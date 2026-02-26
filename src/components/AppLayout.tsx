@@ -3,7 +3,7 @@
 import { usePathname, useRouter } from "next/navigation";
 import Sidebar from "./Sidebar";
 import Header from "./Header";
-import { useSession } from "next-auth/react";
+import { useSession, signOut } from "next-auth/react";
 import { useEffect } from "react";
 
 export default function AppLayout({ children, logoUrl }: { children: React.ReactNode, logoUrl?: string }) {
@@ -16,13 +16,24 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
         if (status === 'authenticated') {
             const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
 
+            // If an authenticated user suddenly has no role, they were likely deleted.
+            // Force sign out to clear the stale session so they can try again.
+            if (!role && session?.user && !isPublicRoute) {
+                signOut({ callbackUrl: '/login?error=AccessDenied' });
+                return;
+            }
+
             if (role === 'CLIENT' && !isPublicRoute) {
                 router.replace('/portal');
             }
         }
-    }, [status, role, pathname, router]);
+    }, [status, role, pathname, router, session]);
 
     const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
+
+    if (status === 'authenticated' && !role && !isPublicRoute) {
+        return <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500">Signing out...</div>;
+    }
 
     if (role === 'CLIENT' && !isPublicRoute) {
         return <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500">Redirecting to Portal...</div>;
