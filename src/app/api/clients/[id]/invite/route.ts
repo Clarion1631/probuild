@@ -56,14 +56,20 @@ export async function POST(
             try {
                 // Ensure the 'from' email is verified in Resend for the user's domain.
                 // If not, we just catch the error and continue.
-                await resend.emails.send({
+                const { data, error } = await resend.emails.send({
                     from: 'ProBuild <notifications@goldentouchremodeling.com>',
                     to: emailToInvite,
                     subject: 'Invitation to Customer Portal',
                     html: `<p>Hello ${client.name},</p><p>You have been invited to view your project portal. Click <a href="${appUrl}">here</a> to log in with your Google account.</p>`
                 });
-            } catch (emailError) {
+
+                if (error) {
+                    console.error("Resend API returned error:", error);
+                    return NextResponse.json({ error: "Failed to send email: " + error.message }, { status: 400 });
+                }
+            } catch (emailError: any) {
                 console.error("Failed to send Resend email:", emailError);
+                return NextResponse.json({ error: "Exception sending email: " + emailError.message }, { status: 500 });
             }
         } else {
             console.log(`[DEV MODE] Invite email would be sent to ${emailToInvite}: Login at ${appUrl}`);
