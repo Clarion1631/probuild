@@ -94,6 +94,29 @@ export default function TeamMemberEditPage({ params }: { params: { id: string } 
         }
     };
 
+    const handleDelete = async () => {
+        if (!confirm(`Are you sure you want to delete ${user?.email}? This action cannot be undone.`)) {
+            return;
+        }
+
+        try {
+            const res = await fetch(`/api/users/${params.id}`, {
+                method: 'DELETE',
+            });
+
+            if (res.ok) {
+                toast.success("Team member deleted successfully");
+                router.push("/company/team-members");
+            } else {
+                const data = await res.json();
+                toast.error(data.error || "Failed to delete member");
+            }
+        } catch (error) {
+            console.error(error);
+            toast.error("An error occurred while deleting");
+        }
+    };
+
     if (loading) return <div className="p-8">Loading...</div>;
     if (!user) return null;
 
@@ -253,10 +276,17 @@ export default function TeamMemberEditPage({ params }: { params: { id: string } 
                 {/* Danger Zone */}
                 <div className="pt-8 border-t mt-12 pb-12">
                     <div className="flex gap-4">
-                        <button className="px-4 py-2 border border-slate-300 text-slate-700 rounded-md font-medium text-sm hover:bg-slate-50 transition">
+                        <button
+                            type="button"
+                            className="px-4 py-2 border border-slate-300 text-slate-700 rounded-md font-medium text-sm hover:bg-slate-50 transition"
+                        >
                             Disable Team Member
                         </button>
-                        <button className="px-4 py-2 bg-red-600 text-white rounded-md font-medium text-sm hover:bg-red-700 transition">
+                        <button
+                            type="button"
+                            onClick={handleDelete}
+                            className="px-4 py-2 bg-red-600 text-white rounded-md font-medium text-sm hover:bg-red-700 transition"
+                        >
                             Delete Team Member
                         </button>
                     </div>
