@@ -57,7 +57,7 @@ export async function POST(
                 // Ensure the 'from' email is verified in Resend for the user's domain.
                 // If not, we just catch the error and continue.
                 await resend.emails.send({
-                    from: 'ProBuild <onboarding@resend.dev>', // Resend testing works with onboarding@resend.dev
+                    from: 'ProBuild <notifications@goldentouchremodeling.com>',
                     to: emailToInvite,
                     subject: 'Invitation to Customer Portal',
                     html: `<p>Hello ${client.name},</p><p>You have been invited to view your project portal. Click <a href="${appUrl}">here</a> to log in with your Google account.</p>`
