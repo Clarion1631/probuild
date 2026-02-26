@@ -89,6 +89,7 @@ export async function POST(req: Request) {
         });
 
         const appUrl = process.env.NEXTAUTH_URL || 'https://probuild-amber.vercel.app';
+        const loginUrl = `${appUrl}/login`;
 
         // Try to send email
         if (process.env.RESEND_API_KEY) {
@@ -97,7 +98,43 @@ export async function POST(req: Request) {
                     from: 'ProBuild <notifications@goldentouchremodeling.com>',
                     to: exactEmailLower,
                     subject: 'Invitation to ProBuild Team',
-                    html: `<p>Hello${name ? ' ' + name : ''},</p><p>You have been invited to join the ProBuild team as a ${role}. Click <a href="${appUrl}">here</a> to log in with your Google account.</p>`
+                    html: `
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <meta charset="utf-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Join ProBuild</title>
+                        <style>
+                            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; background-color: #f8fafc; margin: 0; padding: 0; color: #0f172a; }
+                            .container { padding: 40px 20px; max-width: 600px; margin: 0 auto; }
+                            .card { background-color: #ffffff; border-radius: 12px; padding: 40px; text-align: center; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border: 1px solid #e2e8f0; }
+                            .logo { width: 48px; height: 48px; background-color: #0f172a; border-radius: 12px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 24px; }
+                            .logo svg { display: block; margin: auto; padding-top: 12px; }
+                            h1 { font-size: 24px; font-weight: 700; margin: 0 0 16px; color: #0f172a; letter-spacing: -0.025em; }
+                            p { font-size: 16px; line-height: 1.6; margin: 0 0 32px; color: #475569; }
+                            .button { display: inline-block; background-color: #2563eb; color: #ffffff !important; font-weight: 600; font-size: 16px; text-decoration: none; padding: 14px 28px; border-radius: 8px; transition: background-color 0.2s; }
+                            .button:hover { background-color: #1d4ed8; }
+                            .footer { margin-top: 32px; font-size: 14px; color: #94a3b8; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <div class="card">
+                                <div class="logo">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg>
+                                </div>
+                                <h1>Welcome to ProBuild</h1>
+                                <p>Hello${name ? ' ' + name : ''},<br><br>You have been invited to join the ProBuild team as a <strong>${role}</strong>. Please click the button below to sign in instantly with your Google account.</p>
+                                <a href="${loginUrl}" class="button">Access Your Portal</a>
+                            </div>
+                            <div class="footer text-center">
+                                &copy; ${new Date().getFullYear()} ProBuild. All rights reserved.
+                            </div>
+                        </div>
+                    </body>
+                    </html>
+                    `
                 });
 
                 if (error) {
