@@ -1,0 +1,128 @@
+﻿
+> scrape-website@0.1.0 build
+> next build
+
+Γû▓ Next.js 16.1.6 (Turbopack)
+- Environments: .env.local, .env
+
+  Creating an optimized production build ...
+Γ£ô Compiled successfully in 6.6s
+  Running TypeScript ...
+  Collecting page data using 23 workers ...
+node.exe : Error [PrismaClientInitializationError]: `PrismaClient` needs to be constructed with a non-empty, valid `PrismaClientOptions`:
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Program Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Error [PrismaCl...ClientOptions`::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+
+```
+new PrismaClient({
+  ...
+})
+```
+
+or
+
+```
+constructor() {
+  super({ ... });
+}
+```
+          
+    at module evaluation 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[root-of-the-server]__9e7a09be._.js:1:1237)
+    at instantiateModule (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:740:9)
+    at getOrInstantiateModuleFromParent 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:763:12)
+    at Context.esmImport [as i] 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:228:20)
+    at module evaluation 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[root-of-the-server]__9e7a09be._.js:1:1555)
+    at instantiateModule (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:740:9)
+    at instantiateRuntimeModule 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:768:12)
+    at getOrInstantiateRuntimeModule 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:781:12)
+    at Object.m (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:790:18) {
+  clientVersion: '7.4.1',
+  errorCode: undefined,
+  retryable: undefined
+}
+Error [PrismaClientInitializationError]: `PrismaClient` needs to be constructed with a non-empty, valid `PrismaClientOptions`:
+
+```
+new PrismaClient({
+  ...
+})
+```
+
+or
+
+```
+constructor() {
+  super({ ... });
+}
+```
+          
+    at module evaluation 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[root-of-the-server]__3e1bacdf._.js:1:1812)
+    at instantiateModule (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:740:9)
+    at getOrInstantiateModuleFromParent 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:763:12)
+    at Context.esmImport [as i] 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:228:20)
+    at module evaluation 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[root-of-the-server]__3e1bacdf._.js:1:5314)
+    at instantiateModule (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:740:9)
+    at instantiateRuntimeModule 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:768:12)
+    at getOrInstantiateRuntimeModule 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:781:12)
+    at Object.m (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:790:18) {
+  clientVersion: '7.4.1',
+  errorCode: undefined,
+  retryable: undefined
+}
+Error [PrismaClientInitializationError]: `PrismaClient` needs to be constructed with a non-empty, valid `PrismaClientOptions`:
+
+```
+new PrismaClient({
+  ...
+})
+```
+
+or
+
+```
+constructor() {
+  super({ ... });
+}
+```
+          
+    at module evaluation 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[root-of-the-server]__385b3b96._.js:1:1237)
+    at instantiateModule (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:740:9)
+    at getOrInstantiateModuleFromParent 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:763:12)
+    at Context.esmImport [as i] 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:228:20)
+    at module evaluation 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[root-of-the-server]__385b3b96._.js:1:1555)
+    at instantiateModule (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:740:9)
+    at instantiateRuntimeModule 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:768:12)
+    at getOrInstantiateRuntimeModule 
+(C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:781:12)
+    at Object.m (C:\Users\jat00\.gemini\antigravity\workspaces\scrape-website\.next\server\chunks\[turbopack]_runtime.js:790:18) {
+  clientVersion: '7.4.1',
+  errorCode: undefined,
+  retryable: undefined
+}
+
+> Build error occurred
+Error: Failed to collect page data for /api/clients/[id]
+    at ignore-listed frames {
+  type: 'Error'
+}
