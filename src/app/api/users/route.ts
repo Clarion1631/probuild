@@ -3,6 +3,9 @@ export const dynamic = 'force-dynamic';
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { Resend } from 'resend';
+
+const resend = new Resend(process.env.RESEND_API_KEY || 're_dummy');
 
 export async function GET(req: Request) {
     try {
@@ -84,6 +87,30 @@ export async function POST(req: Request) {
                 pinCode: pinCode || null
             }
         });
+
+        const appUrl = process.env.NEXTAUTH_URL || 'https://probuild-amber.vercel.app';
+
+        // Try to send email
+        if (process.env.RESEND_API_KEY) {
+            try {
+                const { data, error } = await resend.emails.send({
+                    from: 'ProBuild <notifications@goldentouchremodeling.com>',
+                    to: exactEmailLower,
+                    subject: 'Invitation to ProBuild Team',
+                    html: `<p>Hello${name ? ' ' + name : ''},</p><p>You have been invited to join the ProBuild team as a ${role}. Click <a href="${appUrl}">here</a> to log in with your Google account.</p>`
+                });
+
+                if (error) {
+                    console.error("Resend API returned error:", error);
+                    // We still return 201 because the user was created, but we can pass the error warning
+                    return NextResponse.json({ ...newUser, warning: "User created but email failed to send: " + error.message }, { status: 201 });
+                }
+            } catch (emailError: any) {
+                console.error("Failed to send Resend email:", emailError);
+            }
+        } else {
+            console.log(`[DEV MODE] Team Invite email would be sent to ${exactEmailLower}: Login at ${appUrl}`);
+        }
 
         return NextResponse.json(newUser, { status: 201 });
     } catch (error: any) {

@@ -44,9 +44,16 @@ export default function TeamPage() {
         });
 
         if (res.ok) {
+            const data = await res.json();
             setIsAddingUser(false);
             setAddForm({ role: 'EMPLOYEE', email: '' });
-            toast.success("Team member invited successfully.");
+
+            if (data.warning) {
+                toast.warning(data.warning);
+            } else {
+                toast.success("Team member invited successfully.");
+            }
+
             fetchUsers();
         } else {
             const data = await res.json();
