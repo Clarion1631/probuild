@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, use } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronLeft, Save } from "lucide-react";
 import { toast } from "sonner";
@@ -16,7 +16,8 @@ interface User {
     pinCode: string | null;
 }
 
-export default function TeamMemberEditPage({ params }: { params: { id: string } }) {
+export default function TeamMemberEditPage({ params }: { params: Promise<{ id: string }> }) {
+    const { id } = use(params);
     const router = useRouter();
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState(true);
@@ -32,7 +33,7 @@ export default function TeamMemberEditPage({ params }: { params: { id: string } 
 
     useEffect(() => {
         fetchUser();
-    }, [params.id]);
+    }, [id]);
 
     const fetchUser = async () => {
         setLoading(true);
@@ -40,7 +41,7 @@ export default function TeamMemberEditPage({ params }: { params: { id: string } 
             const res = await fetch('/api/users'); // We can filter client side or add a specific GET /api/users/[id] later if needed. For now, find from list.
             if (res.ok) {
                 const users: User[] = await res.json();
-                const found = users.find(u => u.id === params.id);
+                const found = users.find(u => u.id === id);
                 if (found) {
                     setUser(found);
                     const names = (found.name || "").split(" ");
@@ -67,7 +68,7 @@ export default function TeamMemberEditPage({ params }: { params: { id: string } 
         setSaving(true);
         try {
             const fullName = `${firstName} ${lastName}`.trim();
-            const res = await fetch(`/api/users/${params.id}`, {
+            const res = await fetch(`/api/users/${id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -100,7 +101,7 @@ export default function TeamMemberEditPage({ params }: { params: { id: string } 
         }
 
         try {
-            const res = await fetch(`/api/users/${params.id}`, {
+            const res = await fetch(`/api/users/${id}`, {
                 method: 'DELETE',
             });
 
