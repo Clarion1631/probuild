@@ -31,9 +31,21 @@ export const authOptions: NextAuthOptions = {
             }
             return true;
         },
+        async jwt({ token, user }) {
+            if (user?.email) {
+                const dbUser = await prisma.user.findUnique({
+                    where: { email: user.email.toLowerCase() }
+                });
+                if (dbUser) {
+                    token.role = dbUser.role;
+                }
+            }
+            return token;
+        },
         async session({ session, token }) {
             if (session?.user) {
                 (session.user as any).id = token.sub;
+                (session.user as any).role = token.role;
             }
             return session;
         },

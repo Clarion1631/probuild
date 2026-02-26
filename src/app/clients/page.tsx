@@ -33,6 +33,7 @@ export default function ClientsPage() {
     const [activeTab, setActiveTab] = useState<'details' | 'projects' | 'leads'>('details');
 
     const [isSaving, setIsSaving] = useState(false);
+    const [isInviting, setIsInviting] = useState(false);
 
     useEffect(() => {
         fetchClients();
@@ -104,6 +105,28 @@ export default function ClientsPage() {
             alert("An error occurred while saving.");
         } finally {
             setIsSaving(false);
+        }
+    };
+
+    const handleInviteToPortal = async () => {
+        if (!editingClient?.email && !formData.email) {
+            alert("Please provide an email address for this client first.");
+            return;
+        }
+        setIsInviting(true);
+        try {
+            const res = await fetch(`/api/clients/${editingClient?.id}/invite`, { method: 'POST' });
+            if (res.ok) {
+                alert("Invite sent successfully! The client can now log in using Google.");
+            } else {
+                const errorData = await res.json();
+                alert(errorData.error || "Failed to send invite");
+            }
+        } catch (error) {
+            console.error("Invite error", error);
+            alert("An error occurred while sending the invite.");
+        } finally {
+            setIsInviting(false);
         }
     };
 
@@ -418,23 +441,37 @@ export default function ClientsPage() {
                             )}
                         </div>
 
-                        <div className="px-6 py-4 border-t border-slate-200 bg-white flex justify-end gap-3 rounded-b-xl shrink-0">
-                            <button
-                                type="button"
-                                onClick={handleCloseModal}
-                                disabled={isSaving}
-                                className="px-4 py-2 text-sm font-medium text-slate-700 hover:text-slate-900 transition"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                type="submit"
-                                form="client-form"
-                                disabled={isSaving}
-                                className="bg-slate-900 text-white px-6 py-2 rounded font-medium text-sm hover:bg-slate-800 transition shadow-sm disabled:opacity-70 flex items-center"
-                            >
-                                {isSaving ? 'Saving...' : 'Save'}
-                            </button>
+                        <div className="px-6 py-4 border-t border-slate-200 bg-white flex justify-between gap-3 rounded-b-xl shrink-0">
+                            <div>
+                                {editingClient && (
+                                    <button
+                                        type="button"
+                                        onClick={handleInviteToPortal}
+                                        disabled={isInviting || !formData.email}
+                                        className="px-4 py-2 text-sm font-medium text-blue-600 hover:text-blue-800 transition disabled:opacity-50"
+                                    >
+                                        {isInviting ? 'Inviting...' : 'Invite to Portal'}
+                                    </button>
+                                )}
+                            </div>
+                            <div className="flex gap-3">
+                                <button
+                                    type="button"
+                                    onClick={handleCloseModal}
+                                    disabled={isSaving}
+                                    className="px-4 py-2 text-sm font-medium text-slate-700 hover:text-slate-900 transition"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="submit"
+                                    form="client-form"
+                                    disabled={isSaving}
+                                    className="bg-slate-900 text-white px-6 py-2 rounded font-medium text-sm hover:bg-slate-800 transition shadow-sm disabled:opacity-70 flex items-center"
+                                >
+                                    {isSaving ? 'Saving...' : 'Save'}
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
