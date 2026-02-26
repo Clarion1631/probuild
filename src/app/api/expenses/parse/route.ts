@@ -4,7 +4,6 @@ import { GoogleGenAI } from "@google/genai";
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 export async function POST(req: NextRequest) {
     try {
@@ -31,6 +30,12 @@ export async function POST(req: NextRequest) {
         const publicUrl = `/uploads/receipts/${filename}`;
 
         // Call Gemini API to parse the receipt
+        if (!process.env.GEMINI_API_KEY) {
+            console.error("GEMINI_API_KEY is missing");
+            return NextResponse.json({ error: "AI Parsing is not configured on this server." }, { status: 500 });
+        }
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
         const response = await ai.models.generateContent({
             model: "gemini-2.5-flash",
             contents: [
