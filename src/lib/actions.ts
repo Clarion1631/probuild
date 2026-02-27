@@ -50,6 +50,42 @@ export async function getProject(id: string) {
     return project;
 }
 
+export async function createProject(data: { name: string; clientName: string; clientEmail?: string; location?: string; type?: string }) {
+    // Find or create client
+    let client = await prisma.client.findFirst({
+        where: { name: data.clientName },
+    });
+
+    if (!client) {
+        const initials = data.clientName
+            .split(" ")
+            .map((n) => n[0])
+            .join("")
+            .toUpperCase()
+            .slice(0, 2);
+        client = await prisma.client.create({
+            data: {
+                name: data.clientName,
+                initials,
+                email: data.clientEmail || null,
+            },
+        });
+    }
+
+    const project = await prisma.project.create({
+        data: {
+            name: data.name,
+            clientId: client.id,
+            location: data.location || null,
+            type: data.type || null,
+            status: "In Progress",
+        },
+    });
+
+    revalidatePath("/");
+    return { id: project.id };
+}
+
 export async function convertLeadToProject(leadId: string) {
     const lead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!lead) throw new Error("Lead not found");
