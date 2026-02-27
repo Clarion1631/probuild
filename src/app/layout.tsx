@@ -32,7 +32,7 @@ export default async function RootLayout({
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} bg-slate-50 text-slate-900 min-h-screen`}>
         <Providers>
-          <AppLayout logoUrl={settings?.logoUrl}>
+          <AppLayout logoUrl={settings?.logoUrl ?? undefined}>
             {children}
           </AppLayout>
         </Providers>

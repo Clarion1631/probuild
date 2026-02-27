@@ -6,6 +6,7 @@ import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 export default async function ProjectInvoices({ params }: { params: { id: string } }) {
     const { id } = await params;
     const project = await getProject(id);
+    if (!project) return <div className="p-6">Project not found</div>;
     const invoices = await getProjectInvoices(id);
 
     return (

@@ -1,182 +1,193 @@
 "use server";
 
-import Database from "better-sqlite3";
+import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
 import { generateEstimatePdf } from "./pdf";
 
-// Using a lazy DB connection
-let _db: any = null;
-function getDb() {
-    if (!_db) _db = new Database("dev.db");
-    return _db;
-}
-
-function cuid() {
-    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-}
-
 export async function getLeads() {
-    const db = getDb();
-    const leads = db.prepare("SELECT * FROM Lead ORDER BY createdAt DESC").all();
-    for (const lead of leads) {
-        lead.client = db.prepare("SELECT * FROM Client WHERE id = ?").get(lead.clientId);
-        lead.estimates = db.prepare("SELECT * FROM Estimate WHERE leadId = ?").all(lead.id);
-    }
+    const leads = await prisma.lead.findMany({
+        orderBy: { createdAt: "desc" },
+        include: {
+            client: true,
+            estimates: true,
+        },
+    });
     return leads;
 }
 
 export async function getLead(id: string) {
-    const db = getDb();
-    const lead = db.prepare("SELECT * FROM Lead WHERE id = ?").get(id);
-    if (!lead) return null;
-    lead.client = db.prepare("SELECT * FROM Client WHERE id = ?").get(lead.clientId);
-    lead.estimates = db.prepare("SELECT * FROM Estimate WHERE leadId = ?").all(id);
+    const lead = await prisma.lead.findUnique({
+        where: { id },
+        include: {
+            client: true,
+            estimates: true,
+        },
+    });
     return lead;
 }
 
 export async function getProjects() {
-    const db = getDb();
-    const projects = db.prepare("SELECT * FROM Project ORDER BY viewedAt DESC").all();
-    for (const project of projects) {
-        project.client = db.prepare("SELECT * FROM Client WHERE id = ?").get(project.clientId);
-        project.estimates = db.prepare("SELECT * FROM Estimate WHERE projectId = ?").all(project.id);
-    }
+    const projects = await prisma.project.findMany({
+        orderBy: { viewedAt: "desc" },
+        include: {
+            client: true,
+            estimates: true,
+        },
+    });
     return projects;
 }
 
 export async function getProject(id: string) {
-    const db = getDb();
-    const project = db.prepare("SELECT * FROM Project WHERE id = ?").get(id);
-    if (!project) return null;
-    project.client = db.prepare("SELECT * FROM Client WHERE id = ?").get(project.clientId);
-    project.estimates = db.prepare("SELECT * FROM Estimate WHERE projectId = ?").all(id);
-    project.floorPlans = db.prepare("SELECT * FROM FloorPlan WHERE projectId = ?").all(id);
+    const project = await prisma.project.findUnique({
+        where: { id },
+        include: {
+            client: true,
+            estimates: true,
+            floorPlans: true,
+        },
+    });
     return project;
 }
 
 export async function convertLeadToProject(leadId: string) {
-    const db = getDb();
-
-    const lead = db.prepare("SELECT * FROM Lead WHERE id = ?").get(leadId);
+    const lead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!lead) throw new Error("Lead not found");
 
-    const projectId = cuid();
-
-    db.prepare(`
-    INSERT INTO Project (id, name, clientId, location, status, type, viewedAt, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(projectId, lead.name, lead.clientId, lead.location, "In Progress", "Unknown", Date.now(), Date.now());
+    const project = await prisma.project.create({
+        data: {
+            name: lead.name,
+            clientId: lead.clientId,
+            location: lead.location,
+            status: "In Progress",
+            type: "Unknown",
+        },
+    });
 
     // Relink estimates
-    db.prepare("UPDATE Estimate SET projectId = ?, leadId = NULL WHERE leadId = ?").run(projectId, leadId);
+    await prisma.estimate.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
 
     // Update lead
-    db.prepare("UPDATE Lead SET stage = 'Won' WHERE id = ?").run(leadId);
+    await prisma.lead.update({
+        where: { id: leadId },
+        data: { stage: "Won" },
+    });
 
     revalidatePath("/leads");
     revalidatePath("/projects");
     revalidatePath(`/leads/${leadId}`);
 
-    return { id: projectId };
+    return { id: project.id };
 }
 
 export async function createDraftEstimate(projectId: string) {
-    const db = getDb();
-    const estimateId = cuid();
     const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    db.prepare(`
-        INSERT INTO Estimate (id, title, projectId, code, status, totalAmount, balanceDue, privacy, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(estimateId, "Draft Estimate", projectId, code, "Draft", 0, 0, "Shared", Date.now());
+    const estimate = await prisma.estimate.create({
+        data: {
+            title: "Draft Estimate",
+            projectId,
+            code,
+            status: "Draft",
+            totalAmount: 0,
+            balanceDue: 0,
+            privacy: "Shared",
+        },
+    });
 
     revalidatePath(`/projects/${projectId}/estimates`);
-
-    return { id: estimateId };
+    return { id: estimate.id };
 }
 
 export async function createDraftFloorPlan(projectId: string) {
-    const db = getDb();
-    ensureFloorPlanDataColumn(db);
-    const floorPlanId = cuid();
-
-    db.prepare(`
-        INSERT INTO FloorPlan (id, name, projectId, data, createdAt, updatedAt)
-        VALUES (?, ?, ?, ?, ?, ?)
-    `).run(floorPlanId, "New Floor Plan", projectId, null, Date.now(), Date.now());
+    const floorPlan = await prisma.floorPlan.create({
+        data: {
+            name: "New Floor Plan",
+            projectId,
+        },
+    });
 
     revalidatePath(`/projects/${projectId}/floor-plans`);
-    return { id: floorPlanId };
+    return { id: floorPlan.id };
 }
 
 export async function getFloorPlan(id: string) {
-    const db = getDb();
-    ensureFloorPlanDataColumn(db);
-    return db.prepare("SELECT * FROM FloorPlan WHERE id = ?").get(id) || null;
+    return await prisma.floorPlan.findUnique({ where: { id } });
 }
 
 export async function saveFloorPlanData(id: string, projectId: string, data: string) {
-    const db = getDb();
-    ensureFloorPlanDataColumn(db);
-    db.prepare(`
-        UPDATE FloorPlan SET data = ?, updatedAt = ? WHERE id = ?
-    `).run(data, Date.now(), id);
+    await prisma.floorPlan.update({
+        where: { id },
+        data: { data },
+    });
 
     revalidatePath(`/projects/${projectId}/floor-plans`);
     return { success: true };
 }
 
-// Ensure the data column exists on FloorPlan (safe migration for existing DBs)
-function ensureFloorPlanDataColumn(db: any) {
-    try {
-        db.prepare("SELECT data FROM FloorPlan LIMIT 0").run();
-    } catch {
-        db.prepare("ALTER TABLE FloorPlan ADD COLUMN data TEXT").run();
-    }
-}
-
 export async function getEstimate(id: string) {
-    const db = getDb();
-    const estimate: any = db.prepare("SELECT * FROM Estimate WHERE id = ?").get(id);
-    if (!estimate) return null;
-    const items = db.prepare("SELECT * FROM EstimateItem WHERE estimateId = ? ORDER BY \"order\" ASC").all(id);
-    const expenses = db.prepare("SELECT * FROM Expense WHERE estimateId = ?").all(id);
-    for (const item of (items as any[])) {
-        item.expenses = (expenses as any[]).filter(e => e.itemId === item.id);
-    }
-    estimate.items = items;
-    estimate.paymentSchedules = db.prepare("SELECT * FROM EstimatePaymentSchedule WHERE estimateId = ? ORDER BY \"order\" ASC").all(id);
+    const estimate = await prisma.estimate.findUnique({
+        where: { id },
+        include: {
+            items: {
+                orderBy: { order: "asc" },
+                include: {
+                    expenses: true,
+                },
+            },
+            paymentSchedules: {
+                orderBy: { order: "asc" },
+            },
+            expenses: true,
+        },
+    });
     return estimate;
 }
 
 export async function getEstimateForPortal(id: string) {
-    const db = getDb();
-    const estimate: any = db.prepare(`
-        SELECT e.*, p.name as projectName, c.name as clientName, c.email as clientEmail, l.name as leadName, lc.name as leadClientName
-        FROM Estimate e
-        LEFT JOIN Project p ON e.projectId = p.id
-        LEFT JOIN Client c ON p.clientId = c.id
-        LEFT JOIN Lead l ON e.leadId = l.id
-        LEFT JOIN Client lc ON l.clientId = lc.id
-        WHERE e.id = ?
-    `).get(id);
+    const estimate = await prisma.estimate.findUnique({
+        where: { id },
+        include: {
+            project: {
+                include: { client: true },
+            },
+            lead: {
+                include: { client: true },
+            },
+            items: {
+                orderBy: { order: "asc" },
+            },
+            paymentSchedules: {
+                orderBy: { order: "asc" },
+            },
+        },
+    });
+
     if (!estimate) return null;
 
-    estimate.clientName = estimate.clientName || estimate.leadClientName || "Unknown Client";
-
-    const items = db.prepare("SELECT * FROM EstimateItem WHERE estimateId = ? ORDER BY \"order\" ASC").all(id);
-    estimate.items = items;
-    estimate.paymentSchedules = db.prepare("SELECT * FROM EstimatePaymentSchedule WHERE estimateId = ? ORDER BY \"order\" ASC").all(id);
-    return estimate;
+    // Flatten for portal usage
+    return {
+        ...estimate,
+        projectName: estimate.project?.name || estimate.lead?.name || null,
+        clientName: estimate.project?.client?.name || estimate.lead?.client?.name || "Unknown Client",
+        clientEmail: estimate.project?.client?.email || estimate.lead?.client?.email || null,
+    };
 }
 
 export async function markEstimateViewed(estimateId: string) {
-    const db = getDb();
-    const estimate: any = db.prepare("SELECT viewedAt Code FROM Estimate WHERE id = ?").get(estimateId);
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { viewedAt: true },
+    });
 
     if (estimate && !estimate.viewedAt) {
-        db.prepare("UPDATE Estimate SET viewedAt = ? WHERE id = ?").run(Date.now(), estimateId);
+        await prisma.estimate.update({
+            where: { id: estimateId },
+            data: { viewedAt: new Date() },
+        });
 
         const settings = await getCompanySettings();
         if (settings.notificationEmail) {
@@ -190,18 +201,24 @@ export async function markEstimateViewed(estimateId: string) {
 }
 
 export async function approveEstimate(estimateId: string, signatureName: string, ipAddress: string, userAgent: string) {
-    const db = getDb();
-    db.prepare(`
-        UPDATE Estimate 
-        SET status = 'Approved', approvedBy = ?, approvedAt = ?, approvalIp = ?, approvalUserAgent = ?
-        WHERE id = ?
-    `).run(signatureName, Date.now(), ipAddress, userAgent, estimateId);
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: {
+            status: "Approved",
+            approvedBy: signatureName,
+            approvedAt: new Date(),
+            approvalIp: ipAddress,
+            approvalUserAgent: userAgent,
+        },
+    });
 
-    const estimate: any = db.prepare("SELECT projectId, code FROM Estimate WHERE id = ?").get(estimateId);
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true, code: true },
+    });
 
     const settings = await getCompanySettings();
     if (settings.notificationEmail) {
-        // Generate the PDF snapshot of the newly signed estimate
         let attachments: any = undefined;
         try {
             const pdfBuffer = await generateEstimatePdf(estimateId);
@@ -231,67 +248,62 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 }
 
 export async function saveEstimate(estimateId: string, projectId: string, data: any, items: any[]) {
-    const db = getDb();
-
     // Update estimate
-    db.prepare(`
-        UPDATE Estimate 
-        SET title = ?, code = ?, status = ?, totalAmount = ?, balanceDue = ?
-        WHERE id = ?
-    `).run(data.title, data.code, data.status, data.totalAmount, data.totalAmount, estimateId);
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: {
+            title: data.title,
+            code: data.code,
+            status: data.status,
+            totalAmount: data.totalAmount,
+            balanceDue: data.totalAmount,
+        },
+    });
 
     // Delete existing items and schedules
-    db.prepare("DELETE FROM EstimateItem WHERE estimateId = ?").run(estimateId);
-    db.prepare("DELETE FROM EstimatePaymentSchedule WHERE estimateId = ?").run(estimateId);
+    await prisma.estimateItem.deleteMany({ where: { estimateId } });
+    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
 
     // Insert new items
-    const insertItem = db.prepare(`
-        INSERT INTO EstimateItem (id, estimateId, name, description, type, quantity, unitCost, total, "order", parentId, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
     let itemOrder = 0;
     for (const item of items) {
-        insertItem.run(
-            item.id || cuid(),
-            estimateId,
-            item.name,
-            item.description || "",
-            item.type,
-            parseFloat(item.quantity) || 0,
-            parseFloat(item.unitCost) || 0,
-            parseFloat(item.total) || 0,
-            item.order ?? itemOrder++,
-            item.parentId || null,
-            item.createdAt || Date.now()
-        );
+        await prisma.estimateItem.create({
+            data: {
+                id: item.id || undefined,
+                estimateId,
+                name: item.name,
+                description: item.description || "",
+                type: item.type,
+                quantity: parseFloat(item.quantity) || 0,
+                unitCost: parseFloat(item.unitCost) || 0,
+                total: parseFloat(item.total) || 0,
+                order: item.order ?? itemOrder++,
+                parentId: item.parentId || null,
+            },
+        });
     }
 
     // Insert new payment schedules
-    const insertSchedule = db.prepare(`
-        INSERT INTO EstimatePaymentSchedule (id, estimateId, name, percentage, amount, dueDate, "order", createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    let scheduleOrder = 0;
     const schedules = data.paymentSchedules || [];
+    let scheduleOrder = 0;
     for (const schedule of schedules) {
-        insertSchedule.run(
-            schedule.id || cuid(),
-            estimateId,
-            schedule.name,
-            schedule.percentage ? parseFloat(schedule.percentage) : null,
-            parseFloat(schedule.amount) || 0,
-            schedule.dueDate || null,
-            schedule.order ?? scheduleOrder++,
-            schedule.createdAt || Date.now()
-        );
+        await prisma.estimatePaymentSchedule.create({
+            data: {
+                id: schedule.id || undefined,
+                estimateId,
+                name: schedule.name,
+                percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
+                amount: parseFloat(schedule.amount) || 0,
+                dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
+                order: schedule.order ?? scheduleOrder++,
+            },
+        });
     }
 
     if (data.status === 'Approved') {
-        const existingBudget = db.prepare("SELECT id FROM Budget WHERE estimateId = ?").get(estimateId);
+        const existingBudget = await prisma.budget.findUnique({ where: { estimateId } });
         if (!existingBudget) {
-            generateBudgetForEstimate(estimateId, projectId, db);
+            await generateBudgetForEstimate(estimateId, projectId);
         }
     }
 
@@ -301,87 +313,105 @@ export async function saveEstimate(estimateId: string, projectId: string, data: 
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
-    const db = getDb();
-    const estimate: any = db.prepare("SELECT * FROM Estimate WHERE id = ?").get(estimateId);
+    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
-    const project: any = db.prepare("SELECT * FROM Project WHERE id = ?").get(estimate.projectId);
+
+    const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
     if (!project) throw new Error("Project not found");
 
-    const invoiceId = cuid();
     const code = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    db.prepare(`
-        INSERT INTO Invoice (id, code, projectId, clientId, status, totalAmount, balanceDue, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(invoiceId, code, estimate.projectId, project.clientId, "Draft", estimate.totalAmount || 0, estimate.totalAmount || 0, Date.now());
+    const invoice = await prisma.invoice.create({
+        data: {
+            code,
+            projectId: estimate.projectId!,
+            clientId: project.clientId,
+            status: "Draft",
+            totalAmount: estimate.totalAmount || 0,
+            balanceDue: estimate.totalAmount || 0,
+        },
+    });
 
-    const schedules: any[] = db.prepare("SELECT * FROM EstimatePaymentSchedule WHERE estimateId = ? ORDER BY \"order\" ASC").all(estimateId);
+    const schedules = await prisma.estimatePaymentSchedule.findMany({
+        where: { estimateId },
+        orderBy: { order: "asc" },
+    });
 
     if (schedules.length > 0) {
-        const insertPayment = db.prepare(`
-            INSERT INTO PaymentSchedule (id, invoiceId, name, amount, status, dueDate, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        `);
         for (const schedule of schedules) {
-            insertPayment.run(
-                cuid(),
-                invoiceId,
-                schedule.name,
-                schedule.amount,
-                "Pending",
-                schedule.dueDate || null,
-                Date.now()
-            );
+            await prisma.paymentSchedule.create({
+                data: {
+                    invoiceId: invoice.id,
+                    name: schedule.name,
+                    amount: schedule.amount,
+                    status: "Pending",
+                    dueDate: schedule.dueDate || null,
+                },
+            });
         }
     } else {
-        // By default, create a single payment schedule for the full amount
-        db.prepare(`
-            INSERT INTO PaymentSchedule (id, invoiceId, name, amount, status, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `).run(cuid(), invoiceId, "Initial Payment", estimate.totalAmount || 0, "Pending", Date.now());
+        await prisma.paymentSchedule.create({
+            data: {
+                invoiceId: invoice.id,
+                name: "Initial Payment",
+                amount: estimate.totalAmount || 0,
+                status: "Pending",
+            },
+        });
     }
 
     revalidatePath(`/projects/${estimate.projectId}/invoices`);
-
-    return { id: invoiceId, projectId: estimate.projectId };
+    return { id: invoice.id, projectId: estimate.projectId };
 }
 
 export async function getInvoice(id: string) {
-    const db = getDb();
-    const invoice: any = db.prepare("SELECT * FROM Invoice WHERE id = ?").get(id);
-    if (!invoice) return null;
-    invoice.payments = db.prepare("SELECT * FROM PaymentSchedule WHERE invoiceId = ? ORDER BY createdAt ASC").all(id);
+    const invoice = await prisma.invoice.findUnique({
+        where: { id },
+        include: {
+            payments: {
+                orderBy: { createdAt: "asc" },
+            },
+        },
+    });
     return invoice;
 }
 
 export async function recordPayment(paymentId: string, invoiceId: string, timestamp: number) {
-    const db = getDb();
-    const payment: any = db.prepare("SELECT * FROM PaymentSchedule WHERE id = ?").get(paymentId);
+    const payment = await prisma.paymentSchedule.findUnique({ where: { id: paymentId } });
     if (!payment || payment.status === "Paid") return { success: false };
 
-    db.prepare("UPDATE PaymentSchedule SET status = 'Paid', paymentDate = ? WHERE id = ?").run(timestamp, paymentId);
+    await prisma.paymentSchedule.update({
+        where: { id: paymentId },
+        data: {
+            status: "Paid",
+            paymentDate: new Date(timestamp),
+        },
+    });
 
-    // Update invoice balance
-    const invoice: any = db.prepare("SELECT balanceDue FROM Invoice WHERE id = ?").get(invoiceId);
-    const newBalance = Math.max(0, (invoice.balanceDue || 0) - (payment.amount || 0));
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+    const newBalance = Math.max(0, (invoice!.balanceDue || 0) - (payment.amount || 0));
     const newStatus = newBalance <= 0 ? "Paid" : "Partially Paid";
 
-    db.prepare("UPDATE Invoice SET balanceDue = ?, status = ? WHERE id = ?").run(newBalance, newStatus, invoiceId);
+    await prisma.invoice.update({
+        where: { id: invoiceId },
+        data: { balanceDue: newBalance, status: newStatus },
+    });
 
-    const inv: any = db.prepare("SELECT projectId FROM Invoice WHERE id = ?").get(invoiceId);
-    revalidatePath(`/projects/${inv.projectId}/invoices`);
-    revalidatePath(`/projects/${inv.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/projects/${invoice!.projectId}/invoices`);
+    revalidatePath(`/projects/${invoice!.projectId}/invoices/${invoiceId}`);
 
     return { success: true };
 }
 
 export async function getProjectInvoices(projectId: string) {
-    const db = getDb();
-    return db.prepare("SELECT * FROM Invoice WHERE projectId = ? ORDER BY createdAt DESC").all(projectId);
+    return await prisma.invoice.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+    });
 }
 
-function generateBudgetForEstimate(estimateId: string, projectId: string, db: any) {
-    const items = db.prepare("SELECT * FROM EstimateItem WHERE estimateId = ?").all(estimateId);
+async function generateBudgetForEstimate(estimateId: string, projectId: string) {
+    const items = await prisma.estimateItem.findMany({ where: { estimateId } });
 
     let totalLaborBudget = 0;
     let totalMaterialBudget = 0;
@@ -403,84 +433,86 @@ function generateBudgetForEstimate(estimateId: string, projectId: string, db: an
             bucketsMap[topLevelId].laborBudget += item.total || 0;
             totalLaborBudget += item.total || 0;
         } else {
-            // Note: Currently counting Material, Subcontractor, Assembly as Material for simplicity.
             bucketsMap[topLevelId].materialBudget += item.total || 0;
             totalMaterialBudget += item.total || 0;
         }
     }
 
-    const budgetId = cuid();
-    db.prepare(`
-        INSERT INTO Budget (id, projectId, estimateId, totalLaborBudget, totalMaterialBudget, createdAt, updatedAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(budgetId, projectId, estimateId, totalLaborBudget, totalMaterialBudget, Date.now(), Date.now());
-
-    const insertBucket = db.prepare(`
-        INSERT INTO BudgetBucket (id, budgetId, name, laborBudget, materialBudget, createdAt, updatedAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
+    const budget = await prisma.budget.create({
+        data: {
+            projectId,
+            estimateId,
+            totalLaborBudget,
+            totalMaterialBudget,
+        },
+    });
 
     for (const topLevelId in bucketsMap) {
         const b = bucketsMap[topLevelId];
-        insertBucket.run(cuid(), budgetId, b.name, b.laborBudget, b.materialBudget, Date.now(), Date.now());
+        await prisma.budgetBucket.create({
+            data: {
+                budgetId: budget.id,
+                name: b.name,
+                laborBudget: b.laborBudget,
+                materialBudget: b.materialBudget,
+            },
+        });
     }
 }
 
 export async function getCompanySettings() {
-    const db = getDb();
-    let settings: any = db.prepare("SELECT * FROM CompanySettings WHERE id = 'singleton'").get();
+    let settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
 
-    // Auto-initialize if it doesn't exist
     if (!settings) {
-        db.prepare(`
-            INSERT INTO CompanySettings (id, companyName, updatedAt) 
-            VALUES ('singleton', 'My Construction Co.', ?)
-        `).run(Date.now());
-        settings = db.prepare("SELECT * FROM CompanySettings WHERE id = 'singleton'").get();
+        settings = await prisma.companySettings.create({
+            data: {
+                id: "singleton",
+                companyName: "My Construction Co.",
+            },
+        });
     }
 
     return settings;
 }
 
 export async function saveCompanySettings(data: any) {
-    const db = getDb();
-    db.prepare(`
-        UPDATE CompanySettings 
-        SET companyName = ?, address = ?, phone = ?, email = ?, website = ?, logoUrl = ?, notificationEmail = ?, updatedAt = ?
-        WHERE id = 'singleton'
-    `).run(
-        data.companyName,
-        data.address,
-        data.phone,
-        data.email,
-        data.website,
-        data.logoUrl,
-        data.notificationEmail,
-        Date.now()
-    );
+    await prisma.companySettings.update({
+        where: { id: "singleton" },
+        data: {
+            companyName: data.companyName,
+            address: data.address,
+            phone: data.phone,
+            email: data.email,
+            website: data.website,
+            logoUrl: data.logoUrl,
+            notificationEmail: data.notificationEmail,
+        },
+    });
 
     revalidatePath("/settings/company");
-    revalidatePath("/portal"); // Ensure portals update with new info
+    revalidatePath("/portal");
     return { success: true };
 }
 
 export async function deleteEstimate(estimateId: string) {
-    const db = getDb();
-    const estimate: any = db.prepare("SELECT projectId FROM Estimate WHERE id = ?").get(estimateId);
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true },
+    });
     if (!estimate) return { success: false, error: "Estimate not found" };
 
-    // Delete related Budget and BudgetBucket
-    const budget: any = db.prepare("SELECT id FROM Budget WHERE estimateId = ?").get(estimateId);
+    // Delete related Budget and BudgetBuckets
+    const budget = await prisma.budget.findUnique({ where: { estimateId } });
     if (budget) {
-        db.prepare("DELETE FROM BudgetBucket WHERE budgetId = ?").run(budget.id);
-        db.prepare("DELETE FROM Budget WHERE id = ?").run(budget.id);
+        await prisma.budgetBucket.deleteMany({ where: { budgetId: budget.id } });
+        await prisma.budget.delete({ where: { id: budget.id } });
     }
 
-    // Delete related items and schedules, and finally the estimate
-    db.prepare("DELETE FROM EstimateItem WHERE estimateId = ?").run(estimateId);
-    db.prepare("DELETE FROM EstimatePaymentSchedule WHERE estimateId = ?").run(estimateId);
-    db.prepare("DELETE FROM Expense WHERE estimateId = ?").run(estimateId);
-    db.prepare("DELETE FROM Estimate WHERE id = ?").run(estimateId);
+    // Delete related items, schedules, expenses, and the estimate itself
+    await prisma.estimateItem.deleteMany({ where: { estimateId } });
+    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+    await prisma.expense.deleteMany({ where: { estimateId } });
+    await prisma.estimate.delete({ where: { id: estimateId } });
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);

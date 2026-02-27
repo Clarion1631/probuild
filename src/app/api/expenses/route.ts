@@ -1,17 +1,7 @@
 export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from "next/server";
-import Database from "better-sqlite3";
+import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
-
-let _db: any = null;
-function getDb() {
-    if (!_db) _db = new Database("dev.db");
-    return _db;
-}
-
-function cuid() {
-    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-}
 
 export async function POST(req: NextRequest) {
     try {
@@ -21,34 +11,25 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "estimateId is required" }, { status: 400 });
         }
 
-        const db = getDb();
-
         if (itemId) {
-            const itemExists = db.prepare("SELECT id FROM EstimateItem WHERE id = ?").get(itemId);
+            const itemExists = await prisma.estimateItem.findUnique({ where: { id: itemId }, select: { id: true } });
             if (!itemExists) {
                 return NextResponse.json({ error: "This cost code is unsaved. Please click 'Save' on the Estimate first before adding an expense to it." }, { status: 400 });
             }
         }
 
-        const id = cuid();
-
-        db.prepare(`
-            INSERT INTO Expense (id, estimateId, itemId, amount, vendor, date, description, receiptUrl, status, createdAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-            id,
-            estimateId,
-            itemId || null,
-            parseFloat(amount) || 0,
-            vendor || null,
-            date ? new Date(date).getTime() : null,
-            description || null,
-            receiptUrl || null,
-            "Pending",
-            Date.now()
-        );
-
-        const newExpense = db.prepare("SELECT * FROM Expense WHERE id = ?").get(id);
+        const newExpense = await prisma.expense.create({
+            data: {
+                estimateId,
+                itemId: itemId || null,
+                amount: parseFloat(amount) || 0,
+                vendor: vendor || null,
+                date: date ? new Date(date) : null,
+                description: description || null,
+                receiptUrl: receiptUrl || null,
+                status: "Pending",
+            },
+        });
 
         return NextResponse.json(newExpense);
     } catch (error: any) {
