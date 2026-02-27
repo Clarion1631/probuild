@@ -1,9 +1,9 @@
 "use client";
 
 import { Canvas, ThreeEvent } from "@react-three/fiber";
-import { OrbitControls, Grid, Sky, Environment } from "@react-three/drei";
+import { OrbitControls, Grid, Sky, Environment, Loader, OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
 import { useState, useRef, useEffect, Suspense } from "react";
-import { useFloorPlanStore, WallAttachment, Wall, GenericProduct as ProductType } from "@/store/useFloorPlanStore";
+import { useFloorPlanStore, WallAttachment, Wall, GenericProduct as ProductType, PRODUCT_DEFAULTS } from "@/store/useFloorPlanStore";
 import WallComponent from "./Wall";
 import DoorWindow from "./DoorWindow";
 import GenericProduct from "./GenericProduct";
@@ -18,7 +18,7 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
 
     // We use a local ref to track the "pending" position of dragged items without triggering React renders 60 times a second
     const localDragState = useRef<{
-        wallId: string;
+        elementId: string;
         node: 'start' | 'end' | 'center';
         startHoverPoint: THREE.Vector3 | null;
         originalStart: { x: number, y: number, z: number };
@@ -28,7 +28,7 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
     // Initialize local drag state when Zustand registers a drag start
     useEffect(() => {
         if (draggingNode) {
-            const el = elements.find(e => e.id === draggingNode.wallId);
+            const el = elements.find(e => e.id === draggingNode.elementId);
             if (el?.type === 'wall') {
                 const wall = el as Wall;
                 localDragState.current = {
@@ -93,21 +93,17 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
         }
 
         if (activeTool.startsWith('drawProduct_')) {
-            const productType = activeTool.replace('drawProduct_', '') as any;
-            let w = 2, h = 2, d = 2;
-            if (productType === 'sofa') { w = 6; h = 2.5; d = 3; }
-            if (productType === 'coffeeTable') { w = 4; h = 1.5; d = 2; }
-            if (productType === 'island') { w = 6; h = 3; d = 3; }
-            if (productType === 'cabinetBase') { w = 2; h = 3; d = 2; }
+            const productType = activeTool.replace('drawProduct_', '') as keyof typeof PRODUCT_DEFAULTS;
+            const defaults = PRODUCT_DEFAULTS[productType] ?? { width: 2, height: 2, depth: 2 };
 
             useFloorPlanStore.getState().addProduct({
                 type: 'product',
                 productType,
                 position: { x: e.point.x, y: 0, z: e.point.z },
                 rotation: 0,
-                width: w,
-                height: h,
-                depth: d
+                width: defaults.width,
+                height: defaults.height,
+                depth: defaults.depth
             });
 
             // Revert back to select tool so they can immediately drag it
@@ -119,7 +115,7 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
         if (!draggingNode || !localDragState.current) return;
 
         const state = localDragState.current;
-        const draggedElement = elements.find(el => el.id === state.wallId);
+        const draggedElement = elements.find(el => el.id === state.elementId);
         if (!draggedElement) return;
 
         if (draggedElement.type === 'wall') {
@@ -141,7 +137,7 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
                 window.dispatchEvent(groupEvent);
             } else {
                 // Snapping for endpoints
-                const newPoint = getSnappedPoint(e.point, state.wallId);
+                const newPoint = getSnappedPoint(e.point, state.elementId);
                 const newStart = state.node === 'start' ? newPoint : state.originalStart;
                 const newEnd = state.node === 'end' ? newPoint : state.originalEnd;
 
@@ -191,13 +187,13 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
         if (draggingNode && localDragState.current) {
             // Commit final position to Zustand
             const state = localDragState.current;
-            const wallId = state.wallId;
-            const element = elements.find(el => el.id === wallId);
+            const elementId = state.elementId;
+            const element = elements.find(el => el.id === elementId);
 
             if (element?.type === 'product') {
-                window.dispatchEvent(new CustomEvent(`commit-product-${wallId}`));
+                window.dispatchEvent(new CustomEvent(`commit-product-${elementId}`));
             } else if (state.node === 'center' || state.node === 'start' || state.node === 'end') {
-                window.dispatchEvent(new CustomEvent(`commit-wall-${wallId}`));
+                window.dispatchEvent(new CustomEvent(`commit-wall-${elementId}`));
             } else {
                 window.dispatchEvent(new CustomEvent(`commit-attachment`));
             }
@@ -209,18 +205,25 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
         <div className="w-full h-full bg-slate-50 relative">
             <Canvas
                 shadows
-                camera={{ position: is3DView ? [10, 10, 10] : [0, 20, 0], fov: 50 }}
                 onPointerUp={handlePointerUp}
                 onPointerLeave={handlePointerUp}
             >
                 <Suspense fallback={null}>
+                    {/* Cameras — orthographic for 2D, perspective for 3D */}
+                    {is3DView ? (
+                        <PerspectiveCamera makeDefault position={[10, 10, 10]} fov={50} />
+                    ) : (
+                        <OrthographicCamera makeDefault position={[0, 20, 0]} zoom={30} near={0.1} far={100} />
+                    )}
+
                     {/* Lighting */}
                     <ambientLight intensity={0.5} />
                     <directionalLight
                         castShadow
                         position={[10, 20, 10]}
                         intensity={1.5}
-                        shadow-mapSize={[1024, 1024]}
+                        shadow-mapSize={[2048, 2048]}
+                        shadow-bias={-0.001}
                     />
                     <Environment preset="city" />
 
@@ -245,9 +248,12 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
                         enablePan={true}
                         enableDamping={true}
                         dampingFactor={0.05}
-                        minDistance={2}
-                        maxDistance={50}
+                        minDistance={is3DView ? 2 : undefined}
+                        maxDistance={is3DView ? 50 : undefined}
+                        minZoom={is3DView ? undefined : 10}
+                        maxZoom={is3DView ? undefined : 100}
                         maxPolarAngle={is3DView ? Math.PI / 2 - 0.05 : 0} // Prevent looking completely from below in 3D, force top-down in 2D
+                        enableRotate={is3DView}
                     />
 
                     {/* Interactive Plane for drawing/clicking/dragging */}
@@ -257,11 +263,10 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
                         receiveShadow
                         onClick={handleGridClick}
                         onPointerMove={handlePointerMove}
-                        // If visible is false, it might not catch events in some R3F setups unless raycast is defined. Basic wireframe opacity 0 is safe.
                         visible={true}
                     >
                         <planeGeometry args={[100, 100]} />
-                        <meshBasicMaterial color="red" wireframe opacity={0} transparent />
+                        <meshBasicMaterial color="#000" wireframe opacity={0} transparent />
                     </mesh>
 
                     {/* Render Scene Elements */}
@@ -293,6 +298,8 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
                     )}
                 </Suspense>
             </Canvas>
+            {/* Loading indicator shown outside the canvas while 3D assets load */}
+            <Loader />
         </div>
     );
 }

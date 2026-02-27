@@ -2,7 +2,7 @@
 
 import { useFloorPlanStore, Wall as WallType } from "@/store/useFloorPlanStore";
 import { useCursor, Html } from "@react-three/drei";
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import * as THREE from "three";
 
 interface WallProps {
@@ -21,13 +21,7 @@ export default function WallComponent({ wall }: WallProps) {
     const lengthLabelRef = useRef<HTMLDivElement>(null);
     const localGeomRef = useRef<{ start: { x: number, y: number, z: number }, end: { x: number, y: number, z: number } }>({ start: wall.start, end: wall.end });
 
-    // Update local refs seamlessly when react props actually change
-    useEffect(() => {
-        localGeomRef.current = { start: wall.start, end: wall.end };
-        updateTransforms(wall.start, wall.end);
-    }, [wall.start, wall.end, wall.height, wall.thickness]);
-
-    const updateTransforms = (start: { x: number, y: number, z: number }, end: { x: number, y: number, z: number }) => {
+    const updateTransforms = useCallback((start: { x: number, y: number, z: number }, end: { x: number, y: number, z: number }) => {
         const dx = end.x - start.x;
         const dz = end.z - start.z;
         const length = Math.sqrt(dx * dx + dz * dz);
@@ -40,9 +34,6 @@ export default function WallComponent({ wall }: WallProps) {
         if (bodyRef.current) {
             bodyRef.current.position.set(mx, my, mz);
             bodyRef.current.rotation.y = angle;
-            // Note: box geometry args can't easily animate without instancing or scale tricks. We will just use scale on Z.
-            // boxGeometry args are [thickness, height, length]
-            // We can set base length to 1 and scale Z
             bodyRef.current.scale.z = length;
         }
 
@@ -57,7 +48,13 @@ export default function WallComponent({ wall }: WallProps) {
         if (endHandleRef.current) {
             endHandleRef.current.position.set(end.x, wall.height / 2, end.z);
         }
-    };
+    }, [wall.height]);
+
+    // Update local refs seamlessly when react props actually change
+    useEffect(() => {
+        localGeomRef.current = { start: wall.start, end: wall.end };
+        updateTransforms(wall.start, wall.end);
+    }, [wall.start, wall.end, wall.height, wall.thickness, updateTransforms]);
 
     useEffect(() => {
         const handleUpdate = (e: any) => {
@@ -77,7 +74,7 @@ export default function WallComponent({ wall }: WallProps) {
             window.removeEventListener(`update-wall-${wall.id}`, handleUpdate);
             window.removeEventListener(`commit-wall-${wall.id}`, handleCommit);
         };
-    }, [wall.id, wall.height]);
+    }, [wall.id, wall.height, updateTransforms, updateWall]);
 
     const isSelected = selectedElementId === wall.id;
 
@@ -119,7 +116,7 @@ export default function WallComponent({ wall }: WallProps) {
                         if (!isSelected) {
                             selectElement(wall.id);
                         }
-                        setDraggingNode({ wallId: wall.id, node: 'center' });
+                        setDraggingNode({ elementId: wall.id, node: 'center' });
                     }
                 }}
                 onPointerOver={(e) => {
@@ -139,7 +136,7 @@ export default function WallComponent({ wall }: WallProps) {
                 />
 
                 {/* Length Label Overlay (visible when selected or dragging) */}
-                {(isSelected || draggingNode?.wallId === wall.id) && (
+                {(isSelected || draggingNode?.elementId === wall.id) && (
                     // Positioned slightly above the wall center
                     <Html position={[0, (wall.height / 2) + 0.5, 0]} center zIndexRange={[100, 0]}>
                         <div
@@ -159,7 +156,7 @@ export default function WallComponent({ wall }: WallProps) {
                         ref={startHandleRef}
                         onPointerDown={(e) => {
                             e.stopPropagation();
-                            setDraggingNode({ wallId: wall.id, node: 'start' });
+                            setDraggingNode({ elementId: wall.id, node: 'start' });
                         }}
                     >
                         <cylinderGeometry args={[wall.thickness * 0.8, wall.thickness * 0.8, wall.height + 0.1]} />
@@ -169,7 +166,7 @@ export default function WallComponent({ wall }: WallProps) {
                         ref={endHandleRef}
                         onPointerDown={(e) => {
                             e.stopPropagation();
-                            setDraggingNode({ wallId: wall.id, node: 'end' });
+                            setDraggingNode({ elementId: wall.id, node: 'end' });
                         }}
                     >
                         <cylinderGeometry args={[wall.thickness * 0.8, wall.thickness * 0.8, wall.height + 0.1]} />

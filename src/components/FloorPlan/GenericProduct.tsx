@@ -1,7 +1,7 @@
 "use client";
 
 import { useFloorPlanStore, GenericProduct as ProductType } from "@/store/useFloorPlanStore";
-import { useCursor } from "@react-three/drei";
+import { useCursor, Html } from "@react-three/drei";
 import { useState, useRef, useEffect } from "react";
 import * as THREE from "three";
 
@@ -48,6 +48,12 @@ export default function GenericProductComponent({ product }: GenericProductProps
 
     const isSelected = selectedElementId === product.id;
 
+    const handleRotate = (direction: 'cw' | 'ccw') => {
+        const step = Math.PI / 4; // 45 degrees
+        const delta = direction === 'cw' ? step : -step;
+        useFloorPlanStore.getState().updateProduct(product.id, { rotation: product.rotation + delta });
+    };
+
     // Define colors based on product type
     let color = "#cbd5e1";
     if (product.productType === 'sofa') color = "#94a3b8"; // dark gray
@@ -71,8 +77,8 @@ export default function GenericProductComponent({ product }: GenericProductProps
                     if (!isSelected) {
                         selectElement(product.id);
                     }
-                    // RE-USE the DragNode pattern: we'll call the product ID "wallId" inside the store for dragging reference temporarily for speed
-                    setDraggingNode({ wallId: product.id, node: 'center' });
+                    // Use elementId to identify any draggable element in the store
+                    setDraggingNode({ elementId: product.id, node: 'center' });
                 }
             }}
             onPointerOver={(e) => {
@@ -155,12 +161,53 @@ export default function GenericProductComponent({ product }: GenericProductProps
                 )}
             </group>
 
-            {/* Selection Outline */}
+            {/* Selection Outline + Rotation Handles */}
             {isSelected && (
-                <mesh position={[0, product.height / 2, 0]}>
-                    <boxGeometry args={[product.width + 0.1, product.height + 0.1, product.depth + 0.1]} />
-                    <meshBasicMaterial color="#3b82f6" wireframe opacity={0.5} transparent />
-                </mesh>
+                <>
+                    <mesh position={[0, product.height / 2, 0]}>
+                        <boxGeometry args={[product.width + 0.1, product.height + 0.1, product.depth + 0.1]} />
+                        <meshBasicMaterial color="#3b82f6" wireframe opacity={0.5} transparent />
+                    </mesh>
+
+                    {/* Rotation Controls — floating above the product */}
+                    <Html
+                        position={[0, product.height + 1.2, 0]}
+                        center
+                        zIndexRange={[100, 0]}
+                        style={{ pointerEvents: 'auto' }}
+                    >
+                        <div
+                            className="flex items-center gap-1 select-none"
+                            onPointerDown={(e) => e.stopPropagation()}
+                        >
+                            <button
+                                onClick={(e) => { e.stopPropagation(); handleRotate('ccw'); }}
+                                className="w-8 h-8 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                title="Rotate left 45°"
+                            >
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M2.5 2v6h6" />
+                                    <path d="M2.5 8a10 10 0 0 1 17.13-4" />
+                                    <path d="M22 12a10 10 0 0 1-18.37 5.38" />
+                                </svg>
+                            </button>
+                            <div className="bg-black/75 text-white text-[10px] font-bold px-2 py-1 rounded-full whitespace-nowrap backdrop-blur-sm">
+                                {Math.round((product.rotation * 180 / Math.PI) % 360)}°
+                            </div>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); handleRotate('cw'); }}
+                                className="w-8 h-8 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                title="Rotate right 45°"
+                            >
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M21.5 2v6h-6" />
+                                    <path d="M21.5 8A10 10 0 0 0 4.37 4" />
+                                    <path d="M2 12a10 10 0 0 0 18.37 5.38" />
+                                </svg>
+                            </button>
+                        </div>
+                    </Html>
+                </>
             )}
         </group>
     );

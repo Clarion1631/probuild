@@ -98,15 +98,42 @@ export async function createDraftEstimate(projectId: string) {
 
 export async function createDraftFloorPlan(projectId: string) {
     const db = getDb();
+    ensureFloorPlanDataColumn(db);
     const floorPlanId = cuid();
 
     db.prepare(`
-        INSERT INTO FloorPlan (id, name, projectId, createdAt, updatedAt)
-        VALUES (?, ?, ?, ?, ?)
-    `).run(floorPlanId, "New Floor Plan", projectId, Date.now(), Date.now());
+        INSERT INTO FloorPlan (id, name, projectId, data, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `).run(floorPlanId, "New Floor Plan", projectId, null, Date.now(), Date.now());
 
     revalidatePath(`/projects/${projectId}/floor-plans`);
     return { id: floorPlanId };
+}
+
+export async function getFloorPlan(id: string) {
+    const db = getDb();
+    ensureFloorPlanDataColumn(db);
+    return db.prepare("SELECT * FROM FloorPlan WHERE id = ?").get(id) || null;
+}
+
+export async function saveFloorPlanData(id: string, projectId: string, data: string) {
+    const db = getDb();
+    ensureFloorPlanDataColumn(db);
+    db.prepare(`
+        UPDATE FloorPlan SET data = ?, updatedAt = ? WHERE id = ?
+    `).run(data, Date.now(), id);
+
+    revalidatePath(`/projects/${projectId}/floor-plans`);
+    return { success: true };
+}
+
+// Ensure the data column exists on FloorPlan (safe migration for existing DBs)
+function ensureFloorPlanDataColumn(db: any) {
+    try {
+        db.prepare("SELECT data FROM FloorPlan LIMIT 0").run();
+    } catch {
+        db.prepare("ALTER TABLE FloorPlan ADD COLUMN data TEXT").run();
+    }
 }
 
 export async function getEstimate(id: string) {

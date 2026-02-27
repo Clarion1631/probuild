@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useFloorPlanStore } from "@/store/useFloorPlanStore";
+import { getFloorPlan, saveFloorPlanData } from "@/lib/actions";
 
 import {
     BoxSelect,
@@ -13,7 +14,8 @@ import {
     Redo,
     Save,
     Share2,
-    ArrowLeft
+    ArrowLeft,
+    Loader2
 } from "lucide-react";
 import Canvas3D from "./Canvas3D";
 import Sidebar from "./Sidebar";
@@ -21,27 +23,77 @@ import { toast } from "sonner";
 
 interface FloorPlanEditorProps {
     floorPlanId: string;
+    projectId: string;
 }
 
-export default function FloorPlanEditor({ floorPlanId }: FloorPlanEditorProps) {
+export default function FloorPlanEditor({ floorPlanId, projectId }: FloorPlanEditorProps) {
     const router = useRouter();
     const [is3DView, setIs3DView] = useState(true);
-    const { activeTool, setActiveTool, selectedElementId, removeElement } = useFloorPlanStore();
+    const [isSaving, setIsSaving] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
+    const { activeTool, setActiveTool, selectedElementId, removeElement, undo, redo, loadElements, getSerializableState, past, future } = useFloorPlanStore();
 
+    // Load floor plan data on mount
+    useEffect(() => {
+        async function load() {
+            try {
+                const floorPlan = await getFloorPlan(floorPlanId);
+                if (floorPlan?.data) {
+                    const elements = JSON.parse(floorPlan.data);
+                    loadElements(elements);
+                }
+            } catch (err) {
+                console.error("Failed to load floor plan:", err);
+            } finally {
+                setIsLoading(false);
+            }
+        }
+        load();
+    }, [floorPlanId, loadElements]);
+
+    // Keyboard shortcuts
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
+            // Ignore if we're typing in an input field
+            if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') {
+                return;
+            }
+
             if ((e.key === 'Delete' || e.key === 'Backspace') && selectedElementId) {
-                // Ignore if we're typing in an input field
-                if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') {
-                    return;
-                }
                 removeElement(selectedElementId);
+            }
+
+            // Undo: Ctrl+Z / Cmd+Z
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+                e.preventDefault();
+                undo();
+            }
+
+            // Redo: Ctrl+Shift+Z / Cmd+Shift+Z or Ctrl+Y
+            if (((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'z') ||
+                ((e.ctrlKey || e.metaKey) && e.key === 'y')) {
+                e.preventDefault();
+                redo();
             }
         };
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedElementId, removeElement]);
+    }, [selectedElementId, removeElement, undo, redo]);
+
+    const handleSave = async () => {
+        setIsSaving(true);
+        try {
+            const data = getSerializableState();
+            await saveFloorPlanData(floorPlanId, projectId, data);
+            toast.success("Floor plan saved successfully!");
+        } catch (err) {
+            console.error("Failed to save floor plan:", err);
+            toast.error("Failed to save floor plan");
+        } finally {
+            setIsSaving(false);
+        }
+    };
 
     return (
         <div className="flex h-screen w-full bg-slate-50 overflow-hidden text-slate-900">
@@ -100,8 +152,22 @@ export default function FloorPlanEditor({ floorPlanId }: FloorPlanEditorProps) {
                             Draw Wall
                         </button>
                         <div className="h-4 w-px bg-slate-200 mx-2"></div>
-                        <button className="p-2 rounded-md text-slate-500 hover:bg-slate-50 hover:text-slate-900 transition"><Undo className="w-4 h-4" /></button>
-                        <button className="p-2 rounded-md text-slate-500 hover:bg-slate-50 hover:text-slate-900 transition"><Redo className="w-4 h-4" /></button>
+                        <button
+                            className={`p-2 rounded-md transition ${past.length === 0 ? 'text-slate-300 cursor-not-allowed' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'}`}
+                            onClick={undo}
+                            disabled={past.length === 0}
+                            title="Undo (Ctrl+Z)"
+                        >
+                            <Undo className="w-4 h-4" />
+                        </button>
+                        <button
+                            className={`p-2 rounded-md transition ${future.length === 0 ? 'text-slate-300 cursor-not-allowed' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'}`}
+                            onClick={redo}
+                            disabled={future.length === 0}
+                            title="Redo (Ctrl+Shift+Z)"
+                        >
+                            <Redo className="w-4 h-4" />
+                        </button>
                     </div>
 
                     {/* Actions */}
@@ -110,30 +176,40 @@ export default function FloorPlanEditor({ floorPlanId }: FloorPlanEditorProps) {
                             <Share2 className="w-4 h-4" /> Share
                         </button>
                         <button
-                            className="flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-slate-900 text-white hover:bg-slate-800 transition shadow-sm"
-                            onClick={() => {
-                                // Simulate saving to database
-                                toast.success("Floor plan saved successfully!");
-                            }}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-slate-900 text-white hover:bg-slate-800 transition shadow-sm disabled:opacity-50"
+                            onClick={handleSave}
+                            disabled={isSaving}
                         >
-                            <Save className="w-4 h-4" /> Save
+                            {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                            {isSaving ? 'Saving...' : 'Save'}
                         </button>
                     </div>
                 </header>
 
                 {/* 3D Canvas Context */}
                 <div className="flex-1 relative">
-                    <Canvas3D is3DView={is3DView} />
+                    {isLoading ? (
+                        <div className="flex items-center justify-center h-full">
+                            <div className="flex flex-col items-center gap-3 text-slate-400">
+                                <Loader2 className="w-8 h-8 animate-spin" />
+                                <span className="text-sm font-medium">Loading floor plan…</span>
+                            </div>
+                        </div>
+                    ) : (
+                        <Canvas3D is3DView={is3DView} />
+                    )}
 
                     {/* Floating UI overlays could go here (e.g. tooltips, coordinate displays) */}
-                    <div className="absolute bottom-4 left-4 right-4 flex justify-between pointer-events-none">
-                        <div className="bg-white/90 backdrop-blur pointer-events-auto px-3 py-1.5 rounded-full shadow-sm text-xs font-medium text-slate-500 border">
-                            {is3DView ? 'Perspective View' : 'Orthographic View'} • Drag to rotate/pan
+                    {!isLoading && (
+                        <div className="absolute bottom-4 left-4 right-4 flex justify-between pointer-events-none">
+                            <div className="bg-white/90 backdrop-blur pointer-events-auto px-3 py-1.5 rounded-full shadow-sm text-xs font-medium text-slate-500 border">
+                                {is3DView ? 'Perspective View' : 'Orthographic View'} • Drag to {is3DView ? 'rotate/pan' : 'pan'}
+                            </div>
+                            <div className="bg-white/90 backdrop-blur pointer-events-auto px-3 py-1.5 rounded-full shadow-sm text-xs font-medium text-slate-500 border flex items-center gap-2">
+                                <span>Grid: 1m</span>
+                            </div>
                         </div>
-                        <div className="bg-white/90 backdrop-blur pointer-events-auto px-3 py-1.5 rounded-full shadow-sm text-xs font-medium text-slate-500 border flex items-center gap-2">
-                            <span>Grid: 1m</span>
-                        </div>
-                    </div>
+                    )}
                 </div>
             </div>
 

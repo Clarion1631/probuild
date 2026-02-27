@@ -1,8 +1,8 @@
 "use client";
 
 import { useFloorPlanStore, WallAttachment, Wall } from "@/store/useFloorPlanStore";
-import { useCursor } from "@react-three/drei";
-import { useState, useRef, useEffect } from "react";
+import { useCursor, Html } from "@react-three/drei";
+import { useState, useRef, useEffect, useCallback } from "react";
 import * as THREE from "three";
 
 interface DoorWindowProps {
@@ -19,13 +19,7 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
 
     const isSelected = selectedElementId === attachment.id;
 
-    // Update local refs seamlessly when react props actually change
-    useEffect(() => {
-        localGeomRef.current = { distanceFromStart: attachment.distanceFromStart };
-        updateTransforms(attachment.distanceFromStart, attachment.isFlipped);
-    }, [attachment.distanceFromStart, parentWall, attachment.isFlipped]);
-
-    const updateTransforms = (dist: number, flipped: boolean = false) => {
+    const updateTransforms = useCallback((dist: number, flipped: boolean = false) => {
         const dx = parentWall.end.x - parentWall.start.x;
         const dz = parentWall.end.z - parentWall.start.z;
         const wallLength = Math.sqrt(dx * dx + dz * dz);
@@ -42,7 +36,13 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
             meshRef.current.position.set(posX, posY, posZ);
             meshRef.current.rotation.y = angle + (flipped ? Math.PI : 0);
         }
-    };
+    }, [parentWall, attachment.elevation, attachment.height]);
+
+    // Update local refs seamlessly when react props actually change
+    useEffect(() => {
+        localGeomRef.current = { distanceFromStart: attachment.distanceFromStart };
+        updateTransforms(attachment.distanceFromStart, attachment.isFlipped);
+    }, [attachment.distanceFromStart, parentWall, attachment.isFlipped, updateTransforms]);
 
     useEffect(() => {
         const handleUpdate = (e: any) => {
@@ -62,48 +62,81 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
             window.removeEventListener(`update-attachment-${attachment.id}`, handleUpdate);
             window.removeEventListener(`commit-attachment`, handleCommit);
         };
-    }, [attachment.id, parentWall]);
+    }, [attachment.id, parentWall, updateTransforms, updateAttachment]);
 
     const isDoor = attachment.type === 'door';
 
     // Slightly thicker than the wall to prevent Z-fighting and look like a frame/cutout
     const depth = parentWall.thickness * 1.1;
 
-    return (
-        <mesh
-            ref={meshRef}
-            castShadow
-            onClick={(e) => {
-                e.stopPropagation();
-                selectElement(attachment.id);
-            }}
-            onPointerDown={(e) => {
-                if (isSelected) {
-                    e.stopPropagation();
-                    setDraggingNode({ wallId: attachment.id, node: 'center' }); // wallId is actually elementId
-                }
-            }}
-            onPointerOver={(e) => {
-                e.stopPropagation();
-                setHovered(true);
-            }}
-            onPointerOut={() => setHovered(false)}
-        >
-            <boxGeometry args={[depth, attachment.height, attachment.width]} />
+    const handleFlip = () => {
+        updateAttachment(attachment.id, { isFlipped: !attachment.isFlipped });
+    };
 
-            <meshStandardMaterial
-                color={
-                    isSelected ? "#3b82f6"
-                        : hovered ? (isDoor ? "#8B4513" : "#87CEEB")
-                            : (isDoor ? "#A0522D" : "#ADD8E6")
-                }
-                transparent={!isDoor}
-                opacity={isDoor ? 1 : 0.6}
-                roughness={isDoor ? 0.7 : 0.1}
-                metalness={isDoor ? 0.1 : 0.8}
-                emissive={isSelected ? new THREE.Color("#3b82f6") : new THREE.Color("#000000")}
-                emissiveIntensity={isSelected ? 0.3 : 0}
-            />
-        </mesh>
+    return (
+        <group>
+            <mesh
+                ref={meshRef}
+                castShadow
+                onClick={(e) => {
+                    e.stopPropagation();
+                    selectElement(attachment.id);
+                }}
+                onPointerDown={(e) => {
+                    if (isSelected) {
+                        e.stopPropagation();
+                        setDraggingNode({ elementId: attachment.id, node: 'center' });
+                    }
+                }}
+                onPointerOver={(e) => {
+                    e.stopPropagation();
+                    setHovered(true);
+                }}
+                onPointerOut={() => setHovered(false)}
+            >
+                <boxGeometry args={[depth, attachment.height, attachment.width]} />
+
+                <meshStandardMaterial
+                    color={
+                        isSelected ? "#3b82f6"
+                            : hovered ? (isDoor ? "#8B4513" : "#87CEEB")
+                                : (isDoor ? "#A0522D" : "#ADD8E6")
+                    }
+                    transparent={!isDoor}
+                    opacity={isDoor ? 1 : 0.6}
+                    roughness={isDoor ? 0.7 : 0.1}
+                    metalness={isDoor ? 0.1 : 0.8}
+                    emissive={isSelected ? new THREE.Color("#3b82f6") : new THREE.Color("#000000")}
+                    emissiveIntensity={isSelected ? 0.3 : 0}
+                />
+
+                {/* Flip control — floating above the selected door/window */}
+                {isSelected && (
+                    <Html
+                        position={[0, (attachment.height / 2) + 0.8, 0]}
+                        center
+                        zIndexRange={[100, 0]}
+                        style={{ pointerEvents: 'auto' }}
+                    >
+                        <div
+                            className="flex items-center gap-1 select-none"
+                            onPointerDown={(e) => e.stopPropagation()}
+                        >
+                            <button
+                                onClick={(e) => { e.stopPropagation(); handleFlip(); }}
+                                className="h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center gap-1.5 px-2.5 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90 text-[11px] font-semibold whitespace-nowrap"
+                                title={`Flip ${isDoor ? 'door' : 'window'} direction`}
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M7 16V4l-4 4" />
+                                    <path d="M17 8v12l4-4" />
+                                </svg>
+                                Flip
+                            </button>
+                        </div>
+                    </Html>
+                )}
+            </mesh>
+        </group>
     );
 }
