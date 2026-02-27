@@ -110,7 +110,7 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
                     emissiveIntensity={isSelected ? 0.3 : 0}
                 />
 
-                {/* Flip control — floating above the selected door/window */}
+                {/* Controls — slide arrows + flip button */}
                 {isSelected && (
                     <Html
                         position={[0, (attachment.height / 2) + 0.8, 0]}
@@ -122,6 +122,17 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
                             className="flex items-center gap-1 select-none"
                             onPointerDown={(e) => e.stopPropagation()}
                         >
+                            {/* Slide left along wall */}
+                            <button
+                                onClick={(e) => { e.stopPropagation(); updateAttachment(attachment.id, { distanceFromStart: Math.max(0, attachment.distanceFromStart - 0.5) }); }}
+                                className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                title="Slide left along wall"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M19 12H5M12 5l-7 7 7 7" />
+                                </svg>
+                            </button>
+                            {/* Flip button */}
                             <button
                                 onClick={(e) => { e.stopPropagation(); handleFlip(); }}
                                 className="h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center gap-1.5 px-2.5 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90 text-[11px] font-semibold whitespace-nowrap"
@@ -132,6 +143,16 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
                                     <path d="M17 8v12l4-4" />
                                 </svg>
                                 Flip
+                            </button>
+                            {/* Slide right along wall */}
+                            <button
+                                onClick={(e) => { e.stopPropagation(); updateAttachment(attachment.id, { distanceFromStart: attachment.distanceFromStart + 0.5 }); }}
+                                className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                title="Slide right along wall"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M5 12h14M12 5l7 7-7 7" />
+                                </svg>
                             </button>
                         </div>
                     </Html>

@@ -42,11 +42,11 @@ export default function WallComponent({ wall }: WallProps) {
         }
 
         if (startHandleRef.current) {
-            startHandleRef.current.position.set(start.x, wall.height / 2, start.z);
+            startHandleRef.current.position.set(start.x, 0.3, start.z);
         }
 
         if (endHandleRef.current) {
-            endHandleRef.current.position.set(end.x, wall.height / 2, end.z);
+            endHandleRef.current.position.set(end.x, 0.3, end.z);
         }
     }, [wall.height]);
 
@@ -78,6 +78,14 @@ export default function WallComponent({ wall }: WallProps) {
 
     const isSelected = selectedElementId === wall.id;
 
+    const nudgeStep = 0.5;
+    const handleNudge = (dx: number, dz: number) => {
+        updateWall(wall.id, {
+            start: { x: wall.start.x + dx, y: wall.start.y, z: wall.start.z + dz },
+            end: { x: wall.end.x + dx, y: wall.end.y, z: wall.end.z + dz }
+        });
+    };
+
     return (
         <group ref={groupRef}>
             {/* The Wall Body */}
@@ -86,12 +94,11 @@ export default function WallComponent({ wall }: WallProps) {
                 castShadow
                 receiveShadow
                 onClick={(e) => {
-                    e.stopPropagation(); // Prevent grid click when clicking a wall
+                    e.stopPropagation();
 
                     if (activeTool === 'select') {
                         selectElement(wall.id);
                     } else if (activeTool === 'drawDoor' || activeTool === 'drawWindow') {
-                        // Calculate distance from start
                         const distFromStart = Math.sqrt(
                             Math.pow(e.point.x - wall.start.x, 2) + Math.pow(e.point.z - wall.start.z, 2)
                         );
@@ -100,19 +107,17 @@ export default function WallComponent({ wall }: WallProps) {
                             type: activeTool === 'drawDoor' ? 'door' : 'window',
                             wallId: wall.id,
                             distanceFromStart: distFromStart,
-                            width: activeTool === 'drawDoor' ? 3.0 : 4.0, // Default width
-                            height: activeTool === 'drawDoor' ? 6.8 : 4.0, // Default height
-                            elevation: activeTool === 'drawDoor' ? 0 : 3.0, // Default elevation (doors on floor, windows at 3ft)
+                            width: activeTool === 'drawDoor' ? 3.0 : 4.0,
+                            height: activeTool === 'drawDoor' ? 6.8 : 4.0,
+                            elevation: activeTool === 'drawDoor' ? 0 : 3.0,
                         });
 
-                        // Switch back to select tool so the user can easily move things
                         useFloorPlanStore.setState({ activeTool: 'select' });
                     }
                 }}
                 onPointerDown={(e) => {
                     if (activeTool === 'select') {
                         e.stopPropagation();
-                        // Select it immediately on mouse down if not already
                         if (!isSelected) {
                             selectElement(wall.id);
                         }
@@ -125,9 +130,7 @@ export default function WallComponent({ wall }: WallProps) {
                 }}
                 onPointerOut={() => setHovered(false)}
             >
-                {/* We use scale on Z to adjust length without modifying vertex array on every frame */}
                 <boxGeometry args={[wall.thickness, wall.height, 1]} />
-                {/* Visual feedback for selection / hover */}
                 <meshStandardMaterial
                     color={isSelected ? "#3b82f6" : hovered ? "#cbd5e1" : "#f1f5f9"}
                     roughness={0.8}
@@ -135,9 +138,8 @@ export default function WallComponent({ wall }: WallProps) {
                     emissiveIntensity={isSelected ? 0.2 : 0}
                 />
 
-                {/* Length Label Overlay (visible when selected or dragging) */}
+                {/* Length Label Overlay */}
                 {(isSelected || draggingNode?.elementId === wall.id) && (
-                    // Positioned slightly above the wall center
                     <Html position={[0, (wall.height / 2) + 0.5, 0]} center zIndexRange={[100, 0]}>
                         <div
                             ref={lengthLabelRef}
@@ -149,29 +151,115 @@ export default function WallComponent({ wall }: WallProps) {
                 )}
             </mesh>
 
-            {/* Drag Handles - Only show when selected */}
+            {/* Selection UI — only when selected */}
             {isSelected && (
                 <>
+                    {/* Wireframe outline around the wall */}
+                    <mesh
+                        position={[
+                            (wall.start.x + wall.end.x) / 2,
+                            wall.height / 2,
+                            (wall.start.z + wall.end.z) / 2
+                        ]}
+                        rotation={[0, Math.atan2(wall.end.x - wall.start.x, wall.end.z - wall.start.z), 0]}
+                    >
+                        <boxGeometry args={[
+                            wall.thickness + 0.15,
+                            wall.height + 0.15,
+                            Math.sqrt(Math.pow(wall.end.x - wall.start.x, 2) + Math.pow(wall.end.z - wall.start.z, 2)) + 0.15
+                        ]} />
+                        <meshBasicMaterial color="#3b82f6" wireframe opacity={0.4} transparent />
+                    </mesh>
+
+                    {/* Endpoint handles — small spheres at the base */}
                     <mesh
                         ref={startHandleRef}
+                        position={[wall.start.x, 0.3, wall.start.z]}
                         onPointerDown={(e) => {
                             e.stopPropagation();
                             setDraggingNode({ elementId: wall.id, node: 'start' });
                         }}
                     >
-                        <cylinderGeometry args={[wall.thickness * 0.8, wall.thickness * 0.8, wall.height + 0.1]} />
-                        <meshBasicMaterial color="red" opacity={0.5} transparent />
+                        <sphereGeometry args={[0.35, 16, 16]} />
+                        <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={0.4} />
                     </mesh>
                     <mesh
                         ref={endHandleRef}
+                        position={[wall.end.x, 0.3, wall.end.z]}
                         onPointerDown={(e) => {
                             e.stopPropagation();
                             setDraggingNode({ elementId: wall.id, node: 'end' });
                         }}
                     >
-                        <cylinderGeometry args={[wall.thickness * 0.8, wall.thickness * 0.8, wall.height + 0.1]} />
-                        <meshBasicMaterial color="red" opacity={0.5} transparent />
+                        <sphereGeometry args={[0.35, 16, 16]} />
+                        <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={0.4} />
                     </mesh>
+
+                    {/* Arrow Nudge Controls — floating above the wall center */}
+                    <Html
+                        position={[
+                            (wall.start.x + wall.end.x) / 2,
+                            wall.height + 1.5,
+                            (wall.start.z + wall.end.z) / 2
+                        ]}
+                        center
+                        zIndexRange={[100, 0]}
+                        style={{ pointerEvents: 'auto' }}
+                    >
+                        <div
+                            className="flex flex-col items-center gap-0.5 select-none"
+                            onPointerDown={(e) => e.stopPropagation()}
+                        >
+                            {/* Up arrow */}
+                            <button
+                                onClick={(e) => { e.stopPropagation(); handleNudge(0, -nudgeStep); }}
+                                className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                title="Move up"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M12 19V5M5 12l7-7 7 7" />
+                                </svg>
+                            </button>
+                            <div className="flex items-center gap-0.5">
+                                {/* Left arrow */}
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); handleNudge(-nudgeStep, 0); }}
+                                    className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                    title="Move left"
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M19 12H5M12 5l-7 7 7 7" />
+                                    </svg>
+                                </button>
+                                {/* Center label */}
+                                <div className="w-7 h-7 bg-black/75 rounded-full flex items-center justify-center">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M5 9l4-4 4 4M5 15l4 4 4-4" />
+                                    </svg>
+                                </div>
+                                {/* Right arrow */}
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); handleNudge(nudgeStep, 0); }}
+                                    className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                    title="Move right"
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M5 12h14M12 5l7 7-7 7" />
+                                    </svg>
+                                </button>
+                            </div>
+                            {/* Down arrow */}
+                            <button
+                                onClick={(e) => { e.stopPropagation(); handleNudge(0, nudgeStep); }}
+                                className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                title="Move down"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M12 5v14M5 12l7 7 7-7" />
+                                </svg>
+                            </button>
+                        </div>
+                    </Html>
                 </>
             )}
         </group>
