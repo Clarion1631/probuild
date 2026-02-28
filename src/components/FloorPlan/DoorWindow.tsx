@@ -110,29 +110,52 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
                     emissiveIntensity={isSelected ? 0.3 : 0}
                 />
 
-                {/* Controls — slide arrows + flip button */}
+                {/* Controls — 3D style slide arrows + flip button */}
                 {isSelected && (
-                    <Html
-                        position={[0, (attachment.height / 2) + 0.8, 0]}
-                        center
-                        zIndexRange={[100, 0]}
-                        style={{ pointerEvents: 'auto' }}
-                    >
-                        <div
-                            className="flex items-center gap-1 select-none"
-                            onPointerDown={(e) => e.stopPropagation()}
+                    <>
+                        {/* Slide Left Graphic Button */}
+                        <Html
+                            position={[-attachment.width / 2 - 0.6, attachment.height / 2, depth / 2 + 0.2]}
+                            center
+                            zIndexRange={[100, 0]}
+                            style={{ pointerEvents: 'auto' }}
                         >
-                            {/* Slide left along wall */}
                             <button
                                 onClick={(e) => { e.stopPropagation(); updateAttachment(attachment.id, { distanceFromStart: Math.max(0, attachment.distanceFromStart - 0.5) }); }}
-                                className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
-                                title="Slide left along wall"
+                                className="w-12 h-12 hover:scale-110 active:scale-95 transition-transform flex items-center justify-center filter drop-shadow-md cursor-pointer"
+                                title="Slide left"
                             >
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M19 12H5M12 5l-7 7 7 7" />
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="rgba(148, 163, 184, 0.85)" stroke="white" strokeWidth="1.5" strokeLinejoin="round">
+                                    <path d="M 12 4 L 3 12 L 12 20 L 12 15 L 21 15 L 21 9 L 12 9 Z" />
                                 </svg>
                             </button>
-                            {/* Flip button */}
+                        </Html>
+
+                        {/* Slide Right Graphic Button */}
+                        <Html
+                            position={[attachment.width / 2 + 0.6, attachment.height / 2, depth / 2 + 0.2]}
+                            center
+                            zIndexRange={[100, 0]}
+                            style={{ pointerEvents: 'auto' }}
+                        >
+                            <button
+                                onClick={(e) => { e.stopPropagation(); updateAttachment(attachment.id, { distanceFromStart: attachment.distanceFromStart + 0.5 }); }}
+                                className="w-12 h-12 hover:scale-110 active:scale-95 transition-transform flex items-center justify-center filter drop-shadow-md cursor-pointer"
+                                title="Slide right"
+                            >
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="rgba(148, 163, 184, 0.85)" stroke="white" strokeWidth="1.5" strokeLinejoin="round">
+                                    <path d="M 12 4 L 21 12 L 12 20 L 12 15 L 3 15 L 3 9 L 12 9 Z" />
+                                </svg>
+                            </button>
+                        </Html>
+
+                        {/* Flip control — stays floating above */}
+                        <Html
+                            position={[0, attachment.height + 0.8, 0]}
+                            center
+                            zIndexRange={[100, 0]}
+                            style={{ pointerEvents: 'auto' }}
+                        >
                             <button
                                 onClick={(e) => { e.stopPropagation(); handleFlip(); }}
                                 className="h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center gap-1.5 px-2.5 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90 text-[11px] font-semibold whitespace-nowrap"
@@ -144,18 +167,8 @@ export default function DoorWindow({ attachment, parentWall }: DoorWindowProps) 
                                 </svg>
                                 Flip
                             </button>
-                            {/* Slide right along wall */}
-                            <button
-                                onClick={(e) => { e.stopPropagation(); updateAttachment(attachment.id, { distanceFromStart: attachment.distanceFromStart + 0.5 }); }}
-                                className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
-                                title="Slide right along wall"
-                            >
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M5 12h14M12 5l7 7-7 7" />
-                                </svg>
-                            </button>
-                        </div>
-                    </Html>
+                        </Html>
+                    </>
                 )}
             </mesh>
         </group>

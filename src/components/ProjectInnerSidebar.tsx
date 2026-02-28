@@ -1,10 +1,60 @@
+"use client";
+
 import Link from "next/link";
+import { useState } from "react";
+import { usePathname } from "next/navigation";
 
 interface ProjectInnerSidebarProps {
     projectId: string;
 }
 
+type NavSection = {
+    id: string;
+    title: string;
+    items: { label: string; href: string }[];
+};
+
 export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarProps) {
+    const pathname = usePathname();
+    const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+
+    const navSections: NavSection[] = [
+        {
+            id: "planning",
+            title: "Planning",
+            items: [
+                { label: "Contracts", href: `/projects/${projectId}/contracts` },
+                { label: "Estimates", href: `/projects/${projectId}/estimates` },
+                { label: "Takeoffs", href: `/projects/${projectId}/takeoffs` },
+                { label: "3D Floor Plans", href: `/projects/${projectId}/floor-plans` },
+            ],
+        },
+        {
+            id: "management",
+            title: "Management",
+            items: [
+                { label: "Schedule", href: `/projects/${projectId}/schedule` },
+                { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
+                { label: "Daily Logs", href: `/projects/${projectId}/dailylogs` },
+            ],
+        },
+        {
+            id: "finance",
+            title: "Finance",
+            items: [
+                { label: "Invoices", href: `/projects/${projectId}/invoices` },
+                { label: "Change Orders", href: `/projects/${projectId}/changeorders` },
+            ],
+        },
+    ];
+
+    const toggleSection = (sectionId: string) => {
+        setCollapsedSections((prev) => ({
+            ...prev,
+            [sectionId]: !prev[sectionId],
+        }));
+    };
+
     return (
         <div className="w-56 bg-slate-50 border-r border-slate-200 flex flex-col min-h-full">
             <div className="p-4 border-b border-slate-200 bg-white">
@@ -13,50 +63,49 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
 
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
-                    <div className="mb-4">
-                        <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 px-3">Planning</h3>
-                        <ul className="space-y-1">
-                            <li>
-                                <Link href={`/projects/${projectId}/contracts`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Contracts</Link>
-                            </li>
-                            <li>
-                                <Link href={`/projects/${projectId}/estimates`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition font-medium bg-slate-200">Estimates</Link>
-                            </li>
-                            <li>
-                                <Link href={`/projects/${projectId}/takeoffs`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Takeoffs</Link>
-                            </li>
-                            <li>
-                                <Link href={`/projects/${projectId}/floor-plans`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">3D Floor Plans</Link>
-                            </li>
-                        </ul>
-                    </div>
+                    {navSections.map((section) => (
+                        <div key={section.id} className="mb-4">
+                            <button
+                                onClick={() => toggleSection(section.id)}
+                                className="w-full flex items-center justify-between text-left focus:outline-none px-3 mb-2 hover:bg-slate-100 rounded py-1 transition-colors"
+                            >
+                                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                                    {section.title}
+                                </h3>
+                                <svg
+                                    className={`w-4 h-4 text-slate-400 transition-transform ${collapsedSections[section.id] ? "rotate-180" : ""
+                                        }`}
+                                    fill="none"
+                                    stroke="currentColor"
+                                    viewBox="0 0 24 24"
+                                >
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+                                </svg>
+                            </button>
 
-                    <div className="mb-4">
-                        <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 px-3">Management</h3>
-                        <ul className="space-y-1">
-                            <li>
-                                <Link href={`/projects/${projectId}/schedule`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Schedule</Link>
-                            </li>
-                            <li>
-                                <Link href={`/projects/${projectId}/tasks`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Tasks & Punchlist</Link>
-                            </li>
-                            <li>
-                                <Link href={`/projects/${projectId}/dailylogs`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Daily Logs</Link>
-                            </li>
-                        </ul>
-                    </div>
-
-                    <div>
-                        <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 px-3">Finance</h3>
-                        <ul className="space-y-1">
-                            <li>
-                                <Link href={`/projects/${projectId}/invoices`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Invoices</Link>
-                            </li>
-                            <li>
-                                <Link href={`/projects/${projectId}/changeorders`} className="block px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-200 hover:text-slate-900 rounded transition">Change Orders</Link>
-                            </li>
-                        </ul>
-                    </div>
+                            {!collapsedSections[section.id] && (
+                                <ul className="space-y-1">
+                                    {section.items.map((item) => {
+                                        // A simple check if the current path includes the item's href
+                                        const isActive = pathname?.includes(item.href);
+                                        return (
+                                            <li key={item.label}>
+                                                <Link
+                                                    href={item.href}
+                                                    className={`block px-3 py-1.5 text-sm rounded transition ${isActive
+                                                            ? "bg-slate-200 text-slate-900 font-medium"
+                                                            : "text-slate-700 hover:bg-slate-200 hover:text-slate-900"
+                                                        }`}
+                                                >
+                                                    {item.label}
+                                                </Link>
+                                            </li>
+                                        );
+                                    })}
+                                </ul>
+                            )}
+                        </div>
+                    ))}
                 </div>
             </div>
         </div>

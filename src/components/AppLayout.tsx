@@ -27,6 +27,12 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
                 router.replace('/portal');
             }
         }
+        if (status === 'unauthenticated') {
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
+            if (!isPublicRoute) {
+                router.replace('/login');
+            }
+        }
     }, [status, role, pathname, router, session]);
 
     const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';

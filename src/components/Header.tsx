@@ -20,7 +20,7 @@ export default function Header() {
                             <img src={session.user.image} alt="User Avatar" className="w-8 h-8 rounded-full border border-slate-300" />
                         )}
                         <button
-                            onClick={() => signOut()}
+                            onClick={() => signOut({ callbackUrl: '/login' })}
                             className="text-sm font-medium text-red-600 hover:text-red-700 transition"
                         >
                             Sign out

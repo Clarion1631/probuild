@@ -169,22 +169,72 @@ export default function GenericProductComponent({ product }: GenericProductProps
                         <meshBasicMaterial color="#3b82f6" wireframe opacity={0.5} transparent />
                     </mesh>
 
-                    {/* Rotation + Nudge Controls — floating above the product */}
-                    <Html
-                        position={[0, product.height + 1.2, 0]}
-                        center
-                        zIndexRange={[100, 0]}
-                        style={{ pointerEvents: 'auto' }}
-                    >
-                        <div
-                            className="flex flex-col items-center gap-1 select-none"
-                            onPointerDown={(e) => e.stopPropagation()}
-                        >
-                            {/* Rotation row */}
-                            <div className="flex items-center gap-1">
+                    {/* 3D Circular Base Controls */}
+                    {isSelected && (
+                        <group position={[0, 0, 0]}>
+                            {/* Dark Ring on floor */}
+                            <mesh position={[0, 0.05, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                                <ringGeometry args={[Math.max(product.width, product.depth) / 2 + 0.2, Math.max(product.width, product.depth) / 2 + 0.8, 64]} />
+                                <meshBasicMaterial color="#334155" transparent opacity={0.6} side={THREE.DoubleSide} />
+                            </mesh>
+
+                            {/* Move Left Arrow */}
+                            <Html position={[-Math.max(product.width, product.depth) / 2 - 0.5, 0.1, 0]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, x: product.position.x - 0.5 } }); }}
+                                    className="w-8 h-8 hover:scale-110 active:scale-95 transition-transform flex items-center justify-center filter drop-shadow-md cursor-pointer"
+                                    title="Move left"
+                                >
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="rgba(148, 163, 184, 0.85)" stroke="white" strokeWidth="2" strokeLinejoin="round">
+                                        <path d="M 12 4 L 3 12 L 12 20 L 12 15 L 21 15 L 21 9 L 12 9 Z" />
+                                    </svg>
+                                </button>
+                            </Html>
+
+                            {/* Move Right Arrow */}
+                            <Html position={[Math.max(product.width, product.depth) / 2 + 0.5, 0.1, 0]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, x: product.position.x + 0.5 } }); }}
+                                    className="w-8 h-8 hover:scale-110 active:scale-95 transition-transform flex items-center justify-center filter drop-shadow-md cursor-pointer"
+                                    title="Move right"
+                                >
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="rgba(148, 163, 184, 0.85)" stroke="white" strokeWidth="2" strokeLinejoin="round">
+                                        <path d="M 12 4 L 21 12 L 12 20 L 12 15 L 3 15 L 3 9 L 12 9 Z" />
+                                    </svg>
+                                </button>
+                            </Html>
+
+                            {/* Move Forward Arrow */}
+                            <Html position={[0, 0.1, -Math.max(product.width, product.depth) / 2 - 0.5]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, z: product.position.z - 0.5 } }); }}
+                                    className="w-8 h-8 hover:scale-110 active:scale-95 transition-transform flex items-center justify-center filter drop-shadow-md cursor-pointer"
+                                    title="Move forward"
+                                >
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="rgba(148, 163, 184, 0.85)" stroke="white" strokeWidth="2" strokeLinejoin="round">
+                                        <path d="M 12 4 L 3 12 L 12 20 L 12 15 L 21 15 L 21 9 L 12 9 Z" transform="rotate(90 12 12)" />
+                                    </svg>
+                                </button>
+                            </Html>
+
+                            {/* Move Backward Arrow */}
+                            <Html position={[0, 0.1, Math.max(product.width, product.depth) / 2 + 0.5]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, z: product.position.z + 0.5 } }); }}
+                                    className="w-8 h-8 hover:scale-110 active:scale-95 transition-transform flex items-center justify-center filter drop-shadow-md cursor-pointer"
+                                    title="Move backward"
+                                >
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="rgba(148, 163, 184, 0.85)" stroke="white" strokeWidth="2" strokeLinejoin="round">
+                                        <path d="M 12 4 L 3 12 L 12 20 L 12 15 L 21 15 L 21 9 L 12 9 Z" transform="rotate(-90 12 12)" />
+                                    </svg>
+                                </button>
+                            </Html>
+
+                            {/* Rotate CCW */}
+                            <Html position={[-Math.max(product.width, product.depth) / 2 - 0.3, 0.1, Math.max(product.width, product.depth) / 2 + 0.3]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
                                 <button
                                     onClick={(e) => { e.stopPropagation(); handleRotate('ccw'); }}
-                                    className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                    className="w-8 h-8 bg-slate-700/80 rounded-full shadow-md border border-slate-500 flex items-center justify-center hover:bg-slate-600 transition-all text-white cursor-pointer active:scale-90"
                                     title="Rotate left 45°"
                                 >
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -193,12 +243,13 @@ export default function GenericProductComponent({ product }: GenericProductProps
                                         <path d="M22 12a10 10 0 0 1-18.37 5.38" />
                                     </svg>
                                 </button>
-                                <div className="bg-black/75 text-white text-[10px] font-bold px-2 py-1 rounded-full whitespace-nowrap backdrop-blur-sm">
-                                    {Math.round((product.rotation * 180 / Math.PI) % 360)}°
-                                </div>
+                            </Html>
+
+                            {/* Rotate CW */}
+                            <Html position={[Math.max(product.width, product.depth) / 2 + 0.3, 0.1, Math.max(product.width, product.depth) / 2 + 0.3]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
                                 <button
                                     onClick={(e) => { e.stopPropagation(); handleRotate('cw'); }}
-                                    className="w-7 h-7 bg-white rounded-full shadow-md border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-all text-slate-600 cursor-pointer active:scale-90"
+                                    className="w-8 h-8 bg-slate-700/80 rounded-full shadow-md border border-slate-500 flex items-center justify-center hover:bg-slate-600 transition-all text-white cursor-pointer active:scale-90"
                                     title="Rotate right 45°"
                                 >
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -207,45 +258,9 @@ export default function GenericProductComponent({ product }: GenericProductProps
                                         <path d="M2 12a10 10 0 0 0 18.37 5.38" />
                                     </svg>
                                 </button>
-                            </div>
-                            {/* Arrow nudge pad */}
-                            <div className="flex flex-col items-center gap-0.5">
-                                <button
-                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, z: product.position.z - 0.5 } }); }}
-                                    className="w-6 h-6 bg-white rounded-full shadow border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:text-blue-600 transition-all text-slate-500 cursor-pointer active:scale-90"
-                                    title="Nudge forward"
-                                >
-                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
-                                </button>
-                                <div className="flex items-center gap-0.5">
-                                    <button
-                                        onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, x: product.position.x - 0.5 } }); }}
-                                        className="w-6 h-6 bg-white rounded-full shadow border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:text-blue-600 transition-all text-slate-500 cursor-pointer active:scale-90"
-                                        title="Nudge left"
-                                    >
-                                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 5l-7 7 7 7" /></svg>
-                                    </button>
-                                    <div className="w-6 h-6 bg-slate-100 rounded-full border border-slate-200 flex items-center justify-center">
-                                        <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M5 9l4-4 4 4M5 15l4 4 4-4" /></svg>
-                                    </div>
-                                    <button
-                                        onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, x: product.position.x + 0.5 } }); }}
-                                        className="w-6 h-6 bg-white rounded-full shadow border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:text-blue-600 transition-all text-slate-500 cursor-pointer active:scale-90"
-                                        title="Nudge right"
-                                    >
-                                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
-                                    </button>
-                                </div>
-                                <button
-                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, z: product.position.z + 0.5 } }); }}
-                                    className="w-6 h-6 bg-white rounded-full shadow border border-slate-200 flex items-center justify-center hover:bg-blue-50 hover:text-blue-600 transition-all text-slate-500 cursor-pointer active:scale-90"
-                                    title="Nudge backward"
-                                >
-                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
-                                </button>
-                            </div>
-                        </div>
-                    </Html>
+                            </Html>
+                        </group>
+                    )}
                 </>
             )}
         </group>
