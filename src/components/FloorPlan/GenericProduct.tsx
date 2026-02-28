@@ -230,36 +230,91 @@ export default function GenericProductComponent({ product }: GenericProductProps
                                 </button>
                             </Html>
 
-                            {/* Rotate CCW */}
-                            <Html position={[-Math.max(product.width, product.depth) / 2 - 0.3, 0.1, Math.max(product.width, product.depth) / 2 + 0.3]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
-                                <button
-                                    onClick={(e) => { e.stopPropagation(); handleRotate('ccw'); }}
-                                    className="w-8 h-8 bg-slate-700/80 rounded-full shadow-md border border-slate-500 flex items-center justify-center hover:bg-slate-600 transition-all text-white cursor-pointer active:scale-90"
-                                    title="Rotate left 45°"
-                                >
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M2.5 2v6h6" />
-                                        <path d="M2.5 8a10 10 0 0 1 17.13-4" />
-                                        <path d="M22 12a10 10 0 0 1-18.37 5.38" />
-                                    </svg>
-                                </button>
-                            </Html>
+                            {/* Rotate Handles (Drag to Rotate) */}
+                            {/* CCW Corner Handle */}
+                            <mesh
+                                position={[-Math.max(product.width, product.depth) / 2 - 0.3, 0.1, Math.max(product.width, product.depth) / 2 + 0.3]}
+                                onPointerDown={(e) => {
+                                    e.stopPropagation();
+                                    useFloorPlanStore.getState().setDraggingNode({ elementId: product.id, node: 'rotate' });
+                                }}
+                            >
+                                <sphereGeometry args={[0.5, 16, 16]} />
+                                <meshBasicMaterial visible={false} />
+                                <Html center zIndexRange={[100, 0]} style={{ pointerEvents: 'none' }}>
+                                    <div className="w-8 h-8 bg-slate-700/80 rounded-full shadow-md border border-slate-500 flex items-center justify-center text-white cursor-grab active:cursor-grabbing backdrop-blur-sm">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M2.5 2v6h6" />
+                                            <path d="M2.5 8a10 10 0 0 1 17.13-4" />
+                                            <path d="M22 12a10 10 0 0 1-18.37 5.38" />
+                                        </svg>
+                                    </div>
+                                </Html>
+                            </mesh>
 
-                            {/* Rotate CW */}
-                            <Html position={[Math.max(product.width, product.depth) / 2 + 0.3, 0.1, Math.max(product.width, product.depth) / 2 + 0.3]} center zIndexRange={[100, 0]} style={{ pointerEvents: 'auto' }}>
-                                <button
-                                    onClick={(e) => { e.stopPropagation(); handleRotate('cw'); }}
-                                    className="w-8 h-8 bg-slate-700/80 rounded-full shadow-md border border-slate-500 flex items-center justify-center hover:bg-slate-600 transition-all text-white cursor-pointer active:scale-90"
-                                    title="Rotate right 45°"
-                                >
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M21.5 2v6h-6" />
-                                        <path d="M21.5 8A10 10 0 0 0 4.37 4" />
-                                        <path d="M2 12a10 10 0 0 0 18.37 5.38" />
-                                    </svg>
-                                </button>
-                            </Html>
+                            {/* CW Corner Handle */}
+                            <mesh
+                                position={[Math.max(product.width, product.depth) / 2 + 0.3, 0.1, Math.max(product.width, product.depth) / 2 + 0.3]}
+                                onPointerDown={(e) => {
+                                    e.stopPropagation();
+                                    useFloorPlanStore.getState().setDraggingNode({ elementId: product.id, node: 'rotate' });
+                                }}
+                            >
+                                <sphereGeometry args={[0.5, 16, 16]} />
+                                <meshBasicMaterial visible={false} />
+                                <Html center zIndexRange={[100, 0]} style={{ pointerEvents: 'none' }}>
+                                    <div className="w-8 h-8 bg-slate-700/80 rounded-full shadow-md border border-slate-500 flex items-center justify-center text-white cursor-grab active:cursor-grabbing backdrop-blur-sm">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M21.5 2v6h-6" />
+                                            <path d="M21.5 8A10 10 0 0 0 4.37 4" />
+                                            <path d="M2 12a10 10 0 0 0 18.37 5.38" />
+                                        </svg>
+                                    </div>
+                                </Html>
+                            </mesh>
                         </group>
+                    )}
+
+                    {/* Elevation Controls — floating high above product */}
+                    {isSelected && (
+                        <Html
+                            position={[0, product.height + 0.8 + (product.position.y || 0), 0]}
+                            center
+                            zIndexRange={[100, 0]}
+                            style={{ pointerEvents: 'auto' }}
+                        >
+                            <div className="flex flex-col items-center gap-1 bg-white/95 backdrop-blur-sm p-1.5 rounded-lg shadow-[0_4px_20px_rgba(0,0,0,0.15)] border border-slate-200 select-none" onPointerDown={(e) => e.stopPropagation()}>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, y: (product.position.y || 0) + 0.5 } }); }}
+                                    className="w-7 h-7 hover:bg-blue-50 hover:text-blue-600 rounded flex items-center justify-center text-slate-500 transition-colors"
+                                    title="Move Up"
+                                >
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
+                                </button>
+
+                                <div className="text-[11px] font-bold text-slate-600 px-1">
+                                    {((product.position.y || 0)).toFixed(1)}'
+                                </div>
+
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, y: Math.max(0, (product.position.y || 0) - 0.5) } }); }}
+                                    className={`w-7 h-7 rounded flex items-center justify-center transition-colors ${(product.position.y || 0) <= 0 ? 'text-slate-300 opacity-50 cursor-not-allowed' : 'hover:bg-blue-50 hover:text-blue-600 text-slate-500'}`}
+                                    title="Move Down"
+                                    disabled={(product.position.y || 0) <= 0}
+                                >
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
+                                </button>
+
+                                {(product.position.y || 0) > 0 && (
+                                    <button
+                                        onClick={(e) => { e.stopPropagation(); useFloorPlanStore.getState().updateProduct(product.id, { position: { ...product.position, y: 0 } }); }}
+                                        className="mt-1 px-3 py-1.5 w-full text-[10px] bg-slate-100 hover:bg-slate-200 active:bg-slate-300 rounded-md font-bold text-slate-600 uppercase tracking-bolder transition-colors"
+                                    >
+                                        Reground
+                                    </button>
+                                )}
+                            </div>
+                        </Html>
                     )}
                 </>
             )}

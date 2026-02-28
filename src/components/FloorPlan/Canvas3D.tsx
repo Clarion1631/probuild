@@ -19,7 +19,7 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
     // We use a local ref to track the "pending" position of dragged items without triggering React renders 60 times a second
     const localDragState = useRef<{
         elementId: string;
-        node: 'start' | 'end' | 'center';
+        node: 'start' | 'end' | 'center' | 'rotate';
         startHoverPoint: THREE.Vector3 | null;
         originalStart: { x: number, y: number, z: number };
         originalEnd: { x: number, y: number, z: number };
@@ -169,17 +169,37 @@ export default function Canvas3D({ is3DView }: Canvas3DProps) {
                 }
             }
         } else if (draggedElement.type === 'product') {
-            if (!state.startHoverPoint) {
-                state.startHoverPoint = e.point.clone();
+            const product = draggedElement as ProductType;
+            if (state.node === 'rotate') {
+                // Calculate rotation based on center of product to pointer
+                const dx = e.point.x - product.position.x;
+                const dz = e.point.z - product.position.z;
+
+                // Keep the rotation smooth, atan2 works well here
+                let angle = Math.atan2(dx, dz);
+
+                // Optional: Snap to 45 deg if shift keys are down, otherwise free rotate.
+                // We'll just free-rotate for now to match intuitive dragging.
+
+                const groupEvent = new CustomEvent(`update-product-${draggedElement.id}`, { detail: { rotation: angle } });
+                window.dispatchEvent(groupEvent);
+            } else {
+                // Standard center translation dragging
+                if (!state.startHoverPoint) {
+                    state.startHoverPoint = e.point.clone();
+                }
+
+                const dx = e.point.x - state.startHoverPoint.x;
+                const dz = e.point.z - state.startHoverPoint.z;
+
+                // Preserve existing elevation/Y value
+                const y = product.position.y ?? 0;
+
+                const newPos = { x: state.originalStart.x + dx, y: y, z: state.originalStart.z + dz };
+
+                const groupEvent = new CustomEvent(`update-product-${draggedElement.id}`, { detail: { position: newPos } });
+                window.dispatchEvent(groupEvent);
             }
-
-            const dx = e.point.x - state.startHoverPoint.x;
-            const dz = e.point.z - state.startHoverPoint.z;
-
-            const newPos = { x: state.originalStart.x + dx, y: 0, z: state.originalStart.z + dz };
-
-            const groupEvent = new CustomEvent(`update-product-${draggedElement.id}`, { detail: { position: newPos } });
-            window.dispatchEvent(groupEvent);
         }
     };
 

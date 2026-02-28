@@ -95,8 +95,8 @@ export interface FloorPlanState {
     setDraftWallStart: (point: Point3D | null) => void;
 
     // Dragging State
-    draggingNode: { elementId: string; node: 'start' | 'end' | 'center' } | null;
-    setDraggingNode: (node: { elementId: string; node: 'start' | 'end' | 'center' } | null) => void;
+    draggingNode: { elementId: string; node: 'start' | 'end' | 'center' | 'rotate' } | null;
+    setDraggingNode: (node: { elementId: string; node: 'start' | 'end' | 'center' | 'rotate' } | null) => void;
 }
 
 // Helper to push current elements onto the past stack
