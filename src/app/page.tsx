@@ -8,16 +8,14 @@ export default async function Dashboard() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-slate-800">Welcome, Golden Touch Remodeling</h1>
-        <p className="text-slate-500">Manage your projects and finances with ease.</p>
-      </div>
-
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-xl font-bold text-slate-800">All Projects ({projects.length})</h1>
+        <div>
+          <h1 className="text-2xl font-bold text-slate-800">Golden Touch Remodeling</h1>
+          <p className="text-slate-500 text-sm">Project Overview Dashboard</p>
+        </div>
         <div className="flex items-center gap-3">
-          <button className="bg-white border border-slate-300 px-3 py-1.5 rounded text-sm font-medium hover:bg-slate-50 transition">Import with Zapier</button>
-          <button className="bg-slate-900 text-white px-4 py-1.5 rounded text-sm font-medium shadow-sm hover:bg-slate-800 transition">Create Project</button>
+          <button className="bg-white border border-slate-300 px-3 py-1.5 rounded text-sm font-medium hover:bg-slate-50 transition">Import</button>
+          <button className="bg-[#00732e] text-white px-4 py-1.5 rounded text-sm font-medium shadow-sm hover:bg-[#005a24] transition">Create Project</button>
         </div>
       </div>
 
