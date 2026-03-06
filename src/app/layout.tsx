@@ -17,8 +17,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Golden Touch Remodeling | Probuild",
-  description: "Premium Remodeling Management",
+  title: "Golden Touch Remodeling | Pro",
+  description: "High-end remodeling project management",
 };
 
 export default async function RootLayout({
