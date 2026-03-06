@@ -13,37 +13,37 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                 <div className="absolute left-20 top-0 w-64 bg-slate-50 min-h-screen shadow-xl border-r border-slate-200 text-slate-800 flex flex-col z-40">
                     <div className="p-4 border-b border-slate-200 bg-white">
                         <h2 className="font-bold text-lg mb-4">Search</h2>
-                        <input type="text" placeholder="Search Houzz Pro" className="w-full border border-slate-300 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-slate-400" />
+                        <input type="text" placeholder="Search Projects" className="w-full border border-slate-300 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-slate-400" />
                     </div>
                     <div className="flex-1 overflow-y-auto w-full p-4 space-y-6">
                         <div>
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Planning</h3>
                             <ul className="space-y-2 text-sm">
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Contracts</Link></li>
-                                <li><Link href="/projects/all/estimates" className="hover:text-blue-600 block transition">All Estimates</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Takeoffs</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All 3D Floor Plans</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Mood Boards</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Selection Boards</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Selections Tracker</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Bids</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Contracts</Link></li>
+                                <li><Link href="/projects/all/estimates" className="hover:text-[#00732e] block transition">All Estimates</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Takeoffs</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All 3D Floor Plans</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Mood Boards</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Selection Boards</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Selections Tracker</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Bids</Link></li>
                             </ul>
                         </div>
                         <div>
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
                             <ul className="space-y-2 text-sm">
-                                <li><Link href="#" className="hover:text-blue-600 block transition">Task Center</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">Schedule Overview</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Daily Logs</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">Time & Expenses</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">Task Center</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">Schedule Overview</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Daily Logs</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">Time & Expenses</Link></li>
                             </ul>
                         </div>
                         <div>
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Finance</h3>
                             <ul className="space-y-2 text-sm">
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Invoices</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Purchase Orders</Link></li>
-                                <li><Link href="#" className="hover:text-blue-600 block transition">All Change Orders</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Invoices</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Purchase Orders</Link></li>
+                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Change Orders</Link></li>
                             </ul>
                         </div>
                     </div>
@@ -58,8 +58,8 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                             <img src={logoUrl} alt="Company Logo" className="w-full h-full object-contain" />
                         </div>
                     ) : (
-                        <div className="w-10 h-10 bg-amber-500 rounded-md flex items-center justify-center font-bold text-xl hover:bg-amber-600 transition">
-                            GT
+                        <div className="w-10 h-10 bg-[#00732e] rounded-md flex items-center justify-center font-bold text-xl hover:bg-[#005a24] transition">
+                            G
                         </div>
                     )}
                 </Link>
@@ -68,7 +68,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
             <nav className="flex-1 w-full space-y-2 flex flex-col items-center">
                 <button
                     onClick={() => setIsSearchOpen(!isSearchOpen)}
-                    className={`flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] transition ${isSearchOpen ? 'text-blue-400 bg-[#2a2a2a]' : 'text-slate-400'}`}
+                    className={`flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] transition ${isSearchOpen ? 'text-white bg-[#2a2a2a]' : 'text-slate-400'}`}
                 >
                     <svg className="w-5 h-5 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
                     <span className="text-[10px] uppercase font-semibold">Search</span>
@@ -105,7 +105,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
             </nav>
 
             <div className="w-full flex flex-col items-center space-y-2 mt-auto">
-                <Link href="#" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-blue-400 transition">
+                <Link href="#" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-green-400 transition">
                     <svg className="w-5 h-5 mb-1" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M11.3 1.046A12.014 12.014 0 0010 1C5.029 1 1 5.029 1 10c0 4.97 4.029 9 9 9 1.488 0 2.89-.358 4.148-1.006A7.472 7.472 0 0114.5 15C14.5 9.773 18.23 5.372 23 4.296A12.062 12.062 0 0011.3 1.046zM20.5 4a6.5 6.5 0 11-13 0 6.5 6.5 0 0113 0z" clipRule="evenodd" /></svg>
                     <span className="text-[10px] uppercase font-semibold">Upgrade</span>
                 </Link>
