@@ -58,8 +58,8 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                             <img src={logoUrl} alt="Company Logo" className="w-full h-full object-contain" />
                         </div>
                     ) : (
-                        <div className="w-10 h-10 bg-green-500 rounded-md flex items-center justify-center font-bold text-xl hover:bg-green-600 transition">
-                            h
+                        <div className="w-10 h-10 bg-amber-500 rounded-md flex items-center justify-center font-bold text-xl hover:bg-amber-600 transition">
+                            GT
                         </div>
                     )}
                 </Link>
