@@ -12,6 +12,25 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     const { data: session, status } = useSession();
     const role = (session?.user as any)?.role;
 
+    // DEVELOPMENT ONLY: Authentication bypass for local testing
+    if (process.env.NODE_ENV === 'development' && !session) {
+        // Mock a session object for development
+        const mockSession = {
+            user: {
+                email: 'gtrsupport@goldentouchremodeling.com',
+                name: 'Test User',
+                image: '', // Optional: provide a mock image URL
+                role: 'ADMIN', // Assign ADMIN role for full access
+            },
+            expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours from now
+        };
+        // This is a hack to simulate a logged-in state without actually setting cookies
+        // In a real app, you might use a local storage flag or similar for more robust mocking
+        // For the purpose of this task, we'll just short-circuit the unauthenticated check below.
+        Object.defineProperty(session, 'data', { value: mockSession, writable: true });
+        Object.defineProperty(session, 'status', { value: 'authenticated', writable: true });
+    }
+
     useEffect(() => {
         if (status === 'authenticated') {
             const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
@@ -27,7 +46,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
                 router.replace('/portal');
             }
         }
-        if (status === 'unauthenticated') {
+        if (status === 'unauthenticated' && process.env.NODE_ENV !== 'development') { // Bypass only if NOT in development
             const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
             if (!isPublicRoute) {
                 router.replace('/login');
