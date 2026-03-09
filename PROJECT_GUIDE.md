@@ -131,7 +131,7 @@ Metric summary cards at top → data table below.
 
 ### Active Features — IN PROGRESS (Phase 2 Core)
 - [ ] Leads CRM (Pipeline list, Lead details, status tracking)
-- [ ] Projects Hub (Project list, deep dive dashboard)
+- [x] Projects Hub (Project list, deep dive dashboard)
 - [ ] Estimates (Project-scoped, line-item calculator, builder)
 - [ ] Invoices (Project-scoped, generation from estimates, payment tracking)
 

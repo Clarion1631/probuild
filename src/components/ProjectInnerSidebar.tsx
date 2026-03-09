@@ -20,6 +20,13 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
 
     const navSections: NavSection[] = [
         {
+            id: "overview",
+            title: "Overview",
+            items: [
+                { label: "Dashboard", href: `/projects/${projectId}` },
+            ],
+        },
+        {
             id: "planning",
             title: "Planning",
             items: [

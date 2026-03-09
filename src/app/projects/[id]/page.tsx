@@ -1,10 +1,11 @@
-export default function ProjectDashboardPage({ params }: { params: { id: string } }) {
+export default async function ProjectDashboardPage({ params }: { params: Promise<{ id: string }> }) {
+    const { id } = await params;
     return (
         <div className="max-w-6xl mx-auto space-y-6">
             <div className="flex items-center justify-between">
                 <div>
                     <h1 className="text-2xl font-bold text-hui-textMain">Project Overview</h1>
-                    <p className="text-hui-textMuted text-sm mt-1">Project ID: {params.id}</p>
+                    <p className="text-hui-textMuted text-sm mt-1">Project ID: {id}</p>
                 </div>
                 <div className="flex space-x-3">
                     <button className="hui-btn hui-btn-secondary">Edit Details</button>

@@ -172,19 +172,19 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
         <div className="p-8 space-y-8 animate-in fade-in duration-300">
             {/* Header Setup */}
             <div className="flex justify-between items-center">
-                <h2 className="text-2xl font-bold text-slate-800">Job Costing & Expenses</h2>
+                <h2 className="text-2xl font-bold text-hui-textMain">Job Costing & Expenses</h2>
                 <div className="flex items-center gap-3">
                     <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
                     <button
                         onClick={() => fileInputRef.current?.click()}
-                        className="px-4 py-2 bg-blue-600 text-white rounded shadow text-sm font-medium hover:bg-blue-700 transition flex items-center gap-2"
+                        className="hui-btn hui-btn-primary flex items-center gap-2"
                     >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" /></svg>
                         Upload AI Receipt
                     </button>
                     <button
                         onClick={() => setShowModal(true)}
-                        className="px-4 py-2 bg-white text-slate-700 border border-slate-300 rounded shadow-sm text-sm font-medium hover:bg-slate-50 transition"
+                        className="hui-btn hui-btn-secondary"
                     >
                         Add Manual
                     </button>
@@ -194,13 +194,13 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             {/* Variance Overview */}
             <div className="space-y-4">
                 <div className="grid grid-cols-3 gap-6">
-                    <div className="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
-                        <p className="text-sm font-medium text-slate-500 mb-1">Total Budget</p>
-                        <p className="text-3xl font-bold text-slate-900">${totalBudget.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                    <div className="bg-white p-6 rounded-lg shadow-sm border border-hui-border">
+                        <p className="text-sm font-medium text-hui-textMuted mb-1">Total Budget</p>
+                        <p className="text-3xl font-bold text-hui-textMain">${totalBudget.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                     </div>
-                    <div className="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
-                        <p className="text-sm font-medium text-slate-500 mb-1">Actual Cost</p>
-                        <p className="text-3xl font-bold text-slate-900">${totalActual.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                    <div className="bg-white p-6 rounded-lg shadow-sm border border-hui-border">
+                        <p className="text-sm font-medium text-hui-textMuted mb-1">Actual Cost</p>
+                        <p className="text-3xl font-bold text-hui-textMain">${totalActual.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                     </div>
                     <div className={`p-6 rounded-lg shadow-sm border ${totalVariance >= 0 ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"}`}>
                         <p className={`text-sm font-medium mb-1 ${totalVariance >= 0 ? "text-green-700" : "text-red-700"}`}>Variance</p>
@@ -211,10 +211,10 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                 </div>
 
                 {/* Visual Snapshot Graph */}
-                <div className="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                <div className="bg-white p-6 rounded-lg shadow-sm border border-hui-border">
                     <div className="flex justify-between items-end mb-2">
-                        <h3 className="font-semibold text-slate-800">Budget Utilization Snapshot</h3>
-                        <span className="text-sm font-medium text-slate-500">{budgetUtilization.toFixed(1)}% Used</span>
+                        <h3 className="font-semibold text-hui-textMain">Budget Utilization Snapshot</h3>
+                        <span className="text-sm font-medium text-hui-textMuted">{budgetUtilization.toFixed(1)}% Used</span>
                     </div>
                     <div className="w-full bg-slate-100 rounded-full h-4 relative overflow-hidden ring-1 ring-inset ring-slate-200">
                         <div
@@ -233,9 +233,9 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             </div>
 
             {/* Breakdowns */}
-            <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50">
-                    <h3 className="font-semibold text-slate-800">Cost Breakdown by Phase</h3>
+            <div className="bg-white rounded-lg shadow-sm border border-hui-border overflow-hidden">
+                <div className="px-6 py-4 border-b border-hui-border bg-slate-50/50">
+                    <h3 className="font-semibold text-hui-textMain">Cost Breakdown by Phase</h3>
                 </div>
                 <div className="divide-y divide-slate-100">
                     {varianceByItem.map((item: any) => (
@@ -264,12 +264,12 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             </div>
 
             {/* List of Recent Expenses */}
-            <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden mt-8">
-                <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50">
-                    <h3 className="font-semibold text-slate-800">Expense Log</h3>
+            <div className="bg-white rounded-lg shadow-sm border border-hui-border overflow-hidden mt-8">
+                <div className="px-6 py-4 border-b border-hui-border bg-slate-50/50">
+                    <h3 className="font-semibold text-hui-textMain">Expense Log</h3>
                 </div>
                 {expenses.length === 0 ? (
-                    <div className="p-8 text-center text-slate-500">No expenses recorded yet.</div>
+                    <div className="p-8 text-center text-hui-textMuted">No expenses recorded yet.</div>
                 ) : (
                     <div className="divide-y divide-slate-100">
                         {expenses.map((expense, idx) => {
@@ -312,10 +312,10 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             {/* Receipt Modal */}
             {showModal && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-                    <div className="bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+                    <div className="bg-white rounded-xl shadow-xl border border-hui-border w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
                         <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-                            <h3 className="font-bold text-lg text-slate-800">{editingExpenseId ? "Edit Expense" : "Add Expense"}</h3>
-                            <button onClick={() => { setShowModal(false); resetForm(); }} className="text-slate-400 hover:text-slate-600">
+                            <h3 className="font-bold text-lg text-hui-textMain">{editingExpenseId ? "Edit Expense" : "Add Expense"}</h3>
+                            <button onClick={() => { setShowModal(false); resetForm(); }} className="text-hui-textMuted hover:text-hui-textMain">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                             </button>
                         </div>
@@ -381,8 +381,8 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                             )}
                         </div>
                         <div className="px-6 py-4 border-t border-slate-100 flex justify-end gap-3 bg-slate-50 mt-auto">
-                            <button onClick={() => { setShowModal(false); resetForm(); }} className="px-4 py-2 text-slate-600 font-medium hover:bg-slate-200 rounded transition text-sm">Cancel</button>
-                            <button disabled={isUploading} onClick={handleSaveExpense} className="px-4 py-2 bg-slate-900 text-white font-medium hover:bg-slate-800 rounded shadow-sm disabled:opacity-50 transition text-sm">
+                            <button onClick={() => { setShowModal(false); resetForm(); }} className="hui-btn hui-btn-secondary">Cancel</button>
+                            <button disabled={isUploading} onClick={handleSaveExpense} className="hui-btn hui-btn-primary disabled:opacity-50">
                                 Save Expense
                             </button>
                         </div>
