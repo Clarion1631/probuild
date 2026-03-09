@@ -9,13 +9,13 @@ import { useEffect } from "react";
 export default function AppLayout({ children, logoUrl }: { children: React.ReactNode, logoUrl?: string }) {
     const pathname = usePathname();
     const router = useRouter();
-    const { data: session, status } = useSession();
-    const role = (session?.user as any)?.role;
+    let { data: session, status } = useSession();
+    let role = (session?.user as any)?.role;
 
     // DEVELOPMENT ONLY: Authentication bypass for local testing
     if (process.env.NODE_ENV === 'development' && !session) {
         // Mock a session object for development
-        const mockSession = {
+        session = {
             user: {
                 email: 'gtrsupport@goldentouchremodeling.com',
                 name: 'Test User',
@@ -23,12 +23,9 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
                 role: 'ADMIN', // Assign ADMIN role for full access
             },
             expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours from now
-        };
-        // This is a hack to simulate a logged-in state without actually setting cookies
-        // In a real app, you might use a local storage flag or similar for more robust mocking
-        // For the purpose of this task, we'll just short-circuit the unauthenticated check below.
-        Object.defineProperty(session, 'data', { value: mockSession, writable: true });
-        Object.defineProperty(session, 'status', { value: 'authenticated', writable: true });
+        } as any;
+        status = 'authenticated';
+        role = 'ADMIN';
     }
 
     useEffect(() => {

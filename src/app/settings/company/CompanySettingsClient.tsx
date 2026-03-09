@@ -43,9 +43,10 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
 
                 {/* Basic Info */}
                 <div>
-                    <h2 className="text-lg font-bold text-hui-textMain mb-4 border-b border-hui-border pb-2">Company Name & Contact</h2>
-                    <div className="space-y-4">
-                        <div className="relative pt-2">
+                    <h2 className="text-lg font-bold text-hui-textMain mb-6 border-b border-hui-border pb-2">Company Name & Contact</h2>
+                    <p className="text-sm text-hui-textMuted mb-6">Manage your company's profile information. This data will be used on estimates, invoices, and the customer portal.</p>
+                    <div className="space-y-6">
+                        <div className="relative">
                             <input
                                 required
                                 id="companyName"
@@ -54,14 +55,14 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.companyName}
                                 onChange={handleChange}
                                 placeholder="Company Name"
-                                className="hui-input peer w-full placeholder-transparent pt-4 pb-1"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
                             />
-                            <label htmlFor="companyName" className="absolute left-3 top-2 text-xs text-hui-textMuted transition-all peer-placeholder-shown:text-base peer-placeholder-shown:top-3.5 peer-focus:top-2 peer-focus:text-xs pointer-events-none">
+                            <label htmlFor="companyName" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Company Name *
                             </label>
                         </div>
 
-                        <div className="relative pt-2">
+                        <div className="relative">
                             <textarea
                                 id="address"
                                 name="address"
@@ -69,14 +70,14 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 onChange={handleChange}
                                 rows={2}
                                 placeholder="Address"
-                                className="hui-input peer w-full placeholder-transparent pt-4 pb-1"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
                             />
-                            <label htmlFor="address" className="absolute left-3 top-2 text-xs text-hui-textMuted transition-all peer-placeholder-shown:text-base peer-placeholder-shown:top-3.5 peer-focus:top-2 peer-focus:text-xs pointer-events-none">
+                            <label htmlFor="address" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Address
                             </label>
                         </div>
 
-                        <div className="relative pt-2">
+                        <div className="relative">
                             <input
                                 id="phone"
                                 type="tel"
@@ -84,14 +85,14 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.phone}
                                 onChange={handleChange}
                                 placeholder="Public Phone"
-                                className="hui-input peer w-full placeholder-transparent pt-4 pb-1"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
                             />
-                            <label htmlFor="phone" className="absolute left-3 top-2 text-xs text-hui-textMuted transition-all peer-placeholder-shown:text-base peer-placeholder-shown:top-3.5 peer-focus:top-2 peer-focus:text-xs pointer-events-none">
+                            <label htmlFor="phone" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Public Phone
                             </label>
                         </div>
 
-                        <div className="relative pt-2">
+                        <div className="relative">
                             <input
                                 id="email"
                                 type="email"
@@ -99,14 +100,14 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.email}
                                 onChange={handleChange}
                                 placeholder="Public Email"
-                                className="hui-input peer w-full placeholder-transparent pt-4 pb-1"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
                             />
-                            <label htmlFor="email" className="absolute left-3 top-2 text-xs text-hui-textMuted transition-all peer-placeholder-shown:text-base peer-placeholder-shown:top-3.5 peer-focus:top-2 peer-focus:text-xs pointer-events-none">
+                            <label htmlFor="email" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Public Email
                             </label>
                         </div>
 
-                        <div className="relative pt-2">
+                        <div className="relative">
                             <input
                                 id="website"
                                 type="url"
@@ -114,9 +115,9 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.website}
                                 onChange={handleChange}
                                 placeholder="Website URL"
-                                className="hui-input peer w-full placeholder-transparent pt-4 pb-1"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
                             />
-                            <label htmlFor="website" className="absolute left-3 top-2 text-xs text-hui-textMuted transition-all peer-placeholder-shown:text-base peer-placeholder-shown:top-3.5 peer-focus:top-2 peer-focus:text-xs pointer-events-none">
+                            <label htmlFor="website" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Website URL
                             </label>
                         </div>
@@ -155,12 +156,42 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                     </div>
                 </div>
 
+                {/* Company Details */}
+                <div>
+                    <h2 className="text-lg font-bold text-hui-textMain mb-6 border-b border-hui-border pb-2">Company Details</h2>
+                    <div className="space-y-6">
+                        <div className="relative">
+                            <input
+                                id="bidLimit"
+                                type="text"
+                                placeholder="Bid Limit"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
+                            />
+                            <label htmlFor="bidLimit" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
+                                Bid Limit
+                            </label>
+                        </div>
+
+                        <div className="relative">
+                            <input
+                                id="licenseNumber"
+                                type="text"
+                                placeholder="License Number"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
+                            />
+                            <label htmlFor="licenseNumber" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
+                                License Number
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
                 {/* Notifications */}
                 <div>
-                    <h2 className="text-lg font-bold text-hui-textMain mb-4 border-b border-hui-border pb-2">Internal Notifications</h2>
-                    <div className="space-y-4">
+                    <h2 className="text-lg font-bold text-hui-textMain mb-6 border-b border-hui-border pb-2">Internal Notifications</h2>
+                    <div className="space-y-6">
                         <p className="text-xs text-hui-textMuted mb-2">This email will receive alerts when a client views or signs an estimate.</p>
-                        <div className="relative pt-2">
+                        <div className="relative">
                             <input
                                 id="notificationEmail"
                                 type="email"
@@ -168,9 +199,9 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.notificationEmail}
                                 onChange={handleChange}
                                 placeholder="System Notification Email"
-                                className="hui-input peer w-full placeholder-transparent pt-4 pb-1"
+                                className="hui-input peer w-full placeholder-transparent bg-white"
                             />
-                            <label htmlFor="notificationEmail" className="absolute left-3 top-2 text-xs text-hui-textMuted transition-all peer-placeholder-shown:text-base peer-placeholder-shown:top-3.5 peer-focus:top-2 peer-focus:text-xs pointer-events-none">
+                            <label htmlFor="notificationEmail" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 System Notification Email
                             </label>
                         </div>
