@@ -55,7 +55,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.companyName}
                                 onChange={handleChange}
                                 placeholder="Company Name"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="companyName" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Company Name *
@@ -70,7 +70,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 onChange={handleChange}
                                 rows={2}
                                 placeholder="Address"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="address" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Address
@@ -85,7 +85,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.phone}
                                 onChange={handleChange}
                                 placeholder="Public Phone"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="phone" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Public Phone
@@ -100,7 +100,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.email}
                                 onChange={handleChange}
                                 placeholder="Public Email"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="email" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Public Email
@@ -115,7 +115,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 value={formData.website}
                                 onChange={handleChange}
                                 placeholder="Website URL"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="website" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Website URL
@@ -165,7 +165,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 id="bidLimit"
                                 type="text"
                                 placeholder="Bid Limit"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="bidLimit" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 Bid Limit
@@ -177,7 +177,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 id="licenseNumber"
                                 type="text"
                                 placeholder="License Number"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="licenseNumber" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 License Number
@@ -198,8 +198,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                 name="notificationEmail"
                                 value={formData.notificationEmail}
                                 onChange={handleChange}
-                                placeholder="System Notification Email"
-                                className="hui-input peer w-full placeholder-transparent bg-white"
+                                className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
                             <label htmlFor="notificationEmail" className="absolute left-3 -top-2 bg-white px-1 text-xs text-hui-textMuted transition-all peer-placeholder-shown:top-2 peer-placeholder-shown:text-sm peer-focus:-top-2 peer-focus:text-xs pointer-events-none">
                                 System Notification Email
