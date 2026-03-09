@@ -14,10 +14,10 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
     }
 
     return (
-        <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden bg-slate-50">
+        <div className="flex h-[calc(100vh-64px)] -m-6 overflow-hidden bg-hui-background">
 
             {/* Lead Primary Context Column */}
-            <div className="flex-1 flex flex-col border-r border-slate-200 bg-white">
+            <div className="flex-1 flex flex-col border-r border-hui-border bg-white">
                 <div className="p-6 border-b border-hui-border flex items-center justify-between">
                     <div className="flex items-center gap-4">
                         <Avatar name={lead.client.name} color="blue" />
@@ -31,14 +31,14 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 </div>
 
                 {/* Lead Messaging Flow Mock */}
-                <div className="flex-1 overflow-auto p-6 bg-slate-50">
+                <div className="flex-1 overflow-auto p-6 bg-hui-background">
                     <div className="hui-card p-6 mb-6">
                         <div className="flex gap-4">
                             <Avatar name={lead.client.name} color="blue" />
                             <div>
                                 <strong className="text-sm text-hui-textMain block mb-1">Contact Name: {lead.client.name}</strong>
                                 <p className="text-xs text-hui-textMuted mb-4">Project Location: {lead.location}</p>
-                                <p className="text-sm text-slate-700 leading-relaxed bg-slate-50 p-4 rounded border border-slate-100">
+                                <p className="text-sm text-hui-textMain leading-relaxed bg-hui-background p-4 rounded border border-hui-border">
                                     Hi there, <br /><br />
                                     I have a piece of land where I would like to build a new home, and I also have another property where I'm planning a full house remodel. I'm interested in scheduling a consultation to discuss both projects.
                                 </p>
@@ -58,19 +58,19 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 <div className="p-6 border-b border-hui-border">
                     <h3 className="font-semibold text-hui-textMain text-sm mb-4 flex justify-between">Client Details <span className="text-hui-primary font-normal cursor-pointer text-xs">Edit</span></h3>
                     <div className="space-y-3 text-sm">
-                        <div className="flex justify-between"><span className="text-slate-500">Name</span><span className="text-slate-800 font-medium">{lead.client.name}</span></div>
-                        <div className="flex justify-between"><span className="text-slate-500">Email</span><span className="text-slate-800">{lead.client.email || "N/A"}</span></div>
-                        <div className="flex justify-between"><span className="text-slate-500">Phone</span><span className="text-slate-800">N/A</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Name</span><span className="text-hui-textMain font-medium">{lead.client.name}</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Email</span><span className="text-hui-textMain">{lead.client.email || "N/A"}</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Phone</span><span className="text-hui-textMain">N/A</span></div>
                     </div>
                 </div>
 
                 <div className="p-6 border-b border-hui-border">
                     <h3 className="font-semibold text-hui-textMain text-sm mb-4">Lead Details</h3>
                     <div className="space-y-3 text-sm">
-                        <div className="flex justify-between"><span className="text-slate-500">Lead Stage</span><span className="font-medium text-slate-800">{lead.stage}</span></div>
-                        <div className="flex justify-between"><span className="text-slate-500">Lead Source</span><span className="text-slate-800">{lead.source}</span></div>
-                        <div className="flex justify-between"><span className="text-slate-500">Expected Start Date</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
-                        <div className="flex justify-between"><span className="text-slate-500">Target Revenue</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Lead Stage</span><span className="font-medium text-hui-textMain">{lead.stage}</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Lead Source</span><span className="text-hui-textMain">{lead.source}</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Expected Start Date</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
+                        <div className="flex justify-between"><span className="text-hui-textMuted">Target Revenue</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
                     </div>
                 </div>
 
@@ -78,9 +78,9 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 <div className="p-6">
                     <h3 className="font-semibold text-hui-textMain text-sm mb-4">Financials & Planning</h3>
                     <ul className="space-y-2 text-sm">
-                        <li><a href="#" className="flex justify-between items-center text-slate-600 hover:text-blue-600 py-1 transition"><span>Estimates</span><span className="bg-slate-100 text-xs px-2 rounded-full border border-slate-200">{lead.estimates.length}</span></a></li>
-                        <li><a href="#" className="flex justify-between items-center text-slate-600 hover:text-blue-600 py-1 transition"><span>Takeoffs</span><span className="bg-slate-100 text-xs px-2 rounded-full border border-slate-200">0</span></a></li>
-                        <li><a href="#" className="flex justify-between items-center text-slate-600 hover:text-blue-600 py-1 transition"><span>Contracts</span><span className="bg-slate-100 text-xs px-2 rounded-full border border-slate-200">0</span></a></li>
+                        <li><a href="#" className="flex justify-between items-center text-hui-textMuted hover:text-blue-600 py-1 transition"><span>Estimates</span><span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">{lead.estimates.length}</span></a></li>
+                        <li><a href="#" className="flex justify-between items-center text-hui-textMuted hover:text-blue-600 py-1 transition"><span>Takeoffs</span><span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">0</span></a></li>
+                        <li><a href="#" className="flex justify-between items-center text-hui-textMuted hover:text-blue-600 py-1 transition"><span>Contracts</span><span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">0</span></a></li>
                     </ul>
                 </div>
 

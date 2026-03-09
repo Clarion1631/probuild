@@ -213,6 +213,20 @@ export async function getEstimateForPortal(id: string) {
     };
 }
 
+export async function getAllEstimates() {
+    return await prisma.estimate.findMany({
+        orderBy: { createdAt: "desc" },
+        include: {
+            project: {
+                include: { client: true }
+            },
+            lead: {
+                include: { client: true }
+            }
+        }
+    });
+}
+
 export async function markEstimateViewed(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },

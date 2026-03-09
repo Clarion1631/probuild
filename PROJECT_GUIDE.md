@@ -129,16 +129,15 @@ Metric summary cards at top → data table below.
 - [x] Dashboard widget layout
 - [x] Authentication (NextAuth, Google OAuth)
 
-### Active Features — IN PROGRESS
-- [ ] HUI alignment pass across all existing pages
-- [ ] Projects list page (dense data table)
-- [ ] Leads list page (with secondary sidebar stages)
-- [ ] Clients management (CRUD + modal)
-- [ ] Estimates (project-scoped, CRUD, line items)
-- [ ] Invoices (project-scoped, from estimates)
-- [ ] Time & Expenses (tabbed layout, logging table)
+### Active Features — IN PROGRESS (Phase 2 Core)
+- [ ] Leads CRM (Pipeline list, Lead details, status tracking)
+- [ ] Projects Hub (Project list, deep dive dashboard)
+- [ ] Estimates (Project-scoped, line-item calculator, builder)
+- [ ] Invoices (Project-scoped, generation from estimates, payment tracking)
 
-### Planned Features — NOT STARTED
+### Planned Features — NOT STARTED (Phase 3 Addons)
+- [ ] Clients management (CRUD + modal)
+- [ ] Time & Expenses (tabbed layout, logging table)
 - [ ] Contracts
 - [ ] Takeoffs
 - [ ] 3D Floor Plans

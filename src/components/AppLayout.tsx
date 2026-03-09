@@ -53,11 +53,11 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
 
     if (status === 'authenticated' && !role && !isPublicRoute) {
-        return <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500">Signing out...</div>;
+        return <div className="min-h-screen bg-hui-background flex items-center justify-center text-slate-500">Signing out...</div>;
     }
 
     if (role === 'CLIENT' && !isPublicRoute) {
-        return <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500">Redirecting to Portal...</div>;
+        return <div className="min-h-screen bg-hui-background flex items-center justify-center text-slate-500">Redirecting to Portal...</div>;
     }
 
     if (isPublicRoute) {
@@ -65,7 +65,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     }
 
     return (
-        <div className="flex min-h-screen h-full bg-slate-50">
+        <div className="flex min-h-screen h-full bg-hui-background">
             <Sidebar />
             <div className="flex-1 flex flex-col overflow-hidden">
                 <Header />
