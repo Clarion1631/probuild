@@ -1,0 +1,1 @@
+We are only using Vercel. Do not test or use local development anymore unless strictly necessary or requested. Always push changes to GitHub for Vercel deployment when testing functionality instead of instructing the user to run the app locally.

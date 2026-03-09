@@ -1,0 +1,16 @@
+Sure — here it is in clean plain text:
+Houzz Pro is a cloud-based web application, not a standalone desktop 3D engine like Unity or Unreal. The software runs primarily in your browser and mobile app using a modern web technology stack.
+The front end (what you see and interact with) is likely built using React, a JavaScript framework. The backend (servers and business logic) likely runs on technologies such as Node.js, Java, Python, and PHP. It uses APIs (often GraphQL), databases like MySQL, caching systems like Redis, and is hosted on cloud infrastructure such as AWS with containerization (Kubernetes).
+The 3D floor planning and rendering features most likely use WebGL, which is the standard technology for rendering 3D graphics in web browsers. Many web-based 3D apps use libraries like Three.js on top of WebGL to handle rendering, lighting, materials, and interaction. Houzz does not publicly state the exact 3D library it uses, but it is almost certainly WebGL-based.
+For mobile scanning and augmented reality features, Houzz Pro integrates with native device capabilities. On iOS devices, it uses Apple’s RoomPlan API and LiDAR sensors (on supported devices) to scan rooms and capture dimensions. That geometry data is then processed and rendered inside the Houzz Pro environment.
+The AI features (such as 2D-to-3D conversion, automatic rendering enhancements, and design suggestions) are likely handled by cloud-based machine learning services running on backend servers rather than inside your browser.
+All of this integrates directly into the project management side of Houzz Pro. The 3D models connect to estimates, proposals, selections, client portals, and scheduling tools through the same backend system.
+In short, under the hood Houzz Pro likely uses:
+React for the user interface
+WebGL (possibly via Three.js or a similar library) for 3D rendering
+Node.js/Java/Python/PHP for backend services
+MySQL and Redis for data storage
+AWS and Kubernetes for cloud hosting
+Apple RoomPlan and LiDAR for mobile scanning
+Cloud-based AI services for automation features
+If you’re asking because you’re thinking about building your own Houzz Pro-style app, I can break down what stack I’d recommend for you specifically.

@@ -1,0 +1,63 @@
+﻿node.exe : Loaded Prisma config from 
+prisma.config.ts.
+At line:1 char:1
++ & "C:\Program 
+Files\nodejs/node.exe" "C:\Program 
+Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpe 
+   cified: (Loaded Prisma c...isma.  
+  config.ts.:String) [], RemoteExc   
+ eption
+    + FullyQualifiedErrorId : Native 
+   CommandError
+ 
+
+Prisma schema loaded from 
+prisma\schema.prisma.
+
+Error: Prisma schema validation - 
+(validate wasm)
+Error code: P1012
+[1;91merror[0m: [1mError 
+validating field `invoices` in model 
+`Estimate`: The relation field 
+`invoices` on model `Estimate` is 
+missing an opposite relation field 
+on the model `Invoice`. Either run 
+`prisma format` or add it 
+manually.[0m
+  [1;94m-->[0m  
+[4mprisma\schema.prisma:63[0m
+[1;94m   | [0m
+[1;94m62 | [0m  project     
+Project?   @relation(fields: 
+[projectId], references: [id])
+[1;94m63 | [0m  [1;91minvoices    
+Invoice[][0m
+[1;94m64 | [0m  leadId      String?
+[1;94m   | [0m
+[1;91merror[0m: [1mError 
+validating field `project` in model 
+`Invoice`: The relation field 
+`project` on model `Invoice` is 
+missing an opposite relation field 
+on the model `Project`. Either run 
+`prisma format` or add it 
+manually.[0m
+  [1;94m-->[0m  
+[4mprisma\schema.prisma:97[0m
+[1;94m   | [0m
+[1;94m96 | [0m  projectId   String
+[1;94m97 | [0m  [1;91mproject     
+Project  @relation(fields: 
+[projectId], references: [id], 
+onDelete: Cascade)[0m
+[1;94m98 | [0m  clientId    String
+[1;94m   | [0m
+
+Validation Error Count: 2
+[Context: validate]
+
+Prisma CLI Version : 7.4.1
