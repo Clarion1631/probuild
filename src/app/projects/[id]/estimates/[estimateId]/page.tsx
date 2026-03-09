@@ -19,7 +19,17 @@ export default async function EstimatePage({ params }: { params: Promise<{ id: s
             <ProjectInnerSidebar projectId={resolvedParams.id} />
 
             <div className="flex-1 overflow-auto bg-slate-50">
-                <EstimateEditor project={project} initialEstimate={estimate} />
+                <EstimateEditor
+                    context={{
+                        type: "project",
+                        id: project.id,
+                        name: project.name,
+                        clientName: project.client.name,
+                        clientEmail: project.client.email || undefined,
+                        location: project.location || undefined
+                    }}
+                    initialEstimate={estimate}
+                />
             </div>
         </div>
     );

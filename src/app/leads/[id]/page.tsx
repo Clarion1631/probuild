@@ -1,5 +1,5 @@
 import Avatar from "@/components/Avatar";
-import { getLead, convertLeadToProject } from "@/lib/actions";
+import { getLead, convertLeadToProject, createDraftLeadEstimate } from "@/lib/actions";
 import { redirect } from "next/navigation";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -78,7 +78,21 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 <div className="p-6">
                     <h3 className="font-semibold text-hui-textMain text-sm mb-4">Financials & Planning</h3>
                     <ul className="space-y-2 text-sm">
-                        <li><a href="#" className="flex justify-between items-center text-hui-textMuted hover:text-blue-600 py-1 transition"><span>Estimates</span><span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">{lead.estimates.length}</span></a></li>
+                        <li>
+                            <div className="flex justify-between items-center py-1">
+                                <a href="#" className="text-hui-textMuted hover:text-blue-600 transition"><span>Estimates</span></a>
+                                <div className="flex items-center gap-2">
+                                    <span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">{lead.estimates.length}</span>
+                                    <form action={async () => {
+                                        "use server";
+                                        const est = await createDraftLeadEstimate(lead.id);
+                                        redirect(`/leads/${lead.id}/estimates/${est.id}`);
+                                    }}>
+                                        <button className="text-blue-600 hover:text-blue-800 text-xs font-medium px-2 py-0.5 rounded border border-blue-200 bg-blue-50">+ Create</button>
+                                    </form>
+                                </div>
+                            </div>
+                        </li>
                         <li><a href="#" className="flex justify-between items-center text-hui-textMuted hover:text-blue-600 py-1 transition"><span>Takeoffs</span><span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">0</span></a></li>
                         <li><a href="#" className="flex justify-between items-center text-hui-textMuted hover:text-blue-600 py-1 transition"><span>Contracts</span><span className="bg-hui-background text-xs px-2 rounded-full border border-hui-border">0</span></a></li>
                     </ul>

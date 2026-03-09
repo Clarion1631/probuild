@@ -176,6 +176,25 @@ export async function createDraftEstimate(projectId: string) {
     return { id: estimate.id };
 }
 
+export async function createDraftLeadEstimate(leadId: string) {
+    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const estimate = await prisma.estimate.create({
+        data: {
+            title: "Draft Estimate",
+            leadId,
+            code,
+            status: "Draft",
+            totalAmount: 0,
+            balanceDue: 0,
+            privacy: "Shared",
+        },
+    });
+
+    revalidatePath(`/leads/${leadId}`);
+    return { id: estimate.id };
+}
+
 export async function createDraftFloorPlan(projectId: string) {
     const floorPlan = await prisma.floorPlan.create({
         data: {
@@ -335,7 +354,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     return { success: true };
 }
 
-export async function saveEstimate(estimateId: string, projectId: string, data: any, items: any[]) {
+export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
     // Update estimate
     await prisma.estimate.update({
         where: { id: estimateId },
@@ -388,15 +407,20 @@ export async function saveEstimate(estimateId: string, projectId: string, data: 
         });
     }
 
-    if (data.status === 'Approved') {
+    if (data.status === 'Approved' && contextType === 'project') {
         const existingBudget = await prisma.budget.findUnique({ where: { estimateId } });
         if (!existingBudget) {
-            await generateBudgetForEstimate(estimateId, projectId);
+            await generateBudgetForEstimate(estimateId, contextId);
         }
     }
 
-    revalidatePath(`/projects/${projectId}/estimates`);
-    revalidatePath(`/projects/${projectId}/estimates/${estimateId}`);
+    if (contextType === "project") {
+        revalidatePath(`/projects/${contextId}/estimates`);
+        revalidatePath(`/projects/${contextId}/estimates/${estimateId}`);
+    } else {
+        revalidatePath(`/leads/${contextId}`);
+        revalidatePath(`/leads/${contextId}/estimates/${estimateId}`);
+    }
     return { success: true };
 }
 
@@ -585,7 +609,7 @@ export async function saveCompanySettings(data: any) {
 export async function deleteEstimate(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        select: { projectId: true },
+        select: { projectId: true, leadId: true },
     });
     if (!estimate) return { success: false, error: "Estimate not found" };
 
@@ -604,6 +628,8 @@ export async function deleteEstimate(estimateId: string) {
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
+    } else if (estimate.leadId) {
+        revalidatePath(`/leads/${estimate.leadId}`);
     } else {
         revalidatePath("/projects/all/estimates");
     }

@@ -7,7 +7,7 @@ import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
 import { toast } from "sonner";
 
-export default function EstimateEditor({ project, initialEstimate }: { project: any, initialEstimate: any }) {
+export default function EstimateEditor({ context, initialEstimate }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -38,7 +38,7 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
             order: index
         }));
 
-        await saveEstimate(initialEstimate.id, project.id, {
+        await saveEstimate(initialEstimate.id, context.id, context.type, {
             title, code, status, totalAmount: total, paymentSchedules: mappedSchedules
         }, mappedItems);
         setIsSaving(false);
@@ -53,7 +53,7 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
             const res = await createInvoiceFromEstimate(initialEstimate.id);
             if (res.id) {
                 toast.success("Invoice drafted from this estimate.");
-                router.push(`/projects/${project.id}/invoices/${res.id}`);
+                router.push(`/projects/${context.id}/invoices/${res.id}`);
             }
         } catch (e: any) {
             toast.error(e.message || "Failed to create invoice.");
@@ -68,7 +68,11 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
         try {
             await deleteEstimate(initialEstimate.id);
             toast.success("Estimate deleted");
-            router.push(`/projects/${project.id}/estimates`);
+            if (context.type === "project") {
+                router.push(`/projects/${context.id}/estimates`);
+            } else {
+                router.push(`/leads/${context.id}`);
+            }
         } catch (error) {
             toast.error("Failed to delete estimate");
         } finally {
@@ -154,8 +158,14 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
             {/* Top Navigation / Action Bar */}
             <div className="bg-white border-b border-hui-border px-6 py-4 flex items-center justify-between shadow-sm z-10 sticky top-0">
                 <div className="flex items-center gap-4">
-                    <button onClick={() => router.push(`/projects/${project.id}/estimates`)} className="text-hui-textMuted hover:text-hui-textMain transition text-sm flex items-center gap-1">
-                        ← Back to Estimates
+                    <button onClick={() => {
+                        if (context.type === "project") {
+                            router.push(`/projects/${context.id}/estimates`);
+                        } else {
+                            router.push(`/leads/${context.id}`);
+                        }
+                    }} className="text-hui-textMuted hover:text-hui-textMain transition text-sm flex items-center gap-1">
+                        ← Back to {context.type === "project" ? "Estimates" : "Lead"}
                     </button>
                     <div className="h-4 w-px bg-hui-border"></div>
                     <span className="text-sm font-medium text-hui-textMain">{code}</span>
@@ -199,13 +209,15 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
                     >
                         Download PDF
                     </a>
-                    <button
-                        onClick={handleCreateInvoice}
-                        disabled={isCreatingInvoice}
-                        className="hui-btn hui-btn-secondary disabled:opacity-50"
-                    >
-                        {isCreatingInvoice ? "Creating..." : "Create Invoice"}
-                    </button>
+                    {context.type === "project" && (
+                        <button
+                            onClick={handleCreateInvoice}
+                            disabled={isCreatingInvoice}
+                            className="hui-btn hui-btn-secondary disabled:opacity-50"
+                        >
+                            {isCreatingInvoice ? "Creating..." : "Create Invoice"}
+                        </button>
+                    )}
                     <button
                         onClick={handleSave}
                         disabled={isSaving}
@@ -232,9 +244,9 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
                             <div className="flex gap-12 text-sm">
                                 <div>
                                     <p className="text-hui-textMuted mb-1">To</p>
-                                    <p className="font-medium text-hui-textMain">{project.client?.name}</p>
-                                    <p className="text-hui-textMuted">{project.client?.email || "No email provided"}</p>
-                                    <p className="text-hui-textMuted">{project.location}</p>
+                                    <p className="font-medium text-hui-textMain">{context.clientName}</p>
+                                    <p className="text-hui-textMuted">{context.clientEmail || "No email provided"}</p>
+                                    <p className="text-hui-textMuted">{context.location}</p>
                                 </div>
                                 <div>
                                     <p className="text-hui-textMuted mb-1">Estimate Details</p>
@@ -443,7 +455,7 @@ export default function EstimateEditor({ project, initialEstimate }: { project: 
                 )}
                 {activeTab === "expenses" && (
                     <div className="w-full max-w-5xl bg-white border border-hui-border rounded-lg shadow-sm">
-                        <ExpensesTab estimateId={initialEstimate.id} projectId={project.id} items={items} />
+                        <ExpensesTab estimateId={initialEstimate.id} projectId={context.type === "project" ? context.id : ""} items={items} />
                     </div>
                 )}
             </div>
