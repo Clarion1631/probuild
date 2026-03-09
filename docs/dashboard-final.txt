@@ -1,0 +1,16 @@
+│
+◇  Doctor warnings ────────────────────────────────────────────────────────╮
+│                                                                          │
+│  - channels.telegram.groupPolicy is "allowlist" but groupAllowFrom (and  │
+│    allowFrom) is empty — all group messages will be silently dropped.    │
+│    Add sender IDs to channels.telegram.groupAllowFrom or                 │
+│    channels.telegram.allowFrom, or set groupPolicy to "open".            │
+│                                                                          │
+├──────────────────────────────────────────────────────────────────────────╯
+- generic [active] [ref=e1]:
+  - 'heading "Error 429 Too Many Requests: Please try again later." [level=1] [ref=e2]'
+  - paragraph [ref=e3]: "Too Many Requests: Please try again later."
+  - heading "Error 54113" [level=3] [ref=e4]
+  - paragraph [ref=e5]: "Details: cache-pdx12326-PDX 1773040185 1339660396"
+  - separator [ref=e6]
+  - paragraph [ref=e7]: Varnish cache server
