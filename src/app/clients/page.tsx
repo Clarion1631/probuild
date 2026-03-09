@@ -151,18 +151,18 @@ export default function ClientsPage() {
                 <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
                     <div className="flex justify-between items-center mb-8">
                         <div>
-                            <h1 className="text-2xl font-bold text-slate-900">Clients</h1>
-                            <p className="text-sm text-slate-500 mt-1">Manage your clients and their contact details.</p>
+                            <h1 className="text-2xl font-bold text-hui-textMain">Clients</h1>
+                            <p className="text-sm text-hui-textMuted mt-1">Manage your clients and their contact details.</p>
                         </div>
                         <button
                             onClick={handleOpenAddModal}
-                            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition shadow-sm"
+                            className="hui-btn hui-btn-primary"
                         >
                             + Add Client
                         </button>
                     </div>
 
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    <div className="hui-card overflow-hidden">
                         {loading ? (
                             <div className="p-8 text-center text-slate-500">Loading clients...</div>
                         ) : clients.length === 0 ? (
@@ -467,7 +467,7 @@ export default function ClientsPage() {
                                     type="submit"
                                     form="client-form"
                                     disabled={isSaving}
-                                    className="bg-slate-900 text-white px-6 py-2 rounded font-medium text-sm hover:bg-slate-800 transition shadow-sm disabled:opacity-70 flex items-center"
+                                    className="hui-btn hui-btn-primary disabled:opacity-70"
                                 >
                                     {isSaving ? 'Saving...' : 'Save'}
                                 </button>

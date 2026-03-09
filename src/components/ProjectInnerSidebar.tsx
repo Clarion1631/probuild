@@ -56,9 +56,9 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
     };
 
     return (
-        <div className="w-56 bg-slate-50 border-r border-slate-200 flex flex-col min-h-full">
-            <div className="p-4 border-b border-slate-200 bg-white">
-                <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Project Menu</h2>
+        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
+            <div className="p-4 border-b border-hui-border bg-white">
+                <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Project Menu</h2>
             </div>
 
             <div className="flex-1 overflow-y-auto w-full">
@@ -69,7 +69,7 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
                                 onClick={() => toggleSection(section.id)}
                                 className="w-full flex items-center justify-between text-left focus:outline-none px-3 mb-2 hover:bg-slate-100 rounded py-1 transition-colors"
                             >
-                                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                                <h3 className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
                                     {section.title}
                                 </h3>
                                 <svg
@@ -93,8 +93,8 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
                                                 <Link
                                                     href={item.href}
                                                     className={`block px-3 py-1.5 text-sm rounded transition ${isActive
-                                                            ? "bg-slate-200 text-slate-900 font-medium"
-                                                            : "text-slate-700 hover:bg-slate-200 hover:text-slate-900"
+                                                            ? "bg-hui-primary/10 text-hui-primary font-medium"
+                                                            : "text-hui-textMain hover:bg-slate-200 hover:text-hui-textMain"
                                                         }`}
                                                 >
                                                     {item.label}

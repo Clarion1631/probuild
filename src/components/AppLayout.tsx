@@ -9,24 +9,23 @@ import { useEffect } from "react";
 export default function AppLayout({ children, logoUrl }: { children: React.ReactNode, logoUrl?: string }) {
     const pathname = usePathname();
     const router = useRouter();
-    let { data: session, status } = useSession();
-    let role = (session?.user as any)?.role;
-
+    const { data: sessionData, status: sessionStatus } = useSession();
+    
     // DEVELOPMENT ONLY: Authentication bypass for local testing
-    if (process.env.NODE_ENV === 'development' && !session) {
-        // Mock a session object for development
-        session = {
-            user: {
-                email: 'gtrsupport@goldentouchremodeling.com',
-                name: 'Test User',
-                image: '', // Optional: provide a mock image URL
-                role: 'ADMIN', // Assign ADMIN role for full access
-            },
-            expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours from now
-        } as any;
-        status = 'authenticated';
-        role = 'ADMIN';
-    }
+    const isDevMock = process.env.NODE_ENV === 'development' && !sessionData;
+    
+    const session = isDevMock ? {
+        user: {
+            email: 'gtrsupport@goldentouchremodeling.com',
+            name: 'Test User',
+            image: '', // Optional: provide a mock image URL
+            role: 'ADMIN', // Assign ADMIN role for full access
+        },
+        expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours from now
+    } : sessionData;
+    
+    const status = isDevMock ? 'authenticated' : sessionStatus;
+    const role = (session?.user as any)?.role;
 
     useEffect(() => {
         if (status === 'authenticated') {

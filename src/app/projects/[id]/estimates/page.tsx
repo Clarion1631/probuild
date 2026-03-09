@@ -26,23 +26,23 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
             <div className="flex-1 overflow-auto p-6 bg-white flex justify-between gap-6">
                 <div className="flex-1">
                     <div className="flex items-center justify-between mb-6">
-                        <h1 className="text-xl font-bold text-slate-800">Estimates</h1>
+                        <h1 className="text-xl font-bold text-hui-textMain">Estimates</h1>
                         <form action={handleNewEstimate}>
-                            <button type="submit" className="bg-slate-900 text-white px-4 py-1.5 rounded text-sm font-medium shadow-sm hover:bg-slate-800 transition">
+                            <button type="submit" className="hui-btn hui-btn-primary">
                                 New Estimate
                             </button>
                         </form>
                     </div>
 
                     <div className="flex items-center gap-4 mb-4">
-                        <input type="text" placeholder="Search" className="border border-slate-300 rounded px-3 py-1.5 text-sm w-64 focus:outline-none focus:ring-1 focus:ring-slate-400" />
-                        <select className="border border-slate-300 rounded px-3 py-1.5 text-sm bg-white"><option>Date Created: 01/...</option></select>
-                        <select className="border border-slate-300 rounded px-3 py-1.5 text-sm bg-white"><option>Type: Active</option></select>
+                        <input type="text" placeholder="Search" className="hui-input w-64" />
+                        <select className="hui-input w-auto"><option>Date Created: 01/...</option></select>
+                        <select className="hui-input w-auto"><option>Type: Active</option></select>
                     </div>
 
-                    <div className="border border-slate-200 rounded-md">
+                    <div className="hui-card">
                         <table className="w-full text-sm text-left">
-                            <thead className="text-xs text-slate-500 bg-white border-b border-slate-200">
+                            <thead className="text-xs text-hui-textMuted bg-white border-b border-hui-border">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Title</th>
                                     <th className="px-4 py-3 font-medium">Recipient</th>
@@ -85,7 +85,7 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                     <div className="bg-white border text-center border-slate-200 rounded-md p-6 shadow-sm">
                         <h3 className="font-semibold text-slate-800 mb-2">Budget</h3>
                         <p className="text-xs text-slate-500 mb-4 px-2">Track your estimated costs against your actual spend. It all starts with an estimate.</p>
-                        <button className="bg-slate-900 w-full text-white px-4 py-2 rounded text-sm font-medium shadow-sm hover:bg-slate-800 transition">Create a Budget</button>
+                        <button className="hui-btn hui-btn-primary w-full">Create a Budget</button>
                     </div>
 
                     <div className="bg-white border border-slate-200 rounded-md p-6 shadow-sm">

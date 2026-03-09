@@ -144,9 +144,9 @@ export default function TimeClockPage() {
 
     return (
         <div className="max-w-xl mx-auto py-12 px-6">
-            <h1 className="text-3xl font-bold mb-8">Time Clock</h1>
+            <h1 className="text-2xl font-bold text-hui-textMain mb-8">Time Clock</h1>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 text-center">
+            <div className="hui-card p-8 text-center">
                 <div className={`text-sm font-semibold mb-6 \${status === 'Clocked In' ? 'text-green-600' : 'text-slate-500'}`}>
                     Status: {status}
                 </div>
@@ -157,7 +157,7 @@ export default function TimeClockPage() {
                         <select
                             value={selectedProject}
                             onChange={(e) => setSelectedProject(e.target.value)}
-                            className="w-full border border-slate-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            className="hui-input"
                         >
                             <option value="">Select a Project...</option>
                             {projects.map(p => (
@@ -171,7 +171,7 @@ export default function TimeClockPage() {
                                 <select
                                     value={selectedBucket}
                                     onChange={(e) => setSelectedBucket(e.target.value)}
-                                    className="w-full border border-slate-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                                    className="hui-input"
                                 >
                                     <option value="">Select a Phase...</option>
                                     {buckets.map(b => (
@@ -191,8 +191,8 @@ export default function TimeClockPage() {
 
                 <button
                     onClick={handleClockInOut}
-                    className={`w-full py-6 rounded-2xl text-2xl font-bold text-white shadow-lg transition transform hover:scale-105 active:scale-95
-                        \${status === 'Clocked In' ? 'bg-red-500 hover:bg-red-600 shadow-red-200' : 'bg-green-500 hover:bg-green-600 shadow-green-200'}
+                    className={`hui-btn w-full py-4 text-lg font-bold
+                        ${status === 'Clocked In' ? 'bg-red-500 hover:bg-red-600 text-white' : 'hui-btn-green'}
                     `}
                 >
                     {status === 'Clocked In' ? 'Clock Out' : 'Clock In'}

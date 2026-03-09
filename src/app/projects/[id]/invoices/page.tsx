@@ -15,12 +15,27 @@ export default async function ProjectInvoices({ params }: { params: { id: string
             <div className="flex-1 overflow-auto bg-slate-50 p-8">
                 <div className="max-w-6xl mx-auto space-y-6">
                     <div className="flex justify-between items-center">
-                        <h1 className="text-2xl font-bold text-slate-800">Invoices</h1>
+                        <h1 className="text-2xl font-bold text-hui-textMain">Invoices</h1>
                     </div>
 
-                    <div className="bg-white rounded-md shadow-sm border border-slate-200 overflow-hidden">
+                    <div className="grid grid-cols-3 gap-4">
+                        <div className="hui-card p-5">
+                            <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Total</p>
+                            <p className="text-2xl font-bold text-hui-textMain">$0.00</p>
+                        </div>
+                        <div className="hui-card p-5">
+                            <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Paid</p>
+                            <p className="text-2xl font-bold text-green-600">$0.00</p>
+                        </div>
+                        <div className="hui-card p-5">
+                            <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Balance</p>
+                            <p className="text-2xl font-bold text-red-500">$0.00</p>
+                        </div>
+                    </div>
+
+                    <div className="hui-card overflow-hidden">
                         <table className="w-full text-sm text-left">
-                            <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                            <thead className="bg-slate-50 text-hui-textMuted border-b border-hui-border">
                                 <tr>
                                     <th className="px-6 py-3 font-medium">Invoice #</th>
                                     <th className="px-6 py-3 font-medium">Status</th>
