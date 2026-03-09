@@ -7,7 +7,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
     const [isSearchOpen, setIsSearchOpen] = useState(false);
 
     return (
-        <aside className="w-20 bg-[#1e1e1e] text-white flex flex-col min-h-screen items-center py-4 relative z-50">
+        <aside className="w-20 bg-hui-sidebar text-white flex flex-col min-h-screen items-center py-4 relative z-50">
             {/* Search Flyout */}
             {isSearchOpen && (
                 <div className="absolute left-20 top-0 w-64 bg-slate-50 min-h-screen shadow-xl border-r border-slate-200 text-slate-800 flex flex-col z-40">
@@ -19,31 +19,31 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                         <div>
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Planning</h3>
                             <ul className="space-y-2 text-sm">
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Contracts</Link></li>
-                                <li><Link href="/projects/all/estimates" className="hover:text-[#00732e] block transition">All Estimates</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Takeoffs</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All 3D Floor Plans</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Mood Boards</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Selection Boards</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Selections Tracker</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Bids</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Contracts</Link></li>
+                                <li><Link href="/projects/all/estimates" className="hover:text-hui-primary block transition">All Estimates</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Takeoffs</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All 3D Floor Plans</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Mood Boards</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Selection Boards</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Selections Tracker</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Bids</Link></li>
                             </ul>
                         </div>
                         <div>
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
                             <ul className="space-y-2 text-sm">
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">Task Center</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">Schedule Overview</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Daily Logs</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">Time & Expenses</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">Task Center</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">Time & Expenses</Link></li>
                             </ul>
                         </div>
                         <div>
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Finance</h3>
                             <ul className="space-y-2 text-sm">
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Invoices</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Purchase Orders</Link></li>
-                                <li><Link href="#" className="hover:text-[#00732e] block transition">All Change Orders</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Invoices</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Purchase Orders</Link></li>
+                                <li><Link href="#" className="hover:text-hui-primary block transition">All Change Orders</Link></li>
                             </ul>
                         </div>
                     </div>
@@ -58,7 +58,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                             <img src={logoUrl} alt="Company Logo" className="w-full h-full object-contain" />
                         </div>
                     ) : (
-                        <div className="w-10 h-10 bg-[#00732e] rounded-md flex items-center justify-center font-bold text-xl hover:bg-[#005a24] transition">
+                        <div className="w-10 h-10 bg-hui-primary rounded-md flex items-center justify-center font-bold text-xl hover:bg-hui-primaryHover transition">
                             G
                         </div>
                     )}

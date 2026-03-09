@@ -1,15 +1,17 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+@theme {
+  --color-hui-primary: #4c9a2a;
+  --color-hui-primaryHover: #3e8022;
+  --color-hui-sidebar: #1e1e1e;
+  --color-hui-textMain: #222222;
+  --color-hui-textMuted: #666666;
+  --color-hui-border: #e1e4e8;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root {
+  --background: #f8f9fa;
+  --foreground: #222222;
 }
 
 body {
@@ -17,3 +19,29 @@ body {
   background: var(--background);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+@layer components {
+  .hui-btn {
+    @apply inline-flex items-center justify-center px-4 py-2 text-sm font-medium rounded-md transition-colors shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2;
+  }
+  
+  .hui-btn-primary {
+    @apply bg-slate-900 text-white hover:bg-slate-800 focus:ring-slate-900;
+  }
+  
+  .hui-btn-secondary {
+    @apply bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 focus:ring-slate-500;
+  }
+  
+  .hui-btn-green {
+    @apply bg-hui-primary text-white hover:bg-hui-primaryHover focus:ring-hui-primary;
+  }
+
+  .hui-input {
+    @apply w-full border border-slate-300 rounded-md shadow-sm focus:ring-slate-500 focus:border-slate-500 px-3 py-2 text-sm text-slate-900 bg-white disabled:bg-slate-50 disabled:text-slate-500;
+  }
+
+  .hui-card {
+    @apply bg-white rounded-xl shadow-sm border border-hui-border overflow-hidden;
+  }
+}

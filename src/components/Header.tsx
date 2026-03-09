@@ -6,9 +6,9 @@ export default function Header() {
     const { data: session } = useSession();
 
     return (
-        <header className="bg-white border-b border-slate-200 h-16 flex items-center justify-between px-6 shadow-sm">
+        <header className="bg-white border-b border-hui-border h-16 flex items-center justify-between px-6 shadow-sm">
             <div className="flex items-center">
-                <h2 className="text-xl font-semibold text-slate-800">Golden Touch</h2>
+                <h2 className="text-xl font-semibold text-hui-textMain">Golden Touch</h2>
             </div>
             <div className="flex items-center gap-4">
                 {session ? (
@@ -17,7 +17,7 @@ export default function Header() {
                             {session.user?.name}
                         </span>
                         {session.user?.image && (
-                            <img src={session.user.image} alt="User Avatar" className="w-8 h-8 rounded-full border border-slate-300" />
+                            <img src={session.user.image} alt="User Avatar" className="w-8 h-8 rounded-full border border-hui-border" />
                         )}
                         <button
                             onClick={() => signOut({ callbackUrl: '/login' })}
@@ -29,7 +29,7 @@ export default function Header() {
                 ) : (
                     <button
                         onClick={() => signIn("google")}
-                        className="text-sm font-medium bg-[#00732e] text-white px-4 py-2 rounded shadow-sm hover:bg-[#005a24] transition"
+                        className="hui-btn hui-btn-green"
                     >
                         Sign in with Google
                     </button>
