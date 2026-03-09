@@ -136,18 +136,18 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     const perms = getPermissions(role);
 
     return (
-        <div className="flex flex-col h-full overflow-y-auto bg-white">
-            <div className="border-b p-6">
-                <Link href="/company/team-members" className="flex items-center text-slate-500 hover:text-slate-800 text-sm font-medium mb-4 transition-colors">
+        <div className="flex flex-col h-full overflow-y-auto bg-hui-background">
+            <div className="border-b border-hui-border p-6 bg-white">
+                <Link href="/company/team-members" className="flex items-center text-hui-textMuted hover:text-hui-textMain text-sm font-medium mb-4 transition-colors">
                     <ChevronLeft className="w-4 h-4 mr-1" />
                     Back to Team Members
                 </Link>
                 <div className="flex items-center justify-between">
-                    <h1 className="text-2xl font-semibold text-slate-800">Edit "{user.email}"</h1>
+                    <h1 className="text-2xl font-semibold text-hui-textMain">Edit "{user.email}"</h1>
                     <button
                         onClick={handleSave}
                         disabled={saving}
-                        className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-md font-medium text-sm hover:bg-blue-700 transition disabled:opacity-50"
+                        className="hui-btn hui-btn-primary flex items-center gap-2"
                     >
                         <Save className="w-4 h-4" />
                         {saving ? "Saving..." : "Save Changes"}
@@ -157,38 +157,38 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
 
             <div className="p-8 max-w-4xl space-y-8">
                 {/* Name Section */}
-                <div>
-                    <h2 className="text-lg font-semibold text-slate-800 mb-4">Name</h2>
+                <div className="hui-card p-6">
+                    <h2 className="text-lg font-semibold text-hui-textMain mb-4">Name</h2>
                     <div className="grid grid-cols-2 gap-6">
                         <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">First Name</label>
+                            <label className="block text-sm font-medium text-hui-textMain mb-1">First Name</label>
                             <input
                                 type="text"
                                 value={firstName}
                                 onChange={(e) => setFirstName(e.target.value)}
-                                className="w-full border border-slate-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className="hui-input w-full"
                             />
                         </div>
                         <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">Last Name</label>
+                            <label className="block text-sm font-medium text-hui-textMain mb-1">Last Name</label>
                             <input
                                 type="text"
                                 value={lastName}
                                 onChange={(e) => setLastName(e.target.value)}
-                                className="w-full border border-slate-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className="hui-input w-full"
                             />
                         </div>
                     </div>
                 </div>
 
                 {/* Role Section */}
-                <div>
-                    <h2 className="text-lg font-semibold text-slate-800 mb-4">Role</h2>
+                <div className="hui-card p-6">
+                    <h2 className="text-lg font-semibold text-hui-textMain mb-4">Role</h2>
                     <div className="w-64">
                         <select
                             value={role}
                             onChange={(e) => setRole(e.target.value)}
-                            className="w-full border border-slate-300 rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            className="hui-input w-full cursor-pointer"
                         >
                             <option value="ADMIN">Admin</option>
                             <option value="MANAGER">Manager</option>
@@ -199,9 +199,9 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                 </div>
 
                 {/* Permissions Display (Read-Only Matrix based on Role) */}
-                <div className="bg-slate-50 border border-slate-200 rounded-lg p-6">
-                    <h3 className="text-sm font-semibold text-slate-800 mb-4 uppercase tracking-wider">Administrative Permissions (Auto-assigned)</h3>
-                    <div className="grid grid-cols-2 gap-y-4 gap-x-8 text-sm text-slate-700">
+                <div className="hui-card p-6 bg-slate-50 border-hui-border">
+                    <h3 className="text-sm font-semibold text-hui-textMain mb-4 uppercase tracking-wider">Administrative Permissions (Auto-assigned)</h3>
+                    <div className="grid grid-cols-2 gap-y-4 gap-x-8 text-sm text-hui-textMuted">
                         <label className="flex items-center gap-3">
                             <input type="checkbox" checked={perms.adminOnly} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
                             Accounting Integrations
@@ -231,62 +231,62 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
 
                 {/* Rates & App Access */}
                 <div className="grid grid-cols-2 gap-8">
-                    <div>
-                        <h2 className="text-lg font-semibold text-slate-800 mb-4">Labor Cost Rates</h2>
+                    <div className="hui-card p-6">
+                        <h2 className="text-lg font-semibold text-hui-textMain mb-4">Labor Cost Rates</h2>
                         <div className="space-y-4">
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Hourly Rate ($)</label>
+                                <label className="block text-sm font-medium text-hui-textMain mb-1">Hourly Rate ($)</label>
                                 <input
                                     type="number"
                                     value={hourlyRate}
                                     onChange={(e) => setHourlyRate(parseFloat(e.target.value) || 0)}
-                                    className="w-full border border-slate-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    className="hui-input w-full"
                                 />
                             </div>
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Burden Rate ($) / hr</label>
+                                <label className="block text-sm font-medium text-hui-textMain mb-1">Burden Rate ($) / hr</label>
                                 <input
                                     type="number"
                                     value={burdenRate}
                                     onChange={(e) => setBurdenRate(parseFloat(e.target.value) || 0)}
-                                    className="w-full border border-slate-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    className="hui-input w-full"
                                 />
                             </div>
                         </div>
                     </div>
 
-                    <div>
-                        <h2 className="text-lg font-semibold text-slate-800 mb-4">Mobile App Access</h2>
+                    <div className="hui-card p-6">
+                        <h2 className="text-lg font-semibold text-hui-textMain mb-4">Mobile App Access</h2>
                         <div className="space-y-4">
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Mobile PIN Code</label>
+                                <label className="block text-sm font-medium text-hui-textMain mb-1">Mobile PIN Code</label>
                                 <input
                                     type="text"
                                     maxLength={6}
                                     placeholder="e.g. 1234"
                                     value={pinCode}
                                     onChange={(e) => setPinCode(e.target.value.replace(/\D/g, ''))}
-                                    className="w-full border border-slate-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    className="hui-input w-full"
                                 />
-                                <p className="text-xs text-slate-500 mt-1">Used by Field Crew to log in to the native mobile app.</p>
+                                <p className="text-xs text-hui-textMuted mt-1">Used by Field Crew to log in to the native mobile app.</p>
                             </div>
                         </div>
                     </div>
                 </div>
 
                 {/* Danger Zone */}
-                <div className="pt-8 border-t mt-12 pb-12">
+                <div className="pt-8 border-t border-hui-border mt-12 pb-12">
                     <div className="flex gap-4">
                         <button
                             type="button"
-                            className="px-4 py-2 border border-slate-300 text-slate-700 rounded-md font-medium text-sm hover:bg-slate-50 transition"
+                            className="hui-btn hui-btn-secondary"
                         >
                             Disable Team Member
                         </button>
                         <button
                             type="button"
                             onClick={handleDelete}
-                            className="px-4 py-2 bg-red-600 text-white rounded-md font-medium text-sm hover:bg-red-700 transition"
+                            className="bg-red-600 text-white px-4 py-2 rounded-md font-medium text-sm hover:opacity-90 transition"
                         >
                             Delete Team Member
                         </button>

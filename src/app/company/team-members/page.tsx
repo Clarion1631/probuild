@@ -19,6 +19,8 @@ export default function TeamPage() {
     const [loading, setLoading] = useState(true);
     const [isAddingUser, setIsAddingUser] = useState(false);
     const [addForm, setAddForm] = useState<Partial<User>>({ role: 'EMPLOYEE' });
+    const [searchQuery, setSearchQuery] = useState("");
+    const [statusFilter, setStatusFilter] = useState("All");
 
     useEffect(() => {
         fetchUsers();
@@ -62,73 +64,146 @@ export default function TeamPage() {
         }
     };
 
+    const getStatus = (user: User) => {
+        if (!user.name) return "Pending";
+        return "Activated";
+    };
+
+    const filteredUsers = users.filter(user => {
+        const matchesSearch = (user.name?.toLowerCase() || '').includes(searchQuery.toLowerCase()) || 
+                              user.email.toLowerCase().includes(searchQuery.toLowerCase());
+        const status = getStatus(user);
+        const matchesStatus = statusFilter === "All" || status === statusFilter;
+        return matchesSearch && matchesStatus;
+    });
+
+    const getInitials = (name: string | null, email: string) => {
+        if (name) {
+            const parts = name.split(' ');
+            if (parts.length > 1) return (parts[0][0] + parts[1][0]).toUpperCase();
+            return name.substring(0, 2).toUpperCase();
+        }
+        return email.substring(0, 2).toUpperCase();
+    };
+
     return (
         <div className="font-sans text-slate-900 h-full flex flex-col">
-            <header className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between sticky top-0 z-10">
-                <h1 className="text-xl font-bold text-slate-800">Team Members</h1>
+            <header className="bg-white border-b border-hui-border px-8 py-4 flex items-center justify-between sticky top-0 z-10">
+                <h1 className="text-xl font-bold text-hui-textMain">Team Members</h1>
                 <button
                     onClick={() => setIsAddingUser(true)}
-                    className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition shadow-sm"
+                    className="hui-btn hui-btn-primary"
                 >
                     + Add Team Member
                 </button>
             </header>
 
-            <div className="p-8 flex-1 overflow-y-auto w-full max-w-7xl mx-auto">
-                <div className="mb-8">
-                    <p className="text-slate-600">
-                        {users.length} Free Seats used. To modify your team settings, chat with us.
-                    </p>
+            <div className="p-8 flex-1 overflow-y-auto w-full max-w-7xl mx-auto bg-hui-background">
+                <div className="mb-6 bg-green-50 text-green-800 px-4 py-3 rounded-md border border-green-200 flex items-center shadow-sm">
+                    <span className="font-medium text-sm">11 Free Seats — {users.length} Used, {11 - users.length} Available</span>
+                </div>
+
+                <div className="mb-6 flex gap-4 items-center">
+                    <input 
+                        type="text" 
+                        placeholder="Search team members..." 
+                        value={searchQuery}
+                        onChange={e => setSearchQuery(e.target.value)}
+                        className="hui-input max-w-sm w-full"
+                    />
+                    <select 
+                        value={statusFilter}
+                        onChange={e => setStatusFilter(e.target.value)}
+                        className="hui-input max-w-xs w-full cursor-pointer"
+                    >
+                        <option value="All">All Statuses</option>
+                        <option value="Activated">Activated</option>
+                        <option value="Pending">Pending</option>
+                        <option value="Disabled">Disabled</option>
+                    </select>
                 </div>
 
                 {loading ? (
-                    <div className="text-center py-20 text-slate-500">Loading team members...</div>
+                    <div className="text-center py-20 text-hui-textMuted">Loading team members...</div>
                 ) : (
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    <div className="hui-card overflow-hidden">
                         <table className="w-full text-left border-collapse">
                             <thead>
-                                <tr className="bg-slate-50 border-b border-slate-200 text-sm font-semibold text-slate-600 whitespace-nowrap">
+                                <tr className="bg-slate-50 border-b border-hui-border text-sm font-semibold text-hui-textMuted whitespace-nowrap">
                                     <th className="px-6 py-4 font-normal">Name</th>
                                     <th className="px-6 py-4 font-normal">Email</th>
                                     <th className="px-6 py-4 font-normal">Role</th>
+                                    <th className="px-6 py-4 font-normal">Status</th>
                                     <th className="px-6 py-4 font-normal hidden sm:table-cell">Hourly Rate</th>
                                     <th className="px-6 py-4 font-normal text-right">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-100 text-sm">
-                                {users.map(user => (
-                                    <tr key={user.id} className="hover:bg-slate-50 transition-colors group">
-                                        <td className="px-6 py-4">
-                                            <div className="font-medium text-slate-900">
-                                                {user.name || 'Invited User'}
-                                            </div>
-                                        </td>
-                                        <td className="px-6 py-4 text-slate-600">
-                                            {user.email}
-                                        </td>
-                                        <td className="px-6 py-4 text-slate-600">
-                                            {user.role === 'EMPLOYEE' ? 'Field Crew' :
-                                                user.role === 'MANAGER' ? 'Manager' :
-                                                    user.role === 'FINANCE' ? 'Finance' :
-                                                        'Admin'}
-                                        </td>
-                                        <td className="px-6 py-4 text-slate-600 hidden sm:table-cell">
-                                            ${(user.hourlyRate ?? 0).toFixed(2)}
-                                        </td>
-                                        <td className="px-6 py-4 text-right">
-                                            <Link
-                                                href={`/company/team-members/${user.id}`}
-                                                className="text-blue-600 hover:text-blue-800 font-medium opacity-0 group-hover:opacity-100 transition-opacity"
-                                            >
-                                                Edit
-                                            </Link>
-                                        </td>
-                                    </tr>
-                                ))}
+                            <tbody className="divide-y divide-hui-border text-sm">
+                                {filteredUsers.map(user => {
+                                    const status = getStatus(user);
+                                    let badgeBg = "bg-slate-100";
+                                    let badgeText = "text-slate-800";
+                                    let badgeDot = "bg-slate-500";
+                                    
+                                    if (status === "Activated") {
+                                        badgeBg = "bg-green-50";
+                                        badgeText = "text-green-800";
+                                        badgeDot = "bg-green-500";
+                                    } else if (status === "Pending") {
+                                        badgeBg = "bg-amber-50";
+                                        badgeText = "text-amber-800";
+                                        badgeDot = "bg-amber-500";
+                                    } else if (status === "Disabled") {
+                                        badgeBg = "bg-slate-100";
+                                        badgeText = "text-slate-800";
+                                        badgeDot = "bg-slate-400";
+                                    }
+
+                                    return (
+                                        <tr key={user.id} className="hover:bg-slate-50 transition-colors group">
+                                            <td className="px-6 py-4">
+                                                <div className="flex items-center gap-3">
+                                                    <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-xs shrink-0">
+                                                        {getInitials(user.name, user.email)}
+                                                    </div>
+                                                    <div className="font-medium text-hui-textMain">
+                                                        {user.name || 'Invited User'}
+                                                    </div>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-4 text-hui-textMuted">
+                                                {user.email}
+                                            </td>
+                                            <td className="px-6 py-4 text-hui-textMuted">
+                                                {user.role === 'EMPLOYEE' ? 'Field Crew' :
+                                                    user.role === 'MANAGER' ? 'Manager' :
+                                                        user.role === 'FINANCE' ? 'Finance' :
+                                                            'Admin'}
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ${badgeBg} ${badgeText}`}>
+                                                    <span className={`w-1.5 h-1.5 rounded-full ${badgeDot}`}></span>
+                                                    {status}
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
+                                                ${(user.hourlyRate ?? 0).toFixed(2)}
+                                            </td>
+                                            <td className="px-6 py-4 text-right">
+                                                <Link
+                                                    href={`/company/team-members/${user.id}`}
+                                                    className="text-blue-600 hover:text-blue-800 font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                                                >
+                                                    Edit
+                                                </Link>
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
                             </tbody>
                         </table>
-                        {users.length === 0 && (
-                            <div className="p-6 text-center text-slate-500">No team members found.</div>
+                        {filteredUsers.length === 0 && (
+                            <div className="p-6 text-center text-hui-textMuted">No team members found.</div>
                         )}
                     </div>
                 )}
@@ -137,24 +212,24 @@ export default function TeamPage() {
             {/* Add User Modal */}
             {isAddingUser && (
                 <div className="fixed inset-0 bg-slate-900/50 flex flex-col items-center justify-center z-50 p-4">
-                    <div className="bg-white rounded-xl shadow-xl max-w-md w-full overflow-hidden">
-                        <div className="px-6 py-4 border-b border-slate-200 flex justify-between items-center">
-                            <h2 className="text-lg font-bold text-slate-800">Invite New Team Member</h2>
-                            <button onClick={() => setIsAddingUser(false)} className="text-slate-400 hover:text-slate-600">
+                    <div className="bg-white rounded-xl shadow-xl max-w-md w-full overflow-hidden border border-hui-border">
+                        <div className="px-6 py-4 border-b border-hui-border flex justify-between items-center">
+                            <h2 className="text-lg font-bold text-hui-textMain">Invite New Team Member</h2>
+                            <button onClick={() => setIsAddingUser(false)} className="text-hui-textMuted hover:text-hui-textMain transition">
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                             </button>
                         </div>
                         <form onSubmit={handleAddSubmit} className="p-6 space-y-4 text-sm">
-                            <p className="text-slate-600 mb-2 leading-relaxed">
+                            <p className="text-hui-textMuted mb-2 leading-relaxed">
                                 Enter the team member's role and email address. They will be able to log in using their Google account to access the platform.
                             </p>
                             <div>
-                                <label className="block font-medium text-slate-700 mb-1">Email Address <span className="text-red-500">*</span></label>
-                                <input required type="email" placeholder="email@company.com" className="w-full border-slate-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2 border" value={addForm.email || ''} onChange={e => setAddForm({ ...addForm, email: e.target.value })} />
+                                <label className="block font-medium text-hui-textMain mb-1">Email Address <span className="text-red-500">*</span></label>
+                                <input required type="email" placeholder="email@company.com" className="hui-input w-full" value={addForm.email || ''} onChange={e => setAddForm({ ...addForm, email: e.target.value })} />
                             </div>
                             <div>
-                                <label className="block font-medium text-slate-700 mb-1">Role</label>
-                                <select className="w-full border-slate-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2 border bg-white" value={addForm.role} onChange={e => setAddForm({ ...addForm, role: e.target.value })}>
+                                <label className="block font-medium text-hui-textMain mb-1">Role</label>
+                                <select className="hui-input w-full" value={addForm.role} onChange={e => setAddForm({ ...addForm, role: e.target.value })}>
                                     <option value="EMPLOYEE">Field Crew</option>
                                     <option value="MANAGER">Manager</option>
                                     <option value="FINANCE">Finance</option>
@@ -162,9 +237,9 @@ export default function TeamPage() {
                                 </select>
                             </div>
 
-                            <div className="pt-4 flex justify-end gap-3 border-t border-slate-100 mt-6">
-                                <button type="button" onClick={() => setIsAddingUser(false)} className="px-4 py-2 font-medium text-slate-700 hover:bg-slate-50 transition rounded-md">Cancel</button>
-                                <button type="submit" className="px-4 py-2 bg-blue-600 text-white font-medium rounded-md hover:bg-blue-700 transition shadow-sm">Send Invite</button>
+                            <div className="pt-4 flex justify-end gap-3 border-t border-hui-border mt-6">
+                                <button type="button" onClick={() => setIsAddingUser(false)} className="hui-btn hui-btn-secondary">Cancel</button>
+                                <button type="submit" className="hui-btn hui-btn-primary">Send Invite</button>
                             </div>
                         </form>
                     </div>
