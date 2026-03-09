@@ -27,6 +27,44 @@ export async function getLead(id: string) {
     return lead;
 }
 
+export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; source?: string; projectType?: string }) {
+    // Find or create client
+    let client = await prisma.client.findFirst({
+        where: { name: data.clientName },
+    });
+
+    if (!client) {
+        const initials = data.clientName
+            .split(" ")
+            .map((n) => n[0])
+            .join("")
+            .toUpperCase()
+            .slice(0, 2);
+        client = await prisma.client.create({
+            data: {
+                name: data.clientName,
+                initials,
+                email: data.clientEmail || null,
+                primaryPhone: data.clientPhone || null,
+            },
+        });
+    }
+
+    const lead = await prisma.lead.create({
+        data: {
+            name: data.name,
+            clientId: client.id,
+            location: data.location || null,
+            source: data.source || null,
+            projectType: data.projectType || null,
+            stage: "New",
+        },
+    });
+
+    revalidatePath("/leads");
+    return { id: lead.id };
+}
+
 export async function getProjects() {
     const projects = await prisma.project.findMany({
         orderBy: { viewedAt: "desc" },

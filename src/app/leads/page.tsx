@@ -1,6 +1,7 @@
 import Avatar from "@/components/Avatar";
 import { getLeads } from "@/lib/actions";
 import Link from "next/link";
+import AddLeadButton from "./AddLeadButton";
 
 export default async function LeadsPage({ searchParams }: { searchParams: Promise<{ view?: string }> }) {
     const resolvedParams = await searchParams;
@@ -15,7 +16,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: Promis
                     <div className="flex items-center gap-3">
                         <button className="hui-btn hui-btn-secondary">Contact Form</button>
                         <button className="hui-btn hui-btn-secondary">Insights</button>
-                        <button className="hui-btn hui-btn-primary">Add Lead</button>
+                        <AddLeadButton />
                     </div>
                 </div>
             </div>
@@ -67,9 +68,9 @@ export default async function LeadsPage({ searchParams }: { searchParams: Promis
 
                     <div className="flex-1 overflow-auto bg-hui-background">
                         {leads.length === 0 ? (
-                            <div className="flex flex-col items-center justify-center h-full text-hui-textMuted">
+                            <div className="flex flex-col items-center justify-center h-full text-hui-textMuted p-12">
                                 <p className="mb-4">No leads found. Create your first lead to get started.</p>
-                                <button className="hui-btn hui-btn-primary">Add Lead</button>
+                                <AddLeadButton />
                             </div>
                         ) : view === 'table' ? (
                             <table className="w-full text-sm text-left bg-white">
