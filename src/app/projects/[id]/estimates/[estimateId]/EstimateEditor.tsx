@@ -228,41 +228,45 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                 </div>
             </div>
 
-            <div className="flex-1 p-8 flex justify-center pb-24">
+            <div className="flex-1 p-8 flex justify-center pb-24 overflow-y-auto">
                 {activeTab === "builder" && (
                     <div className="w-full max-w-5xl">
-                        {/* Document Header */}
-                        <div className="bg-white p-8 rounded-t-lg shadow-sm border border-hui-border border-b-0 space-y-6">
-                            <input
-                                type="text"
-                                value={title}
-                                onChange={e => setTitle(e.target.value)}
-                                className="text-3xl font-bold text-hui-textMain w-full focus:outline-none focus:border-b border-hui-border pb-1 placeholder:text-slate-300 bg-transparent"
-                                placeholder="Estimate Title"
-                            />
+                        {/* Premium Document Wrapper */}
+                        <div className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
+                            {/* Subtle Gradient Accent Top Line */}
+                            <div className="h-1.5 w-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500"></div>
+                            {/* Document Header */}
+                            <div className="p-10 pb-12 space-y-10 border-b border-slate-100">
+                                <input
+                                    type="text"
+                                    value={title}
+                                    onChange={e => setTitle(e.target.value)}
+                                    className="text-4xl font-extrabold tracking-tight text-slate-800 w-full focus:outline-none focus:bg-slate-50 hover:bg-slate-50 transition-colors rounded-lg px-3 py-2 -ml-3 placeholder:text-slate-300 bg-transparent"
+                                    placeholder="Estimate Title"
+                                />
 
-                            <div className="flex gap-12 text-sm">
-                                <div>
-                                    <p className="text-hui-textMuted mb-1">To</p>
-                                    <p className="font-medium text-hui-textMain">{context.clientName}</p>
-                                    <p className="text-hui-textMuted">{context.clientEmail || "No email provided"}</p>
-                                    <p className="text-hui-textMuted">{context.location}</p>
-                                </div>
-                                <div>
-                                    <p className="text-hui-textMuted mb-1">Estimate Details</p>
-                                    <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-                                        <label className="text-hui-textMuted">Code</label>
-                                        <input type="text" value={code} onChange={e => setCode(e.target.value)} className="border-b border-dashed border-slate-300 focus:outline-none focus:border-solid focus:border-slate-400 max-w-24 text-right bg-transparent" />
-                                        <label className="text-hui-textMuted">Date</label>
-                                        <span className="text-right text-hui-textMain">{new Date().toLocaleDateString()}</span>
+                                <div className="flex justify-between items-start gap-12 text-sm px-3">
+                                    <div className="space-y-1">
+                                        <p className="text-[11px] font-semibold tracking-widest uppercase text-slate-400 mb-2">Estimate To</p>
+                                        <p className="font-semibold text-base text-slate-800">{context.clientName}</p>
+                                        {context.clientEmail && <p className="text-slate-500">{context.clientEmail}</p>}
+                                        {context.location && <p className="text-slate-500 pt-1">{context.location}</p>}
+                                    </div>
+                                    <div className="bg-slate-50 p-5 rounded-lg border border-slate-100 min-w-[280px]">
+                                        <div className="grid grid-cols-2 gap-x-4 gap-y-4">
+                                            <label className="text-slate-500 font-medium">Estimate No.</label>
+                                            <input type="text" value={code} onChange={e => setCode(e.target.value)} className="font-semibold text-slate-800 focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 -mr-2 text-right bg-transparent transition" />
+                                            
+                                            <label className="text-slate-500 font-medium">Date Issued</label>
+                                            <span className="text-right font-medium text-slate-800 px-2 py-1">{new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}</span>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
-                        </div>
 
-                        {/* Items Grid with DnD */}
-                        <div className="bg-white shadow-sm border border-hui-border">
-                            <div className="flex text-xs font-medium text-hui-textMuted bg-slate-50 border-b border-hui-border px-6 py-3 uppercase tracking-wider">
+                            {/* Items Grid with DnD */}
+                            <div className="bg-white">
+                                <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
                                 <div className="w-8"></div>
                                 <div className="flex-1">Item Description</div>
                                 <div className="w-32">Type</div>
@@ -315,28 +319,29 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                                         <option>Subcontractor</option>
                                                                         <option>Assembly</option>
                                                                     </select>
-                                                                </div>
-                                                                <div className="w-24 px-4 text-right">
-                                                                    <input
-                                                                        type="number"
-                                                                        value={item.quantity}
-                                                                        onChange={e => updateItem(index, "quantity", e.target.value)}
-                                                                        className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 text-right transition text-sm text-hui-textMain"
-                                                                    />
-                                                                </div>
-                                                                <div className="w-32 px-4 text-right">
-                                                                    <input
-                                                                        type="number"
-                                                                        value={item.unitCost}
-                                                                        onChange={e => updateItem(index, "unitCost", e.target.value)}
-                                                                        className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 text-right transition text-sm text-hui-textMain"
-                                                                    />
-                                                                </div>
-                                                                <div className="w-32 px-4 text-right font-medium text-hui-textMain text-sm">
-                                                                    ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                                                </div>
-                                                                <div className="w-10 flex justify-end">
-                                                                    <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 transition opacity-0 group-hover:opacity-100 p-1">
+                                                                    </div>
+                                                                    <div className="w-24 px-4 pt-1 text-right">
+                                                                        <input
+                                                                            type="number"
+                                                                            value={item.quantity}
+                                                                            onChange={e => updateItem(index, "quantity", e.target.value)}
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                        />
+                                                                    </div>
+                                                                    <div className="w-32 px-4 pt-1 text-right relative">
+                                                                        <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
+                                                                        <input
+                                                                            type="number"
+                                                                            value={item.unitCost}
+                                                                            onChange={e => updateItem(index, "unitCost", e.target.value)}
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                        />
+                                                                    </div>
+                                                                    <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
+                                                                        ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                                    </div>
+                                                                    <div className="w-10 pt-1.5 flex justify-end">
+                                                                    <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
                                                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                                     </button>
                                                                 </div>
@@ -351,68 +356,70 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                 </Droppable>
                             </DragDropContext>
 
-                            <div className="p-4 border-t border-hui-border bg-slate-50/50 flex items-center gap-4">
-                                <button onClick={() => addItem(null)} className="text-sm font-medium text-hui-textMain hover:text-hui-primary flex items-center gap-1 transition">
-                                    + Add Item
+                            <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={() => addItem(null)}>
+                                <button className="text-sm font-semibold text-indigo-500 group-hover:text-indigo-600 flex items-center gap-2 transition">
+                                    <span className="bg-indigo-50 text-indigo-500 group-hover:bg-indigo-100 rounded p-1">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                                    </span>
+                                    Add New Item
                                 </button>
                             </div>
                         </div>
 
                         {/* Progress Payments Section */}
                         {paymentSchedules.length > 0 && (
-                            <div className="bg-white shadow-sm border border-hui-border mt-6">
-                                <div className="flex items-center justify-between bg-slate-50 border-b border-hui-border px-6 py-4">
-                                    <h3 className="font-semibold text-hui-textMain">Payment Schedule</h3>
+                            <div className="bg-white border-t border-slate-200 mt-8">
+                                <div className="flex items-center justify-between bg-slate-50/50 border-b border-slate-100 px-8 py-5">
+                                    <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
                                 </div>
-                                <div className="flex text-xs font-medium text-hui-textMuted bg-white border-b border-hui-border px-6 py-3 uppercase tracking-wider">
+                                <div className="flex text-[11px] font-bold text-slate-400 bg-white border-b border-slate-100 px-8 py-3 uppercase tracking-wider">
                                     <div className="flex-1">Payment Name</div>
                                     <div className="w-32">Percentage</div>
                                     <div className="w-32">Amount</div>
                                     <div className="w-40 text-right">Due Date</div>
                                     <div className="w-10"></div>
                                 </div>
-                                <div className="divide-y divide-slate-100">
+                                <div className="divide-y divide-slate-50">
                                     {paymentSchedules.map((schedule, index) => (
-                                        <div key={schedule.id || index} className="flex items-center px-6 py-3 bg-white group hover:bg-slate-50 transition border-l-2 border-transparent">
+                                        <div key={schedule.id || index} className="flex items-center px-8 py-4 bg-white group hover:bg-slate-50/50 transition-colors border-l-4 border-transparent">
                                             <div className="flex-1">
                                                 <input
                                                     type="text"
                                                     value={schedule.name}
                                                     onChange={e => updatePaymentSchedule(index, "name", e.target.value)}
                                                     placeholder="e.g. Initial Deposit"
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm font-medium text-hui-textMain"
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800"
                                                 />
                                             </div>
-                                            <div className="w-32 px-4">
+                                            <div className="w-32 px-4 relative">
                                                 <input
                                                     type="number"
                                                     value={schedule.percentage}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 transition text-sm text-hui-textMuted"
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium text-slate-600"
                                                 />
+                                                <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
                                             </div>
-                                            <div className="w-32 px-4">
-                                                <div className="flex items-center">
-                                                    <span className="text-hui-textMuted mr-1">$</span>
-                                                    <input
-                                                        type="number"
-                                                        value={schedule.amount}
-                                                        onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
-                                                        className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 transition text-sm text-hui-textMain"
-                                                    />
-                                                </div>
+                                            <div className="w-32 px-4 relative">
+                                                <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
+                                                <input
+                                                    type="number"
+                                                    value={schedule.amount}
+                                                    onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
+                                                />
                                             </div>
                                             <div className="w-40 px-4 text-right">
                                                 <input
                                                     type="date"
                                                     value={schedule.dueDate ? new Date(schedule.dueDate).toISOString().split('T')[0] : ''}
                                                     onChange={e => updatePaymentSchedule(index, "dueDate", new Date(e.target.value).toISOString())}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 text-right transition text-sm text-hui-textMuted"
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500"
                                                 />
                                             </div>
-                                            <div className="w-10 flex justify-end">
-                                                <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 transition opacity-0 group-hover:opacity-100 p-1">
+                                            <div className="w-10 pt-0.5 flex justify-end">
+                                                <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
                                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                 </button>
                                             </div>
@@ -423,32 +430,34 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                         )}
 
                         {/* Footer Totals */}
-                        <div className="bg-white p-8 rounded-b-lg shadow-sm border border-hui-border border-t-0 flex justify-end">
-                            <div className="w-80 space-y-3 text-sm">
-                                <div className="flex justify-between text-hui-textMuted">
-                                    <span>Subtotal</span>
-                                    <span>${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                                </div>
-                                <div className="flex justify-between text-hui-textMuted">
-                                    <span>Estimated Tax (8.7%)</span>
-                                    <span>${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                                </div>
-                                <div className="h-px w-full bg-hui-border my-2"></div>
-                                <div className="flex justify-between text-lg font-bold text-hui-textMain">
-                                    <span>Estimate Total</span>
-                                    <span>${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                            <div className="bg-slate-50 p-10 flex justify-end border-t border-slate-200">
+                                <div className="w-80 space-y-4 text-sm">
+                                    <div className="flex justify-between text-slate-500 font-medium">
+                                        <span>Subtotal</span>
+                                        <span className="text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                    </div>
+                                    <div className="flex justify-between text-slate-500 font-medium">
+                                        <span>Estimated Tax (8.7%)</span>
+                                        <span className="text-slate-800">${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                    </div>
+                                    <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
+                                    <div className="flex justify-between text-xl font-extrabold text-slate-900">
+                                        <span>Total</span>
+                                        <span className="text-indigo-600">${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                    </div>
                                 </div>
                             </div>
                         </div>
 
-                        <div className="mt-8">
-                            <div>
-                                <button onClick={addPaymentSchedule} className="text-sm font-medium text-hui-primary hover:text-hui-primaryHover transition">
-                                    + Add Payment Schedule
+                        <div className="mt-8 flex items-start gap-4 mx-2">
+                            <div className="bg-indigo-50 p-3 rounded-lg flex-1 border border-indigo-100 flex items-center justify-between">
+                                <div>
+                                    <h4 className="font-semibold text-indigo-900 text-sm">Payment Schedule</h4>
+                                    <p className="text-xs text-indigo-700/70 mt-0.5">Allow your clients to pay in milestones (e.g., Deposit, Completion).</p>
+                                </div>
+                                <button onClick={addPaymentSchedule} className="hui-btn hui-btn-secondary text-indigo-700 border-indigo-200 hover:bg-indigo-100 bg-white transition shadow-sm text-xs py-1.5 px-3">
+                                    + Add milestone
                                 </button>
-                                {paymentSchedules.length === 0 && (
-                                    <p className="text-xs text-hui-textMuted mt-1">Break this estimate into multiple progress payments (e.g., Deposit, Milestone, Completion)</p>
-                                )}
                             </div>
                         </div>
                     </div>
