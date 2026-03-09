@@ -56,21 +56,21 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const isApproved = initialEstimate.status === "Approved";
 
     return (
-        <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+        <div className="hui-card overflow-hidden">
             {/* Header section */}
-            <div className="p-8 border-b border-slate-200">
+            <div className="p-8 border-b border-hui-border">
                 <div className="flex justify-between items-start">
                     <div>
                         {companySettings?.logoUrl && (
                             <img src={companySettings.logoUrl} alt="Company Logo" className="h-12 w-auto mb-4 object-contain print:h-10 print:mb-2" />
                         )}
-                        <h1 className="text-3xl font-bold text-slate-900 mb-2">Estimate: {initialEstimate.title}</h1>
-                        <p className="text-slate-500">From: {companySettings?.companyName || initialEstimate.projectName || initialEstimate.leadName}</p>
-                        <p className="text-slate-500 mb-4">For: {initialEstimate.clientName}</p>
+                        <h1 className="text-3xl font-bold text-hui-textMain mb-2">Estimate: {initialEstimate.title}</h1>
+                        <p className="text-hui-textMuted">From: {companySettings?.companyName || initialEstimate.projectName || initialEstimate.leadName}</p>
+                        <p className="text-hui-textMuted mb-4">For: {initialEstimate.clientName}</p>
                         <a
                             href={`/api/pdf/${initialEstimate.id}`}
                             target="_blank"
-                            className="print:hidden inline-flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-medium rounded transition"
+                            className="print:hidden inline-flex items-center gap-2 hui-btn hui-btn-secondary"
                         >
                             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -79,8 +79,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </a>
                     </div>
                     <div className="text-right">
-                        <div className="text-sm text-slate-500 mb-1">Estimate #</div>
-                        <div className="font-semibold text-slate-800">{initialEstimate.code}</div>
+                        <div className="text-sm text-hui-textMuted mb-1">Estimate #</div>
+                        <div className="font-semibold text-hui-textMain">{initialEstimate.code}</div>
                         <div className="mt-2">
                             {isApproved ? (
                                 <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 border border-green-200">
@@ -115,18 +115,18 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             <div className="p-8 space-y-8">
                 {/* Items Table */}
                 <div>
-                    <h2 className="text-lg font-semibold text-slate-800 mb-4">Line Items</h2>
-                    <div className="border border-slate-200 rounded-md overflow-hidden">
-                        <table className="min-w-full divide-y divide-slate-200">
-                            <thead className="bg-slate-50">
+                    <h2 className="text-lg font-semibold text-hui-textMain mb-4">Line Items</h2>
+                    <div className="border border-hui-border rounded-md overflow-hidden">
+                        <table className="min-w-full divide-y divide-hui-border">
+                            <thead className="bg-hui-background">
                                 <tr>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Item</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Qty</th>
-                                    <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">Cost</th>
-                                    <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">Total</th>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-hui-textMuted uppercase tracking-wider">Item</th>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-hui-textMuted uppercase tracking-wider">Qty</th>
+                                    <th className="px-6 py-3 text-right text-xs font-medium text-hui-textMuted uppercase tracking-wider">Cost</th>
+                                    <th className="px-6 py-3 text-right text-xs font-medium text-hui-textMuted uppercase tracking-wider">Total</th>
                                 </tr>
                             </thead>
-                            <tbody className="bg-white divide-y divide-slate-100">
+                            <tbody className="bg-white divide-y divide-hui-border">
                                 {items.map((item: any) => {
                                     const hasSubItems = item.subItems && item.subItems.length > 0;
                                     const itemTotal = calculateTotal(item);
@@ -135,16 +135,16 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                         <React.Fragment key={item.id}>
                                             <tr className={hasSubItems ? "bg-slate-50/50" : ""}>
                                                 <td className="px-6 py-4">
-                                                    <div className="font-medium text-slate-900">{item.name}</div>
-                                                    {item.description && <div className="text-sm text-slate-500 mt-1">{item.description}</div>}
+                                                    <div className="font-medium text-hui-textMain">{item.name}</div>
+                                                    {item.description && <div className="text-sm text-hui-textMuted mt-1">{item.description}</div>}
                                                 </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-hui-textMuted">
                                                     {!hasSubItems ? item.quantity : ""}
                                                 </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500 text-right">
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-hui-textMuted text-right">
                                                     {!hasSubItems ? `$${item.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : ""}
                                                 </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-slate-900 text-right">
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-hui-textMain text-right">
                                                     ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                                 </td>
                                             </tr>
@@ -152,15 +152,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                             {hasSubItems && item.subItems.map((sub: any) => (
                                                 <tr key={sub.id} className="bg-white">
                                                     <td className="px-6 py-3 pl-12 text-sm">
-                                                        <div className="text-slate-700 flex items-center">
-                                                            <svg className="w-4 h-4 text-slate-400 mr-2 -ml-6" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" /></svg>
+                                                        <div className="text-hui-textMain flex items-center">
+                                                            <svg className="w-4 h-4 text-hui-textMuted mr-2 -ml-6" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" /></svg>
                                                             {sub.name}
                                                         </div>
-                                                        {sub.description && <div className="text-slate-500 text-xs mt-1">{sub.description}</div>}
+                                                        {sub.description && <div className="text-hui-textMuted text-xs mt-1">{sub.description}</div>}
                                                     </td>
-                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-slate-500">{sub.quantity}</td>
-                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-slate-500 text-right">${sub.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-slate-600 text-right">${sub.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-hui-textMuted">{sub.quantity}</td>
+                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-hui-textMuted text-right">${sub.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-hui-textMain text-right">${sub.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                                                 </tr>
                                             ))}
                                         </React.Fragment>
@@ -174,18 +174,18 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 {/* Progress Payments */}
                 {initialEstimate.paymentSchedules && initialEstimate.paymentSchedules.length > 0 && (
                     <div>
-                        <h2 className="text-lg font-semibold text-slate-800 mb-4">Payment Schedule</h2>
-                        <div className="border border-slate-200 rounded-md overflow-hidden bg-white">
-                            <ul className="divide-y divide-slate-100">
+                        <h2 className="text-lg font-semibold text-hui-textMain mb-4">Payment Schedule</h2>
+                        <div className="border border-hui-border rounded-md overflow-hidden bg-white">
+                            <ul className="divide-y divide-hui-border">
                                 {initialEstimate.paymentSchedules.map((payment: any) => (
                                     <li key={payment.id} className="px-6 py-4 flex justify-between items-center text-sm">
                                         <div>
-                                            <span className="font-medium text-slate-900">{payment.name}</span>
-                                            {payment.percentage && <span className="ml-2 text-slate-500">({payment.percentage}%)</span>}
+                                            <span className="font-medium text-hui-textMain">{payment.name}</span>
+                                            {payment.percentage && <span className="ml-2 text-hui-textMuted">({payment.percentage}%)</span>}
                                         </div>
-                                        <div className="flex gap-8 items-center text-slate-600 text-right">
+                                        <div className="flex gap-8 items-center text-hui-textMuted text-right">
                                             <span>{payment.dueDate ? new Date(payment.dueDate).toLocaleDateString() : 'TBD'}</span>
-                                            <span className="font-semibold text-slate-900 w-24">${payment.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                            <span className="font-semibold text-hui-textMain w-24">${payment.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                         </div>
                                     </li>
                                 ))}
@@ -196,17 +196,17 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                 {/* Totals Box */}
                 <div className="flex justify-end pt-4">
-                    <div className="w-80 space-y-3 bg-slate-50 p-6 rounded-lg border border-slate-200">
-                        <div className="flex justify-between text-slate-600 text-sm">
+                    <div className="w-80 space-y-3 bg-hui-background p-6 rounded-lg border border-hui-border">
+                        <div className="flex justify-between text-hui-textMuted text-sm">
                             <span>Subtotal</span>
                             <span>${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                         </div>
-                        <div className="flex justify-between text-slate-600 text-sm">
+                        <div className="flex justify-between text-hui-textMuted text-sm">
                             <span>Estimated Tax (8.7%)</span>
                             <span>${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                         </div>
-                        <div className="h-px w-full bg-slate-200 my-2"></div>
-                        <div className="flex justify-between text-lg font-bold text-slate-900">
+                        <div className="h-px w-full bg-hui-border my-2"></div>
+                        <div className="flex justify-between text-lg font-bold text-hui-textMain">
                             <span>Estimate Total</span>
                             <span>${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                         </div>
@@ -215,40 +215,40 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                 {/* Approval Area */}
                 {!isApproved && (
-                    <div className="mt-12 pt-8 border-t border-slate-200 flex flex-col items-center print:hidden">
-                        <p className="text-slate-600 mb-6 text-center max-w-lg">Please review the details above. By approving this estimate, you agree to the terms and authorize work to proceed.</p>
+                    <div className="mt-12 pt-8 border-t border-hui-border flex flex-col items-center print:hidden">
+                        <p className="text-hui-textMuted mb-6 text-center max-w-lg">Please review the details above. By approving this estimate, you agree to the terms and authorize work to proceed.</p>
 
                         {!isApproving ? (
                             <button
                                 onClick={() => setIsApproving(true)}
-                                className="px-8 py-3 bg-blue-600 text-white font-medium rounded-md shadow-sm hover:bg-blue-700 transition"
+                                className="hui-btn hui-btn-primary px-8 py-3"
                             >
                                 Approve & Sign Estimate
                             </button>
                         ) : (
-                            <div className="w-full max-w-md bg-slate-50 p-6 rounded-lg border border-slate-200 shadow-sm">
-                                <h3 className="text-lg font-semibold text-slate-900 mb-4">Finalize Approval</h3>
+                            <div className="w-full max-w-md bg-hui-background p-6 rounded-lg border border-hui-border shadow-sm">
+                                <h3 className="text-lg font-semibold text-hui-textMain mb-4">Finalize Approval</h3>
 
                                 <div className="space-y-4">
                                     <div>
-                                        <label className="block text-sm font-medium text-slate-700 mb-1">Electronic Signature (Type Full Name)</label>
+                                        <label className="block text-sm font-medium text-hui-textMuted mb-1">Electronic Signature (Type Full Name)</label>
                                         <input
                                             type="text"
                                             value={signature}
                                             onChange={(e) => setSignature(e.target.value)}
-                                            className="w-full border border-slate-300 rounded px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 font-serif italic text-lg"
+                                            className="hui-input w-full font-serif italic text-lg"
                                             placeholder="John Doe"
                                             autoFocus
                                         />
                                         {error && <p className="text-red-500 text-xs mt-1">{error}</p>}
                                     </div>
 
-                                    <p className="text-xs text-slate-500">I agree that my typed name above acts as my legal electronic signature and binds me to the terms of this estimate.</p>
+                                    <p className="text-xs text-hui-textMuted">I agree that my typed name above acts as my legal electronic signature and binds me to the terms of this estimate.</p>
 
                                     <div className="flex gap-3 justify-end pt-2">
                                         <button
                                             onClick={() => setIsApproving(false)}
-                                            className="px-4 py-2 text-slate-600 hover:text-slate-900 font-medium text-sm transition"
+                                            className="hui-btn hui-btn-secondary px-4 py-2"
                                             disabled={isSubmitting}
                                         >
                                             Cancel
@@ -256,7 +256,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                         <button
                                             onClick={handleApprove}
                                             disabled={isSubmitting}
-                                            className="px-6 py-2 bg-green-600 text-white font-medium text-sm rounded transition hover:bg-green-700 disabled:opacity-50 flex items-center gap-2"
+                                            className="hui-btn hui-btn-green px-6 py-2 flex items-center gap-2"
                                         >
                                             {isSubmitting ? "Processing..." : "Sign & Agree"}
                                             {!isSubmitting && (
