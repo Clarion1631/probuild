@@ -32,8 +32,8 @@ export default async function VarianceReportPage() {
     return (
         <div className="max-w-7xl mx-auto py-8 px-6 space-y-8">
             <div className="flex justify-between items-center">
-                <h1 className="text-3xl font-bold">Project Variance Report</h1>
-                <Link href="/manager/time-entries" className="px-4 py-2 bg-slate-100 text-slate-700 rounded shadow-sm text-sm font-medium hover:bg-slate-200 transition">
+                <h1 className="text-2xl font-bold text-hui-textMain">Project Variance Report</h1>
+                <Link href="/manager/time-entries" className="hui-btn hui-btn-primary">
                     View Time Entries Audit
                 </Link>
             </div>
@@ -59,15 +59,15 @@ export default async function VarianceReportPage() {
                     const isOverBudget = projectVariance < 0;
 
                     return (
-                        <div key={budget.id} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                            <div className="p-6 border-b border-slate-200 bg-slate-50 flex justify-between items-start">
+                        <div key={budget.id} className="hui-card overflow-hidden">
+                            <div className="p-6 border-b border-hui-border bg-slate-50 flex justify-between items-start">
                                 <div>
-                                    <h2 className="text-xl font-bold text-slate-900">{budget.project.name}</h2>
-                                    <p className="text-sm text-slate-500 mt-1">Estimate: {budget.estimate.code} - {budget.estimate.title}</p>
+                                    <h2 className="text-xl font-bold text-hui-textMain">{budget.project.name}</h2>
+                                    <p className="text-sm text-hui-textMuted mt-1">Estimate: {budget.estimate.code} - {budget.estimate.title}</p>
                                 </div>
                                 <div className="text-right">
-                                    <div className="text-sm text-slate-500 mb-1">Total Labor Variance</div>
-                                    <div className={`text-xl font-bold \${isOverBudget ? 'text-red-500' : 'text-green-500'}`}>
+                                    <div className="text-sm text-hui-textMuted mb-1">Total Labor Variance</div>
+                                    <div className={`text-xl font-bold ${isOverBudget ? 'text-red-600' : 'text-green-600'}`}>
                                         {isOverBudget ? '-' : '+'}${Math.abs(projectVariance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                     </div>
                                 </div>
@@ -75,8 +75,8 @@ export default async function VarianceReportPage() {
 
                             <div className="p-6">
                                 <div className="flex justify-between text-sm mb-2">
-                                    <span className="font-medium text-slate-700">Budgeted Labor: ${totalLaborBudget.toLocaleString()}</span>
-                                    <span className="font-medium text-slate-700">Actual Labor + Burden: ${totalActualLabor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                    <span className="font-medium text-hui-textMain">Budgeted Labor: ${totalLaborBudget.toLocaleString()}</span>
+                                    <span className="font-medium text-hui-textMain">Actual Labor + Burden: ${totalActualLabor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                 </div>
                                 <div className="w-full bg-slate-100 rounded-full h-3 mb-8 overflow-hidden flex">
                                     <div
@@ -85,26 +85,26 @@ export default async function VarianceReportPage() {
                                     ></div>
                                 </div>
 
-                                <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 mb-4">Phase Breakdown</h3>
+                                <h3 className="text-sm font-semibold uppercase tracking-wider text-hui-textMuted mb-4">Phase Breakdown</h3>
                                 <div className="space-y-4">
                                     {bucketsWithActuals.map((b: any) => (
-                                        <div key={b.id} className="flex items-center justify-between p-4 rounded-lg bg-slate-50 border border-slate-100">
-                                            <div className="w-1/3 font-medium text-slate-800">{b.name}</div>
+                                        <div key={b.id} className="flex items-center justify-between p-4 rounded-lg bg-slate-50 border border-hui-border">
+                                            <div className="w-1/3 font-medium text-hui-textMain">{b.name}</div>
                                             <div className="w-1/4 text-sm">
-                                                <div className="text-slate-500">Budget</div>
-                                                <div className="font-medium">${(b.laborBudget || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                                <div className="text-hui-textMuted">Budget</div>
+                                                <div className="font-medium text-hui-textMain">${(b.laborBudget || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                                             </div>
                                             <div className="w-1/4 text-sm">
-                                                <div className="text-slate-500">Actual (w/ Burden)</div>
-                                                <div className="font-medium">${b.actualLabor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                                <div className="text-hui-textMuted">Actual (w/ Burden)</div>
+                                                <div className="font-medium text-hui-textMain">${b.actualLabor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                                             </div>
-                                            <div className={`w-1/4 text-sm text-right font-bold \${b.variance < 0 ? 'text-red-500' : 'text-green-500'}`}>
+                                            <div className={`w-1/4 text-sm text-right font-bold ${b.variance < 0 ? 'text-red-600' : 'text-green-600'}`}>
                                                 {b.variance < 0 ? '-' : '+'}${Math.abs(b.variance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                             </div>
                                         </div>
                                     ))}
                                     {bucketsWithActuals.length === 0 && (
-                                        <div className="text-sm text-slate-400 italic">No phases found for this budget.</div>
+                                        <div className="text-sm text-hui-textMuted italic">No phases found for this budget.</div>
                                     )}
                                 </div>
                             </div>
@@ -113,7 +113,7 @@ export default async function VarianceReportPage() {
                 })}
 
                 {budgets.length === 0 && (
-                    <div className="text-center py-12 text-slate-500 bg-white rounded-xl border border-slate-200 border-dashed">
+                    <div className="text-center py-12 text-hui-textMuted hui-card border-dashed">
                         No budgets found automatically generated from approved estimates.
                     </div>
                 )}
