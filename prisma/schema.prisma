@@ -407,6 +407,7 @@ model ScheduleTask {
   comments       TaskComment[]
   punchItems     TaskPunchItem[]
   assignments    TaskAssignment[]
+  subAssignments SubTaskAssignment[]
 }
 
 model TaskDependency {
@@ -452,6 +453,39 @@ model TaskAssignment {
   createdAt      DateTime     @default(now())
 
   @@unique([taskId, userId])
+}
+
+model Subcontractor {
+  id              String   @id @default(cuid())
+  companyName     String
+  contactName     String?
+  email           String   @unique
+  phone           String?
+  trade           String?   // Electrical, Plumbing, HVAC, etc.
+  licenseNumber   String?
+  status          String   @default("ACTIVE")  // ACTIVE, INACTIVE
+  
+  // Certificate of Insurance
+  coiFileUrl      String?
+  coiExpiresAt    DateTime?
+  coiUploaded     Boolean  @default(false)
+  
+  // Relations
+  taskAssignments SubTaskAssignment[]
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model SubTaskAssignment {
+  id               String         @id @default(cuid())
+  subcontractorId  String
+  subcontractor    Subcontractor  @relation(fields: [subcontractorId], references: [id], onDelete: Cascade)
+  taskId           String
+  task             ScheduleTask   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  createdAt        DateTime       @default(now())
+  
+  @@unique([subcontractorId, taskId])
 }
 
 model FileFolder {

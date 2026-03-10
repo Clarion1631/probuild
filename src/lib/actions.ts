@@ -1179,6 +1179,8 @@ export async function getScheduleTasks(projectId: string) {
             dependencies: { include: { predecessor: true } },
             dependents: { include: { dependent: true } },
             timeEntries: { select: { durationHours: true } },
+            assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
+            subAssignments: { include: { subcontractor: true } },
         },
     });
 }
@@ -1406,6 +1408,24 @@ export async function unassignUserFromTask(taskId: string, userId: string) {
     if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
 }
 
+export async function assignSubToTask(taskId: string, subcontractorId: string) {
+    const assignment = await prisma.subTaskAssignment.create({
+        data: { taskId, subcontractorId },
+        include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } },
+    });
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
+    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    return assignment;
+}
+
+export async function unassignSubFromTask(taskId: string, subcontractorId: string) {
+    await prisma.subTaskAssignment.deleteMany({
+        where: { taskId, subcontractorId },
+    });
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
+    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+}
+
 // ========== AI PUNCHLIST ==========
 
 export async function aiGeneratePunchlist(taskId: string) {
@@ -1595,8 +1615,13 @@ export async function clearAllTasks(projectId: string) {
     if (taskIds.length === 0) return;
     await prisma.taskAssignment.deleteMany({ where: { taskId: { in: taskIds } } });
     await prisma.taskComment.deleteMany({ where: { taskId: { in: taskIds } } });
-    await prisma.taskPunchItem.deleteMany({ where: { taskId: { in: taskIds } } });
-    await prisma.taskDependency.deleteMany({ where: { OR: [{ predecessorId: { in: taskIds } }, { dependentId: { in: taskIds } }] } });
-    await prisma.scheduleTask.deleteMany({ where: { projectId } });
     revalidatePath(`/projects/${projectId}/schedule`);
+}
+
+export async function getActiveSubcontractors() {
+    return prisma.subcontractor.findMany({
+        where: { status: "ACTIVE" },
+        orderBy: { companyName: "asc" },
+        select: { id: true, companyName: true, email: true, trade: true }
+    });
 }

@@ -1,14 +1,15 @@
-import { getProject, getScheduleTasks, getTeamMembers } from "@/lib/actions";
+import { getProject, getScheduleTasks, getTeamMembers, getActiveSubcontractors } from "@/lib/actions";
 import GanttChart from "./GanttChart";
 
 export const dynamic = "force-dynamic";
 
 export default async function SchedulePage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
-    const [project, rawTasks, teamMembers] = await Promise.all([
+    const [project, rawTasks, teamMembers, subcontractors] = await Promise.all([
         getProject(id),
         getScheduleTasks(id),
         getTeamMembers(),
+        getActiveSubcontractors(),
     ]);
     if (!project) return <div className="p-6 text-hui-textMuted">Project not found</div>;
 
@@ -27,6 +28,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
         dependencies: (t.dependencies || []).map((d: any) => ({ id: d.id, predecessorId: d.predecessorId, dependentId: d.dependentId })),
         dependents: (t.dependents || []).map((d: any) => ({ id: d.id, predecessorId: d.predecessorId, dependentId: d.dependentId })),
         assignments: (t.assignments || []).map((a: any) => ({ id: a.id, userId: a.userId, user: a.user })),
+        subAssignments: (t.subAssignments || []).map((a: any) => ({ id: a.id, subcontractorId: a.subcontractorId, subcontractor: a.subcontractor })),
     }));
 
     const estimates = (project.estimates || []).map((e: any) => ({ id: e.id, title: e.title, status: e.status }));
@@ -39,6 +41,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
                 initialTasks={tasks}
                 estimates={estimates}
                 teamMembers={teamMembers as any}
+                subcontractors={subcontractors as any}
             />
         </div>
     );

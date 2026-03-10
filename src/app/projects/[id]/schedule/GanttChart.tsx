@@ -7,7 +7,7 @@ import {
     aiGenerateSchedule,
     addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
-    assignUserToTask, unassignUserFromTask,
+    assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask
 } from "@/lib/actions";
 import { toast } from "sonner";
 
@@ -17,6 +17,8 @@ type TeamMember = { id: string; name: string | null; email: string };
 type PunchItem = { id: string; name: string; completed: boolean; order: number };
 type Comment = { id: string; text: string; createdAt: string; user: { id: string; name: string | null; email: string } };
 type Assignment = { id: string; userId: string; user: TeamMember };
+type Subcontractor = { id: string; companyName: string; email: string; trade: string | null };
+type SubAssignment = { id: string; subcontractorId: string; subcontractor: Subcontractor };
 
 type Task = {
     id: string;
@@ -33,6 +35,7 @@ type Task = {
     dependencies: Dependency[];
     dependents: Dependency[];
     assignments?: Assignment[];
+    subAssignments?: SubAssignment[];
 };
 
 type ZoomLevel = "day" | "week" | "month";
@@ -53,12 +56,13 @@ function getMonday(d: Date) { const day = d.getDay(); const diff = d.getDate() -
 function isWeekend(d: Date) { const day = d.getDay(); return day === 0 || day === 6; }
 function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
 
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [] }: {
+export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [] }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
+    subcontractors?: Subcontractor[];
 }) {
     const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [zoom, setZoom] = useState<ZoomLevel>("week");
@@ -330,6 +334,22 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         if (!selectedTaskId) return;
         await unassignUserFromTask(selectedTaskId, userId);
         setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: (t.assignments || []).filter(a => a.userId !== userId) } : t));
+    }
+    
+    // Subcontractor assignments
+    async function handleAssignSub(subcontractorId: string) {
+        if (!selectedTaskId) return;
+        try {
+            const assignment = await assignSubToTask(selectedTaskId, subcontractorId);
+            setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, subAssignments: [...(t.subAssignments || []), assignment as any] } : t));
+            setShowAssignMenu(false);
+            toast.success("Subcontractor assigned");
+        } catch { toast.error("Already assigned"); }
+    }
+    async function handleUnassignSub(subId: string) {
+        if (!selectedTaskId) return;
+        await unassignSubFromTask(selectedTaskId, subId);
+        setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, subAssignments: (t.subAssignments || []).filter(a => a.subcontractorId !== subId) } : t));
     }
 
     // Arrows
@@ -652,18 +672,28 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                     {/* Assigned Members */}
                                     <div>
                                         <div className="flex items-center justify-between mb-2">
-                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Assigned Members</label>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Assigned</label>
                                             <div className="relative">
                                                 <button onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
                                                 {showAssignMenu && (
-                                                    <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[200px] py-1 animate-in fade-in max-h-48 overflow-y-auto">
+                                                    <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[220px] py-1 animate-in fade-in max-h-60 overflow-y-auto">
+                                                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50">Team Members</div>
                                                         {teamMembers.filter(m => !(selectedTask.assignments || []).some(a => a.userId === m.id)).map(m => (
                                                             <button key={m.id} onClick={() => handleAssign(m.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition flex items-center gap-2 text-xs">
-                                                                <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-[9px] font-bold flex items-center justify-center">{getInitials(m.name, m.email)}</div>
-                                                                {m.name || m.email}
+                                                                <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-[9px] font-bold flex items-center justify-center shrink-0">{getInitials(m.name, m.email)}</div>
+                                                                <span className="truncate">{m.name || m.email}</span>
                                                             </button>
                                                         ))}
-                                                        {teamMembers.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No team members found</div>}
+                                                        
+                                                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 mt-1 border-t border-hui-border">Subcontractors</div>
+                                                        {subcontractors.filter(s => !(selectedTask.subAssignments || []).some(a => a.subcontractorId === s.id)).map(s => (
+                                                            <button key={s.id} onClick={() => handleAssignSub(s.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition flex items-center gap-2 text-xs">
+                                                                <div className="w-6 h-6 rounded-full bg-purple-100 text-purple-700 text-[9px] font-bold flex items-center justify-center shrink-0">{s.companyName.substring(0,2).toUpperCase()}</div>
+                                                                <span className="truncate flex-1">{s.companyName}</span>
+                                                            </button>
+                                                        ))}
+                                                        
+                                                        {teamMembers.length === 0 && subcontractors.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No options found</div>}
                                                     </div>
                                                 )}
                                             </div>
@@ -671,14 +701,23 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                         <div className="space-y-1.5">
                                             {(selectedTask.assignments || []).map(a => (
                                                 <div key={a.userId} className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2">
-                                                    <div className="w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-bold flex items-center justify-center">{getInitials(a.user.name, a.user.email)}</div>
-                                                    <span className="text-xs font-medium text-hui-textMain flex-1">{a.user.name || a.user.email}</span>
-                                                    <button onClick={() => handleUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition">
+                                                    <div className="w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-bold flex items-center justify-center shrink-0">{getInitials(a.user.name, a.user.email)}</div>
+                                                    <span className="text-xs font-medium text-hui-textMain flex-1 truncate">{a.user.name || a.user.email}</span>
+                                                    <button onClick={() => handleUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition shrink-0">
                                                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                     </button>
                                                 </div>
                                             ))}
-                                            {(selectedTask.assignments || []).length === 0 && <p className="text-xs text-slate-400 italic">No members assigned</p>}
+                                            {(selectedTask.subAssignments || []).map(a => (
+                                                <div key={a.subcontractorId} className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2 border-l-2 border-purple-400">
+                                                    <div className="w-7 h-7 rounded-full bg-purple-100 text-purple-700 text-[10px] font-bold flex items-center justify-center shrink-0">{a.subcontractor.companyName.substring(0, 2).toUpperCase()}</div>
+                                                    <span className="text-xs font-medium text-hui-textMain flex-1 truncate">{a.subcontractor.companyName} <span className="text-purple-600/70 ml-1 text-[10px]">(Sub)</span></span>
+                                                    <button onClick={() => handleUnassignSub(a.subcontractorId)} className="text-slate-300 hover:text-red-500 transition shrink-0">
+                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                    </button>
+                                                </div>
+                                            ))}
+                                            {(selectedTask.assignments || []).length === 0 && (selectedTask.subAssignments || []).length === 0 && <p className="text-xs text-slate-400 italic">No one assigned</p>}
                                         </div>
                                     </div>
                                 </div>
