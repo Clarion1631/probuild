@@ -102,7 +102,7 @@ export default function SubcontractorsPage() {
                         {filtered.map(s => (
                             <tr key={s.id} className="border-b border-hui-border last:border-0 hover:bg-slate-50/50 transition">
                                 <td className="px-5 py-3.5">
-                                    <Link href={`/settings/subcontractors/${s.id}`} className="font-semibold text-hui-textMain hover:text-hui-primary transition">
+                                    <Link href={`/company/subcontractors/${s.id}`} className="font-semibold text-hui-textMain hover:text-hui-primary transition">
                                         {s.companyName}
                                     </Link>
                                     <p className="text-xs text-slate-500 mt-0.5">{s.email}</p>

@@ -50,7 +50,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
         const res = await fetch(`/api/subcontractors/${id}`);
         if (!res.ok) {
             toast.error("Subcontractor not found");
-            router.push("/settings/subcontractors");
+            router.push("/company/subcontractors");
             return;
         }
         const data = await res.json();
@@ -91,7 +91,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
             const res = await fetch(`/api/subcontractors/${id}`, { method: "DELETE" });
             if (!res.ok) throw new Error("Failed to delete");
             toast.success("Subcontractor deleted");
-            router.push("/settings/subcontractors");
+            router.push("/company/subcontractors");
         } catch {
             toast.error("Failed to delete subcontractor");
         }
@@ -104,7 +104,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
         <div className="flex-1 p-6 md:p-8 max-w-5xl">
             {/* Header */}
             <div className="flex items-center gap-4 mb-8">
-                <Link href="/settings/subcontractors" className="p-2 hover:bg-slate-100 rounded-full transition text-slate-400 hover:text-hui-primary">
+                <Link href="/company/subcontractors" className="p-2 hover:bg-slate-100 rounded-full transition text-slate-400 hover:text-hui-primary">
                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                 </Link>
                 <div>
