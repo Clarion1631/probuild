@@ -11,7 +11,7 @@ export const authOptions: NextAuthOptions = {
     ],
     pages: {
         signIn: "/login",
-        error: "/login?error=AccessDenied", // Redirect here if signin blocked
+        error: "/login?error=AccessDenied",
     },
     callbacks: {
         async signIn({ user, account, profile }) {
@@ -19,22 +19,29 @@ export const authOptions: NextAuthOptions = {
                 const email = user.email;
                 if (!email) return false;
 
-                // Only allow login if the email is already in the database
                 const existingUser = await prisma.user.findUnique({
                     where: { email: email.toLowerCase() }
                 });
 
                 if (!existingUser) {
-                    // Returns false or an error string (or URL) to reject
                     return "/login?error=AccessDenied";
+                }
+
+                // Activate user on first sign-in
+                if (existingUser.status === "PENDING") {
+                    await prisma.user.update({
+                        where: { id: existingUser.id },
+                        data: { status: "ACTIVATED" },
+                    });
                 }
             }
             return true;
         },
-        async jwt({ token, user }) {
-            if (user?.email) {
+        async jwt({ token, user, trigger }) {
+            // Always read the latest role from DB (picks up admin role changes)
+            if (token.email) {
                 const dbUser = await prisma.user.findUnique({
-                    where: { email: user.email.toLowerCase() }
+                    where: { email: (token.email as string).toLowerCase() }
                 });
                 if (dbUser) {
                     token.role = dbUser.role;
