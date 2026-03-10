@@ -30,6 +30,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         try {
             const userAgent = window.navigator.userAgent;
             await approveEstimate(initialEstimate.id, signature.trim(), "Client IP", userAgent, signatureDataUrl);
+            window.location.reload();
         } catch (e) {
             setError("Something went wrong processing your approval.");
         } finally {
@@ -38,7 +39,6 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         }
     };
 
-    // Calculate totals based on hierarchical structure
     const calculateTotal = (item: any) => {
         if (item.subItems && item.subItems.length > 0) {
             return item.subItems.reduce((sum: number, subItem: any) => sum + (subItem.total || 0), 0);
@@ -47,132 +47,151 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     };
 
     const topLevelItems = initialEstimate.items.filter((i: any) => !i.parentId);
-    // Nest sub-items
     const items = topLevelItems.map((parent: any) => {
         parent.subItems = initialEstimate.items.filter((i: any) => i.parentId === parent.id);
         return parent;
     });
 
     const subtotal = items.reduce((sum: number, item: any) => sum + calculateTotal(item), 0);
-    const tax = subtotal * 0.087; // 8.7% fake tax rate
+    const tax = subtotal * 0.087;
     const total = subtotal + tax;
-
     const isApproved = initialEstimate.status === "Approved";
+    const companyName = companySettings?.companyName || "Golden Touch Remodeling";
+    const companyPhone = companySettings?.phone || "";
+    const companyEmail = companySettings?.email || "";
+    const companyAddress = companySettings?.address || "";
 
     return (
-        <div className="hui-card overflow-hidden">
-            {/* Header section */}
-            <div className="p-8 border-b border-hui-border">
-                <div className="flex justify-between items-start">
-                    <div>
-                        {companySettings?.logoUrl && (
-                            <img src={companySettings.logoUrl} alt="Company Logo" className="h-12 w-auto mb-4 object-contain print:h-10 print:mb-2" />
-                        )}
-                        <h1 className="text-3xl font-bold text-hui-textMain mb-2">Estimate: {initialEstimate.title}</h1>
-                        <p className="text-hui-textMuted">From: {companySettings?.companyName || initialEstimate.projectName || initialEstimate.leadName}</p>
-                        <p className="text-hui-textMuted mb-4">For: {initialEstimate.clientName}</p>
-                        <a
-                            href={`/api/pdf/${initialEstimate.id}`}
-                            target="_blank"
-                            className="print:hidden inline-flex items-center gap-2 hui-btn hui-btn-secondary"
-                        >
-                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                            </svg>
-                            Download PDF
-                        </a>
-                    </div>
-                    <div className="text-right">
-                        <div className="text-sm text-hui-textMuted mb-1">Estimate #</div>
-                        <div className="font-semibold text-hui-textMain">{initialEstimate.code}</div>
-                        <div className="mt-2">
-                            {isApproved ? (
-                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 border border-green-200">
-                                    Approved
-                                </span>
-                            ) : (
-                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 border border-blue-200">
-                                    {initialEstimate.status}
-                                </span>
-                            )}
-                        </div>
-                    </div>
+        <div className="min-h-screen bg-slate-100 font-sans">
+            {/* Minimal Top Bar */}
+            <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden">
+                <div className="flex items-center gap-3">
+                    {companySettings?.logoUrl ? (
+                        <img src={companySettings.logoUrl} alt={companyName} className="h-8 w-auto object-contain" />
+                    ) : (
+                        <img src="/logo.png" alt={companyName} className="h-8 w-auto object-contain" />
+                    )}
+                    <span className="text-sm text-slate-500">Estimate Portal</span>
                 </div>
+                {isApproved && (
+                    <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Approved & Signed</span>
+                )}
+            </header>
 
-                {isApproved && initialEstimate.approvedBy && (
-                    <div className="mt-6 p-4 bg-green-50 border border-green-200 rounded-lg flex flex-col gap-3">
-                        <div className="flex items-start gap-3">
-                            <svg className="h-5 w-5 text-green-600 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            </svg>
+            {/* Document Container */}
+            <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
+                <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+
+                    {/* Document Header */}
+                    <div className="px-10 pt-10 pb-8 border-b border-slate-200">
+                        <div className="flex justify-between items-start">
                             <div>
-                                <h3 className="text-sm font-medium text-green-800">Electronically Signed and Approved</h3>
-                                <div className="mt-1 text-sm text-green-700">
-                                    <p>Signed by: <strong>{initialEstimate.approvedBy}</strong></p>
-                                    <p>Date: {new Date(initialEstimate.approvedAt).toLocaleString()}</p>
+                                {companySettings?.logoUrl ? (
+                                    <img src={companySettings.logoUrl} alt={companyName} className="h-14 w-auto object-contain mb-3" />
+                                ) : (
+                                    <img src="/logo.png" alt={companyName} className="h-14 w-auto object-contain mb-3" />
+                                )}
+                                <h2 className="text-lg font-bold text-slate-800">{companyName}</h2>
+                                {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
+                                {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
+                                {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
+                            </div>
+                            <div className="text-right">
+                                <h1 className="text-2xl font-bold text-slate-800 tracking-tight">ESTIMATE</h1>
+                                <div className="mt-2 space-y-1 text-sm">
+                                    <p className="text-slate-500">Estimate # <span className="font-semibold text-slate-700">{initialEstimate.code}</span></p>
+                                    <p className="text-slate-500">Date: <span className="text-slate-700">{new Date(initialEstimate.createdAt).toLocaleDateString()}</span></p>
+                                </div>
+                                <div className="mt-3">
+                                    {isApproved ? (
+                                        <span className="inline-flex items-center gap-1 px-3 py-1 rounded-md text-xs font-bold bg-green-50 text-green-700 border border-green-200 uppercase tracking-wider">
+                                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                                            Approved
+                                        </span>
+                                    ) : (
+                                        <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
+                                            Pending Approval
+                                        </span>
+                                    )}
                                 </div>
                             </div>
                         </div>
-                        {initialEstimate.signatureUrl && (
-                            <div className="mt-2 border-t border-green-200 pt-3">
-                                <p className="text-xs text-green-700 mb-2">Signature:</p>
-                                <img src={initialEstimate.signatureUrl} alt="Client Signature" className="h-16 object-contain" />
-                            </div>
-                        )}
-                    </div>
-                )}
-            </div>
 
-            {/* Main Content */}
-            <div className="p-8 space-y-8">
-                {/* Items Table */}
-                <div>
-                    <h2 className="text-lg font-semibold text-hui-textMain mb-4">Line Items</h2>
-                    <div className="border border-hui-border rounded-md overflow-hidden">
-                        <table className="min-w-full divide-y divide-hui-border">
-                            <thead className="bg-hui-background">
-                                <tr>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-hui-textMuted uppercase tracking-wider">Item</th>
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-hui-textMuted uppercase tracking-wider">Qty</th>
-                                    <th className="px-6 py-3 text-right text-xs font-medium text-hui-textMuted uppercase tracking-wider">Cost</th>
-                                    <th className="px-6 py-3 text-right text-xs font-medium text-hui-textMuted uppercase tracking-wider">Total</th>
+                        {/* Bill To */}
+                        <div className="mt-8 pt-6 border-t border-slate-100">
+                            <div className="grid grid-cols-2 gap-8">
+                                <div>
+                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Prepared For</p>
+                                    <p className="text-sm font-semibold text-slate-800">{initialEstimate.clientName || "Client"}</p>
+                                    <p className="text-sm text-slate-500">{initialEstimate.title}</p>
+                                </div>
+                                <div>
+                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
+                                    <p className="text-sm font-semibold text-slate-800">{initialEstimate.title || "Project"}</p>
+                                    <p className="text-sm text-slate-500">{initialEstimate.projectName || initialEstimate.leadName || ""}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Signed Badge */}
+                    {isApproved && initialEstimate.approvedBy && (
+                        <div className="mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
+                            <div className="flex items-start gap-3">
+                                <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">
+                                    <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
+                                </div>
+                                <div>
+                                    <h3 className="text-sm font-semibold text-green-800">Electronically Signed and Approved</h3>
+                                    <p className="text-sm text-green-700 mt-0.5">Signed by: <strong>{initialEstimate.approvedBy}</strong></p>
+                                    <p className="text-xs text-green-600 mt-0.5">{new Date(initialEstimate.approvedAt).toLocaleString()}</p>
+                                </div>
+                            </div>
+                            {initialEstimate.signatureUrl && (
+                                <div className="mt-3 pt-3 border-t border-green-200">
+                                    <img src={initialEstimate.signatureUrl} alt="Signature" className="h-12 object-contain" />
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Line Items Table */}
+                    <div className="px-10 py-8">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className="border-b-2 border-slate-200">
+                                    <th className="text-left py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider">Description</th>
+                                    <th className="text-center py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-20">Qty</th>
+                                    <th className="text-right py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-28">Unit Price</th>
+                                    <th className="text-right py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-28">Amount</th>
                                 </tr>
                             </thead>
-                            <tbody className="bg-white divide-y divide-hui-border">
+                            <tbody className="divide-y divide-slate-100">
                                 {items.map((item: any) => {
                                     const hasSubItems = item.subItems && item.subItems.length > 0;
                                     const itemTotal = calculateTotal(item);
-
                                     return (
                                         <React.Fragment key={item.id}>
                                             <tr className={hasSubItems ? "bg-slate-50/50" : ""}>
-                                                <td className="px-6 py-4">
-                                                    <div className="font-medium text-hui-textMain">{item.name}</div>
-                                                    {item.description && <div className="text-sm text-hui-textMuted mt-1">{item.description}</div>}
+                                                <td className="py-3">
+                                                    <div className="font-medium text-slate-800">{item.name}</div>
+                                                    {item.description && <div className="text-xs text-slate-500 mt-0.5">{item.description}</div>}
                                                 </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-hui-textMuted">
-                                                    {!hasSubItems ? item.quantity : ""}
-                                                </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-hui-textMuted text-right">
-                                                    {!hasSubItems ? `$${item.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : ""}
-                                                </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-hui-textMain text-right">
-                                                    ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                                </td>
+                                                <td className="py-3 text-center text-slate-600">{!hasSubItems ? item.quantity : ""}</td>
+                                                <td className="py-3 text-right text-slate-600">{!hasSubItems ? `$${item.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ""}</td>
+                                                <td className="py-3 text-right font-medium text-slate-800">${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                                             </tr>
-                                            {/* Sub Items */}
                                             {hasSubItems && item.subItems.map((sub: any) => (
-                                                <tr key={sub.id} className="bg-white">
-                                                    <td className="px-6 py-3 pl-12 text-sm">
-                                                        <div className="text-hui-textMain flex items-center">
-                                                            <svg className="w-4 h-4 text-hui-textMuted mr-2 -ml-6" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" /></svg>
-                                                            {sub.name}
+                                                <tr key={sub.id}>
+                                                    <td className="py-2.5 pl-6">
+                                                        <div className="text-slate-600 flex items-center gap-1">
+                                                            <span className="text-slate-300">└</span> {sub.name}
                                                         </div>
-                                                        {sub.description && <div className="text-hui-textMuted text-xs mt-1">{sub.description}</div>}
+                                                        {sub.description && <div className="text-xs text-slate-400 ml-5 mt-0.5">{sub.description}</div>}
                                                     </td>
-                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-hui-textMuted">{sub.quantity}</td>
-                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-hui-textMuted text-right">${sub.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                                                    <td className="px-6 py-3 whitespace-nowrap text-sm text-hui-textMain text-right">${sub.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                                    <td className="py-2.5 text-center text-slate-500">{sub.quantity}</td>
+                                                    <td className="py-2.5 text-right text-slate-500">${sub.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                    <td className="py-2.5 text-right text-slate-700">${sub.total.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                                                 </tr>
                                             ))}
                                         </React.Fragment>
@@ -180,141 +199,137 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 })}
                             </tbody>
                         </table>
-                    </div>
-                </div>
 
-                {/* Progress Payments */}
-                {initialEstimate.paymentSchedules && initialEstimate.paymentSchedules.length > 0 && (
-                    <div>
-                        <h2 className="text-lg font-semibold text-hui-textMain mb-4">Payment Schedule</h2>
-                        <div className="border border-hui-border rounded-md overflow-hidden bg-white">
-                            <ul className="divide-y divide-hui-border">
-                                {initialEstimate.paymentSchedules.map((payment: any) => (
-                                    <li key={payment.id} className="px-6 py-4 flex justify-between items-center text-sm">
-                                        <div>
-                                            <span className="font-medium text-hui-textMain">{payment.name}</span>
-                                            {payment.percentage && <span className="ml-2 text-hui-textMuted">({payment.percentage}%)</span>}
-                                        </div>
-                                        <div className="flex gap-8 items-center text-hui-textMuted text-right">
-                                            <span>{payment.dueDate ? new Date(payment.dueDate).toLocaleDateString() : 'TBD'}</span>
-                                            <span className="font-semibold text-hui-textMain w-24">${payment.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                                        </div>
-                                    </li>
-                                ))}
-                            </ul>
-                        </div>
-                    </div>
-                )}
-
-                {/* Totals Box */}
-                <div className="flex justify-end pt-4">
-                    <div className="w-80 space-y-3 bg-hui-background p-6 rounded-lg border border-hui-border">
-                        <div className="flex justify-between text-hui-textMuted text-sm">
-                            <span>Subtotal</span>
-                            <span>${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                        </div>
-                        <div className="flex justify-between text-hui-textMuted text-sm">
-                            <span>Estimated Tax (8.7%)</span>
-                            <span>${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                        </div>
-                        <div className="h-px w-full bg-hui-border my-2"></div>
-                        <div className="flex justify-between text-lg font-bold text-hui-textMain">
-                            <span>Estimate Total</span>
-                            <span>${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Terms & Conditions */}
-                {initialEstimate.termsAndConditions && (
-                    <div className="mt-8">
-                        <h2 className="text-lg font-semibold text-hui-textMain mb-4 flex items-center gap-2">
-                            <svg className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                            Terms & Conditions
-                        </h2>
-                        <div className="border border-hui-border rounded-lg bg-slate-50/50 p-6">
-                            <div
-                                className="prose prose-sm max-w-none text-hui-textMuted prose-headings:text-hui-textMain prose-headings:font-semibold prose-strong:text-hui-textMain"
-                                dangerouslySetInnerHTML={{ __html: initialEstimate.termsAndConditions }}
-                            />
-                        </div>
-                    </div>
-                )}
-
-                {/* Approval Area */}
-                {!isApproved && (
-                    <div className="mt-12 pt-8 border-t border-hui-border flex flex-col items-center print:hidden">
-                        <p className="text-hui-textMuted mb-6 text-center max-w-lg">
-                            Please review the details above{initialEstimate.termsAndConditions ? ", including the Terms & Conditions," : ""}. By approving this estimate, you agree to the terms and authorize work to proceed.
-                        </p>
-
-                        {!isApproving ? (
-                            <button
-                                onClick={() => setIsApproving(true)}
-                                className="hui-btn hui-btn-primary px-8 py-3"
-                            >
-                                Approve & Sign Estimate
-                            </button>
-                        ) : (
-                            <div className="w-full max-w-lg bg-hui-background p-6 rounded-lg border border-hui-border shadow-sm">
-                                <h3 className="text-lg font-semibold text-hui-textMain mb-1">Sign & Approve</h3>
-                                <p className="text-sm text-hui-textMuted mb-5">Draw your signature and type your full legal name to approve this estimate.</p>
-
-                                <div className="space-y-5">
-                                    {/* Drawn Signature */}
-                                    <div>
-                                        <label className="block text-sm font-medium text-hui-textMain mb-2">Your Signature</label>
-                                        <SignaturePad onSignatureChange={setSignatureDataUrl} />
-                                    </div>
-
-                                    {/* Typed Name */}
-                                    <div>
-                                        <label className="block text-sm font-medium text-hui-textMain mb-1">Full Legal Name</label>
-                                        <input
-                                            type="text"
-                                            value={signature}
-                                            onChange={(e) => setSignature(e.target.value)}
-                                            className="hui-input w-full"
-                                            placeholder="e.g. John A. Doe"
-                                            autoFocus
-                                        />
-                                    </div>
-
-                                    {error && <p className="text-red-500 text-sm">{error}</p>}
-
-                                    {/* Legal Disclosure */}
-                                    <div className="bg-white border border-hui-border rounded-md p-3">
-                                        <p className="text-xs text-hui-textMuted leading-relaxed">
-                                            <strong className="text-hui-textMain">Electronic Signature Disclosure:</strong> By signing above and clicking &ldquo;Sign & Approve,&rdquo; I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act and UETA, (2) I have reviewed and agree to the estimate details{initialEstimate.termsAndConditions ? " and the Terms & Conditions" : ""} above, and (3) I authorize the described work to proceed.
-                                        </p>
-                                    </div>
-
-                                    <div className="flex gap-3 justify-end pt-1">
-                                        <button
-                                            onClick={() => setIsApproving(false)}
-                                            className="hui-btn hui-btn-secondary px-4 py-2"
-                                            disabled={isSubmitting}
-                                        >
-                                            Cancel
-                                        </button>
-                                        <button
-                                            onClick={handleApprove}
-                                            disabled={isSubmitting}
-                                            className="hui-btn hui-btn-green px-6 py-2 flex items-center gap-2"
-                                        >
-                                            {isSubmitting ? "Processing..." : "Sign & Approve"}
-                                            {!isSubmitting && (
-                                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
-                                                </svg>
-                                            )}
-                                        </button>
-                                    </div>
+                        {/* Totals */}
+                        <div className="flex justify-end mt-6">
+                            <div className="w-72">
+                                <div className="flex justify-between py-2 text-sm text-slate-600">
+                                    <span>Subtotal</span>
+                                    <span>${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                </div>
+                                <div className="flex justify-between py-2 text-sm text-slate-600">
+                                    <span>Tax (8.7%)</span>
+                                    <span>${tax.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                </div>
+                                <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-slate-800">
+                                    <span>Total</span>
+                                    <span>${total.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                                 </div>
                             </div>
-                        )}
+                        </div>
                     </div>
-                )}
+
+                    {/* Payment Schedule */}
+                    {initialEstimate.paymentSchedules && initialEstimate.paymentSchedules.length > 0 && (
+                        <div className="px-10 pb-8">
+                            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment Schedule</h2>
+                            <div className="border border-slate-200 rounded-md overflow-hidden">
+                                {initialEstimate.paymentSchedules.map((p: any) => (
+                                    <div key={p.id} className="flex justify-between items-center px-5 py-3 text-sm border-b last:border-b-0 border-slate-100">
+                                        <div>
+                                            <span className="font-medium text-slate-700">{p.name}</span>
+                                            {p.percentage && <span className="text-slate-400 ml-1">({p.percentage}%)</span>}
+                                        </div>
+                                        <div className="flex gap-6 items-center">
+                                            <span className="text-slate-500 text-xs">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : "TBD"}</span>
+                                            <span className="font-semibold text-slate-800 w-24 text-right">${p.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Terms & Conditions */}
+                    {initialEstimate.termsAndConditions && (
+                        <div className="px-10 pb-8 border-t border-slate-200 pt-8">
+                            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Terms & Conditions</h2>
+                            <div className="bg-slate-50 rounded-md p-6 border border-slate-100">
+                                <div
+                                    className="prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-sm"
+                                    dangerouslySetInnerHTML={{ __html: initialEstimate.termsAndConditions }}
+                                />
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Signature / Approval Area */}
+                    {!isApproved && (
+                        <div className="px-10 pb-10 print:hidden">
+                            <div className="border-t-2 border-slate-200 pt-8">
+                                <div className="text-center max-w-lg mx-auto">
+                                    <h3 className="text-lg font-bold text-slate-800 mb-2">Ready to Approve?</h3>
+                                    <p className="text-sm text-slate-500 mb-6">
+                                        By signing below, you accept this estimate{initialEstimate.termsAndConditions ? " and the attached Terms & Conditions" : ""}, and authorize work to proceed.
+                                    </p>
+
+                                    {!isApproving ? (
+                                        <button
+                                            onClick={() => setIsApproving(true)}
+                                            className="px-8 py-3 bg-slate-800 text-white rounded-lg font-semibold text-sm hover:bg-slate-900 transition shadow-sm"
+                                        >
+                                            Sign & Approve Estimate
+                                        </button>
+                                    ) : (
+                                        <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 text-left">
+                                            <h4 className="text-sm font-bold text-slate-800 mb-4">Electronic Signature</h4>
+
+                                            <div className="space-y-4">
+                                                <div>
+                                                    <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">Draw Your Signature</label>
+                                                    <SignaturePad onSignatureChange={setSignatureDataUrl} />
+                                                </div>
+
+                                                <div>
+                                                    <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">Full Legal Name</label>
+                                                    <input
+                                                        type="text"
+                                                        value={signature}
+                                                        onChange={(e) => setSignature(e.target.value)}
+                                                        className="w-full px-4 py-2.5 border border-slate-300 rounded-md text-sm focus:ring-2 focus:ring-blue-200 focus:border-blue-400 outline-none transition"
+                                                        placeholder="e.g. John A. Doe"
+                                                        autoFocus
+                                                    />
+                                                </div>
+
+                                                {error && <p className="text-red-600 text-xs font-medium">{error}</p>}
+
+                                                <div className="bg-white border border-slate-200 rounded-md p-3">
+                                                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                                                        <strong className="text-slate-700">ESIGN Act Disclosure:</strong> By signing above and clicking "Sign & Approve," I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA, (2) I have reviewed and agree to the estimate{initialEstimate.termsAndConditions ? " and Terms & Conditions" : ""}, and (3) I authorize the described work.
+                                                    </p>
+                                                </div>
+
+                                                <div className="flex gap-3 justify-end pt-1">
+                                                    <button onClick={() => setIsApproving(false)} disabled={isSubmitting} className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 transition">
+                                                        Cancel
+                                                    </button>
+                                                    <button
+                                                        onClick={handleApprove}
+                                                        disabled={isSubmitting}
+                                                        className="px-6 py-2.5 bg-green-600 text-white rounded-lg font-semibold text-sm hover:bg-green-700 transition shadow-sm flex items-center gap-2"
+                                                    >
+                                                        {isSubmitting ? "Processing..." : "Sign & Approve"}
+                                                        {!isSubmitting && (
+                                                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
+                                                        )}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Footer */}
+                    <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
+                        <p className="text-xs text-slate-400">
+                            This estimate was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
+                        </p>
+                    </div>
+                </div>
             </div>
         </div>
     );
