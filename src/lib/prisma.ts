@@ -4,7 +4,17 @@ const globalForPrisma = globalThis as unknown as {
     prisma: PrismaClient | undefined
 }
 
-export const prisma = globalForPrisma.prisma ?? new PrismaClient();
+let dbUrl = process.env.DATABASE_URL;
+if (dbUrl && !dbUrl.includes("connection_limit")) {
+    dbUrl += (dbUrl.includes("?") ? "&" : "?") + "connection_limit=1";
+}
 
-// Fallback removed for safety, require DATABASE_URL from environment
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({
+    datasources: {
+        db: {
+            url: dbUrl
+        }
+    }
+});
+
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
