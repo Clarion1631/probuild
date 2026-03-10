@@ -1625,3 +1625,53 @@ export async function getActiveSubcontractors() {
         select: { id: true, companyName: true, email: true, trade: true }
     });
 }
+
+// ========== PROJECT BOARD ACTIONS ==========
+
+export async function updateProjectStatus(projectId: string, status: string) {
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { status }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectColor(projectId: string, color: string) {
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { color }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectTags(projectId: string, tags: string) {
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { tags }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function deleteProjects(projectIds: string[]) {
+    await prisma.project.deleteMany({
+        where: { id: { in: projectIds } }
+    });
+    revalidatePath(`/projects`);
+    return { success: true };
+}
+
+export async function updateCompanyProjectStatuses(statuses: string) {
+    await prisma.companySettings.update({
+        where: { id: "singleton" },
+        data: { projectStatuses: statuses }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/settings/company`);
+    return { success: true };
+}

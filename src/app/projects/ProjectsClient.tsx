@@ -1,44 +1,52 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import AddLeadModal from "@/app/leads/AddLeadModal";
 import { toast } from "sonner";
+import { updateProjectStatus, deleteProjects, updateProjectTags } from "@/lib/actions";
+import { CustomizeStatusModal, ManageStatusModal, ProjectStatus } from "./StatusModals";
 
-const PROJECT_STATUSES = [
-    { value: "Active", label: "Active", color: "bg-green-100 text-green-700", dot: "bg-green-500" },
-    { value: "In Progress", label: "In Progress", color: "bg-blue-100 text-blue-700", dot: "bg-blue-500" },
-    { value: "On Hold", label: "On Hold", color: "bg-amber-100 text-amber-700", dot: "bg-amber-500" },
-    { value: "Completed", label: "Completed", color: "bg-purple-100 text-purple-700", dot: "bg-purple-500" },
-    { value: "Closed", label: "Closed", color: "bg-slate-100 text-slate-600", dot: "bg-slate-400" },
-    { value: "Archived", label: "Archived", color: "bg-slate-50 text-slate-400", dot: "bg-slate-300" },
+const DEFAULT_PROJECT_STATUSES: ProjectStatus[] = [
+    { value: "Open", label: "Open", color: "bg-blue-100 text-blue-700", dot: "bg-blue-500", rawColor: "#3b82f6", isActive: true },
+    { value: "In Progress", label: "In Progress", color: "bg-green-100 text-green-700", dot: "bg-green-500", rawColor: "#22c55e", isActive: true },
+    { value: "Done", label: "Done", color: "bg-teal-100 text-teal-700", dot: "bg-teal-600", rawColor: "#0d9488", isActive: true },
+    { value: "Closed", label: "Closed", color: "bg-amber-100 text-amber-700", dot: "bg-amber-400", rawColor: "#fbbf24", isActive: true },
+    { value: "Paid, Ready to Start", label: "Paid, Ready to Start", color: "bg-cyan-100 text-cyan-700", dot: "bg-cyan-400", rawColor: "#22d3ee", isActive: true },
 ];
 
-function getStatusColor(status: string) {
-    return PROJECT_STATUSES.find(s => s.value === status)?.color || "bg-slate-100 text-slate-600";
+function getStatusColor(status: string, statuses: ProjectStatus[]) {
+    return statuses.find(s => s.value === status)?.color || "bg-slate-100 text-slate-600";
 }
 
-function getStatusDot(status: string) {
-    return PROJECT_STATUSES.find(s => s.value === status)?.dot || "bg-slate-400";
+function getStatusDot(status: string, statuses: ProjectStatus[]) {
+    return statuses.find(s => s.value === status)?.dot || "bg-slate-400";
 }
 
-export default function ProjectsClient({ projects: initialProjects }: { projects: any[] }) {
+export default function ProjectsClient({ projects: initialProjects, initialStatuses }: { projects: any[], initialStatuses?: ProjectStatus[] | null }) {
     const [projects, setProjects] = useState(initialProjects);
+    const [statuses, setStatuses] = useState<ProjectStatus[]>(initialStatuses || DEFAULT_PROJECT_STATUSES);
     const [statusFilter, setStatusFilter] = useState<string>("all-active");
     const [search, setSearch] = useState("");
     const [showModal, setShowModal] = useState(false);
     const [updatingId, setUpdatingId] = useState<string | null>(null);
+    const [viewMode, setViewMode] = useState<"list" | "kanban">("list");
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const [isDeleting, setIsDeleting] = useState(false);
+    const [showCustomizeModal, setShowCustomizeModal] = useState(false);
+    const [showManageModal, setShowManageModal] = useState(false);
+
+    const activeStatuses = statuses.filter(s => s.isActive);
 
     async function handleStatusChange(projectId: string, newStatus: string) {
+        if (newStatus === "Manage Status") {
+            setShowCustomizeModal(true);
+            return;
+        }
         setUpdatingId(projectId);
         try {
-            const res = await fetch(`/api/projects/${projectId}`, {
-                method: "PATCH",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ status: newStatus }),
-            });
-            if (!res.ok) throw new Error("Failed to update");
-            setProjects(prev => prev.map(p => p.id === projectId ? { ...p, status: newStatus } : p));
+            await updateProjectStatus(projectId, newStatus);
+            setProjects((prev: any) => prev.map((p: any) => p.id === projectId ? { ...p, status: newStatus } : p));
             toast.success(`Status updated to ${newStatus}`);
         } catch {
             toast.error("Failed to update status");
@@ -47,7 +55,22 @@ export default function ProjectsClient({ projects: initialProjects }: { projects
         }
     }
 
-    const filteredProjects = projects.filter(p => {
+    async function handleDeleteSelected() {
+        if (!confirm(`Are you sure you want to delete ${selectedIds.length} projects?`)) return;
+        setIsDeleting(true);
+        try {
+            await deleteProjects(selectedIds);
+            setProjects((prev: any) => prev.filter((p: any) => !selectedIds.includes(p.id)));
+            setSelectedIds([]);
+            toast.success("Projects deleted successfully");
+        } catch {
+            toast.error("Failed to delete projects");
+        } finally {
+            setIsDeleting(false);
+        }
+    }
+
+    const filteredProjects = projects.filter((p: any) => {
         if (statusFilter === "all-active") {
             if (p.status === "Closed" || p.status === "Archived") return false;
         } else if (statusFilter !== "all") {
@@ -63,174 +86,313 @@ export default function ProjectsClient({ projects: initialProjects }: { projects
     });
 
     const statusCounts: Record<string, number> = {};
-    projects.forEach(p => {
-        const s = p.status || "Active";
+    projects.forEach((p: any) => {
+        const s = p.status || "Open";
         statusCounts[s] = (statusCounts[s] || 0) + 1;
     });
-    const activeCount = projects.filter(p => p.status !== "Closed" && p.status !== "Archived").length;
-    const totalValue = projects.reduce((sum, p) => sum + (p.estimates?.[0]?.totalAmount || 0), 0);
+    const activeCount = projects.filter((p: any) => p.status !== "Closed" && p.status !== "Archived").length;
+
+    // Drag and Drop handlers
+    const handleDragStart = (e: React.DragEvent, projectId: string) => {
+        e.dataTransfer.setData("projectId", projectId);
+    };
+
+    const handleDragOver = (e: React.DragEvent) => {
+        e.preventDefault();
+    };
+
+    const handleDrop = async (e: React.DragEvent, newStatus: string) => {
+        e.preventDefault();
+        const projectId = e.dataTransfer.getData("projectId");
+        if (projectId) {
+            const project = projects.find((p: any) => p.id === projectId);
+            if (project && project.status !== newStatus) {
+                await handleStatusChange(projectId, newStatus);
+            }
+        }
+    };
 
     return (
-        <div className="max-w-7xl mx-auto">
+        <div className="max-w-screen-2xl mx-auto px-4 md:px-8 pb-10">
             {/* Header */}
-            <div className="flex items-center justify-between mb-8">
+            <div className="flex items-center justify-between mb-8 pt-4">
                 <div className="flex items-center gap-4">
-                    <div className="w-11 h-11 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/25">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-                    </div>
-                    <div>
-                        <h1 className="text-2xl font-bold text-hui-textMain">Projects</h1>
-                        <p className="text-sm text-hui-textMuted mt-0.5">{activeCount} active · {projects.length} total · ${totalValue.toLocaleString()} value</p>
-                    </div>
+                    <h1 className="text-2xl font-bold text-hui-textMain">All Projects ({projects.length})</h1>
                 </div>
-                <button className="hui-btn hui-btn-primary flex items-center gap-2 shadow-md shadow-indigo-500/20 hover:shadow-lg hover:shadow-indigo-500/30 transition-all" onClick={() => setShowModal(true)}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
-                    New Project
-                </button>
-            </div>
-
-            {/* Status Summary Cards */}
-            <div className="grid grid-cols-6 gap-3 mb-6">
-                {PROJECT_STATUSES.map(s => {
-                    const count = statusCounts[s.value] || 0;
-                    const isActive = statusFilter === s.value;
-                    return (
-                        <button
-                            key={s.value}
-                            onClick={() => setStatusFilter(isActive ? "all-active" : s.value)}
-                            className={`flex items-center gap-2.5 px-4 py-3 rounded-xl border transition-all text-left ${
-                                isActive
-                                    ? "bg-white border-indigo-300 shadow-md ring-2 ring-indigo-100"
-                                    : "bg-white border-slate-200/80 shadow-sm hover:shadow-md hover:border-slate-300"
-                            }`}
-                        >
-                            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${s.dot}`} />
-                            <div>
-                                <p className="text-lg font-bold text-hui-textMain leading-none">{count}</p>
-                                <p className="text-[10px] text-slate-400 font-medium mt-0.5">{s.label}</p>
-                            </div>
+                <div className="flex items-center gap-3">
+                    <div className="flex bg-slate-100 rounded-lg p-1 border border-slate-200">
+                        <button onClick={() => setViewMode("list")} className={`p-1.5 rounded-md transition ${viewMode === "list" ? "bg-white shadow-sm text-slate-800" : "text-slate-400 hover:text-slate-600"}`}>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
                         </button>
-                    );
-                })}
-            </div>
-
-            {/* Filters */}
-            <div className="flex items-center mb-5 gap-3">
-                <div className="relative flex-1 max-w-xs">
-                    <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-                    <input
-                        type="text"
-                        placeholder="Search projects or clients..."
-                        value={search}
-                        onChange={e => setSearch(e.target.value)}
-                        className="hui-input w-full pl-10"
-                    />
-                </div>
-                <select
-                    value={statusFilter}
-                    onChange={e => setStatusFilter(e.target.value)}
-                    className="hui-input w-52"
-                >
-                    <option value="all-active">Active Projects ({activeCount})</option>
-                    <option value="all">All Projects ({projects.length})</option>
-                    {PROJECT_STATUSES.map(s => (
-                        <option key={s.value} value={s.value}>
-                            {s.label} ({statusCounts[s.value] || 0})
-                        </option>
-                    ))}
-                </select>
-                {statusFilter !== "all-active" && statusFilter !== "all" && (
-                    <button onClick={() => setStatusFilter("all-active")} className="text-xs text-slate-400 hover:text-slate-600 transition flex items-center gap-1">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
-                        Clear filter
+                        <button onClick={() => setViewMode("kanban")} className={`p-1.5 rounded-md transition ${viewMode === "kanban" ? "bg-white shadow-sm text-slate-800" : "text-slate-400 hover:text-slate-600"}`}>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                        </button>
+                    </div>
+                    <button className="hui-btn hui-btn-primary flex items-center gap-2" onClick={() => setShowModal(true)}>
+                        Create Project
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6"/></svg>
                     </button>
-                )}
+                </div>
             </div>
 
-            {/* Table */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
-                <table className="w-full text-left border-collapse">
-                    <thead>
-                        <tr className="bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-slate-200">
-                            <th className="py-3.5 px-5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Project Name</th>
-                            <th className="py-3.5 px-5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Client</th>
-                            <th className="py-3.5 px-5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Start Date</th>
-                            <th className="py-3.5 px-5 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">Amount</th>
-                            <th className="py-3.5 px-5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Status</th>
-                            <th className="py-3.5 px-3 w-12"></th>
-                        </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                        {filteredProjects.map((project) => (
-                            <tr key={project.id} className="hover:bg-slate-50/70 transition-colors group">
-                                <td className="py-4 px-5">
-                                    <Link href={`/projects/${project.id}`} className="flex items-center gap-3">
-                                        <div className="w-9 h-9 bg-gradient-to-br from-indigo-50 to-blue-50 rounded-lg flex items-center justify-center shrink-0 border border-indigo-100/50 group-hover:from-indigo-100 group-hover:to-blue-100 transition">
-                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+            {/* Kanban Columns Summaries visually similar to Houzz Pro header strips */}
+            {viewMode === "kanban" && (
+                <div className="flex gap-4 mb-4 overflow-x-auto pb-2">
+                     {activeStatuses.map(s => {
+                        const colProjects = filteredProjects.filter((p: any) => (p.status || "Open") === s.value);
+                        return (
+                            <div 
+                                key={s.value} 
+                                className="min-w-[300px] w-[300px] shrink-0"
+                                onDragOver={handleDragOver}
+                                onDrop={(e) => handleDrop(e, s.value)}
+                            >
+                                <div className="flex items-center justify-between mb-3 px-2">
+                                    <h3 className="font-semibold text-[15px] flex items-center gap-2 text-slate-800">
+                                        <div className={`w-2.5 h-2.5 rounded-full ${s.dot}`} style={{ backgroundColor: s.rawColor + " !important" }} />
+                                        {s.label} ({colProjects.length})
+                                    </h3>
+                                    <button onClick={() => setShowCustomizeModal(true)} className="text-slate-400 hover:text-slate-600">...</button>
+                                </div>
+                                <div className="flex flex-col gap-3 min-h-[200px] bg-slate-50/50 rounded-xl p-2 border border-slate-100">
+                                    {colProjects.map((project: any) => (
+                                        <div 
+                                            key={project.id}
+                                            draggable
+                                            onDragStart={(e) => handleDragStart(e, project.id)}
+                                            className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm hover:shadow-md cursor-grab active:cursor-grabbing group relative overflow-hidden"
+                                        >
+                                            {/* Colored left border strip matching Houzz Pro */}
+                                            <div className="absolute left-0 top-0 bottom-0 w-1.5" style={{ backgroundColor: project.color || s.rawColor }} />
+                                            
+                                            <div className="flex justify-between items-start mb-2 pl-2">
+                                                <Link href={`/projects/${project.id}`} className="font-semibold text-[15px] text-slate-800 hover:text-indigo-600 line-clamp-1">{project.name}</Link>
+                                                <button className="text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">...</button>
+                                            </div>
+                                            
+                                            <div className="space-y-1.5 pl-2">
+                                                <div className="flex items-center gap-2 text-[13px] text-slate-500">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                                                    <span className="truncate">{project.client?.name || "No Client"}</span>
+                                                </div>
+                                                {project.location && (
+                                                    <div className="flex items-center gap-2 text-[13px] text-slate-500">
+                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                                                        <span className="truncate">{project.location}</span>
+                                                    </div>
+                                                )}
+                                            </div>
+                                            
+                                            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between pl-2">
+                                                <div className="text-[12px] text-slate-400 flex flex-col">
+                                                    <span className="mb-0.5">Type</span>
+                                                    <span className="text-slate-600 truncate max-w-[120px]">{project.type || "—"}</span>
+                                                </div>
+                                                <div className="text-[12px] text-slate-400 flex flex-col">
+                                                    <span className="mb-0.5">Manager</span>
+                                                    <div className="w-6 h-6 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-[10px]">
+                                                        R
+                                                    </div>
+                                                </div>
+                                            </div>
                                         </div>
-                                        <div>
-                                            <p className="font-semibold text-hui-textMain group-hover:text-hui-primary transition-colors text-sm">{project.name}</p>
-                                            {project.location && <p className="text-[10px] text-slate-400">{project.location}</p>}
-                                        </div>
-                                    </Link>
-                                </td>
-                                <td className="py-4 px-5">
-                                    <div className="flex items-center gap-2">
-                                        <div className="w-7 h-7 rounded-full bg-slate-100 flex items-center justify-center text-[10px] font-bold text-slate-500 shrink-0">
-                                            {(project.client?.name || "?")[0].toUpperCase()}
-                                        </div>
-                                        <span className="text-sm text-slate-600">{project.client?.name || "No Client"}</span>
-                                    </div>
-                                </td>
-                                <td className="py-4 px-5 text-sm text-slate-400">{new Date(project.createdAt).toLocaleDateString()}</td>
-                                <td className="py-4 px-5 text-right">
-                                    <span className="text-sm font-semibold text-slate-700">
-                                        {project.estimates?.length > 0 
-                                            ? `$${(project.estimates[0].totalAmount || 0).toLocaleString()}` 
-                                            : <span className="text-slate-300 font-normal">—</span>
-                                        }
-                                    </span>
-                                </td>
-                                <td className="py-3.5 px-5">
-                                    <select
-                                        value={project.status || "Active"}
-                                        onChange={e => handleStatusChange(project.id, e.target.value)}
-                                        disabled={updatingId === project.id}
-                                        className={`text-xs font-semibold rounded-full px-3 py-1.5 border-0 cursor-pointer appearance-none focus:ring-2 focus:ring-indigo-200 transition disabled:opacity-50 ${getStatusColor(project.status || "Active")}`}
-                                        style={{ backgroundImage: "none", paddingRight: "14px" }}
-                                    >
-                                        {PROJECT_STATUSES.map(s => (
-                                            <option key={s.value} value={s.value}>{s.label}</option>
-                                        ))}
-                                    </select>
-                                </td>
-                                <td className="py-4 px-3 text-right">
-                                    <Link href={`/projects/${project.id}`} className="text-slate-300 hover:text-indigo-500 opacity-0 group-hover:opacity-100 transition-all">
-                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                                        </svg>
-                                    </Link>
-                                </td>
-                            </tr>
-                        ))}
-                        {filteredProjects.length === 0 && (
-                            <tr>
-                                <td colSpan={6} className="py-16 text-center">
-                                    <div className="flex flex-col items-center gap-3">
-                                        <div className="w-14 h-14 bg-gradient-to-br from-slate-100 to-slate-50 rounded-2xl flex items-center justify-center">
-                                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-                                        </div>
-                                        <p className="text-sm font-medium text-slate-400">No projects match your filters</p>
-                                        <button onClick={() => { setStatusFilter("all-active"); setSearch(""); }} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">Reset filters</button>
-                                    </div>
-                                </td>
-                            </tr>
+                                    ))}
+                                </div>
+                            </div>
+                        );
+                     })}
+                </div>
+            )}
+
+            {/* List View */}
+            {viewMode === "list" && (
+                <>
+                    {/* Filters & Bulk Actions Toolbar */}
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+                        <div className="flex items-center gap-3 bg-white p-1 rounded-lg border border-slate-200">
+                            <div className="relative w-64">
+                                <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                                <input
+                                    type="text"
+                                    placeholder="Search"
+                                    value={search}
+                                    onChange={e => setSearch(e.target.value)}
+                                    className="w-full pl-9 pr-3 py-1.5 text-sm bg-transparent border-0 focus:ring-0"
+                                />
+                            </div>
+                            <div className="h-5 w-px bg-slate-200"></div>
+                            <select
+                                value={statusFilter}
+                                onChange={e => setStatusFilter(e.target.value)}
+                                className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-600 font-medium"
+                            >
+                                <option value="all-active">Status: Active</option>
+                                <option value="all">Status: All</option>
+                                {activeStatuses.map(s => (
+                                    <option key={s.value} value={s.value}>{s.label}</option>
+                                ))}
+                            </select>
+                            <div className="h-5 w-px bg-slate-200"></div>
+                            <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-600 font-medium">
+                                <option>Tags: None</option>
+                            </select>
+                            <div className="h-5 w-px bg-slate-200"></div>
+                            <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-600 font-medium">
+                                <option>All Managers</option>
+                            </select>
+                        </div>
+
+                        {/* Bulk Actions Toolbar */}
+                        {selectedIds.length > 0 && (
+                            <div className="flex items-center gap-3 bg-red-50 text-red-700 px-4 py-2 rounded-lg border border-red-200 animate-in fade-in slide-in-from-bottom-2">
+                                <span className="text-sm font-semibold">{selectedIds.length} selected</span>
+                                <div className="h-4 w-px bg-red-200"></div>
+                                <button 
+                                    onClick={handleDeleteSelected}
+                                    disabled={isDeleting}
+                                    className="text-sm font-semibold flex items-center gap-1.5 hover:text-red-800 disabled:opacity-50"
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                                    Delete
+                                </button>
+                            </div>
                         )}
-                    </tbody>
-                </table>
-            </div>
+                    </div>
+
+                    {/* Table */}
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <table className="w-full text-left bg-white text-sm">
+                            <thead>
+                                <tr className="border-b border-slate-200">
+                                    <th className="py-3 px-4 w-10 text-center">
+                                        <input 
+                                            type="checkbox" 
+                                            className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                            checked={selectedIds.length === filteredProjects.length && filteredProjects.length > 0}
+                                            onChange={(e) => {
+                                                if (e.target.checked) setSelectedIds(filteredProjects.map((p: any) => p.id));
+                                                else setSelectedIds([]);
+                                            }}
+                                        />
+                                    </th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Project Name</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Client Name</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Created</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Location</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Status</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Type</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">#Code</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Tags</th>
+                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Managers</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100">
+                                {filteredProjects.map((project: any) => (
+                                    <tr key={project.id} className={`hover:bg-slate-50/70 transition-colors group ${selectedIds.includes(project.id) ? "bg-indigo-50/30" : ""}`}>
+                                        <td className="py-4 px-4 text-center">
+                                            <input 
+                                                type="checkbox" 
+                                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                                checked={selectedIds.includes(project.id)}
+                                                onChange={(e) => {
+                                                    if (e.target.checked) setSelectedIds([...selectedIds, project.id]);
+                                                    else setSelectedIds(selectedIds.filter(id => id !== project.id));
+                                                }}
+                                            />
+                                        </td>
+                                        <td className="py-4 px-4">
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-1.5 h-6 rounded-full" style={{ backgroundColor: project.color || getStatusColor(project.status || "Open", statuses).replace("bg-", "").split("-")[0] }} />
+                                                <Link href={`/projects/${project.id}`} className="font-medium text-slate-800 hover:text-indigo-600 transition">
+                                                    {project.name}
+                                                </Link>
+                                            </div>
+                                        </td>
+                                        <td className="py-4 px-4">
+                                            <div className="flex items-center gap-2">
+                                                <div className="w-6 h-6 rounded-full bg-[#34d399] flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                                                    {(project.client?.name || "?")[0].toUpperCase()}
+                                                </div>
+                                                <span className="text-slate-600">{project.client?.name || "No Client"}</span>
+                                            </div>
+                                        </td>
+                                        <td className="py-4 px-4 text-slate-500 whitespace-nowrap">
+                                            {new Date(project.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                                        </td>
+                                        <td className="py-4 px-4 text-slate-600">
+                                            {project.location || "—"}
+                                        </td>
+                                        <td className="py-4 px-4">
+                                            <select
+                                                value={project.status || "Open"}
+                                                onChange={e => handleStatusChange(project.id, e.target.value)}
+                                                disabled={updatingId === project.id}
+                                                className={`text-xs font-semibold rounded-full px-3 py-1.5 border border-slate-200 cursor-pointer focus:ring-2 focus:ring-indigo-200 transition disabled:opacity-50 appearance-none bg-white pr-8 bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2212%22%20height%3D%2212%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22M4%205l4%204%204-4%22%20fill%3D%22none%22%20stroke%3D%22%23666%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E')] bg-no-repeat bg-[position:right_8px_center] ${getStatusColor(project.status || "Open", statuses).replace("bg-", "text-").replace("100", "700")}`}
+                                            >
+                                                {activeStatuses.map(s => (
+                                                    <option key={s.value} value={s.value}>• {s.label}</option>
+                                                ))}
+                                                <option disabled>────────</option>
+                                                <option value="Manage Status">⚙ Manage Status</option>
+                                            </select>
+                                        </td>
+                                        <td className="py-4 px-4 text-slate-600">
+                                            {project.type || "—"}
+                                        </td>
+                                        <td className="py-4 px-4 text-slate-600">
+                                            {project.code || "—"}
+                                        </td>
+                                        <td className="py-4 px-4">
+                                            {project.tags ? (
+                                                <span className="text-slate-600">{project.tags}</span>
+                                            ) : (
+                                                <button className="text-slate-400 hover:text-slate-700 font-medium flex items-center gap-1 transition">
+                                                    + Add Tags
+                                                </button>
+                                            )}
+                                        </td>
+                                        <td className="py-4 px-4">
+                                            <div className="w-7 h-7 rounded-full bg-[#1d4ed8] text-white flex items-center justify-center font-bold text-xs ring-2 ring-white">
+                                                R
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                                {filteredProjects.length === 0 && (
+                                    <tr>
+                                        <td colSpan={10} className="py-16 text-center">
+                                            <div className="flex flex-col items-center gap-3">
+                                                <div className="w-14 h-14 bg-gradient-to-br from-slate-100 to-slate-50 rounded-2xl flex items-center justify-center">
+                                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                                                </div>
+                                                <p className="text-sm font-medium text-slate-400">No projects match your filters</p>
+                                                <button onClick={() => { setStatusFilter("all-active"); setSearch(""); }} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">Reset filters</button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </>
+            )}
 
             {showModal && <AddLeadModal onClose={() => setShowModal(false)} />}
+            {showCustomizeModal && (
+                <CustomizeStatusModal 
+                    statuses={statuses} 
+                    onClose={() => setShowCustomizeModal(false)}
+                    onSave={setStatuses}
+                    onManageClick={() => setShowManageModal(true)}
+                />
+            )}
+            {showManageModal && (
+                <ManageStatusModal 
+                    statuses={statuses} 
+                    onClose={() => setShowManageModal(false)}
+                    onSave={setStatuses}
+                />
+            )}
         </div>
     );
 }

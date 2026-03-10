@@ -57,6 +57,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 { label: "Files & Photos", href: `/projects/${projectId}/files`, permission: "files" },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
                 { label: "Daily Logs", href: `/projects/${projectId}/dailylogs`, permission: "dailyLogs" },
+                { label: "Time Clock", href: `/projects/${projectId}/timeclock`, permission: "timeClock" },
             ],
         },
         {
@@ -65,6 +66,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             items: [
                 { label: "Invoices", href: `/projects/${projectId}/invoices`, permission: "invoices" },
                 { label: "Change Orders", href: `/projects/${projectId}/changeorders`, permission: "changeOrders" },
+                { label: "Job Costing", href: `/projects/${projectId}/costing`, permission: "financialReports" },
             ],
         },
     ];

@@ -84,6 +84,7 @@ model Project {
   type      String?   // Kitchen Remodeling, Patio, Water Damage
   code      String?
   tags      String?
+  color     String?   @default("#3b82f6") // Added color field
   managerId String?
   estimates Estimate[]
   invoices    Invoice[]
@@ -363,6 +364,7 @@ model CompanySettings {
   website           String?
   logoUrl           String?
   notificationEmail String?  // Where to send View/Sign alerts
+  projectStatuses   String?  // JSON string array of custom statues [{label, value, color, dot}, ...]
   
   updatedAt         DateTime @updatedAt
 }
