@@ -1,4 +1,3 @@
-import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Avatar from "@/components/Avatar";
 import { getProject, createDraftEstimate } from "@/lib/actions";
