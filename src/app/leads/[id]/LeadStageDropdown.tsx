@@ -47,31 +47,39 @@ export default function LeadStageDropdown({ leadId, currentStage, variant = "def
 
     if (variant === "pill") {
         return (
+            <div className="relative inline-block" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
+                <select
+                    value={currentStage}
+                    onChange={handleChange}
+                    disabled={isUpdating}
+                    className={`appearance-none cursor-pointer inline-flex items-center px-3 py-1.5 pr-8 rounded-full text-xs font-semibold tracking-wide border focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all shadow-sm ${getStageColor(currentStage)} disabled:opacity-50`}
+                >
+                    {stages.map(stage => (
+                        <option key={stage} value={stage}>{stage}</option>
+                    ))}
+                </select>
+                <div className="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none">
+                    <svg className="w-4 h-4 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="relative w-full" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
             <select
                 value={currentStage}
                 onChange={handleChange}
-                onClick={(e) => e.stopPropagation()}
                 disabled={isUpdating}
-                className={`cursor-pointer inline-flex items-center px-2.5 py-1 rounded text-xs font-semibold tracking-wide border focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all shadow-sm ${getStageColor(currentStage)} disabled:opacity-50`}
+                className="appearance-none bg-slate-50 border border-slate-200 text-slate-800 text-sm font-medium rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full px-3 py-2 pr-10 outline-none transition disabled:opacity-50"
             >
                 {stages.map(stage => (
                     <option key={stage} value={stage}>{stage}</option>
                 ))}
             </select>
-        );
-    }
-
-    return (
-        <select
-            value={currentStage}
-            onChange={handleChange}
-            onClick={(e) => e.stopPropagation()}
-            disabled={isUpdating}
-            className="bg-slate-50 border border-slate-200 text-slate-800 text-sm font-medium rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full px-2 py-1.5 outline-none transition disabled:opacity-50"
-        >
-            {stages.map(stage => (
-                <option key={stage} value={stage}>{stage}</option>
-            ))}
-        </select>
+            <div className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none">
+                <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+            </div>
+        </div>
     );
 }
