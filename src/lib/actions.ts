@@ -249,6 +249,17 @@ export async function getEstimate(id: string) {
     return estimate;
 }
 
+export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
+    await prisma.estimate.update({
+        where: { id },
+        data: { status }
+    });
+    if (leadId) revalidatePath(`/leads/${leadId}`);
+    if (projectId) revalidatePath(`/projects/${projectId}`);
+    revalidatePath(`/leads/${leadId}/estimates/${id}`);
+    revalidatePath(`/projects/${projectId}/estimates/${id}`);
+}
+
 export async function getEstimateForPortal(id: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id },

@@ -2,6 +2,7 @@ import Avatar from "@/components/Avatar";
 import { getLead, convertLeadToProject, createDraftLeadEstimate, deleteEstimate } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
+import EstimateStatusDropdown from "@/components/EstimateStatusDropdown";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -82,8 +83,9 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                                     <div key={est.id} className="p-4 flex items-center justify-between hover:bg-slate-50 transition group">
                                         <div>
                                             <h4 className="font-medium text-sm text-hui-textMain mb-1 hover:text-blue-600"><a href={`/leads/${lead.id}/estimates/${est.id}`}>{est.title || "Draft Estimate"} ({est.code})</a></h4>
-                                            <p className="text-xs text-hui-textMuted">
-                                                Total: ${est.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} • Status: <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold tracking-wider uppercase border ${est.status === 'Draft' ? 'bg-slate-100 text-slate-600 border-slate-200' : 'bg-green-50 text-green-700 border-green-200'}`}>{est.status}</span>
+                                            <p className="text-xs text-hui-textMuted flex items-center gap-2 mt-2">
+                                                Total: ${est.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} • Status: 
+                                                <EstimateStatusDropdown estimateId={est.id} currentStatus={est.status} leadId={lead.id} />
                                             </p>
                                         </div>
                                         <div className="flex items-center gap-3 opacity-0 group-hover:opacity-100 transition">
