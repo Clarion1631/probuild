@@ -68,6 +68,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [isAdding, setIsAdding] = useState(false);
     const [isImporting, setIsImporting] = useState(false);
     const [showImportMenu, setShowImportMenu] = useState(false);
+    const [isAiGenerating, setIsAiGenerating] = useState(false);
+    const [showAiMenu, setShowAiMenu] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const [dragState, setDragState] = useState<{
         taskId: string;
@@ -302,6 +304,34 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         await updateScheduleTask(taskId, { progress });
     }
 
+    async function handleAiSchedule(estimateId?: string) {
+        setIsAiGenerating(true);
+        setShowAiMenu(false);
+        try {
+            const res = await fetch("/api/ai-schedule", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId, estimateId }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                toast.error(data.error || "AI scheduling failed");
+                return;
+            }
+            const mapped: Task[] = data.tasks.map((t: any) => ({
+                ...t,
+                startDate: typeof t.startDate === 'string' ? t.startDate : t.startDate,
+                endDate: typeof t.endDate === 'string' ? t.endDate : t.endDate,
+            }));
+            setTasks(prev => [...prev, ...mapped]);
+            toast.success(`✨ AI generated ${data.count} tasks`);
+        } catch {
+            toast.error("Failed to connect to AI");
+        } finally {
+            setIsAiGenerating(false);
+        }
+    }
+
     const headers = getHeaders();
     const todayOffset = getTodayOffset();
     const ROW_HEIGHT = 52;
@@ -389,6 +419,51 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             )}
                         </div>
                     )}
+                    {/* ✨ AI Schedule Button */}
+                    <div className="relative">
+                        <button
+                            onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()}
+                            disabled={isAiGenerating}
+                            className={`text-sm flex items-center gap-1.5 px-3 py-2 rounded-lg font-medium transition-all border ${
+                                isAiGenerating
+                                    ? "bg-gradient-to-r from-purple-500 to-indigo-500 text-white border-purple-600 animate-pulse"
+                                    : "bg-gradient-to-r from-purple-50 to-indigo-50 text-purple-700 border-purple-200 hover:from-purple-100 hover:to-indigo-100 hover:border-purple-300 hover:shadow-md"
+                            }`}
+                        >
+                            <span className="text-base">✨</span>
+                            {isAiGenerating ? "AI is thinking..." : "AI Schedule"}
+                        </button>
+                        {showAiMenu && estimates.length > 0 && (
+                            <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[300px] py-1 animate-in fade-in">
+                                <div className="px-3 py-2 text-[11px] font-bold text-slate-400 uppercase tracking-wider border-b border-hui-border">
+                                    AI Schedule from...
+                                </div>
+                                <button
+                                    onClick={() => handleAiSchedule()}
+                                    className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition flex items-center gap-2 group border-b border-slate-100"
+                                >
+                                    <span className="text-base">🧠</span>
+                                    <div>
+                                        <div className="text-sm font-medium text-hui-textMain group-hover:text-purple-700 transition">General Project Schedule</div>
+                                        <div className="text-[11px] text-hui-textMuted">AI creates a schedule based on the project type</div>
+                                    </div>
+                                </button>
+                                {estimates.map(est => (
+                                    <button
+                                        key={est.id}
+                                        onClick={() => handleAiSchedule(est.id)}
+                                        className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition flex items-center gap-2 group"
+                                    >
+                                        <span className="text-base">📋</span>
+                                        <div>
+                                            <div className="text-sm font-medium text-hui-textMain group-hover:text-purple-700 transition">{est.title}</div>
+                                            <div className="text-[11px] text-hui-textMuted">Schedule from estimate — {est.status}</div>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
                     <button onClick={handleAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-sm">
                         + Add Task
                     </button>
