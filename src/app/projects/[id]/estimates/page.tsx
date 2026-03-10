@@ -1,5 +1,4 @@
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
-import Avatar from "@/components/Avatar";
 import { getProject, createDraftEstimate } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import Link from "next/link";
@@ -10,7 +9,13 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
 
     if (!project) return <div className="p-6">Project not found</div>;
 
-    const estimates = project.estimates;
+    const estimates = project.estimates || [];
+
+    // Calculate real stats
+    const approvedEstimates = estimates.filter((e: any) => e.status === 'Approved' || e.status === 'Sent');
+    const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
+    const totalAll = estimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
+    const winRate = estimates.length > 0 ? Math.round((approvedEstimates.length / estimates.length) * 100) : 0;
 
     async function handleNewEstimate() {
         "use server";
@@ -20,91 +25,96 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
 
     return (
         <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
-            <div className="flex-1 overflow-auto p-6 bg-white flex justify-between gap-6">
-                <div className="flex-1">
-                    <div className="flex items-center justify-between mb-6">
-                        <h1 className="text-xl font-bold text-hui-textMain">Estimates</h1>
+            <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-50 via-white to-slate-50/50">
+                <div className="p-8 max-w-6xl mx-auto">
+                    {/* Header */}
+                    <div className="flex items-center justify-between mb-8">
+                        <div>
+                            <h1 className="text-2xl font-bold text-hui-textMain">Estimates</h1>
+                            <p className="text-sm text-hui-textMuted mt-1">{estimates.length} estimate{estimates.length !== 1 ? 's' : ''} for {project.name}</p>
+                        </div>
                         <form action={handleNewEstimate}>
-                            <button type="submit" className="hui-btn hui-btn-primary">
+                            <button type="submit" className="hui-btn hui-btn-primary flex items-center gap-2 shadow-md shadow-indigo-500/20 hover:shadow-lg hover:shadow-indigo-500/30 transition-all">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
                                 New Estimate
                             </button>
                         </form>
                     </div>
 
-                    <div className="flex items-center gap-4 mb-4">
-                        <input type="text" placeholder="Search" className="hui-input w-64" />
-                        <select className="hui-input w-auto"><option>Date Created: 01/...</option></select>
-                        <select className="hui-input w-auto"><option>Type: Active</option></select>
-                    </div>
-                    <div className="grid grid-cols-3 gap-4">
-                        <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm">
-                            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider mb-1">Total Approved</p>
-                            <p className="text-2xl font-bold text-slate-900">$0.00</p>
+                    {/* Stats Cards */}
+                    <div className="grid grid-cols-3 gap-5 mb-8">
+                        <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group">
+                            <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-green-400 to-emerald-500" />
+                            <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Approved</p>
+                            <p className="text-2xl font-bold text-slate-900">${totalApproved.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-[10px] text-slate-400 mt-1">{approvedEstimates.length} approved estimate{approvedEstimates.length !== 1 ? 's' : ''}</p>
                         </div>
-                        <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm">
-                            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider mb-1">Total Invoiced</p>
-                            <p className="text-2xl font-bold text-blue-600">$0.00</p>
+                        <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group">
+                            <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-400 to-indigo-500" />
+                            <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Value</p>
+                            <p className="text-2xl font-bold text-blue-600">${totalAll.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-[10px] text-slate-400 mt-1">Across all estimates</p>
                         </div>
-                        <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm">
-                            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider mb-1">Win Rate</p>
-                            <p className="text-2xl font-bold text-green-600">0%</p>
+                        <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group">
+                            <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-purple-400 to-violet-500" />
+                            <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Win Rate</p>
+                            <div className="flex items-end gap-2">
+                                <p className="text-2xl font-bold text-purple-600">{winRate}%</p>
+                                <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden mb-1.5">
+                                    <div className="h-full bg-gradient-to-r from-purple-400 to-violet-500 rounded-full transition-all" style={{ width: `${winRate}%` }} />
+                                </div>
+                            </div>
                         </div>
                     </div>
 
-                    <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+                    {/* Estimates Table */}
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
                         <table className="w-full text-sm text-left">
-                            <thead className="bg-slate-50 text-slate-500 border-b border-slate-200">
-                                <tr>
-                                    <th className="px-6 py-3 font-medium">Estimate Name</th>
-                                    <th className="px-6 py-3 font-medium">Status</th>
-                                    <th className="px-6 py-3 font-medium text-right">Total Amount</th>
-                                    <th className="px-6 py-3 font-medium text-right">Date</th>
+                            <thead>
+                                <tr className="bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-slate-200">
+                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Estimate Name</th>
+                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Status</th>
+                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Total Amount</th>
+                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Date</th>
+                                    <th className="w-12"></th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {(!estimates || estimates.length === 0) && (
-                                    <tr><td colSpan={4} className="px-6 py-8 text-center text-slate-500">No estimates found. Create one to get started.</td></tr>
+                                {estimates.length === 0 && (
+                                    <tr>
+                                        <td colSpan={5} className="px-6 py-16 text-center">
+                                            <div className="flex flex-col items-center gap-3">
+                                                <div className="w-14 h-14 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center">
+                                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+                                                </div>
+                                                <p className="text-sm font-medium text-slate-500">No estimates yet</p>
+                                                <p className="text-xs text-slate-400 max-w-xs">Create your first estimate to start tracking project costs and send proposals to clients.</p>
+                                            </div>
+                                        </td>
+                                    </tr>
                                 )}
-                                {estimates && estimates.map((est: any) => (
-                                    <tr key={est.id} className="hover:bg-slate-50 transition">
-                                        <td className="px-6 py-4 font-medium text-blue-600 hover:underline">
-                                            <Link href={`/projects/${project.id}/estimates/${est.id}`}>{est.title}</Link>
+                                {estimates.map((est: any) => (
+                                    <tr key={est.id} className="hover:bg-slate-50/80 transition group">
+                                        <td className="px-6 py-4">
+                                            <Link href={`/projects/${project.id}/estimates/${est.id}`} className="font-medium text-hui-textMain hover:text-hui-primary transition-colors flex items-center gap-2">
+                                                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center shrink-0 border border-indigo-100/50">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+                                                </div>
+                                                {est.title}
+                                            </Link>
                                         </td>
                                         <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
-                                        <td className="px-6 py-4 text-right">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                        <td className="px-6 py-4 text-right text-slate-500">{new Date(est.createdAt).toLocaleDateString()}</td>
+                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
+                                        <td className="px-4 py-4">
+                                            <Link href={`/projects/${project.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
+                                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
+                                            </Link>
+                                        </td>
                                     </tr>
                                 ))}
                             </tbody>
                         </table>
-                    </div>
-                </div>
-
-                <div className="w-72 flex flex-col gap-6">
-                    <div className="bg-white border text-center border-hui-border rounded-md p-6 shadow-sm">
-                        <h3 className="font-semibold text-hui-textMain mb-2">Budget</h3>
-                        <p className="text-xs text-hui-textMuted mb-4 px-2">Track your estimated costs against your actual spend. It all starts with an estimate.</p>
-                        <button className="hui-btn hui-btn-primary w-full">Create a Budget</button>
-                    </div>
-
-                    <div className="bg-white border border-hui-border rounded-md p-6 shadow-sm">
-                        <h3 className="font-semibold text-hui-textMain mb-2">Total Estimated Cost</h3>
-                        <p className="text-2xl font-bold text-hui-textMain mb-6">$258,806.88</p>
-
-                        <div className="space-y-4 text-sm">
-                            <div>
-                                <p className="text-hui-textMuted text-xs mb-1">Material</p>
-                                <p className="font-medium text-hui-textMain">$183,128.01</p>
-                            </div>
-                            <div>
-                                <p className="text-hui-textMuted text-xs mb-1">Labor</p>
-                                <p className="font-medium text-hui-textMain">$54,964.75</p>
-                            </div>
-                            <div>
-                                <p className="text-hui-textMuted text-xs mb-1">Tax</p>
-                                <p className="font-medium text-hui-textMain">$20,714.12</p>
-                            </div>
-                        </div>
                     </div>
                 </div>
             </div>

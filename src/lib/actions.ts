@@ -888,7 +888,8 @@ export async function getContract(id: string) {
 export async function createContractFromTemplate(
     templateId: string,
     context: { type: "project" | "lead"; id: string },
-    titleOverride?: string
+    titleOverride?: string,
+    recurringDays?: number
 ) {
     const template = await prisma.documentTemplate.findUnique({ where: { id: templateId } });
     if (!template) throw new Error("Template not found");
@@ -905,6 +906,10 @@ export async function createContractFromTemplate(
             title: titleOverride || template.name,
             body: resolvedBody,
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
+            ...(recurringDays && recurringDays > 0 ? {
+                recurringDays,
+                nextDueDate: new Date(Date.now() + recurringDays * 86400000),
+            } : {}),
         }
     });
 
@@ -1009,34 +1014,82 @@ export async function sendContractToClient(contractId: string) {
 }
 
 export async function approveContract(contractId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
-    await prisma.contract.update({
-        where: { id: contractId },
-        data: {
-            status: "Signed",
-            approvedBy: signatureName,
-            approvedAt: new Date(),
-            approvalIp: ipAddress,
-            approvalUserAgent: userAgent,
-            signatureUrl: signatureDataUrl || null,
-        }
-    });
-
+    // Fetch the contract first to get recurring info
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: { project: true, lead: true }
     });
+    if (!contract) throw new Error("Contract not found");
+
+    const now = new Date();
+
+    // Always save a signing record for historical audit
+    await prisma.contractSigningRecord.create({
+        data: {
+            contractId,
+            signedBy: signatureName,
+            signedAt: now,
+            signatureUrl: signatureDataUrl || null,
+            ipAddress,
+            userAgent,
+            periodStart: contract.nextDueDate
+                ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
+                : contract.sentAt || contract.createdAt,
+            periodEnd: now,
+        }
+    });
+
+    if (contract.recurringDays && contract.recurringDays > 0) {
+        // Recurring contract: save the signature, then reset for next cycle
+        const nextDue = new Date(now.getTime() + contract.recurringDays * 86400000);
+        await prisma.contract.update({
+            where: { id: contractId },
+            data: {
+                approvedBy: signatureName,
+                approvedAt: now,
+                approvalIp: ipAddress,
+                approvalUserAgent: userAgent,
+                signatureUrl: signatureDataUrl || null,
+                status: "Sent", // Reset to Sent so it can be signed again next cycle
+                viewedAt: null,
+                nextDueDate: nextDue,
+            }
+        });
+    } else {
+        // One-time contract: mark as signed permanently
+        await prisma.contract.update({
+            where: { id: contractId },
+            data: {
+                status: "Signed",
+                approvedBy: signatureName,
+                approvedAt: now,
+                approvalIp: ipAddress,
+                approvalUserAgent: userAgent,
+                signatureUrl: signatureDataUrl || null,
+            }
+        });
+    }
 
     const settings = await getCompanySettings();
     if (settings.notificationEmail) {
+        const isRecurring = contract.recurringDays && contract.recurringDays > 0;
         await sendNotification(
             settings.notificationEmail,
-            `Contract "${contract?.title}" has been signed!`,
-            `<p>The contract "<strong>${contract?.title}</strong>" has been electronically signed by <strong>${signatureName}</strong> on ${new Date().toLocaleString()}.</p>`
+            `Contract "${contract.title}" has been signed!`,
+            `<p>The contract "<strong>${contract.title}</strong>" has been electronically signed by <strong>${signatureName}</strong> on ${now.toLocaleString()}.</p>
+            ${isRecurring ? `<p style="color: #666; font-size: 0.9em;">This is a recurring document (every ${contract.recurringDays} days). The next signing will be due on <strong>${new Date(now.getTime() + contract.recurringDays! * 86400000).toLocaleDateString()}</strong>.</p>` : ""}`
         );
     }
 
     revalidatePath("/");
     return { success: true };
+}
+
+export async function getContractSigningHistory(contractId: string) {
+    return await prisma.contractSigningRecord.findMany({
+        where: { contractId },
+        orderBy: { signedAt: "desc" },
+    });
 }
 
 // ────────────────────────────────────────────────
