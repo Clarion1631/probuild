@@ -1200,6 +1200,9 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
             items: {
                 where: { parentId: null },
                 orderBy: { order: "asc" },
+                include: {
+                    subItems: { orderBy: { order: "asc" } },
+                },
             },
         },
     });
@@ -1222,10 +1225,23 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
     let dayOffset = 0;
 
     for (const item of estimate.items) {
+        // Calculate estimated hours from labor items
+        let estimatedHours: number | null = null;
+        if (item.type === "Labor") {
+            // Top-level is labor — use its quantity as hours
+            estimatedHours = item.quantity || null;
+        } else if (item.subItems && item.subItems.length > 0) {
+            // Parent group — sum labor sub-item quantities as hours
+            const laborHours = item.subItems
+                .filter((si: any) => si.type === "Labor")
+                .reduce((sum: number, si: any) => sum + (si.quantity || 0), 0);
+            if (laborHours > 0) estimatedHours = laborHours;
+        }
+
         const duration = item.type === "Labor" ? 7 : item.type === "Subcontractor" ? 10 : 5;
         const startDate = new Date(today.getTime() + dayOffset * 86400000);
         const endDate = new Date(today.getTime() + (dayOffset + duration) * 86400000);
-        dayOffset += Math.ceil(duration * 0.7); // overlap a bit
+        dayOffset += Math.ceil(duration * 0.7);
 
         const task = await prisma.scheduleTask.create({
             data: {
@@ -1236,6 +1252,7 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
                 color: TYPE_COLORS[item.type] || "#4c9a2a",
                 order: order++,
                 status: "Not Started",
+                estimatedHours,
             },
         });
         created.push(task);
@@ -1244,6 +1261,7 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
     revalidatePath(`/projects/${projectId}/schedule`);
     return created;
 }
+
 
 // ========== TASK COMMENTS ==========
 
