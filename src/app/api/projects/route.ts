@@ -23,22 +23,32 @@ export async function GET(req: Request) {
     let projects;
 
     if (user.role === 'MANAGER' || user.role === 'ADMIN') {
-        // Managers see all projects loosely sorted by recent
+        // Admins and Managers see all projects
         projects = await prisma.project.findMany({
             orderBy: { createdAt: 'desc' }
         });
     } else {
-        // Employees only see assigned projects
-        projects = await prisma.project.findMany({
-            where: {
-                crew: {
-                    some: {
-                        id: user.id
-                    }
-                }
-            },
-            orderBy: { createdAt: 'desc' }
+        // Other roles: filter by ProjectAccess records
+        const accessRecords = await prisma.projectAccess.findMany({
+            where: { userId: user.id },
+            select: { projectId: true },
         });
+        const allowedIds = accessRecords.map(a => a.projectId);
+
+        if (allowedIds.length === 0) {
+            // Fall back to crew assignment if no ProjectAccess records exist yet
+            projects = await prisma.project.findMany({
+                where: {
+                    crew: { some: { id: user.id } }
+                },
+                orderBy: { createdAt: 'desc' }
+            });
+        } else {
+            projects = await prisma.project.findMany({
+                where: { id: { in: allowedIds } },
+                orderBy: { createdAt: 'desc' }
+            });
+        }
     }
 
     return NextResponse.json(projects);
