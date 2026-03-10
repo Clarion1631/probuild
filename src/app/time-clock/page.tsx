@@ -13,12 +13,12 @@ export default function TimeClockPage() {
     const [projects, setProjects] = useState<any[]>([]);
     const [selectedProject, setSelectedProject] = useState<string>("");
 
-    const [buckets, setBuckets] = useState<any[]>([]);
-    const [selectedBucket, setSelectedBucket] = useState<string>("");
+    const [costCodes, setCostCodes] = useState<any[]>([]);
+    const [selectedCostCode, setSelectedCostCode] = useState<string>("");
 
     useEffect(() => {
-        // Fetch projects for assignment
-        fetch('/api/projects') // Assuming there is an endpoint or we can server-side render this
+        // Fetch only projects the current user is assigned to
+        fetch('/api/projects?assigned=true')
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
@@ -36,7 +36,7 @@ export default function TimeClockPage() {
                     setStatus("Clocked In");
                     setCurrentTimeEntryId(active.id);
                     setSelectedProject(active.projectId);
-                    setSelectedBucket(active.budgetBucketId || "");
+                    setSelectedCostCode(active.costCodeId || "");
                 }
             })
             .catch(e => console.error("Could not fetch time entries", e));
@@ -44,20 +44,20 @@ export default function TimeClockPage() {
 
     useEffect(() => {
         if (!selectedProject) {
-            setBuckets([]);
-            setSelectedBucket("");
+            setCostCodes([]);
+            setSelectedCostCode("");
             return;
         }
 
-        // Fetch buckets for project
-        fetch(`/api/projects/${selectedProject}/buckets`)
+        // Fetch cost codes used in the selected project's estimates
+        fetch(`/api/projects/${selectedProject}/cost-codes`)
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
-                    setBuckets(data);
+                    setCostCodes(data);
                 }
             })
-            .catch(e => console.error("Could not fetch buckets", e));
+            .catch(e => console.error("Could not fetch cost codes", e));
 
     }, [selectedProject]);
 
@@ -86,7 +86,6 @@ export default function TimeClockPage() {
             setLocation(loc);
         } catch (e: any) {
             setError(e);
-            // Can decide to block clock in if location is required
         }
 
         if (status === "Clocked Out") {
@@ -95,14 +94,13 @@ export default function TimeClockPage() {
                 return;
             }
 
-            // Clock In
             try {
                 const res = await fetch('/api/time-entries', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         projectId: selectedProject,
-                        budgetBucketId: selectedBucket || null,
+                        costCodeId: selectedCostCode || null,
                         latitude: loc?.lat,
                         longitude: loc?.lng
                     })
@@ -116,7 +114,6 @@ export default function TimeClockPage() {
                 setError(err.message);
             }
         } else {
-            // Clock Out
             try {
                 if (!currentTimeEntryId) return;
 
@@ -135,11 +132,18 @@ export default function TimeClockPage() {
                 setStatus("Clocked Out");
                 setCurrentTimeEntryId(null);
                 setSelectedProject("");
-                setSelectedBucket("");
+                setSelectedCostCode("");
             } catch (err: any) {
                 setError(err.message);
             }
         }
+    };
+
+    const typeColors: Record<string, string> = {
+        Labor: "text-blue-600",
+        Material: "text-amber-600",
+        Subcontractor: "text-purple-600",
+        Equipment: "text-green-600",
     };
 
     return (
@@ -147,39 +151,61 @@ export default function TimeClockPage() {
             <h1 className="text-2xl font-bold text-hui-textMain mb-8">Time Clock</h1>
 
             <div className="hui-card p-8 text-center">
-                <div className={`text-sm font-semibold mb-6 \${status === 'Clocked In' ? 'text-green-600' : 'text-slate-500'}`}>
+                <div className={`text-sm font-semibold mb-6 ${status === 'Clocked In' ? 'text-green-600' : 'text-slate-500'}`}>
                     Status: {status}
                 </div>
 
                 {status === "Clocked Out" && (
-                    <div className="mb-8 text-left">
-                        <label className="block text-sm font-medium text-slate-700 mb-2">Project</label>
-                        <select
-                            value={selectedProject}
-                            onChange={(e) => setSelectedProject(e.target.value)}
-                            className="hui-input"
-                        >
-                            <option value="">Select a Project...</option>
-                            {projects.map(p => (
-                                <option key={p.id} value={p.id}>{p.name}</option>
-                            ))}
-                        </select>
+                    <div className="mb-8 text-left space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 mb-2">Project</label>
+                            <select
+                                value={selectedProject}
+                                onChange={(e) => setSelectedProject(e.target.value)}
+                                className="hui-input"
+                            >
+                                <option value="">Select a Project...</option>
+                                {projects.map(p => (
+                                    <option key={p.id} value={p.id}>{p.name}</option>
+                                ))}
+                            </select>
+                            {projects.length === 0 && (
+                                <p className="text-xs text-amber-600 mt-1">No projects assigned to you. Ask your manager to assign you.</p>
+                            )}
+                        </div>
 
-                        {buckets.length > 0 && (
-                            <div className="mt-4">
-                                <label className="block text-sm font-medium text-slate-700 mb-2">Phase / Bucket (Optional)</label>
+                        {costCodes.length > 0 && (
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-2">Phase / Cost Code</label>
                                 <select
-                                    value={selectedBucket}
-                                    onChange={(e) => setSelectedBucket(e.target.value)}
+                                    value={selectedCostCode}
+                                    onChange={(e) => setSelectedCostCode(e.target.value)}
                                     className="hui-input"
                                 >
                                     <option value="">Select a Phase...</option>
-                                    {buckets.map(b => (
-                                        <option key={b.id} value={b.id}>{b.name}</option>
+                                    {costCodes.map(cc => (
+                                        <option key={cc.id} value={cc.id}>
+                                            {cc.code} — {cc.name}
+                                        </option>
                                     ))}
                                 </select>
                             </div>
                         )}
+                    </div>
+                )}
+
+                {status === "Clocked In" && selectedProject && (
+                    <div className="mb-6 text-left">
+                        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                            <div className="text-sm text-green-800 font-medium">
+                                Currently working on: {projects.find(p => p.id === selectedProject)?.name || "Unknown Project"}
+                            </div>
+                            {selectedCostCode && (
+                                <div className="text-xs text-green-700 mt-1">
+                                    Phase: {costCodes.find(cc => cc.id === selectedCostCode)?.name || ""}
+                                </div>
+                            )}
+                        </div>
                     </div>
                 )}
 

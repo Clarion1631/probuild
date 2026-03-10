@@ -238,6 +238,7 @@ export async function getEstimate(id: string) {
                 orderBy: { order: "asc" },
                 include: {
                     expenses: true,
+                    costCode: true,
                 },
             },
             paymentSchedules: {
@@ -406,6 +407,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 total: parseFloat(item.total) || 0,
                 order: item.order ?? itemOrder++,
                 parentId: item.parentId || null,
+                costCodeId: item.costCodeId || null,
             },
         });
     }
@@ -633,10 +635,9 @@ export async function deleteEstimate(estimateId: string) {
     });
     if (!estimate) return { success: false, error: "Estimate not found" };
 
-    // Delete related Budget and BudgetBuckets
+    // Delete related Budget
     const budget = await prisma.budget.findUnique({ where: { estimateId } });
     if (budget) {
-        await prisma.budgetBucket.deleteMany({ where: { budgetId: budget.id } });
         await prisma.budget.delete({ where: { id: budget.id } });
     }
 
@@ -655,3 +656,214 @@ export async function deleteEstimate(estimateId: string) {
     }
     return { success: true };
 }
+
+// =============================================
+// Document Templates CRUD
+// =============================================
+
+export async function getDocumentTemplates() {
+    return await prisma.documentTemplate.findMany({
+        orderBy: { updatedAt: "desc" },
+    });
+}
+
+export async function getDocumentTemplate(id: string) {
+    return await prisma.documentTemplate.findUnique({ where: { id } });
+}
+
+export async function createDocumentTemplate(data: { name: string; type: string; body: string; isDefault?: boolean }) {
+    // If setting as default, unset all other defaults of same type
+    if (data.isDefault) {
+        await prisma.documentTemplate.updateMany({
+            where: { type: data.type, isDefault: true },
+            data: { isDefault: false }
+        });
+    }
+    const template = await prisma.documentTemplate.create({ data });
+    revalidatePath("/company/templates");
+    return template;
+}
+
+export async function updateDocumentTemplate(id: string, data: { name?: string; type?: string; body?: string; isDefault?: boolean }) {
+    if (data.isDefault) {
+        const existing = await prisma.documentTemplate.findUnique({ where: { id } });
+        if (existing) {
+            await prisma.documentTemplate.updateMany({
+                where: { type: data.type || existing.type, isDefault: true, NOT: { id } },
+                data: { isDefault: false }
+            });
+        }
+    }
+    const template = await prisma.documentTemplate.update({ where: { id }, data });
+    revalidatePath("/company/templates");
+    return template;
+}
+
+export async function deleteDocumentTemplate(id: string) {
+    await prisma.documentTemplate.delete({ where: { id } });
+    revalidatePath("/company/templates");
+    return { success: true };
+}
+
+// =============================================
+// Send Estimate to Client
+// =============================================
+
+export async function sendEstimateToClient(estimateId: string, templateId?: string) {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        include: {
+            project: { include: { client: true } },
+            lead: { include: { client: true } },
+        }
+    });
+
+    if (!estimate) throw new Error("Estimate not found");
+
+    const client = estimate.project?.client || estimate.lead?.client;
+    if (!client?.email) throw new Error("Client has no email address");
+
+    // Snapshot T&C if a template is selected
+    let termsHtml: string | null = null;
+    if (templateId) {
+        const template = await prisma.documentTemplate.findUnique({ where: { id: templateId } });
+        if (template) termsHtml = template.body;
+    } else {
+        // Try to use the default terms template
+        const defaultTemplate = await prisma.documentTemplate.findFirst({
+            where: { type: "terms", isDefault: true }
+        });
+        if (defaultTemplate) termsHtml = defaultTemplate.body;
+    }
+
+    // Update estimate with T&C snapshot and sent timestamp
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: {
+            termsAndConditions: termsHtml,
+            sentAt: new Date(),
+            status: "Sent"
+        }
+    });
+
+    // Send email notification to client
+    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/estimates/${estimateId}`;
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const companyName = settings?.companyName || "Your Contractor";
+
+    await sendNotification(
+        client.email,
+        `${companyName} sent you an estimate`,
+        `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
+            </div>
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">New Estimate for You</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    ${companyName} has sent you an estimate for review and approval. 
+                    Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
+                </p>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        View & Sign Estimate
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center;">
+                    Or copy this link: ${portalUrl}
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                Sent via ProBuild • ${companyName}
+            </p>
+        </body>
+        </html>`
+    );
+
+    // Revalidate paths
+    if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
+    if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
+    revalidatePath("/projects/all/estimates");
+
+    return { success: true, sentTo: client.email };
+}
+
+// ────────────────────────────────────────────────
+// Schedule Tasks
+// ────────────────────────────────────────────────
+
+export async function getScheduleTasks(projectId: string) {
+    return prisma.scheduleTask.findMany({
+        where: { projectId },
+        orderBy: { order: "asc" },
+        include: { children: true },
+    });
+}
+
+export async function createScheduleTask(projectId: string, data: {
+    name: string;
+    startDate: string;
+    endDate: string;
+    color?: string;
+    status?: string;
+    assignee?: string;
+    parentId?: string;
+}) {
+    const maxOrder = await prisma.scheduleTask.aggregate({
+        where: { projectId },
+        _max: { order: true },
+    });
+    const task = await prisma.scheduleTask.create({
+        data: {
+            projectId,
+            name: data.name,
+            startDate: new Date(data.startDate),
+            endDate: new Date(data.endDate),
+            color: data.color || "#4c9a2a",
+            status: data.status || "Not Started",
+            assignee: data.assignee || null,
+            parentId: data.parentId || null,
+            order: (maxOrder._max.order ?? -1) + 1,
+        },
+    });
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return task;
+}
+
+export async function updateScheduleTask(taskId: string, data: {
+    name?: string;
+    startDate?: string;
+    endDate?: string;
+    color?: string;
+    progress?: number;
+    status?: string;
+    assignee?: string;
+    order?: number;
+}) {
+    const updateData: any = {};
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.startDate !== undefined) updateData.startDate = new Date(data.startDate);
+    if (data.endDate !== undefined) updateData.endDate = new Date(data.endDate);
+    if (data.color !== undefined) updateData.color = data.color;
+    if (data.progress !== undefined) updateData.progress = data.progress;
+    if (data.status !== undefined) updateData.status = data.status;
+    if (data.assignee !== undefined) updateData.assignee = data.assignee;
+    if (data.order !== undefined) updateData.order = data.order;
+
+    const task = await prisma.scheduleTask.update({
+        where: { id: taskId },
+        data: updateData,
+    });
+    revalidatePath(`/projects/${task.projectId}/schedule`);
+    return task;
+}
+
+export async function deleteScheduleTask(taskId: string) {
+    const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
+    revalidatePath(`/projects/${task.projectId}/schedule`);
+    return task;
+}
+

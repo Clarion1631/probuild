@@ -80,6 +80,7 @@ model Project {
   floorPlans  FloorPlan[]
   contracts   Contract[]
   crew        User[]      @relation("CrewAssignments")
+  scheduleTasks ScheduleTask[]
 }
 
 model FloorPlan {
@@ -127,6 +128,10 @@ model Estimate {
   
   // Phase 8: Tracking
   viewedAt    DateTime?
+
+  // Phase 9: Terms & Sending
+  termsAndConditions String?   // Snapshot of T&C HTML at time of sending
+  sentAt             DateTime? // When the estimate was emailed to the client
 }
 
 model EstimatePaymentSchedule {
@@ -156,6 +161,8 @@ model EstimateItem {
   parent      EstimateItem?   @relation("SubItems", fields: [parentId], references: [id], onDelete: Cascade)
   subItems    EstimateItem[]  @relation("SubItems")
   expenses    Expense[]
+  costCodeId  String?
+  costCode    CostCode? @relation(fields: [costCodeId], references: [id])
   createdAt   DateTime @default(now())
 }
 
@@ -165,6 +172,8 @@ model Expense {
   estimate    Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
   itemId      String?
   item        EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  costCodeId  String?
+  costCode    CostCode? @relation(fields: [costCodeId], references: [id])
   amount      Float
   vendor      String?
   date        DateTime?
@@ -212,21 +221,21 @@ model Budget {
   totalMaterialBudget Float    @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
-  
-  buckets             BudgetBucket[]
 }
 
-model BudgetBucket {
-  id             String   @id @default(cuid())
-  budgetId       String
-  budget         Budget   @relation(fields: [budgetId], references: [id], onDelete: Cascade)
-  name           String
-  laborBudget    Float    @default(0)
-  materialBudget Float    @default(0)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+model CostCode {
+  id          String   @id @default(cuid())
+  code        String   @unique  // e.g. "01-DEMO", "02-FRAME"
+  name        String             // e.g. "Demolition", "Framing"
+  description String?
+  type        String   @default("Labor") // Labor, Material, Subcontractor, Equipment
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  timeEntries    TimeEntry[]
+  estimateItems EstimateItem[]
+  timeEntries   TimeEntry[]
+  expenses      Expense[]
 }
 
 model TimeEntry {
@@ -235,8 +244,8 @@ model TimeEntry {
   user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   projectId        String
   project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  budgetBucketId   String?
-  budgetBucket     BudgetBucket? @relation(fields: [budgetBucketId], references: [id], onDelete: Cascade)
+  costCodeId       String?
+  costCode         CostCode? @relation(fields: [costCodeId], references: [id])
   
   startTime        DateTime
   endTime          DateTime?
@@ -284,4 +293,33 @@ model CompanySettings {
   notificationEmail String?  // Where to send View/Sign alerts
   
   updatedAt         DateTime @updatedAt
+}
+
+model DocumentTemplate {
+  id        String   @id @default(cuid())
+  name      String
+  type      String   @default("terms")  // terms, contract, disclaimer
+  body      String
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ScheduleTask {
+  id          String    @id @default(cuid())
+  projectId   String
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name        String
+  startDate   DateTime
+  endDate     DateTime
+  color       String    @default("#4c9a2a")
+  progress    Int       @default(0)
+  assignee    String?
+  parentId    String?
+  parent      ScheduleTask?  @relation("SubTasks", fields: [parentId], references: [id], onDelete: Cascade)
+  children    ScheduleTask[] @relation("SubTasks")
+  order       Int       @default(0)
+  status      String    @default("Not Started") // Not Started, In Progress, Complete, Blocked
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 }

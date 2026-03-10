@@ -213,10 +213,28 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     </div>
                 </div>
 
+                {/* Terms & Conditions */}
+                {initialEstimate.termsAndConditions && (
+                    <div className="mt-8">
+                        <h2 className="text-lg font-semibold text-hui-textMain mb-4 flex items-center gap-2">
+                            <svg className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            Terms & Conditions
+                        </h2>
+                        <div className="border border-hui-border rounded-lg bg-slate-50/50 p-6">
+                            <div
+                                className="prose prose-sm max-w-none text-hui-textMuted prose-headings:text-hui-textMain prose-headings:font-semibold prose-strong:text-hui-textMain"
+                                dangerouslySetInnerHTML={{ __html: initialEstimate.termsAndConditions }}
+                            />
+                        </div>
+                    </div>
+                )}
+
                 {/* Approval Area */}
                 {!isApproved && (
                     <div className="mt-12 pt-8 border-t border-hui-border flex flex-col items-center print:hidden">
-                        <p className="text-hui-textMuted mb-6 text-center max-w-lg">Please review the details above. By approving this estimate, you agree to the terms and authorize work to proceed.</p>
+                        <p className="text-hui-textMuted mb-6 text-center max-w-lg">
+                            Please review the details above{initialEstimate.termsAndConditions ? ", including the Terms & Conditions," : ""}. By approving this estimate, you agree to the terms and authorize work to proceed.
+                        </p>
 
                         {!isApproving ? (
                             <button

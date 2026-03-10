@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { saveEstimate, createInvoiceFromEstimate, deleteEstimate } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
+import SendEstimateModal from "@/components/SendEstimateModal";
 import { toast } from "sonner";
 
 export default function EstimateEditor({ context, initialEstimate }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any }) {
@@ -18,6 +19,15 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [activeTab, setActiveTab] = useState("builder"); // builder | expenses
+    const [showSendModal, setShowSendModal] = useState(false);
+    const [costCodes, setCostCodes] = useState<any[]>([]);
+
+    useEffect(() => {
+        fetch('/api/cost-codes?active=true')
+            .then(res => res.json())
+            .then(data => { if (Array.isArray(data)) setCostCodes(data); })
+            .catch(() => {});
+    }, []);
 
     // Filter items to calculate subtotal correctly (don't double count children if parent also has cost, but here we just sum everything that isn't an assembly, or just sum all)
     // To match Houzz, Assemblies sum up their children, but for simplicity we will just let every row have a cost and sum all root level or sum all.
@@ -93,7 +103,8 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             quantity: 1,
             unitCost: 0,
             total: 0,
-            parentId
+            parentId,
+            costCodeId: null
         }]);
     }
 
@@ -219,6 +230,13 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                         </button>
                     )}
                     <button
+                        onClick={() => setShowSendModal(true)}
+                        className="hui-btn hui-btn-green flex items-center gap-2"
+                    >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                        Send to Client
+                    </button>
+                    <button
                         onClick={handleSave}
                         disabled={isSaving}
                         className="hui-btn hui-btn-primary disabled:opacity-50"
@@ -269,6 +287,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
                                 <div className="w-8"></div>
                                 <div className="flex-1">Item Description</div>
+                                <div className="w-32">Phase</div>
                                 <div className="w-32">Type</div>
                                 <div className="w-24 text-right">Qty</div>
                                 <div className="w-32 text-right">Unit Cost</div>
@@ -307,6 +326,18 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                                             + Add Sub-item
                                                                         </button>
                                                                     )}
+                                                                </div>
+                                                                <div className="w-32 px-2">
+                                                                    <select
+                                                                        value={item.costCodeId || ""}
+                                                                        onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
+                                                                        className="bg-transparent focus:outline-none text-hui-textMuted w-full text-xs truncate"
+                                                                    >
+                                                                        <option value="">No Phase</option>
+                                                                        {costCodes.map(cc => (
+                                                                            <option key={cc.id} value={cc.id}>{cc.code}</option>
+                                                                        ))}
+                                                                    </select>
                                                                 </div>
                                                                 <div className="w-32 px-4">
                                                                     <select
@@ -469,6 +500,13 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     </div>
                 )}
             </div>
+            {showSendModal && (
+                <SendEstimateModal
+                    estimateId={initialEstimate.id}
+                    clientEmail={context.clientEmail}
+                    onClose={() => setShowSendModal(false)}
+                />
+            )}
         </div>
     );
 }
