@@ -93,6 +93,7 @@ export async function getProject(id: string) {
             client: true,
             estimates: true,
             floorPlans: true,
+            contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
         },
     });
     return project;
