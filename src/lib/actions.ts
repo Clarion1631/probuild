@@ -1191,4 +1191,152 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
     return created;
 }
 
+// ========== TASK COMMENTS ==========
 
+export async function addTaskComment(taskId: string, userId: string, text: string) {
+    const comment = await prisma.taskComment.create({
+        data: { taskId, userId, text },
+        include: { user: { select: { id: true, name: true, email: true } } },
+    });
+    return comment;
+}
+
+export async function getTaskComments(taskId: string) {
+    return prisma.taskComment.findMany({
+        where: { taskId },
+        orderBy: { createdAt: "asc" },
+        include: { user: { select: { id: true, name: true, email: true } } },
+    });
+}
+
+// ========== PUNCH LIST ==========
+
+export async function addTaskPunchItem(taskId: string, name: string) {
+    const maxOrder = await prisma.taskPunchItem.aggregate({
+        where: { taskId },
+        _max: { order: true },
+    });
+    return prisma.taskPunchItem.create({
+        data: { taskId, name, order: (maxOrder._max.order ?? -1) + 1 },
+    });
+}
+
+export async function togglePunchItem(id: string) {
+    const item = await prisma.taskPunchItem.findUnique({ where: { id } });
+    if (!item) return null;
+    return prisma.taskPunchItem.update({
+        where: { id },
+        data: { completed: !item.completed },
+    });
+}
+
+export async function deletePunchItem(id: string) {
+    return prisma.taskPunchItem.delete({ where: { id } });
+}
+
+export async function getTaskPunchItems(taskId: string) {
+    return prisma.taskPunchItem.findMany({
+        where: { taskId },
+        orderBy: { order: "asc" },
+    });
+}
+
+// ========== TASK ASSIGNMENTS ==========
+
+export async function assignUserToTask(taskId: string, userId: string) {
+    const assignment = await prisma.taskAssignment.create({
+        data: { taskId, userId },
+        include: { user: { select: { id: true, name: true, email: true } } },
+    });
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
+    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    return assignment;
+}
+
+export async function unassignUserFromTask(taskId: string, userId: string) {
+    await prisma.taskAssignment.deleteMany({
+        where: { taskId, userId },
+    });
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
+    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+}
+
+// ========== AI PUNCHLIST ==========
+
+export async function aiGeneratePunchlist(taskId: string) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
+
+    const task = await prisma.scheduleTask.findUnique({
+        where: { id: taskId },
+        include: { project: true },
+    });
+    if (!task) throw new Error("Task not found");
+
+    const prompt = `You are an expert construction project manager. Generate a detailed punch list for this construction task.
+
+TASK: "${task.name}"
+PROJECT: "${task.project.name}"
+PROJECT TYPE: ${task.project.type || "General Construction"}
+
+Generate 5-10 specific, actionable punch list items that a foreman would check before marking this task complete. Be specific to the trade and scope of work.
+
+Return ONLY a JSON array of strings, nothing else. Each string is one punch list item.
+Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet areas"]`;
+
+    const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.7, responseMimeType: "application/json" },
+            }),
+        }
+    );
+
+    const data = await res.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) throw new Error("No AI response");
+
+    let items: string[] = JSON.parse(rawText);
+    if (!Array.isArray(items)) throw new Error("Invalid AI response");
+
+    const maxOrder = await prisma.taskPunchItem.aggregate({
+        where: { taskId },
+        _max: { order: true },
+    });
+    let order = (maxOrder._max.order ?? -1) + 1;
+
+    const created = [];
+    for (const name of items) {
+        const item = await prisma.taskPunchItem.create({
+            data: { taskId, name, order: order++ },
+        });
+        created.push(item);
+    }
+    return created;
+}
+
+// ========== MASTER SCHEDULE ==========
+
+export async function getAllScheduleTasks() {
+    return prisma.scheduleTask.findMany({
+        orderBy: [{ projectId: "asc" }, { order: "asc" }],
+        include: {
+            project: { select: { id: true, name: true, type: true, status: true } },
+            assignments: {
+                include: { user: { select: { id: true, name: true, email: true } } },
+            },
+            timeEntries: { select: { durationHours: true } },
+        },
+    });
+}
+
+export async function getTeamMembers() {
+    return prisma.user.findMany({
+        orderBy: { name: "asc" },
+        select: { id: true, name: true, email: true, role: true },
+    });
+}

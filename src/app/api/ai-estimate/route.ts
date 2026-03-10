@@ -55,17 +55,36 @@ INSTRUCTIONS:
 - Group sub-items under parent items by phase when logical
 - The "description" field should be brief but helpful (e.g., "R-13 batt insulation, exterior walls")
 
-Return ONLY a JSON array of objects. Each object must have exactly these fields:
+Also generate a payment milestone schedule (typically 4-6 milestones) based on standard construction draw schedules:
+- Deposit/Signing (10-20%)
+- After demolition/rough-in (20-25%)
+- After framing/structural (20-25%)
+- After finishes begin (15-20%)
+- Substantial completion (10-15%)
+- Final walkthrough/completion (5-10%)
+
+Return ONLY a JSON object (NOT an array) with two keys:
+
 {
-  "name": string,
-  "description": string,
-  "costCode": string (the phase code, e.g. "01-DEMO"),
-  "costType": string (exactly one of: ${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}),
-  "quantity": number,
-  "unit": string (e.g. "sq ft", "hr", "each", "job", "linear ft"),
-  "unitCost": number,
-  "total": number,
-  "isAllowance": boolean
+  "items": [
+    {
+      "name": string,
+      "description": string,
+      "costCode": string (the phase code, e.g. "01-DEMO"),
+      "costType": string (exactly one of: ${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}),
+      "quantity": number,
+      "unit": string (e.g. "sq ft", "hr", "each", "job", "linear ft"),
+      "unitCost": number,
+      "total": number,
+      "isAllowance": boolean
+    }
+  ],
+  "paymentMilestones": [
+    {
+      "name": string (e.g. "Deposit upon signing"),
+      "percentage": number (e.g. 15)
+    }
+  ]
 }
 
 Sort items by phase code, then by cost type within each phase. Make the estimate thorough and professional.`;
@@ -105,17 +124,29 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
         }
 
-        let aiItems: any[];
+        let aiData: any;
         try {
-            aiItems = JSON.parse(rawText);
-            if (!Array.isArray(aiItems)) throw new Error("Not an array");
+            aiData = JSON.parse(rawText);
+            // Handle both object format { items: [...], paymentMilestones: [...] } and legacy array format
+            if (Array.isArray(aiData)) {
+                aiData = { items: aiData, paymentMilestones: [] };
+            }
         } catch {
-            const match = rawText.match(/\[[\s\S]*\]/);
-            if (!match) {
+            // Try to extract JSON object or array
+            const objMatch = rawText.match(/\{[\s\S]*\}/);
+            const arrMatch = rawText.match(/\[[\s\S]*\]/);
+            if (objMatch) {
+                aiData = JSON.parse(objMatch[0]);
+                if (Array.isArray(aiData)) aiData = { items: aiData, paymentMilestones: [] };
+            } else if (arrMatch) {
+                aiData = { items: JSON.parse(arrMatch[0]), paymentMilestones: [] };
+            } else {
                 return NextResponse.json({ error: "Could not parse AI response" }, { status: 502 });
             }
-            aiItems = JSON.parse(match[0]);
         }
+
+        const aiItems = aiData.items || [];
+        const aiMilestones = aiData.paymentMilestones || [];
 
         // Map cost codes and cost types to IDs
         const codeMap: Record<string, string> = {};
@@ -143,10 +174,22 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             order: idx,
         }));
 
+        const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0);
+
+        // Build payment milestones with amounts based on total
+        const paymentMilestones = aiMilestones.map((m: any, idx: number) => ({
+            id: `pm_${Date.now()}_${idx}`,
+            name: m.name || `Payment ${idx + 1}`,
+            percentage: String(m.percentage || 0),
+            amount: ((m.percentage || 0) / 100 * totalEstimate).toFixed(2),
+            dueDate: "",
+        }));
+
         return NextResponse.json({
             items: estimateItems,
+            paymentMilestones,
             count: estimateItems.length,
-            totalEstimate: estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0),
+            totalEstimate,
         });
     } catch (err: any) {
         console.error("AI Estimate error:", err);

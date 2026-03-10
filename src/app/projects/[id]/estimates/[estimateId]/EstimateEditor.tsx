@@ -143,14 +143,18 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             const data = await res.json();
             if (data.items && data.items.length > 0) {
                 setItems(prev => [...prev, ...data.items]);
+                if (data.paymentMilestones && data.paymentMilestones.length > 0) {
+                    setPaymentSchedules(prev => [...prev, ...data.paymentMilestones]);
+                }
                 toast.success(`AI generated ${data.count} items (est. $${data.totalEstimate?.toLocaleString()})`);
                 setShowAiModal(false);
                 setAiPrompt("");
             } else {
                 toast.error('AI returned no items');
             }
-        } catch (err) {
-            toast.error('Failed to generate estimate');
+        } catch (err: any) {
+            console.error('AI Generate error:', err);
+            toast.error(err?.message || 'Failed to generate estimate — check console');
         } finally {
             setIsGenerating(false);
         }

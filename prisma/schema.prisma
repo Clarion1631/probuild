@@ -17,6 +17,8 @@ model User {
   pinCode    String?     // Used for mobile app quick login
   timeEntries TimeEntry[]
   assignedProjects Project[] @relation("CrewAssignments")
+  taskAssignments  TaskAssignment[]
+  taskComments     TaskComment[]
 }
 
 model Client {
@@ -363,6 +365,11 @@ model ScheduleTask {
 
   // Time tracking
   timeEntries    TimeEntry[]
+
+  // Task details
+  comments       TaskComment[]
+  punchItems     TaskPunchItem[]
+  assignments    TaskAssignment[]
 }
 
 model TaskDependency {
@@ -374,4 +381,38 @@ model TaskDependency {
   type            String       @default("FS") // FS = Finish-to-Start
 
   @@unique([predecessorId, dependentId])
+}
+
+model TaskComment {
+  id             String       @id @default(cuid())
+  taskId         String
+  task           ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  text           String
+  createdAt      DateTime     @default(now())
+}
+
+model TaskPunchItem {
+  id             String       @id @default(cuid())
+  taskId         String
+  task           ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  name           String
+  completed      Boolean      @default(false)
+  assignee       String?
+  photoUrl       String?
+  order          Int          @default(0)
+  createdAt      DateTime     @default(now())
+}
+
+model TaskAssignment {
+  id             String       @id @default(cuid())
+  taskId         String
+  task           ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           String       @default("assigned") // assigned, lead
+  createdAt      DateTime     @default(now())
+
+  @@unique([taskId, userId])
 }
