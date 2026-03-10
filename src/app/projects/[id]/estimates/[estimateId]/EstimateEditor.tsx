@@ -21,11 +21,16 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [activeTab, setActiveTab] = useState("builder"); // builder | expenses
     const [showSendModal, setShowSendModal] = useState(false);
     const [costCodes, setCostCodes] = useState<any[]>([]);
+    const [costTypes, setCostTypes] = useState<any[]>([]);
 
     useEffect(() => {
         fetch('/api/cost-codes?active=true')
             .then(res => res.json())
             .then(data => { if (Array.isArray(data)) setCostCodes(data); })
+            .catch(() => {});
+        fetch('/api/cost-types?active=true')
+            .then(res => res.json())
+            .then(data => { if (Array.isArray(data)) setCostTypes(data); })
             .catch(() => {});
     }, []);
 
@@ -104,7 +109,8 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             unitCost: 0,
             total: 0,
             parentId,
-            costCodeId: null
+            costCodeId: null,
+            costTypeId: null
         }]);
     }
 
@@ -341,14 +347,23 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                                 </div>
                                                                 <div className="w-32 px-4">
                                                                     <select
-                                                                        value={item.type}
-                                                                        onChange={e => updateItem(index, "type", e.target.value)}
-                                                                        className="bg-transparent focus:outline-none text-hui-textMuted w-full text-sm"
+                                                                        value={item.costTypeId || ""}
+                                                                        onChange={e => {
+                                                                            updateItem(index, "costTypeId", e.target.value || null);
+                                                                            // Also update legacy type field for backwards compat
+                                                                            const ct = costTypes.find(c => c.id === e.target.value);
+                                                                            if (ct) updateItem(index, "type", ct.name);
+                                                                        }}
+                                                                        className={`bg-transparent focus:outline-none w-full text-sm ${
+                                                                            costTypes.find(c => c.id === item.costTypeId)?.name === 'Allowance'
+                                                                                ? 'text-amber-600 font-semibold'
+                                                                                : 'text-hui-textMuted'
+                                                                        }`}
                                                                     >
-                                                                        <option>Material</option>
-                                                                        <option>Labor</option>
-                                                                        <option>Subcontractor</option>
-                                                                        <option>Assembly</option>
+                                                                        <option value="">Cost Type</option>
+                                                                        {costTypes.map(ct => (
+                                                                            <option key={ct.id} value={ct.id}>{ct.name}</option>
+                                                                        ))}
                                                                     </select>
                                                                     </div>
                                                                     <div className="w-24 px-4 pt-1 text-right">

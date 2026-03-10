@@ -239,6 +239,7 @@ export async function getEstimate(id: string) {
                 include: {
                     expenses: true,
                     costCode: true,
+                    costType: true,
                 },
             },
             paymentSchedules: {
@@ -408,6 +409,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 order: item.order ?? itemOrder++,
                 parentId: item.parentId || null,
                 costCodeId: item.costCodeId || null,
+                costTypeId: item.costTypeId || null,
             },
         });
     }

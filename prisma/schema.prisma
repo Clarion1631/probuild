@@ -152,7 +152,7 @@ model EstimateItem {
   estimate    Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
   name        String
   description String?
-  type        String   @default("Material") // Material, Labor, Subcontractor
+  type        String   @default("Material") // Legacy fallback
   quantity    Float    @default(1)
   unitCost    Float    @default(0)
   total       Float    @default(0)
@@ -163,6 +163,8 @@ model EstimateItem {
   expenses    Expense[]
   costCodeId  String?
   costCode    CostCode? @relation(fields: [costCodeId], references: [id])
+  costTypeId  String?
+  costType    CostType? @relation(fields: [costTypeId], references: [id])
   createdAt   DateTime @default(now())
 }
 
@@ -174,6 +176,8 @@ model Expense {
   item        EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
   costCodeId  String?
   costCode    CostCode? @relation(fields: [costCodeId], references: [id])
+  costTypeId  String?
+  costType    CostType? @relation(fields: [costTypeId], references: [id])
   amount      Float
   vendor      String?
   date        DateTime?
@@ -228,7 +232,20 @@ model CostCode {
   code        String   @unique  // e.g. "01-DEMO", "02-FRAME"
   name        String             // e.g. "Demolition", "Framing"
   description String?
-  type        String   @default("Labor") // Labor, Material, Subcontractor, Equipment
+  type        String   @default("Labor") // Legacy — kept for migration, use CostType going forward
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  estimateItems EstimateItem[]
+  timeEntries   TimeEntry[]
+  expenses      Expense[]
+}
+
+model CostType {
+  id          String   @id @default(cuid())
+  name        String   @unique   // "Labor", "Material", "Unit", "Allowance", etc.
+  description String?
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -246,6 +263,8 @@ model TimeEntry {
   project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   costCodeId       String?
   costCode         CostCode? @relation(fields: [costCodeId], references: [id])
+  costTypeId       String?
+  costType         CostType? @relation(fields: [costTypeId], references: [id])
   
   startTime        DateTime
   endTime          DateTime?
