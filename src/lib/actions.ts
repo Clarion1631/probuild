@@ -75,6 +75,42 @@ export async function createLead(data: { name: string; clientName: string; clien
     return { id: lead.id };
 }
 
+export async function updateClient(clientId: string, data: { name?: string; email?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
+    "use server";
+    const client = await prisma.client.update({
+        where: { id: clientId },
+        data: {
+            name: data.name,
+            email: data.email,
+            primaryPhone: data.primaryPhone,
+            addressLine1: data.addressLine1,
+            city: data.city,
+            state: data.state,
+            zipCode: data.zipCode,
+        },
+    });
+    revalidatePath("/leads");
+    return client;
+}
+
+export async function updateLead(leadId: string, data: { name?: string; source?: string; expectedStartDate?: string | null; targetRevenue?: number | null; location?: string; projectType?: string }) {
+    "use server";
+    const updateData: any = {};
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.source !== undefined) updateData.source = data.source;
+    if (data.location !== undefined) updateData.location = data.location;
+    if (data.projectType !== undefined) updateData.projectType = data.projectType;
+    if (data.expectedStartDate !== undefined) updateData.expectedStartDate = data.expectedStartDate ? new Date(data.expectedStartDate) : null;
+    if (data.targetRevenue !== undefined) updateData.targetRevenue = data.targetRevenue;
+
+    const lead = await prisma.lead.update({
+        where: { id: leadId },
+        data: updateData,
+    });
+    revalidatePath(`/leads/${leadId}`);
+    return lead;
+}
+
 export async function getProjects() {
     const projects = await prisma.project.findMany({
         orderBy: { viewedAt: "desc" },

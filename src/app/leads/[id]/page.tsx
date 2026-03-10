@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
 import EstimateStatusDropdown from "@/components/EstimateStatusDropdown";
 import LeadContractsSection from "./LeadContractsSection";
+import LeadDetailsCards from "./LeadDetailsCards";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -38,30 +39,24 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 </div>
 
                 <div className="p-6 space-y-6 bg-slate-50 min-h-full">
-                    {/* Cards for Details */}
-                    <div className="grid grid-cols-2 gap-6">
-                        <div className="hui-card p-6">
-                            <h3 className="font-semibold text-hui-textMain text-sm mb-4 flex justify-between items-center">Client Details <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm cursor-pointer">Edit</span></h3>
-                            <div className="space-y-3 text-sm">
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Name</span><span className="text-hui-textMain font-medium">{lead.client.name}</span></div>
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Email</span><span className="text-hui-textMain">{lead.client.email || "N/A"}</span></div>
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Phone</span><span className="text-hui-textMain">N/A</span></div>
-                            </div>
-                        </div>
-                        <div className="hui-card p-6">
-                            <h3 className="font-semibold text-hui-textMain text-sm mb-4">Lead Details</h3>
-                            <div className="space-y-3 text-sm">
-                                <div className="flex justify-between items-center"><span className="text-hui-textMuted">Lead Stage</span>
-                                    <div className="w-1/2">
-                                        <LeadStageDropdown leadId={lead.id} currentStage={lead.stage} />
-                                    </div>
-                                </div>
-                                <div className="flex justify-between mt-3"><span className="text-hui-textMuted">Lead Source</span><span className="text-hui-textMain">{lead.source}</span></div>
-                                <div className="flex justify-between items-center"><span className="text-hui-textMuted">Expected Start Date</span><span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-primary bg-indigo-50 border border-indigo-100 rounded-md hover:bg-indigo-100 transition shadow-sm cursor-pointer">+ Add</span></div>
-                                <div className="flex justify-between items-center"><span className="text-hui-textMuted">Target Revenue</span><span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-primary bg-indigo-50 border border-indigo-100 rounded-md hover:bg-indigo-100 transition shadow-sm cursor-pointer">+ Add</span></div>
-                            </div>
-                        </div>
-                    </div>
+                    {/* Client & Lead Details Cards - Editable */}
+                    <LeadDetailsCards
+                        leadId={lead.id}
+                        leadName={lead.name}
+                        leadSource={lead.source}
+                        expectedStartDate={lead.expectedStartDate?.toISOString().split("T")[0] || null}
+                        targetRevenue={lead.targetRevenue}
+                        location={lead.location}
+                        projectType={lead.projectType}
+                        clientId={lead.client.id}
+                        clientName={lead.client.name}
+                        clientEmail={lead.client.email}
+                        clientPhone={(lead.client as any).primaryPhone || null}
+                        clientAddress={(lead.client as any).addressLine1 || null}
+                        clientCity={(lead.client as any).city || null}
+                        clientState={(lead.client as any).state || null}
+                        clientZip={(lead.client as any).zipCode || null}
+                    />
 
                     {/* Estimates Section */}
                     <div className="hui-card p-6 shadow-sm">
