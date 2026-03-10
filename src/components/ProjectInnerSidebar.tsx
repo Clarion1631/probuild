@@ -5,6 +5,7 @@ import { useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { linkProjectToLead } from "@/lib/actions";
 import { toast } from "sonner";
+import { usePermissions } from "@/components/PermissionsProvider";
 
 interface ProjectInnerSidebarProps {
     projectId: string;
@@ -12,10 +13,11 @@ interface ProjectInnerSidebarProps {
     availableLeads?: { id: string; name: string; stage: string; client: { name: string } }[];
 }
 
+type NavItem = { label: string; href: string; permission?: string };
 type NavSection = {
     id: string;
     title: string;
-    items: { label: string; href: string }[];
+    items: NavItem[];
 };
 
 export default function ProjectInnerSidebar({ projectId, lead, availableLeads = [] }: ProjectInnerSidebarProps) {
@@ -25,6 +27,9 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const [showLinkModal, setShowLinkModal] = useState(false);
     const [linking, setLinking] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
+    const { permissions, loaded } = usePermissions();
+
+    const can = (key?: string) => !key || !loaded || !!permissions[key];
 
     const navSections: NavSection[] = [
         {
@@ -38,28 +43,28 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             id: "planning",
             title: "Planning",
             items: [
-                { label: "Contracts", href: `/projects/${projectId}/contracts` },
-                { label: "Estimates", href: `/projects/${projectId}/estimates` },
-                { label: "Takeoffs", href: `/projects/${projectId}/takeoffs` },
-                { label: "3D Floor Plans", href: `/projects/${projectId}/floor-plans` },
+                { label: "Contracts", href: `/projects/${projectId}/contracts`, permission: "contracts" },
+                { label: "Estimates", href: `/projects/${projectId}/estimates`, permission: "estimates" },
+                { label: "Takeoffs", href: `/projects/${projectId}/takeoffs`, permission: "takeoffs" },
+                { label: "3D Floor Plans", href: `/projects/${projectId}/floor-plans`, permission: "floorPlans" },
             ],
         },
         {
             id: "management",
             title: "Management",
             items: [
-                { label: "Schedule", href: `/projects/${projectId}/schedule` },
-                { label: "Files & Photos", href: `/projects/${projectId}/files` },
+                { label: "Schedule", href: `/projects/${projectId}/schedule`, permission: "schedules" },
+                { label: "Files & Photos", href: `/projects/${projectId}/files`, permission: "files" },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
-                { label: "Daily Logs", href: `/projects/${projectId}/dailylogs` },
+                { label: "Daily Logs", href: `/projects/${projectId}/dailylogs`, permission: "dailyLogs" },
             ],
         },
         {
             id: "finance",
             title: "Finance",
             items: [
-                { label: "Invoices", href: `/projects/${projectId}/invoices` },
-                { label: "Change Orders", href: `/projects/${projectId}/changeorders` },
+                { label: "Invoices", href: `/projects/${projectId}/invoices`, permission: "invoices" },
+                { label: "Change Orders", href: `/projects/${projectId}/changeorders`, permission: "changeOrders" },
             ],
         },
     ];
@@ -168,7 +173,10 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
-                    {navSections.map((section) => (
+                    {navSections.map((section) => {
+                        const visibleItems = section.items.filter(item => can(item.permission));
+                        if (visibleItems.length === 0) return null;
+                        return (
                         <div key={section.id} className="mb-4">
                             <button
                                 onClick={() => toggleSection(section.id)}
@@ -189,7 +197,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
                             {!collapsedSections[section.id] && (
                                 <ul className="space-y-1">
-                                    {section.items.map((item) => {
+                                    {visibleItems.map((item) => {
                                         const isActive = pathname?.includes(item.href);
                                         return (
                                             <li key={item.label}>
@@ -208,7 +216,8 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                                 </ul>
                             )}
                         </div>
-                    ))}
+                        );
+                    })}
                 </div>
             </div>
 
