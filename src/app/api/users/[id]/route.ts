@@ -1,92 +1,132 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
-export const dynamic = 'force-dynamic';
-
-export async function PUT(
-    req: Request,
-    { params }: { params: Promise<{ id: string }> }
-) {
+// GET: get user details with permissions and project access
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
         const session = await getServerSession(authOptions);
-        if (!session?.user?.email) {
-            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-        }
+        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-        const currentUser = await prisma.user.findUnique({
-            where: { email: session.user.email }
-        });
-
-        // Only MANAGER and ADMIN can edit users
-        if (!currentUser || (currentUser.role !== 'MANAGER' && currentUser.role !== 'ADMIN')) {
+        const currentUser = await prisma.user.findUnique({ where: { email: session.user.email } });
+        if (!currentUser || !["MANAGER", "ADMIN"].includes(currentUser.role)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
 
-        const body = await req.json();
-
-        // Allowed fields for update
-        const { name, role, hourlyRate, burdenRate, pinCode } = body;
-
-        const updateData: any = {};
-        if (name !== undefined) updateData.name = name;
-        if (role !== undefined) updateData.role = role;
-        if (hourlyRate !== undefined) updateData.hourlyRate = Number(hourlyRate);
-        if (burdenRate !== undefined) updateData.burdenRate = Number(burdenRate);
-        if (pinCode !== undefined) updateData.pinCode = pinCode;
-
-        const updatedUser = await prisma.user.update({
-            where: { id: (await params).id },
-            data: updateData,
-            select: {
-                id: true,
-                name: true,
-                email: true,
-                role: true,
-                hourlyRate: true,
-                burdenRate: true,
-                pinCode: true,
-            }
+        const { id } = await params;
+        const user = await prisma.user.findUnique({
+            where: { id },
+            include: {
+                permissions: true,
+                projectAccess: {
+                    include: { project: { select: { id: true, name: true, client: { select: { name: true } }, createdAt: true } } }
+                },
+            },
         });
 
-        return NextResponse.json(updatedUser);
+        if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
+
+        // Get all projects for the access toggle list
+        const allProjects = await prisma.project.findMany({
+            select: { id: true, name: true, client: { select: { name: true } }, createdAt: true },
+            orderBy: { createdAt: "desc" },
+        });
+
+        return NextResponse.json({ user, allProjects });
+    } catch (error: any) {
+        console.error("GET /api/users/[id] error:", error);
+        return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    }
+}
+
+// PUT: update permissions and project access
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+    try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+        const currentUser = await prisma.user.findUnique({ where: { email: session.user.email } });
+        if (!currentUser || !["MANAGER", "ADMIN"].includes(currentUser.role)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+
+        const { id } = await params;
+        const body = await req.json();
+        const { permissions, projectIds, userInfo } = body;
+
+        // Update user info if provided
+        if (userInfo) {
+            const data: any = {};
+            if (userInfo.name !== undefined) data.name = userInfo.name;
+            if (userInfo.role !== undefined) data.role = userInfo.role;
+            if (userInfo.status !== undefined) data.status = userInfo.status;
+            if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
+            if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+            if (Object.keys(data).length > 0) {
+                await prisma.user.update({ where: { id }, data });
+            }
+        }
+
+        // Update permissions if provided
+        if (permissions) {
+            await prisma.userPermission.upsert({
+                where: { userId: id },
+                create: { userId: id, ...permissions },
+                update: permissions,
+            });
+        }
+
+        // Update project access if provided
+        if (projectIds !== undefined) {
+            // Delete all existing access
+            await prisma.projectAccess.deleteMany({ where: { userId: id } });
+            // Re-create with new list
+            if (projectIds.length > 0) {
+                await prisma.projectAccess.createMany({
+                    data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
+                    skipDuplicates: true,
+                });
+            }
+        }
+
+        // Fetch updated user
+        const user = await prisma.user.findUnique({
+            where: { id },
+            include: {
+                permissions: true,
+                projectAccess: {
+                    include: { project: { select: { id: true, name: true, client: { select: { name: true } }, createdAt: true } } }
+                },
+            },
+        });
+
+        return NextResponse.json(user);
     } catch (error: any) {
         console.error("PUT /api/users/[id] error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
     }
 }
 
-export async function DELETE(
-    req: Request,
-    { params }: { params: Promise<{ id: string }> }
-) {
+// DELETE: remove a user
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
         const session = await getServerSession(authOptions);
-        if (!session?.user?.email) {
-            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-        }
+        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-        const currentUser = await prisma.user.findUnique({
-            where: { email: session.user.email }
-        });
-
-        // Only MANAGER and ADMIN can delete users
-        if (!currentUser || (currentUser.role !== 'MANAGER' && currentUser.role !== 'ADMIN')) {
+        const currentUser = await prisma.user.findUnique({ where: { email: session.user.email } });
+        if (!currentUser || !["MANAGER", "ADMIN"].includes(currentUser.role)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
 
-        const userId = (await params).id;
+        const { id } = await params;
 
-        // Prevent deleting yourself
-        if (currentUser.id === userId) {
-            return NextResponse.json({ error: "You cannot delete your own account" }, { status: 400 });
+        // Can't delete yourself
+        if (id === currentUser.id) {
+            return NextResponse.json({ error: "Cannot delete your own account" }, { status: 400 });
         }
 
-        await prisma.user.delete({
-            where: { id: userId }
-        });
-
+        await prisma.user.delete({ where: { id } });
         return NextResponse.json({ success: true });
     } catch (error: any) {
         console.error("DELETE /api/users/[id] error:", error);
