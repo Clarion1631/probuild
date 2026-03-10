@@ -228,6 +228,13 @@ export default function TemplatesPage() {
         terms: "bg-blue-50 text-blue-700 border-blue-200",
         contract: "bg-purple-50 text-purple-700 border-purple-200",
         disclaimer: "bg-amber-50 text-amber-700 border-amber-200",
+        lien_release: "bg-rose-50 text-rose-700 border-rose-200",
+    };
+    const typeLabels: Record<string, string> = {
+        terms: "Terms & Conditions",
+        contract: "Contract",
+        disclaimer: "Disclaimer",
+        lien_release: "Lien Release",
     };
 
     // ─── FULL-SCREEN EDITOR ───
@@ -258,6 +265,7 @@ export default function TemplatesPage() {
                         >
                             <option value="terms">Terms & Conditions</option>
                             <option value="contract">Contract</option>
+                            <option value="lien_release">Lien Release</option>
                             <option value="disclaimer">Disclaimer</option>
                         </select>
                         <label className="flex items-center gap-1.5 text-sm text-hui-textMuted cursor-pointer">
@@ -452,8 +460,8 @@ export default function TemplatesPage() {
                                     <div className="flex-1 min-w-0">
                                         <div className="flex items-center gap-3 mb-2">
                                             <h3 className="font-semibold text-hui-textMain text-base">{t.name}</h3>
-                                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border capitalize ${typeColors[t.type] || typeColors.terms}`}>
-                                                {t.type}
+                                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border ${typeColors[t.type] || typeColors.terms}`}>
+                                                {typeLabels[t.type] || t.type}
                                             </span>
                                             {t.isDefault && (
                                                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700 border border-green-200">
