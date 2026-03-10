@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { writeFile, mkdir } from "fs/promises";
-import path from "path";
+import { supabase, STORAGE_BUCKET } from "@/lib/supabase";
 
 // GET: list files and folders for a project or lead
 export async function GET(req: NextRequest) {
@@ -48,11 +47,15 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ folders, files });
 }
 
-// POST: upload file(s)
+// POST: upload file(s) to Supabase Storage
 export async function POST(req: NextRequest) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    if (!supabase) {
+        return NextResponse.json({ error: "Storage not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY." }, { status: 500 });
     }
 
     const user = await prisma.user.findUnique({ where: { email: session.user.email } });
@@ -71,28 +74,42 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "No files provided" }, { status: 400 });
     }
 
-    // Ensure upload directory exists
-    const uploadDir = path.join(process.cwd(), "public", "uploads");
-    await mkdir(uploadDir, { recursive: true });
-
     const created = [];
 
     for (const file of files) {
         const bytes = await file.arrayBuffer();
         const buffer = Buffer.from(bytes);
 
-        // Create unique filename
-        const ext = path.extname(file.name);
-        const baseName = path.basename(file.name, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
-        const uniqueName = `${baseName}_${Date.now()}${ext}`;
-        const filePath = path.join(uploadDir, uniqueName);
+        // Build storage path: projects/PROJECT_ID/filename_timestamp.ext or leads/LEAD_ID/...
+        const prefix = projectId ? `projects/${projectId}` : `leads/${leadId}`;
+        const ext = file.name.includes(".") ? "." + file.name.split(".").pop() : "";
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const storagePath = `${prefix}/${Date.now()}_${safeName}`;
 
-        await writeFile(filePath, buffer);
+        // Upload to Supabase Storage
+        const { data: uploadData, error: uploadError } = await supabase.storage
+            .from(STORAGE_BUCKET)
+            .upload(storagePath, buffer, {
+                contentType: file.type || "application/octet-stream",
+                upsert: false,
+            });
+
+        if (uploadError) {
+            console.error("Supabase upload error:", uploadError);
+            return NextResponse.json({ error: `Upload failed: ${uploadError.message}` }, { status: 500 });
+        }
+
+        // Get public URL
+        const { data: urlData } = supabase.storage
+            .from(STORAGE_BUCKET)
+            .getPublicUrl(storagePath);
+
+        const publicUrl = urlData?.publicUrl || storagePath;
 
         const record = await prisma.projectFile.create({
             data: {
                 name: file.name,
-                url: `/uploads/${uniqueName}`,
+                url: publicUrl,
                 size: buffer.length,
                 mimeType: file.type || "application/octet-stream",
                 ...(projectId && { projectId }),
@@ -111,7 +128,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ files: created }, { status: 201 });
 }
 
-// DELETE: delete a file
+// DELETE: delete a file or folder
 export async function DELETE(req: NextRequest) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
@@ -123,6 +140,18 @@ export async function DELETE(req: NextRequest) {
     const folderId = searchParams.get("folderId");
 
     if (fileId) {
+        // Get file URL to delete from storage
+        const file = await prisma.projectFile.findUnique({ where: { id: fileId } });
+        if (file && supabase) {
+            // Extract storage path from URL
+            const url = file.url;
+            const bucketPrefix = `/storage/v1/object/public/${STORAGE_BUCKET}/`;
+            const pathIdx = url.indexOf(bucketPrefix);
+            if (pathIdx >= 0) {
+                const storagePath = url.substring(pathIdx + bucketPrefix.length);
+                await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]);
+            }
+        }
         await prisma.projectFile.delete({ where: { id: fileId } });
         return NextResponse.json({ success: true });
     }

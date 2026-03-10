@@ -267,16 +267,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         } catch { toast.error("Import failed"); } finally { setIsImporting(false); }
     }
 
-    async function handleAiSchedule(estimateId?: string) {
-        setIsAiGenerating(true); setShowAiMenu(false);
-        try {
-            const res = await fetch("/api/ai-schedule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId, estimateId }) });
-            const data = await res.json();
-            if (!res.ok) { toast.error(data.error || "AI failed"); return; }
-            setTasks(prev => [...prev, ...data.tasks.map((t: any) => ({ ...t, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [] }))]);
-            toast.success(`✨ AI generated ${data.count} tasks`);
-        } catch { toast.error("Failed to connect to AI"); } finally { setIsAiGenerating(false); }
-    }
+
 
     // --- Linking ---
     async function handleTaskClick(taskId: string) {
