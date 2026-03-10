@@ -12,7 +12,7 @@ interface ProjectInnerSidebarProps {
 type NavSection = {
     id: string;
     title: string;
-    items: { label: string; href: string; icon?: string }[];
+    items: { label: string; href: string }[];
 };
 
 export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSidebarProps) {
@@ -66,6 +66,17 @@ export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSid
 
     return (
         <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
+            {/* Back Button */}
+            <Link
+                href="/projects"
+                className="flex items-center gap-2 px-4 py-2.5 text-sm text-slate-500 hover:text-hui-primary hover:bg-slate-100 transition border-b border-hui-border group"
+            >
+                <svg className="w-4 h-4 transition group-hover:-translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                </svg>
+                <span className="font-medium">All Projects</span>
+            </Link>
+
             <div className="p-4 border-b border-hui-border bg-white">
                 <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Project Menu</h2>
             </div>
@@ -108,8 +119,7 @@ export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSid
                                     {section.title}
                                 </h3>
                                 <svg
-                                    className={`w-4 h-4 text-slate-400 transition-transform ${collapsedSections[section.id] ? "rotate-180" : ""
-                                        }`}
+                                    className={`w-4 h-4 text-slate-400 transition-transform ${collapsedSections[section.id] ? "rotate-180" : ""}`}
                                     fill="none"
                                     stroke="currentColor"
                                     viewBox="0 0 24 24"
@@ -127,9 +137,9 @@ export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSid
                                                 <Link
                                                     href={item.href}
                                                     className={`block px-3 py-1.5 text-sm rounded transition ${isActive
-                                                            ? "bg-hui-primary/10 text-hui-primary font-medium"
-                                                            : "text-hui-textMain hover:bg-slate-200 hover:text-hui-textMain"
-                                                        }`}
+                                                        ? "bg-hui-primary/10 text-hui-primary font-medium"
+                                                        : "text-hui-textMain hover:bg-slate-200 hover:text-hui-textMain"
+                                                    }`}
                                                 >
                                                     {item.label}
                                                 </Link>
