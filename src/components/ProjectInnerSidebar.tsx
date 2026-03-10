@@ -41,6 +41,7 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
             title: "Management",
             items: [
                 { label: "Schedule", href: `/projects/${projectId}/schedule` },
+                { label: "Files & Photos", href: `/projects/${projectId}/files` },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
                 { label: "Daily Logs", href: `/projects/${projectId}/dailylogs` },
             ],

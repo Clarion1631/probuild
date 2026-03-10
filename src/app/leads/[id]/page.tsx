@@ -106,6 +106,18 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                         )}
                     </div>
 
+                    {/* Files & Photos Section */}
+                    <a href={`/leads/${lead.id}/files`} className="hui-card p-5 shadow-sm flex items-center gap-4 hover:shadow-md transition group block">
+                        <div className="w-11 h-11 bg-gradient-to-br from-amber-100 to-orange-100 rounded-xl flex items-center justify-center group-hover:from-amber-200 group-hover:to-orange-200 transition">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="1.5"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                        </div>
+                        <div className="flex-1">
+                            <h3 className="font-semibold text-hui-textMain text-sm group-hover:text-indigo-600 transition">Files & Photos</h3>
+                            <p className="text-xs text-hui-textMuted">Upload site photos, plans, and documents</p>
+                        </div>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" className="group-hover:translate-x-1 transition-transform"><path d="M9 5l7 7-7 7"/></svg>
+                    </a>
+
                     {/* Contracts Section */}
                     <LeadContractsSection leadId={lead.id} contracts={lead.contracts as any} templates={templates as any} />
                 </div>
