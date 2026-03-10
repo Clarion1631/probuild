@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useState, useMemo } from "react";
+import { useRouter } from "next/navigation";
+import { useState, useMemo, useRef, useEffect } from "react";
 import AddLeadModal from "@/app/leads/AddLeadModal";
 import { toast } from "sonner";
 import { updateProjectStatus, deleteProjects, updateProjectTags } from "@/lib/actions";
@@ -24,6 +25,7 @@ function getStatusDot(status: string, statuses: ProjectStatus[]) {
 }
 
 export default function ProjectsClient({ projects: initialProjects, initialStatuses }: { projects: any[], initialStatuses?: ProjectStatus[] | null }) {
+    const router = useRouter();
     const [projects, setProjects] = useState(initialProjects);
     const [statuses, setStatuses] = useState<ProjectStatus[]>(initialStatuses || DEFAULT_PROJECT_STATUSES);
     const [statusFilter, setStatusFilter] = useState<string>("all-active");
@@ -35,8 +37,35 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     const [isDeleting, setIsDeleting] = useState(false);
     const [showCustomizeModal, setShowCustomizeModal] = useState(false);
     const [showManageModal, setShowManageModal] = useState(false);
+    const [openCardMenu, setOpenCardMenu] = useState<string | null>(null);
+    const cardMenuRef = useRef<HTMLDivElement>(null);
+
+    // Close card menu on click outside
+    useEffect(() => {
+        function handleClickOutside(e: MouseEvent) {
+            if (cardMenuRef.current && !cardMenuRef.current.contains(e.target as Node)) {
+                setOpenCardMenu(null);
+            }
+        }
+        if (openCardMenu) {
+            document.addEventListener("mousedown", handleClickOutside);
+            return () => document.removeEventListener("mousedown", handleClickOutside);
+        }
+    }, [openCardMenu]);
 
     const activeStatuses = statuses.filter(s => s.isActive);
+
+    async function handleDeleteProject(projectId: string) {
+        if (!confirm("Are you sure you want to delete this project?")) return;
+        try {
+            await deleteProjects([projectId]);
+            setProjects((prev: any) => prev.filter((p: any) => p.id !== projectId));
+            toast.success("Project deleted");
+        } catch {
+            toast.error("Failed to delete project");
+        }
+        setOpenCardMenu(null);
+    }
 
     async function handleStatusChange(projectId: string, newStatus: string) {
         if (newStatus === "Manage Status") {
@@ -195,72 +224,58 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                         return (
                             <div 
                                 key={s.value} 
-                                className="min-w-[320px] w-[320px] shrink-0 bg-[#f4f5f7] rounded-xl flex flex-col max-h-[calc(100vh-250px)]"
+                                className="min-w-[260px] w-[260px] shrink-0"
                                 onDragOver={handleDragOver}
                                 onDrop={(e) => handleDrop(e, s.value)}
                             >
-                                <div className="flex items-center justify-between p-4 pb-2">
-                                    <h3 className="font-semibold text-[14px] flex items-center gap-2 text-slate-800">
-                                        <div className={`w-2 h-2 rounded-full ${s.dot}`} style={{ backgroundColor: s.rawColor + " !important" }} />
+                                <div className="flex items-center justify-between mb-3 px-1">
+                                    <h3 className="font-semibold text-[13px] flex items-center gap-2 text-slate-700">
+                                        <div className="w-2 h-2 rounded-full" style={{ backgroundColor: s.rawColor }} />
                                         {s.label} ({colProjects.length})
                                     </h3>
-                                    <button onClick={() => setShowCustomizeModal(true)} className="text-slate-400 hover:text-slate-600">...</button>
+                                    <button onClick={() => setShowCustomizeModal(true)} className="text-slate-400 hover:text-slate-600 text-lg leading-none px-1">···</button>
                                 </div>
-                                <div className="flex flex-col gap-3 p-3 pt-2 overflow-y-auto">
+                                <div className="flex flex-col gap-2">
                                     {colProjects.map((project: any) => (
                                         <div 
                                             key={project.id}
                                             draggable
                                             onDragStart={(e) => handleDragStart(e, project.id)}
-                                            className="bg-white rounded-lg shadow-sm hover:shadow border border-slate-200 cursor-grab active:cursor-grabbing group relative flex flex-col"
+                                            className="bg-white rounded-lg shadow-sm hover:shadow border border-slate-200 cursor-grab active:cursor-grabbing group relative"
                                         >
-                                            {/* Colored left border strip matching Houzz Pro */}
-                                            <div className="absolute left-0 top-0 bottom-0 w-[5px] rounded-l-lg" style={{ backgroundColor: project.color || s.rawColor }} />
+                                            {/* Colored left border strip */}
+                                            <div className="absolute left-0 top-0 bottom-0 w-[4px] rounded-l-lg" style={{ backgroundColor: project.color || s.rawColor }} />
                                             
-                                            <div className="pl-4 p-3.5 flex flex-col gap-2">
+                                            <div className="pl-4 pr-3 py-3 flex flex-col gap-1.5">
                                                 <div className="flex justify-between items-start">
-                                                    <Link href={`/projects/${project.id}`} className="font-semibold text-[14px] text-slate-900 hover:text-indigo-600 line-clamp-1 pr-2">{project.name}</Link>
-                                                    <div className="flex items-center gap-1 -mt-1 -mr-1">
-                                                        <button className="text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                            <svg width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path d="M12 16a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm0-6a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm0-6a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/></svg>
+                                                    <Link href={`/projects/${project.id}`} className="font-semibold text-[13px] text-slate-900 hover:text-indigo-600 line-clamp-1 pr-1">{project.name}</Link>
+                                                    <div className="relative" ref={openCardMenu === project.id ? cardMenuRef : undefined}>
+                                                        <button 
+                                                            onClick={(e) => { e.stopPropagation(); setOpenCardMenu(openCardMenu === project.id ? null : project.id); }}
+                                                            className="text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 -mt-0.5 -mr-0.5"
+                                                        >
+                                                            <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0-8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 16a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg>
                                                         </button>
+                                                        {openCardMenu === project.id && (
+                                                            <div className="absolute right-0 top-6 z-50 bg-white rounded-lg shadow-lg border border-slate-200 py-1 min-w-[140px]">
+                                                                <button onClick={() => { router.push(`/projects/${project.id}`); setOpenCardMenu(null); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition">Edit</button>
+                                                                <button onClick={() => { toast.info("Pin feature coming soon"); setOpenCardMenu(null); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition">Pin Project</button>
+                                                                <button onClick={() => handleDeleteProject(project.id)} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition">Delete</button>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 </div>
                                                 
-                                                <div className="space-y-1">
-                                                    <div className="flex items-center gap-2 text-[12.5px] text-slate-500">
-                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                                                        <span className="truncate">{project.client?.name || "No Client"}</span>
-                                                    </div>
-                                                    {project.location && (
-                                                        <div className="flex items-center gap-2 text-[12.5px] text-slate-500">
-                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-                                                            <span className="truncate">{project.location}</span>
-                                                        </div>
-                                                    )}
+                                                <div className="flex items-center gap-1.5 text-[12px] text-slate-500">
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                                                    <span className="truncate">{project.client?.name || "No Client"}</span>
                                                 </div>
-                                                
-                                                <div className="mt-2 text-[12.5px] text-slate-500 grid grid-cols-2 gap-2">
-                                                    <div className="flex gap-2">
-                                                        <span className="text-slate-400 w-9">Type</span>
-                                                        <span className="truncate flex-1 text-slate-600">{project.type || "—"}</span>
+                                                {project.location && (
+                                                    <div className="flex items-center gap-1.5 text-[12px] text-slate-500">
+                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                                                        <span className="truncate">{project.location}</span>
                                                     </div>
-                                                    {project.code && (
-                                                        <div className="flex gap-2">
-                                                            <span className="text-slate-400 w-9">Code</span>
-                                                            <span className="truncate flex-1 text-slate-600">{project.code}</span>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                                
-                                                <div className="flex gap-2 text-[12.5px] text-slate-500 items-center justify-between">
-                                                    <div className="flex gap-2 items-center text-slate-400">
-                                                        Manager
-                                                    </div>
-                                                    <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-[9px]">
-                                                        R
-                                                    </div>
-                                                </div>
+                                                )}
                                             </div>
                                         </div>
                                     ))}
