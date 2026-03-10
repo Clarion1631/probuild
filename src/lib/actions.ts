@@ -770,6 +770,236 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
 }
 
 // ────────────────────────────────────────────────
+// Contracts
+// ────────────────────────────────────────────────
+
+function resolveMergeFields(template: string, data: Record<string, string>): string {
+    return template.replace(/\{\{(\w+)\}\}/g, (match, key) => data[key] || match);
+}
+
+async function buildMergeData(projectId?: string | null, leadId?: string | null): Promise<Record<string, string>> {
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const data: Record<string, string> = {
+        company_name: settings?.companyName || "Our Company",
+        company_address: settings?.address || "",
+        company_phone: settings?.phone || "",
+        company_email: settings?.email || "",
+        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
+        year: new Date().getFullYear().toString(),
+    };
+
+    if (projectId) {
+        const project = await prisma.project.findUnique({
+            where: { id: projectId },
+            include: { client: true, estimates: { orderBy: { createdAt: "desc" }, take: 1 } }
+        });
+        if (project) {
+            data.project_name = project.name;
+            data.client_name = project.client.name;
+            data.client_email = project.client.email || "";
+            data.client_phone = project.client.primaryPhone || "";
+            data.client_address = [project.client.addressLine1, project.client.city, project.client.state, project.client.zipCode].filter(Boolean).join(", ");
+            data.location = project.location || "";
+            data.estimate_total = project.estimates[0] ? `$${project.estimates[0].totalAmount.toLocaleString()}` : "$0.00";
+        }
+    } else if (leadId) {
+        const lead = await prisma.lead.findUnique({
+            where: { id: leadId },
+            include: { client: true, estimates: { orderBy: { createdAt: "desc" }, take: 1 } }
+        });
+        if (lead) {
+            data.project_name = lead.name;
+            data.client_name = lead.client.name;
+            data.client_email = lead.client.email || "";
+            data.client_phone = lead.client.primaryPhone || "";
+            data.client_address = [lead.client.addressLine1, lead.client.city, lead.client.state, lead.client.zipCode].filter(Boolean).join(", ");
+            data.location = lead.location || "";
+            data.estimate_total = lead.estimates[0] ? `$${lead.estimates[0].totalAmount.toLocaleString()}` : "$0.00";
+        }
+    }
+
+    return data;
+}
+
+export async function getContracts(projectId?: string, leadId?: string) {
+    return prisma.contract.findMany({
+        where: {
+            ...(projectId ? { projectId } : {}),
+            ...(leadId ? { leadId } : {}),
+        },
+        orderBy: { createdAt: "desc" },
+        include: {
+            project: { select: { name: true, client: { select: { name: true } } } },
+            lead: { select: { name: true, client: { select: { name: true } } } },
+        }
+    });
+}
+
+export async function getContract(id: string) {
+    return prisma.contract.findUnique({
+        where: { id },
+        include: {
+            project: { include: { client: true } },
+            lead: { include: { client: true } },
+        }
+    });
+}
+
+export async function createContractFromTemplate(
+    templateId: string,
+    context: { type: "project" | "lead"; id: string },
+    titleOverride?: string
+) {
+    const template = await prisma.documentTemplate.findUnique({ where: { id: templateId } });
+    if (!template) throw new Error("Template not found");
+
+    const mergeData = await buildMergeData(
+        context.type === "project" ? context.id : null,
+        context.type === "lead" ? context.id : null
+    );
+
+    const resolvedBody = resolveMergeFields(template.body, mergeData);
+
+    const contract = await prisma.contract.create({
+        data: {
+            title: titleOverride || template.name,
+            body: resolvedBody,
+            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
+        }
+    });
+
+    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
+    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
+
+    return contract;
+}
+
+export async function createContractBlank(
+    context: { type: "project" | "lead"; id: string },
+    title: string,
+    body: string
+) {
+    const mergeData = await buildMergeData(
+        context.type === "project" ? context.id : null,
+        context.type === "lead" ? context.id : null
+    );
+
+    const resolvedBody = resolveMergeFields(body, mergeData);
+
+    const contract = await prisma.contract.create({
+        data: {
+            title,
+            body: resolvedBody,
+            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
+        }
+    });
+
+    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
+    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
+
+    return contract;
+}
+
+export async function updateContract(id: string, data: { title?: string; body?: string; status?: string }) {
+    const contract = await prisma.contract.update({ where: { id }, data });
+    revalidatePath(`/`);
+    return contract;
+}
+
+export async function deleteContract(id: string) {
+    const contract = await prisma.contract.findUnique({ where: { id } });
+    await prisma.contract.delete({ where: { id } });
+    if (contract?.projectId) revalidatePath(`/projects/${contract.projectId}`);
+    if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
+}
+
+export async function sendContractToClient(contractId: string) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true } },
+            lead: { include: { client: true } },
+        }
+    });
+
+    if (!contract) throw new Error("Contract not found");
+    const client = contract.project?.client || contract.lead?.client;
+    if (!client?.email) throw new Error("Client has no email address");
+
+    await prisma.contract.update({
+        where: { id: contractId },
+        data: { status: "Sent", sentAt: new Date() }
+    });
+
+    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/contracts/${contractId}`;
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const companyName = settings?.companyName || "Your Contractor";
+
+    await sendNotification(
+        client.email,
+        `${companyName} sent you a contract to review`,
+        `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
+            </div>
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Contract Ready for Your Signature</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    ${companyName} has sent you a contract titled "<strong>${contract.title}</strong>" for your review and signature.
+                    Please click the button below to read the agreement and sign electronically.
+                </p>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        Review & Sign Contract
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; margin: 0;">If you have any questions, reply to this email or contact us directly.</p>
+            </div>
+        </body>
+        </html>`
+    );
+
+    if (contract.projectId) revalidatePath(`/projects/${contract.projectId}`);
+    if (contract.leadId) revalidatePath(`/leads/${contract.leadId}`);
+
+    return { success: true, sentTo: client.email };
+}
+
+export async function approveContract(contractId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+    await prisma.contract.update({
+        where: { id: contractId },
+        data: {
+            status: "Signed",
+            approvedBy: signatureName,
+            approvedAt: new Date(),
+            approvalIp: ipAddress,
+            approvalUserAgent: userAgent,
+            signatureUrl: signatureDataUrl || null,
+        }
+    });
+
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: { project: true, lead: true }
+    });
+
+    const settings = await getCompanySettings();
+    if (settings.notificationEmail) {
+        await sendNotification(
+            settings.notificationEmail,
+            `Contract "${contract?.title}" has been signed!`,
+            `<p>The contract "<strong>${contract?.title}</strong>" has been electronically signed by <strong>${signatureName}</strong> on ${new Date().toLocaleString()}.</p>`
+        );
+    }
+
+    revalidatePath("/");
+    return { success: true };
+}
+
+// ────────────────────────────────────────────────
 // Schedule Tasks
 // ────────────────────────────────────────────────
 
@@ -777,7 +1007,12 @@ export async function getScheduleTasks(projectId: string) {
     return prisma.scheduleTask.findMany({
         where: { projectId },
         orderBy: { order: "asc" },
-        include: { children: true },
+        include: {
+            children: true,
+            dependencies: { include: { predecessor: true } },
+            dependents: { include: { dependent: true } },
+            timeEntries: { select: { durationHours: true } },
+        },
     });
 }
 
@@ -820,6 +1055,7 @@ export async function updateScheduleTask(taskId: string, data: {
     status?: string;
     assignee?: string;
     order?: number;
+    estimatedHours?: number | null;
 }) {
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
@@ -830,6 +1066,7 @@ export async function updateScheduleTask(taskId: string, data: {
     if (data.status !== undefined) updateData.status = data.status;
     if (data.assignee !== undefined) updateData.assignee = data.assignee;
     if (data.order !== undefined) updateData.order = data.order;
+    if (data.estimatedHours !== undefined) updateData.estimatedHours = data.estimatedHours;
 
     const task = await prisma.scheduleTask.update({
         where: { id: taskId },
@@ -843,6 +1080,23 @@ export async function deleteScheduleTask(taskId: string) {
     const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
     revalidatePath(`/projects/${task.projectId}/schedule`);
     return task;
+}
+
+export async function linkTasks(predecessorId: string, dependentId: string) {
+    const dep = await prisma.taskDependency.create({
+        data: { predecessorId, dependentId },
+    });
+    const task = await prisma.scheduleTask.findUnique({ where: { id: predecessorId } });
+    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    return dep;
+}
+
+export async function unlinkTasks(predecessorId: string, dependentId: string) {
+    await prisma.taskDependency.deleteMany({
+        where: { predecessorId, dependentId },
+    });
+    const task = await prisma.scheduleTask.findUnique({ where: { id: predecessorId } });
+    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
 }
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {

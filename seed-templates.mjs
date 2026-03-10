@@ -1,49 +1,33 @@
 import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 
-const templates = [
-  {
-    name: 'Standard Terms & Conditions',
-    type: 'terms',
+await prisma.documentTemplate.create({
+  data: {
+    name: 'Standard Construction Contract',
+    type: 'contract',
     isDefault: true,
-    body: `<h3>Terms & Conditions</h3>
-<p><strong>1. Scope of Work.</strong> The contractor agrees to perform the work described in this estimate. Any additional work outside the scope will require a written change order and may result in additional charges.</p>
-<p><strong>2. Payment Terms.</strong> Payment is due within 30 days of invoice date. A deposit of 50% is required before work begins. Progress payments may be billed at milestones outlined in the payment schedule.</p>
-<p><strong>3. Warranty.</strong> All workmanship is guaranteed for one (1) year from the date of project completion. Manufacturer warranties on materials apply separately.</p>
-<p><strong>4. Permits &amp; Inspections.</strong> The contractor will obtain all necessary permits unless otherwise stated. The client is responsible for providing access for required inspections.</p>
-<p><strong>5. Changes &amp; Modifications.</strong> Any changes to the scope of work must be agreed upon in writing. Change orders may affect the project timeline and cost.</p>
-<p><strong>6. Timeline.</strong> Estimated project timelines are approximate and may be affected by weather, material availability, or unforeseen conditions. The contractor will communicate any significant delays promptly.</p>
-<p><strong>7. Insurance.</strong> The contractor maintains general liability insurance and workers compensation coverage for all employees and subcontractors.</p>
-<p><strong>8. Cancellation.</strong> Either party may cancel this agreement with 14 days written notice. The client is responsible for payment of all work completed and materials ordered prior to cancellation.</p>`
-  },
-  {
-    name: 'Kitchen & Bath Remodel Terms',
-    type: 'terms',
-    isDefault: false,
-    body: `<h3>Kitchen &amp; Bath Remodel Terms</h3>
-<p><strong>1. Material Selections.</strong> Client must finalize all material selections (cabinets, countertops, fixtures, tile) at least 4 weeks prior to installation date. Delays in selection may affect the project timeline.</p>
-<p><strong>2. Plumbing &amp; Electrical.</strong> This estimate includes standard plumbing and electrical connections. Any upgrades to plumbing lines, electrical panels, or code-required updates discovered during demolition will be quoted as a change order.</p>
-<p><strong>3. Existing Conditions.</strong> Hidden damage such as water damage, mold, or structural issues discovered during demolition will be documented and quoted separately before proceeding.</p>
-<p><strong>4. Living Arrangements.</strong> Kitchen and bathroom areas will be inaccessible during construction. The contractor will make reasonable efforts to maintain access to other areas of the home.</p>
-<p><strong>5. Cleanup.</strong> Daily cleanup of work areas is included. Final cleaning of installed surfaces is included upon completion.</p>
-<p><strong>6. Payment Schedule.</strong> 50% deposit upon signing, 25% at rough-in completion, 25% upon final completion and walkthrough.</p>`
-  },
-  {
-    name: 'Liability Disclaimer',
-    type: 'disclaimer',
-    isDefault: true,
-    body: `<h3>Liability Disclaimer</h3>
-<p>This estimate is valid for 30 days from the date of issue. Prices are subject to change based on material cost fluctuations after the expiration date.</p>
-<p>The contractor is not liable for pre-existing conditions, including but not limited to: structural deficiencies, hidden water damage, asbestos, lead paint, or code violations not related to the scope of work.</p>
-<p>The client is responsible for clearing and securing personal belongings in and around the work area prior to project start.</p>
-<p>Any dispute arising from this agreement shall be resolved through mediation before any legal action is taken.</p>`
+    body: `<h2>Construction Services Agreement</h2>
+<p>This Construction Services Agreement (the "Agreement") is entered into on <strong>{{date}}</strong>, by and between:</p>
+<p><strong>Contractor:</strong> {{company_name}}<br/>Address: {{company_address}}<br/>Phone: {{company_phone}}<br/>Email: {{company_email}}</p>
+<p><strong>Client:</strong> {{client_name}}<br/>Address: {{client_address}}<br/>Phone: {{client_phone}}<br/>Email: {{client_email}}</p>
+<h3>1. Scope of Work</h3>
+<p>The Contractor agrees to perform the construction services described in the project "<strong>{{project_name}}</strong>" located at <strong>{{location}}</strong>, in accordance with the attached estimate totaling <strong>{{estimate_total}}</strong>.</p>
+<h3>2. Payment Terms</h3>
+<p>Payment shall be made according to the payment schedule outlined in the approved estimate. A deposit of 50% of the total contract amount is due upon signing of this Agreement. The remaining balance shall be paid upon satisfactory completion of the work.</p>
+<h3>3. Project Timeline</h3>
+<p>Work shall commence within 14 business days of receiving the signed contract and deposit. The Contractor will provide a detailed project schedule upon commencement. Timelines are estimates and may be affected by weather, material availability, or change orders.</p>
+<h3>4. Change Orders</h3>
+<p>Any modifications to the scope of work must be documented in a written change order signed by both parties. Change orders may affect the project cost and timeline.</p>
+<h3>5. Warranty</h3>
+<p>The Contractor warrants all workmanship for a period of one (1) year from the date of project completion. This warranty does not cover damage caused by the Client, normal wear and tear, or acts of nature.</p>
+<h3>6. Insurance</h3>
+<p>The Contractor maintains general liability insurance and workers compensation coverage. Certificates of insurance are available upon request.</p>
+<h3>7. Dispute Resolution</h3>
+<p>Any disputes arising from this Agreement shall first be addressed through good-faith negotiation. If unresolved, the parties agree to submit to binding mediation before pursuing legal action.</p>
+<h3>8. Entire Agreement</h3>
+<p>This Agreement, together with any attached estimates and change orders, constitutes the entire agreement between the parties. Modifications must be made in writing and signed by both parties.</p>`
   }
-];
+});
 
-for (const t of templates) {
-  await prisma.documentTemplate.create({ data: t });
-  console.log('Created:', t.name);
-}
-
-console.log(`\nDone! Seeded ${templates.length} templates.`);
+console.log('Created: Standard Construction Contract template');
 await prisma.$disconnect();

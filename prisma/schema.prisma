@@ -276,6 +276,9 @@ model TimeEntry {
   laborCost        Float?
   burdenCost       Float?
   
+  scheduleTaskId   String?
+  scheduleTask     ScheduleTask? @relation(fields: [scheduleTaskId], references: [id])
+
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
@@ -336,20 +339,39 @@ model DocumentTemplate {
 }
 
 model ScheduleTask {
-  id          String    @id @default(cuid())
-  projectId   String
-  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name        String
-  startDate   DateTime
-  endDate     DateTime
-  color       String    @default("#4c9a2a")
-  progress    Int       @default(0)
-  assignee    String?
-  parentId    String?
-  parent      ScheduleTask?  @relation("SubTasks", fields: [parentId], references: [id], onDelete: Cascade)
-  children    ScheduleTask[] @relation("SubTasks")
-  order       Int       @default(0)
-  status      String    @default("Not Started") // Not Started, In Progress, Complete, Blocked
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id             String    @id @default(cuid())
+  projectId      String
+  project        Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name           String
+  startDate      DateTime
+  endDate        DateTime
+  color          String    @default("#4c9a2a")
+  progress       Int       @default(0)
+  estimatedHours Float?
+  assignee       String?
+  parentId       String?
+  parent         ScheduleTask?  @relation("SubTasks", fields: [parentId], references: [id], onDelete: Cascade)
+  children       ScheduleTask[] @relation("SubTasks")
+  order          Int       @default(0)
+  status         String    @default("Not Started")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  // Dependencies
+  dependencies   TaskDependency[] @relation("Dependent")
+  dependents     TaskDependency[] @relation("Predecessor")
+
+  // Time tracking
+  timeEntries    TimeEntry[]
+}
+
+model TaskDependency {
+  id              String       @id @default(cuid())
+  predecessorId   String
+  predecessor     ScheduleTask @relation("Predecessor", fields: [predecessorId], references: [id], onDelete: Cascade)
+  dependentId     String
+  dependent       ScheduleTask @relation("Dependent", fields: [dependentId], references: [id], onDelete: Cascade)
+  type            String       @default("FS") // FS = Finish-to-Start
+
+  @@unique([predecessorId, dependentId])
 }
