@@ -17,6 +17,7 @@ export default async function CompanySettingsPage() {
                         <ul className="space-y-1">
                             <li><a href="#" className="block px-3 py-2 text-sm font-medium bg-slate-200 text-hui-textMain rounded-md">Company Info</a></li>
                             <li><a href="#" className="block px-3 py-2 text-sm text-hui-textMuted hover:bg-slate-100 rounded-md">Business Documents</a></li>
+                            <li><a href="/settings/cost-codes" className="block px-3 py-2 text-sm text-hui-textMuted hover:bg-slate-100 rounded-md">Cost Codes</a></li>
                             <li><a href="#" className="block px-3 py-2 text-sm text-hui-textMuted hover:bg-slate-100 rounded-md">Workday Exceptions</a></li>
                             <li><a href="#" className="block px-3 py-2 text-sm text-hui-textMuted hover:bg-slate-100 rounded-md">Communications</a></li>
                         </ul>

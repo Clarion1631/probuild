@@ -550,29 +550,15 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
     let totalLaborBudget = 0;
     let totalMaterialBudget = 0;
 
-    const bucketsMap: Record<string, { name: string, laborBudget: number, materialBudget: number }> = {};
-
     for (const item of items) {
-        const topLevelId = item.parentId || item.id;
-        if (!bucketsMap[topLevelId]) {
-            const topItem = items.find((i: any) => i.id === topLevelId);
-            bucketsMap[topLevelId] = {
-                name: topItem ? topItem.name : (item.name || "Phase"),
-                laborBudget: 0,
-                materialBudget: 0
-            };
-        }
-
         if (item.type === "Labor") {
-            bucketsMap[topLevelId].laborBudget += item.total || 0;
             totalLaborBudget += item.total || 0;
         } else {
-            bucketsMap[topLevelId].materialBudget += item.total || 0;
             totalMaterialBudget += item.total || 0;
         }
     }
 
-    const budget = await prisma.budget.create({
+    await prisma.budget.create({
         data: {
             projectId,
             estimateId,
@@ -580,19 +566,8 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
             totalMaterialBudget,
         },
     });
-
-    for (const topLevelId in bucketsMap) {
-        const b = bucketsMap[topLevelId];
-        await prisma.budgetBucket.create({
-            data: {
-                budgetId: budget.id,
-                name: b.name,
-                laborBudget: b.laborBudget,
-                materialBudget: b.materialBudget,
-            },
-        });
-    }
 }
+
 
 export async function getCompanySettings() {
     let settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
