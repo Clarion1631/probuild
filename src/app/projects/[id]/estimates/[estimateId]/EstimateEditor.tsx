@@ -22,6 +22,9 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [showSendModal, setShowSendModal] = useState(false);
     const [costCodes, setCostCodes] = useState<any[]>([]);
     const [costTypes, setCostTypes] = useState<any[]>([]);
+    const [showAiModal, setShowAiModal] = useState(false);
+    const [aiPrompt, setAiPrompt] = useState("");
+    const [isGenerating, setIsGenerating] = useState(false);
 
     useEffect(() => {
         fetch('/api/cost-codes?active=true')
@@ -112,6 +115,44 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             costCodeId: null,
             costTypeId: null
         }]);
+    }
+
+    async function handleAiGenerate() {
+        setIsGenerating(true);
+        try {
+            const res = await fetch('/api/ai-estimate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    projectName: context.name,
+                    projectType: title || context.name,
+                    description: aiPrompt,
+                    location: context.location || 'Vancouver, WA',
+                    costCodes,
+                    costTypes,
+                }),
+            });
+
+            if (!res.ok) {
+                const data = await res.json();
+                toast.error(data.error || 'AI generation failed');
+                return;
+            }
+
+            const data = await res.json();
+            if (data.items && data.items.length > 0) {
+                setItems(prev => [...prev, ...data.items]);
+                toast.success(`AI generated ${data.count} items (est. $${data.totalEstimate?.toLocaleString()})`);
+                setShowAiModal(false);
+                setAiPrompt("");
+            } else {
+                toast.error('AI returned no items');
+            }
+        } catch (err) {
+            toast.error('Failed to generate estimate');
+        } finally {
+            setIsGenerating(false);
+        }
     }
 
     function updateItem(index: number, field: string, value: any) {
@@ -212,6 +253,13 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                         className="hui-btn hui-btn-secondary text-red-600 border-red-200 hover:bg-red-50 mr-2 disabled:opacity-50"
                     >
                         {isDeleting ? "Deleting..." : "Delete"}
+                    </button>
+                    <button
+                        onClick={() => setShowAiModal(true)}
+                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
+                    >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                        AI Generate
                     </button>
                     <button
                         onClick={() => window.open(`/portal/estimates/${initialEstimate.id}`, '_blank')}
@@ -521,6 +569,79 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     clientEmail={context.clientEmail}
                     onClose={() => setShowSendModal(false)}
                 />
+            )}
+
+            {/* AI Estimate Modal */}
+            {showAiModal && (
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full overflow-hidden border border-purple-200">
+                        <div className="px-6 py-4 border-b border-purple-100 bg-gradient-to-r from-purple-50 to-indigo-50 flex justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="w-8 h-8 rounded-lg bg-purple-100 flex items-center justify-center">
+                                    <svg className="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                                </div>
+                                <div>
+                                    <h2 className="text-lg font-bold text-hui-textMain">AI Estimate Generator</h2>
+                                    <p className="text-xs text-purple-600">Powered by Gemini • Vancouver, WA pricing</p>
+                                </div>
+                            </div>
+                            <button onClick={() => setShowAiModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-6 space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-hui-textMain mb-2">Describe the scope of work</label>
+                                <textarea
+                                    value={aiPrompt}
+                                    onChange={e => setAiPrompt(e.target.value)}
+                                    placeholder="e.g. Full kitchen remodel — gut existing kitchen, new cabinets, quartz countertops, tile backsplash, new appliances, LVP flooring, recessed lighting. Approx 120 sq ft kitchen."
+                                    className="hui-input w-full h-32 resize-none"
+                                    disabled={isGenerating}
+                                />
+                            </div>
+                            <div className="bg-slate-50 rounded-lg p-3 text-xs text-slate-600 space-y-1">
+                                <div className="font-semibold text-slate-700">AI will generate:</div>
+                                <div>• Line items grouped by phase (Demo, Framing, Electrical, etc.)</div>
+                                <div>• Separate Labor, Material, and Subcontractor costs</div>
+                                <div>• Allowances for customer selections (fixtures, finishes)</div>
+                                <div>• Local Vancouver, WA market pricing</div>
+                            </div>
+                            {items.length > 0 && (
+                                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
+                                    <strong>Note:</strong> AI items will be appended to your existing {items.length} item(s).
+                                </div>
+                            )}
+                        </div>
+                        <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50">
+                            <button
+                                type="button"
+                                onClick={() => setShowAiModal(false)}
+                                disabled={isGenerating}
+                                className="hui-btn hui-btn-secondary"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleAiGenerate}
+                                disabled={isGenerating || !aiPrompt.trim()}
+                                className="hui-btn bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 disabled:opacity-50 flex items-center gap-2"
+                            >
+                                {isGenerating ? (
+                                    <>
+                                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Generating...
+                                    </>
+                                ) : (
+                                    <>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                                        Generate Estimate
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     );
