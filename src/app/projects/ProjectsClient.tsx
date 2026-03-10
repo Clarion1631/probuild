@@ -2,9 +2,11 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import AddLeadModal from "@/app/leads/AddLeadModal";
 
 export default function ProjectsClient({ projects }: { projects: any[] }) {
     const [activeTab, setActiveTab] = useState<'active' | 'archived'>('active');
+    const [showModal, setShowModal] = useState(false);
 
     const filteredProjects = projects.filter(p => activeTab === 'active' ? p.status !== 'Archived' : p.status === 'Archived');
 
@@ -18,7 +20,7 @@ export default function ProjectsClient({ projects }: { projects: any[] }) {
                     <button className="hui-btn hui-btn-secondary">
                         Import Projects
                     </button>
-                    <button className="hui-btn hui-btn-primary">
+                    <button className="hui-btn hui-btn-primary" onClick={() => setShowModal(true)}>
                         + New Project
                     </button>
                 </div>
@@ -106,6 +108,8 @@ export default function ProjectsClient({ projects }: { projects: any[] }) {
                     </tbody>
                 </table>
             </div>
+
+            {showModal && <AddLeadModal onClose={() => setShowModal(false)} />}
         </div>
     );
 }

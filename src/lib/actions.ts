@@ -27,6 +27,15 @@ export async function getLead(id: string) {
     return lead;
 }
 
+export async function updateLeadStage(id: string, stage: string) {
+    await prisma.lead.update({
+        where: { id },
+        data: { stage }
+    });
+    revalidatePath(`/leads/${id}`);
+    revalidatePath(`/leads`);
+}
+
 export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; source?: string; projectType?: string }) {
     // Find or create client
     let client = await prisma.client.findFirst({

@@ -463,7 +463,8 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     </div>
                 )}
                 {activeTab === "expenses" && (
-                    <div className="w-full max-w-5xl bg-white border border-hui-border rounded-lg shadow-sm">
+                    <div className="w-full max-w-5xl bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
+                        <div className="h-1.5 w-full bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500"></div>
                         <ExpensesTab estimateId={initialEstimate.id} projectId={context.type === "project" ? context.id : ""} items={items} />
                     </div>
                 )}

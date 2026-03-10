@@ -1,6 +1,7 @@
 import Avatar from "@/components/Avatar";
 import { getLead, convertLeadToProject, createDraftLeadEstimate, deleteEstimate } from "@/lib/actions";
 import { redirect } from "next/navigation";
+import LeadStageDropdown from "./LeadStageDropdown";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -46,8 +47,12 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                         <div className="hui-card p-6">
                             <h3 className="font-semibold text-hui-textMain text-sm mb-4">Lead Details</h3>
                             <div className="space-y-3 text-sm">
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Lead Stage</span><span className="font-medium text-hui-textMain">{lead.stage}</span></div>
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Lead Source</span><span className="text-hui-textMain">{lead.source}</span></div>
+                                <div className="flex justify-between items-center"><span className="text-hui-textMuted">Lead Stage</span>
+                                    <div className="w-1/2">
+                                        <LeadStageDropdown leadId={lead.id} currentStage={lead.stage} />
+                                    </div>
+                                </div>
+                                <div className="flex justify-between mt-3"><span className="text-hui-textMuted">Lead Source</span><span className="text-hui-textMain">{lead.source}</span></div>
                                 <div className="flex justify-between"><span className="text-hui-textMuted">Expected Start Date</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
                                 <div className="flex justify-between"><span className="text-hui-textMuted">Target Revenue</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
                             </div>

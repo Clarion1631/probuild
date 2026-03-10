@@ -39,41 +39,43 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                         <select className="hui-input w-auto"><option>Date Created: 01/...</option></select>
                         <select className="hui-input w-auto"><option>Type: Active</option></select>
                     </div>
+                    <div className="grid grid-cols-3 gap-4">
+                        <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm">
+                            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider mb-1">Total Approved</p>
+                            <p className="text-2xl font-bold text-slate-900">$0.00</p>
+                        </div>
+                        <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm">
+                            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider mb-1">Total Invoiced</p>
+                            <p className="text-2xl font-bold text-blue-600">$0.00</p>
+                        </div>
+                        <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm">
+                            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider mb-1">Win Rate</p>
+                            <p className="text-2xl font-bold text-green-600">0%</p>
+                        </div>
+                    </div>
 
-                    <div className="hui-card overflow-hidden">
+                    <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
                         <table className="w-full text-sm text-left">
-                            <thead className="text-xs text-hui-textMuted bg-slate-50 border-b border-hui-border">
+                            <thead className="bg-slate-50 text-slate-500 border-b border-slate-200">
                                 <tr>
-                                    <th className="px-4 py-3 font-medium">Title</th>
-                                    <th className="px-4 py-3 font-medium">Recipient</th>
-                                    <th className="px-4 py-3 font-medium">Code</th>
-                                    <th className="px-4 py-3 font-medium">Status</th>
-                                    <th className="px-4 py-3 font-medium">Shared</th>
-                                    <th className="px-4 py-3 font-medium">Created</th>
-                                    <th className="px-4 py-3 font-medium text-right">Total</th>
-                                    <th className="px-4 py-3 font-medium text-right">Balance</th>
+                                    <th className="px-6 py-3 font-medium">Estimate Name</th>
+                                    <th className="px-6 py-3 font-medium">Status</th>
+                                    <th className="px-6 py-3 font-medium text-right">Total Amount</th>
+                                    <th className="px-6 py-3 font-medium text-right">Date</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-hui-border">
-                                {estimates.map((e: any) => (
-                                    <tr key={e.id} className="hover:bg-slate-50 transition cursor-pointer">
-                                        <td className="px-4 py-4 font-medium text-hui-textMain">
-                                            <Link href={`/projects/${project.id}/estimates/${e.id}`}>
-                                                {e.title}
-                                            </Link>
+                            <tbody className="divide-y divide-slate-100">
+                                {(!estimates || estimates.length === 0) && (
+                                    <tr><td colSpan={4} className="px-6 py-8 text-center text-slate-500">No estimates found. Create one to get started.</td></tr>
+                                )}
+                                {estimates && estimates.map((est: any) => (
+                                    <tr key={est.id} className="hover:bg-slate-50 transition">
+                                        <td className="px-6 py-4 font-medium text-blue-600 hover:underline">
+                                            <Link href={`/projects/${project.id}/estimates/${est.id}`}>{est.title}</Link>
                                         </td>
-                                        <td className="px-4 py-4">
-                                            <div className="flex items-center gap-2">
-                                                <Avatar name={project.client.name} color="green" />
-                                                <span className="text-hui-textMain">{project.client.name}</span>
-                                            </div>
-                                        </td>
-                                        <td className="px-4 py-4 text-hui-textMuted text-xs font-mono">{e.code}</td>
-                                        <td className="px-4 py-4"><StatusBadge status={e.status as StatusType} /></td>
-                                        <td className="px-4 py-4 text-hui-textMuted text-xs"><span className="bg-slate-100 px-2 py-1 rounded text-hui-textMuted border border-hui-border">{e.privacy}</span></td>
-                                        <td className="px-4 py-4 text-hui-textMuted">{new Date(e.createdAt).toLocaleDateString()}</td>
-                                        <td className="px-4 py-4 text-hui-textMain font-medium text-right">${e.totalAmount?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                                        <td className={`px-4 py-4 font-medium text-right ${e.balanceDue > 0 ? "text-red-500" : "text-hui-textMain"}`}>${e.balanceDue?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                        <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
+                                        <td className="px-6 py-4 text-right">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-6 py-4 text-right text-slate-500">{new Date(est.createdAt).toLocaleDateString()}</td>
                                     </tr>
                                 ))}
                             </tbody>

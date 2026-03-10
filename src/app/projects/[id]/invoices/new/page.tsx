@@ -1,5 +1,4 @@
 import { getProject } from "@/lib/actions";
-import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import Link from "next/link";
 import NewInvoiceClient from "./NewInvoiceClient";
 
@@ -13,7 +12,6 @@ export default async function NewInvoicePage({ params }: { params: { id: string 
 
     return (
         <div className="flex h-full bg-hui-background">
-            <ProjectInnerSidebar projectId={project.id} />
             <div className="flex-1 overflow-auto p-8">
                 <div className="max-w-6xl mx-auto space-y-6">
                     <div className="flex items-center gap-4 border-b border-hui-border pb-4">

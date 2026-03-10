@@ -1,24 +1,26 @@
 import { getEstimate, getProject } from "@/lib/actions";
-import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import EstimateEditor from "./EstimateEditor";
 import { notFound } from "next/navigation";
 
 export const dynamic = "force-dynamic";
 
-export default async function EstimatePage({ params }: { params: Promise<{ id: string, estimateId: string }> }) {
+export default async function EstimatePage({
+    params
+}: {
+    params: Promise<{ id: string; estimateId: string }>
+}) {
     const resolvedParams = await params;
     const project = await getProject(resolvedParams.id);
     const estimate = await getEstimate(resolvedParams.estimateId);
 
-    if (!project || !estimate) {
+    if (!project) return <div>Project not found</div>;
+    if (!estimate) { 
         notFound();
     }
 
     return (
-        <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
-            <ProjectInnerSidebar projectId={resolvedParams.id} />
-
-            <div className="flex-1 overflow-auto bg-slate-50">
+        <div className="flex h-[calc(100vh-64px)] -m-6 overflow-hidden">
+            <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
                 <EstimateEditor
                     context={{
                         type: "project",

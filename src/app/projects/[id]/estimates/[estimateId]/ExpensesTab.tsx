@@ -169,10 +169,10 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
     const utilizationColor = budgetUtilization > 100 ? "bg-red-500" : (budgetUtilization > 85 ? "bg-amber-400" : "bg-green-500");
 
     return (
-        <div className="p-8 space-y-8 animate-in fade-in duration-300">
+        <div className="p-10 pb-12 space-y-10 animate-in fade-in duration-300">
             {/* Header Setup */}
             <div className="flex justify-between items-center">
-                <h2 className="text-2xl font-bold text-hui-textMain">Job Costing & Expenses</h2>
+                <h2 className="text-3xl font-extrabold tracking-tight text-slate-800">Job Costing & Expenses</h2>
                 <div className="flex items-center gap-3">
                     <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
                     <button
@@ -194,25 +194,25 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             {/* Variance Overview */}
             <div className="space-y-4">
                 <div className="grid grid-cols-3 gap-6">
-                    <div className="bg-white p-6 rounded-lg shadow-sm border border-hui-border">
-                        <p className="text-sm font-medium text-hui-textMuted mb-1">Total Budget</p>
-                        <p className="text-3xl font-bold text-hui-textMain">${totalBudget.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                    <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
+                        <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">Total Budget</p>
+                        <p className="text-3xl font-extrabold text-slate-800">${totalBudget.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                     </div>
-                    <div className="bg-white p-6 rounded-lg shadow-sm border border-hui-border">
-                        <p className="text-sm font-medium text-hui-textMuted mb-1">Actual Cost</p>
-                        <p className="text-3xl font-bold text-hui-textMain">${totalActual.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                    <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
+                        <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">Actual Cost</p>
+                        <p className="text-3xl font-extrabold text-slate-800">${totalActual.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                     </div>
-                    <div className={`p-6 rounded-lg shadow-sm border ${totalVariance >= 0 ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"}`}>
-                        <p className={`text-sm font-medium mb-1 ${totalVariance >= 0 ? "text-green-700" : "text-red-700"}`}>Variance</p>
-                        <p className={`text-3xl font-bold ${totalVariance >= 0 ? "text-green-800" : "text-red-800"}`}>
+                    <div className={`p-6 rounded-xl border ${totalVariance >= 0 ? "bg-emerald-50 border-emerald-100" : "bg-red-50 border-red-100"}`}>
+                        <p className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${totalVariance >= 0 ? "text-emerald-600" : "text-red-600"}`}>Variance</p>
+                        <p className={`text-3xl font-extrabold ${totalVariance >= 0 ? "text-emerald-700" : "text-red-700"}`}>
                             {totalVariance >= 0 ? "+" : "-"}${Math.abs(totalVariance).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                         </p>
                     </div>
                 </div>
 
                 {/* Visual Snapshot Graph */}
-                <div className="bg-white p-6 rounded-lg shadow-sm border border-hui-border">
-                    <div className="flex justify-between items-end mb-2">
+                <div className="bg-slate-50 p-6 rounded-xl border border-slate-100 mt-6">
+                    <div className="flex justify-between items-end mb-3">
                         <h3 className="font-semibold text-hui-textMain">Budget Utilization Snapshot</h3>
                         <span className="text-sm font-medium text-hui-textMuted">{budgetUtilization.toFixed(1)}% Used</span>
                     </div>
@@ -233,11 +233,11 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             </div>
 
             {/* Breakdowns */}
-            <div className="bg-white rounded-lg shadow-sm border border-hui-border overflow-hidden">
-                <div className="px-6 py-4 border-b border-hui-border bg-slate-50/50">
-                    <h3 className="font-semibold text-hui-textMain">Cost Breakdown by Phase</h3>
+            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden mt-10">
+                <div className="px-8 py-5 border-b border-slate-100 bg-slate-50/50">
+                    <h3 className="font-bold text-slate-800 tracking-tight">Cost Breakdown by Phase</h3>
                 </div>
-                <div className="divide-y divide-slate-100">
+                <div className="divide-y divide-slate-50">
                     {varianceByItem.map((item: any) => (
                         <div key={item.id} className="p-4 px-6 flex items-center justify-between hover:bg-slate-50">
                             <div className="w-1/3">
@@ -264,9 +264,9 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             </div>
 
             {/* List of Recent Expenses */}
-            <div className="bg-white rounded-lg shadow-sm border border-hui-border overflow-hidden mt-8">
-                <div className="px-6 py-4 border-b border-hui-border bg-slate-50/50">
-                    <h3 className="font-semibold text-hui-textMain">Expense Log</h3>
+            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden mt-10">
+                <div className="px-8 py-5 border-b border-slate-100 bg-slate-50/50">
+                    <h3 className="font-bold text-slate-800 tracking-tight">Expense Log</h3>
                 </div>
                 {expenses.length === 0 ? (
                     <div className="p-8 text-center text-hui-textMuted">No expenses recorded yet.</div>

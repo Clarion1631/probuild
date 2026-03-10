@@ -1,4 +1,3 @@
-import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import Avatar from "@/components/Avatar";
 import { getProject, createDraftFloorPlan } from "@/lib/actions";
 import { redirect } from "next/navigation";
@@ -19,10 +18,8 @@ export default async function FloorPlansPage({ params }: { params: Promise<{ id:
     }
 
     return (
-        <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
-            <ProjectInnerSidebar projectId={resolvedParams.id} />
-
-            <div className="flex-1 overflow-auto p-6 bg-slate-50 flex flex-col items-center">
+        <div className="h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
+            <div className="overflow-auto p-6 bg-slate-50 flex flex-col items-center">
                 <div className="w-full max-w-5xl">
                     <div className="flex items-center justify-between mb-8">
                         <h1 className="text-2xl font-bold text-slate-800">3D Floor Plans</h1>

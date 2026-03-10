@@ -1,7 +1,6 @@
 import { getProject, getProjectInvoices } from "@/lib/actions";
 import Link from "next/link";
 import StatusBadge from "@/components/StatusBadge";
-import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 
 export default async function ProjectInvoices({ params }: { params: { id: string } }) {
     const { id } = await params;
@@ -16,7 +15,6 @@ export default async function ProjectInvoices({ params }: { params: { id: string
 
     return (
         <div className="flex h-full bg-hui-background">
-            <ProjectInnerSidebar projectId={project.id} />
             <div className="flex-1 overflow-auto p-8">
                 <div className="max-w-6xl mx-auto space-y-6">
                     <div className="flex justify-between items-center">
