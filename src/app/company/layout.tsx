@@ -25,16 +25,6 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
                 { name: "My Items", href: "#", icon: FileText }, // Placeholder icon
                 { name: "Catalogs", href: "#", icon: FileText }, // Placeholder icon
             ]
-        },
-        {
-            title: "Marketing",
-            items: [
-                { name: "Houzz Profile", href: "/settings/company", icon: Building },
-                { name: "Contact Form", href: "#", icon: FileText }, // Placeholder icon
-                { name: "Website", href: "#", icon: FileText }, // Placeholder icon
-                { name: "Email Marketing", href: "#", icon: FileText }, // Placeholder icon
-                { name: "Marketing Insights", href: "#", icon: FileText }, // Placeholder icon
-            ]
         }
     ];
 
