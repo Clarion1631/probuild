@@ -135,62 +135,129 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                 </div>
             </div>
 
-            {/* Kanban Columns Summaries visually similar to Houzz Pro header strips */}
+            {/* Shared Filters Toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                <div className="flex items-center gap-3 bg-white p-1 rounded-lg border border-slate-200 shadow-sm">
+                    <div className="relative w-48 sm:w-64">
+                        <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                        <input
+                            type="text"
+                            placeholder="Search"
+                            value={search}
+                            onChange={e => setSearch(e.target.value)}
+                            className="w-full pl-9 pr-3 py-1.5 text-sm bg-transparent border-0 focus:ring-0 text-slate-800 placeholder:text-slate-400"
+                        />
+                    </div>
+                    <div className="h-5 w-px bg-slate-200"></div>
+                    <select
+                        value={statusFilter}
+                        onChange={e => setStatusFilter(e.target.value)}
+                        className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-700 font-medium"
+                    >
+                        <option value="all-active">Status: Active</option>
+                        <option value="all">Status: All</option>
+                        {activeStatuses.map(s => (
+                            <option key={s.value} value={s.value}>{s.label}</option>
+                        ))}
+                    </select>
+                    <div className="h-5 w-px bg-slate-200"></div>
+                    <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-700 font-medium">
+                        <option>Tags: None</option>
+                    </select>
+                    <div className="h-5 w-px bg-slate-200"></div>
+                    <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-700 font-medium">
+                        <option>All Managers</option>
+                    </select>
+                </div>
+
+                {/* Bulk Actions Toolbar for List View */}
+                {viewMode === "list" && selectedIds.length > 0 && (
+                    <div className="flex items-center gap-3 bg-red-50 text-red-700 px-4 py-2 rounded-lg border border-red-200 animate-in fade-in slide-in-from-bottom-2">
+                        <span className="text-sm font-semibold">{selectedIds.length} selected</span>
+                        <div className="h-4 w-px bg-red-200"></div>
+                        <button 
+                            onClick={handleDeleteSelected}
+                            disabled={isDeleting}
+                            className="text-sm font-semibold flex items-center gap-1.5 hover:text-red-800 disabled:opacity-50"
+                        >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                            Delete
+                        </button>
+                    </div>
+                )}
+            </div>
+
+            {/* Kanban View */}
             {viewMode === "kanban" && (
-                <div className="flex gap-4 mb-4 overflow-x-auto pb-2">
+                <div className="flex gap-4 mb-4 overflow-x-auto pb-6 items-start">
                      {activeStatuses.map(s => {
                         const colProjects = filteredProjects.filter((p: any) => (p.status || "Open") === s.value);
                         return (
                             <div 
                                 key={s.value} 
-                                className="min-w-[300px] w-[300px] shrink-0"
+                                className="min-w-[320px] w-[320px] shrink-0 bg-[#f4f5f7] rounded-xl flex flex-col max-h-[calc(100vh-250px)]"
                                 onDragOver={handleDragOver}
                                 onDrop={(e) => handleDrop(e, s.value)}
                             >
-                                <div className="flex items-center justify-between mb-3 px-2">
-                                    <h3 className="font-semibold text-[15px] flex items-center gap-2 text-slate-800">
-                                        <div className={`w-2.5 h-2.5 rounded-full ${s.dot}`} style={{ backgroundColor: s.rawColor + " !important" }} />
+                                <div className="flex items-center justify-between p-4 pb-2">
+                                    <h3 className="font-semibold text-[14px] flex items-center gap-2 text-slate-800">
+                                        <div className={`w-2 h-2 rounded-full ${s.dot}`} style={{ backgroundColor: s.rawColor + " !important" }} />
                                         {s.label} ({colProjects.length})
                                     </h3>
                                     <button onClick={() => setShowCustomizeModal(true)} className="text-slate-400 hover:text-slate-600">...</button>
                                 </div>
-                                <div className="flex flex-col gap-3 min-h-[200px] bg-slate-50/50 rounded-xl p-2 border border-slate-100">
+                                <div className="flex flex-col gap-3 p-3 pt-2 overflow-y-auto">
                                     {colProjects.map((project: any) => (
                                         <div 
                                             key={project.id}
                                             draggable
                                             onDragStart={(e) => handleDragStart(e, project.id)}
-                                            className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm hover:shadow-md cursor-grab active:cursor-grabbing group relative overflow-hidden"
+                                            className="bg-white rounded-lg shadow-sm hover:shadow border border-slate-200 cursor-grab active:cursor-grabbing group relative flex flex-col"
                                         >
                                             {/* Colored left border strip matching Houzz Pro */}
-                                            <div className="absolute left-0 top-0 bottom-0 w-1.5" style={{ backgroundColor: project.color || s.rawColor }} />
+                                            <div className="absolute left-0 top-0 bottom-0 w-[5px] rounded-l-lg" style={{ backgroundColor: project.color || s.rawColor }} />
                                             
-                                            <div className="flex justify-between items-start mb-2 pl-2">
-                                                <Link href={`/projects/${project.id}`} className="font-semibold text-[15px] text-slate-800 hover:text-indigo-600 line-clamp-1">{project.name}</Link>
-                                                <button className="text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">...</button>
-                                            </div>
-                                            
-                                            <div className="space-y-1.5 pl-2">
-                                                <div className="flex items-center gap-2 text-[13px] text-slate-500">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                                                    <span className="truncate">{project.client?.name || "No Client"}</span>
-                                                </div>
-                                                {project.location && (
-                                                    <div className="flex items-center gap-2 text-[13px] text-slate-500">
-                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-                                                        <span className="truncate">{project.location}</span>
+                                            <div className="pl-4 p-3.5 flex flex-col gap-2">
+                                                <div className="flex justify-between items-start">
+                                                    <Link href={`/projects/${project.id}`} className="font-semibold text-[14px] text-slate-900 hover:text-indigo-600 line-clamp-1 pr-2">{project.name}</Link>
+                                                    <div className="flex items-center gap-1 -mt-1 -mr-1">
+                                                        <button className="text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                            <svg width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path d="M12 16a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm0-6a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm0-6a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/></svg>
+                                                        </button>
                                                     </div>
-                                                )}
-                                            </div>
-                                            
-                                            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between pl-2">
-                                                <div className="text-[12px] text-slate-400 flex flex-col">
-                                                    <span className="mb-0.5">Type</span>
-                                                    <span className="text-slate-600 truncate max-w-[120px]">{project.type || "—"}</span>
                                                 </div>
-                                                <div className="text-[12px] text-slate-400 flex flex-col">
-                                                    <span className="mb-0.5">Manager</span>
-                                                    <div className="w-6 h-6 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-[10px]">
+                                                
+                                                <div className="space-y-1">
+                                                    <div className="flex items-center gap-2 text-[12.5px] text-slate-500">
+                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                                                        <span className="truncate">{project.client?.name || "No Client"}</span>
+                                                    </div>
+                                                    {project.location && (
+                                                        <div className="flex items-center gap-2 text-[12.5px] text-slate-500">
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                                                            <span className="truncate">{project.location}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                
+                                                <div className="mt-2 text-[12.5px] text-slate-500 grid grid-cols-2 gap-2">
+                                                    <div className="flex gap-2">
+                                                        <span className="text-slate-400 w-9">Type</span>
+                                                        <span className="truncate flex-1 text-slate-600">{project.type || "—"}</span>
+                                                    </div>
+                                                    {project.code && (
+                                                        <div className="flex gap-2">
+                                                            <span className="text-slate-400 w-9">Code</span>
+                                                            <span className="truncate flex-1 text-slate-600">{project.code}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                
+                                                <div className="flex gap-2 text-[12.5px] text-slate-500 items-center justify-between">
+                                                    <div className="flex gap-2 items-center text-slate-400">
+                                                        Manager
+                                                    </div>
+                                                    <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-[9px]">
                                                         R
                                                     </div>
                                                 </div>
@@ -207,58 +274,6 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
             {/* List View */}
             {viewMode === "list" && (
                 <>
-                    {/* Filters & Bulk Actions Toolbar */}
-                    <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
-                        <div className="flex items-center gap-3 bg-white p-1 rounded-lg border border-slate-200">
-                            <div className="relative w-64">
-                                <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-                                <input
-                                    type="text"
-                                    placeholder="Search"
-                                    value={search}
-                                    onChange={e => setSearch(e.target.value)}
-                                    className="w-full pl-9 pr-3 py-1.5 text-sm bg-transparent border-0 focus:ring-0"
-                                />
-                            </div>
-                            <div className="h-5 w-px bg-slate-200"></div>
-                            <select
-                                value={statusFilter}
-                                onChange={e => setStatusFilter(e.target.value)}
-                                className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-600 font-medium"
-                            >
-                                <option value="all-active">Status: Active</option>
-                                <option value="all">Status: All</option>
-                                {activeStatuses.map(s => (
-                                    <option key={s.value} value={s.value}>{s.label}</option>
-                                ))}
-                            </select>
-                            <div className="h-5 w-px bg-slate-200"></div>
-                            <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-600 font-medium">
-                                <option>Tags: None</option>
-                            </select>
-                            <div className="h-5 w-px bg-slate-200"></div>
-                            <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-600 font-medium">
-                                <option>All Managers</option>
-                            </select>
-                        </div>
-
-                        {/* Bulk Actions Toolbar */}
-                        {selectedIds.length > 0 && (
-                            <div className="flex items-center gap-3 bg-red-50 text-red-700 px-4 py-2 rounded-lg border border-red-200 animate-in fade-in slide-in-from-bottom-2">
-                                <span className="text-sm font-semibold">{selectedIds.length} selected</span>
-                                <div className="h-4 w-px bg-red-200"></div>
-                                <button 
-                                    onClick={handleDeleteSelected}
-                                    disabled={isDeleting}
-                                    className="text-sm font-semibold flex items-center gap-1.5 hover:text-red-800 disabled:opacity-50"
-                                >
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                                    Delete
-                                </button>
-                            </div>
-                        )}
-                    </div>
-
                     {/* Table */}
                     <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                         <table className="w-full text-left bg-white text-sm">
