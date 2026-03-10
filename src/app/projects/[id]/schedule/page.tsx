@@ -10,9 +10,22 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
 
     const tasks = await getScheduleTasks(id);
 
+    // Pass estimate summaries for the import dropdown
+    const estimates = (project.estimates || []).map((e: any) => ({
+        id: e.id,
+        title: e.title,
+        status: e.status,
+        itemCount: 0, // will be enriched client-side if needed
+    }));
+
     return (
         <div className="flex flex-col h-[calc(100vh-64px)] -m-6 overflow-hidden bg-hui-background">
-            <GanttChart projectId={id} projectName={project.name} initialTasks={tasks} />
+            <GanttChart
+                projectId={id}
+                projectName={project.name}
+                initialTasks={tasks}
+                estimates={estimates}
+            />
         </div>
     );
 }

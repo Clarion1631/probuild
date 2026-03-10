@@ -9,8 +9,8 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
 
     const menuItems = [
         { name: "Team Members", href: "/company/team-members", icon: Users },
+        { name: "Templates", href: "/company/templates", icon: FileText },
         { name: "Subcontractors", href: "#", icon: Anchor },
-        { name: "Vendors", href: "#", icon: FileText },
     ];
 
     return (

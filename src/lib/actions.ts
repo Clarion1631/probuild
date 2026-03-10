@@ -842,3 +842,56 @@ export async function deleteScheduleTask(taskId: string) {
     return task;
 }
 
+export async function importEstimateToSchedule(projectId: string, estimateId: string) {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        include: {
+            items: {
+                where: { parentId: null },
+                orderBy: { order: "asc" },
+            },
+        },
+    });
+    if (!estimate || estimate.items.length === 0) return [];
+
+    const maxOrder = await prisma.scheduleTask.aggregate({
+        where: { projectId },
+        _max: { order: true },
+    });
+    let order = (maxOrder._max.order ?? -1) + 1;
+
+    const TYPE_COLORS: Record<string, string> = {
+        Material: "#3b82f6",
+        Labor: "#f59e0b",
+        Subcontractor: "#8b5cf6",
+    };
+
+    const today = new Date();
+    const created = [];
+    let dayOffset = 0;
+
+    for (const item of estimate.items) {
+        const duration = item.type === "Labor" ? 7 : item.type === "Subcontractor" ? 10 : 5;
+        const startDate = new Date(today.getTime() + dayOffset * 86400000);
+        const endDate = new Date(today.getTime() + (dayOffset + duration) * 86400000);
+        dayOffset += Math.ceil(duration * 0.7); // overlap a bit
+
+        const task = await prisma.scheduleTask.create({
+            data: {
+                projectId,
+                name: item.name,
+                startDate,
+                endDate,
+                color: TYPE_COLORS[item.type] || "#4c9a2a",
+                order: order++,
+                status: "Not Started",
+            },
+        });
+        created.push(task);
+    }
+
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return created;
+}
+
+

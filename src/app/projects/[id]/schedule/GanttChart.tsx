@@ -1,8 +1,14 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { createScheduleTask, updateScheduleTask, deleteScheduleTask } from "@/lib/actions";
+import { createScheduleTask, updateScheduleTask, deleteScheduleTask, importEstimateToSchedule } from "@/lib/actions";
 import { toast } from "sonner";
+
+type EstimateSummary = {
+    id: string;
+    title: string;
+    status: string;
+};
 
 type Task = {
     id: string;
@@ -48,10 +54,11 @@ function getMonday(d: Date) {
     return new Date(d.setDate(diff));
 }
 
-export default function GanttChart({ projectId, projectName, initialTasks }: {
+export default function GanttChart({ projectId, projectName, initialTasks, estimates = [] }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
+    estimates?: EstimateSummary[];
 }) {
     const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [zoom, setZoom] = useState<ZoomLevel>("week");
@@ -59,6 +66,8 @@ export default function GanttChart({ projectId, projectName, initialTasks }: {
     const [editName, setEditName] = useState("");
     const [colorPickerId, setColorPickerId] = useState<string | null>(null);
     const [isAdding, setIsAdding] = useState(false);
+    const [isImporting, setIsImporting] = useState(false);
+    const [showImportMenu, setShowImportMenu] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const [dragState, setDragState] = useState<{
         taskId: string;
@@ -265,6 +274,29 @@ export default function GanttChart({ projectId, projectName, initialTasks }: {
         toast.success("Task deleted");
     }
 
+    async function handleImportEstimate(estimateId: string) {
+        setIsImporting(true);
+        setShowImportMenu(false);
+        try {
+            const newTasks = await importEstimateToSchedule(projectId, estimateId);
+            if (newTasks.length === 0) {
+                toast.error("No line items found in that estimate");
+                return;
+            }
+            const mapped: Task[] = newTasks.map((t: any) => ({
+                ...t,
+                startDate: typeof t.startDate === 'string' ? t.startDate : t.startDate.toISOString().split('T')[0],
+                endDate: typeof t.endDate === 'string' ? t.endDate : t.endDate.toISOString().split('T')[0],
+            }));
+            setTasks(prev => [...prev, ...mapped]);
+            toast.success(`Imported ${newTasks.length} tasks from estimate`);
+        } catch {
+            toast.error("Failed to import estimate");
+        } finally {
+            setIsImporting(false);
+        }
+    }
+
     async function handleProgressChange(taskId: string, progress: number) {
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress } : t));
         await updateScheduleTask(taskId, { progress });
@@ -324,6 +356,39 @@ export default function GanttChart({ projectId, projectName, initialTasks }: {
                     >
                         Today
                     </button>
+                    {/* Import from Estimate */}
+                    {estimates.length > 0 && (
+                        <div className="relative">
+                            <button
+                                onClick={() => setShowImportMenu(!showImportMenu)}
+                                disabled={isImporting}
+                                className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                                {isImporting ? "Importing..." : "Import from Estimate"}
+                            </button>
+                            {showImportMenu && (
+                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[280px] py-1 animate-in fade-in">
+                                    <div className="px-3 py-2 text-[11px] font-bold text-slate-400 uppercase tracking-wider border-b border-hui-border">
+                                        Select Estimate
+                                    </div>
+                                    {estimates.map(est => (
+                                        <button
+                                            key={est.id}
+                                            onClick={() => handleImportEstimate(est.id)}
+                                            className="w-full text-left px-3 py-2.5 hover:bg-slate-50 transition flex items-center justify-between group"
+                                        >
+                                            <div>
+                                                <div className="text-sm font-medium text-hui-textMain group-hover:text-hui-primary transition">{est.title}</div>
+                                                <div className="text-[11px] text-hui-textMuted">{est.status}</div>
+                                            </div>
+                                            <svg className="w-4 h-4 text-slate-300 group-hover:text-hui-primary transition" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
                     <button onClick={handleAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-sm">
                         + Add Task
                     </button>
