@@ -71,11 +71,15 @@ Return ONLY a JSON array of objects. Each object must have exactly these fields:
 Sort items by phase code, then by cost type within each phase. Make the estimate thorough and professional.`;
 
     try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 55000); // 55s timeout
+
         const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
             {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
+                signal: controller.signal,
                 body: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }],
                     generationConfig: {
@@ -85,6 +89,8 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
                 }),
             }
         );
+
+        clearTimeout(timeout);
 
         if (!geminiResponse.ok) {
             const errorText = await geminiResponse.text();

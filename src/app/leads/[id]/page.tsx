@@ -1,13 +1,16 @@
 import Avatar from "@/components/Avatar";
-import { getLead, convertLeadToProject, createDraftLeadEstimate, deleteEstimate } from "@/lib/actions";
+import { getLead, convertLeadToProject, createDraftLeadEstimate, deleteEstimate, getDocumentTemplates, deleteContract, sendContractToClient } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
 import EstimateStatusDropdown from "@/components/EstimateStatusDropdown";
+import LeadContractsSection from "./LeadContractsSection";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
     const lead = await getLead(resolvedParams.id);
     if (!lead) return <div className="p-6">Lead not found</div>;
+
+    const templates = await getDocumentTemplates();
 
     async function handleConvert() {
         "use server";
@@ -102,6 +105,9 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                             </div>
                         )}
                     </div>
+
+                    {/* Contracts Section */}
+                    <LeadContractsSection leadId={lead.id} contracts={lead.contracts as any} templates={templates as any} />
                 </div>
             </div>
 

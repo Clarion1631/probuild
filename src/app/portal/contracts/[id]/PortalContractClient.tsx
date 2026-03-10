@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useState } from "react";
-import { approveContract } from "@/lib/actions";
+import React, { useState, useEffect } from "react";
+import { approveContract, markContractViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 
 export default function PortalContractClient({ initialContract, companySettings }: { initialContract: any; companySettings?: any }) {
@@ -13,6 +13,10 @@ export default function PortalContractClient({ initialContract, companySettings 
 
     const isSigned = initialContract.status === "Signed";
     const companyName = companySettings?.companyName || "Your Contractor";
+
+    useEffect(() => {
+        markContractViewed(initialContract.id).catch(console.error);
+    }, [initialContract.id]);
 
     const handleApprove = async () => {
         if (!signature.trim()) {
