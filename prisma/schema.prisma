@@ -292,10 +292,21 @@ model Contract {
   lead        Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
   
   title       String
-  body        String   // HTML string of the legal agreement
-  status      String   @default("Draft") // Draft, Sent, Signed
+  body        String   // HTML string of the legal agreement (with merge fields resolved)
+  status      String   @default("Draft") // Draft, Sent, Viewed, Signed, Declined
   
   estimates   Estimate[]
+  
+  // Signing fields
+  approvedBy        String?
+  approvedAt        DateTime?
+  approvalIp        String?
+  approvalUserAgent String?
+  signatureUrl      String?   // PNG data URL of drawn signature
+  
+  // Sending
+  sentAt      DateTime?
+  viewedAt    DateTime?
   
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
