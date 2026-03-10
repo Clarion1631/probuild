@@ -100,15 +100,40 @@ export async function getProject(id: string) {
 }
 
 export async function getProjectLead(projectId: string) {
-    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { clientId: true } });
+    // Direct approach: use leadId if set
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { leadId: true, clientId: true, lead: { select: { id: true, name: true, stage: true } } },
+    });
     if (!project) return null;
-    // Find the most recent lead for this client
+    if (project.lead) return project.lead;
+    // Fallback: find lead by matching client
     const lead = await prisma.lead.findFirst({
         where: { clientId: project.clientId },
         orderBy: { createdAt: "desc" },
         select: { id: true, name: true, stage: true },
     });
     return lead;
+}
+
+export async function linkProjectToLead(projectId: string, leadId: string | null) {
+    "use server";
+    const project = await prisma.project.update({
+        where: { id: projectId },
+        data: { leadId },
+    });
+    revalidatePath(`/projects/${projectId}`);
+    return project;
+}
+
+export async function getLeadsForLinking() {
+    "use server";
+    const leads = await prisma.lead.findMany({
+        orderBy: { createdAt: "desc" },
+        select: { id: true, name: true, stage: true, client: { select: { name: true } } },
+        take: 50,
+    });
+    return leads;
 }
 
 export async function createProject(data: { name: string; clientName: string; clientEmail?: string; location?: string; type?: string }) {

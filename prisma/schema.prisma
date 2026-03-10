@@ -63,6 +63,7 @@ model Lead {
   contracts         Contract[]
   files             ProjectFile[]
   folders           FileFolder[]
+  project           Project?  // reverse relation: the project created from this lead
 }
 
 model Project {
@@ -70,6 +71,8 @@ model Project {
   name      String
   clientId  String
   client    Client    @relation(fields: [clientId], references: [id])
+  leadId    String?   @unique
+  lead      Lead?     @relation(fields: [leadId], references: [id])
   viewedAt  DateTime  @default(now())
   createdAt DateTime  @default(now())
   location  String?

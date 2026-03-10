@@ -2,11 +2,14 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { linkProjectToLead } from "@/lib/actions";
+import { toast } from "sonner";
 
 interface ProjectInnerSidebarProps {
     projectId: string;
     lead?: { id: string; name: string } | null;
+    availableLeads?: { id: string; name: string; stage: string; client: { name: string } }[];
 }
 
 type NavSection = {
@@ -15,9 +18,13 @@ type NavSection = {
     items: { label: string; href: string }[];
 };
 
-export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSidebarProps) {
+export default function ProjectInnerSidebar({ projectId, lead, availableLeads = [] }: ProjectInnerSidebarProps) {
     const pathname = usePathname();
+    const router = useRouter();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+    const [showLinkModal, setShowLinkModal] = useState(false);
+    const [linking, setLinking] = useState(false);
+    const [searchTerm, setSearchTerm] = useState("");
 
     const navSections: NavSection[] = [
         {
@@ -64,6 +71,35 @@ export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSid
         }));
     };
 
+    const handleLinkLead = async (leadId: string) => {
+        setLinking(true);
+        try {
+            await linkProjectToLead(projectId, leadId);
+            toast.success("Lead linked to project!");
+            setShowLinkModal(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e.message || "Failed to link lead");
+        } finally { setLinking(false); }
+    };
+
+    const handleUnlinkLead = async () => {
+        if (!confirm("Unlink this lead from the project?")) return;
+        setLinking(true);
+        try {
+            await linkProjectToLead(projectId, null);
+            toast.success("Lead unlinked");
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e.message || "Failed to unlink lead");
+        } finally { setLinking(false); }
+    };
+
+    const filtered = availableLeads.filter(l =>
+        l.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        l.client.name.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+
     return (
         <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
             {/* Back Button */}
@@ -82,30 +118,53 @@ export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSid
             </div>
 
             {/* Lead Link - Prominent */}
-            {lead && (
-                <div className="px-3 pt-3 pb-1">
-                    <Link
-                        href={`/leads/${lead.id}`}
-                        className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 hover:from-amber-100 hover:to-orange-100 transition group"
+            <div className="px-3 pt-3 pb-1">
+                {lead ? (
+                    <div className="group/lead">
+                        <Link
+                            href={`/leads/${lead.id}`}
+                            className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 hover:from-amber-100 hover:to-orange-100 transition"
+                        >
+                            <div className="w-7 h-7 bg-amber-100 rounded-lg flex items-center justify-center shrink-0">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="1.5">
+                                    <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" />
+                                    <circle cx="9" cy="7" r="4" />
+                                    <path d="M22 21v-2a4 4 0 00-3-3.87" />
+                                    <path d="M16 3.13a4 4 0 010 7.75" />
+                                </svg>
+                            </div>
+                            <div className="min-w-0 flex-1">
+                                <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider">Lead</p>
+                                <p className="text-xs font-medium text-amber-800 truncate">{lead.name}</p>
+                            </div>
+                            <svg className="w-3.5 h-3.5 text-amber-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                            </svg>
+                        </Link>
+                        <button
+                            onClick={handleUnlinkLead}
+                            className="w-full text-center text-[10px] text-slate-400 hover:text-red-500 mt-1 transition opacity-0 group-hover/lead:opacity-100"
+                        >
+                            Unlink lead
+                        </button>
+                    </div>
+                ) : (
+                    <button
+                        onClick={() => setShowLinkModal(true)}
+                        className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-slate-50 border border-dashed border-slate-300 hover:border-amber-300 hover:bg-amber-50 transition text-slate-400 hover:text-amber-600 group"
                     >
-                        <div className="w-7 h-7 bg-amber-100 group-hover:bg-amber-200 rounded-lg flex items-center justify-center shrink-0 transition">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="1.5">
-                                <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" />
-                                <circle cx="9" cy="7" r="4" />
-                                <path d="M22 21v-2a4 4 0 00-3-3.87" />
-                                <path d="M16 3.13a4 4 0 010 7.75" />
+                        <div className="w-7 h-7 bg-slate-100 group-hover:bg-amber-100 rounded-lg flex items-center justify-center shrink-0 transition">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                                <path d="M12 5v14M5 12h14" />
                             </svg>
                         </div>
-                        <div className="min-w-0">
-                            <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider">Lead</p>
-                            <p className="text-xs font-medium text-amber-800 truncate">{lead.name}</p>
+                        <div className="text-left">
+                            <p className="text-[10px] font-semibold uppercase tracking-wider">Link Lead</p>
+                            <p className="text-[10px]">Connect to a lead</p>
                         </div>
-                        <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                        </svg>
-                    </Link>
-                </div>
-            )}
+                    </button>
+                )}
+            </div>
 
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
@@ -152,6 +211,50 @@ export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSid
                     ))}
                 </div>
             </div>
+
+            {/* Link Lead Modal */}
+            {showLinkModal && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-5 max-h-[70vh] flex flex-col">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-base font-bold text-hui-textMain">Link Lead to Project</h3>
+                            <button onClick={() => setShowLinkModal(false)} className="text-slate-400 hover:text-slate-600 text-lg">&times;</button>
+                        </div>
+
+                        <input
+                            type="text"
+                            placeholder="Search leads..."
+                            value={searchTerm}
+                            onChange={e => setSearchTerm(e.target.value)}
+                            className="hui-input w-full mb-3 text-sm"
+                            autoFocus
+                        />
+
+                        <div className="flex-1 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                            {filtered.length === 0 ? (
+                                <div className="p-4 text-center text-sm text-slate-400">No leads found</div>
+                            ) : (
+                                filtered.map(l => (
+                                    <button
+                                        key={l.id}
+                                        onClick={() => handleLinkLead(l.id)}
+                                        disabled={linking}
+                                        className="w-full text-left px-4 py-3 hover:bg-amber-50 transition flex items-center justify-between group disabled:opacity-50"
+                                    >
+                                        <div className="min-w-0">
+                                            <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
+                                            <p className="text-xs text-slate-400">{l.client.name} · {l.stage}</p>
+                                        </div>
+                                        <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
+                                            Link →
+                                        </span>
+                                    </button>
+                                ))
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

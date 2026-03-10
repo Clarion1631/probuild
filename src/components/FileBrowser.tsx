@@ -84,14 +84,20 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
             Array.from(fileList).forEach(f => formData.append("files", f));
 
             const res = await fetch("/api/files", { method: "POST", body: formData });
-            if (!res.ok) throw new Error("Upload failed");
             const data = await res.json();
+            if (!res.ok) {
+                toast.error(data.error || `Upload failed (${res.status})`);
+                console.error("Upload error:", data);
+                return;
+            }
             setFiles(prev => [...data.files, ...prev]);
             toast.success(`${data.files.length} file${data.files.length > 1 ? "s" : ""} uploaded`);
-        } catch {
-            toast.error("Upload failed");
+        } catch (err: any) {
+            console.error("Upload error:", err);
+            toast.error(err.message || "Upload failed — check console for details");
         } finally {
             setIsUploading(false);
+            if (fileInputRef.current) fileInputRef.current.value = "";
         }
     }
 
