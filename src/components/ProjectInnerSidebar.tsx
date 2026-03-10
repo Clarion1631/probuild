@@ -6,15 +6,16 @@ import { usePathname } from "next/navigation";
 
 interface ProjectInnerSidebarProps {
     projectId: string;
+    lead?: { id: string; name: string } | null;
 }
 
 type NavSection = {
     id: string;
     title: string;
-    items: { label: string; href: string }[];
+    items: { label: string; href: string; icon?: string }[];
 };
 
-export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarProps) {
+export default function ProjectInnerSidebar({ projectId, lead }: ProjectInnerSidebarProps) {
     const pathname = usePathname();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
 
@@ -69,6 +70,32 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
                 <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Project Menu</h2>
             </div>
 
+            {/* Lead Link - Prominent */}
+            {lead && (
+                <div className="px-3 pt-3 pb-1">
+                    <Link
+                        href={`/leads/${lead.id}`}
+                        className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 hover:from-amber-100 hover:to-orange-100 transition group"
+                    >
+                        <div className="w-7 h-7 bg-amber-100 group-hover:bg-amber-200 rounded-lg flex items-center justify-center shrink-0 transition">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="1.5">
+                                <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" />
+                                <circle cx="9" cy="7" r="4" />
+                                <path d="M22 21v-2a4 4 0 00-3-3.87" />
+                                <path d="M16 3.13a4 4 0 010 7.75" />
+                            </svg>
+                        </div>
+                        <div className="min-w-0">
+                            <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider">Lead</p>
+                            <p className="text-xs font-medium text-amber-800 truncate">{lead.name}</p>
+                        </div>
+                        <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                        </svg>
+                    </Link>
+                </div>
+            )}
+
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
                     {navSections.map((section) => (
@@ -94,7 +121,6 @@ export default function ProjectInnerSidebar({ projectId }: ProjectInnerSidebarPr
                             {!collapsedSections[section.id] && (
                                 <ul className="space-y-1">
                                     {section.items.map((item) => {
-                                        // A simple check if the current path includes the item's href
                                         const isActive = pathname?.includes(item.href);
                                         return (
                                             <li key={item.label}>

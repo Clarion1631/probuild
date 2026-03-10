@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
     importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
+    aiGenerateSchedule,
     addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
     assignUserToTask, unassignUserFromTask,
@@ -88,6 +89,30 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     } | null>(null);
 
     const selectedTask = tasks.find(t => t.id === selectedTaskId);
+
+    // AI Schedule handler
+    async function handleAiSchedule(estimateId?: string) {
+        setIsAiGenerating(true);
+        setShowAiMenu(false);
+        try {
+            const created = await aiGenerateSchedule(projectId, estimateId);
+            const newTasks: Task[] = created.map((t: any) => ({
+                id: t.id, name: t.name,
+                startDate: new Date(t.startDate).toISOString().split("T")[0],
+                endDate: new Date(t.endDate).toISOString().split("T")[0],
+                color: t.color, progress: 0, status: t.status,
+                assignee: null, order: t.order,
+                estimatedHours: t.estimatedHours, actualHours: 0,
+                dependencies: [], dependents: [], assignments: [],
+            }));
+            setTasks(prev => [...prev, ...newTasks]);
+            toast.success(`AI generated ${newTasks.length} tasks`);
+        } catch (e: any) {
+            toast.error(e.message || "AI schedule generation failed");
+        } finally {
+            setIsAiGenerating(false);
+        }
+    }
 
     // Load detail data when task selected
     useEffect(() => {
@@ -339,9 +364,33 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                 </div>
                 <div className="flex items-center gap-3">
                     <button onClick={handleAddTask} className="hui-btn hui-btn-primary" disabled={isAdding}>+ Add First Task</button>
-                    <button onClick={() => estimates.length > 0 ? setShowAiMenu(true) : handleAiSchedule()} disabled={isAiGenerating}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
-                    >✨ AI Schedule</button>
+                    <div className="relative">
+                        <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
+                            className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
+                        >✨ {isAiGenerating ? "Generating..." : "AI Schedule"}</button>
+                        {showAiMenu && estimates.length > 0 && (
+                            <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] py-1 animate-in fade-in">
+                                <button onClick={() => handleAiSchedule()} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>🧠</span> General Schedule</button>
+                                {estimates.map(est => (
+                                    <button key={est.id} onClick={() => handleAiSchedule(est.id)} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>📋</span> {est.title}</button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                    {estimates.length > 0 && (
+                        <div className="relative">
+                            <button onClick={() => setShowImportMenu(!showImportMenu)} disabled={isImporting}
+                                className="hui-btn hui-btn-secondary flex items-center gap-2"
+                            >{isImporting ? "Importing..." : "📋 Import"}</button>
+                            {showImportMenu && (
+                                <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
+                                    {estimates.map(est => (
+                                        <button key={est.id} onClick={() => handleImportEstimate(est.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm">{est.title}</button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
         );

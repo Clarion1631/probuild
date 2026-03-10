@@ -99,6 +99,18 @@ export async function getProject(id: string) {
     return project;
 }
 
+export async function getProjectLead(projectId: string) {
+    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { clientId: true } });
+    if (!project) return null;
+    // Find the most recent lead for this client
+    const lead = await prisma.lead.findFirst({
+        where: { clientId: project.clientId },
+        orderBy: { createdAt: "desc" },
+        select: { id: true, name: true, stage: true },
+    });
+    return lead;
+}
+
 export async function createProject(data: { name: string; clientName: string; clientEmail?: string; location?: string; type?: string }) {
     // Find or create client
     let client = await prisma.client.findFirst({
@@ -1388,6 +1400,109 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
         });
         created.push(item);
     }
+    return created;
+}
+
+export async function aiGenerateSchedule(projectId: string, estimateId?: string) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
+
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) throw new Error("Project not found");
+
+    let estimateContext = "";
+    if (estimateId) {
+        const estimate = await prisma.estimate.findUnique({
+            where: { id: estimateId },
+            include: { items: { where: { parentId: null }, orderBy: { order: "asc" }, include: { subItems: true } } },
+        });
+        if (estimate) {
+            estimateContext = `\n\nESTIMATE LINE ITEMS:\n${estimate.items.map(i => {
+                const laborHrs = i.subItems?.filter((s: any) => s.type === "Labor").reduce((a: number, s: any) => a + (s.quantity || 0), 0) || (i.type === "Labor" ? i.quantity : 0);
+                return `- ${i.name} (Type: ${i.type}, Labor Hours: ${laborHrs || "N/A"})`;
+            }).join("\n")}`;
+        }
+    }
+
+    const prompt = `You are an expert construction project manager. Generate a realistic schedule for this project.
+
+PROJECT: "${project.name}"
+TYPE: ${project.type || "General Remodeling"}${estimateContext}
+
+Generate 8-15 construction tasks in logical order with realistic durations and dependencies. Each task should have a name, duration in days, estimated labor hours, and which tasks it depends on (by index, 0-based).
+
+Return ONLY a JSON array with objects like:
+[{"name":"Demo & Site Prep","durationDays":5,"estimatedHours":40,"dependsOn":[]},{"name":"Framing","durationDays":7,"estimatedHours":56,"dependsOn":[0]}]
+
+Rules:
+- Use real construction phases appropriate for the project type
+- Duration should be realistic working days
+- EstimatedHours = labor hours only
+- Dependencies reference previous task indexes (0-based)
+- The first task has no dependencies`;
+
+    const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.7, responseMimeType: "application/json" },
+            }),
+        }
+    );
+
+    const data = await res.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) throw new Error("No AI response");
+
+    const aiTasks: { name: string; durationDays: number; estimatedHours: number; dependsOn: number[] }[] = JSON.parse(rawText);
+    if (!Array.isArray(aiTasks)) throw new Error("Invalid AI response");
+
+    const maxOrder = await prisma.scheduleTask.aggregate({ where: { projectId }, _max: { order: true } });
+    let order = (maxOrder._max.order ?? -1) + 1;
+
+    const COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
+    const today = new Date();
+    const createdIds: string[] = [];
+    const created = [];
+    let dayOffset = 0;
+
+    for (let i = 0; i < aiTasks.length; i++) {
+        const t = aiTasks[i];
+        const startDate = new Date(today.getTime() + dayOffset * 86400000);
+        const endDate = new Date(today.getTime() + (dayOffset + (t.durationDays || 5)) * 86400000);
+        dayOffset += Math.ceil((t.durationDays || 5) * 0.7);
+
+        const task = await prisma.scheduleTask.create({
+            data: {
+                projectId,
+                name: t.name,
+                startDate,
+                endDate,
+                color: COLORS[i % COLORS.length],
+                order: order++,
+                status: "Not Started",
+                estimatedHours: t.estimatedHours || null,
+            },
+        });
+        createdIds.push(task.id);
+        created.push(task);
+    }
+
+    // Create dependencies
+    for (let i = 0; i < aiTasks.length; i++) {
+        for (const depIdx of (aiTasks[i].dependsOn || [])) {
+            if (depIdx >= 0 && depIdx < createdIds.length && depIdx !== i) {
+                await prisma.taskDependency.create({
+                    data: { predecessorId: createdIds[depIdx], dependentId: createdIds[i] },
+                });
+            }
+        }
+    }
+
+    revalidatePath(`/projects/${projectId}/schedule`);
     return created;
 }
 
