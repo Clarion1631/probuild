@@ -35,29 +35,6 @@ export async function GET(req: Request) {
             }
         });
 
-        // Create leads
-        const lead1 = await prisma.lead.create({
-            data: {
-                name: 'Dustin Smith sent a Direct Message',
-                clientId: client1.id,
-                stage: 'New',
-                source: 'My website',
-                location: 'Portland, OR',
-                projectType: 'Kitchen Remodel'
-            }
-        });
-
-        await prisma.lead.create({
-            data: {
-                name: 'Jennifer Obrien inquiry',
-                clientId: client3.id,
-                stage: 'Estimate Sent',
-                source: 'Houzz',
-                location: 'Seattle, WA',
-                projectType: 'Bathroom Remodel'
-            }
-        });
-
         // Create projects
         const project1 = await prisma.project.create({
             data: {
@@ -99,7 +76,7 @@ export async function GET(req: Request) {
         });
 
         // 5 additional projects in various statuses
-        await prisma.project.create({
+        const project2 = await prisma.project.create({
             data: {
                 name: 'Parkin Laundry Room',
                 clientId: client4.id,
@@ -110,7 +87,7 @@ export async function GET(req: Request) {
             }
         });
 
-        await prisma.project.create({
+        const project3 = await prisma.project.create({
             data: {
                 name: 'Howard/Salzer Bathroom',
                 clientId: client5.id,
@@ -121,7 +98,7 @@ export async function GET(req: Request) {
             }
         });
 
-        await prisma.project.create({
+        const project4 = await prisma.project.create({
             data: {
                 name: 'Anspach Bedroom',
                 clientId: client6.id,
@@ -132,7 +109,7 @@ export async function GET(req: Request) {
             }
         });
 
-        await prisma.project.create({
+        const project5 = await prisma.project.create({
             data: {
                 name: 'Atherton Kitchen',
                 clientId: client7.id,
@@ -143,7 +120,7 @@ export async function GET(req: Request) {
             }
         });
 
-        await prisma.project.create({
+        const project6 = await prisma.project.create({
             data: {
                 name: 'OHaver Garage Conversion',
                 clientId: client8.id,
@@ -154,7 +131,88 @@ export async function GET(req: Request) {
             }
         });
 
-        // Create Estimate connected to Lead
+        // --- Leads ---
+        // Original leads
+        const lead1 = await prisma.lead.create({
+            data: {
+                name: 'Dustin Smith sent a Direct Message',
+                clientId: client1.id,
+                stage: 'New',
+                source: 'My website',
+                location: 'Portland, OR',
+                projectType: 'Kitchen Remodel'
+            }
+        });
+
+        await prisma.lead.create({
+            data: {
+                name: 'Jennifer Obrien inquiry',
+                clientId: client3.id,
+                stage: 'Estimate Sent',
+                source: 'Houzz',
+                location: 'Seattle, WA',
+                projectType: 'Bathroom Remodel'
+            }
+        });
+
+        // Leads tied to new projects
+        const lead3 = await prisma.lead.create({
+            data: {
+                name: 'Ruth Parkin - Laundry Room Renovation',
+                clientId: client4.id,
+                stage: 'Won',
+                source: 'Referral',
+                location: 'Vancouver, WA',
+                projectType: 'Laundry Room'
+            }
+        });
+
+        const lead4 = await prisma.lead.create({
+            data: {
+                name: 'David Howard - Master Bath Remodel',
+                clientId: client5.id,
+                stage: 'Won',
+                source: 'Houzz',
+                location: 'Vancouver, WA',
+                projectType: 'Bathroom Remodeling'
+            }
+        });
+
+        const lead5 = await prisma.lead.create({
+            data: {
+                name: 'Karen Anspach - Bedroom Suite',
+                clientId: client6.id,
+                stage: 'Won',
+                source: 'Google',
+                location: 'Vancouver, WA',
+                projectType: 'Bedroom Remodel'
+            }
+        });
+
+        const lead6 = await prisma.lead.create({
+            data: {
+                name: 'Tricia Atherton - Kitchen Redesign',
+                clientId: client7.id,
+                stage: 'Won',
+                source: 'Referral',
+                location: 'Vancouver, WA',
+                projectType: 'Kitchen Remodel'
+            }
+        });
+
+        const lead7 = await prisma.lead.create({
+            data: {
+                name: 'Dan OHaver - Garage ADU Conversion',
+                clientId: client8.id,
+                stage: 'Won',
+                source: 'My website',
+                location: 'Portland, OR',
+                projectType: 'Garage Conversion'
+            }
+        });
+
+        // --- Estimates ---
+        // Original estimates
         await prisma.estimate.create({
             data: {
                 title: 'Kitchen Remodel Initial Estimate',
@@ -166,7 +224,6 @@ export async function GET(req: Request) {
             }
         });
 
-        // Create Estimate connected to Project
         await prisma.estimate.create({
             data: {
                 title: 'Water Damage Repairs',
@@ -175,6 +232,67 @@ export async function GET(req: Request) {
                 status: 'Invoiced',
                 totalAmount: 12500,
                 balanceDue: 0
+            }
+        });
+
+        // Estimates tied to new projects
+        await prisma.estimate.create({
+            data: {
+                title: 'Laundry Room Full Renovation',
+                projectId: project2.id,
+                leadId: lead3.id,
+                code: 'EST-103',
+                status: 'Approved',
+                totalAmount: 18500,
+                balanceDue: 18500
+            }
+        });
+
+        await prisma.estimate.create({
+            data: {
+                title: 'Master Bathroom Remodel',
+                projectId: project3.id,
+                leadId: lead4.id,
+                code: 'EST-104',
+                status: 'Approved',
+                totalAmount: 32000,
+                balanceDue: 16000
+            }
+        });
+
+        await prisma.estimate.create({
+            data: {
+                title: 'Bedroom Suite Renovation',
+                projectId: project4.id,
+                leadId: lead5.id,
+                code: 'EST-105',
+                status: 'Invoiced',
+                totalAmount: 22000,
+                balanceDue: 0
+            }
+        });
+
+        await prisma.estimate.create({
+            data: {
+                title: 'Kitchen Full Redesign',
+                projectId: project5.id,
+                leadId: lead6.id,
+                code: 'EST-106',
+                status: 'Approved',
+                totalAmount: 55000,
+                balanceDue: 55000
+            }
+        });
+
+        await prisma.estimate.create({
+            data: {
+                title: 'Garage to ADU Conversion',
+                projectId: project6.id,
+                leadId: lead7.id,
+                code: 'EST-107',
+                status: 'Sent',
+                totalAmount: 75000,
+                balanceDue: 75000
             }
         });
 
