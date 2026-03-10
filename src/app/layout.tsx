@@ -26,7 +26,12 @@ export default async function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const settings = await getCompanySettings();
+  let settings = null;
+  try {
+    settings = await getCompanySettings();
+  } catch {
+    // During build-time static generation, DATABASE_URL may not exist — gracefully skip.
+  }
 
   return (
     <html lang="en">
