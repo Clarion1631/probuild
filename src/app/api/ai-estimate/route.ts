@@ -55,13 +55,11 @@ INSTRUCTIONS:
 - Group sub-items under parent items by phase when logical
 - The "description" field should be brief but helpful (e.g., "R-13 batt insulation, exterior walls")
 
-Also generate a payment milestone schedule (typically 4-6 milestones) based on standard construction draw schedules:
-- Deposit/Signing (10-20%)
-- After demolition/rough-in (20-25%)
-- After framing/structural (20-25%)
-- After finishes begin (15-20%)
-- Substantial completion (10-15%)
-- Final walkthrough/completion (5-10%)
+Also generate a payment milestone schedule (exactly 3-4 milestones, no more) based on standard construction draw schedules:
+- Deposit upon signing (20-30%)
+- Progress payment at rough-in completion (30-35%)
+- Substantial completion (25-30%)
+- Final walkthrough/completion (10-15%)
 
 Return ONLY a JSON object (NOT an array) with two keys:
 
