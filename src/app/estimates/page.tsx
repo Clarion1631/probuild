@@ -1,8 +1,8 @@
+export const dynamic = "force-dynamic";
 import { getAllEstimates } from "@/lib/actions";
 import Avatar from "@/components/Avatar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Link from "next/link";
-
 export default async function EstimatesPage() {
     const estimates = await getAllEstimates();
 

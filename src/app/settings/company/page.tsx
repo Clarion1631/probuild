@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 import { getCompanySettings } from "@/lib/actions";
 import CompanySettingsClient from "./CompanySettingsClient";
 

@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Avatar from "@/components/Avatar";
 import { getProjects } from "@/lib/actions";
