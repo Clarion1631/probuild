@@ -2,10 +2,12 @@
 
 import React, { useState, useEffect } from "react";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
+import SignaturePad from "@/components/SignaturePad";
 
 export default function PortalEstimateClient({ initialEstimate, companySettings }: { initialEstimate: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
     const [signature, setSignature] = useState("");
+    const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
 
@@ -15,17 +17,19 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
     const handleApprove = async () => {
         if (!signature.trim()) {
-            setError("Please clearly type your full name to sign.");
+            setError("Please type your full legal name.");
+            return;
+        }
+        if (!signatureDataUrl) {
+            setError("Please draw your signature above.");
             return;
         }
 
         setIsSubmitting(true);
         setError("");
         try {
-            // In a real app we'd fetch the IP address here or from the server headers
             const userAgent = window.navigator.userAgent;
-            await approveEstimate(initialEstimate.id, signature.trim(), "Client IP", userAgent);
-            // The server action revalidates the path, which will automatically refetch the data
+            await approveEstimate(initialEstimate.id, signature.trim(), "Client IP", userAgent, signatureDataUrl);
         } catch (e) {
             setError("Something went wrong processing your approval.");
         } finally {
@@ -96,17 +100,25 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 </div>
 
                 {isApproved && initialEstimate.approvedBy && (
-                    <div className="mt-6 p-4 bg-green-50 border border-green-200 rounded-md flex items-start gap-3">
-                        <svg className="h-5 w-5 text-green-600 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
-                        <div>
-                            <h3 className="text-sm font-medium text-green-800">Electronically Signed and Approved</h3>
-                            <div className="mt-1 text-sm text-green-700">
-                                <p>Signed by: <strong>{initialEstimate.approvedBy}</strong></p>
-                                <p>Date: {new Date(initialEstimate.approvedAt).toLocaleString()}</p>
+                    <div className="mt-6 p-4 bg-green-50 border border-green-200 rounded-lg flex flex-col gap-3">
+                        <div className="flex items-start gap-3">
+                            <svg className="h-5 w-5 text-green-600 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            <div>
+                                <h3 className="text-sm font-medium text-green-800">Electronically Signed and Approved</h3>
+                                <div className="mt-1 text-sm text-green-700">
+                                    <p>Signed by: <strong>{initialEstimate.approvedBy}</strong></p>
+                                    <p>Date: {new Date(initialEstimate.approvedAt).toLocaleString()}</p>
+                                </div>
                             </div>
                         </div>
+                        {initialEstimate.signatureUrl && (
+                            <div className="mt-2 border-t border-green-200 pt-3">
+                                <p className="text-xs text-green-700 mb-2">Signature:</p>
+                                <img src={initialEstimate.signatureUrl} alt="Client Signature" className="h-16 object-contain" />
+                            </div>
+                        )}
                     </div>
                 )}
             </div>
@@ -244,26 +256,40 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 Approve & Sign Estimate
                             </button>
                         ) : (
-                            <div className="w-full max-w-md bg-hui-background p-6 rounded-lg border border-hui-border shadow-sm">
-                                <h3 className="text-lg font-semibold text-hui-textMain mb-4">Finalize Approval</h3>
+                            <div className="w-full max-w-lg bg-hui-background p-6 rounded-lg border border-hui-border shadow-sm">
+                                <h3 className="text-lg font-semibold text-hui-textMain mb-1">Sign & Approve</h3>
+                                <p className="text-sm text-hui-textMuted mb-5">Draw your signature and type your full legal name to approve this estimate.</p>
 
-                                <div className="space-y-4">
+                                <div className="space-y-5">
+                                    {/* Drawn Signature */}
                                     <div>
-                                        <label className="block text-sm font-medium text-hui-textMuted mb-1">Electronic Signature (Type Full Name)</label>
+                                        <label className="block text-sm font-medium text-hui-textMain mb-2">Your Signature</label>
+                                        <SignaturePad onSignatureChange={setSignatureDataUrl} />
+                                    </div>
+
+                                    {/* Typed Name */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-hui-textMain mb-1">Full Legal Name</label>
                                         <input
                                             type="text"
                                             value={signature}
                                             onChange={(e) => setSignature(e.target.value)}
-                                            className="hui-input w-full font-serif italic text-lg"
-                                            placeholder="John Doe"
+                                            className="hui-input w-full"
+                                            placeholder="e.g. John A. Doe"
                                             autoFocus
                                         />
-                                        {error && <p className="text-red-500 text-xs mt-1">{error}</p>}
                                     </div>
 
-                                    <p className="text-xs text-hui-textMuted">I agree that my typed name above acts as my legal electronic signature and binds me to the terms of this estimate.</p>
+                                    {error && <p className="text-red-500 text-sm">{error}</p>}
 
-                                    <div className="flex gap-3 justify-end pt-2">
+                                    {/* Legal Disclosure */}
+                                    <div className="bg-white border border-hui-border rounded-md p-3">
+                                        <p className="text-xs text-hui-textMuted leading-relaxed">
+                                            <strong className="text-hui-textMain">Electronic Signature Disclosure:</strong> By signing above and clicking &ldquo;Sign & Approve,&rdquo; I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act and UETA, (2) I have reviewed and agree to the estimate details{initialEstimate.termsAndConditions ? " and the Terms & Conditions" : ""} above, and (3) I authorize the described work to proceed.
+                                        </p>
+                                    </div>
+
+                                    <div className="flex gap-3 justify-end pt-1">
                                         <button
                                             onClick={() => setIsApproving(false)}
                                             className="hui-btn hui-btn-secondary px-4 py-2"
@@ -276,7 +302,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                             disabled={isSubmitting}
                                             className="hui-btn hui-btn-green px-6 py-2 flex items-center gap-2"
                                         >
-                                            {isSubmitting ? "Processing..." : "Sign & Agree"}
+                                            {isSubmitting ? "Processing..." : "Sign & Approve"}
                                             {!isSubmitting && (
                                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />

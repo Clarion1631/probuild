@@ -329,7 +329,7 @@ export async function markEstimateViewed(estimateId: string) {
     }
 }
 
-export async function approveEstimate(estimateId: string, signatureName: string, ipAddress: string, userAgent: string) {
+export async function approveEstimate(estimateId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
     await prisma.estimate.update({
         where: { id: estimateId },
         data: {
@@ -338,6 +338,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             approvedAt: new Date(),
             approvalIp: ipAddress,
             approvalUserAgent: userAgent,
+            signatureUrl: signatureDataUrl || null,
         },
     });
 
