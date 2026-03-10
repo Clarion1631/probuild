@@ -22,6 +22,7 @@ export async function getLead(id: string) {
         include: {
             client: true,
             estimates: true,
+            contracts: true,
         },
     });
     return lead;
@@ -309,7 +310,7 @@ export async function getAllEstimates() {
 export async function markEstimateViewed(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        select: { viewedAt: true },
+        select: { viewedAt: true, title: true, code: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
     if (estimate && !estimate.viewedAt) {
@@ -318,12 +319,51 @@ export async function markEstimateViewed(estimateId: string) {
             data: { viewedAt: new Date() },
         });
 
+        const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || "A client";
+        const projectName = estimate.project?.name || estimate.lead?.name || "";
         const settings = await getCompanySettings();
         if (settings.notificationEmail) {
             await sendNotification(
                 settings.notificationEmail,
-                `Estimate Viewed: ${estimateId}`,
-                `<p>A client has opened and viewed estimate <b>${estimateId}</b>.</p>`
+                `👁️ Estimate Viewed — ${estimate.title || estimate.code}`,
+                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                    <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 20px;">
+                        <h3 style="margin: 0 0 8px; color: #0369a1;">Estimate Viewed</h3>
+                        <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened estimate <strong>${estimate.title || estimate.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                    </div>
+                </div>`
+            );
+        }
+    }
+}
+
+export async function markContractViewed(contractId: string) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { viewedAt: true, title: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
+    });
+
+    if (contract && !contract.viewedAt) {
+        await prisma.contract.update({
+            where: { id: contractId },
+            data: { viewedAt: new Date() },
+        });
+
+        const clientName = contract.project?.client?.name || contract.lead?.client?.name || "A client";
+        const projectName = contract.project?.name || contract.lead?.name || "";
+        const settings = await getCompanySettings();
+        if (settings.notificationEmail) {
+            await sendNotification(
+                settings.notificationEmail,
+                `👁️ Contract Viewed — ${contract.title}`,
+                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                    <div style="background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; padding: 20px;">
+                        <h3 style="margin: 0 0 8px; color: #854d0e;">Contract Viewed</h3>
+                        <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened contract <strong>${contract.title}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                    </div>
+                </div>`
             );
         }
     }
