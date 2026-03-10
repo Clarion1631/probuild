@@ -55,8 +55,9 @@ export default async function TimeClockPage({
     });
     
     const teamMembers = await prisma.user.findMany({
-        where: { status: "ACTIVATED" },
-        select: { id: true, name: true, email: true, hourlyRate: true }
+        where: { status: { not: "DISABLED" } },
+        select: { id: true, name: true, email: true, hourlyRate: true },
+        orderBy: { name: 'asc' }
     });
 
     return (

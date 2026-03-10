@@ -71,7 +71,7 @@ export default function TimeClockClient({
                 setHours("");
             } else {
                 setEntryType("hourly");
-                setHours(entry.durationHours?.toString() || "");
+                setHours(entry.durationHours != null ? parseFloat(entry.durationHours.toFixed(2)).toString() : "");
                 setManualCost("");
             }
         } else {
@@ -188,7 +188,7 @@ export default function TimeClockClient({
                                         {entry.costCode ? `${entry.costCode.code} - ${entry.costCode.name}` : <span className="text-slate-400 italic">Unassigned</span>}
                                     </td>
                                     <td className="px-6 py-4 font-medium">
-                                        {entry.durationHours === 0 ? <span className="text-slate-400">Unit-based</span> : `${entry.durationHours}h`}
+                                        {entry.durationHours === 0 ? <span className="text-slate-400">Unit-based</span> : `${parseFloat((entry.durationHours ?? 0).toFixed(2))}h`}
                                     </td>
                                     <td className="px-6 py-4">
                                         ${(entry.laborCost || 0).toFixed(2)}

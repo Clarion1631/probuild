@@ -224,9 +224,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                         return (
                             <div 
                                 key={s.value} 
-                                className="min-w-[260px] w-[260px] shrink-0"
-                                onDragOver={handleDragOver}
-                                onDrop={(e) => handleDrop(e, s.value)}
+                                className="min-w-[260px] w-[260px] shrink-0 flex flex-col"
                             >
                                 <div className="flex items-center justify-between mb-3 px-1">
                                     <h3 className="font-semibold text-[13px] flex items-center gap-2 text-slate-700">
@@ -235,12 +233,18 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                     </h3>
                                     <button onClick={() => setShowCustomizeModal(true)} className="text-slate-400 hover:text-slate-600 text-lg leading-none px-1">···</button>
                                 </div>
-                                <div className="flex flex-col gap-2">
+                                {/* Drop zone container with soft outline */}
+                                <div 
+                                    className="flex flex-col gap-2 p-2 rounded-xl bg-slate-50 border border-slate-200/70 min-h-[120px] transition-colors"
+                                    onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add("bg-blue-50", "border-blue-200"); }}
+                                    onDragLeave={(e) => { e.currentTarget.classList.remove("bg-blue-50", "border-blue-200"); }}
+                                    onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove("bg-blue-50", "border-blue-200"); handleDrop(e, s.value); }}
+                                >
                                     {colProjects.map((project: any) => (
                                         <div 
                                             key={project.id}
                                             draggable
-                                            onDragStart={(e) => handleDragStart(e, project.id)}
+                                            onDragStart={(e) => { e.dataTransfer.setData("projectId", project.id); e.dataTransfer.effectAllowed = "move"; }}
                                             className="bg-white rounded-lg shadow-sm hover:shadow border border-slate-200 cursor-grab active:cursor-grabbing group relative"
                                         >
                                             {/* Colored left border strip */}
@@ -279,6 +283,9 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                             </div>
                                         </div>
                                     ))}
+                                    {colProjects.length === 0 && (
+                                        <div className="text-center text-[12px] text-slate-400 py-6">Drop projects here</div>
+                                    )}
                                 </div>
                             </div>
                         );
