@@ -94,6 +94,7 @@ function resolvePreview(html: string, company: CompanySettings): string {
 export default function TemplatesPage() {
     const [templates, setTemplates] = useState<Template[]>([]);
     const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState<string | null>(null);
     const [showEditor, setShowEditor] = useState(false);
     const [editingTemplate, setEditingTemplate] = useState<Template | null>(null);
     const [company, setCompany] = useState<CompanySettings>({ companyName: "Your Company" });
@@ -108,16 +109,26 @@ export default function TemplatesPage() {
     }, []);
 
     async function loadTemplates() {
-        const data = await getDocumentTemplates();
-        setTemplates(data as Template[]);
-        setLoading(false);
+        setLoading(true);
+        setLoadError(null);
+        try {
+            const data = await getDocumentTemplates();
+            setTemplates(data as Template[]);
+        } catch (e: any) {
+            console.error("Failed to load templates:", e);
+            setLoadError(e?.message || "Failed to load templates. Please try again.");
+        } finally {
+            setLoading(false);
+        }
     }
 
     async function loadCompany() {
         try {
             const data = await getCompanySettings();
             setCompany(data as CompanySettings);
-        } catch { /* ignore */ }
+        } catch (e) {
+            console.error("Failed to load company settings:", e);
+        }
     }
 
     function openCreate() {
@@ -411,7 +422,19 @@ export default function TemplatesPage() {
 
             <div className="p-8 flex-1 overflow-y-auto w-full max-w-5xl mx-auto bg-hui-background">
                 {loading ? (
-                    <div className="text-center py-20 text-hui-textMuted">Loading templates...</div>
+                    <div className="text-center py-20 text-hui-textMuted">
+                        <div className="w-8 h-8 border-2 border-slate-300 border-t-blue-500 rounded-full animate-spin mx-auto mb-4"></div>
+                        Loading templates...
+                    </div>
+                ) : loadError ? (
+                    <div className="text-center py-20 flex flex-col items-center">
+                        <div className="w-16 h-16 bg-red-50 rounded-full flex items-center justify-center mb-4">
+                            <svg className="w-8 h-8 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
+                        </div>
+                        <h3 className="text-lg font-medium text-slate-900 mb-1">Failed to load templates</h3>
+                        <p className="text-slate-500 mb-4 text-sm">{loadError}</p>
+                        <button onClick={loadTemplates} className="hui-btn hui-btn-primary">Retry</button>
+                    </div>
                 ) : templates.length === 0 ? (
                     <div className="text-center py-20 flex flex-col items-center">
                         <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mb-4">
