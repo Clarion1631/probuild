@@ -33,7 +33,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
                             <ul className="space-y-2 text-sm">
                                 <li><Link href="#" className="hover:text-hui-primary block transition">Task Center</Link></li>
-                                <li><Link href="#" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>
+                                <li><Link href="/manager/schedule" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>
                                 <li><Link href="#" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>
                                 <li><Link href="#" className="hover:text-hui-primary block transition">Time & Expenses</Link></li>
                             </ul>
