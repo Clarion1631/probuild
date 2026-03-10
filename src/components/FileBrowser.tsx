@@ -53,6 +53,8 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
     const [dragOver, setDragOver] = useState(false);
     const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
     const [previewFile, setPreviewFile] = useState<FileRecord | null>(null);
+    const [moveFileId, setMoveFileId] = useState<string | null>(null);
+    const [allFolders, setAllFolders] = useState<FolderRecord[]>([]);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [loaded, setLoaded] = useState(false);
 
@@ -142,6 +144,36 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
             setFolders(prev => prev.filter(f => f.id !== folderId));
             toast.success("Folder deleted");
         } catch { toast.error("Delete failed"); }
+    }
+
+    async function openMoveModal(fileId: string) {
+        setMoveFileId(fileId);
+        // Fetch ALL folders for this project/lead (not just current level)
+        const params = new URLSearchParams();
+        if (projectId) params.set("projectId", projectId);
+        if (leadId) params.set("leadId", leadId);
+        params.set("allFolders", "true");
+        const res = await fetch(`/api/files/folders?${params}`);
+        if (res.ok) {
+            const data = await res.json();
+            setAllFolders(data);
+        }
+    }
+
+    async function handleMoveFile(targetFolderId: string | null) {
+        if (!moveFileId) return;
+        try {
+            const res = await fetch("/api/files", {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ fileId: moveFileId, folderId: targetFolderId }),
+            });
+            if (!res.ok) { const d = await res.json(); toast.error(d.error || "Move failed"); return; }
+            // Remove the file from current view
+            setFiles(prev => prev.filter(f => f.id !== moveFileId));
+            toast.success("File moved");
+        } catch { toast.error("Move failed"); }
+        setMoveFileId(null);
     }
 
     function navigateToFolder(folderId: string | null, folderName: string) {
@@ -327,9 +359,14 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
                                             ) : (
                                                 <span className="text-3xl">{getFileIcon(file.mimeType)}</span>
                                             )}
-                                            <button onClick={() => handleDeleteFile(file.id)} className="absolute top-2 right-2 bg-white/90 rounded-full p-1.5 shadow-sm text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition">
-                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                                            </button>
+                                            <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition">
+                                                <button onClick={() => openMoveModal(file.id)} title="Move to folder" className="bg-white/90 rounded-full p-1.5 shadow-sm text-slate-400 hover:text-indigo-600 transition">
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/><path d="M12 11v6M9 14h6"/></svg>
+                                                </button>
+                                                <button onClick={() => handleDeleteFile(file.id)} title="Delete" className="bg-white/90 rounded-full p-1.5 shadow-sm text-slate-300 hover:text-red-500 transition">
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                                                </button>
+                                            </div>
                                         </div>
                                         <div className="p-3">
                                             <a href={file.url} target="_blank" rel="noreferrer" className="text-xs font-semibold text-hui-textMain hover:text-indigo-600 truncate block transition">{file.name}</a>
@@ -357,6 +394,9 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
                                             <p className="text-[10px] text-slate-400">{formatBytes(file.size)} · {file.uploadedBy?.name || file.uploadedBy?.email || "Unknown"}</p>
                                         </div>
                                         <span className="text-[10px] text-slate-400 shrink-0">{new Date(file.createdAt).toLocaleDateString()}</span>
+                                        <button onClick={() => openMoveModal(file.id)} title="Move" className="text-slate-400 hover:text-indigo-600 opacity-0 group-hover:opacity-100 transition p-1">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/><path d="M12 11v6M9 14h6"/></svg>
+                                        </button>
                                         <button onClick={() => handleDeleteFile(file.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition p-1">
                                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
                                         </button>
@@ -369,6 +409,54 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
             </div>
 
             {/* Image Preview Modal */}
+            {/* Move to Folder Modal */}
+            {moveFileId && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setMoveFileId(null)}>
+                    <div className="bg-white rounded-2xl shadow-2xl w-96 max-h-[60vh] flex flex-col" onClick={e => e.stopPropagation()}>
+                        <div className="p-5 border-b border-slate-200 flex items-center justify-between">
+                            <h3 className="font-bold text-hui-textMain">Move to Folder</h3>
+                            <button onClick={() => setMoveFileId(null)} className="text-slate-400 hover:text-slate-600 transition">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                            </button>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3">
+                            {/* Root option */}
+                            <button
+                                onClick={() => handleMoveFile(null)}
+                                className="w-full flex items-center gap-3 p-3 rounded-xl hover:bg-slate-50 transition text-left"
+                            >
+                                <div className="w-9 h-9 bg-slate-100 rounded-lg flex items-center justify-center">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="1.5"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+                                </div>
+                                <div>
+                                    <p className="text-sm font-medium text-hui-textMain">Root / All Files</p>
+                                    <p className="text-[10px] text-slate-400">No folder</p>
+                                </div>
+                            </button>
+                            {/* Folder list */}
+                            {allFolders.map(folder => (
+                                <button
+                                    key={folder.id}
+                                    onClick={() => handleMoveFile(folder.id)}
+                                    className={`w-full flex items-center gap-3 p-3 rounded-xl hover:bg-amber-50 transition text-left ${folder.id === currentFolder ? "bg-amber-50 ring-1 ring-amber-200" : ""}`}
+                                >
+                                    <div className="w-9 h-9 bg-gradient-to-br from-amber-50 to-orange-50 rounded-lg flex items-center justify-center border border-amber-100/50">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="1.5"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                                    </div>
+                                    <div>
+                                        <p className="text-sm font-medium text-hui-textMain">{folder.name}</p>
+                                        <p className="text-[10px] text-slate-400">{folder._count.files} file{folder._count.files !== 1 ? "s" : ""}</p>
+                                    </div>
+                                </button>
+                            ))}
+                            {allFolders.length === 0 && (
+                                <p className="text-sm text-slate-400 text-center py-6">No folders yet. Create one first!</p>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {previewFile && (
                 <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-8" onClick={() => setPreviewFile(null)}>
                     <div className="relative max-w-4xl max-h-full" onClick={e => e.stopPropagation()}>

@@ -137,6 +137,38 @@ export async function POST(req: NextRequest) {
     }
 }
 
+// PATCH: move file to a different folder (or root)
+export async function PATCH(req: NextRequest) {
+    try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.email) {
+            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        }
+
+        const body = await req.json();
+        const { fileId, folderId, name } = body; // folderId = null means root
+
+        if (!fileId) {
+            return NextResponse.json({ error: "fileId required" }, { status: 400 });
+        }
+
+        const updateData: any = {};
+        if (folderId !== undefined) updateData.folderId = folderId || null;
+        if (name) updateData.name = name;
+
+        const file = await prisma.projectFile.update({
+            where: { id: fileId },
+            data: updateData,
+            include: { uploadedBy: { select: { id: true, name: true, email: true } } },
+        });
+
+        return NextResponse.json(file);
+    } catch (err: any) {
+        console.error("PATCH /api/files error:", err);
+        return NextResponse.json({ error: err.message || "Move failed" }, { status: 500 });
+    }
+}
+
 // DELETE: delete a file or folder
 export async function DELETE(req: NextRequest) {
     try {

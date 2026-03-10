@@ -3,6 +3,33 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
+// GET: list all folders for a project or lead
+export async function GET(req: NextRequest) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(req.url);
+    const projectId = searchParams.get("projectId");
+    const leadId = searchParams.get("leadId");
+
+    if (!projectId && !leadId) {
+        return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
+    }
+
+    const where: any = {};
+    if (projectId) where.projectId = projectId;
+    if (leadId) where.leadId = leadId;
+
+    const folders = await prisma.fileFolder.findMany({
+        where,
+        orderBy: { name: "asc" },
+        include: { _count: { select: { files: true, children: true } } },
+    });
+
+    return NextResponse.json(folders);
+}
 // POST: create a new folder
 export async function POST(req: NextRequest) {
     const session = await getServerSession(authOptions);
