@@ -22,7 +22,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
             {/* Top Navigation */}
             <div className="bg-white border-b border-hui-border px-6 py-4 flex items-center justify-between shadow-sm z-10 sticky top-0">
                 <div className="flex items-center gap-4">
-                    <button onClick={() => router.push(`/projects/${project.id}/invoices`)} className="text-hui-textMuted hover:text-hui-textMain transition text-sm flex items-center gap-1">
+                    <button onClick={() => router.push(`/projects/${project.id}/invoices`)} className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
                         Back to Invoices
                     </button>

@@ -46,7 +46,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
     return (
         <div className="max-w-5xl mx-auto py-8">
             <div className="mb-6">
-                <Link href="/portal" className="text-sm text-blue-600 hover:text-blue-800 transition flex items-center gap-1">
+                <Link href="/portal" className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm w-fit">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                     Back to Dashboard
                 </Link>

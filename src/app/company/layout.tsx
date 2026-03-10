@@ -9,7 +9,6 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
 
     const menuItems = [
         { name: "Team Members", href: "/company/team-members", icon: Users },
-        { name: "Clients", href: "/clients", icon: Building }, // Just links for now
         { name: "Subcontractors", href: "#", icon: Anchor },
         { name: "Vendors", href: "#", icon: FileText },
     ];
@@ -22,7 +21,7 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
                     <h2 className="text-lg font-bold text-hui-textMain mb-6 px-2">Company</h2>
                     <ul className="space-y-1">
                         {menuItems.map((item) => {
-                            const isActive = pathname.startsWith(item.href) && item.href !== "#" && item.href !== "/clients";
+                            const isActive = pathname.startsWith(item.href) && item.href !== "#";
                             const Icon = item.icon;
                             return (
                                 <li key={item.name}>

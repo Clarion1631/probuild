@@ -138,7 +138,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     return (
         <div className="flex flex-col h-full overflow-y-auto bg-hui-background">
             <div className="border-b border-hui-border p-6 bg-white">
-                <Link href="/company/team-members" className="flex items-center text-hui-textMuted hover:text-hui-textMain text-sm font-medium mb-4 transition-colors">
+                <Link href="/company/team-members" className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm w-fit mb-4">
                     <ChevronLeft className="w-4 h-4 mr-1" />
                     Back to Team Members
                 </Link>

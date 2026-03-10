@@ -38,7 +38,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                     {/* Cards for Details */}
                     <div className="grid grid-cols-2 gap-6">
                         <div className="hui-card p-6">
-                            <h3 className="font-semibold text-hui-textMain text-sm mb-4 flex justify-between">Client Details <span className="text-hui-primary font-normal cursor-pointer text-xs">Edit</span></h3>
+                            <h3 className="font-semibold text-hui-textMain text-sm mb-4 flex justify-between items-center">Client Details <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm cursor-pointer">Edit</span></h3>
                             <div className="space-y-3 text-sm">
                                 <div className="flex justify-between"><span className="text-hui-textMuted">Name</span><span className="text-hui-textMain font-medium">{lead.client.name}</span></div>
                                 <div className="flex justify-between"><span className="text-hui-textMuted">Email</span><span className="text-hui-textMain">{lead.client.email || "N/A"}</span></div>
@@ -54,8 +54,8 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                                     </div>
                                 </div>
                                 <div className="flex justify-between mt-3"><span className="text-hui-textMuted">Lead Source</span><span className="text-hui-textMain">{lead.source}</span></div>
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Expected Start Date</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
-                                <div className="flex justify-between"><span className="text-hui-textMuted">Target Revenue</span><span className="text-blue-600 cursor-pointer text-xs">+ Add</span></div>
+                                <div className="flex justify-between items-center"><span className="text-hui-textMuted">Expected Start Date</span><span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-primary bg-indigo-50 border border-indigo-100 rounded-md hover:bg-indigo-100 transition shadow-sm cursor-pointer">+ Add</span></div>
+                                <div className="flex justify-between items-center"><span className="text-hui-textMuted">Target Revenue</span><span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-primary bg-indigo-50 border border-indigo-100 rounded-md hover:bg-indigo-100 transition shadow-sm cursor-pointer">+ Add</span></div>
                             </div>
                         </div>
                     </div>
@@ -89,7 +89,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                                             </p>
                                         </div>
                                         <div className="flex items-center gap-3 opacity-0 group-hover:opacity-100 transition">
-                                            <a href={`/leads/${lead.id}/estimates/${est.id}`} className="text-hui-textMuted hover:text-blue-600 text-sm font-medium transition px-2 py-1">Edit</a>
+                                            <a href={`/leads/${lead.id}/estimates/${est.id}`} className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm">Edit</a>
                                             <form action={async () => {
                                                 "use server";
                                                 await deleteEstimate(est.id);

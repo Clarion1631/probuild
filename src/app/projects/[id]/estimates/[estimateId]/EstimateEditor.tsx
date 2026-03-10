@@ -164,7 +164,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                         } else {
                             router.push(`/leads/${context.id}`);
                         }
-                    }} className="text-hui-textMuted hover:text-hui-textMain transition text-sm flex items-center gap-1">
+                    }} className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm">
                         ← Back to {context.type === "project" ? "Estimates" : "Lead"}
                     </button>
                     <div className="h-4 w-px bg-hui-border"></div>
