@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
-    importEstimateToSchedule, linkTasks, unlinkTasks,
+    importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
     addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
     assignUserToTask, unassignUserFromTask,
@@ -70,6 +70,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [isAiGenerating, setIsAiGenerating] = useState(false);
     const [showAiMenu, setShowAiMenu] = useState(false);
     const [linkMode, setLinkMode] = useState<string | null>(null);
+    const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [editingHoursId, setEditingHoursId] = useState<string | null>(null);
     const [editHoursVal, setEditHoursVal] = useState("");
     // Detail panel state
@@ -369,32 +370,13 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             </div>
                         </div>
                     </div>
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                             {(["day", "week", "month"] as ZoomLevel[]).map(z => (
                                 <button key={z} onClick={() => setZoom(z)} className={`px-3 py-1.5 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>{z}</button>
                             ))}
                         </div>
-                        <div className="w-px h-6 bg-slate-200 mx-1" />
                         <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 300); }} className="hui-btn hui-btn-secondary text-xs py-1.5 px-3">Today</button>
-                        <button onClick={() => setLinkMode(linkMode ? null : "__awaiting__")} className={`text-xs flex items-center gap-1 px-3 py-1.5 rounded-lg font-medium transition border ${linkMode ? "bg-amber-50 text-amber-700 border-amber-300 ring-2 ring-amber-200" : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"}`}>
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                            {linkMode ? "Linking..." : "Link"}
-                        </button>
-                        {estimates.length > 0 && (
-                            <div className="relative">
-                                <button onClick={() => setShowImportMenu(!showImportMenu)} disabled={isImporting} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
-                                    {isImporting ? "Importing..." : "Import"}
-                                </button>
-                                {showImportMenu && (
-                                    <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
-                                        {estimates.map(est => (
-                                            <button key={est.id} onClick={() => handleImportEstimate(est.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm">{est.title}</button>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        )}
                         <div className="relative">
                             <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
                                 className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiGenerating ? "bg-gradient-to-r from-purple-500 to-indigo-500 text-white border-purple-600 animate-pulse" : "bg-gradient-to-r from-purple-50 to-indigo-50 text-purple-700 border-purple-200 hover:shadow-md hover:from-purple-100 hover:to-indigo-100"}`}>
@@ -410,6 +392,35 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             )}
                         </div>
                         <button onClick={handleAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Add Task</button>
+                        {/* More menu */}
+                        <div className="relative">
+                            <button onClick={() => setShowMoreMenu(!showMoreMenu)} className="hui-btn hui-btn-secondary text-xs py-1.5 px-2">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+                            </button>
+                            {showMoreMenu && (
+                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[200px] py-1 animate-in fade-in">
+                                    <button onClick={() => { setLinkMode(linkMode ? null : "__awaiting__"); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                                        {linkMode ? "Cancel Linking" : "Link Tasks"}
+                                    </button>
+                                    {estimates.length > 0 && (
+                                        <>
+                                            <div className="border-t border-slate-100 my-1" />
+                                            <div className="px-3 py-1 text-[10px] text-slate-400 uppercase font-semibold">Import from Estimate</div>
+                                            {estimates.map(est => (
+                                                <button key={est.id} onClick={() => { handleImportEstimate(est.id); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
+                                                    📋 {est.title}
+                                                </button>
+                                            ))}
+                                        </>
+                                    )}
+                                    <div className="border-t border-slate-100 my-1" />
+                                    <button onClick={async () => { if (confirm('Delete ALL tasks from this schedule? This cannot be undone.')) { setShowMoreMenu(false); await clearAllTasks(projectId); setTasks([]); setSelectedTaskId(null); toast.success('Schedule cleared'); } }} className="w-full text-left px-3 py-2 hover:bg-red-50 transition text-sm flex items-center gap-2 text-red-600">
+                                        🗑️ Clear All Tasks
+                                    </button>
+                                </div>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>

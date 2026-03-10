@@ -1412,3 +1412,15 @@ export async function getTeamMembers() {
         select: { id: true, name: true, email: true, role: true },
     });
 }
+
+export async function clearAllTasks(projectId: string) {
+    // Delete all related data first (dependencies, comments, punch items, assignments)
+    const taskIds = (await prisma.scheduleTask.findMany({ where: { projectId }, select: { id: true } })).map(t => t.id);
+    if (taskIds.length === 0) return;
+    await prisma.taskAssignment.deleteMany({ where: { taskId: { in: taskIds } } });
+    await prisma.taskComment.deleteMany({ where: { taskId: { in: taskIds } } });
+    await prisma.taskPunchItem.deleteMany({ where: { taskId: { in: taskIds } } });
+    await prisma.taskDependency.deleteMany({ where: { OR: [{ predecessorId: { in: taskIds } }, { dependentId: { in: taskIds } }] } });
+    await prisma.scheduleTask.deleteMany({ where: { projectId } });
+    revalidatePath(`/projects/${projectId}/schedule`);
+}

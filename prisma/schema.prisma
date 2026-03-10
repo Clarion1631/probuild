@@ -19,6 +19,7 @@ model User {
   assignedProjects Project[] @relation("CrewAssignments")
   taskAssignments  TaskAssignment[]
   taskComments     TaskComment[]
+  uploadedFiles    ProjectFile[]
 }
 
 model Client {
@@ -60,6 +61,8 @@ model Lead {
   estimates         Estimate[]
   floorPlans        FloorPlan[]
   contracts         Contract[]
+  files             ProjectFile[]
+  folders           FileFolder[]
 }
 
 model Project {
@@ -83,6 +86,8 @@ model Project {
   contracts   Contract[]
   crew        User[]      @relation("CrewAssignments")
   scheduleTasks ScheduleTask[]
+  files         ProjectFile[]
+  folders       FileFolder[]
 }
 
 model FloorPlan {
@@ -439,4 +444,36 @@ model TaskAssignment {
   createdAt      DateTime     @default(now())
 
   @@unique([taskId, userId])
+}
+
+model FileFolder {
+  id          String        @id @default(cuid())
+  name        String
+  projectId   String?
+  project     Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId      String?
+  lead        Lead?         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  parentId    String?
+  parent      FileFolder?   @relation("FolderHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children    FileFolder[]  @relation("FolderHierarchy")
+  files       ProjectFile[]
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+}
+
+model ProjectFile {
+  id          String      @id @default(cuid())
+  name        String
+  url         String
+  size        Int         @default(0)
+  mimeType    String      @default("application/octet-stream")
+  projectId   String?
+  project     Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId      String?
+  lead        Lead?       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  folderId    String?
+  folder      FileFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  uploadedById String?
+  uploadedBy   User?      @relation(fields: [uploadedById], references: [id])
+  createdAt   DateTime    @default(now())
 }
