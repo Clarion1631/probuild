@@ -235,7 +235,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                 </div>
                                 {/* Drop zone container with soft outline */}
                                 <div 
-                                    className="flex flex-col gap-2 p-2 rounded-xl bg-slate-50 border border-slate-200/70 min-h-[120px] transition-colors"
+                                    className="flex flex-col gap-2 p-2 rounded-xl bg-[#eef0f4] border border-slate-200/60 min-h-[100px] transition-colors"
                                     onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add("bg-blue-50", "border-blue-200"); }}
                                     onDragLeave={(e) => { e.currentTarget.classList.remove("bg-blue-50", "border-blue-200"); }}
                                     onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove("bg-blue-50", "border-blue-200"); handleDrop(e, s.value); }}
@@ -283,9 +283,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                             </div>
                                         </div>
                                     ))}
-                                    {colProjects.length === 0 && (
-                                        <div className="text-center text-[12px] text-slate-400 py-6">Drop projects here</div>
-                                    )}
+
                                 </div>
                             </div>
                         );

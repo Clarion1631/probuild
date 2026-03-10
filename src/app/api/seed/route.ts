@@ -81,6 +81,79 @@ export async function GET(req: Request) {
             }
         });
 
+        // Additional clients for seeded projects
+        const client4 = await prisma.client.create({
+            data: { name: 'Ruth Parkin', initials: 'RP', email: 'ruth@example.com' }
+        });
+        const client5 = await prisma.client.create({
+            data: { name: 'David Howard', initials: 'DH', email: 'david.howard@example.com' }
+        });
+        const client6 = await prisma.client.create({
+            data: { name: 'Karen Anspach', initials: 'KA', email: 'karen.a@example.com' }
+        });
+        const client7 = await prisma.client.create({
+            data: { name: 'Tricia Atherton', initials: 'TA', email: 'tricia@example.com' }
+        });
+        const client8 = await prisma.client.create({
+            data: { name: 'Dan OHaver', initials: 'DO', email: 'dan.ohaver@example.com' }
+        });
+
+        // 5 additional projects in various statuses
+        await prisma.project.create({
+            data: {
+                name: 'Parkin Laundry Room',
+                clientId: client4.id,
+                location: 'Vancouver, Washington',
+                status: 'Open',
+                type: 'Laundry Room',
+                code: '#1003'
+            }
+        });
+
+        await prisma.project.create({
+            data: {
+                name: 'Howard/Salzer Bathroom',
+                clientId: client5.id,
+                location: 'Vancouver, Washington',
+                status: 'In Progress',
+                type: 'Bathroom Remodeling',
+                code: '#1004'
+            }
+        });
+
+        await prisma.project.create({
+            data: {
+                name: 'Anspach Bedroom',
+                clientId: client6.id,
+                location: 'Vancouver, Washington',
+                status: 'Done',
+                type: 'Bedroom Remodel',
+                code: '#1005'
+            }
+        });
+
+        await prisma.project.create({
+            data: {
+                name: 'Atherton Kitchen',
+                clientId: client7.id,
+                location: 'Vancouver, Washington',
+                status: 'Paid, Ready to Start',
+                type: 'Kitchen Remodel',
+                code: '#1006'
+            }
+        });
+
+        await prisma.project.create({
+            data: {
+                name: 'OHaver Garage Conversion',
+                clientId: client8.id,
+                location: 'Portland, Oregon',
+                status: 'Open',
+                type: 'Garage Conversion',
+                code: '#1007'
+            }
+        });
+
         // Create Estimate connected to Lead
         await prisma.estimate.create({
             data: {
