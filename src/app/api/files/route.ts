@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { supabase, STORAGE_BUCKET } from "@/lib/supabase";
+import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
 // Allow larger uploads (50MB)
 export const maxDuration = 60;
@@ -54,12 +54,11 @@ export async function POST(req: NextRequest) {
     try {
         const session = await getServerSession(authOptions);
         if (!session?.user?.email) {
-            console.error("Upload auth failed - no session:", JSON.stringify(session));
             return NextResponse.json({ error: "Not signed in. Please sign in and try again." }, { status: 401 });
         }
 
+        const supabase = getSupabase();
         if (!supabase) {
-            console.error("Supabase not configured:", { url: process.env.SUPABASE_URL, hasKey: !!process.env.SUPABASE_SERVICE_KEY });
             return NextResponse.json({ error: "Storage not configured. Contact admin to set SUPABASE_URL and SUPABASE_SERVICE_KEY." }, { status: 500 });
         }
 
@@ -152,6 +151,7 @@ export async function DELETE(req: NextRequest) {
 
         if (fileId) {
             const file = await prisma.projectFile.findUnique({ where: { id: fileId } });
+            const supabase = getSupabase();
             if (file && supabase) {
                 const url = file.url;
                 const bucketPrefix = `/storage/v1/object/public/${STORAGE_BUCKET}/`;

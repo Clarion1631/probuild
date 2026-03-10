@@ -1,23 +1,26 @@
-import { createClient } from "@supabase/supabase-js";
-
-// Extract Supabase project URL from the DATABASE_URL
-// Format: postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
-function getSupabaseConfig() {
-    const dbUrl = process.env.DATABASE_URL || "";
-    // Extract the project ref from the user part: postgres.PROJECT_REF
-    const match = dbUrl.match(/postgres\.([^:]+):/);
-    const projectRef = match?.[1] || "";
-
-    const supabaseUrl = process.env.SUPABASE_URL || `https://${projectRef}.supabase.co`;
-    const supabaseKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || "";
-
-    return { supabaseUrl, supabaseKey };
-}
-
-const { supabaseUrl, supabaseKey } = getSupabaseConfig();
-
-export const supabase = supabaseKey
-    ? createClient(supabaseUrl, supabaseKey)
-    : null;
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 export const STORAGE_BUCKET = "project-files";
+
+// Lazy-initialize Supabase client so env vars are read at runtime, not build time
+let _supabase: SupabaseClient | null = null;
+let _initialized = false;
+
+export function getSupabase(): SupabaseClient | null {
+    if (_initialized) return _supabase;
+    _initialized = true;
+
+    const supabaseUrl = process.env.SUPABASE_URL || "";
+    const supabaseKey = process.env.SUPABASE_SERVICE_KEY || "";
+
+    console.log("[Supabase] Init:", { hasUrl: !!supabaseUrl, hasKey: !!supabaseKey, urlPrefix: supabaseUrl.substring(0, 30) });
+
+    if (supabaseUrl && supabaseKey) {
+        _supabase = createClient(supabaseUrl, supabaseKey);
+    }
+
+    return _supabase;
+}
+
+// Backward compat alias
+export const supabase = null as SupabaseClient | null; // not used anymore - use getSupabase()
