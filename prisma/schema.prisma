@@ -302,7 +302,7 @@ model Contract {
   
   estimates   Estimate[]
   
-  // Signing fields
+  // Signing fields (current/latest)
   approvedBy        String?
   approvedAt        DateTime?
   approvalIp        String?
@@ -313,8 +313,32 @@ model Contract {
   sentAt      DateTime?
   viewedAt    DateTime?
   
+  // Recurring (e.g. lien release every 30 days)
+  recurringDays     Int?       // null = one-time, 30 = every 30 days
+  nextDueDate       DateTime?  // When the next signing is due
+  signingRecords    ContractSigningRecord[]
+  
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+}
+
+model ContractSigningRecord {
+  id              String   @id @default(cuid())
+  contractId      String
+  contract        Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  
+  signedBy        String       // Full legal name
+  signedAt        DateTime     @default(now())
+  signatureUrl    String?      // PNG data URL of drawn signature
+  ipAddress       String?
+  userAgent       String?
+  
+  periodStart     DateTime?    // Start of the period this release covers
+  periodEnd       DateTime?    // End of the period this release covers
+  
+  notes           String?      // Optional notes (e.g. payment amount)
+  
+  createdAt       DateTime @default(now())
 }
 
 model CompanySettings {
