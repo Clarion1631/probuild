@@ -857,7 +857,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
                 <h2 style="font-size: 20px; margin: 0 0 8px;">New Estimate for You</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
                 <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you an estimate for review and approval. 
+                    ${companyName} has sent you an estimate for review and approval.
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
                 </p>
                 <div style="text-align: center; margin: 32px 0;">
@@ -873,7 +873,9 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
                 Sent via ProBuild • ${companyName}
             </p>
         </body>
-        </html>`
+        </html>`,
+        undefined,
+        { fromName: companyName, replyTo: settings?.email || undefined }
     );
 
     // Revalidate paths
