@@ -7,7 +7,8 @@ export async function sendNotification(
     toEmail: string,
     subject: string,
     htmlContent: string,
-    attachments?: { filename: string, content: Buffer }[]
+    attachments?: { filename: string, content: Buffer }[],
+    options?: { fromName?: string; replyTo?: string }
 ) {
     if (!toEmail) {
         console.log("No notification email configured. Skipping email dispatch.");
@@ -27,12 +28,23 @@ export async function sendNotification(
         return;
     }
 
+    // Strip HTML tags for plain text version (improves deliverability)
+    const textContent = htmlContent
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const displayName = options?.fromName || 'Golden Touch Remodeling';
+
     try {
         const data = await resend.emails.send({
-            from: 'Golden Touch Remodeling <notifications@goldentouchremodeling.com>',
+            from: `${displayName} <notifications@goldentouchremodeling.com>`,
             to: [toEmail],
+            replyTo: options?.replyTo || 'jadkins@goldentouchremodeling.com',
             subject: subject,
             html: htmlContent,
+            text: textContent,
             attachments: attachments
         });
         console.log("Email dispatched via Resend:", data);
