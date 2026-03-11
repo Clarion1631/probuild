@@ -142,13 +142,35 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
 
             const data = await res.json();
             if (data.items && data.items.length > 0) {
-                setItems(prev => [...prev, ...data.items]);
+                const newItems = [...items, ...data.items];
+                const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
+                    ? [...paymentSchedules, ...data.paymentMilestones]
+                    : paymentSchedules;
+                setItems(newItems);
                 if (data.paymentMilestones && data.paymentMilestones.length > 0) {
-                    setPaymentSchedules(prev => [...prev, ...data.paymentMilestones]);
+                    setPaymentSchedules(newSchedules);
                 }
                 toast.success(`AI generated ${data.count} items (est. $${data.totalEstimate?.toLocaleString()})`);
                 setShowAiModal(false);
                 setAiPrompt("");
+
+                // Auto-save with the newly merged items
+                const mappedItems = newItems.map((item, index) => ({
+                    ...item,
+                    order: index,
+                    total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
+                }));
+                const mappedSchedules = newSchedules.map((schedule, index) => ({
+                    ...schedule,
+                    order: index
+                }));
+                const newSubtotal = newItems.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+                const newTotal = newSubtotal + newSubtotal * 0.087;
+                await saveEstimate(initialEstimate.id, context.id, context.type, {
+                    title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
+                }, mappedItems);
+                toast.success("Estimate auto-saved");
+                router.refresh();
             } else {
                 toast.error('AI returned no items');
             }
@@ -587,7 +609,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     </div>
                 )}
                 {activeTab === "expenses" && (
-                    <div className="w-full max-w-5xl bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
+                    <div className="w-full max-w-5xl bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-visible relative">
                         <div className="h-1.5 w-full bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500"></div>
                         <ExpensesTab estimateId={initialEstimate.id} projectId={context.type === "project" ? context.id : ""} items={items} />
                     </div>

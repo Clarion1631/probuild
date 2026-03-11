@@ -801,7 +801,7 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string) {
+export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -813,7 +813,8 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     if (!estimate) throw new Error("Estimate not found");
 
     const client = estimate.project?.client || estimate.lead?.client;
-    if (!client?.email) throw new Error("Client has no email address");
+    const recipientEmail = overrideEmail || client?.email;
+    if (!recipientEmail) throw new Error("No email address provided");
 
     // Snapshot T&C if a template is selected
     let termsHtml: string | null = null;
@@ -844,7 +845,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const companyName = settings?.companyName || "Your Contractor";
 
     await sendNotification(
-        client.email,
+        recipientEmail,
         `${companyName} sent you an estimate`,
         `<!DOCTYPE html>
         <html>
@@ -854,7 +855,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             </div>
             <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
                 <h2 style="font-size: 20px; margin: 0 0 8px;">New Estimate for You</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you an estimate for review and approval. 
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
@@ -880,7 +881,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
     revalidatePath("/projects/all/estimates");
 
-    return { success: true, sentTo: client.email };
+    return { success: true, sentTo: recipientEmail };
 }
 
 // ────────────────────────────────────────────────

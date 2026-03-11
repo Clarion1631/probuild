@@ -11,6 +11,7 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
     const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
     const [isSending, setIsSending] = useState(false);
     const [previewBody, setPreviewBody] = useState("");
+    const [sendToEmail, setSendToEmail] = useState(clientEmail || "");
 
     useEffect(() => {
         getDocumentTemplates().then((data: any[]) => {
@@ -30,13 +31,13 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
     }, [selectedTemplateId, templates]);
 
     async function handleSend() {
-        if (!clientEmail) {
-            toast.error("This client has no email address. Please add one first.");
+        if (!sendToEmail.trim()) {
+            toast.error("Please enter an email address.");
             return;
         }
         setIsSending(true);
         try {
-            const result = await sendEstimateToClient(estimateId, selectedTemplateId || undefined);
+            const result = await sendEstimateToClient(estimateId, selectedTemplateId || undefined, sendToEmail.trim());
             toast.success(`Estimate sent to ${result.sentTo}`);
             onClose();
         } catch (e: any) {
@@ -64,12 +65,15 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                     <div>
                         <label className="block text-sm font-medium text-hui-textMain mb-1">Sending To</label>
                         <div className="flex items-center gap-2 bg-slate-50 px-4 py-3 rounded-lg border border-hui-border">
-                            <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
-                            <span className="text-sm font-medium text-hui-textMain">{clientEmail || "No email on file"}</span>
+                            <svg className="w-4 h-4 text-slate-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
+                            <input
+                                type="email"
+                                value={sendToEmail}
+                                onChange={e => setSendToEmail(e.target.value)}
+                                placeholder="client@email.com"
+                                className="flex-1 text-sm font-medium text-hui-textMain bg-transparent focus:outline-none"
+                            />
                         </div>
-                        {!clientEmail && (
-                            <p className="text-xs text-red-500 mt-1">Please add an email address to the client before sending.</p>
-                        )}
                     </div>
 
                     {/* Template Picker */}
@@ -101,7 +105,7 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
 
                 <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 shrink-0 bg-slate-50">
                     <button onClick={onClose} className="hui-btn hui-btn-secondary" disabled={isSending}>Cancel</button>
-                    <button onClick={handleSend} disabled={isSending || !clientEmail} className="hui-btn hui-btn-green flex items-center gap-2">
+                    <button onClick={handleSend} disabled={isSending || !sendToEmail.trim()} className="hui-btn hui-btn-green flex items-center gap-2">
                         {isSending ? (
                             <>
                                 <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
