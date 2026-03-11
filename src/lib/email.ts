@@ -29,7 +29,7 @@ export async function sendNotification(
 
     try {
         const data = await resend.emails.send({
-            from: 'ProBuild Notifications <onboarding@resend.dev>',
+            from: 'Golden Touch Remodeling <notifications@goldentouchremodeling.com>',
             to: [toEmail],
             subject: subject,
             html: htmlContent,
