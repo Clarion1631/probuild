@@ -24,6 +24,7 @@ model User {
   uploadedFiles    ProjectFile[]
   permissions      UserPermission?
   projectAccess    ProjectAccess[]
+  leadTasks        LeadTask[]
 }
 
 model Client {
@@ -67,7 +68,41 @@ model Lead {
   contracts         Contract[]
   files             ProjectFile[]
   folders           FileFolder[]
+  tasks             LeadTask[]
+  meetings          LeadMeeting[]
+  takeoffs          Takeoff[]
   project           Project?  // reverse relation: the project created from this lead
+}
+
+model LeadTask {
+  id          String    @id @default(cuid())
+  leadId      String
+  lead        Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  title       String
+  status      String    @default("To Do")    // To Do, In Progress, Done
+  dueDate     DateTime?
+  tags        String?                         // Comma-separated tag strings
+  assigneeId  String?
+  assignee    User?     @relation(fields: [assigneeId], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model LeadMeeting {
+  id            String    @id @default(cuid())
+  leadId        String
+  lead          Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  title         String
+  meetingType   String    @default("Video Call") // Phone Call, Onsite Visit, Video Call
+  duration      Int       @default(60)           // minutes
+  scheduledAt   DateTime
+  endAt         DateTime
+  location      String?                          // for Onsite Visit
+  videoApp      String?                          // e.g. "Google Meet"
+  description   String?
+  status        String    @default("Scheduled")  // Scheduled, Completed, Cancelled
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 }
 
 model Project {
@@ -97,6 +132,7 @@ model Project {
   files         ProjectFile[]
   folders       FileFolder[]
   userAccess    ProjectAccess[]
+  takeoffs      Takeoff[]
 }
 
 model FloorPlan {
@@ -132,6 +168,7 @@ model Estimate {
   expenses    Expense[]
   paymentSchedules EstimatePaymentSchedule[]
   budget      Budget?
+  takeoff     Takeoff?
 
   // Phase 7: Contracts & Approvals
   approvedBy  String?
@@ -565,4 +602,40 @@ model ProjectAccess {
   createdAt DateTime @default(now())
   
   @@unique([userId, projectId])
+}
+
+model Takeoff {
+  id              String        @id @default(cuid())
+  name            String
+  description     String?
+  status          String        @default("Draft") // Draft, In Progress, Completed
+
+  // Flexible Relation: Can belong to a Project OR a Lead
+  projectId       String?
+  project         Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId          String?
+  lead            Lead?         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  // AI-generated estimate data (JSON string)
+  aiEstimateData  String?
+
+  // Link to an actual Estimate if one was created from this takeoff
+  estimateId      String?       @unique
+  estimate        Estimate?     @relation(fields: [estimateId], references: [id])
+
+  files           TakeoffFile[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+model TakeoffFile {
+  id          String   @id @default(cuid())
+  takeoffId   String
+  takeoff     Takeoff  @relation(fields: [takeoffId], references: [id], onDelete: Cascade)
+  name        String
+  url         String
+  mimeType    String   @default("application/octet-stream")
+  size        Int      @default(0)
+  createdAt   DateTime @default(now())
 }

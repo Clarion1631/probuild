@@ -111,6 +111,153 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
     return lead;
 }
 
+// =============================================
+// Lead Tasks CRUD
+// =============================================
+
+export async function getLeadTasks(leadId: string) {
+    return await prisma.leadTask.findMany({
+        where: { leadId },
+        orderBy: { createdAt: "desc" },
+        include: { assignee: { select: { id: true, name: true, email: true } } },
+    });
+}
+
+export async function createLeadTask(leadId: string, data: {
+    title: string;
+    status?: string;
+    dueDate?: string | null;
+    tags?: string | null;
+    assigneeId?: string | null;
+}) {
+    const task = await prisma.leadTask.create({
+        data: {
+            leadId,
+            title: data.title,
+            status: data.status || "To Do",
+            dueDate: data.dueDate ? new Date(data.dueDate) : null,
+            tags: data.tags || null,
+            assigneeId: data.assigneeId || null,
+        },
+    });
+    revalidatePath(`/leads/${leadId}/tasks`);
+    return task;
+}
+
+export async function updateLeadTask(taskId: string, data: {
+    title?: string;
+    status?: string;
+    dueDate?: string | null;
+    tags?: string | null;
+    assigneeId?: string | null;
+}) {
+    const updateData: any = {};
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.status !== undefined) updateData.status = data.status;
+    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? new Date(data.dueDate) : null;
+    if (data.tags !== undefined) updateData.tags = data.tags;
+    if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId || null;
+
+    const task = await prisma.leadTask.update({
+        where: { id: taskId },
+        data: updateData,
+    });
+    revalidatePath(`/leads/${task.leadId}/tasks`);
+    return task;
+}
+
+export async function deleteLeadTask(taskId: string) {
+    const task = await prisma.leadTask.findUnique({ where: { id: taskId } });
+    if (!task) return { success: false };
+    await prisma.leadTask.delete({ where: { id: taskId } });
+    revalidatePath(`/leads/${task.leadId}/tasks`);
+    return { success: true };
+}
+
+// =============================================
+// Lead Meetings CRUD
+// =============================================
+
+export async function getLeadMeetings(leadId: string) {
+    return await prisma.leadMeeting.findMany({
+        where: { leadId },
+        orderBy: { scheduledAt: "asc" },
+    });
+}
+
+export async function createLeadMeeting(leadId: string, data: {
+    title: string;
+    meetingType: string;
+    duration: number;
+    scheduledAt: string;
+    location?: string | null;
+    videoApp?: string | null;
+    description?: string | null;
+}) {
+    const startDate = new Date(data.scheduledAt);
+    const endDate = new Date(startDate.getTime() + data.duration * 60000);
+
+    const meeting = await prisma.leadMeeting.create({
+        data: {
+            leadId,
+            title: data.title,
+            meetingType: data.meetingType,
+            duration: data.duration,
+            scheduledAt: startDate,
+            endAt: endDate,
+            location: data.location || null,
+            videoApp: data.videoApp || null,
+            description: data.description || null,
+        },
+    });
+    revalidatePath(`/leads/${leadId}`);
+    revalidatePath(`/leads/${leadId}/meetings`);
+    return meeting;
+}
+
+export async function updateLeadMeeting(meetingId: string, data: {
+    title?: string;
+    meetingType?: string;
+    duration?: number;
+    scheduledAt?: string;
+    location?: string | null;
+    videoApp?: string | null;
+    description?: string | null;
+    status?: string;
+}) {
+    const updateData: any = {};
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.meetingType !== undefined) updateData.meetingType = data.meetingType;
+    if (data.duration !== undefined) updateData.duration = data.duration;
+    if (data.location !== undefined) updateData.location = data.location;
+    if (data.videoApp !== undefined) updateData.videoApp = data.videoApp;
+    if (data.description !== undefined) updateData.description = data.description;
+    if (data.status !== undefined) updateData.status = data.status;
+    if (data.scheduledAt !== undefined) {
+        updateData.scheduledAt = new Date(data.scheduledAt);
+        if (data.duration !== undefined) {
+            updateData.endAt = new Date(updateData.scheduledAt.getTime() + data.duration * 60000);
+        }
+    }
+
+    const meeting = await prisma.leadMeeting.update({
+        where: { id: meetingId },
+        data: updateData,
+    });
+    revalidatePath(`/leads/${meeting.leadId}`);
+    revalidatePath(`/leads/${meeting.leadId}/meetings`);
+    return meeting;
+}
+
+export async function deleteLeadMeeting(meetingId: string) {
+    const meeting = await prisma.leadMeeting.findUnique({ where: { id: meetingId } });
+    if (!meeting) return { success: false };
+    await prisma.leadMeeting.delete({ where: { id: meetingId } });
+    revalidatePath(`/leads/${meeting.leadId}`);
+    revalidatePath(`/leads/${meeting.leadId}/meetings`);
+    return { success: true };
+}
+
 export async function getProjects() {
     const projects = await prisma.project.findMany({
         orderBy: { viewedAt: "desc" },

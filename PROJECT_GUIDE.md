@@ -134,12 +134,12 @@ Metric summary cards at top → data table below.
 - [x] Projects Hub (Project list, deep dive dashboard)
 - [ ] Estimates (Project-scoped, line-item calculator, builder)
 - [ ] Invoices (Project-scoped, generation from estimates, payment tracking)
+- [x] Takeoffs (AI-powered estimate generation from plans, file upload, project & lead scoped)
 
 ### Planned Features — NOT STARTED (Phase 3 Addons)
 - [ ] Clients management (CRUD + modal)
 - [ ] Time & Expenses (tabbed layout, logging table)
 - [ ] Contracts
-- [ ] Takeoffs
 - [ ] 3D Floor Plans
 - [ ] Mood Boards / Selection Boards
 - [ ] Task Center / Punchlist
