@@ -10,7 +10,14 @@ Clone the core experience of **Houzz Pro** as a clean, normalized SaaS applicati
 
 ---
 
-## 2. Design System: HUI
+## 2. AI Conventions
+
+> **Always use `gemini-3-flash-preview`** for all AI features (estimates, takeoff analysis, etc.).
+> Do NOT use gemini-2.0-flash, gemini-1.5-flash, or any other model variant.
+
+---
+
+## 3. Design System: HUI
 
 All UI must use the standardized HUI (Houzz UI) design tokens defined in `globals.css` and `tailwind.config.js`. **Do not use ad-hoc inline Tailwind classes** for buttons, inputs, cards, or text colors when a standard class exists.
 

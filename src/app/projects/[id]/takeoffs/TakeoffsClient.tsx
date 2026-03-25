@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 interface TakeoffFile {
@@ -31,11 +32,13 @@ interface TakeoffsClientProps {
 }
 
 export default function TakeoffsClient({ contextType, contextId, contextName }: TakeoffsClientProps) {
+    const router = useRouter();
     const [takeoffs, setTakeoffs] = useState<Takeoff[]>([]);
     const [loading, setLoading] = useState(true);
     const [showCreateModal, setShowCreateModal] = useState(false);
     const [selectedTakeoff, setSelectedTakeoff] = useState<Takeoff | null>(null);
     const [activeTab, setActiveTab] = useState<"plans" | "estimate">("plans");
+    const [converting, setConverting] = useState(false);
 
     // Create modal state
     const [createName, setCreateName] = useState("");
@@ -172,6 +175,29 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
             toast.error(err.message || "Failed to generate estimate");
         } finally {
             setAiLoading(false);
+        }
+    };
+
+    const handleConvertToEstimate = async () => {
+        if (!selectedTakeoff) return;
+        setConverting(true);
+        try {
+            const res = await fetch("/api/takeoffs/convert-to-estimate", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ takeoffId: selectedTakeoff.id }),
+            });
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.error || "Failed to convert");
+            }
+            const result = await res.json();
+            toast.success(`Estimate ${result.code} created with ${result.itemCount} line items!`);
+            router.push(result.redirectUrl);
+        } catch (err: any) {
+            toast.error(err.message || "Failed to convert to estimate");
+        } finally {
+            setConverting(false);
         }
     };
 
@@ -503,15 +529,49 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                         </div>
                                     )}
 
-                                    {/* Estimate Total */}
+                                    {/* Estimate Total + Convert Button */}
                                     <div className="flex items-center justify-between bg-slate-900 rounded-xl px-6 py-4 text-white">
                                         <div>
                                             <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Total Estimate</p>
                                             <p className="text-3xl font-bold">${(parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                                         </div>
-                                        <div className="text-right">
-                                            <p className="text-xs text-slate-400">{parsedAiData.items?.length || 0} line items</p>
-                                            <p className="text-xs text-slate-400">{parsedAiData.paymentMilestones?.length || 0} milestones</p>
+                                        <div className="flex items-center gap-4">
+                                            <div className="text-right">
+                                                <p className="text-xs text-slate-400">{parsedAiData.items?.length || 0} line items</p>
+                                                <p className="text-xs text-slate-400">{parsedAiData.paymentMilestones?.length || 0} milestones</p>
+                                            </div>
+                                            {selectedTakeoff?.estimateId ? (
+                                                <button
+                                                    onClick={() => {
+                                                        const url = contextType === "project"
+                                                            ? `/projects/${contextId}/estimates/${selectedTakeoff.estimateId}`
+                                                            : `/leads/${contextId}/estimates/${selectedTakeoff.estimateId}`;
+                                                        router.push(url);
+                                                    }}
+                                                    className="px-5 py-2.5 bg-white text-slate-900 rounded-lg font-bold text-sm hover:bg-slate-100 transition flex items-center gap-2 shadow-lg"
+                                                >
+                                                    <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15,3 21,3 21,9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                                    View Estimate
+                                                </button>
+                                            ) : (
+                                                <button
+                                                    onClick={handleConvertToEstimate}
+                                                    disabled={converting}
+                                                    className="px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-green-500 hover:from-emerald-600 hover:to-green-600 text-white rounded-lg font-bold text-sm transition flex items-center gap-2 shadow-lg disabled:opacity-50"
+                                                >
+                                                    {converting ? (
+                                                        <>
+                                                            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                                            Converting...
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9,15 12,12 15,15"/></svg>
+                                                            Convert to Estimate →
+                                                        </>
+                                                    )}
+                                                </button>
+                                            )}
                                         </div>
                                     </div>
 
@@ -584,14 +644,23 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                         </div>
                                     )}
 
-                                    {/* Re-generate */}
-                                    <div className="text-center py-4">
+                                    {/* Actions */}
+                                    <div className="flex items-center justify-center gap-6 py-4">
                                         <button
                                             onClick={() => { setActiveTab("plans"); }}
                                             className="text-sm text-indigo-600 hover:text-indigo-800 font-medium transition"
                                         >
                                             ← Back to Plans to Refine & Re-generate
                                         </button>
+                                        {!selectedTakeoff?.estimateId && (
+                                            <button
+                                                onClick={handleConvertToEstimate}
+                                                disabled={converting}
+                                                className="px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-green-500 hover:from-emerald-600 hover:to-green-600 text-white rounded-lg font-bold text-sm transition flex items-center gap-2 shadow disabled:opacity-50"
+                                            >
+                                                {converting ? "Converting..." : "✅ Convert to Estimate & Open Editor →"}
+                                            </button>
+                                        )}
                                     </div>
                                 </div>
                             ) : (
