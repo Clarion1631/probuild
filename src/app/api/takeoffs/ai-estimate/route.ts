@@ -114,7 +114,15 @@ export async function POST(req: NextRequest) {
         }
     }
 
-    const textPrompt = `You are an expert residential remodeling estimator and takeoff specialist in the Pacific Northwest (Vancouver, WA / Portland, OR metro area). You are analyzing construction/architect plans to generate a detailed, accurate estimate.
+    const textPrompt = `You are an expert residential remodeling estimator and takeoff specialist based in Clark County, Washington (Vancouver, WA metro area). You work for Golden Touch Remodeling. You are analyzing construction/architect plans to generate a detailed, accurate estimate.
+
+IMPORTANT LOCATION CONTEXT:
+- Clark County, WA is in the Portland-Vancouver metropolitan area
+- Washington State has NO income tax, but higher property taxes and WA sales tax (8.4% in Clark County)
+- Labor rates in Clark County tend to be 5-10% higher than national averages due to cost of living and no income tax
+- Material costs reflect Pacific Northwest pricing (lumber is local/competitive, but specialty items may cost more due to shipping)
+- Permits are handled by Clark County Community Development — building permits typically run $800-4,000 for remodels
+- If a zip code is provided, use it to fine-tune pricing for that specific neighborhood
 
 PROJECT: "${resolvedProjectName}"
 TYPE: ${resolvedProjectType}
@@ -147,24 +155,25 @@ CRITICAL INSTRUCTIONS:
 - Generate 15-40 detailed line items organized by construction phase
 - For each phase, create separate line items for each cost type (Labor, Material, Sub, etc.)
 - Include realistic quantities WITH UNITS derived from the plans (e.g., "240 sq ft", "14 linear ft of cabinets", "80 linear ft baseboard")
-- Use accurate Pacific Northwest market rates (2024-2025 pricing)
+- Use accurate CLARK COUNTY, WA market rates (2024-2025 pricing) — adjust for local cost of living
 - Include ALLOWANCE items for customer selections (lighting fixtures, plumbing fixtures, tile, countertop material, appliances)
 
-PRICING REFERENCE:
-  * General labor: $45-65/hr
-  * Skilled carpenter: $55-80/hr
-  * Electrician sub: $85-120/hr  
-  * Plumber sub: $90-130/hr
-  * HVAC sub: $95-140/hr
-  * Demolition: $1,500-4,000 per room
-  * Drywall: $2.50-4.00/sq ft (material + labor)
-  * Paint: $3.50-5.50/sq ft
-  * Tile: $12-25/sq ft installed
-  * Hardwood flooring: $8-15/sq ft installed
-  * LVP flooring: $5-9/sq ft installed
-  * Cabinets (mid-range): $250-450/linear ft
-  * Granite/quartz countertops: $55-100/sq ft
-  * Permits: $500-3,000 depending on scope
+CLARK COUNTY, WA PRICING REFERENCE (2024-2025):
+  * General labor: $50-70/hr (WA rates, no income tax adjustment)
+  * Skilled carpenter: $60-85/hr
+  * Electrician sub: $90-130/hr  
+  * Plumber sub: $95-140/hr
+  * HVAC sub: $100-150/hr
+  * Demolition: $1,800-4,500 per room
+  * Drywall: $3.00-4.50/sq ft (material + labor)
+  * Paint: $4.00-6.00/sq ft (includes prep, prime, 2 coats)
+  * Tile: $14-28/sq ft installed
+  * Hardwood flooring: $9-16/sq ft installed
+  * LVP flooring: $6-10/sq ft installed
+  * Cabinets (mid-range): $275-500/linear ft
+  * Granite/quartz countertops: $60-110/sq ft (fabricated + installed)
+  * Permits (Clark County): $800-4,000 depending on scope
+  * WA Sales Tax on materials: 8.4% (factor into material line items)
 
 Also generate a "planAnalysis" object describing what you detected from the plans.
 
