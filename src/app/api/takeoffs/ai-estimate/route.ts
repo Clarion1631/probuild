@@ -175,11 +175,13 @@ CLARK COUNTY, WA PRICING REFERENCE (2024-2025):
   * Permits (Clark County): $800-4,000 depending on scope
 
 IMPORTANT — WA SALES TAX:
-- Clark County WA sales tax is 8.4% and applies to MATERIALS ONLY (not labor)
-- Add a SEPARATE line item at the end called "WA Sales Tax (8.4% on Materials)" in phase "99-TAX"
-- Calculate the tax as 8.4% of the total of all Material-type line items
-- Do NOT bake tax into individual material prices — keep them pre-tax
-- The totalEstimate should INCLUDE the tax line item
+- In Washington State, residential remodeling/construction is classified as a RETAIL SALE
+- Clark County WA sales tax rate is 8.4%
+- The 8.4% tax applies to the ENTIRE CONTRACT PRICE (labor + materials + subcontractors + everything)
+- Add a SEPARATE line item at the end called "WA Sales Tax (8.4%)" in phase "99-TAX", type "Other"
+- Calculate: tax = 8.4% × (sum of ALL other line item totals before tax)
+- Keep all other line items pre-tax
+- The totalEstimate MUST INCLUDE the tax line item
 
 PAYMENT MILESTONES — Use WA residential remodeling industry standard:
 - "Deposit / Contract Signing": 10% (due at signing)
