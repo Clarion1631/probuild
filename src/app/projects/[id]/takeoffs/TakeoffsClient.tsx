@@ -39,6 +39,9 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
     const [selectedTakeoff, setSelectedTakeoff] = useState<Takeoff | null>(null);
     const [activeTab, setActiveTab] = useState<"plans" | "estimate">("plans");
     const [converting, setConverting] = useState(false);
+    const [viewMode, setViewMode] = useState<"internal" | "client">("internal");
+    const [globalMarkup, setGlobalMarkup] = useState(25);
+    const [adjustedItems, setAdjustedItems] = useState<any[] | null>(null);
 
     // Create modal state
     const [createName, setCreateName] = useState("");
@@ -645,7 +648,89 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                     <div className="hui-card overflow-hidden">
                                         <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
                                             <h3 className="text-sm font-bold text-hui-textMain">Line Items</h3>
+                                            <div className="flex items-center gap-3">
+                                                {/* Global Markup Control (internal only) */}
+                                                {viewMode === "internal" && (
+                                                    <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-3 py-1.5">
+                                                        <span className="text-[10px] text-slate-500 font-semibold uppercase">Global Markup</span>
+                                                        <input
+                                                            type="number"
+                                                            value={globalMarkup}
+                                                            onChange={(e) => {
+                                                                const newMarkup = parseFloat(e.target.value) || 0;
+                                                                setGlobalMarkup(newMarkup);
+                                                                const items = adjustedItems || parsedAiData.items || [];
+                                                                setAdjustedItems(items.map((item: any) => {
+                                                                    const base = item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100);
+                                                                    const sell = base * (1 + newMarkup / 100);
+                                                                    return { ...item, markupPercent: newMarkup, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * item.quantity * 100) / 100 };
+                                                                }));
+                                                            }}
+                                                            className="w-14 text-center text-xs font-bold border border-slate-200 rounded px-1 py-0.5"
+                                                            min={0}
+                                                            max={100}
+                                                            step={1}
+                                                        />
+                                                        <span className="text-xs font-bold text-slate-600">%</span>
+                                                    </div>
+                                                )}
+                                                {/* View Mode Toggle */}
+                                                <div className="flex rounded-lg overflow-hidden border border-slate-200">
+                                                    <button
+                                                        onClick={() => setViewMode("internal")}
+                                                        className={`px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider transition ${
+                                                            viewMode === "internal"
+                                                                ? "bg-slate-800 text-white"
+                                                                : "bg-white text-slate-500 hover:bg-slate-50"
+                                                        }`}
+                                                    >
+                                                        🔒 Internal
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setViewMode("client")}
+                                                        className={`px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider transition ${
+                                                            viewMode === "client"
+                                                                ? "bg-emerald-600 text-white"
+                                                                : "bg-white text-slate-500 hover:bg-slate-50"
+                                                        }`}
+                                                    >
+                                                        👁️ Client
+                                                    </button>
+                                                </div>
+                                            </div>
                                         </div>
+
+                                        {/* Internal View: Margin Summary Bar */}
+                                        {viewMode === "internal" && (() => {
+                                            const items = adjustedItems || parsedAiData.items || [];
+                                            const totalCost = items.reduce((s: number, i: any) => s + ((i.baseCost || i.unitCost / (1 + (i.markupPercent || 25) / 100)) * (i.quantity || 1)), 0);
+                                            const totalSell = items.reduce((s: number, i: any) => s + (i.total || 0), 0);
+                                            const totalMarkup = totalSell - totalCost;
+                                            const marginPct = totalSell > 0 ? (totalMarkup / totalSell * 100) : 0;
+                                            return (
+                                                <div className="px-4 py-2.5 bg-gradient-to-r from-slate-800 to-slate-700 flex items-center justify-between text-white text-xs">
+                                                    <div className="flex items-center gap-6">
+                                                        <div>
+                                                            <span className="text-slate-400 uppercase text-[9px] font-semibold">Total Cost</span>
+                                                            <p className="font-bold">${totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-slate-400 uppercase text-[9px] font-semibold">Markup</span>
+                                                            <p className="font-bold text-emerald-400">+${totalMarkup.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-slate-400 uppercase text-[9px] font-semibold">Profit Margin</span>
+                                                            <p className="font-bold text-amber-400">{marginPct.toFixed(1)}%</p>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <span className="text-slate-400 uppercase text-[9px] font-semibold">Sell Price</span>
+                                                        <p className="font-bold text-lg">${totalSell.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
+
                                         <div className="overflow-x-auto">
                                             <table className="w-full text-xs">
                                                 <thead>
@@ -655,38 +740,75 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                         <th className="text-left px-4 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Type</th>
                                                         <th className="text-right px-4 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Qty</th>
                                                         <th className="text-right px-4 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Unit</th>
-                                                        <th className="text-right px-4 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Unit Cost</th>
+                                                        {viewMode === "internal" && (
+                                                            <>
+                                                                <th className="text-right px-4 py-2.5 font-semibold text-blue-600 uppercase tracking-wider text-[10px] bg-blue-50/50">Base Cost</th>
+                                                                <th className="text-right px-4 py-2.5 font-semibold text-blue-600 uppercase tracking-wider text-[10px] bg-blue-50/50">Markup %</th>
+                                                            </>
+                                                        )}
+                                                        <th className="text-right px-4 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</th>
                                                         <th className="text-right px-4 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Total</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody className="divide-y divide-slate-50">
-                                                    {(parsedAiData.items || []).map((item: any, idx: number) => (
-                                                        <tr key={idx} className={`hover:bg-slate-50 transition ${item.isAllowance ? "bg-amber-50/30" : ""}`}>
-                                                            <td className="px-4 py-2">
-                                                                <span className="px-1.5 py-0.5 bg-slate-100 rounded text-[10px] font-mono text-slate-600">{item.costCode || "—"}</span>
-                                                            </td>
-                                                            <td className="px-4 py-2">
-                                                                <div>
-                                                                    <p className="font-medium text-hui-textMain flex items-center gap-1">
-                                                                        {item.name}
-                                                                        {item.isAllowance && <span className="px-1 py-0.5 bg-amber-100 text-amber-700 rounded text-[9px] font-bold">ALLOWANCE</span>}
-                                                                    </p>
-                                                                    {item.description && <p className="text-slate-400 truncate max-w-sm">{item.description}</p>}
-                                                                </div>
-                                                            </td>
-                                                            <td className="px-4 py-2 text-slate-500">{item.type}</td>
-                                                            <td className="px-4 py-2 text-right text-slate-700 font-medium">{item.quantity}</td>
-                                                            <td className="px-4 py-2 text-right text-slate-500">{item.unit || "ea"}</td>
-                                                            <td className="px-4 py-2 text-right text-slate-700">${item.unitCost?.toFixed(2)}</td>
-                                                            <td className="px-4 py-2 text-right font-bold text-hui-textMain">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                                        </tr>
-                                                    ))}
+                                                    {((adjustedItems || parsedAiData.items || [])).map((item: any, idx: number) => {
+                                                        const baseCost = item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100);
+                                                        const mkp = item.markupPercent ?? 25;
+                                                        return (
+                                                            <tr key={idx} className={`hover:bg-slate-50 transition ${item.isAllowance ? "bg-amber-50/30" : ""}`}>
+                                                                <td className="px-4 py-2">
+                                                                    <span className="px-1.5 py-0.5 bg-slate-100 rounded text-[10px] font-mono text-slate-600">{item.costCode || "—"}</span>
+                                                                </td>
+                                                                <td className="px-4 py-2">
+                                                                    <div>
+                                                                        <p className="font-medium text-hui-textMain flex items-center gap-1">
+                                                                            {item.name}
+                                                                            {item.isAllowance && <span className="px-1 py-0.5 bg-amber-100 text-amber-700 rounded text-[9px] font-bold">ALLOWANCE</span>}
+                                                                        </p>
+                                                                        {item.description && <p className="text-slate-400 truncate max-w-sm">{item.description}</p>}
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-4 py-2 text-slate-500">{item.type || item.costType}</td>
+                                                                <td className="px-4 py-2 text-right text-slate-700 font-medium">{item.quantity}</td>
+                                                                <td className="px-4 py-2 text-right text-slate-500">{item.unit || "ea"}</td>
+                                                                {viewMode === "internal" && (
+                                                                    <>
+                                                                        <td className="px-4 py-2 text-right text-blue-700 font-medium bg-blue-50/30">
+                                                                            ${baseCost.toFixed(2)}
+                                                                        </td>
+                                                                        <td className="px-4 py-2 text-right bg-blue-50/30">
+                                                                            <input
+                                                                                type="number"
+                                                                                value={mkp}
+                                                                                onChange={(e) => {
+                                                                                    const newMkp = parseFloat(e.target.value) || 0;
+                                                                                    const items = adjustedItems || parsedAiData.items || [];
+                                                                                    const newItems = [...items];
+                                                                                    const base = newItems[idx].baseCost || newItems[idx].unitCost / (1 + (newItems[idx].markupPercent || 25) / 100);
+                                                                                    const sell = base * (1 + newMkp / 100);
+                                                                                    newItems[idx] = { ...newItems[idx], markupPercent: newMkp, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * newItems[idx].quantity * 100) / 100 };
+                                                                                    setAdjustedItems(newItems);
+                                                                                }}
+                                                                                className="w-14 text-right text-xs font-bold text-blue-700 border border-blue-200 rounded px-1 py-0.5 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+                                                                                min={0}
+                                                                                max={100}
+                                                                                step={1}
+                                                                            />
+                                                                            <span className="text-blue-500 ml-0.5">%</span>
+                                                                        </td>
+                                                                    </>
+                                                                )}
+                                                                <td className="px-4 py-2 text-right text-slate-700">${item.unitCost?.toFixed(2)}</td>
+                                                                <td className="px-4 py-2 text-right font-bold text-hui-textMain">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                            </tr>
+                                                        );
+                                                    })}
                                                 </tbody>
                                                 <tfoot>
                                                     <tr className="bg-slate-50 border-t-2 border-slate-200">
-                                                        <td colSpan={6} className="px-4 py-3 text-right font-bold text-sm text-hui-textMain">TOTAL</td>
+                                                        <td colSpan={viewMode === "internal" ? 8 : 6} className="px-4 py-3 text-right font-bold text-sm text-hui-textMain">TOTAL</td>
                                                         <td className="px-4 py-3 text-right font-bold text-sm text-green-700">
-                                                            ${(parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                            ${((adjustedItems || parsedAiData.items || []).reduce((s: number, i: any) => s + (i.total || 0), 0) || parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                                                         </td>
                                                     </tr>
                                                 </tfoot>

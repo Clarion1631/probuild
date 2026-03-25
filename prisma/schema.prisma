@@ -200,25 +200,27 @@ model EstimatePaymentSchedule {
 }
 
 model EstimateItem {
-  id          String   @id @default(cuid())
-  estimateId  String
-  estimate    Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  name        String
-  description String?
-  type        String   @default("Material") // Legacy fallback
-  quantity    Float    @default(1)
-  unitCost    Float    @default(0)
-  total       Float    @default(0)
-  order       Int      @default(0)
-  parentId    String?
-  parent      EstimateItem?   @relation("SubItems", fields: [parentId], references: [id], onDelete: Cascade)
-  subItems    EstimateItem[]  @relation("SubItems")
-  expenses    Expense[]
-  costCodeId  String?
-  costCode    CostCode? @relation(fields: [costCodeId], references: [id])
-  costTypeId  String?
-  costType    CostType? @relation(fields: [costTypeId], references: [id])
-  createdAt   DateTime @default(now())
+  id             String   @id @default(cuid())
+  estimateId     String
+  estimate       Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  type           String   @default("Material") // Legacy fallback
+  quantity       Float    @default(1)
+  baseCost       Float?   // Raw cost before markup (internal only)
+  markupPercent  Float    @default(25) // Markup percentage (internal only)
+  unitCost       Float    @default(0) // Sell price = baseCost * (1 + markupPercent/100)
+  total          Float    @default(0)
+  order          Int      @default(0)
+  parentId       String?
+  parent         EstimateItem?   @relation("SubItems", fields: [parentId], references: [id], onDelete: Cascade)
+  subItems       EstimateItem[]  @relation("SubItems")
+  expenses       Expense[]
+  costCodeId     String?
+  costCode       CostCode? @relation(fields: [costCodeId], references: [id])
+  costTypeId     String?
+  costType       CostType? @relation(fields: [costTypeId], references: [id])
+  createdAt      DateTime @default(now())
 }
 
 model Expense {

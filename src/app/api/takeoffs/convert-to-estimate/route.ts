@@ -63,6 +63,8 @@ export async function POST(req: NextRequest) {
                     description: item.description || "",
                     type: item.type || item.costType || "Material",
                     quantity: parseFloat(item.quantity) || 1,
+                    baseCost: item.baseCost != null ? parseFloat(item.baseCost) : null,
+                    markupPercent: item.markupPercent != null ? parseFloat(item.markupPercent) : 25,
                     unitCost: parseFloat(item.unitCost) || 0,
                     total: parseFloat(item.total) || 0,
                     order: idx,

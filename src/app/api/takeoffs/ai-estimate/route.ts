@@ -178,10 +178,14 @@ PRICING STRATEGY — HOW A REAL CONTRACTOR BIDS:
 
 1. OVERHEAD & PROFIT — BAKE IT IN (NEVER show as a separate line item):
    * ALL unit costs and line item prices should ALREADY INCLUDE 20-25% overhead & profit markup
-   * This means the labor rates, material costs, and sub prices listed above are the CONTRACTOR'S SELL PRICE, not raw cost
+   * For EACH line item, you MUST provide:
+     - baseCost: the RAW contractor cost (what you actually pay — labor rate, material cost, sub cost)
+     - markupPercent: the markup percentage (default 25% for most items)
+     - unitCost: the SELL PRICE shown to client = baseCost × (1 + markupPercent/100)
+     - total: unitCost × quantity
+   * Example: If a carpenter costs $65/hr, baseCost=65, markupPercent=25, unitCost=81.25, quantity=40, total=3250
    * Overhead covers: office, insurance (GL/auto/umbrella), WA contractor bond, vehicles, licensing, accounting, warranty reserve, and profit
-   * NEVER create a visible "Overhead & Profit" line item — that invites client negotiation on your margin
-   * The client sees the final price per item — that's it
+   * The client only sees unitCost and total — baseCost and markupPercent are internal
 
 2. CONTINGENCY — BUILT INTO PRICING (NOT a separate line item):
    * Build a reasonable buffer into your line item pricing (the unit costs already have room for this)
@@ -244,6 +248,8 @@ Return ONLY a JSON object:
       "costType": string,
       "quantity": number,
       "unit": string,
+      "baseCost": number,
+      "markupPercent": number,
       "unitCost": number,
       "total": number,
       "isAllowance": boolean
