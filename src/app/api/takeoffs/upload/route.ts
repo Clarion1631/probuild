@@ -1,14 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { createClient } from "@supabase/supabase-js";
+import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { v4 as uuidv4 } from "uuid";
 
-const supabaseUrl = process.env.SUPABASE_URL || "";
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY || "";
-const BUCKET = "project-files";
+// Allow larger uploads (50MB) and longer duration
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
-    const formData = await req.formData();
+    const supabase = getSupabase();
+    if (!supabase) {
+        return NextResponse.json(
+            { error: "Storage not configured. Contact admin to set SUPABASE_URL and SUPABASE_SERVICE_KEY." },
+            { status: 500 }
+        );
+    }
+
+    let formData;
+    try {
+        formData = await req.formData();
+    } catch (parseErr: any) {
+        console.error("FormData parse error:", parseErr);
+        return NextResponse.json({ error: `File too large or invalid: ${parseErr.message}` }, { status: 413 });
+    }
+
     const takeoffId = formData.get("takeoffId") as string;
     const files = formData.getAll("files") as File[];
 
@@ -16,7 +30,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "takeoffId required" }, { status: 400 });
     }
 
-    if (files.length === 0) {
+    if (!files || files.length === 0) {
         return NextResponse.json({ error: "No files provided" }, { status: 400 });
     }
 
@@ -26,37 +40,42 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "Takeoff not found" }, { status: 404 });
     }
 
-    const supabase = createClient(supabaseUrl, supabaseKey);
     const uploadedFiles: any[] = [];
 
     for (const file of files) {
-        const buffer = Buffer.from(await file.arrayBuffer());
-        const ext = file.name.split(".").pop() || "bin";
-        const storagePath = `takeoffs/${takeoffId}/${uuidv4()}.${ext}`;
+        const bytes = await file.arrayBuffer();
+        const buffer = Buffer.from(bytes);
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const storagePath = `takeoffs/${takeoffId}/${uuidv4()}_${safeName}`;
 
         const { error: uploadError } = await supabase.storage
-            .from(BUCKET)
+            .from(STORAGE_BUCKET)
             .upload(storagePath, buffer, {
                 contentType: file.type || "application/octet-stream",
                 upsert: false,
             });
 
         if (uploadError) {
-            console.error("Upload error:", uploadError);
-            continue;
+            console.error("Supabase upload error:", uploadError);
+            return NextResponse.json(
+                { error: `Storage upload failed: ${uploadError.message}` },
+                { status: 500 }
+            );
         }
 
         const { data: urlData } = supabase.storage
-            .from(BUCKET)
+            .from(STORAGE_BUCKET)
             .getPublicUrl(storagePath);
+
+        const publicUrl = urlData?.publicUrl || storagePath;
 
         const takeoffFile = await prisma.takeoffFile.create({
             data: {
                 takeoffId,
                 name: file.name,
-                url: urlData.publicUrl,
+                url: publicUrl,
                 mimeType: file.type || "application/octet-stream",
-                size: file.size,
+                size: buffer.length,
             },
         });
 

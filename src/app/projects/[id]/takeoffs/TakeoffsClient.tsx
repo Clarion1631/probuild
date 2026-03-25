@@ -87,7 +87,11 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                 const formData = new FormData();
                 formData.append("takeoffId", takeoff.id);
                 for (const f of pendingFiles) formData.append("files", f);
-                await fetch("/api/takeoffs/upload", { method: "POST", body: formData });
+                const uploadRes = await fetch("/api/takeoffs/upload", { method: "POST", body: formData });
+                if (!uploadRes.ok) {
+                    const uploadErr = await uploadRes.json();
+                    toast.warning(`Takeoff created but file upload failed: ${uploadErr.error || "Unknown error"}`);
+                }
             }
 
             toast.success("Takeoff created!");
@@ -136,14 +140,23 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
         input.accept = ".pdf,.png,.jpg,.jpeg,.webp,.mp4,.mov,.avi";
         input.onchange = async () => {
             if (!input.files?.length) return;
+            toast.info("Uploading files...");
             const formData = new FormData();
             formData.append("takeoffId", selectedTakeoff.id);
             for (const f of Array.from(input.files)) formData.append("files", f);
-            const res = await fetch("/api/takeoffs/upload", { method: "POST", body: formData });
-            if (res.ok) {
-                toast.success("Files uploaded!");
-                openTakeoff(selectedTakeoff.id);
-                await fetchTakeoffs();
+            try {
+                const res = await fetch("/api/takeoffs/upload", { method: "POST", body: formData });
+                if (res.ok) {
+                    const data = await res.json();
+                    toast.success(`${data.count} file(s) uploaded!`);
+                    openTakeoff(selectedTakeoff.id);
+                    await fetchTakeoffs();
+                } else {
+                    const err = await res.json();
+                    toast.error(`Upload failed: ${err.error || "Unknown error"}`);
+                }
+            } catch (err: any) {
+                toast.error(`Upload error: ${err.message || "Network error"}`);
             }
         };
         input.click();
