@@ -207,7 +207,7 @@ Sort items by phase code, then by cost type within each phase. Be thorough and p
         const timeout = setTimeout(() => controller.abort(), 90000); // 90s for vision
 
         const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
             {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -228,9 +228,9 @@ Sort items by phase code, then by cost type within each phase. Be thorough and p
             const errorText = await geminiResponse.text();
             console.error("Gemini API error:", geminiResponse.status, errorText);
             
-            // Fallback: try with gemini-1.5-flash if 2.0 fails
+            // Fallback: try with gemini-2.0-flash if 3 preview fails
             const fallbackResponse = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
                 {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
