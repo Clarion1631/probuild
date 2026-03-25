@@ -3,7 +3,10 @@ import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { v4 as uuidv4 } from "uuid";
 
-// Allow larger uploads (50MB) and longer duration
+// This route handles BOTH:
+// 1. Small files (<4MB): Direct upload through the API
+// 2. Large files: Returns signed upload URLs for direct-to-Supabase upload
+
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
@@ -15,12 +18,70 @@ export async function POST(req: NextRequest) {
         );
     }
 
+    // Check if this is a JSON request (for signed URL generation) or FormData (for direct upload)
+    const contentType = req.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+        // === SIGNED URL MODE: Generate upload URLs for large files ===
+        const body = await req.json();
+        const { takeoffId, files } = body;
+
+        if (!takeoffId || !files?.length) {
+            return NextResponse.json({ error: "takeoffId and files array required" }, { status: 400 });
+        }
+
+        const takeoff = await prisma.takeoff.findUnique({ where: { id: takeoffId } });
+        if (!takeoff) {
+            return NextResponse.json({ error: "Takeoff not found" }, { status: 404 });
+        }
+
+        const uploadUrls = [];
+        for (const file of files) {
+            const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+            const storagePath = `takeoffs/${takeoffId}/${uuidv4()}_${safeName}`;
+
+            // Create a signed URL for direct upload (valid for 10 minutes)
+            const { data: signedData, error: signedError } = await supabase.storage
+                .from(STORAGE_BUCKET)
+                .createSignedUploadUrl(storagePath);
+
+            if (signedError) {
+                console.error("Signed URL error:", signedError);
+                return NextResponse.json(
+                    { error: `Failed to create upload URL: ${signedError.message}` },
+                    { status: 500 }
+                );
+            }
+
+            // Get the public URL for this path
+            const { data: urlData } = supabase.storage
+                .from(STORAGE_BUCKET)
+                .getPublicUrl(storagePath);
+
+            uploadUrls.push({
+                fileName: file.name,
+                mimeType: file.type || "application/octet-stream",
+                size: file.size || 0,
+                storagePath,
+                signedUrl: signedData.signedUrl,
+                token: signedData.token,
+                publicUrl: urlData.publicUrl,
+            });
+        }
+
+        return NextResponse.json({ uploadUrls });
+    }
+
+    // === DIRECT UPLOAD MODE: For smaller files (<4MB) ===
     let formData;
     try {
         formData = await req.formData();
     } catch (parseErr: any) {
         console.error("FormData parse error:", parseErr);
-        return NextResponse.json({ error: `File too large or invalid: ${parseErr.message}` }, { status: 413 });
+        return NextResponse.json(
+            { error: `File too large for server upload. Use the signed URL method for files over 4MB.` },
+            { status: 413 }
+        );
     }
 
     const takeoffId = formData.get("takeoffId") as string;
@@ -34,7 +95,6 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "No files provided" }, { status: 400 });
     }
 
-    // Verify the takeoff exists
     const takeoff = await prisma.takeoff.findUnique({ where: { id: takeoffId } });
     if (!takeoff) {
         return NextResponse.json({ error: "Takeoff not found" }, { status: 404 });

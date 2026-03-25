@@ -84,13 +84,9 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
             const takeoff = await res.json();
 
             if (pendingFiles.length > 0) {
-                const formData = new FormData();
-                formData.append("takeoffId", takeoff.id);
-                for (const f of pendingFiles) formData.append("files", f);
-                const uploadRes = await fetch("/api/takeoffs/upload", { method: "POST", body: formData });
-                if (!uploadRes.ok) {
-                    const uploadErr = await uploadRes.json();
-                    toast.warning(`Takeoff created but file upload failed: ${uploadErr.error || "Unknown error"}`);
+                const uploadResult = await uploadFilesToTakeoff(takeoff.id, pendingFiles);
+                if (!uploadResult.success) {
+                    toast.warning(`Takeoff created but file upload failed: ${uploadResult.error}`);
                 }
             }
 
@@ -132,6 +128,73 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
         } catch { toast.error("Failed to load takeoff"); }
     };
 
+    // Direct-to-Supabase upload via signed URLs (bypasses Vercel 4.5MB limit)
+    const uploadFilesToTakeoff = async (takeoffId: string, filesToUpload: File[]): Promise<{ success: boolean; count: number; error?: string }> => {
+        try {
+            // Step 1: Get signed upload URLs from our API
+            const fileInfos = filesToUpload.map(f => ({ name: f.name, type: f.type, size: f.size }));
+            const urlRes = await fetch("/api/takeoffs/upload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ takeoffId, files: fileInfos }),
+            });
+
+            if (!urlRes.ok) {
+                const errText = await urlRes.text();
+                let errMsg = "Failed to get upload URLs";
+                try { errMsg = JSON.parse(errText).error || errMsg; } catch {}
+                return { success: false, count: 0, error: errMsg };
+            }
+
+            const { uploadUrls } = await urlRes.json();
+
+            // Step 2: Upload each file directly to Supabase using the signed URL
+            const registeredFiles = [];
+            for (let i = 0; i < filesToUpload.length; i++) {
+                const file = filesToUpload[i];
+                const urlInfo = uploadUrls[i];
+                toast.info(`Uploading ${file.name} (${i + 1}/${filesToUpload.length})...`);
+
+                const uploadRes = await fetch(urlInfo.signedUrl, {
+                    method: "PUT",
+                    headers: { "Content-Type": file.type || "application/octet-stream" },
+                    body: file,
+                });
+
+                if (!uploadRes.ok) {
+                    console.error(`Direct upload failed for ${file.name}:`, await uploadRes.text());
+                    toast.error(`Failed to upload ${file.name}`);
+                    continue;
+                }
+
+                registeredFiles.push({
+                    name: file.name,
+                    url: urlInfo.publicUrl,
+                    mimeType: file.type || "application/octet-stream",
+                    size: file.size,
+                });
+            }
+
+            // Step 3: Register all uploaded files in the database
+            if (registeredFiles.length > 0) {
+                const regRes = await fetch("/api/takeoffs/register-file", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ takeoffId, files: registeredFiles }),
+                });
+
+                if (!regRes.ok) {
+                    const errData = await regRes.json();
+                    return { success: false, count: 0, error: errData.error || "Failed to register files" };
+                }
+            }
+
+            return { success: true, count: registeredFiles.length };
+        } catch (err: any) {
+            return { success: false, count: 0, error: err.message || "Upload failed" };
+        }
+    };
+
     const handleUploadMore = async () => {
         if (!selectedTakeoff) return;
         const input = document.createElement("input");
@@ -140,23 +203,13 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
         input.accept = ".pdf,.png,.jpg,.jpeg,.webp,.mp4,.mov,.avi";
         input.onchange = async () => {
             if (!input.files?.length) return;
-            toast.info("Uploading files...");
-            const formData = new FormData();
-            formData.append("takeoffId", selectedTakeoff.id);
-            for (const f of Array.from(input.files)) formData.append("files", f);
-            try {
-                const res = await fetch("/api/takeoffs/upload", { method: "POST", body: formData });
-                if (res.ok) {
-                    const data = await res.json();
-                    toast.success(`${data.count} file(s) uploaded!`);
-                    openTakeoff(selectedTakeoff.id);
-                    await fetchTakeoffs();
-                } else {
-                    const err = await res.json();
-                    toast.error(`Upload failed: ${err.error || "Unknown error"}`);
-                }
-            } catch (err: any) {
-                toast.error(`Upload error: ${err.message || "Network error"}`);
+            const result = await uploadFilesToTakeoff(selectedTakeoff.id, Array.from(input.files));
+            if (result.success) {
+                toast.success(`${result.count} file(s) uploaded!`);
+                openTakeoff(selectedTakeoff.id);
+                await fetchTakeoffs();
+            } else {
+                toast.error(`Upload failed: ${result.error}`);
             }
         };
         input.click();
