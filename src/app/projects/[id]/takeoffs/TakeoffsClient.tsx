@@ -551,7 +551,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                     </div>
                                 </div>
                             ) : parsedAiData ? (
-                                <div className="max-w-5xl mx-auto p-6 space-y-6">
+                                <div className="w-full px-4 py-6 space-y-6">
                                     {/* Plan Analysis Card */}
                                     {planAnalysis && (
                                         <div className="bg-gradient-to-r from-emerald-50 to-teal-50 rounded-xl border border-emerald-200 p-5">
@@ -732,22 +732,22 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                         })()}
 
                                         <div className="overflow-hidden">
-                                            <table className="w-full text-xs table-fixed">
+                                            <table className="w-full text-xs">
                                                 <thead>
                                                     <tr className="border-b border-slate-100 bg-slate-50/50">
-                                                        <th className="text-left px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]" style={{width: '70px'}}>Phase</th>
-                                                        <th className="text-left px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Item</th>
-                                                        <th className="text-left px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]" style={{width: '75px'}}>Type</th>
-                                                        <th className="text-right px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]" style={{width: '40px'}}>Qty</th>
-                                                        <th className="text-right px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]" style={{width: '40px'}}>Unit</th>
+                                                        <th className="text-left px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px] whitespace-nowrap">Phase</th>
+                                                        <th className="text-left px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]">Item</th>
+                                                        <th className="text-left px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px] whitespace-nowrap">Type</th>
+                                                        <th className="text-right px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px] whitespace-nowrap">Qty</th>
+                                                        <th className="text-right px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px] whitespace-nowrap">Unit</th>
                                                         {viewMode === "internal" && (
                                                             <>
-                                                                <th className="text-right px-2 py-2.5 font-semibold text-blue-600 uppercase tracking-wider text-[10px] bg-blue-50/50" style={{width: '80px'}}>Base Cost</th>
-                                                                <th className="text-right px-2 py-2.5 font-semibold text-blue-600 uppercase tracking-wider text-[10px] bg-blue-50/50" style={{width: '70px'}}>Markup %</th>
+                                                                <th className="text-right px-3 py-2.5 font-semibold text-blue-600 uppercase tracking-wider text-[10px] bg-blue-50/50 whitespace-nowrap">Base Cost</th>
+                                                                <th className="text-right px-3 py-2.5 font-semibold text-blue-600 uppercase tracking-wider text-[10px] bg-blue-50/50 whitespace-nowrap">Markup %</th>
                                                             </>
                                                         )}
-                                                        <th className="text-right px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]" style={{width: '80px'}}>{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</th>
-                                                        <th className="text-right px-2 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px]" style={{width: '85px'}}>Total</th>
+                                                        <th className="text-right px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px] whitespace-nowrap">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</th>
+                                                        <th className="text-right px-3 py-2.5 font-semibold text-slate-500 uppercase tracking-wider text-[10px] whitespace-nowrap">Total</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody className="divide-y divide-slate-50">
@@ -756,27 +756,27 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                         const mkp = item.markupPercent ?? 25;
                                                         return (
                                                             <tr key={idx} className={`hover:bg-slate-50 transition ${item.isAllowance ? "bg-amber-50/30" : ""}`}>
-                                                                <td className="px-2 py-2">
-                                                                    <span className="px-1 py-0.5 bg-slate-100 rounded text-[9px] font-mono text-slate-600 whitespace-nowrap">{item.costCode || "—"}</span>
+                                                                <td className="px-3 py-2 whitespace-nowrap">
+                                                                    <span className="px-1.5 py-0.5 bg-slate-100 rounded text-[10px] font-mono text-slate-600">{item.costCode || "—"}</span>
                                                                 </td>
-                                                                <td className="px-2 py-2">
-                                                                    <div className="min-w-0">
-                                                                        <p className="font-medium text-hui-textMain flex items-center gap-1 flex-wrap">
-                                                                            <span className="break-words">{item.name}</span>
-                                                                            {item.isAllowance && <span className="px-1 py-0.5 bg-amber-100 text-amber-700 rounded text-[9px] font-bold shrink-0">ALLOWANCE</span>}
+                                                                <td className="px-3 py-2">
+                                                                    <div>
+                                                                        <p className="font-medium text-hui-textMain flex items-center gap-1">
+                                                                            {item.name}
+                                                                            {item.isAllowance && <span className="px-1 py-0.5 bg-amber-100 text-amber-700 rounded text-[9px] font-bold">ALLOWANCE</span>}
                                                                         </p>
-                                                                        {item.description && <p className="text-slate-400 break-words text-[10px] leading-tight mt-0.5">{item.description}</p>}
+                                                                        {item.description && <p className="text-slate-400 text-[11px] mt-0.5">{item.description}</p>}
                                                                     </div>
                                                                 </td>
-                                                                <td className="px-2 py-2 text-slate-500 text-[10px]">{item.type || item.costType}</td>
-                                                                <td className="px-2 py-2 text-right text-slate-700 font-medium">{item.quantity}</td>
-                                                                <td className="px-2 py-2 text-right text-slate-500 text-[10px]">{item.unit || "ea"}</td>
+                                                                <td className="px-3 py-2 text-slate-500 whitespace-nowrap">{item.type || item.costType}</td>
+                                                                <td className="px-3 py-2 text-right text-slate-700 font-medium whitespace-nowrap">{item.quantity}</td>
+                                                                <td className="px-3 py-2 text-right text-slate-500 whitespace-nowrap">{item.unit || "ea"}</td>
                                                                 {viewMode === "internal" && (
                                                                     <>
-                                                                        <td className="px-2 py-2 text-right text-blue-700 font-medium bg-blue-50/30">
+                                                                        <td className="px-3 py-2 text-right text-blue-700 font-medium bg-blue-50/30 whitespace-nowrap">
                                                                             ${baseCost.toFixed(2)}
                                                                         </td>
-                                                                        <td className="px-2 py-2 text-right bg-blue-50/30">
+                                                                        <td className="px-3 py-2 text-right bg-blue-50/30 whitespace-nowrap">
                                                                             <input
                                                                                 type="number"
                                                                                 value={mkp}
@@ -798,16 +798,16 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                         </td>
                                                                     </>
                                                                 )}
-                                                                <td className="px-2 py-2 text-right text-slate-700">${item.unitCost?.toFixed(2)}</td>
-                                                                <td className="px-2 py-2 text-right font-bold text-hui-textMain">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                                <td className="px-3 py-2 text-right text-slate-700 whitespace-nowrap">${item.unitCost?.toFixed(2)}</td>
+                                                                <td className="px-3 py-2 text-right font-bold text-hui-textMain whitespace-nowrap">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                                                             </tr>
                                                         );
                                                     })}
                                                 </tbody>
                                                 <tfoot>
                                                     <tr className="bg-slate-50 border-t-2 border-slate-200">
-                                                        <td colSpan={viewMode === "internal" ? 8 : 6} className="px-2 py-3 text-right font-bold text-sm text-hui-textMain">TOTAL</td>
-                                                        <td className="px-2 py-3 text-right font-bold text-sm text-green-700">
+                                                        <td colSpan={viewMode === "internal" ? 8 : 6} className="px-3 py-3 text-right font-bold text-sm text-hui-textMain">TOTAL</td>
+                                                        <td className="px-3 py-3 text-right font-bold text-sm text-green-700">
                                                             ${((adjustedItems || parsedAiData.items || []).reduce((s: number, i: any) => s + (i.total || 0), 0) || parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                                                         </td>
                                                     </tr>
