@@ -173,7 +173,21 @@ CLARK COUNTY, WA PRICING REFERENCE (2024-2025):
   * Cabinets (mid-range): $275-500/linear ft
   * Granite/quartz countertops: $60-110/sq ft (fabricated + installed)
   * Permits (Clark County): $800-4,000 depending on scope
-  * WA Sales Tax on materials: 8.4% (factor into material line items)
+
+IMPORTANT — WA SALES TAX:
+- Clark County WA sales tax is 8.4% and applies to MATERIALS ONLY (not labor)
+- Add a SEPARATE line item at the end called "WA Sales Tax (8.4% on Materials)" in phase "99-TAX"
+- Calculate the tax as 8.4% of the total of all Material-type line items
+- Do NOT bake tax into individual material prices — keep them pre-tax
+- The totalEstimate should INCLUDE the tax line item
+
+PAYMENT MILESTONES — Use WA residential remodeling industry standard:
+- "Deposit / Contract Signing": 10% (due at signing)
+- "Demolition & Rough-In Complete": 25% (due when demo and rough framing/plumbing/electrical done)
+- "Mid-Project / Drywall & Mechanical": 25% (due when drywall hung, HVAC complete)
+- "Finish Work / Cabinets & Counters": 25% (due when cabinets, counters, tile, paint complete)
+- "Final Completion & Walkthrough": 15% (due after final inspection, punchlist, and client walkthrough)
+Note: Each milestone amount = percentage × totalEstimate. Percentages must sum to 100%.
 
 Also generate a "planAnalysis" object describing what you detected from the plans.
 
@@ -201,7 +215,8 @@ Return ONLY a JSON object:
   "paymentMilestones": [
     {
       "name": string,
-      "percentage": number
+      "percentage": number,
+      "amount": number
     }
   ],
   "summary": string
