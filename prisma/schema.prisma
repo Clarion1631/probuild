@@ -641,3 +641,28 @@ model TakeoffFile {
   size        Int      @default(0)
   createdAt   DateTime @default(now())
 }
+
+model EstimateTemplate {
+  id        String                 @id @default(cuid())
+  name      String
+  items     EstimateTemplateItem[]
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+}
+
+model EstimateTemplateItem {
+  id            String           @id @default(cuid())
+  templateId    String
+  template      EstimateTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  name          String
+  description   String?
+  type          String           @default("Material")
+  quantity      Float            @default(1)
+  baseCost      Float?
+  markupPercent Float            @default(25)
+  unitCost      Float            @default(0)
+  order         Int              @default(0)
+  parentId      String?
+  costCodeId    String?
+  costTypeId    String?
+}

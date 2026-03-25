@@ -666,6 +666,8 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 description: item.description || "",
                 type: item.type,
                 quantity: parseFloat(item.quantity) || 0,
+                baseCost: item.baseCost != null ? parseFloat(item.baseCost) || 0 : null,
+                markupPercent: parseFloat(item.markupPercent) ?? 25,
                 unitCost: parseFloat(item.unitCost) || 0,
                 total: parseFloat(item.total) || 0,
                 order: item.order ?? itemOrder++,
@@ -894,6 +896,179 @@ export async function deleteEstimate(estimateId: string) {
         revalidatePath("/projects/all/estimates");
     }
     return { success: true };
+}
+
+// =============================================
+// Duplicate Estimate
+// =============================================
+
+export async function duplicateEstimate(estimateId: string) {
+    const original = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        include: {
+            items: { orderBy: { order: "asc" } },
+            paymentSchedules: { orderBy: { order: "asc" } },
+        },
+    });
+    if (!original) throw new Error("Estimate not found");
+
+    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const newEstimate = await prisma.estimate.create({
+        data: {
+            title: `Copy of ${original.title}`,
+            projectId: original.projectId,
+            leadId: original.leadId,
+            code,
+            status: "Draft",
+            totalAmount: original.totalAmount,
+            balanceDue: original.totalAmount,
+            privacy: original.privacy,
+        },
+    });
+
+    // Build old-to-new ID mapping for parentId references
+    const idMap: Record<string, string> = {};
+
+    for (const item of original.items) {
+        const newItem = await prisma.estimateItem.create({
+            data: {
+                estimateId: newEstimate.id,
+                name: item.name,
+                description: item.description || "",
+                type: item.type,
+                quantity: item.quantity,
+                baseCost: item.baseCost,
+                markupPercent: item.markupPercent,
+                unitCost: item.unitCost,
+                total: item.total,
+                order: item.order,
+                costCodeId: item.costCodeId,
+                costTypeId: item.costTypeId,
+                // parentId mapped below
+            },
+        });
+        idMap[item.id] = newItem.id;
+    }
+
+    // Fix parentId references
+    for (const item of original.items) {
+        if (item.parentId && idMap[item.parentId]) {
+            await prisma.estimateItem.update({
+                where: { id: idMap[item.id] },
+                data: { parentId: idMap[item.parentId] },
+            });
+        }
+    }
+
+    for (const schedule of original.paymentSchedules) {
+        await prisma.estimatePaymentSchedule.create({
+            data: {
+                estimateId: newEstimate.id,
+                name: schedule.name,
+                percentage: schedule.percentage,
+                amount: schedule.amount,
+                dueDate: schedule.dueDate,
+                order: schedule.order,
+            },
+        });
+    }
+
+    if (original.projectId) {
+        revalidatePath(`/projects/${original.projectId}/estimates`);
+    } else if (original.leadId) {
+        revalidatePath(`/leads/${original.leadId}`);
+    }
+    revalidatePath("/estimates");
+
+    return { id: newEstimate.id, projectId: original.projectId, leadId: original.leadId };
+}
+
+// =============================================
+// Estimate Templates
+// =============================================
+
+export async function saveEstimateAsTemplate(estimateId: string, templateName: string) {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        include: { items: { orderBy: { order: "asc" } } },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+
+    const template = await prisma.estimateTemplate.create({
+        data: {
+            name: templateName,
+            items: {
+                create: estimate.items.map((item) => ({
+                    name: item.name,
+                    description: item.description || "",
+                    type: item.type,
+                    quantity: item.quantity,
+                    baseCost: item.baseCost,
+                    markupPercent: item.markupPercent,
+                    unitCost: item.unitCost,
+                    order: item.order,
+                    parentId: item.parentId,
+                    costCodeId: item.costCodeId,
+                    costTypeId: item.costTypeId,
+                })),
+            },
+        },
+    });
+
+    return { id: template.id, name: template.name };
+}
+
+export async function getEstimateTemplates() {
+    return await prisma.estimateTemplate.findMany({
+        orderBy: { createdAt: "desc" },
+        include: { items: { orderBy: { order: "asc" } } },
+    });
+}
+
+export async function createEstimateFromTemplate(projectId: string, templateId: string) {
+    const template = await prisma.estimateTemplate.findUnique({
+        where: { id: templateId },
+        include: { items: { orderBy: { order: "asc" } } },
+    });
+    if (!template) throw new Error("Template not found");
+
+    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const estimate = await prisma.estimate.create({
+        data: {
+            title: template.name,
+            projectId,
+            code,
+            status: "Draft",
+            totalAmount: 0,
+            balanceDue: 0,
+            privacy: "Shared",
+        },
+    });
+
+    for (const item of template.items) {
+        await prisma.estimateItem.create({
+            data: {
+                estimateId: estimate.id,
+                name: item.name,
+                description: item.description || "",
+                type: item.type,
+                quantity: item.quantity,
+                baseCost: item.baseCost,
+                markupPercent: item.markupPercent,
+                unitCost: item.unitCost,
+                total: (item.quantity || 0) * (item.unitCost || 0),
+                order: item.order,
+                parentId: item.parentId,
+                costCodeId: item.costCodeId,
+                costTypeId: item.costTypeId,
+            },
+        });
+    }
+
+    revalidatePath(`/projects/${projectId}/estimates`);
+    return { id: estimate.id };
 }
 
 // =============================================
