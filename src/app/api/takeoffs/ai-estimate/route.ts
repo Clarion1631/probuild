@@ -180,10 +180,11 @@ PRICING STRATEGY — HOW A REAL CONTRACTOR BIDS:
    * ALL unit costs and line item prices should ALREADY INCLUDE 20-25% overhead & profit markup
    * For EACH line item, you MUST provide:
      - baseCost: the RAW contractor cost (what you actually pay — labor rate, material cost, sub cost)
-     - markupPercent: the markup percentage (default 25% for most items)
+     - markupPercent: the markup percentage (default 25% for most items, but 0 for TAX items)
      - unitCost: the SELL PRICE shown to client = baseCost × (1 + markupPercent/100)
      - total: unitCost × quantity
    * Example: If a carpenter costs $65/hr, baseCost=65, markupPercent=25, unitCost=81.25, quantity=40, total=3250
+   * TAX ITEMS: Sales tax MUST have markupPercent=0 (tax is a pass-through, no markup). Set costCode starting with "99-TAX".
    * Overhead covers: office, insurance (GL/auto/umbrella), WA contractor bond, vehicles, licensing, accounting, warranty reserve, and profit
    * The client only sees unitCost and total — baseCost and markupPercent are internal
 

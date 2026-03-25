@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -26,6 +26,11 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [aiPrompt, setAiPrompt] = useState("");
     const [isGenerating, setIsGenerating] = useState(false);
     const [showMoreMenu, setShowMoreMenu] = useState(false);
+    const [viewMode, setViewMode] = useState<"internal" | "client">("client");
+    const [showTemplateModal, setShowTemplateModal] = useState(false);
+    const [templateName, setTemplateName] = useState("");
+    const [isSavingTemplate, setIsSavingTemplate] = useState(false);
+    const [isDuplicating, setIsDuplicating] = useState(false);
 
     useEffect(() => {
         fetch('/api/cost-codes?active=true')
@@ -38,12 +43,14 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             .catch(() => {});
     }, []);
 
-    // Filter items to calculate subtotal correctly (don't double count children if parent also has cost, but here we just sum everything that isn't an assembly, or just sum all)
-    // To match Houzz, Assemblies sum up their children, but for simplicity we will just let every row have a cost and sum all root level or sum all.
-    // Let's sum every item's (qty * cost).
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const tax = subtotal * 0.087; // Estimate local tax
+    const tax = subtotal * 0.087;
     const total = subtotal + tax;
+
+    // Internal margin calculations
+    const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
+    const totalMarkup = subtotal - totalBaseCost;
+    const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
     async function handleSave() {
         setIsSaving(true);
@@ -99,6 +106,38 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
         }
     }
 
+    async function handleDuplicate() {
+        setIsDuplicating(true);
+        try {
+            await handleSave();
+            const res = await duplicateEstimate(initialEstimate.id);
+            toast.success("Estimate duplicated");
+            if (res.projectId) {
+                router.push(`/projects/${res.projectId}/estimates/${res.id}`);
+            }
+        } catch (e: any) {
+            toast.error(e.message || "Failed to duplicate");
+        } finally {
+            setIsDuplicating(false);
+        }
+    }
+
+    async function handleSaveAsTemplate() {
+        if (!templateName.trim()) { toast.error("Enter a template name"); return; }
+        setIsSavingTemplate(true);
+        try {
+            await handleSave();
+            await saveEstimateAsTemplate(initialEstimate.id, templateName.trim());
+            toast.success("Template saved");
+            setShowTemplateModal(false);
+            setTemplateName("");
+        } catch (e: any) {
+            toast.error(e.message || "Failed to save template");
+        } finally {
+            setIsSavingTemplate(false);
+        }
+    }
+
     function generateId() {
         return Math.random().toString(36).substr(2, 9);
     }
@@ -110,6 +149,8 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             description: "",
             type: "Material",
             quantity: 1,
+            baseCost: 0,
+            markupPercent: 25,
             unitCost: 0,
             total: 0,
             parentId,
@@ -274,6 +315,20 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                 </div>
 
                 <div className="flex items-center gap-2">
+                    {/* Internal / Client View Toggle */}
+                    <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-md">
+                        <button
+                            onClick={() => setViewMode("client")}
+                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "client" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                        >Client</button>
+                        <button
+                            onClick={() => setViewMode("internal")}
+                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-amber-50 text-amber-800 shadow-sm border border-amber-200" : "text-slate-500 hover:text-slate-700"}`}
+                        >Internal</button>
+                    </div>
+
+                    <div className="h-4 w-px bg-hui-border"></div>
+
                     {/* More dropdown for secondary actions */}
                     <div className="relative">
                         <button
@@ -286,7 +341,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                         {showMoreMenu && (
                             <>
                                 <div className="fixed inset-0 z-40" onClick={() => setShowMoreMenu(false)} />
-                                <div className="absolute right-0 top-full mt-1 w-52 bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
+                                <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
                                     <button
                                         onClick={() => { window.open(`/portal/estimates/${initialEstimate.id}`, '_blank'); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
@@ -294,6 +349,15 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                         <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
                                         Customer Portal
                                     </button>
+                                    <a
+                                        href={`/api/pdf/${initialEstimate.id}?inline=true`}
+                                        target="_blank"
+                                        onClick={() => setShowMoreMenu(false)}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
+                                    >
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+                                        Preview PDF
+                                    </a>
                                     <a
                                         href={`/api/pdf/${initialEstimate.id}`}
                                         target="_blank"
@@ -303,6 +367,22 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                         <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
                                         Download PDF
                                     </a>
+                                    <div className="border-t border-hui-border my-1" />
+                                    <button
+                                        onClick={() => { handleDuplicate(); setShowMoreMenu(false); }}
+                                        disabled={isDuplicating}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain disabled:opacity-50"
+                                    >
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                        {isDuplicating ? "Duplicating..." : "Duplicate Estimate"}
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowTemplateModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
+                                    >
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" /></svg>
+                                        Save as Template
+                                    </button>
                                     {context.type === "project" && (
                                         <button
                                             onClick={() => { handleCreateInvoice(); setShowMoreMenu(false); }}
@@ -352,6 +432,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                 </div>
             </div>
 
+
             <div className="flex-1 p-8 flex justify-center pb-24 overflow-y-auto">
                 {activeTab === "builder" && (
                     <div className="w-full max-w-5xl">
@@ -396,7 +477,9 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                 <div className="w-32">Phase</div>
                                 <div className="w-32">Type</div>
                                 <div className="w-24 text-right">Qty</div>
-                                <div className="w-32 text-right">Unit Cost</div>
+                                {viewMode === "internal" && <div className="w-28 text-right text-amber-500">Base Cost</div>}
+                                {viewMode === "internal" && <div className="w-20 text-right text-amber-500">Markup %</div>}
+                                <div className="w-32 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
                                 <div className="w-32 text-right">Total</div>
                                 <div className="w-10"></div>
                             </div>
@@ -466,23 +549,56 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                                         ))}
                                                                     </select>
                                                                     </div>
-                                                                    <div className="w-24 px-4 pt-1 text-right">
-                                                                        <input
-                                                                            type="number"
-                                                                            value={item.quantity}
-                                                                            onChange={e => updateItem(index, "quantity", e.target.value)}
-                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
-                                                                        />
-                                                                    </div>
-                                                                    <div className="w-32 px-4 pt-1 text-right relative">
-                                                                        <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
-                                                                        <input
-                                                                            type="number"
-                                                                            value={item.unitCost}
-                                                                            onChange={e => updateItem(index, "unitCost", e.target.value)}
-                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
-                                                                        />
-                                                                    </div>
+                                                                     <div className="w-24 px-4 pt-1 text-right">
+                                                                         <input
+                                                                             type="number"
+                                                                             value={item.quantity}
+                                                                             onChange={e => updateItem(index, "quantity", e.target.value)}
+                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                         />
+                                                                     </div>
+                                                                     {viewMode === "internal" && (
+                                                                         <div className="w-28 px-2 pt-1 text-right relative">
+                                                                             <span className="absolute left-4 top-1.5 text-amber-400 text-sm">$</span>
+                                                                             <input
+                                                                                 type="number"
+                                                                                 value={item.baseCost ?? 0}
+                                                                                 onChange={e => {
+                                                                                     const bc = parseFloat(e.target.value) || 0;
+                                                                                     const mp = parseFloat(item.markupPercent) || 0;
+                                                                                     updateItem(index, "baseCost", e.target.value);
+                                                                                     updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
+                                                                                 }}
+                                                                                 className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 pl-5 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
+                                                                             />
+                                                                         </div>
+                                                                     )}
+                                                                     {viewMode === "internal" && (
+                                                                         <div className="w-20 px-1 pt-1 text-right relative">
+                                                                             <input
+                                                                                 type="number"
+                                                                                 value={item.markupPercent ?? 25}
+                                                                                 onChange={e => {
+                                                                                     const mp = parseFloat(e.target.value) || 0;
+                                                                                     const bc = parseFloat(item.baseCost) || 0;
+                                                                                     updateItem(index, "markupPercent", e.target.value);
+                                                                                     updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
+                                                                                 }}
+                                                                                 className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
+                                                                             />
+                                                                             <span className="absolute right-3 top-2 text-amber-400 text-xs">%</span>
+                                                                         </div>
+                                                                     )}
+                                                                     <div className="w-32 px-4 pt-1 text-right relative">
+                                                                         <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
+                                                                         <input
+                                                                             type="number"
+                                                                             value={item.unitCost}
+                                                                             onChange={e => updateItem(index, "unitCost", e.target.value)}
+                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                             readOnly={viewMode === "internal"}
+                                                                         />
+                                                                     </div>
                                                                     <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
                                                                         ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                                                     </div>

@@ -660,6 +660,8 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                 setGlobalMarkup(newMarkup);
                                                                 const items = adjustedItems || parsedAiData.items || [];
                                                                 setAdjustedItems(items.map((item: any) => {
+                                                                    const itemIsTax = /tax/i.test(item.costCode || '') || /tax/i.test(item.name || '');
+                                                                    if (itemIsTax) return item;
                                                                     const base = item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100);
                                                                     const sell = base * (1 + newMarkup / 100);
                                                                     return { ...item, markupPercent: newMarkup, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * item.quantity * 100) / 100 };
@@ -686,10 +688,11 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
 
                                         {viewMode === "internal" && (() => {
                                             const items = adjustedItems || parsedAiData.items || [];
-                                            const totalCost = items.reduce((s: number, i: any) => s + ((i.baseCost || i.unitCost / (1 + (i.markupPercent || 25) / 100)) * (i.quantity || 1)), 0);
+                                            const totalCost = items.filter((i: any) => !/tax/i.test(i.costCode || '') && !/tax/i.test(i.name || '')).reduce((s: number, i: any) => s + ((i.baseCost || i.unitCost / (1 + (i.markupPercent || 25) / 100)) * (i.quantity || 1)), 0);
+                                            const totalSellExTax = items.filter((i: any) => !/tax/i.test(i.costCode || '') && !/tax/i.test(i.name || '')).reduce((s: number, i: any) => s + (i.total || 0), 0);
                                             const totalSell = items.reduce((s: number, i: any) => s + (i.total || 0), 0);
-                                            const totalMarkup = totalSell - totalCost;
-                                            const marginPct = totalSell > 0 ? (totalMarkup / totalSell * 100) : 0;
+                                            const totalMarkup = totalSellExTax - totalCost;
+                                            const marginPct = totalSellExTax > 0 ? (totalMarkup / totalSellExTax * 100) : 0;
                                             return (
                                                 <div className="px-6 py-4 bg-gradient-to-r from-slate-800 to-slate-700 flex items-center justify-between text-white">
                                                     <div className="flex items-center gap-8">
@@ -732,11 +735,21 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                     </tr>
                                                 </thead>
                                                 <tbody className="divide-y divide-slate-100">
-                                                    {((adjustedItems || parsedAiData.items || [])).map((item: any, idx: number) => {
-                                                        const baseCost = item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100);
-                                                        const mkp = item.markupPercent ?? 25;
+                                                    {((adjustedItems || parsedAiData.items || []) as any[])
+                                                        .slice()
+                                                        .sort((a: any, b: any) => {
+                                                            const aIsTax = /tax/i.test(a.costCode || '') || /tax/i.test(a.name || '');
+                                                            const bIsTax = /tax/i.test(b.costCode || '') || /tax/i.test(b.name || '');
+                                                            if (aIsTax && !bIsTax) return 1;
+                                                            if (!aIsTax && bIsTax) return -1;
+                                                            return 0;
+                                                        })
+                                                        .map((item: any, idx: number) => {
+                                                        const isTax = /tax/i.test(item.costCode || '') || /tax/i.test(item.name || '');
+                                                        const baseCost = isTax ? item.unitCost : (item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100));
+                                                        const mkp = isTax ? 0 : (item.markupPercent ?? 25);
                                                         return (
-                                                            <tr key={idx} className={`hover:bg-slate-50/80 transition ${item.isAllowance ? "bg-amber-50/40" : ""}`}>
+                                                            <tr key={idx} className={`hover:bg-slate-50/80 transition ${item.isAllowance ? "bg-amber-50/40" : ""} ${isTax ? "border-t-2 border-slate-200" : ""}`}>
                                                                 <td className="px-4 py-3 whitespace-nowrap align-top">
                                                                     <span className="inline-block px-2 py-1 bg-slate-100 rounded text-xs font-mono text-slate-600 font-medium">{item.costCode || "—"}</span>
                                                                 </td>
@@ -755,15 +768,22 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                         ${baseCost.toFixed(2)}
                                                                     </td>
                                                                     <td className="px-4 py-3 bg-blue-50/40 align-top">
+                                                                        {isTax ? (
+                                                                            <div className="flex items-center justify-center gap-1">
+                                                                                <span className="text-sm text-slate-400">—</span>
+                                                                            </div>
+                                                                        ) : (
                                                                         <div className="flex items-center justify-center gap-1">
                                                                             <input type="number" value={mkp}
                                                                                 onChange={(e) => {
                                                                                     const newMkp = parseFloat(e.target.value) || 0;
-                                                                                    const items = adjustedItems || parsedAiData.items || [];
-                                                                                    const newItems = [...items];
-                                                                                    const base = newItems[idx].baseCost || newItems[idx].unitCost / (1 + (newItems[idx].markupPercent || 25) / 100);
+                                                                                    const sourceItems = adjustedItems || parsedAiData.items || [];
+                                                                                    const origIdx = sourceItems.indexOf(item);
+                                                                                    if (origIdx === -1) return;
+                                                                                    const newItems = [...sourceItems];
+                                                                                    const base = newItems[origIdx].baseCost || newItems[origIdx].unitCost / (1 + (newItems[origIdx].markupPercent || 25) / 100);
                                                                                     const sell = base * (1 + newMkp / 100);
-                                                                                    newItems[idx] = { ...newItems[idx], markupPercent: newMkp, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * newItems[idx].quantity * 100) / 100 };
+                                                                                    newItems[origIdx] = { ...newItems[origIdx], markupPercent: newMkp, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * newItems[origIdx].quantity * 100) / 100 };
                                                                                     setAdjustedItems(newItems);
                                                                                 }}
                                                                                 className="w-14 text-center text-sm font-bold text-blue-700 border border-blue-300 rounded-md px-1 py-1 bg-white focus:outline-none focus:ring-2 focus:ring-blue-400"
@@ -771,6 +791,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                             />
                                                                             <span className="text-sm font-bold text-blue-600">%</span>
                                                                         </div>
+                                                                        )}
                                                                     </td>
                                                                 </>)}
                                                                 <td className="px-4 py-3 text-right text-slate-800 font-medium whitespace-nowrap align-top">${item.unitCost?.toFixed(2)}</td>
