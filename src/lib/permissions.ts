@@ -47,6 +47,31 @@ export function hasPermission(
     return !!user.permissions[key];
 }
 
+// All permission keys (single source of truth)
+export const ALL_PERMISSION_KEYS: PermissionKey[] = [
+    // Administrative
+    "manageTeamMembers", "manageSubs", "manageVendors",
+    "companySettings", "costCodesCategories",
+    // Project screens
+    "schedules", "estimates", "invoices", "contracts",
+    "floorPlans", "changeOrders", "financialReports",
+    "timeClock", "dailyLogs", "files", "takeoffs",
+    // Leads
+    "createLead", "clientCommunication", "leadAccess",
+];
+
+// Build a flat permissions object using the same logic as hasPermission()
+// Used by the API route to send consistent permissions to the client
+export function getEffectivePermissions(
+    user: { role: string; permissions?: any | null }
+): Record<string, boolean> {
+    const result: Record<string, boolean> = {};
+    for (const key of ALL_PERMISSION_KEYS) {
+        result[key] = hasPermission(user, key);
+    }
+    return result;
+}
+
 // Check if user can access a specific project
 export function canAccessProject(
     user: { role: string; projectAccess?: { projectId: string }[] },

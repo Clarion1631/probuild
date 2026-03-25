@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { getEffectivePermissions } from "@/lib/permissions";
 
 export const dynamic = "force-dynamic";
 
@@ -25,32 +26,8 @@ export async function GET() {
 
         const isAdmin = user.role === "ADMIN" || user.role === "MANAGER";
 
-        // Build a flat permissions object for the client
-        const perms: any = user.permissions || {};
-        const effectivePermissions: Record<string, boolean> = {
-            // Administrative
-            manageTeamMembers: isAdmin || !!perms.manageTeamMembers,
-            manageSubs: isAdmin || !!perms.manageSubs,
-            manageVendors: isAdmin || !!perms.manageVendors,
-            companySettings: isAdmin || !!perms.companySettings,
-            costCodesCategories: isAdmin || !!perms.costCodesCategories,
-            // Project screens
-            schedules: isAdmin || !!perms.schedules,
-            estimates: isAdmin || !!perms.estimates,
-            invoices: isAdmin || !!perms.invoices,
-            contracts: isAdmin || !!perms.contracts,
-            floorPlans: isAdmin || !!perms.floorPlans,
-            changeOrders: isAdmin || !!perms.changeOrders,
-            financialReports: isAdmin || !!perms.financialReports,
-            timeClock: isAdmin || !!perms.timeClock,
-            dailyLogs: isAdmin || !!perms.dailyLogs,
-            files: isAdmin || !!perms.files,
-            takeoffs: isAdmin || !!perms.takeoffs,
-            // Leads
-            createLead: isAdmin || !!perms.createLead,
-            clientCommunication: isAdmin || !!perms.clientCommunication,
-            leadAccess: isAdmin || !!perms.leadAccess,
-        };
+        // Use shared helper — applies role-based defaults when no UserPermission record exists
+        const effectivePermissions = getEffectivePermissions(user);
 
         return NextResponse.json({
             role: user.role,
