@@ -731,7 +731,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                             );
                                         })()}
 
-                                        <div className="overflow-x-auto">
+                                        <div className="overflow-hidden">
                                             <table className="w-full text-xs">
                                                 <thead>
                                                     <tr className="border-b border-slate-100 bg-slate-50/50">
