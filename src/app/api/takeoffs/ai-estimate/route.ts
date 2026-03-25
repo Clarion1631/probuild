@@ -138,7 +138,7 @@ ${additionalContext ? `ADDITIONAL CONTEXT FROM MANAGER:\n${additionalContext}\n`
 ${pastEstimateContext}
 
 AVAILABLE PHASES (use the code field exactly as shown):
-${phasesList || "Use standard construction phases: 00-GC (General Conditions), 01-DEMO, 02-FRAME, 03-PLUMB, 04-ELEC, 05-HVAC, 06-INSUL, 07-DRYWALL, 08-PAINT, 09-FLOOR, 10-CABINET, 11-COUNTER, 12-TILE, 13-FINISH, 14-CLEAN, 15-PERMIT, 90-CONTINGENCY, 95-OVERHEAD, 99-TAX"}
+${phasesList || "Use standard construction phases: 00-GC (General Conditions), 01-DEMO, 02-FRAME, 03-PLUMB, 04-ELEC, 05-HVAC, 06-INSUL, 07-DRYWALL, 08-PAINT, 09-FLOOR, 10-CABINET, 11-COUNTER, 12-TILE, 13-FINISH, 14-CLEAN, 15-PERMIT, 99-TAX"}
 
 AVAILABLE COST TYPES (use exactly as shown):
 ${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}
@@ -174,60 +174,48 @@ CLARK COUNTY, WA PRICING REFERENCE (2024-2025):
   * Granite/quartz countertops: $60-110/sq ft (fabricated + installed)
   * Permits (Clark County): $800-4,000 depending on scope
 
-MANDATORY COST CATEGORIES — DO NOT OMIT THESE:
+PRICING STRATEGY — HOW A REAL CONTRACTOR BIDS:
 
-1. GENERAL CONDITIONS (phase 00-GC) — Include ALL of these as separate line items:
-   * Project Management / Superintendent time (8-15% of project duration, $65-85/hr)
-   * Dumpster rental (20-30 yard, $450-800 per haul)
-   * Portable toilet rental if needed ($150-250/month)
-   * Temporary protections (floor protection, dust barriers, plastic sheeting: $300-800)
-   * Site cleanup (daily/weekly during construction)
-   * Material delivery/handling
-   * Small tools & consumables (blades, bits, tape, caulk: $200-600)
+1. OVERHEAD & PROFIT — BAKE IT IN (NEVER show as a separate line item):
+   * ALL unit costs and line item prices should ALREADY INCLUDE 20-25% overhead & profit markup
+   * This means the labor rates, material costs, and sub prices listed above are the CONTRACTOR'S SELL PRICE, not raw cost
+   * Overhead covers: office, insurance (GL/auto/umbrella), WA contractor bond, vehicles, licensing, accounting, warranty reserve, and profit
+   * NEVER create a visible "Overhead & Profit" line item — that invites client negotiation on your margin
+   * The client sees the final price per item — that's it
 
-2. WA L&I / WORKERS' COMPENSATION (factor into labor rates):
-   * Washington State requires L&I (Labor & Industries) insurance on ALL labor
-   * Rate varies by trade: carpentry ~$1.50/hr, electrical ~$1.20/hr, general labor ~$1.80/hr
-   * DO NOT add as separate line — it's already included in the hourly labor rates above
-   * But DO ensure labor rates reflect this (the rates provided already include L&I)
+2. CONTINGENCY — BUILT INTO PRICING (NOT a separate line item):
+   * Build a reasonable buffer into your line item pricing (the unit costs already have room for this)
+   * Remodel unknowns (rot, old wiring, plumbing surprises) are handled through change orders if/when discovered
+   * Do NOT add a visible "Contingency" line item — it looks unprofessional to clients
 
-3. CONTRACTOR OVERHEAD & PROFIT (phase 95-OVERHEAD):
-   * Add ONE line item: "Contractor Overhead & Profit" 
-   * Type: "Other"
-   * Calculate as 20-25% of the subtotal of ALL construction line items (phases 00 through 15)
-   * Overhead covers: office expenses, insurance (GL + auto + umbrella), vehicle costs, 
-     WA contractor bond, licensing, accounting, warranty reserve, and profit margin
-   * This is STANDARD in the industry — a contractor who doesn't include O&P is losing money
+3. GENERAL CONDITIONS (phase 00-GC) — Only REAL pass-through costs:
+   * Dumpster rental (20-30 yard, $450-800 per haul) — visible, real cost
+   * Portable toilet rental if needed ($150-250/month) — visible, real cost
+   * Temporary protections (floor protection, dust barriers: $300-800) — visible, real cost
+   * Final construction cleaning ($200-600) — visible, real cost
+   * DO NOT include "Project Management" or "Superintendent" as line items — that's part of overhead, already baked into every line item's price
 
-4. CONTINGENCY (phase 90-CONTINGENCY):
-   * Add ONE line item: "Contingency (Remodel Unknowns)"
-   * Type: "Other"  
-   * Calculate as 10% of construction subtotal (phases 00 through 15)
-   * Remodels ALWAYS have unknowns: hidden rot, outdated wiring, asbestos, 
-     plumbing surprises, structural issues behind walls
-   * This protects both the contractor and client from change order surprises
+4. WA L&I / WORKERS' COMPENSATION:
+   * Already included in the hourly labor rates above
+   * DO NOT show as a separate line item
 
 5. PERMITS & INSPECTIONS (phase 15-PERMIT):
-   * Clark County building permit (based on project valuation)
+   * Clark County building permit (real pass-through cost based on project valuation)
    * Plan review fees
-   * Inspection fees (rough, final, specialty)
-   * If applicable: engineering/structural review
+   * These are legitimately separate because they're paid directly to the county
 
 IMPORTANT — WA SALES TAX:
 - In Washington State, residential remodeling/construction is classified as a RETAIL SALE
 - Clark County WA sales tax rate is 8.4%
-- The 8.4% tax applies to the ENTIRE CONTRACT PRICE (all phases including O&P and contingency)
-- Add a SEPARATE line item at the end called "WA Sales Tax (8.4%)" in phase "99-TAX", type "Other"
-- Calculate: tax = 8.4% × (sum of ALL other line item totals before tax)
-- Keep all other line items pre-tax
+- The 8.4% tax applies to the ENTIRE CONTRACT PRICE
+- Add ONE SEPARATE line item at the end: "WA Sales Tax (8.4%)" in phase "99-TAX", type "Other"
+- Calculate: tax = 8.4% × (sum of ALL other line item totals)
+- All other line items are pre-tax
 - The totalEstimate MUST INCLUDE the tax line item
 
-ESTIMATE STRUCTURE (order of totaling):
-  Construction Subtotal (phases 00-15) → all direct work costs
-  + Contingency (10% of construction subtotal)
-  + Overhead & Profit (20-25% of construction subtotal)
-  = Pre-Tax Total
-  + WA Sales Tax (8.4% of pre-tax total)
+ESTIMATE STRUCTURE:
+  Construction line items (phases 00-15, with O&P already baked into each price)
+  + WA Sales Tax (8.4% of the above total)
   = TOTAL ESTIMATE (this is totalEstimate)
 
 PAYMENT MILESTONES — Use WA residential remodeling industry standard:
