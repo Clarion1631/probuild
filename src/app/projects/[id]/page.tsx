@@ -1,6 +1,7 @@
 import { getProject, getScheduleTasks } from "@/lib/actions";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import ProjectHeader from "./ProjectHeader";
 
 export const dynamic = "force-dynamic";
 
@@ -28,28 +29,13 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
 
     return (
         <div className="max-w-7xl mx-auto">
-            {/* Header */}
-            <div className="flex items-center justify-between mb-8">
-                <div>
-                    <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/25">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
-                        </div>
-                        <div>
-                            <h1 className="text-2xl font-bold text-hui-textMain">{project.name}</h1>
-                            <p className="text-sm text-hui-textMuted">{project.client?.name || "No client"} · {project.location || "No location"}</p>
-                        </div>
-                    </div>
-                </div>
-                <div className="flex items-center gap-2">
-                    <span className={`text-xs font-semibold px-3 py-1.5 rounded-full ${
-                        project.status === 'Active' ? 'bg-green-100 text-green-700' :
-                        project.status === 'Completed' ? 'bg-purple-100 text-purple-700' :
-                        project.status === 'On Hold' ? 'bg-amber-100 text-amber-700' :
-                        'bg-slate-100 text-slate-600'
-                    }`}>{project.status || 'Active'}</span>
-                </div>
-            </div>
+            <ProjectHeader
+                projectId={id}
+                name={project.name}
+                clientName={project.client?.name || "No client"}
+                location={project.location}
+                status={project.status}
+            />
 
             {/* Stats Row */}
             <div className="grid grid-cols-4 gap-5 mb-8">

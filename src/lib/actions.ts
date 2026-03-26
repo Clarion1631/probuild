@@ -89,7 +89,17 @@ export async function updateClient(clientId: string, data: { name?: string; emai
             zipCode: data.zipCode,
         },
     });
+
+    // Revalidate all projects using this client so name/details update everywhere
+    const linkedProjects = await prisma.project.findMany({
+        where: { clientId },
+        select: { id: true },
+    });
+    for (const p of linkedProjects) {
+        revalidatePath(`/projects/${p.id}`, 'layout');
+    }
     revalidatePath("/leads");
+    revalidatePath("/projects");
     return client;
 }
 
@@ -107,6 +117,20 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
         where: { id: leadId },
         data: updateData,
     });
+
+    // Sync name to linked project when lead name changes
+    if (data.name !== undefined) {
+        const linkedProject = await prisma.project.findUnique({ where: { leadId } });
+        if (linkedProject) {
+            await prisma.project.update({
+                where: { id: linkedProject.id },
+                data: { name: data.name },
+            });
+            revalidatePath(`/projects`);
+            revalidatePath(`/projects/${linkedProject.id}`, 'layout');
+        }
+    }
+
     revalidatePath(`/leads/${leadId}`);
     return lead;
 }
@@ -305,7 +329,8 @@ export async function linkProjectToLead(projectId: string, leadId: string | null
         where: { id: projectId },
         data: { leadId },
     });
-    revalidatePath(`/projects/${projectId}`);
+    revalidatePath(`/projects/${projectId}`, 'layout');
+    revalidatePath(`/projects`);
     return project;
 }
 
@@ -1980,6 +2005,16 @@ export async function updateProjectTags(projectId: string, tags: string) {
     });
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectName(projectId: string, name: string) {
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { name }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`, 'layout');
     return { success: true };
 }
 
