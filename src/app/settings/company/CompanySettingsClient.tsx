@@ -12,13 +12,19 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
         website: initialData?.website || "",
         logoUrl: initialData?.logoUrl || "",
         notificationEmail: initialData?.notificationEmail || "",
+        stripeEnabled: initialData?.stripeEnabled || false,
+        enableCard: initialData?.enableCard ?? true,
+        enableBankTransfer: initialData?.enableBankTransfer || false,
+        enableAffirm: initialData?.enableAffirm || false,
+        enableKlarna: initialData?.enableKlarna || false,
     });
 
     const [isSaving, setIsSaving] = useState(false);
     const [message, setMessage] = useState({ type: "", text: "" });
 
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-        setFormData({ ...formData, [e.target.name]: e.target.value });
+        const value = e.target.type === 'checkbox' ? (e.target as HTMLInputElement).checked : e.target.value;
+        setFormData({ ...formData, [e.target.name]: value });
     };
 
     const handleSubmit = async (e: React.FormEvent) => {
@@ -205,6 +211,81 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                             </label>
                         </div>
                     </div>
+                </div>
+
+                {/* Stripe Integrations */}
+                <div>
+                    <div className="flex items-center justify-between mb-6 border-b border-hui-border pb-2">
+                        <div>
+                            <h2 className="text-lg font-bold text-hui-textMain">Payment Integrations</h2>
+                            <p className="text-xs text-hui-textMuted">Enable Stripe to collect payments directly from the client portal.</p>
+                        </div>
+                        <label className="flex items-center gap-2 cursor-pointer">
+                            <span className="text-sm font-medium text-hui-textMain">Enable Stripe</span>
+                            <div className="relative inline-block w-10 mr-2 align-middle select-none transition duration-200 ease-in">
+                                <input
+                                    type="checkbox"
+                                    name="stripeEnabled"
+                                    id="stripeEnabled"
+                                    checked={formData.stripeEnabled}
+                                    onChange={handleChange}
+                                    className="toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border border-gray-300 appearance-none cursor-pointer transition-transform duration-200 ease-in-out checked:translate-x-full checked:bg-white checked:border-hui-primary"
+                                    style={{
+                                        WebkitAppearance: 'none',
+                                        MozAppearance: 'none'
+                                    }}
+                                />
+                                <label
+                                    htmlFor="stripeEnabled"
+                                    className={`toggle-label block overflow-hidden h-5 rounded-full cursor-pointer border transition-colors duration-200 ease-in-out ${formData.stripeEnabled ? 'bg-hui-primary border-hui-primary' : 'bg-gray-300 border-gray-300'}`}
+                                ></label>
+                            </div>
+                        </label>
+                    </div>
+                    
+                    {formData.stripeEnabled && (
+                        <div className="space-y-4 bg-hui-background border border-hui-border rounded-lg p-6">
+                            <p className="text-sm text-hui-textMuted mb-4">Choose which payment methods clients can use. Fees shown are standard rates and may vary based on your Stripe account setup.</p>
+                            
+                            <div className="flex items-center justify-between py-3 border-b border-hui-border/50">
+                                <div>
+                                    <p className="text-sm font-semibold text-hui-textMain">Credit & Debit Cards</p>
+                                    <p className="text-xs text-hui-textMuted">Standard capability. ~2.9% + 30¢ fee.</p>
+                                </div>
+                                <input type="checkbox" name="enableCard" checked={formData.enableCard} onChange={handleChange} className="w-4 h-4 text-hui-primary border-gray-300 rounded focus:ring-hui-primary" />
+                            </div>
+
+                            <div className="flex items-center justify-between py-3 border-b border-hui-border/50">
+                                <div>
+                                    <p className="text-sm font-semibold text-hui-textMain">ACH Bank Transfer</p>
+                                    <p className="text-xs text-hui-textMuted">Best for large invoices. ~0.8% fee capped at $5.</p>
+                                </div>
+                                <input type="checkbox" name="enableBankTransfer" checked={formData.enableBankTransfer} onChange={handleChange} className="w-4 h-4 text-hui-primary border-gray-300 rounded focus:ring-hui-primary" />
+                            </div>
+
+                            <div className="flex items-center justify-between py-3 border-b border-hui-border/50">
+                                <div>
+                                    <p className="text-sm font-semibold text-hui-textMain">Affirm (Buy Now Pay Later)</p>
+                                    <p className="text-xs text-hui-textMuted">Help clients finance. Fees absorbed by merchant (~3-5%).</p>
+                                </div>
+                                <input type="checkbox" name="enableAffirm" checked={formData.enableAffirm} onChange={handleChange} className="w-4 h-4 text-hui-primary border-gray-300 rounded focus:ring-hui-primary" />
+                            </div>
+
+                            <div className="flex items-center justify-between py-3">
+                                <div>
+                                    <p className="text-sm font-semibold text-hui-textMain">Klarna</p>
+                                    <p className="text-xs text-hui-textMuted">Pay in 4 installments. Fees absorbed by merchant (~3-5%).</p>
+                                </div>
+                                <input type="checkbox" name="enableKlarna" checked={formData.enableKlarna} onChange={handleChange} className="w-4 h-4 text-hui-primary border-gray-300 rounded focus:ring-hui-primary" />
+                            </div>
+
+                            <div className="mt-4 pt-4 border-t border-hui-border/50 flex justify-end">
+                                <a href="https://dashboard.stripe.com/" target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-1">
+                                    Manage Stripe Dashboard <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+                                </a>
+                            </div>
+                        </div>
+                    )}
                 </div>
 
             </div>

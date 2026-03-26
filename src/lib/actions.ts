@@ -916,6 +916,11 @@ export async function saveCompanySettings(data: any) {
             website: data.website,
             logoUrl: data.logoUrl,
             notificationEmail: data.notificationEmail,
+            stripeEnabled: data.stripeEnabled,
+            enableCard: data.enableCard,
+            enableBankTransfer: data.enableBankTransfer,
+            enableAffirm: data.enableAffirm,
+            enableKlarna: data.enableKlarna,
         },
     });
 

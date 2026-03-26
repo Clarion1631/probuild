@@ -267,6 +267,10 @@ model PaymentSchedule {
   status      String   @default("Pending") // Pending, Paid, Canceled
   dueDate     DateTime?
   paymentDate DateTime?
+  stripeSessionId       String?
+  stripePaymentIntentId String?
+  paymentMethod         String?
+  paidAt                DateTime?
   createdAt   DateTime @default(now())
 }
 
@@ -404,6 +408,11 @@ model CompanySettings {
   logoUrl           String?
   notificationEmail String?  // Where to send View/Sign alerts
   projectStatuses   String?  // JSON string array of custom statues [{label, value, color, dot}, ...]
+  stripeEnabled     Boolean @default(false)
+  enableCard        Boolean @default(true)
+  enableBankTransfer Boolean @default(false)
+  enableAffirm      Boolean @default(false)
+  enableKlarna      Boolean @default(false)
   
   updatedAt         DateTime @updatedAt
 }

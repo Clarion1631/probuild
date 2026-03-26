@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import Link from 'next/link';
 import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
+import PortalPayButton from "@/components/PortalPayButton";
 
 export default async function PortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const session = await getServerSession(authOptions);
@@ -33,7 +34,12 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
             },
             invoices: {
                 where: { status: { not: 'Draft' } },
-                orderBy: { issueDate: 'desc' }
+                orderBy: { issueDate: 'desc' },
+                include: {
+                    payments: {
+                        orderBy: { createdAt: 'asc' }
+                    }
+                }
             },
             floorPlans: {
                 orderBy: { createdAt: 'desc' }
@@ -119,10 +125,51 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                             {inv.status}
                                         </span>
                                     </div>
-                                    <div className="flex justify-between text-sm">
+                                    <div className="flex justify-between text-sm mb-4">
                                         <span className="text-hui-textMuted">Amount: ${(inv.totalAmount || 0).toLocaleString()}</span>
                                         <span className="font-medium text-hui-textMain">Due: ${(inv.balanceDue || 0).toLocaleString()}</span>
                                     </div>
+                                    
+                                    {inv.payments && inv.payments.length > 0 && (
+                                        <div className="space-y-2 border-t border-hui-border pt-3 mt-3">
+                                            {inv.payments.map((payment: any) => (
+                                                <div key={payment.id} className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 rounded-md border border-slate-100 gap-3">
+                                                    <div>
+                                                        <p className="text-sm font-semibold text-hui-textMain flex items-center gap-2">
+                                                            {payment.name}
+                                                            {payment.status === 'Paid' && (
+                                                                <span className="inline-flex items-center text-xs text-green-600 bg-green-50 px-1.5 py-0.5 rounded-full border border-green-200">
+                                                                    <svg className="w-3 h-3 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                    Paid {payment.paymentMethod ? `via ${payment.paymentMethod.toUpperCase()}` : ''}
+                                                                </span>
+                                                            )}
+                                                            {payment.status === 'Processing' && (
+                                                                <span className="text-xs text-yellow-600 bg-yellow-50 px-1.5 py-0.5 rounded-md border border-yellow-200">
+                                                                    Processing ACH
+                                                                </span>
+                                                            )}
+                                                        </p>
+                                                        {payment.dueDate && (
+                                                            <p className="text-xs text-hui-textMuted mt-0.5">Due: {new Date(payment.dueDate).toLocaleDateString()}</p>
+                                                        )}
+                                                    </div>
+                                                    
+                                                    <div className="flex flex-col sm:items-end w-full sm:w-auto mt-2 sm:mt-0">
+                                                        {payment.status === 'Pending' ? (
+                                                            <PortalPayButton 
+                                                                invoiceId={inv.id} 
+                                                                paymentScheduleId={payment.id} 
+                                                                amount={payment.amount}
+                                                                label="Pay Now"
+                                                            />
+                                                        ) : (
+                                                            <span className="text-sm font-medium text-hui-textMain">${payment.amount.toLocaleString()}</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                             ))}
                         </div>
