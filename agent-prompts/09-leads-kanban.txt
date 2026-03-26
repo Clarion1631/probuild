@@ -1,0 +1,56 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Add a Kanban board view to the Leads pipeline.
+
+Current state:
+- Lead model has stage field: "New", "Followed Up", "Connected", "Estimate Sent", "Won", "Closed"
+- Leads list page at src/app/leads/page.tsx (currently a table view)
+- Lead detail at src/app/leads/[id]/
+- @hello-pangea/dnd is already installed
+
+Build:
+1. KANBAN VIEW at src/app/leads/page.tsx:
+   - Add a toggle between "List" and "Board" view (persist choice in localStorage)
+   - Board view: 6 columns (one per stage), cards showing lead name, client, target revenue, days since created
+   - Drag-and-drop cards between columns to update stage (use @hello-pangea/dnd)
+   - On drop: call server action to update lead.stage
+   - Column headers show count and total target revenue
+
+2. LEAD CARDS — Each card shows:
+   - Client name + lead name
+   - Target revenue (if set)
+   - Days in stage
+   - Number of estimates attached
+   - Color-coded left border by stage
+
+3. QUICK ACTIONS — On card hover, show action buttons:
+   - "Create Estimate" → navigates to estimate creation for this lead
+   - "Schedule Meeting" → opens LeadMeeting modal
+   - "Convert to Project" → existing flow
+
+Use hui-card for lane containers, smooth drag animations with Framer Motion.

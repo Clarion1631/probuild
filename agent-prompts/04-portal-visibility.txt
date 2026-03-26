@@ -1,0 +1,54 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a per-project visibility control system for the client portal.
+
+Current state:
+- Client portal lives at src/app/portal/ with sub-routes: /projects/[id], /estimates/[id], /contracts/[id]
+- Portal layout is at src/app/portal/layout.tsx
+- Portal is excluded from auth middleware (see src/middleware.ts)
+- Project settings page exists at src/app/projects/[id]/settings/
+
+Build:
+1. PRISMA MODEL — Add a PortalVisibility model to prisma/schema.prisma:
+   - projectId (unique, links to Project)
+   - Boolean fields: showSchedule, showFiles, showDailyLogs, showEstimates, showInvoices, showContracts, showMessages
+   - All default to true except showDailyLogs (false)
+
+2. ADMIN SETTINGS UI — In the project settings page (src/app/projects/[id]/settings/), add a "Client Portal Visibility" section:
+   - Toggle switches for each visibility field
+   - Saves via server action to PortalVisibility record
+   - Use hui-card container with clear labels
+
+3. PORTAL ENFORCEMENT — Update the portal project detail page:
+   - Fetch PortalVisibility for the project
+   - Conditionally show/hide tabs and sections based on the toggles
+   - If a client navigates directly to a hidden section URL, show a friendly "This section is not available" message
+
+4. DEFAULT BEHAVIOR — When no PortalVisibility record exists, show everything except dailyLogs (match the defaults).
+
+Use hui-card, hui-btn for save, toggle switches with Tailwind for the admin settings.

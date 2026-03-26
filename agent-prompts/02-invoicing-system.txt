@@ -1,0 +1,57 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build the full invoicing workflow.
+
+Current state:
+- Invoice model exists in prisma/schema.prisma with PaymentSchedule relation
+- Invoice has: code, projectId, clientId, status (Draft/Issued/Paid/Overdue), totalAmount, balanceDue
+- Estimate model has EstimatePaymentSchedule for milestone payments
+- Basic invoice list at src/app/projects/[id]/invoices/ (needs verification)
+- Server actions in src/lib/actions.ts: createInvoiceFromEstimate, getInvoice, getProjectInvoices, recordPayment
+
+Build these features:
+1. INVOICE FROM ESTIMATE — Add a "Create Invoice" button on approved estimates that:
+   - Creates an Invoice record linked to the project and client
+   - Copies EstimatePaymentSchedule entries into PaymentSchedule records
+   - Sets totalAmount from the estimate total
+   - Auto-generates an invoice code (e.g., INV-001)
+
+2. INVOICE DETAIL PAGE at src/app/projects/[id]/invoices/[invoiceId]/page.tsx:
+   - Show invoice header (code, client, project, dates, status badge)
+   - Payment schedule table with milestone name, amount, status, due date
+   - "Record Payment" action that marks a PaymentSchedule as Paid and updates balanceDue
+   - Status auto-transitions: all paid → "Paid", past due date → "Overdue"
+
+3. INVOICE LIST at src/app/projects/[id]/invoices/page.tsx:
+   - Summary cards at top: Total Invoiced, Total Paid, Outstanding Balance
+   - Table with sortable columns: Code, Status, Amount, Balance Due, Issue Date
+   - Status filter tabs
+
+4. CROSS-PROJECT INVOICES LIST — Create a global invoices page at src/app/invoices/page.tsx or wire into the Financials sidebar link showing all invoices across projects.
+
+Use hui-card, hui-btn, StatusBadge component. Follow the list page pattern from PROJECT_GUIDE.md §4.1.

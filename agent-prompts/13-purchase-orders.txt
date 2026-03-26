@@ -1,0 +1,49 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a purchase order system.
+
+Build:
+1. PRISMA MODELS — Add to schema.prisma:
+   - Vendor: id, name, contactName, email, phone, address, notes, createdAt
+   - PurchaseOrder: id, code (auto-gen PO-001), projectId, vendorId, status ("Draft"/"Sent"/"Received"/"Cancelled"), totalAmount, notes, sentAt, createdAt
+   - PurchaseOrderItem: id, purchaseOrderId, description, quantity, unitCost, total, costCodeId
+
+2. API ROUTES at src/app/api/purchase-orders/ and src/app/api/vendors/
+
+3. PROJECT UI at src/app/projects/[id]/purchase-orders/page.tsx:
+   - PO list with status badges, vendor name, total amount
+   - "Create PO" → editor page with vendor selector, line items, cost code mapping
+   - "Send PO" → emails PDF to vendor
+
+4. VENDOR MANAGEMENT at src/app/company/vendors/page.tsx:
+   - Vendor list with search
+   - Add/edit vendor modal
+
+5. BUDGET INTEGRATION — PO amounts feed into the budget vs. actual tracking (committed costs).
+
+Add "Purchase Orders" to ProjectInnerSidebar. Use hui-card, hui-btn, hui-input patterns.

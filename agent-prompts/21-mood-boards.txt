@@ -1,0 +1,46 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a selection board / mood board feature for projects.
+
+Build:
+1. PRISMA MODELS:
+   - SelectionBoard: id, projectId, title, status ("Draft"/"Sent"/"Selections Made"), createdAt
+   - SelectionCategory: id, boardId, name (e.g., "Countertops", "Flooring", "Fixtures"), order
+   - SelectionOption: id, categoryId, name, description, imageUrl, price, vendorUrl, selected (boolean), order
+
+2. ADMIN UI at src/app/projects/[id]/selections/page.tsx:
+   - Create boards with categories
+   - Add options to each category (name, image upload, price, link)
+   - "Send to Client" button → makes board available in portal
+
+3. CLIENT PORTAL VIEW at /portal/projects/[id]/selections:
+   - Visual grid of options per category with images
+   - Client clicks to select their preferred option per category
+   - "Submit Selections" button → notifies PM
+
+4. Add "Selections" to ProjectInnerSidebar. Use image grid layout with hui-card for each option.

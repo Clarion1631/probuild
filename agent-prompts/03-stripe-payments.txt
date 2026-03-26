@@ -1,0 +1,87 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Wire Stripe payments into the client portal with support for Credit/Debit Cards, ACH Bank Transfer, and Buy Now Pay Later (Affirm/Klarna).
+
+Stripe packages are already installed (stripe + @stripe/stripe-js in package.json).
+
+Build these features:
+
+1. STRIPE SETUP:
+   - Add STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, and STRIPE_WEBHOOK_SECRET to .env.example
+   - Create src/lib/stripe.ts with a Stripe client singleton
+
+2. PAYMENT SESSION API — Create API route src/app/api/payments/create-session/route.ts:
+   - Accepts invoiceId and paymentScheduleId
+   - Creates a Stripe Checkout Session for the specific milestone amount
+   - Enable ALL of these payment method types:
+     payment_method_types: ['card', 'us_bank_account', 'affirm', 'klarna']
+   - 'card' = credit/debit cards (~2.9% + $0.30)
+   - 'us_bank_account' = ACH bank transfer (~0.8%, capped at $5 — huge savings on large invoices)
+   - 'affirm' = Buy Now Pay Later, pay over 3-12 months (client sees financing options at checkout)
+   - 'klarna' = Alternative BNPL, pay in 4 installments
+   - Set success_url to /portal/projects/[id]?payment=success
+   - Set cancel_url to /portal/projects/[id]?payment=cancelled
+   - Store Stripe session ID on the PaymentSchedule record
+   - Include metadata: { invoiceId, paymentScheduleId, projectId } for webhook reconciliation
+
+3. WEBHOOK HANDLER — Create src/app/api/webhook/stripe/route.ts:
+   - Verifies Stripe signature using STRIPE_WEBHOOK_SECRET
+   - Handle these events:
+     a) checkout.session.completed — mark PaymentSchedule as "Paid", update Invoice.balanceDue, record paymentDate
+     b) checkout.session.async_payment_succeeded — for ACH (bank transfers are async, can take 2-5 days)
+     c) checkout.session.async_payment_failed — for ACH failures, mark payment as "Failed", send alert email
+   - If all milestones on an invoice are paid, set Invoice.status to "Paid"
+   - Send notification email to CompanySettings.notificationEmail on successful payment
+   - Log the payment method used (card vs ACH vs affirm) for reporting
+
+4. PAYMENT METHOD DISPLAY — Update the PaymentSchedule model if needed:
+   - Add optional fields: stripeSessionId, stripePaymentIntentId, paymentMethod (string: "card"/"ach"/"affirm"/"klarna"), paidAt
+
+5. PORTAL PAY BUTTON — In the client portal project detail page (src/app/portal/projects/[id]/):
+   - Show outstanding invoices with individual "Pay Now" buttons per milestone
+   - Button calls the create-session API and redirects to Stripe Checkout
+   - Stripe Checkout automatically shows all enabled payment methods to the client:
+     * Card (default)
+     * Bank Transfer (shown with "Save with bank transfer" badge since fees are lower)
+     * Affirm / Pay Later options (shown automatically for eligible amounts)
+   - Show paid milestones with green checkmarks and the payment method used (e.g., "Paid via ACH")
+   - Show "Processing" state for pending ACH transfers
+
+6. PAYMENT SETTINGS UI — In settings (src/app/settings/company/ or new integrations page):
+   - Toggle to enable/disable each payment method (card, ACH, Affirm, Klarna)
+   - Show fee breakdown for each method so admin understands costs
+   - Stripe connection status indicator
+   - Link to Stripe Dashboard for managing disputes/payouts
+
+Add the webhook route to the middleware matcher exclusion list (already excludes /api/webhook).
+
+NOTE ON FEES (for the settings UI display):
+- Credit/Debit Card: 2.9% + $0.30 per transaction
+- ACH Bank Transfer: 0.8%, capped at $5.00 (best for large invoices)
+- Affirm: ~3-5% (absorbed by merchant, client pays 0% or low interest)
+- Klarna: ~3-5% (absorbed by merchant, client pays in 4 installments)

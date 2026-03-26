@@ -1,0 +1,55 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a messaging system between clients and project managers.
+
+Build:
+1. PRISMA MODELS — Add to schema.prisma:
+   - MessageThread: id, projectId (links to Project), createdAt
+   - Message: id, threadId, senderType ("CLIENT" | "TEAM"), senderName, senderEmail, body, readAt, createdAt
+
+2. API ROUTES at src/app/api/messages/:
+   - GET /api/messages?projectId=X — list messages for a project thread
+   - POST /api/messages — send a message (body: projectId, body, senderType)
+   - PATCH /api/messages/[id]/read — mark message as read
+
+3. ADMIN MESSAGE VIEW — Add a "Messages" tab in the project inner sidebar (src/components/ProjectInnerSidebar.tsx):
+   - Page at src/app/projects/[id]/messages/page.tsx
+   - Chat-style UI: messages in a scrollable container, input at bottom
+   - Team messages aligned right (green bubble), client messages aligned left (gray bubble)
+   - Show unread count badge on the sidebar tab
+
+4. PORTAL MESSAGE VIEW — Add a "Messages" tab to the portal project page:
+   - Similar chat UI but client messages are on the right
+   - Input field at bottom to compose and send
+
+5. EMAIL NOTIFICATION — When a new message is sent:
+   - If from client → email CompanySettings.notificationEmail
+   - If from team → email the Client.email
+   - Use src/lib/email.ts for sending
+
+Guard the Messages tab visibility behind PortalVisibility.showMessages (from Prompt #4). Use hui-card for the chat container.

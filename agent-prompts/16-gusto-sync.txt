@@ -1,0 +1,67 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a Gusto payroll integration.
+
+Current state:
+- TimeEntry model tracks: userId, projectId, costCodeId, startTime, endTime, durationHours, laborCost, burdenCost
+- Users have hourlyRate and burdenRate fields
+- Manager time entry approval exists at src/app/manager/time-entries/
+
+Build:
+1. SETUP:
+   - Install Gusto API client or use fetch calls to api.gusto.com
+   - Add env vars: GUSTO_CLIENT_ID, GUSTO_CLIENT_SECRET, GUSTO_REDIRECT_URI
+   - Create src/lib/gusto.ts — OAuth client, token management
+
+2. PRISMA — Add GustoConnection model:
+   - id, companyId (Gusto company UUID), accessToken, refreshToken, expiresAt
+   - Add GustoEmployeeMapping: id, userId (ProBuild User), gustoEmployeeId
+
+3. OAUTH FLOW:
+   - Settings page: "Connect to Gusto" button
+   - Standard OAuth redirect → callback → store tokens
+
+4. EMPLOYEE MAPPING:
+   - Pull Gusto employee list
+   - UI to map ProBuild Users to Gusto employees
+   - Store mappings in GustoEmployeeMapping
+
+5. TIME SYNC:
+   - "Push to Gusto" action on the manager time entries page
+   - Aggregates approved TimeEntries by employee for a pay period
+   - Creates regular hours entries in Gusto for each mapped employee
+   - Maps cost codes to Gusto earning types if configured
+   - Marks synced TimeEntries with a gustoSyncedAt timestamp to prevent double-push
+
+6. SETTINGS UI — Add Gusto section to src/app/settings/integrations/page.tsx:
+   - Connection status
+   - Employee mapping table
+   - Pay period selector for manual sync
+   - Sync history log
+
+Handle rate limiting and pagination from Gusto API. Show clear error messages if sync fails.

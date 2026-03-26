@@ -1,4 +1,5 @@
 import { getProject } from "@/lib/actions";
+import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import NewInvoiceClient from "./NewInvoiceClient";
 
@@ -8,7 +9,12 @@ export default async function NewInvoicePage({ params }: { params: { id: string 
     
     if (!project) return <div className="p-6 text-hui-textMain">Project not found</div>;
 
-    const estimates = project.estimates || [];
+    // Fetch estimates with payment schedules for milestone count display
+    const estimates = await prisma.estimate.findMany({
+        where: { projectId: id },
+        orderBy: { createdAt: "desc" },
+        include: { paymentSchedules: true },
+    });
 
     return (
         <div className="flex h-full bg-hui-background">

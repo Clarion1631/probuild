@@ -1,0 +1,71 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a certificate and license vault for subcontractors.
+
+Current state:
+- Subcontractor model has single-file COI fields: coiFileUrl, coiExpiresAt, coiUploaded
+- File uploads use Supabase Storage (src/lib/supabase.ts)
+- Admin sub management at src/app/company/subcontractors/
+
+Build:
+1. PRISMA MODEL — Add SubcontractorDocument to schema.prisma:
+   - id, subcontractorId (links to Subcontractor)
+   - type: "COI" | "W9" | "LICENSE" | "BOND" | "OTHER"
+   - name (display name), fileUrl, mimeType, size
+   - expiresAt (nullable DateTime)
+   - status: "ACTIVE" | "EXPIRED" | "EXPIRING_SOON" (computed or stored)
+   - uploadedAt, createdAt
+
+2. API ROUTES at src/app/api/subcontractors/[id]/documents/:
+   - GET — list all documents for a sub
+   - POST — upload a new document (use Supabase Storage bucket "sub-documents")
+   - DELETE /[docId] — remove a document
+
+3. SUB DETAIL UI — On the subcontractor detail page in Company settings:
+   - "Documents" section showing a table of uploaded docs
+   - Type badge, filename, expiration date, status badge (green/yellow/red)
+   - Upload button with type selector dropdown
+   - Delete button per row
+
+4. COMPLIANCE DASHBOARD — Create src/app/company/subcontractors/compliance/page.tsx:
+   - Summary cards: Total Subs, Compliant, Expiring Soon (< 30 days), Expired
+   - Table of all subs with their document status (traffic light indicators)
+   - Click a sub to expand and see their documents
+   - Filter tabs: All, Expiring Soon, Expired
+
+5. SUB-PORTAL VIEW — In the sub portal, add a "My Documents" page:
+   - Subs can view their own documents
+   - Upload new documents (COI, W-9, etc.)
+   - See expiration warnings
+
+6. EXPIRATION ALERTS — Add a server action or cron-compatible API route that:
+   - Finds documents expiring within 30 days
+   - Sets status to "EXPIRING_SOON"
+   - Sends email alert to CompanySettings.notificationEmail listing expiring docs
+
+Use hui-card for containers, StatusBadge for status indicators, hui-btn for actions.

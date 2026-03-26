@@ -1,0 +1,58 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Build a subcontractor-facing portal.
+
+Current state:
+- Subcontractor model in prisma/schema.prisma has: companyName, contactName, email, phone, trade, licenseNumber, status, coiFileUrl, coiExpiresAt
+- SubTaskAssignment links subcontractors to ScheduleTasks
+- Subcontractor CRUD API at src/app/api/subcontractors/
+- Admin management UI at src/app/company/subcontractors/
+
+Build:
+1. AUTH — Add a magic-link login flow for subcontractors:
+   - API route POST /api/sub-portal/login — accepts email, finds Subcontractor, generates a signed JWT token (24hr expiry), emails a login link
+   - API route GET /api/sub-portal/verify?token=X — verifies JWT, sets an httpOnly cookie
+   - Add /sub-portal to the middleware matcher exclusions (same pattern as /portal)
+
+2. PORTAL LAYOUT at src/app/sub-portal/layout.tsx:
+   - Clean layout without the main app Sidebar/Header
+   - Simple top nav: company logo, sub name, Logout
+   - Similar aesthetic to the client portal
+
+3. DASHBOARD at src/app/sub-portal/page.tsx:
+   - Show all projects where the sub has SubTaskAssignment entries
+   - Card grid showing project name, status, number of assigned tasks
+
+4. PROJECT VIEW at src/app/sub-portal/projects/[id]/page.tsx:
+   - Show only the ScheduleTasks assigned to this sub (via SubTaskAssignment)
+   - Task list with: name, start/end dates, status, progress bar
+   - Read-only — subs can view but not edit
+
+5. ADMIN INVITE — Add an "Invite to Portal" button on the subcontractor detail page in Company settings that triggers the magic link email.
+
+Use the HUI design system. Match the visual style of the client portal at src/app/portal/.

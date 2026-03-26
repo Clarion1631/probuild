@@ -1,0 +1,46 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Wire the global search flyout to a cross-entity search API.
+
+Current state: Sidebar.tsx has a search flyout panel with a text input but it's not connected to anything.
+
+Build:
+1. API ROUTE at /api/search?q=QUERY:
+   - Search across: Projects (name), Clients (name, email), Leads (name), Estimates (title, code), Invoices (code), Subcontractors (companyName, contactName)
+   - Use Prisma `contains` with case-insensitive mode
+   - Return results grouped by entity type, max 5 per type
+   - Each result: id, type, title, subtitle, url (link to detail page)
+
+2. UPDATE SIDEBAR SEARCH — In the search flyout in Sidebar.tsx:
+   - Debounced search (300ms) on input change
+   - Show results grouped by type with icons
+   - Click result → navigate to detail page and close flyout
+   - "No results" empty state
+   - Loading spinner while searching
+
+Respect permissions: only return entities the user has access to (use getCurrentUserWithPermissions).

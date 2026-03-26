@@ -49,7 +49,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                             <div>
                                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Finance</h3>
                                 <ul className="space-y-2 text-sm">
-                                    {can("invoices") && <li><Link href="#" className="hover:text-hui-primary block transition">All Invoices</Link></li>}
+                                    {can("invoices") && <li><Link href="/invoices" className="hover:text-hui-primary block transition">All Invoices</Link></li>}
                                     {can("changeOrders") && <li><Link href="#" className="hover:text-hui-primary block transition">All Change Orders</Link></li>}
                                 </ul>
                             </div>
@@ -98,7 +98,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
 
                 {/* Financials — gated by invoices or financialReports */}
                 {(can("invoices") || can("financialReports")) && (
-                    <Link href="#" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
+                    <Link href="/invoices" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
                         <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                         <span className="text-[10px] uppercase font-semibold text-center leading-tight">Financials</span>
                     </Link>

@@ -1,0 +1,82 @@
+MANDATORY WORKFLOW:
+
+STEP 1 — READ CONTEXT:
+1. Read AGENT_CONTEXT.md — it lists every existing function, route, page, and model.
+2. Read PROJECT_GUIDE.md — it defines the HUI design system and coding conventions.
+
+STEP 2 — AUDIT BEFORE BUILDING:
+3. BEFORE writing any code, check if this feature (or parts of it) already exists.
+4. If it exists: review the current implementation, identify bugs or improvements, fix them.
+5. If it partially exists: extend it — do NOT rebuild from scratch.
+6. If it doesn't exist: build it following the conventions in the context files.
+
+STEP 3 — CODING RULES:
+7. Do NOT rebuild, re-scaffold, or duplicate anything that already exists.
+8. ADD new server actions to src/lib/actions.ts (do NOT create new action files).
+9. EXTEND existing pages/components when possible rather than creating new ones.
+
+STEP 4 — VERIFY:
+10. Run `npm run dev` and visually verify your changes work in the browser.
+11. Run `npm run build` to confirm there are no build errors.
+
+STEP 5 — DEPLOY:
+12. Stage all changes: git add -A
+13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
+14. Push to trigger Vercel deployment: git push origin main
+15. Confirm the push succeeded and report the commit hash.
+
+TASK: Integrate Wisetack consumer financing into the client portal.
+
+CONTEXT: Wisetack is a contractor-focused financing platform. Clients apply for a loan ($500–$25,000+), get approved in seconds, and the contractor gets paid in full upfront. The client pays Wisetack back over time. The contractor pays $0 in fees — the borrower pays interest.
+
+Wisetack provides either:
+A) An embeddable widget URL (iframe) that you place in your portal
+B) A partner API for creating financing requests programmatically
+
+Build:
+
+1. WISETACK SETUP:
+   - Add env vars to .env.example: WISETACK_PARTNER_ID, WISETACK_API_KEY, WISETACK_ENVIRONMENT (sandbox/production)
+   - Create src/lib/wisetack.ts with:
+     * API client configured for sandbox (api.sandbox.wisetack.us) or production (api.wisetack.us)
+     * Function: createFinancingRequest(amount, customerEmail, customerName, projectDescription) → returns a financing URL
+     * Function: getFinancingStatus(transactionId) → returns approval status
+
+2. PRISMA MODEL — Add FinancingRequest to schema.prisma:
+   - id, invoiceId (links to Invoice), projectId
+   - provider: "WISETACK" (expandable for future providers)
+   - externalId (Wisetack transaction ID)
+   - amount, status ("PENDING" | "APPROVED" | "FUNDED" | "DECLINED" | "EXPIRED")
+   - applicationUrl (the link client clicks to apply)
+   - createdAt, updatedAt
+
+3. API ROUTES:
+   - POST /api/financing/request — creates a Wisetack financing request for an invoice
+     * Calls Wisetack API to create the transaction
+     * Stores the FinancingRequest record with the returned application URL and transaction ID
+     * Returns the application URL to the client
+   - GET /api/financing/status/[id] — checks current status from Wisetack API
+   - POST /api/webhook/wisetack — webhook endpoint for Wisetack status updates
+     * On "funded": mark the related Invoice as "Paid", update PaymentSchedule records
+     * On "declined"/"expired": update FinancingRequest status
+     * Send notification email to CompanySettings.notificationEmail
+
+4. PORTAL UI — On the client portal invoice/project page:
+   - Below the "Pay Now" button (Stripe), add a "Finance This Project" section:
+     * Card with Wisetack branding: "Need financing? Apply in 60 seconds."
+     * "Check My Rate" button — calls /api/financing/request, then redirects to the Wisetack application URL
+     * Show financing status if a request already exists (Pending, Approved, Funded, Declined)
+     * If approved/funded, show green banner: "Financing approved — your contractor has been paid!"
+   - Make this section toggleable from the admin payment settings (same settings page from Prompt #3)
+
+5. ADMIN VIEW — On the invoice detail page (admin side):
+   - Show financing status if a FinancingRequest exists for this invoice
+   - Badge: "Client applied for financing" with current status
+   - Link to Wisetack dashboard for details
+
+6. SETTINGS — In the payment settings UI (from Prompt #3):
+   - "Client Financing" section with toggle to enable/disable Wisetack
+   - Wisetack connection status (connected / not configured)
+   - Note: "You pay $0 — the client pays interest on their loan"
+
+Add /api/webhook/wisetack to the middleware matcher exclusion list.

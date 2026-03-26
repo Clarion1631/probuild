@@ -793,6 +793,10 @@ export async function getInvoice(id: string) {
     const invoice = await prisma.invoice.findUnique({
         where: { id },
         include: {
+            project: {
+                include: { client: true },
+            },
+            client: true,
             payments: {
                 orderBy: { createdAt: "asc" },
             },
@@ -824,6 +828,7 @@ export async function recordPayment(paymentId: string, invoiceId: string, timest
 
     revalidatePath(`/projects/${invoice!.projectId}/invoices`);
     revalidatePath(`/projects/${invoice!.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/invoices`);
 
     return { success: true };
 }
@@ -832,7 +837,32 @@ export async function getProjectInvoices(projectId: string) {
     return await prisma.invoice.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
+        include: { client: true },
     });
+}
+
+export async function getAllInvoices() {
+    return await prisma.invoice.findMany({
+        orderBy: { createdAt: "desc" },
+        include: {
+            project: { select: { id: true, name: true } },
+            client: { select: { id: true, name: true } },
+        },
+    });
+}
+
+export async function issueInvoice(invoiceId: string) {
+    const invoice = await prisma.invoice.update({
+        where: { id: invoiceId },
+        data: {
+            status: "Issued",
+            issueDate: new Date(),
+        },
+    });
+    revalidatePath(`/projects/${invoice.projectId}/invoices`);
+    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/invoices`);
+    return { success: true };
 }
 
 async function generateBudgetForEstimate(estimateId: string, projectId: string) {
