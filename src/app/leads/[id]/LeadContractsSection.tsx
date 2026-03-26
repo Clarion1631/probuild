@@ -11,8 +11,8 @@ interface Contract {
     recurringDays?: number | null; nextDueDate?: string | null;
 }
 interface SigningRecord {
-    id: string; signedBy: string; signedAt: string;
-    periodStart?: string | null; periodEnd?: string | null;
+    id: string; signedBy: string; signedAt: string | Date;
+    periodStart?: string | Date | null; periodEnd?: string | Date | null;
     signatureUrl?: string | null;
 }
 

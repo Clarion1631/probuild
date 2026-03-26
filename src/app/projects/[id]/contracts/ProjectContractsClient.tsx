@@ -6,8 +6,8 @@ import { toast } from "sonner";
 
 interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
-    id: string; signedBy: string; signedAt: string;
-    periodStart?: string | null; periodEnd?: string | null;
+    id: string; signedBy: string; signedAt: string | Date;
+    periodStart?: string | Date | null; periodEnd?: string | Date | null;
     signatureUrl?: string | null;
 }
 

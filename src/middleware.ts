@@ -1,7 +1,7 @@
 import { withAuth } from "next-auth/middleware";
 import { NextResponse } from "next/server";
 
-export default async function middleware(req: any) {
+export default async function middleware(req: any, event: any) {
     // Bypass authentication entirely during development for local testing
     if (process.env.NODE_ENV === 'development') {
         // Allow all requests to pass through without authentication in development
@@ -10,11 +10,13 @@ export default async function middleware(req: any) {
     }
 
     // Existing authentication logic for other environments
-    return withAuth({
+    const authMiddleware = withAuth({
         pages: {
             signIn: "/login",
         },
-    })(req);
+    });
+    
+    return authMiddleware(req as any, event);
 }
 
 export const config = {

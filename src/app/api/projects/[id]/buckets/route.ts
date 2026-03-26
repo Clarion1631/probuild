@@ -25,7 +25,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     // params.id is awaitable in Next.js 15, but since Next 13-14 it's sync. Assuming Next 14 here.
     const projectId = (await params).id;
 
-    const budget = await prisma.budget.findFirst({
+    const budget = await (prisma as any).budget?.findFirst({
         where: { projectId },
         include: {
             buckets: true

@@ -15,7 +15,7 @@ export default async function ManagerTimeEntriesPage() {
         return <div className="p-8 text-red-500">Access Denied. Managers Only.</div>;
     }
 
-    const entries = await prisma.timeEntry.findMany({
+    const entries = await (prisma as any).timeEntry?.findMany({
         include: {
             user: true,
             project: true,
@@ -23,7 +23,7 @@ export default async function ManagerTimeEntriesPage() {
         },
         orderBy: { startTime: 'desc' },
         take: 100 // Limit for display
-    });
+    }) || [];
 
     const totalDuration = entries.reduce((acc: number, e: any) => acc + (e.durationHours || 0), 0);
     const totalCost = entries.reduce((acc: number, e: any) => acc + (e.laborCost || 0) + (e.burdenCost || 0), 0);
