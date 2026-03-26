@@ -51,6 +51,8 @@ export async function POST(req: Request) {
         const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || "http://localhost:3000";
         const clientName = paymentSchedule.invoice.project?.client?.name || "Client";
 
+        const projectName = paymentSchedule.invoice.project?.name || "Services";
+
         // Create Stripe checkout session
         const stripeSession = await stripe.checkout.sessions.create({
             payment_method_types: paymentMethodTypes,
@@ -60,7 +62,7 @@ export async function POST(req: Request) {
                         currency: "usd",
                         product_data: {
                             name: `Invoice #${paymentSchedule.invoice.code} — ${paymentSchedule.name}`,
-                            description: `${paymentSchedule.invoice.project.name} • ${clientName}`,
+                            description: `${projectName} • ${clientName}`,
                         },
                         unit_amount: Math.round(paymentSchedule.amount * 100), // Stripe expects cents
                     },
@@ -73,7 +75,7 @@ export async function POST(req: Request) {
             metadata: {
                 invoiceId: paymentSchedule.invoiceId,
                 paymentScheduleId: paymentSchedule.id,
-                projectId: projectId,
+                projectId: projectId || "none",
             },
         });
 
