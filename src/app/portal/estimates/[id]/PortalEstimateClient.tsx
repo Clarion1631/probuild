@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 
@@ -10,8 +10,11 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
+    const viewedRef = useRef(false);
 
     useEffect(() => {
+        if (viewedRef.current) return;
+        viewedRef.current = true;
         markEstimateViewed(initialEstimate.id).catch(console.error);
     }, [initialEstimate.id]);
 
