@@ -198,8 +198,9 @@ export default function PortalContractClient({ initialContract, companySettings 
             }
 
             window.location.reload();
-        } catch (e) {
-            setError("Something went wrong processing your approval.");
+        } catch (e: any) {
+            console.error(e);
+            setError(e?.message || String(e) || "Something went wrong processing your approval.");
             setIsSubmitting(false);
         }
     };
