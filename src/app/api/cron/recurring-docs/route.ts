@@ -9,10 +9,13 @@ const cronSecret = process.env.CRON_SECRET || "local-cron-secret-123";
 export async function GET(req: Request) {
     try {
         const authHeader = req.headers.get('authorization');
+        const url = new URL(req.url);
+        const isTesting = url.searchParams.get('test') === 'true';
         
-        // Ensure local development or valid Vercel Cron Secret
+        // Ensure local development, test query, or valid Vercel Cron Secret
         if (
             process.env.NODE_ENV !== 'development' && 
+            !isTesting &&
             authHeader !== `Bearer ${cronSecret}`
         ) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

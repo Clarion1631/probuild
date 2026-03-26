@@ -63,32 +63,31 @@ export default function PortalContractClient({ initialContract, companySettings 
         return html;
     }, [initialContract.body, isSigned, initialContract.approvedAt]);
 
-    // Attach Listeners to injected buttons
+    // Attach Delegated Listeners
     useEffect(() => {
-        if (!contractBodyRef.current || isSigned) return;
+        const container = contractBodyRef.current;
+        if (!container || isSigned) return;
 
-        const handleSigClick = (e: MouseEvent) => {
-            const target = e.currentTarget as HTMLElement;
-            setActiveBlockId(target.dataset.id || null);
-            setModalMode("signature");
-            setModalOpen(true);
+        const handleDelegatedClick = (e: MouseEvent) => {
+            const target = e.target as HTMLElement;
+            const btn = target.closest('.doc-block-btn') as HTMLElement;
+            if (!btn) return;
+
+            const id = btn.dataset.id;
+            if (btn.classList.contains('sig-block')) {
+                setActiveBlockId(id || null);
+                setModalMode("signature");
+                setModalOpen(true);
+            } else if (btn.classList.contains('init-block')) {
+                setActiveBlockId(id || null);
+                setModalMode("initials");
+                setModalOpen(true);
+            }
         };
-        const handleInitClick = (e: MouseEvent) => {
-            const target = e.currentTarget as HTMLElement;
-            setActiveBlockId(target.dataset.id || null);
-            setModalMode("initials");
-            setModalOpen(true);
-        };
 
-        const sigBtns = contractBodyRef.current.querySelectorAll('.sig-block');
-        const initBtns = contractBodyRef.current.querySelectorAll('.init-block');
-
-        sigBtns.forEach(btn => btn.addEventListener('click', handleSigClick as any));
-        initBtns.forEach(btn => btn.addEventListener('click', handleInitClick as any));
-
+        container.addEventListener('click', handleDelegatedClick);
         return () => {
-            sigBtns.forEach(btn => btn.removeEventListener('click', handleSigClick as any));
-            initBtns.forEach(btn => btn.removeEventListener('click', handleInitClick as any));
+            container.removeEventListener('click', handleDelegatedClick);
         };
     }, [parsedBody, isSigned]);
 
