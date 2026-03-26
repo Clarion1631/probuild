@@ -64,11 +64,13 @@ export async function POST(req: Request) {
             const flat = settings.cardProcessingFlat ?? 0.30;
             const feeAmount = (paymentSchedule.amount * (rate / 100)) + flat;
             
+            const feeName = flat > 0 ? `Processing Fee (${rate}% + $${flat.toFixed(2)})` : `Processing Fee (${rate}%)`;
+            
             feeLineItem = {
                 price_data: {
                     currency: "usd",
                     product_data: {
-                        name: `Processing Fee (${rate}% + $${flat.toFixed(2)})`,
+                        name: feeName,
                         description: `Convenience fee for online card payment`,
                     },
                     unit_amount: Math.round(feeAmount * 100), // Stripe expects cents

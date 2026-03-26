@@ -105,7 +105,9 @@ export default function PortalPayButton({
                                             </div>
                                         </div>
                                         {passFee ? (
-                                            <p className="text-xs text-gray-500">Includes a {rate}% + ${flat.toFixed(2)} processing fee.</p>
+                                            <p className="text-xs text-gray-500">
+                                                Includes a {rate}% {flat > 0 ? `+ $${flat.toFixed(2)} ` : ''}processing fee.
+                                            </p>
                                         ) : (
                                             <p className="text-xs text-gray-500">Pay securely with any major card.</p>
                                         )}
