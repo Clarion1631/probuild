@@ -1179,6 +1179,9 @@ export async function saveCompanySettings(data: any) {
             enableBankTransfer: data.enableBankTransfer,
             enableAffirm: data.enableAffirm,
             enableKlarna: data.enableKlarna,
+            passProcessingFee: data.passProcessingFee,
+            cardProcessingRate: data.cardProcessingRate !== undefined ? parseFloat(data.cardProcessingRate) : undefined,
+            cardProcessingFlat: data.cardProcessingFlat !== undefined ? parseFloat(data.cardProcessingFlat) : undefined,
         },
     });
 

@@ -17,6 +17,9 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
         enableBankTransfer: initialData?.enableBankTransfer || false,
         enableAffirm: initialData?.enableAffirm || false,
         enableKlarna: initialData?.enableKlarna || false,
+        passProcessingFee: initialData?.passProcessingFee || false,
+        cardProcessingRate: initialData?.cardProcessingRate ?? 2.9,
+        cardProcessingFlat: initialData?.cardProcessingFlat ?? 0.30,
     });
 
     const [isSaving, setIsSaving] = useState(false);
@@ -287,6 +290,84 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                         </div>
                     )}
                 </div>
+
+                {/* Payment Processing Fees */}
+                {formData.stripeEnabled && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6 border-b border-hui-border pb-2">
+                            <div>
+                                <h2 className="text-lg font-bold text-hui-textMain">Payment Processing Fees</h2>
+                                <p className="text-xs text-hui-textMuted">Choose who pays the processing fees for online card payments.</p>
+                            </div>
+                        </div>
+
+                        <div className="space-y-6">
+                            <label className="flex items-start gap-3 cursor-pointer p-4 border border-hui-border rounded-lg bg-white hover:bg-slate-50 transition">
+                                <input
+                                    type="radio"
+                                    name="passProcessingFee"
+                                    checked={!formData.passProcessingFee}
+                                    onChange={() => setFormData({ ...formData, passProcessingFee: false })}
+                                    className="w-4 h-4 text-hui-primary border-gray-300 mt-1 focus:ring-hui-primary"
+                                />
+                                <div>
+                                    <span className="block text-sm font-semibold text-hui-textMain">Deduct fee from my payout (Recommended)</span>
+                                    <span className="block text-xs text-hui-textMuted mt-1">The client pays the exact invoice amount. Stripe deducts fees before depositing to your bank.</span>
+                                </div>
+                            </label>
+
+                            <div className={`p-4 border rounded-lg transition-colors ${formData.passProcessingFee ? 'border-hui-primary bg-blue-50/30' : 'border-hui-border bg-white hover:bg-slate-50'}`}>
+                                <label className="flex items-start gap-3 cursor-pointer w-full">
+                                    <input
+                                        type="radio"
+                                        name="passProcessingFee"
+                                        checked={formData.passProcessingFee}
+                                        onChange={() => setFormData({ ...formData, passProcessingFee: true })}
+                                        className="w-4 h-4 text-hui-primary border-gray-300 mt-1 focus:ring-hui-primary"
+                                    />
+                                    <div className="flex-1">
+                                        <span className="block text-sm font-semibold text-hui-textMain">Client pays the processing fee</span>
+                                        <span className="block text-xs text-hui-textMuted mt-1">A separate "Processing Fee" line item is added when the client chooses to pay by Credit Card. (Bank transfers remain free).</span>
+                                        
+                                        {formData.passProcessingFee && (
+                                            <div className="mt-4 pt-4 border-t border-blue-100 flex items-center gap-4">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-sm font-medium text-hui-textMain">Card Rate:</span>
+                                                    <div className="relative w-24">
+                                                        <input
+                                                            type="number"
+                                                            step="0.01"
+                                                            name="cardProcessingRate"
+                                                            value={formData.cardProcessingRate}
+                                                            onChange={handleChange}
+                                                            className="hui-input w-full pr-6 text-right"
+                                                        />
+                                                        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-sm text-hui-textMuted">%</span>
+                                                    </div>
+                                                </div>
+                                                <span className="text-sm text-hui-textMuted">+</span>
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-sm font-medium text-hui-textMain">Flat Fee:</span>
+                                                    <div className="relative w-24">
+                                                        <span className="absolute left-2 top-1/2 -translate-y-1/2 text-sm text-hui-textMuted">$</span>
+                                                        <input
+                                                            type="number"
+                                                            step="0.01"
+                                                            name="cardProcessingFlat"
+                                                            value={formData.cardProcessingFlat}
+                                                            onChange={handleChange}
+                                                            className="hui-input w-full pl-6 text-left"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                )}
 
             </div>
 

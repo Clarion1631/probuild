@@ -5,7 +5,7 @@ import { stripe } from "@/lib/stripe";
 export async function POST(req: Request) {
     try {
         const body = await req.json();
-        const { invoiceId, paymentScheduleId } = body;
+        const { invoiceId, paymentScheduleId, selectedMethod } = body;
 
         if (!invoiceId || !paymentScheduleId) {
             return new NextResponse("Missing invoiceId or paymentScheduleId", { status: 400 });
@@ -35,16 +35,20 @@ export async function POST(req: Request) {
         // Check company settings for enabled payment methods
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
 
-        // Build payment method types based on settings (default to card if nothing configured)
+        // Build payment method types based on settings or the specific selection
         const paymentMethodTypes: any[] = [];
-        if (settings?.enableCard !== false) paymentMethodTypes.push("card");
-        if (settings?.enableBankTransfer) paymentMethodTypes.push("us_bank_account");
-        if (settings?.enableAffirm) paymentMethodTypes.push("affirm");
-        if (settings?.enableKlarna) paymentMethodTypes.push("klarna");
+        if (selectedMethod) {
+            paymentMethodTypes.push(selectedMethod);
+        } else {
+            if (settings?.enableCard !== false) paymentMethodTypes.push("card");
+            if (settings?.enableBankTransfer) paymentMethodTypes.push("us_bank_account");
+            if (settings?.enableAffirm) paymentMethodTypes.push("affirm");
+            if (settings?.enableKlarna) paymentMethodTypes.push("klarna");
 
-        // Fallback to card if nothing is selected
-        if (paymentMethodTypes.length === 0) {
-            paymentMethodTypes.push("card");
+            // Fallback to card if nothing is selected
+            if (paymentMethodTypes.length === 0) {
+                paymentMethodTypes.push("card");
+            }
         }
 
         const projectId = paymentSchedule.invoice.projectId;
@@ -53,22 +57,48 @@ export async function POST(req: Request) {
 
         const projectName = paymentSchedule.invoice.project?.name || "Services";
 
+        // Calculate Processing Fees
+        let feeLineItem = null;
+        if (settings?.passProcessingFee && selectedMethod && selectedMethod !== 'us_bank_account') {
+            const rate = settings.cardProcessingRate ?? 2.9;
+            const flat = settings.cardProcessingFlat ?? 0.30;
+            const feeAmount = (paymentSchedule.amount * (rate / 100)) + flat;
+            
+            feeLineItem = {
+                price_data: {
+                    currency: "usd",
+                    product_data: {
+                        name: `Processing Fee (${rate}% + $${flat.toFixed(2)})`,
+                        description: `Convenience fee for online card payment`,
+                    },
+                    unit_amount: Math.round(feeAmount * 100), // Stripe expects cents
+                },
+                quantity: 1,
+            };
+        }
+
+        const lineItems: any[] = [
+            {
+                price_data: {
+                    currency: "usd",
+                    product_data: {
+                        name: `Invoice #${paymentSchedule.invoice.code} — ${paymentSchedule.name}`,
+                        description: `${projectName} • ${clientName}`,
+                    },
+                    unit_amount: Math.round(paymentSchedule.amount * 100), // Stripe expects cents
+                },
+                quantity: 1,
+            },
+        ];
+
+        if (feeLineItem) {
+            lineItems.push(feeLineItem);
+        }
+
         // Create Stripe checkout session
         const stripeSession = await stripe.checkout.sessions.create({
             payment_method_types: paymentMethodTypes,
-            line_items: [
-                {
-                    price_data: {
-                        currency: "usd",
-                        product_data: {
-                            name: `Invoice #${paymentSchedule.invoice.code} — ${paymentSchedule.name}`,
-                            description: `${projectName} • ${clientName}`,
-                        },
-                        unit_amount: Math.round(paymentSchedule.amount * 100), // Stripe expects cents
-                    },
-                    quantity: 1,
-                },
-            ],
+            line_items: lineItems,
             mode: "payment",
             success_url: `${appUrl}/portal/invoices/${invoiceId}?payment=success`,
             cancel_url: `${appUrl}/portal/invoices/${invoiceId}?payment=cancelled`,

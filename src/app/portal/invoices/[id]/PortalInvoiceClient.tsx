@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import { markInvoiceViewed } from "@/lib/actions";
+import PortalPayButton from "@/components/PortalPayButton";
 
 export default function PortalInvoiceClient({ initialInvoice, companySettings }: { initialInvoice: any, companySettings?: any }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
@@ -9,35 +10,6 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
     useEffect(() => {
         markInvoiceViewed(initialInvoice.id).catch(console.error);
     }, [initialInvoice.id]);
-
-    async function handlePay(paymentScheduleId: string) {
-        setIsPayingId(paymentScheduleId);
-        try {
-            const res = await fetch("/api/payments/create-session", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    invoiceId: initialInvoice.id,
-                    paymentScheduleId,
-                }),
-            });
-            if (!res.ok) {
-                const errText = await res.text();
-                console.error("Payment session error:", errText);
-                alert(`Unable to start payment:\n\n${errText}`);
-                return;
-            }
-            const data = await res.json();
-            if (data.url) {
-                window.location.href = data.url;
-            }
-        } catch (err) {
-            console.error("Payment error:", err);
-            alert("Something went wrong. Please try again.");
-        } finally {
-            setIsPayingId(null);
-        }
-    }
 
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
@@ -194,13 +166,13 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                                                     ${(payment.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                                                 </span>
                                                 {!isPaidItem && (
-                                                    <button
-                                                        onClick={() => handlePay(payment.id)}
-                                                        disabled={isPayingId !== null}
-                                                        className="px-5 py-2.5 bg-slate-800 text-white rounded-lg font-semibold text-sm hover:bg-slate-900 transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                                                    >
-                                                        {isPayingId === payment.id ? "Redirecting..." : "Pay Now"}
-                                                    </button>
+                                                    <PortalPayButton 
+                                                        invoiceId={initialInvoice.id} 
+                                                        paymentScheduleId={payment.id} 
+                                                        amount={payment.amount}
+                                                        label="Pay Now"
+                                                        settings={companySettings}
+                                                    />
                                                 )}
                                                 {isPaidItem && (
                                                     <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center">

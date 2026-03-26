@@ -47,6 +47,8 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
         }
     });
 
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+
     if (!project) return notFound();
 
     return (
@@ -161,6 +163,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                                                 paymentScheduleId={payment.id} 
                                                                 amount={payment.amount}
                                                                 label="Pay Now"
+                                                                settings={settings}
                                                             />
                                                         ) : (
                                                             <span className="text-sm font-medium text-hui-textMain">${payment.amount.toLocaleString()}</span>

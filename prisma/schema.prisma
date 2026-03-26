@@ -417,6 +417,11 @@ model CompanySettings {
   enableAffirm      Boolean @default(false)
   enableKlarna      Boolean @default(false)
   
+  // Processing Fees
+  passProcessingFee   Boolean @default(false)
+  cardProcessingRate  Float   @default(2.9)
+  cardProcessingFlat  Float   @default(0.30)
+  
   updatedAt         DateTime @updatedAt
 }
 
