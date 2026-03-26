@@ -3,7 +3,6 @@
 import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
-import { generateEstimatePdf } from "./pdf";
 
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
@@ -637,6 +636,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     if (settings.notificationEmail) {
         let attachments: any = undefined;
         try {
+            const { generateEstimatePdf } = await import("./pdf");
             const pdfBuffer = await generateEstimatePdf(estimateId);
             attachments = [{
                 filename: `Estimate_${estimate?.code || estimateId}.pdf`,
