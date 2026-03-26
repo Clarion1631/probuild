@@ -27,6 +27,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const [showLinkModal, setShowLinkModal] = useState(false);
     const [linking, setLinking] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
+    const [currentLead, setCurrentLead] = useState(lead || null);
     const { permissions, loaded } = usePermissions();
 
     const can = (key?: string) => !key || !loaded || !!permissions[key];
@@ -82,6 +83,8 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
         setLinking(true);
         try {
             await linkProjectToLead(projectId, leadId);
+            const linked = availableLeads.find(l => l.id === leadId);
+            if (linked) setCurrentLead({ id: linked.id, name: linked.name });
             toast.success("Lead linked to project!");
             setShowLinkModal(false);
             router.refresh();
@@ -95,6 +98,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
         setLinking(true);
         try {
             await linkProjectToLead(projectId, null);
+            setCurrentLead(null);
             toast.success("Lead unlinked");
             router.refresh();
         } catch (e: any) {
@@ -126,10 +130,10 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
             {/* Lead Link - Prominent */}
             <div className="px-3 pt-3 pb-1">
-                {lead ? (
+                {currentLead ? (
                     <div className="group/lead">
                         <Link
-                            href={`/leads/${lead.id}`}
+                            href={`/leads/${currentLead.id}`}
                             className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 hover:from-amber-100 hover:to-orange-100 transition"
                         >
                             <div className="w-7 h-7 bg-amber-100 rounded-lg flex items-center justify-center shrink-0">
@@ -142,7 +146,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                             </div>
                             <div className="min-w-0 flex-1">
                                 <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider">Lead</p>
-                                <p className="text-xs font-medium text-amber-800 truncate">{lead.name}</p>
+                                <p className="text-xs font-medium text-amber-800 truncate">{currentLead.name}</p>
                             </div>
                             <svg className="w-3.5 h-3.5 text-amber-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
