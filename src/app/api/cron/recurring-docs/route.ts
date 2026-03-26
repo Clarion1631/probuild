@@ -6,7 +6,7 @@ import crypto from 'crypto';
 // Protect cron route against unauthorized access outside Vercel Cron
 const cronSecret = process.env.CRON_SECRET || "local-cron-secret-123";
 
-export async function POST(req: Request) {
+export async function GET(req: Request) {
     try {
         const authHeader = req.headers.get('authorization');
         

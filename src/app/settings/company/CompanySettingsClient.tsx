@@ -311,7 +311,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                     className="w-4 h-4 text-hui-primary border-gray-300 mt-1 focus:ring-hui-primary"
                                 />
                                 <div>
-                                    <span className="block text-sm font-semibold text-hui-textMain">Deduct fee from my payout (Recommended)</span>
+                                    <span className="block text-sm font-semibold text-hui-textMain">Deduct fee from my payout</span>
                                     <span className="block text-xs text-hui-textMuted mt-1">The client pays the exact invoice amount. Stripe deducts fees before depositing to your bank.</span>
                                 </div>
                             </label>
@@ -326,7 +326,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                         className="w-4 h-4 text-hui-primary border-gray-300 mt-1 focus:ring-hui-primary"
                                     />
                                     <div className="flex-1">
-                                        <span className="block text-sm font-semibold text-hui-textMain">Client pays the processing fee</span>
+                                        <span className="block text-sm font-semibold text-hui-textMain">Client pays the processing fee (Recommended)</span>
                                         <span className="block text-xs text-hui-textMuted mt-1">A separate "Processing Fee" line item is added when the client chooses to pay by Credit Card. (Bank transfers remain free).</span>
                                         
                                         {formData.passProcessingFee && (

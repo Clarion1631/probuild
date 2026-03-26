@@ -92,17 +92,45 @@ export default function PortalContractClient({ initialContract, companySettings 
         };
     }, [parsedBody, isSigned]);
 
+    // Sync DOM with State for visual highlighting and re-rendering images
+    useEffect(() => {
+        if (!contractBodyRef.current || isSigned) return;
+
+        const sigBtns = contractBodyRef.current.querySelectorAll('.sig-block');
+        const initBtns = contractBodyRef.current.querySelectorAll('.init-block');
+
+        // Helper to sync
+        const syncBtn = (btn: Element, stateMap: Record<string, any>, defaultText: string) => {
+            const id = (btn as HTMLElement).dataset.id;
+            if (!id) return;
+            
+            if (stateMap[id]) {
+                // It is signed
+                btn.innerHTML = `<img src="${stateMap[id].image}" class="h-10 object-contain mix-blend-multiply" alt="Signed" />`;
+                btn.classList.add('bg-transparent', 'border-none', 'p-0', 'ring-0', 'shadow-none');
+                btn.classList.remove('bg-blue-50', 'border-blue-300', 'text-blue-700', 'animate-pulse', 'ring-2', 'ring-red-400');
+            } else {
+                // It is missing
+                btn.innerHTML = defaultText;
+                btn.classList.remove('bg-transparent', 'border-none', 'p-0', 'ring-0', 'shadow-none');
+                btn.classList.add('bg-blue-50', 'border-blue-300', 'text-blue-700');
+                
+                // If they tried to submit and failed, or just naturally highlight
+                if (error) {
+                    btn.classList.add('ring-2', 'ring-red-400', 'animate-pulse');
+                } else {
+                    btn.classList.add('ring-2', 'ring-blue-400', 'animate-bounce-subtle');
+                }
+            }
+        };
+
+        sigBtns.forEach(btn => syncBtn(btn, signatures, "[ Click to Sign ]"));
+        initBtns.forEach(btn => syncBtn(btn, initials, "[ Click to Initial ]"));
+    }, [signatures, initials, error, isSigned]);
+
     // Handle Modal Finish
     const handleSignBlock = (dataUrl: string, typedName: string) => {
         if (!activeBlockId) return;
-
-        // Render the image into the DOM immediately replacing the button visually
-        const btn = contractBodyRef.current?.querySelector(`[data-id="${activeBlockId}"]`);
-        if (btn) {
-            btn.innerHTML = `<img src="${dataUrl}" class="h-12 object-contain mix-blend-multiply" alt="${typedName}" />`;
-            btn.classList.add('bg-transparent', 'border-none', 'p-0');
-            btn.classList.remove('bg-blue-50', 'text-blue-600', 'hover:bg-blue-100');
-        }
 
         if (modalMode === "signature") {
             setSignatures(prev => ({ ...prev, [activeBlockId]: { image: dataUrl, name: typedName } }));
