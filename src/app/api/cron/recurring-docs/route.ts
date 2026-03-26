@@ -47,21 +47,10 @@ export async function GET(req: Request) {
             const clientEmail = contract.project?.client?.email || contract.lead?.client?.email;
             const clientName = contract.project?.client?.name || contract.lead?.client?.name || "Client";
             
-            if (!clientEmail) continue;
-
             // Generate a secure one-time period record
             const periodStart = contract.nextDueDate || now;
             const periodEnd = new Date(periodStart);
             periodEnd.setDate(periodEnd.getDate() + contract.recurringDays);
-
-            // We use ContractSigningRecord to track individual monthly signatures
-            // The portal will check if there's an active unsigned record for this specific Contract
-            // Wait, our portal signs the Contract itself (updating approvedBy on Contract). 
-            // In a true recurring setup, the portal should link to the specific record, OR we update the contract status.
-            
-            // To be straightforward for now: The portal signs the `Contract` model natively.
-            // When a recurring document is due, we reset its `status` back to "Sent", clearing the main signature,
-            // and saving the existing signature into `ContractSigningRecord` for history!
 
             // Keep historical archive of current signature
             if (contract.approvedBy) {
@@ -91,39 +80,43 @@ export async function GET(req: Request) {
                 }
             });
 
-            const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/contracts/${contract.id}`;
-            const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-            
-            // Dispatch Notification Email
-            await sendNotification(
-                clientEmail,
-                `Action Required: Monthly Document Ready to Sign - ${contract.title}`,
-                `<!DOCTYPE html>
-                <html>
-                <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-                    <div style="text-align: center; margin-bottom: 32px;">
-                        <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${settings?.companyName || 'ProBuild'}</h1>
-                    </div>
-                    <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                        <h2 style="font-size: 20px; margin: 0 0 8px;">Action Required: Signature Needed</h2>
-                        <p style="color: #666; margin: 0 0 24px;">Hi ${clientName},</p>
-                        <p style="color: #666; line-height: 1.6;">
-                            It's time to sign your upcoming <strong>${contract.title}</strong> for the current billing period.
-                        </p>
-                        <div style="text-align: center; margin: 32px 0;">
-                            <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                                Review & Sign Securely
-                            </a>
+            // Dispatch Notification Email only if we have an email
+            if (clientEmail) {
+                const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/contracts/${contract.id}`;
+                const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                
+                await sendNotification(
+                    clientEmail,
+                    `Action Required: Monthly Document Ready to Sign - ${contract.title}`,
+                    `<!DOCTYPE html>
+                    <html>
+                    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+                        <div style="text-align: center; margin-bottom: 32px;">
+                            <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${settings?.companyName || 'ProBuild'}</h1>
                         </div>
-                        <p style="color: #999; font-size: 13px; text-align: center;">
-                            Or copy this link: ${portalUrl}
-                        </p>
-                    </div>
-                </body>
-                </html>`,
-                undefined,
-                { fromName: settings?.companyName || 'ProBuild', replyTo: settings?.email || undefined }
-            );
+                        <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                            <h2 style="font-size: 20px; margin: 0 0 8px;">Action Required: Signature Needed</h2>
+                            <p style="color: #666; margin: 0 0 24px;">Hi ${clientName},</p>
+                            <p style="color: #666; line-height: 1.6;">
+                                It's time to sign your upcoming <strong>${contract.title}</strong> for the current billing period.
+                            </p>
+                            <div style="text-align: center; margin: 32px 0;">
+                                <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                                    Review & Sign Securely
+                                </a>
+                            </div>
+                            <p style="color: #999; font-size: 13px; text-align: center;">
+                                Or copy this link: ${portalUrl}
+                            </p>
+                        </div>
+                    </body>
+                    </html>`,
+                    undefined,
+                    { fromName: settings?.companyName || 'ProBuild', replyTo: settings?.email || undefined }
+                );
+            }
+
+            createdRecords.push(contract.id);
 
             createdRecords.push(contract.id);
         }
