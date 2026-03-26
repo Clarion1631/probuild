@@ -148,11 +148,13 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                     <h3 className="text-sm font-semibold text-green-800">Electronically Signed and Approved</h3>
                                     <p className="text-sm text-green-700 mt-0.5">Signed by: <strong>{initialEstimate.approvedBy}</strong></p>
                                     <p className="text-xs text-green-600 mt-0.5">{new Date(initialEstimate.approvedAt).toLocaleString()}</p>
+                                    <p className="text-xs text-green-700 mt-1 flex items-center gap-1.5"><svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg> A copy of the signed PDF has been sent to your email.</p>
                                 </div>
                             </div>
                             {initialEstimate.signatureUrl && (
-                                <div className="mt-3 pt-3 border-t border-green-200">
-                                    <img src={initialEstimate.signatureUrl} alt="Signature" className="h-12 object-contain" />
+                                <div className="mt-4 pt-4 border-t border-green-200 flex flex-col items-start">
+                                    <span className="text-[10px] text-green-600 uppercase font-semibold mb-2">Electronic Signature</span>
+                                    <img src={initialEstimate.signatureUrl} alt="Signature" className="h-16 object-contain mix-blend-multiply" />
                                 </div>
                             )}
                         </div>

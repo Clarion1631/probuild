@@ -296,6 +296,60 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         }
     }
 
+    // --- Signature Section ---
+    if (estimate.status === 'Approved' && estimate.approvedBy) {
+        y -= 60;
+        checkNewPage(150);
+
+        page.drawText('Electronic Signature / Approval', {
+            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
+        });
+
+        y -= 20;
+        page.drawLine({
+            start: { x: margin, y }, end: { x: pageWidth - margin, y },
+            thickness: 0.5, color: colors.border,
+        });
+
+        y -= 25;
+        // Signature metadata
+        page.drawText(`Signed By:  ${estimate.approvedBy}`, {
+            x: margin, y, size: 10, font: helveticaBold, color: colors.textMain,
+        });
+        y -= 15;
+        page.drawText(`Date:          ${estimate.approvedAt ? new Date(estimate.approvedAt).toLocaleString() : new Date().toLocaleString()}`, {
+            x: margin, y, size: 10, font: helvetica, color: colors.textMain,
+        });
+        if (estimate.approvalIp) {
+            y -= 15;
+            page.drawText(`IP Address:  ${estimate.approvalIp}`, {
+                x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
+            });
+        }
+
+        // Signature Image
+        if (estimate.signatureUrl && estimate.signatureUrl.startsWith('data:image/png;base64,')) {
+            try {
+                const base64Data = estimate.signatureUrl.replace('data:image/png;base64,', '');
+                const sigImageBytes = Buffer.from(base64Data, 'base64');
+                const embeddedSig = await doc.embedPng(sigImageBytes);
+                
+                // Scale signature down so it fits nicely
+                const sigDims = embeddedSig.scale(0.35); 
+                page.drawImage(embeddedSig, {
+                    x: pageWidth - margin - sigDims.width,
+                    y: y, // draw next to metadata
+                    width: sigDims.width,
+                    height: sigDims.height,
+                });
+            } catch (err) {
+                console.warn("Could not embed signature image in PDF:", err);
+            }
+        }
+        
+        y -= 40;
+    }
+
     // --- Footer ---
     const footerY = 30;
     const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;

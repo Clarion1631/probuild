@@ -25,9 +25,9 @@ export default function PortalPayButton({ paymentScheduleId, invoiceId, amount, 
             } else {
                 throw new Error("No URL returned from Stripe");
             }
-        } catch (error) {
+        } catch (error: any) {
             console.error(error);
-            alert("Unable to process payment right now. Please try again later.");
+            alert(`Unable to process payment right now:\n\n${error.message || error}`);
             setIsLoading(false);
         }
     };

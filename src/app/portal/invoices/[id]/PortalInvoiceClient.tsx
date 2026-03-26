@@ -24,7 +24,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
             if (!res.ok) {
                 const errText = await res.text();
                 console.error("Payment session error:", errText);
-                alert("Unable to start payment. Please try again or contact us.");
+                alert(`Unable to start payment:\n\n${errText}`);
                 return;
             }
             const data = await res.json();
