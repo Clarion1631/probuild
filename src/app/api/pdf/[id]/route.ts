@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateEstimatePdf } from "@/lib/pdf";
-import { getEstimate } from "@/lib/actions";
 
 export async function GET(
     req: NextRequest,
-    context: { params: Promise<{ id: string }> } // Await the entire params object
+    context: { params: Promise<{ id: string }> }
 ) {
     const resolvedParams = await context.params;
     const { id } = resolvedParams;
@@ -14,18 +13,17 @@ export async function GET(
     }
 
     try {
-        const estimate = await getEstimate(id);
-        if (!estimate) {
-            return NextResponse.json({ error: "Estimate not found" }, { status: 404 });
-        }
-
         const pdfBuffer = await generateEstimatePdf(id);
+
+        const inline = req.nextUrl.searchParams.get('inline') === 'true';
 
         return new NextResponse(pdfBuffer as any, {
             status: 200,
             headers: {
                 "Content-Type": "application/pdf",
-                "Content-Disposition": `attachment; filename="Estimate_${estimate.code || id}.pdf"`,
+                "Content-Disposition": inline
+                    ? `inline; filename="Estimate_${id}.pdf"`
+                    : `attachment; filename="Estimate_${id}.pdf"`,
             },
         });
     } catch (error) {

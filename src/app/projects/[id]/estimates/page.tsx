@@ -1,7 +1,8 @@
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
-import { getProject, createDraftEstimate } from "@/lib/actions";
+import { getProject, createDraftEstimate, duplicateEstimate, getEstimateTemplates, createEstimateFromTemplate } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import EstimatesListClient from "./EstimatesListClient";
 
 export default async function EstimatesPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -10,6 +11,8 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
     if (!project) return <div className="p-6">Project not found</div>;
 
     const estimates = project.estimates || [];
+    let templates: any[] = [];
+    try { templates = await getEstimateTemplates(); } catch {}
 
     // Calculate real stats
     const approvedEstimates = estimates.filter((e: any) => e.status === 'Approved' || e.status === 'Sent');
@@ -23,6 +26,22 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
         redirect(`/projects/${resolvedParams.id}/estimates/${result.id}`);
     }
 
+    async function handleNewFromTemplate(formData: FormData) {
+        "use server";
+        const templateId = formData.get("templateId") as string;
+        if (!templateId) return;
+        const result = await createEstimateFromTemplate(resolvedParams.id, templateId);
+        redirect(`/projects/${resolvedParams.id}/estimates/${result.id}`);
+    }
+
+    async function handleDuplicate(formData: FormData) {
+        "use server";
+        const estimateId = formData.get("estimateId") as string;
+        if (!estimateId) return;
+        const result = await duplicateEstimate(estimateId);
+        redirect(`/projects/${resolvedParams.id}/estimates/${result.id}`);
+    }
+
     return (
         <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
             <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-50 via-white to-slate-50/50">
@@ -33,12 +52,12 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                             <h1 className="text-2xl font-bold text-hui-textMain">Estimates</h1>
                             <p className="text-sm text-hui-textMuted mt-1">{estimates.length} estimate{estimates.length !== 1 ? 's' : ''} for {project.name}</p>
                         </div>
-                        <form action={handleNewEstimate}>
-                            <button type="submit" className="hui-btn hui-btn-primary flex items-center gap-2 shadow-md shadow-indigo-500/20 hover:shadow-lg hover:shadow-indigo-500/30 transition-all">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
-                                New Estimate
-                            </button>
-                        </form>
+                        <EstimatesListClient
+                            projectId={resolvedParams.id}
+                            templates={templates}
+                            handleNewEstimate={handleNewEstimate}
+                            handleNewFromTemplate={handleNewFromTemplate}
+                        />
                     </div>
 
                     {/* Stats Cards */}
@@ -76,7 +95,7 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                     <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Status</th>
                                     <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Total Amount</th>
                                     <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Date</th>
-                                    <th className="w-12"></th>
+                                    <th className="w-24"></th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
@@ -106,7 +125,17 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                         <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
                                         <td className="px-6 py-4 text-right font-semibold text-slate-700">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                                         <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
-                                        <td className="px-4 py-4">
+                                        <td className="px-4 py-4 flex items-center gap-1 justify-end">
+                                            <form action={handleDuplicate}>
+                                                <input type="hidden" name="estimateId" value={est.id} />
+                                                <button
+                                                    type="submit"
+                                                    title="Duplicate estimate"
+                                                    className="text-slate-300 hover:text-slate-600 hover:bg-slate-100 rounded p-1.5 transition opacity-0 group-hover:opacity-100"
+                                                >
+                                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                                </button>
+                                            </form>
                                             <Link href={`/projects/${project.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
                                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
                                             </Link>
