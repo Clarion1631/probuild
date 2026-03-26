@@ -41,7 +41,7 @@ export default async function ProjectLayout({
     }
 
     const lead = await getProjectLead(id);
-    const allLeads = !lead ? await getLeadsForLinking() : [];
+    const allLeads = await getLeadsForLinking();
 
     return (
         <div className="flex h-full -mx-6 -my-6 bg-slate-50">
