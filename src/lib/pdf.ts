@@ -1,5 +1,19 @@
-import { jsPDF } from 'jspdf';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
+
+// Color helpers
+const colors = {
+    primary: rgb(79 / 255, 70 / 255, 229 / 255),     // indigo-600
+    textMain: rgb(15 / 255, 23 / 255, 42 / 255),      // slate-900
+    textMuted: rgb(100 / 255, 116 / 255, 139 / 255),   // slate-500
+    border: rgb(226 / 255, 232 / 255, 240 / 255),      // slate-200
+    bgLight: rgb(248 / 255, 250 / 255, 252 / 255),     // slate-50
+    white: rgb(1, 1, 1),
+};
+
+function formatCurrency(amount: number): string {
+    return `$${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
 
 export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     const estimate = await prisma.estimate.findUnique({
@@ -8,226 +22,292 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             items: { orderBy: { order: 'asc' } },
             paymentSchedules: { orderBy: { order: 'asc' } },
             project: {
-                include: {
-                    client: true,
-                },
+                include: { client: true },
             },
-            lead: true,
+            lead: {
+                include: { client: true },
+            },
         },
     });
 
     if (!estimate) throw new Error('Estimate not found');
 
-    // Fetch company info for header
-    const company = await prisma.companyInfo.findFirst();
+    const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
 
-    const doc = new jsPDF({ unit: 'pt', format: 'letter' });
-    const pageWidth = doc.internal.pageSize.getWidth();
+    const doc = await PDFDocument.create();
+    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const pageWidth = 612; // Letter width in points
+    const pageHeight = 792; // Letter height in points
     const margin = 50;
     const contentWidth = pageWidth - margin * 2;
-    let y = margin;
 
-    // Colors
-    const primaryColor: [number, number, number] = [79, 70, 229]; // indigo-600
-    const textMain: [number, number, number] = [15, 23, 42]; // slate-900
-    const textMuted: [number, number, number] = [100, 116, 139]; // slate-500
-    const borderColor: [number, number, number] = [226, 232, 240]; // slate-200
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+        }
+    }
 
     // --- Header accent bar ---
-    doc.setFillColor(...primaryColor);
-    doc.rect(0, 0, pageWidth, 6, 'F');
-    y = 40;
+    page.drawRectangle({
+        x: 0, y: pageHeight - 6, width: pageWidth, height: 6,
+        color: colors.primary,
+    });
+    y = pageHeight - 40;
 
     // --- Company Name ---
-    if (company?.name) {
-        doc.setFontSize(11);
-        doc.setTextColor(...textMuted);
-        doc.text(company.name.toUpperCase(), margin, y);
+    if (company?.companyName) {
+        page.drawText(company.companyName.toUpperCase(), {
+            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
+        });
     }
 
     // --- Title ---
-    y += 30;
-    doc.setFontSize(26);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(...textMain);
-    doc.text(estimate.title || 'Estimate', margin, y);
+    y -= 30;
+    page.drawText(estimate.title || 'Estimate', {
+        x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
+    });
 
-    // --- Estimate Info Box ---
-    y += 30;
-    doc.setFontSize(9);
-    doc.setTextColor(...textMuted);
+    // --- Estimate Info ---
+    y -= 30;
 
     // Left: Client info
     const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
-    const clientEmail = estimate.project?.client?.email || estimate.lead?.email || '';
-    doc.setFont('helvetica', 'bold');
-    doc.text('ESTIMATE TO', margin, y);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(11);
-    doc.setTextColor(...textMain);
-    if (clientName) { y += 16; doc.text(clientName, margin, y); }
-    if (clientEmail) { y += 14; doc.setFontSize(9); doc.setTextColor(...textMuted); doc.text(clientEmail, margin, y); }
+    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
 
-    // Right: Estimate # and Date
+    page.drawText('ESTIMATE TO', {
+        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
+    });
+
+    if (clientName) {
+        y -= 16;
+        page.drawText(clientName, {
+            x: margin, y, size: 11, font: helvetica, color: colors.textMain,
+        });
+    }
+    if (clientEmail) {
+        y -= 14;
+        page.drawText(clientEmail, {
+            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
+        });
+    }
+
+    // Right side: Estimate # / Date / Status
     const rightX = pageWidth - margin;
-    let ry = y - (clientEmail ? 30 : 16);
-    doc.setFontSize(9);
-    doc.setTextColor(...textMuted);
-    doc.text('Estimate No.', rightX - 140, ry);
-    doc.setTextColor(...textMain);
-    doc.setFont('helvetica', 'bold');
-    doc.text(estimate.code || '', rightX, ry, { align: 'right' });
-    ry += 16;
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...textMuted);
-    doc.text('Date', rightX - 140, ry);
-    doc.setTextColor(...textMain);
-    doc.text(new Date(estimate.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), rightX, ry, { align: 'right' });
-    ry += 16;
-    doc.setTextColor(...textMuted);
-    doc.text('Status', rightX - 140, ry);
-    doc.setTextColor(...textMain);
-    doc.text(estimate.status || 'Draft', rightX, ry, { align: 'right' });
+    let ry = y + (clientEmail ? 30 : 16);
 
-    // --- Line Items Table ---
-    y += 30;
+    const drawRightLabel = (label: string, value: string, yPos: number) => {
+        page.drawText(label, {
+            x: rightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted,
+        });
+        const valueWidth = helveticaBold.widthOfTextAtSize(value, 9);
+        page.drawText(value, {
+            x: rightX - valueWidth, y: yPos, size: 9, font: helveticaBold, color: colors.textMain,
+        });
+    };
 
-    // Separator
-    doc.setDrawColor(...borderColor);
-    doc.setLineWidth(0.5);
-    doc.line(margin, y, pageWidth - margin, y);
-    y += 20;
+    drawRightLabel('Estimate No.', estimate.code || '', ry);
+    ry -= 16;
+    drawRightLabel('Date', new Date(estimate.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
+    ry -= 16;
+    drawRightLabel('Status', estimate.status || 'Draft', ry);
 
-    // Table header
+    // --- Separator ---
+    y -= 20;
+    page.drawLine({
+        start: { x: margin, y }, end: { x: pageWidth - margin, y },
+        thickness: 0.5, color: colors.border,
+    });
+    y -= 20;
+
+    // --- Table Header ---
     const cols = {
         name: margin,
         qty: margin + contentWidth * 0.55,
-        unitCost: margin + contentWidth * 0.68,
+        unitCost: margin + contentWidth * 0.75,
         total: pageWidth - margin,
     };
 
-    doc.setFontSize(8);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(...textMuted);
-    doc.text('ITEM DESCRIPTION', cols.name, y);
-    doc.text('QTY', cols.qty, y, { align: 'right' });
-    doc.text('UNIT COST', cols.unitCost + 40, y, { align: 'right' });
-    doc.text('TOTAL', cols.total, y, { align: 'right' });
+    function drawTableHeader() {
+        page.drawText('ITEM DESCRIPTION', {
+            x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
+        const qtyLabel = 'QTY';
+        const qtyWidth = helveticaBold.widthOfTextAtSize(qtyLabel, 8);
+        page.drawText(qtyLabel, {
+            x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
+        const ucLabel = 'UNIT COST';
+        const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
+        page.drawText(ucLabel, {
+            x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
+        const totalLabel = 'TOTAL';
+        const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
+        page.drawText(totalLabel, {
+            x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
 
-    y += 8;
-    doc.setDrawColor(...borderColor);
-    doc.line(margin, y, pageWidth - margin, y);
-    y += 14;
+        y -= 8;
+        page.drawLine({
+            start: { x: margin, y }, end: { x: pageWidth - margin, y },
+            thickness: 0.5, color: colors.border,
+        });
+        y -= 14;
+    }
 
-    // Table rows — client-facing: only show unitCost (sell price), not baseCost/markup
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(10);
+    drawTableHeader();
 
+    // --- Table Rows ---
     for (const item of estimate.items) {
-        // Check if we need a new page
-        if (y > doc.internal.pageSize.getHeight() - 100) {
-            doc.addPage();
-            y = margin;
-        }
+        checkNewPage(100);
 
         const isSubItem = !!item.parentId;
         const nameX = isSubItem ? cols.name + 16 : cols.name;
+        const nameFont = isSubItem ? helvetica : helveticaBold;
 
-        doc.setTextColor(...textMain);
-        doc.setFont('helvetica', isSubItem ? 'normal' : 'bold');
-        doc.text(item.name || '', nameX, y, { maxWidth: contentWidth * 0.5 });
+        // Truncate long names
+        let displayName = item.name || '';
+        const maxNameWidth = contentWidth * 0.5;
+        while (nameFont.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) {
+            displayName = displayName.slice(0, -1);
+        }
 
-        doc.setFont('helvetica', 'normal');
-        doc.setTextColor(...textMuted);
-        doc.text(String(item.quantity || 0), cols.qty, y, { align: 'right' });
+        page.drawText(displayName, {
+            x: nameX, y, size: 10, font: nameFont, color: colors.textMain,
+        });
 
-        doc.text(
-            `$${(item.unitCost || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-            cols.unitCost + 40, y, { align: 'right' }
-        );
+        // Qty
+        const qtyStr = String(item.quantity || 0);
+        const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
+        page.drawText(qtyStr, {
+            x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+        });
 
-        doc.setTextColor(...textMain);
-        doc.setFont('helvetica', 'bold');
-        doc.text(
-            `$${(item.total || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-            cols.total, y, { align: 'right' }
-        );
-        doc.setFont('helvetica', 'normal');
+        // Unit cost
+        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
+        page.drawText(ucStr, {
+            x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+        });
 
-        y += 20;
+        // Total
+        const totalStr = formatCurrency(item.total || 0);
+        const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
+        page.drawText(totalStr, {
+            x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
+        });
+
+        y -= 20;
     }
 
-    // --- Totals ---
-    y += 10;
-    doc.setDrawColor(...borderColor);
-    doc.line(margin + contentWidth * 0.5, y, pageWidth - margin, y);
-    y += 20;
+    // --- Totals Section ---
+    y -= 10;
+    checkNewPage(120);
+    page.drawLine({
+        start: { x: margin + contentWidth * 0.5, y },
+        end: { x: pageWidth - margin, y },
+        thickness: 0.5, color: colors.border,
+    });
+    y -= 20;
 
     const subtotal = estimate.items.reduce((sum, item) => sum + (item.total || 0), 0);
     const tax = subtotal * 0.087;
     const total = subtotal + tax;
 
     // Subtotal
-    doc.setFontSize(10);
-    doc.setTextColor(...textMuted);
-    doc.text('Subtotal', cols.unitCost - 20, y);
-    doc.setTextColor(...textMain);
-    doc.text(`$${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, cols.total, y, { align: 'right' });
-    y += 18;
+    const labelX = cols.unitCost - 60;
+    page.drawText('Subtotal', {
+        x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
+    });
+    const subtotalStr = formatCurrency(subtotal);
+    const subtotalWidth = helvetica.widthOfTextAtSize(subtotalStr, 10);
+    page.drawText(subtotalStr, {
+        x: cols.total - subtotalWidth, y, size: 10, font: helvetica, color: colors.textMain,
+    });
+    y -= 18;
 
     // Tax
-    doc.setTextColor(...textMuted);
-    doc.text('Estimated Tax (8.7%)', cols.unitCost - 20, y);
-    doc.setTextColor(...textMain);
-    doc.text(`$${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, cols.total, y, { align: 'right' });
-    y += 22;
+    page.drawText('Estimated Tax (8.7%)', {
+        x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
+    });
+    const taxStr = formatCurrency(tax);
+    const taxWidth = helvetica.widthOfTextAtSize(taxStr, 10);
+    page.drawText(taxStr, {
+        x: cols.total - taxWidth, y, size: 10, font: helvetica, color: colors.textMain,
+    });
+    y -= 22;
 
     // Total line
-    doc.setDrawColor(...borderColor);
-    doc.line(cols.unitCost - 30, y - 6, pageWidth - margin, y - 6);
+    page.drawLine({
+        start: { x: labelX - 10, y: y + 6 },
+        end: { x: pageWidth - margin, y: y + 6 },
+        thickness: 0.5, color: colors.border,
+    });
 
-    doc.setFontSize(14);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(...primaryColor);
-    doc.text('Total', cols.unitCost - 20, y + 8);
-    doc.text(`$${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, cols.total, y + 8, { align: 'right' });
+    page.drawText('Total', {
+        x: labelX, y: y - 8, size: 14, font: helveticaBold, color: colors.primary,
+    });
+    const totalStr2 = formatCurrency(total);
+    const totalWidth2 = helveticaBold.widthOfTextAtSize(totalStr2, 14);
+    page.drawText(totalStr2, {
+        x: cols.total - totalWidth2, y: y - 8, size: 14, font: helveticaBold, color: colors.primary,
+    });
 
     // --- Payment Schedule ---
     if (estimate.paymentSchedules.length > 0) {
-        y += 50;
-        if (y > doc.internal.pageSize.getHeight() - 120) { doc.addPage(); y = margin; }
+        y -= 50;
+        checkNewPage(120);
 
-        doc.setFontSize(11);
-        doc.setFont('helvetica', 'bold');
-        doc.setTextColor(...textMain);
-        doc.text('Payment Schedule', margin, y);
-        y += 20;
+        page.drawText('Payment Schedule', {
+            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
+        });
+        y -= 20;
 
-        doc.setFontSize(9);
         for (const sched of estimate.paymentSchedules) {
-            doc.setFont('helvetica', 'bold');
-            doc.setTextColor(...textMain);
-            doc.text(sched.name || '', margin, y);
-            doc.setFont('helvetica', 'normal');
-            doc.setTextColor(...textMuted);
-            const schedAmount = sched.amount ? `$${sched.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '';
-            const schedPct = sched.percentage ? `${sched.percentage}%` : '';
-            doc.text(`${schedPct}  ${schedAmount}`, margin + contentWidth * 0.5, y);
+            checkNewPage(60);
+
+            page.drawText(sched.name || '', {
+                x: margin, y, size: 9, font: helveticaBold, color: colors.textMain,
+            });
+
+            const schedInfo: string[] = [];
+            if (sched.percentage) schedInfo.push(`${sched.percentage}%`);
+            if (sched.amount) schedInfo.push(formatCurrency(sched.amount));
+            const schedText = schedInfo.join('  ');
+
+            page.drawText(schedText, {
+                x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
+            });
+
             if (sched.dueDate) {
-                doc.text(new Date(sched.dueDate).toLocaleDateString(), cols.total, y, { align: 'right' });
+                const dateStr = new Date(sched.dueDate).toLocaleDateString();
+                const dateWidth = helvetica.widthOfTextAtSize(dateStr, 9);
+                page.drawText(dateStr, {
+                    x: cols.total - dateWidth, y, size: 9, font: helvetica, color: colors.textMuted,
+                });
             }
-            y += 18;
+            y -= 18;
         }
     }
 
     // --- Footer ---
-    const footerY = doc.internal.pageSize.getHeight() - 30;
-    doc.setFontSize(7);
-    doc.setTextColor(...textMuted);
-    doc.text(`Generated ${new Date().toLocaleDateString()} • ${company?.name || 'ProBuild'}`, margin, footerY);
-    doc.text('Page 1', pageWidth - margin, footerY, { align: 'right' });
+    const footerY = 30;
+    const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
+    page.drawText(footerText, {
+        x: margin, y: footerY, size: 7, font: helvetica, color: colors.textMuted,
+    });
+    const pageLabel = 'Page 1';
+    const pageLabelWidth = helvetica.widthOfTextAtSize(pageLabel, 7);
+    page.drawText(pageLabel, {
+        x: pageWidth - margin - pageLabelWidth, y: footerY, size: 7, font: helvetica, color: colors.textMuted,
+    });
 
-    // Convert to Buffer
-    const arrayBuffer = doc.output('arraybuffer');
-    return Buffer.from(arrayBuffer);
+    const pdfBytes = await doc.save();
+    return Buffer.from(pdfBytes);
 }
