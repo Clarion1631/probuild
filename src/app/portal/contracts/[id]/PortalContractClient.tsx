@@ -3,6 +3,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 
 export default function PortalContractClient({ initialContract, companySettings }: { initialContract: any; companySettings?: any }) {
     const isSigned = initialContract.status === "Signed" || initialContract.status === "Approved";
@@ -154,24 +156,50 @@ export default function PortalContractClient({ initialContract, companySettings 
         setError("");
 
         try {
-            // Pick the first signature as the primary signature, or default
+            // Stage 1: Mathematical Approval in DB
             const primarySigData = Object.values(signatures)[0];
             const primarySigUrl = primarySigData?.image || null;
             const primarySigName = primarySigData?.name || "Accepted Digitally";
-
-            // Grab the finalized HTML representing the styled document with images
-            const domCopy = contractBodyRef.current?.cloneNode(true) as HTMLDivElement;
-            const finalHtmlSnapshot = domCopy?.innerHTML || parsedBody;
-
             const userAgent = window.navigator.userAgent;
+            
             await approveContract(initialContract.id, primarySigName, "Client IP", userAgent, primarySigUrl || undefined);
             
-            // TODO: In Phase 3, pass the `finalHtmlSnapshot` to pdf generation backend so it preserves inline placement.
+            // Stage 2: Capture crisp DOM Snapshot
+            const element = document.getElementById("contract-document-wrapper");
+            if (element) {
+                // Remove box shadows or borders that mess up standard A4 sizing
+                element.style.boxShadow = "none";
+                element.style.border = "none";
+                
+                const canvas = await html2canvas(element, { scale: 2, useCORS: true });
+                const imgData = canvas.toDataURL('image/png');
+                
+                const pdf = new jsPDF({
+                    orientation: "portrait",
+                    unit: "px",
+                    format: [canvas.width / 2, canvas.height / 2] // perfect 1:1 matching
+                });
+
+                pdf.addImage(imgData, 'PNG', 0, 0, canvas.width / 2, canvas.height / 2);
+                
+                // Stage 3: Send blob to finalize server action
+                const blob = pdf.output('blob');
+                const formData = new FormData();
+                formData.append("pdf", blob);
+
+                const response = await fetch(`/api/portal/contracts/${initialContract.id}/finalize`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    console.error("Failed to upload PDF", await response.text());
+                }
+            }
 
             window.location.reload();
         } catch (e) {
             setError("Something went wrong processing your approval.");
-        } finally {
             setIsSubmitting(false);
         }
     };
@@ -195,7 +223,7 @@ export default function PortalContractClient({ initialContract, companySettings 
 
             {/* Document Container */}
             <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
-                <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="contract-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
                     <div className="px-10 pt-10 pb-8 border-b border-slate-200">

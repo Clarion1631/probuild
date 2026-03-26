@@ -27,12 +27,13 @@ export const config = {
          * - api/cron (System automated cron tasks)
          * - api/webhook (Stripe webhooks)
          * - api/payments (Client portal payment sessions)
+         * - api/portal (Public backend handlers for documents)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
          * - _next/static (Static files)
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          */
-        "/((?!api/auth|api/cron|api/webhook|api/payments|login|portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/webhook|api/payments|api/portal|login|portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
     ],
 };
