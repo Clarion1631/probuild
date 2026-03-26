@@ -193,11 +193,24 @@ export default function PortalContractClient({ initialContract, companySettings 
                 });
                 
                 if (!response.ok) {
-                    console.error("Failed to upload PDF", await response.text());
+                    const errText = await response.text();
+                    throw new Error(`Failed to upload PDF: ${errText}`);
                 }
             }
 
-            window.location.reload();
+            // Stop loading indicator
+            setIsSubmitting(false);
+
+            // If it's a recurring contract, the backend immediately resets it to "Sent" for the next cycle.
+            // A reload would make it look like the signing failed. Instead, we show a success screen manually.
+            if (initialContract.recurringDays && initialContract.recurringDays > 0) {
+                alert("Thank you! Your document has been signed successfully and a receipt has been emailed to you.");
+                // We reload so the user sees the 'next' cycle, preserving safety
+                window.location.reload();
+            } else {
+                window.location.reload();
+            }
+
         } catch (e: any) {
             console.error(e);
             setError(e?.message || String(e) || "Something went wrong processing your approval.");
