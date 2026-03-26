@@ -615,52 +615,310 @@ export async function markContractViewed(contractId: string) {
 }
 
 export async function approveEstimate(estimateId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+    const approvedAt = new Date();
+
     await prisma.estimate.update({
         where: { id: estimateId },
         data: {
             status: "Approved",
             approvedBy: signatureName,
-            approvedAt: new Date(),
+            approvedAt,
             approvalIp: ipAddress,
             approvalUserAgent: userAgent,
             signatureUrl: signatureDataUrl || null,
         },
     });
 
+    // Fetch full estimate data for emails and filing
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        select: { projectId: true, code: true },
+        select: {
+            projectId: true, leadId: true, code: true, title: true,
+            project: { select: { id: true, name: true, client: { select: { name: true, email: true } } } },
+            lead: { select: { name: true, client: { select: { name: true, email: true } } } },
+        },
     });
 
     const settings = await getCompanySettings();
-    if (settings.notificationEmail) {
-        let attachments: any = undefined;
-        try {
-            const { generateEstimatePdf } = await import("./pdf");
-            const pdfBuffer = await generateEstimatePdf(estimateId);
-            attachments = [{
-                filename: `Estimate_${estimate?.code || estimateId}.pdf`,
-                content: pdfBuffer,
-            }];
-        } catch (e) {
-            console.error("Failed to generate PDF snapshot for email:", e);
-        }
+    const companyName = settings.companyName || "Golden Touch Remodeling";
+    const estimateCode = estimate?.code || estimateId;
+    const projectName = estimate?.project?.name || estimate?.lead?.name || "your project";
+    const clientName = estimate?.project?.client?.name || estimate?.lead?.client?.name || signatureName;
+    const clientEmail = estimate?.project?.client?.email || estimate?.lead?.client?.email || null;
+    const pdfFilename = `Signed_Estimate_${estimateCode}.pdf`;
 
+    // Generate PDF once — reused for customer email, company email, and project filing
+    let pdfBuffer: Buffer | null = null;
+    let attachments: any = undefined;
+    try {
+        const { generateEstimatePdf } = await import("./pdf");
+        pdfBuffer = await generateEstimatePdf(estimateId);
+        attachments = [{ filename: pdfFilename, content: pdfBuffer }];
+    } catch (e) {
+        console.error("Failed to generate PDF snapshot for signed estimate:", e);
+    }
+
+    // ─── 1. Email the CUSTOMER a professional confirmation ───
+    if (clientEmail) {
+        await sendNotification(
+            clientEmail,
+            `Your Approved Estimate — ${estimateCode}`,
+            `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 560px; margin: 0 auto;">
+                <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-radius: 12px 12px 0 0; padding: 32px 28px;">
+                    <h1 style="color: #fff; font-size: 20px; margin: 0 0 4px;">Thank You, ${clientName}!</h1>
+                    <p style="color: #94a3b8; font-size: 14px; margin: 0;">Your estimate has been approved and signed.</p>
+                </div>
+                <div style="background: #fff; border: 1px solid #e2e8f0; border-top: none; padding: 28px; border-radius: 0 0 12px 12px;">
+                    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                        <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Estimate</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${estimateCode}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Project</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${projectName}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Signed By</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${signatureName}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Date</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${approvedAt.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}</td></tr>
+                    </table>
+                    <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;">
+                        <p style="margin: 0; color: #166534; font-size: 13px;">✓ A signed copy of your estimate is attached to this email for your records.</p>
+                    </div>
+                    <p style="color: #64748b; font-size: 13px; line-height: 1.6; margin: 0;">
+                        If you have any questions, feel free to reach out to us${settings.phone ? ` at ${settings.phone}` : ""}${settings.email ? ` or ${settings.email}` : ""}.
+                    </p>
+                </div>
+                <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;">${companyName}${settings.address ? ` • ${settings.address}` : ""}</p>
+            </div>`,
+            attachments,
+            { fromName: companyName, replyTo: settings.email || undefined }
+        );
+    }
+
+    // ─── 2. Email the COMPANY notification ───
+    if (settings.notificationEmail) {
         await sendNotification(
             settings.notificationEmail,
-            `Estimate Approved: ${estimate?.code || estimateId}`,
-            `<p>Great news! The client <b>${signatureName}</b> has electronically signed and approved estimate <b>${estimate?.code || estimateId}</b>.</p>
-             <p>IP Address: ${ipAddress}</p>
-             <p>User Agent: ${userAgent}</p>`,
+            `✅ Estimate Approved: ${estimateCode}`,
+            `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 20px;">
+                    <h3 style="margin: 0 0 8px; color: #166534;">Estimate Signed & Approved</h3>
+                    <p style="margin: 0 0 12px; color: #333;"><strong>${signatureName}</strong> has electronically signed estimate <strong>${estimateCode}</strong> for <strong>${projectName}</strong>.</p>
+                    <table style="width: 100%; font-size: 13px; color: #555;">
+                        <tr><td style="padding: 4px 0;">Client</td><td style="text-align: right; font-weight: 600;">${clientName}</td></tr>
+                        <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${approvedAt.toLocaleString()}</td></tr>
+                        <tr><td style="padding: 4px 0;">IP Address</td><td style="text-align: right; font-family: monospace; font-size: 12px;">${ipAddress}</td></tr>
+                    </table>
+                </div>
+                ${clientEmail ? `<p style="margin: 12px 0 0; font-size: 12px; color: #888;">A copy was also sent to the client at ${clientEmail}.</p>` : ""}
+            </div>`,
             attachments
         );
     }
 
+    // ─── 3. File the signed PDF into the project's "Signed Documents" folder ───
+    if (pdfBuffer && estimate?.projectId) {
+        try {
+            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+            const supabase = getSupabase();
+
+            if (supabase) {
+                // Find or create a "Signed Documents" folder for this project
+                let folder = await prisma.fileFolder.findFirst({
+                    where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+                });
+                if (!folder) {
+                    folder = await prisma.fileFolder.create({
+                        data: { name: "Signed Documents", projectId: estimate.projectId },
+                    });
+                }
+
+                // Upload to Supabase Storage
+                const storagePath = `projects/${estimate.projectId}/signed/${Date.now()}_${pdfFilename}`;
+                const { error: uploadError } = await supabase.storage
+                    .from(STORAGE_BUCKET)
+                    .upload(storagePath, pdfBuffer, {
+                        contentType: "application/pdf",
+                        upsert: false,
+                    });
+
+                if (!uploadError) {
+                    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+                    const publicUrl = urlData?.publicUrl || storagePath;
+
+                    await prisma.projectFile.create({
+                        data: {
+                            name: pdfFilename,
+                            url: publicUrl,
+                            size: pdfBuffer.length,
+                            mimeType: "application/pdf",
+                            projectId: estimate.projectId,
+                            folderId: folder.id,
+                        },
+                    });
+                    console.log(`[approveEstimate] Filed signed PDF to project ${estimate.projectId} / Signed Documents`);
+                } else {
+                    console.error("[approveEstimate] Supabase upload failed:", uploadError);
+                }
+            }
+        } catch (fileErr) {
+            // Non-critical — don't block the approval if filing fails
+            console.error("[approveEstimate] Failed to file signed PDF:", fileErr);
+        }
+    }
+
     if (estimate?.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
+        revalidatePath(`/projects/${estimate.projectId}/files`);
     }
     revalidatePath(`/portal/estimates/${estimateId}`);
     return { success: true };
+}
+
+export async function deleteInvoice(invoiceId: string) {
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        include: { payments: true },
+    });
+    if (!invoice) throw new Error("Invoice not found");
+
+    const hasPaidPayments = invoice.payments.some(p => p.status === "Paid");
+    if (hasPaidPayments) throw new Error("Cannot delete an invoice with recorded payments");
+    if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
+        throw new Error("Cannot delete a paid or partially paid invoice");
+    }
+
+    await prisma.invoice.delete({ where: { id: invoiceId } });
+    revalidatePath(`/projects/${invoice.projectId}/invoices`);
+    revalidatePath(`/invoices`);
+    return { success: true, projectId: invoice.projectId };
+}
+
+export async function updateInvoiceNotes(invoiceId: string, notes: string) {
+    const invoice = await prisma.invoice.update({
+        where: { id: invoiceId },
+        data: { notes },
+    });
+    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    return { success: true };
+}
+
+export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: string) {
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        include: {
+            project: { include: { client: true } },
+            client: true,
+        },
+    });
+    if (!invoice) throw new Error("Invoice not found");
+
+    const recipientEmail = overrideEmail || invoice.client?.email;
+    if (!recipientEmail) throw new Error("No email address provided");
+
+    if (invoice.status === "Draft") {
+        await prisma.invoice.update({
+            where: { id: invoiceId },
+            data: { status: "Issued", issueDate: new Date(), sentAt: new Date() },
+        });
+    } else {
+        await prisma.invoice.update({
+            where: { id: invoiceId },
+            data: { sentAt: new Date() },
+        });
+    }
+
+    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/invoices/${invoiceId}`;
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const companyName = settings?.companyName || "Your Contractor";
+
+    await sendNotification(
+        recipientEmail,
+        `${companyName} sent you an invoice — ${invoice.code}`,
+        `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
+            </div>
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${invoice.code}</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${invoice.client?.name || 'there'},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    ${companyName} has sent you an invoice for <strong>$${(invoice.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</strong>.
+                    Please click the button below to view the details and make a payment.
+                </p>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        View & Pay Invoice
+                    </a>
+                </div>
+                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center;">
+                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">$${(invoice.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
+                    Or copy this link: ${portalUrl}
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                Sent via ProBuild • ${companyName}
+            </p>
+        </body>
+        </html>`,
+        undefined,
+        { fromName: companyName, replyTo: settings?.email || undefined }
+    );
+
+    revalidatePath(`/projects/${invoice.projectId}/invoices`);
+    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/invoices`);
+    return { success: true, sentTo: recipientEmail };
+}
+
+export async function getInvoiceForPortal(id: string) {
+    const invoice = await prisma.invoice.findUnique({
+        where: { id },
+        include: {
+            project: { include: { client: true } },
+            client: true,
+            payments: { orderBy: { createdAt: "asc" } },
+        },
+    });
+    if (!invoice) return null;
+    return {
+        ...invoice,
+        projectName: invoice.project?.name || null,
+        clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
+        clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
+    };
+}
+
+export async function markInvoiceViewed(invoiceId: string) {
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: {
+            viewedAt: true, code: true,
+            project: { select: { name: true, client: { select: { name: true } } } },
+            client: { select: { name: true } },
+        },
+    });
+    if (invoice && !invoice.viewedAt) {
+        await prisma.invoice.update({
+            where: { id: invoiceId },
+            data: { viewedAt: new Date() },
+        });
+        const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
+        const projectName = invoice.project?.name || "";
+        const settings = await getCompanySettings();
+        if (settings.notificationEmail) {
+            await sendNotification(
+                settings.notificationEmail,
+                `👁️ Invoice Viewed — ${invoice.code}`,
+                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                    <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
+                        <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
+                        <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                    </div>
+                </div>`
+            );
+        }
+    }
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {

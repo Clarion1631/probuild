@@ -1,14 +1,20 @@
 "use client";
 
 import { useState } from "react";
-import { recordPayment, issueInvoice } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
+import SendInvoiceModal from "@/components/SendInvoiceModal";
+import { toast } from "sonner";
 
 export default function InvoiceEditor({ project, initialInvoice }: { project: any, initialInvoice: any }) {
     const router = useRouter();
     const [isRecording, setIsRecording] = useState<string | null>(null);
     const [isIssuing, setIsIssuing] = useState(false);
+    const [isDeleting, setIsDeleting] = useState(false);
+    const [showSendModal, setShowSendModal] = useState(false);
+    const [notes, setNotes] = useState(initialInvoice.notes || "");
+    const [isSavingNotes, setIsSavingNotes] = useState(false);
     const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
 
     async function handleRecordPayment(paymentId: string) {
@@ -22,11 +28,38 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
         setIsIssuing(true);
         try {
             await issueInvoice(initialInvoice.id);
+            toast.success("Invoice issued");
             router.refresh();
         } catch (e) {
             console.error(e);
         } finally {
             setIsIssuing(false);
+        }
+    }
+
+    async function handleDelete() {
+        if (!confirm("Are you sure you want to delete this invoice? This cannot be undone.")) return;
+        setIsDeleting(true);
+        try {
+            const res = await deleteInvoice(initialInvoice.id);
+            toast.success("Invoice deleted");
+            router.push(`/projects/${res.projectId}/invoices`);
+        } catch (e: any) {
+            toast.error(e.message || "Cannot delete this invoice");
+        } finally {
+            setIsDeleting(false);
+        }
+    }
+
+    async function handleSaveNotes() {
+        setIsSavingNotes(true);
+        try {
+            await updateInvoiceNotes(initialInvoice.id, notes);
+            toast.success("Notes saved");
+        } catch (e: any) {
+            toast.error("Failed to save notes");
+        } finally {
+            setIsSavingNotes(false);
         }
     }
 
@@ -37,9 +70,16 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
         ? new Date(initialInvoice.issueDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
         : null;
     const createdDate = new Date(initialInvoice.createdAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    const sentDate = initialInvoice.sentAt
+        ? new Date(initialInvoice.sentAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+        : null;
+    const viewedDate = initialInvoice.viewedAt
+        ? new Date(initialInvoice.viewedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+        : null;
 
     const paidCount = (initialInvoice.payments || []).filter((p: any) => p.status === "Paid").length;
     const totalCount = (initialInvoice.payments || []).length;
+    const canDelete = initialInvoice.status === "Draft" || (initialInvoice.status === "Issued" && paidCount === 0);
 
     return (
         <div className="flex flex-col h-full bg-hui-background">
@@ -60,16 +100,46 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                     )}
                 </div>
                 <div className="flex items-center gap-2">
+                    {/* Portal Preview */}
+                    <button
+                        onClick={() => window.open(`/portal/invoices/${initialInvoice.id}`, '_blank')}
+                        className="hui-btn hui-btn-secondary flex items-center gap-2"
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                        Preview
+                    </button>
+
+                    {/* Delete - only if Draft/Issued with no payments */}
+                    {canDelete && (
+                        <button
+                            onClick={handleDelete}
+                            disabled={isDeleting}
+                            className="hui-btn hui-btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2 disabled:opacity-50"
+                        >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            {isDeleting ? "Deleting..." : "Delete"}
+                        </button>
+                    )}
+
+                    {/* Issue button (draft only) */}
                     {initialInvoice.status === "Draft" && (
                         <button
                             onClick={handleIssueInvoice}
                             disabled={isIssuing}
-                            className="hui-btn hui-btn-green flex items-center gap-2 disabled:opacity-50"
+                            className="hui-btn hui-btn-primary flex items-center gap-2 disabled:opacity-50"
                         >
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
                             {isIssuing ? "Issuing..." : "Issue Invoice"}
                         </button>
                     )}
+
+                    {/* Send button */}
+                    <button
+                        onClick={() => setShowSendModal(true)}
+                        className="hui-btn hui-btn-green flex items-center gap-2"
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                        Send
+                    </button>
                 </div>
             </div>
 
@@ -78,7 +148,6 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
                     {/* Document Header */}
                     <div className="hui-card overflow-hidden">
-                        {/* Accent bar */}
                         <div className="h-1.5 w-full bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500"></div>
                         <div className="p-8 space-y-6">
                             <div className="flex justify-between items-start">
@@ -111,6 +180,21 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 <span className="text-right text-hui-textMain font-medium">{issueDate}</span>
                                             </>
                                         )}
+                                        {sentDate && (
+                                            <>
+                                                <span className="text-hui-textMuted">Sent</span>
+                                                <span className="text-right text-hui-textMain">{sentDate}</span>
+                                            </>
+                                        )}
+                                        {viewedDate && (
+                                            <>
+                                                <span className="text-hui-textMuted">Viewed</span>
+                                                <span className="text-right text-emerald-600 font-medium flex items-center justify-end gap-1">
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                    {viewedDate}
+                                                </span>
+                                            </>
+                                        )}
                                     </div>
                                 </div>
                             </div>
@@ -132,6 +216,29 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </div>
                             </div>
                         </div>
+                    </div>
+
+                    {/* Notes */}
+                    <div className="hui-card p-6">
+                        <div className="flex justify-between items-center mb-3">
+                            <h2 className="font-semibold text-hui-textMain flex items-center gap-2">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                                Notes
+                            </h2>
+                            <button
+                                onClick={handleSaveNotes}
+                                disabled={isSavingNotes}
+                                className="hui-btn hui-btn-secondary text-xs py-1 px-3 disabled:opacity-50"
+                            >
+                                {isSavingNotes ? "Saving..." : "Save Notes"}
+                            </button>
+                        </div>
+                        <textarea
+                            value={notes}
+                            onChange={e => setNotes(e.target.value)}
+                            placeholder="Add internal notes or payment instructions that will be visible to the client..."
+                            className="hui-input w-full h-24 resize-none text-sm"
+                        />
                     </div>
 
                     {/* Payments Schedule */}
@@ -163,7 +270,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                             <div className="flex flex-col items-center">
                                                 <svg className="w-10 h-10 mb-2 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                                 <p className="font-medium text-hui-textMain">No payment schedule</p>
-                                                <p className="text-sm">This invoice has no line items yet.</p>
+                                                <p className="text-sm">This invoice has no payment milestones.</p>
                                             </div>
                                         </td>
                                     </tr>
@@ -226,6 +333,15 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
                 </div>
             </div>
+
+            {/* Send Invoice Modal */}
+            {showSendModal && (
+                <SendInvoiceModal
+                    invoiceId={initialInvoice.id}
+                    clientEmail={clientEmail}
+                    onClose={() => { setShowSendModal(false); router.refresh(); }}
+                />
+            )}
         </div>
     );
 }

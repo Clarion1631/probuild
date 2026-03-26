@@ -252,7 +252,10 @@ model Invoice {
   status      String   @default("Draft") // Draft, Issued, Paid, Overdue
   totalAmount Float    @default(0)
   balanceDue  Float    @default(0)
+  notes       String?
   issueDate   DateTime?
+  sentAt      DateTime?
+  viewedAt    DateTime?
   createdAt   DateTime @default(now())
   
   payments    PaymentSchedule[]
