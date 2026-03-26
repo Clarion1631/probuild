@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
-import html2canvas from "html2canvas";
+import { toPng } from "html-to-image";
 import { jsPDF } from "jspdf";
 
 export default function PortalContractClient({ initialContract, companySettings }: { initialContract: any; companySettings?: any }) {
@@ -171,16 +171,16 @@ export default function PortalContractClient({ initialContract, companySettings 
                 element.style.boxShadow = "none";
                 element.style.border = "none";
                 
-                const canvas = await html2canvas(element, { scale: 2, useCORS: true });
-                const imgData = canvas.toDataURL('image/png');
+                // Capture crisp DOM Snapshot natively
+                const imgData = await toPng(element, { pixelRatio: 2 });
                 
                 const pdf = new jsPDF({
                     orientation: "portrait",
                     unit: "px",
-                    format: [canvas.width / 2, canvas.height / 2] // perfect 1:1 matching
+                    format: [element.offsetWidth || 800, element.offsetHeight || 1200]
                 });
 
-                pdf.addImage(imgData, 'PNG', 0, 0, canvas.width / 2, canvas.height / 2);
+                pdf.addImage(imgData, 'PNG', 0, 0, element.offsetWidth || 800, element.offsetHeight || 1200);
                 
                 // Stage 3: Send blob to finalize server action
                 const blob = pdf.output('blob');
