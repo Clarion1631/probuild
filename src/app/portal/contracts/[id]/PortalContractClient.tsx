@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
-import { toPng } from "html-to-image";
+import { toJpeg } from "html-to-image";
 import { jsPDF } from "jspdf";
 
 export default function PortalContractClient({ initialContract, companySettings }: { initialContract: any; companySettings?: any }) {
@@ -172,7 +172,9 @@ export default function PortalContractClient({ initialContract, companySettings 
                 element.style.border = "none";
                 
                 // Capture crisp DOM Snapshot natively
-                const imgData = await toPng(element, { pixelRatio: 2 });
+                // Using JPEG with quality 0.85 instead of uncompressed PNG drops file size from ~8MB to ~300KB
+                // This prevents Vercel's 4.5MB FUNCTION_PAYLOAD_TOO_LARGE fatal error natively.
+                const imgData = await toJpeg(element, { quality: 0.85, pixelRatio: 1.5 });
                 
                 const pdf = new jsPDF({
                     orientation: "portrait",
@@ -180,7 +182,7 @@ export default function PortalContractClient({ initialContract, companySettings 
                     format: [element.offsetWidth || 800, element.offsetHeight || 1200]
                 });
 
-                pdf.addImage(imgData, 'PNG', 0, 0, element.offsetWidth || 800, element.offsetHeight || 1200);
+                pdf.addImage(imgData, 'JPEG', 0, 0, element.offsetWidth || 800, element.offsetHeight || 1200);
                 
                 // Stage 3: Send blob to finalize server action
                 const blob = pdf.output('blob');
