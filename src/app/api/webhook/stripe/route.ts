@@ -89,9 +89,9 @@ export async function POST(req: Request) {
                         `Payment Received: ${updatedSchedule.name} - ${invoice.code}`,
                         `<div style="font-family: sans-serif; padding: 20px;">
                             <h2>Payment Received! 🎉</h2>
-                            <p>A payment of <strong>$${updatedSchedule.amount.toLocaleString()}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code}.</p>
+                            <p>A payment of <strong>$${updatedSchedule.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code}.</p>
                             <p>Milestone: ${updatedSchedule.name}</p>
-                            <p>Remaining Invoice Balance: $${newBalance.toLocaleString()}</p>
+                            <p>Remaining Invoice Balance: $${newBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
                         </div>`
                     );
                 }

@@ -128,8 +128,8 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                         </span>
                                     </div>
                                     <div className="flex justify-between text-sm mb-4">
-                                        <span className="text-hui-textMuted">Amount: ${(inv.totalAmount || 0).toLocaleString()}</span>
-                                        <span className="font-medium text-hui-textMain">Due: ${(inv.balanceDue || 0).toLocaleString()}</span>
+                                        <span className="text-hui-textMuted">Amount: ${(inv.totalAmount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="font-medium text-hui-textMain">Due: ${(inv.balanceDue || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
                                     
                                     {inv.payments && inv.payments.length > 0 && (
@@ -166,7 +166,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                                                 settings={settings}
                                                             />
                                                         ) : (
-                                                            <span className="text-sm font-medium text-hui-textMain">${payment.amount.toLocaleString()}</span>
+                                                            <span className="text-sm font-medium text-hui-textMain">${payment.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                                         )}
                                                     </div>
                                                 </div>
