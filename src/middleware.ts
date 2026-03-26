@@ -24,6 +24,7 @@ export const config = {
         /*
          * Match all request paths except for the ones starting with:
          * - api/auth (NextAuth endpoints)
+         * - api/cron (System automated cron tasks)
          * - api/webhook (Stripe webhooks)
          * - api/payments (Client portal payment sessions)
          * - login (The login page itself)
@@ -32,6 +33,6 @@ export const config = {
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          */
-        "/((?!api/auth|api/webhook|api/payments|login|portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/webhook|api/payments|login|portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
     ],
 };

@@ -9,8 +9,7 @@ const cronSecret = process.env.CRON_SECRET || "local-cron-secret-123";
 export async function GET(req: Request) {
     try {
         const authHeader = req.headers.get('authorization');
-        const url = new URL(req.url);
-        const isTesting = url.searchParams.get('test') === 'true';
+        const isTesting = req.url.includes('test');
         
         // Ensure local development, test query, or valid Vercel Cron Secret
         if (
