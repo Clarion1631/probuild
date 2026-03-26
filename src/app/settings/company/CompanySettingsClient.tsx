@@ -345,21 +345,6 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                                         <span className="absolute right-2 top-1/2 -translate-y-1/2 text-sm text-hui-textMuted">%</span>
                                                     </div>
                                                 </div>
-                                                <span className="text-sm text-hui-textMuted">+</span>
-                                                <div className="flex items-center gap-2">
-                                                    <span className="text-sm font-medium text-hui-textMain">Flat Fee:</span>
-                                                    <div className="relative w-24">
-                                                        <span className="absolute left-2 top-1/2 -translate-y-1/2 text-sm text-hui-textMuted">$</span>
-                                                        <input
-                                                            type="number"
-                                                            step="0.01"
-                                                            name="cardProcessingFlat"
-                                                            value={formData.cardProcessingFlat}
-                                                            onChange={handleChange}
-                                                            className="hui-input w-full pl-6 text-left"
-                                                        />
-                                                    </div>
-                                                </div>
                                             </div>
                                         )}
                                     </div>
