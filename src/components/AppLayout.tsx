@@ -29,7 +29,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
 
     useEffect(() => {
         if (status === 'authenticated') {
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname === '/login';
 
             // If an authenticated user suddenly has no role, they were likely deleted.
             // Force sign out to clear the stale session so they can try again.
@@ -43,14 +43,14 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
             }
         }
         if (status === 'unauthenticated' && process.env.NODE_ENV !== 'development') { // Bypass only if NOT in development
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname === '/login';
             if (!isPublicRoute) {
                 router.replace('/login');
             }
         }
     }, [status, role, pathname, router, session]);
 
-    const isPublicRoute = pathname?.startsWith('/portal') || pathname === '/login';
+    const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname === '/login';
 
     if (status === 'authenticated' && !role && !isPublicRoute) {
         return <div className="min-h-screen bg-hui-background flex items-center justify-center text-slate-500">Signing out...</div>;
