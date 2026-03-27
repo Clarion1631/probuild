@@ -30,6 +30,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
     const [sub, setSub] = useState<Subcontractor | null>(null);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [inviting, setInviting] = useState(false);
     
     // Form state
     const [form, setForm] = useState({
@@ -94,6 +95,27 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
             router.push("/company/subcontractors");
         } catch {
             toast.error("Failed to delete subcontractor");
+        }
+    }
+
+    async function handleInviteToPortal() {
+        if (!sub?.email) {
+            toast.error("Subcontractor must have an email address");
+            return;
+        }
+        setInviting(true);
+        try {
+            const res = await fetch("/api/sub-portal/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ email: sub.email })
+            });
+            if (!res.ok) throw new Error("Failed to send invite");
+            toast.success(`Portal login link sent to ${sub.email}`);
+        } catch {
+            toast.error("Failed to send portal invite");
+        } finally {
+            setInviting(false);
         }
     }
 
@@ -179,9 +201,15 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                         <button onClick={handleDelete} className="text-red-500 hover:text-red-700 text-sm font-semibold transition px-2">
                             Delete Subcontractor
                         </button>
-                        <button onClick={handleSave} disabled={saving} className="bg-hui-primary text-white px-6 py-2.5 rounded-lg text-sm font-semibold hover:bg-indigo-700 transition shadow-sm disabled:opacity-50">
-                            {saving ? "Saving..." : "Save Changes"}
-                        </button>
+                        <div className="flex items-center gap-3">
+                            <button onClick={handleInviteToPortal} disabled={inviting} className="hui-btn hui-btn-secondary px-5 py-2.5 text-sm flex items-center gap-2 disabled:opacity-50">
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
+                                {inviting ? "Sending..." : "Invite to Portal"}
+                            </button>
+                            <button onClick={handleSave} disabled={saving} className="hui-btn hui-btn-green px-6 py-2.5 text-sm disabled:opacity-50">
+                                {saving ? "Saving..." : "Save Changes"}
+                            </button>
+                        </div>
                     </div>
                 </div>
 

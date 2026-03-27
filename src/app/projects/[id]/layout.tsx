@@ -1,5 +1,5 @@
 import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
-import { getProjectLead, getLeadsForLinking } from "@/lib/actions";
+import { getProjectLead, getLeadsForLinking, getUnreadMessageCount } from "@/lib/actions";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -42,6 +42,7 @@ export default async function ProjectLayout({
 
     const lead = await getProjectLead(id);
     const allLeads = await getLeadsForLinking();
+    const unreadCount = await getUnreadMessageCount(id, "TEAM");
 
     return (
         <div className="flex h-full -mx-6 -my-6 bg-slate-50">
@@ -49,6 +50,7 @@ export default async function ProjectLayout({
                 projectId={id}
                 lead={lead ? { id: lead.id, name: lead.name } : null}
                 availableLeads={JSON.parse(JSON.stringify(allLeads))}
+                unreadMessageCount={unreadCount}
             />
             <div className="flex-1 p-6 overflow-y-auto w-full">
                 {children}
@@ -56,3 +58,4 @@ export default async function ProjectLayout({
         </div>
     );
 }
+

@@ -2331,3 +2331,106 @@ export async function updateCompanyProjectStatuses(statuses: string) {
     revalidatePath(`/settings/company`);
     return { success: true };
 }
+
+// ────────────────────────────────────────────────
+// Messages
+// ────────────────────────────────────────────────
+
+export async function getProjectMessages(projectId: string) {
+    let thread = await prisma.messageThread.findUnique({
+        where: { projectId },
+        include: {
+            messages: { orderBy: { createdAt: "asc" } },
+        },
+    });
+
+    if (!thread) {
+        thread = await prisma.messageThread.create({
+            data: { projectId },
+            include: {
+                messages: { orderBy: { createdAt: "asc" } },
+            },
+        });
+    }
+
+    return thread;
+}
+
+export async function getUnreadMessageCount(projectId: string, forSenderType: "CLIENT" | "TEAM") {
+    // Count messages sent by the OTHER party that haven't been read
+    const oppositeType = forSenderType === "TEAM" ? "CLIENT" : "TEAM";
+
+    const thread = await prisma.messageThread.findUnique({
+        where: { projectId },
+    });
+
+    if (!thread) return 0;
+
+    return prisma.message.count({
+        where: {
+            threadId: thread.id,
+            senderType: oppositeType,
+            readAt: null,
+        },
+    });
+}
+
+
+
+
+
+export async function getPortalVisibility(projectId: string) {
+    const record = await prisma.portalVisibility.findUnique({
+        where: { projectId },
+    });
+    // Return defaults if no record exists
+    if (!record) {
+        return {
+            projectId,
+            showSchedule: true,
+            showFiles: true,
+            showDailyLogs: false,
+            showEstimates: true,
+            showInvoices: true,
+            showContracts: true,
+            showMessages: true,
+        };
+    }
+    return record;
+}
+
+export async function savePortalVisibility(projectId: string, data: {
+    showSchedule: boolean;
+    showFiles: boolean;
+    showDailyLogs: boolean;
+    showEstimates: boolean;
+    showInvoices: boolean;
+    showContracts: boolean;
+    showMessages: boolean;
+}) {
+    const record = await prisma.portalVisibility.upsert({
+        where: { projectId },
+        update: {
+            showSchedule: data.showSchedule,
+            showFiles: data.showFiles,
+            showDailyLogs: data.showDailyLogs,
+            showEstimates: data.showEstimates,
+            showInvoices: data.showInvoices,
+            showContracts: data.showContracts,
+            showMessages: data.showMessages,
+        },
+        create: {
+            projectId,
+            showSchedule: data.showSchedule,
+            showFiles: data.showFiles,
+            showDailyLogs: data.showDailyLogs,
+            showEstimates: data.showEstimates,
+            showInvoices: data.showInvoices,
+            showContracts: data.showContracts,
+            showMessages: data.showMessages,
+        },
+    });
+    revalidatePath(`/projects/${projectId}/settings`);
+    revalidatePath(`/portal/projects/${projectId}`);
+    return { success: true };
+}

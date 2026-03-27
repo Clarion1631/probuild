@@ -53,6 +53,9 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 ### Company & Settings
 `getCompanySettings` · `saveCompanySettings` · `getTeamMembers` · `getActiveSubcontractors` · `getDocumentTemplates` · `getDocumentTemplate` · `createDocumentTemplate` · `updateDocumentTemplate` · `deleteDocumentTemplate` · `updateCompanyProjectStatuses`
 
+### Portal Visibility
+`getPortalVisibility` · `savePortalVisibility`
+
 ### Floor Plans
 `createDraftFloorPlan` · `getFloorPlan` · `saveFloorPlanData`
 
@@ -100,7 +103,7 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 
 ## Prisma Models (prisma/schema.prisma — 30+ models)
 
-`User` · `Client` · `Lead` · `LeadTask` · `LeadMeeting` · `Project` · `FloorPlan` · `Estimate` · `EstimateItem` · `EstimatePaymentSchedule` · `Expense` · `Invoice` · `PaymentSchedule` · `Budget` · `CostCode` · `CostType` · `TimeEntry` · `Contract` · `ContractSigningRecord` · `CompanySettings` · `DocumentTemplate` · `ScheduleTask` · `TaskDependency` · `TaskComment` · `TaskPunchItem` · `TaskAssignment` · `Subcontractor` · `SubTaskAssignment` · `FileFolder` · `ProjectFile` · `UserPermission` · `ProjectAccess` · `Takeoff` · `TakeoffFile`
+`User` · `Client` · `Lead` · `LeadTask` · `LeadMeeting` · `Project` · `FloorPlan` · `Estimate` · `EstimateItem` · `EstimatePaymentSchedule` · `Expense` · `Invoice` · `PaymentSchedule` · `Budget` · `CostCode` · `CostType` · `TimeEntry` · `Contract` · `ContractSigningRecord` · `CompanySettings` · `DocumentTemplate` · `ScheduleTask` · `TaskDependency` · `TaskComment` · `TaskPunchItem` · `TaskAssignment` · `Subcontractor` · `SubTaskAssignment` · `FileFolder` · `ProjectFile` · `UserPermission` · `ProjectAccess` · `Takeoff` · `TakeoffFile` · `PortalVisibility`
 
 ---
 

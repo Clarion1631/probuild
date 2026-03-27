@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import PortalPayButton from "@/components/PortalPayButton";
+import { getPortalVisibility } from "@/lib/actions";
+import PortalChatSection from "./PortalChatSection";
 
 export default async function PortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const session = await getServerSession(authOptions);
@@ -28,7 +30,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
             estimates: {
                 where: {
                     privacy: 'Shared',
-                    status: { not: 'Draft' } // Show Sent, Approved, Invoiced, etc.
+                    status: { not: 'Draft' }
                 },
                 orderBy: { createdAt: 'desc' }
             },
@@ -48,8 +50,12 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
     });
 
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const visibility = await getPortalVisibility(projectId);
 
     if (!project) return notFound();
+
+    const clientName = project.client.name || session?.user?.name || "Client";
+    const clientEmail = project.client.email || email;
 
     return (
         <div className="max-w-5xl mx-auto py-8">
@@ -79,7 +85,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                 <div>
                     <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
                         <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                        Estimates & Proposals
+                        Estimates &amp; Proposals
                     </h2>
                     {project.estimates.length === 0 ? (
                         <div className="bg-hui-background border border-hui-border rounded-lg p-6 text-center text-hui-textMuted text-sm">
@@ -183,7 +189,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                 <div className="md:col-span-2 mt-4">
                     <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
                         <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" /></svg>
-                        3D Floor Plans & Designs
+                        3D Floor Plans &amp; Designs
                     </h2>
                     {project.floorPlans.length === 0 ? (
                         <div className="bg-hui-background border border-hui-border rounded-lg p-6 text-center text-hui-textMuted text-sm">
@@ -206,6 +212,23 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                         </div>
                     )}
                 </div>
+
+                {/* Messages Section — guarded by PortalVisibility */}
+                {visibility.showMessages && (
+                    <div className="md:col-span-2 mt-4">
+                        <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
+                            <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                            </svg>
+                            Messages
+                        </h2>
+                        <PortalChatSection
+                            projectId={projectId}
+                            clientName={clientName}
+                            clientEmail={clientEmail}
+                        />
+                    </div>
+                )}
 
             </div>
         </div>

@@ -11,6 +11,7 @@ interface ProjectInnerSidebarProps {
     projectId: string;
     lead?: { id: string; name: string } | null;
     availableLeads?: { id: string; name: string; stage: string; client: { name: string } }[];
+    unreadMessageCount?: number;
 }
 
 type NavItem = { label: string; href: string; permission?: string };
@@ -20,7 +21,7 @@ type NavSection = {
     items: NavItem[];
 };
 
-export default function ProjectInnerSidebar({ projectId, lead, availableLeads = [] }: ProjectInnerSidebarProps) {
+export default function ProjectInnerSidebar({ projectId, lead, availableLeads = [], unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
     const pathname = usePathname();
     const router = useRouter();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
@@ -56,6 +57,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             items: [
                 { label: "Schedule", href: `/projects/${projectId}/schedule`, permission: "schedules" },
                 { label: "Files & Photos", href: `/projects/${projectId}/files`, permission: "files" },
+                { label: "Messages", href: `/projects/${projectId}/messages` },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
                 { label: "Daily Logs", href: `/projects/${projectId}/dailylogs`, permission: "dailyLogs" },
                 { label: "Time Clock", href: `/projects/${projectId}/timeclock`, permission: "timeClock" },
@@ -205,16 +207,22 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                                 <ul className="space-y-1">
                                     {visibleItems.map((item) => {
                                         const isActive = pathname?.includes(item.href);
+                                        const showBadge = item.label === "Messages" && unreadMessageCount > 0;
                                         return (
                                             <li key={item.label}>
                                                 <Link
                                                     href={item.href}
-                                                    className={`block px-3 py-1.5 text-sm rounded transition ${isActive
+                                                    className={`flex items-center justify-between px-3 py-1.5 text-sm rounded transition ${isActive
                                                         ? "bg-hui-primary/10 text-hui-primary font-medium"
                                                         : "text-hui-textMain hover:bg-slate-200 hover:text-hui-textMain"
                                                     }`}
                                                 >
-                                                    {item.label}
+                                                    <span>{item.label}</span>
+                                                    {showBadge && (
+                                                        <span className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-bold text-white bg-red-500 rounded-full">
+                                                            {unreadMessageCount > 99 ? "99+" : unreadMessageCount}
+                                                        </span>
+                                                    )}
                                                 </Link>
                                             </li>
                                         );
