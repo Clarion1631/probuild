@@ -176,13 +176,12 @@ export default function PortalContractClient({ initialContract, companySettings 
                 // This prevents Vercel's 4.5MB FUNCTION_PAYLOAD_TOO_LARGE fatal error natively.
                 const imgData = await toJpeg(element, { quality: 0.85, pixelRatio: 1.5 });
                 
-                const pdf = new jsPDF({
-                    orientation: "portrait",
-                    unit: "px",
-                    format: [element.offsetWidth || 800, element.offsetHeight || 1200]
-                });
+                // Scale perfectly onto standard A4 PDF to prevent 96dpi vs 72dpi zooming
+                const pdf = new jsPDF("p", "mm", "a4");
+                const pdfWidth = pdf.internal.pageSize.getWidth();
+                const pdfHeight = (element.offsetHeight * pdfWidth) / element.offsetWidth;
 
-                pdf.addImage(imgData, 'JPEG', 0, 0, element.offsetWidth || 800, element.offsetHeight || 1200);
+                pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
                 
                 // Stage 3: Send blob to finalize server action
                 const blob = pdf.output('blob');
