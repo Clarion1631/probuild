@@ -133,6 +133,7 @@ model Project {
   folders       FileFolder[]
   userAccess    ProjectAccess[]
   takeoffs      Takeoff[]
+  portalVisibility PortalVisibility?
 }
 
 model FloorPlan {
@@ -682,4 +683,18 @@ model EstimateTemplateItem {
   parentId      String?
   costCodeId    String?
   costTypeId    String?
+}
+
+model PortalVisibility {
+  id              String  @id @default(cuid())
+  projectId       String  @unique
+  project         Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  showSchedule    Boolean @default(true)
+  showFiles       Boolean @default(true)
+  showDailyLogs   Boolean @default(false)
+  showEstimates   Boolean @default(true)
+  showInvoices    Boolean @default(true)
+  showContracts   Boolean @default(true)
+  showMessages    Boolean @default(true)
 }

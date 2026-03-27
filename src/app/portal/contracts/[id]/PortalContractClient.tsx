@@ -29,6 +29,7 @@ export default function PortalContractClient({ initialContract, companySettings 
 
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
+    const [isSuccess, setIsSuccess] = useState(false);
 
     // Detect View
     useEffect(() => {
@@ -202,15 +203,8 @@ export default function PortalContractClient({ initialContract, companySettings 
             // Stop loading indicator
             setIsSubmitting(false);
 
-            // If it's a recurring contract, the backend immediately resets it to "Sent" for the next cycle.
-            // A reload would make it look like the signing failed. Instead, we show a success screen manually.
-            if (initialContract.recurringDays && initialContract.recurringDays > 0) {
-                alert("Thank you! Your document has been signed successfully and a receipt has been emailed to you.");
-                // We reload so the user sees the 'next' cycle, preserving safety
-                window.location.reload();
-            } else {
-                window.location.reload();
-            }
+            // Show the success screen instead of reloading the page
+            setIsSuccess(true);
 
         } catch (e: any) {
             console.error(e);
@@ -218,6 +212,27 @@ export default function PortalContractClient({ initialContract, companySettings 
             setIsSubmitting(false);
         }
     };
+
+    if (isSuccess) {
+        return (
+            <div className="min-h-screen bg-slate-100 font-sans flex items-center justify-center p-4">
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-10 max-w-md text-center">
+                    <div className="w-16 h-16 mx-auto bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-6">
+                        <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                    </div>
+                    <h2 className="text-2xl font-bold text-slate-800 mb-2">Document Executed</h2>
+                    <p className="text-slate-500 mb-8 leading-relaxed">
+                        Thank you! Your document has been signed successfully. A PDF receipt has been securely archived and emailed to you for your records.
+                    </p>
+                    <p className="text-sm font-medium text-slate-400">
+                        You may now close this window.
+                    </p>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
