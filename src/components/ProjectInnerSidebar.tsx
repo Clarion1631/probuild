@@ -72,6 +72,13 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 { label: "Job Costing", href: `/projects/${projectId}/costing`, permission: "financialReports" },
             ],
         },
+        {
+            id: "settings",
+            title: "Settings",
+            items: [
+                { label: "Project Settings", href: `/projects/${projectId}/settings` },
+            ],
+        },
     ];
 
     const toggleSection = (sectionId: string) => {

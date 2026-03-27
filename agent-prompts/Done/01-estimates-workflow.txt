@@ -19,11 +19,32 @@ STEP 4 — VERIFY:
 10. Run `npm run dev` and visually verify your changes work in the browser.
 11. Run `npm run build` to confirm there are no build errors.
 
-STEP 5 — DEPLOY:
+STEP 5 — DEPLOY (MANDATORY):
 12. Stage all changes: git add -A
 13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
 14. Push to trigger Vercel deployment: git push origin main
 15. Confirm the push succeeded and report the commit hash.
+16. Wait 30 seconds then verify the Vercel deployment URL is live (check https://probuild.vercel.app or the preview URL).
+
+STEP 6 — TESTING HANDOFF (MANDATORY — do NOT skip this):
+After deploying, you MUST provide the user with a detailed testing guide. Include ALL of the following:
+
+17. SUMMARY — One paragraph explaining what was built/changed and where it lives.
+18. VERCEL URL — Provide the live deployment URL where the user can test (e.g., https://probuild.vercel.app).
+19. PAGES TO TEST — List every specific URL path the user should visit to test the feature. Use exact URLs like:
+    - https://probuild.vercel.app/projects/[pick-a-project-id]/change-orders
+    - https://probuild.vercel.app/portal/projects/[id]
+    (Replace IDs with actual record IDs if known, or tell the user how to find them.)
+20. STEP-BY-STEP TEST PLAN — Write a numbered checklist of exactly what to click, fill in, and verify. For example:
+    a) Navigate to [URL]
+    b) Click the "[Button Name]" button
+    c) Fill in [field] with [sample value]
+    d) Verify [expected result]
+    e) Check [edge case]
+21. EDGE CASES — List 2-3 edge cases the user should also test (empty states, error cases, permission checks, etc.).
+22. DATABASE/SCHEMA CHANGES — If any Prisma migrations were added, note them and confirm they ran on the deployed environment.
+23. ENV VARS — If any new environment variables are required, list them and tell the user where to add them (Vercel dashboard → Settings → Environment Variables).
+24. KNOWN LIMITATIONS — Note anything that is not yet complete or has known issues.
 
 TASK: Polish the Estimates feature.
 

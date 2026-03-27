@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
+import { sendSMS } from "@/lib/sms";
 
 // GET /api/messages?projectId=X — list messages for a project thread
 export async function GET(request: Request) {
@@ -138,6 +139,20 @@ export async function POST(request: Request) {
                         </div>
                     </div>
                 </body></html>`
+            );
+        }
+        // Send SMS notification
+        if (senderType === "CLIENT" && settings?.phone) {
+            // Client sent a message → text the team
+            await sendSMS(
+                settings.phone,
+                `${companyName}: New message from ${resolvedName} on ${project?.name || "project"}: "${messageBody.substring(0, 100)}${messageBody.length > 100 ? '...' : ''}" — Reply at ${appUrl}/projects/${projectId}/messages`
+            );
+        } else if (senderType === "TEAM" && project?.client?.primaryPhone) {
+            // Team sent a message → text the client
+            await sendSMS(
+                project.client.primaryPhone,
+                `${companyName}: New message about your ${project.name} project from ${resolvedName}: "${messageBody.substring(0, 100)}${messageBody.length > 100 ? '...' : ''}" — View at ${appUrl}/portal/projects/${projectId}`
             );
         }
     } catch (e) {
