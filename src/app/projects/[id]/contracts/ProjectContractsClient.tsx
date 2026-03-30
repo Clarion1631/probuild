@@ -45,6 +45,14 @@ const MERGE_FIELDS = [
             { key: "date", label: "Today's Date", example: "March 10, 2026" },
             { key: "year", label: "Year", example: "2026" },
         ]
+    },
+    {
+        category: "Signing", icon: "✍️", color: "rose",
+        fields: [
+            { key: "SIGNATURE_BLOCK", label: "Signature", example: "[ Click to Sign ]" },
+            { key: "INITIAL_BLOCK", label: "Initials", example: "[ Click to Initial ]" },
+            { key: "DATE_BLOCK", label: "Signed Date", example: "3/27/2026" },
+        ]
     }
 ];
 
@@ -53,6 +61,7 @@ const categoryColors: Record<string, { pill: string }> = {
     purple: { pill: "bg-purple-100 text-purple-700 hover:bg-purple-200" },
     green: { pill: "bg-green-100 text-green-700 hover:bg-green-200" },
     amber: { pill: "bg-amber-100 text-amber-700 hover:bg-amber-200" },
+    rose: { pill: "bg-rose-100 text-rose-700 hover:bg-rose-200" },
 };
 
 function resolvePreview(html: string): string {

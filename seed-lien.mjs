@@ -52,7 +52,24 @@ await prisma.documentTemplate.create({
 <strong>Phone:</strong> {{company_phone}}<br/>
 <strong>Email:</strong> {{company_email}}</p>
 
-<p style="margin-top: 2em;"><strong>Date:</strong> {{date}}</p>`
+<hr/>
+
+<h3>Acknowledgment</h3>
+
+<p>By signing below, the Client acknowledges receipt of this Conditional Waiver and Release on Progress Payment and confirms that the progress payment referenced above has been issued or is being processed.</p>
+
+<table style="width: 100%; border-collapse: collapse; margin-top: 2em;">
+<tr>
+<td style="width: 60%; padding: 8px 0; vertical-align: bottom;">
+<p style="margin: 0 0 4px;"><strong>Client Signature:</strong></p>
+{{SIGNATURE_BLOCK}}
+</td>
+<td style="width: 40%; padding: 8px 0; vertical-align: bottom;">
+<p style="margin: 0 0 4px;"><strong>Date:</strong></p>
+{{DATE_BLOCK}}
+</td>
+</tr>
+</table>`
   }
 });
 
@@ -102,7 +119,24 @@ await prisma.documentTemplate.create({
 <strong>Phone:</strong> {{company_phone}}<br/>
 <strong>Email:</strong> {{company_email}}</p>
 
-<p style="margin-top: 2em;"><strong>Date:</strong> {{date}}</p>`
+<hr/>
+
+<h3>Acknowledgment</h3>
+
+<p>By signing below, the Client acknowledges receipt of this Unconditional Waiver and Release on Final Payment and confirms that the final payment referenced above has been issued.</p>
+
+<table style="width: 100%; border-collapse: collapse; margin-top: 2em;">
+<tr>
+<td style="width: 60%; padding: 8px 0; vertical-align: bottom;">
+<p style="margin: 0 0 4px;"><strong>Client Signature:</strong></p>
+{{SIGNATURE_BLOCK}}
+</td>
+<td style="width: 40%; padding: 8px 0; vertical-align: bottom;">
+<p style="margin: 0 0 4px;"><strong>Date:</strong></p>
+{{DATE_BLOCK}}
+</td>
+</tr>
+</table>`
   }
 });
 

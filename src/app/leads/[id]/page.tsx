@@ -3,11 +3,25 @@ import { redirect } from "next/navigation";
 import LeadSidebar from "./LeadSidebar";
 import LeadMessaging from "./LeadMessaging";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
+import { prisma } from "@/lib/prisma";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
     const lead = await getLead(resolvedParams.id);
     if (!lead) return <div className="p-6">Lead not found</div>;
+
+    // Fetch estimates for the attachment picker
+    const estimates = await prisma.estimate.findMany({
+        where: { leadId: lead.id },
+        select: { id: true, code: true, title: true, status: true },
+        orderBy: { createdAt: "desc" },
+    });
+
+    // Fetch the initial message field
+    const leadFull = await prisma.lead.findUnique({
+        where: { id: lead.id },
+        select: { message: true },
+    });
 
     async function handleConvert() {
         "use server";
@@ -34,6 +48,9 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 createdAt={lead.createdAt.toISOString()}
                 location={lead.location}
                 clientEmail={lead.client.email}
+                clientPhone={(lead.client as any).primaryPhone || null}
+                initialMessage={leadFull?.message || null}
+                estimates={estimates}
             />
 
             {/* Right Sidebar - Details */}
@@ -54,6 +71,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientCity={(lead.client as any).city || null}
                 clientState={(lead.client as any).state || null}
                 clientZip={(lead.client as any).zipCode || null}
+                initialMessage={leadFull?.message || null}
             />
         </div>
     );

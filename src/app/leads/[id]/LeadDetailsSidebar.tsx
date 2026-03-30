@@ -23,11 +23,13 @@ interface LeadDetailsSidebarProps {
     clientCity: string | null;
     clientState: string | null;
     clientZip: string | null;
+    initialMessage: string | null;
 }
 
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
     clientId, clientName, clientEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
+    initialMessage,
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
 
@@ -320,10 +322,11 @@ export default function LeadDetailsSidebar({
                         </div>
                         <div>
                             <p className="text-slate-500 text-xs font-medium mb-0.5">Message</p>
-                            <p className="text-slate-600 leading-relaxed text-xs">
-                                Hi there,<br />
-                                I have a piece of land where I would like to build a new home, and I also have another property where I&apos;m planning a full house remodel. I&apos;m interested in scheduling a consultation to discuss both projects.
-                            </p>
+                            {initialMessage ? (
+                                <p className="text-slate-600 leading-relaxed text-xs whitespace-pre-wrap">{initialMessage}</p>
+                            ) : (
+                                <p className="text-slate-400 italic text-xs">No initial message</p>
+                            )}
                         </div>
                     </div>
                 )}

@@ -71,6 +71,8 @@ model Lead {
   tasks             LeadTask[]
   meetings          LeadMeeting[]
   takeoffs          Takeoff[]
+  leadMessages      LeadMessage[]
+  message           String?   // Initial inquiry message from the client
   project           Project?  // reverse relation: the project created from this lead
 }
 
@@ -717,5 +719,21 @@ model Message {
   senderEmail String?
   body        String
   readAt      DateTime?
+  createdAt   DateTime  @default(now())
+}
+
+model LeadMessage {
+  id          String    @id @default(cuid())
+  leadId      String
+  lead        Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  direction   String    // "INBOUND" (from client) or "OUTBOUND" (from team)
+  senderName  String
+  senderEmail String?
+  subject     String?
+  body        String
+  channel     String    @default("email")  // "email", "sms", "both"
+  attachments String?   // JSON array: [{ type, id, name, url }]
+  sentViaEmail Boolean  @default(false)
+  sentViaSms   Boolean  @default(false)
   createdAt   DateTime  @default(now())
 }
