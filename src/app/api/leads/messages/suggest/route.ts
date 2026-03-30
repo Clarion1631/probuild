@@ -144,8 +144,8 @@ TASK: ${contextPrompt}`;
         const suggestion = response.text?.trim() || "";
 
         return NextResponse.json({ suggestion });
-    } catch (e) {
-        console.error("[AI Suggest] Failed:", e);
-        return NextResponse.json({ error: "AI generation failed" }, { status: 500 });
+    } catch (e: any) {
+        console.error("[AI Suggest] Failed:", e?.message || e);
+        return NextResponse.json({ error: `AI generation failed: ${e?.message || "Unknown error"}` }, { status: 500 });
     }
 }

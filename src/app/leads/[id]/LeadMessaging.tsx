@@ -419,11 +419,10 @@ export default function LeadMessaging({
                 <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between">
                     <div className="flex items-center gap-3">
                         {/* Send button */}
-                        <div className="flex items-center">
                             <button
                                 onClick={handleSend}
                                 disabled={!messageText.trim() || sending}
-                                className={`px-5 py-2 text-sm font-semibold rounded-l-lg transition shadow-sm ${
+                                className={`px-6 py-2 text-sm font-semibold rounded-lg transition shadow-sm ${
                                     messageText.trim() && !sending
                                         ? "bg-green-600 hover:bg-green-700 text-white"
                                         : "bg-slate-200 text-slate-400 cursor-not-allowed"
@@ -431,14 +430,6 @@ export default function LeadMessaging({
                             >
                                 {sending ? "Sending..." : "Send"}
                             </button>
-                            <button className={`px-2 py-2 rounded-r-lg transition ${
-                                messageText.trim() && !sending
-                                    ? "bg-green-700 hover:bg-green-800 text-white border-l border-green-500/50"
-                                    : "bg-slate-200 text-slate-400 cursor-not-allowed border-l border-slate-300"
-                            }`}>
-                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M6 9l6 6 6-6"/></svg>
-                            </button>
-                        </div>
 
                         {/* Email/SMS/Both toggle */}
                         <div className="flex items-center gap-3 px-3">
