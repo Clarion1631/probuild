@@ -439,10 +439,10 @@ export default function LeadMessaging({
                             >
                                 {sending ? "Sending..." : "Send"}
                             </button>
-                            <button className={`px-2 py-2 rounded-r-lg transition border-l ${
+                            <button className={`px-2 py-2 rounded-r-lg transition ${
                                 messageText.trim() && !sending
-                                    ? "bg-green-700 hover:bg-green-800 text-white border-green-600"
-                                    : "bg-slate-300 text-slate-400 cursor-not-allowed border-slate-200"
+                                    ? "bg-green-700 hover:bg-green-800 text-white border-l border-green-500/50"
+                                    : "bg-slate-200 text-slate-400 cursor-not-allowed border-l border-slate-300"
                             }`}>
                                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M6 9l6 6 6-6"/></svg>
                             </button>
