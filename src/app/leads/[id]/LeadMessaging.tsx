@@ -114,8 +114,15 @@ export default function LeadMessaging({
                 setMessages(prev => [...prev, msg]);
                 setMessageText("");
                 setAttachedEstimates([]);
+            } else {
+                const errData = await res.json().catch(() => ({}));
+                console.error("[Send] API error:", res.status, errData);
+                alert(`Failed to send: ${errData?.error || res.statusText}`);
             }
-        } catch {} finally {
+        } catch (err) {
+            console.error("[Send] Network error:", err);
+            alert("Failed to send message. Check your connection.");
+        } finally {
             setSending(false);
         }
     };
@@ -134,8 +141,15 @@ export default function LeadMessaging({
                 if (data.suggestion) {
                     setMessageText(data.suggestion);
                 }
+            } else {
+                const errData = await res.json().catch(() => ({}));
+                console.error("[AI Suggest] API error:", res.status, errData);
+                alert(`AI suggestion failed: ${errData?.error || res.statusText}`);
             }
-        } catch {} finally {
+        } catch (err) {
+            console.error("[AI Suggest] Network error:", err);
+            alert("AI suggestion failed. Check your connection.");
+        } finally {
             setAiSuggesting(false);
         }
     };
@@ -371,33 +385,11 @@ export default function LeadMessaging({
                     <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-2">
                         <span className="text-slate-500 font-medium w-16">To:</span>
                         <span className="text-hui-textMain font-medium">{clientName}</span>
-                        <div className="ml-auto flex items-center gap-3 text-xs text-slate-500">
-                            <button className="hover:text-slate-700 transition font-medium">Cc</button>
-                            <button className="hover:text-slate-700 transition font-medium flex items-center gap-1">
-                                Templates
-                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M6 9l6 6 6-6"/></svg>
-                            </button>
-                        </div>
                     </div>
                     <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-3">
                         <span className="text-slate-500 font-medium w-16">Subject:</span>
                         <span className="text-hui-textMain text-sm">New message from Golden Touch Remodeling LLC about {clientName}&apos;s project</span>
                     </div>
-                </div>
-
-                {/* Quick Response Buttons */}
-                <div className="px-5 pb-2 flex items-center gap-2">
-                    {["Interested", "Unavailable", "Not a Fit"].map(label => (
-                        <button
-                            key={label}
-                            className="px-4 py-1.5 border border-slate-300 rounded-md text-sm font-medium text-hui-textMain hover:bg-slate-50 hover:border-slate-400 transition"
-                        >
-                            {label}
-                        </button>
-                    ))}
-                    <button className="px-3 py-1.5 border border-slate-300 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition">
-                        <svg width="16" height="4" viewBox="0 0 24 8" fill="currentColor"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/><circle cx="20" cy="4" r="2"/></svg>
-                    </button>
                 </div>
 
                 {/* Text Area */}

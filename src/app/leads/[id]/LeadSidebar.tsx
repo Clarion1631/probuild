@@ -40,7 +40,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         { key: "takeoff", label: "Takeoff", href: `/leads/${leadId}/takeoffs`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
         )},
-        { key: "estimates", label: "Estimates", icon: (
+        { key: "estimates", label: "Estimates", href: `/leads/${leadId}/estimates`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
         )},
         { key: "contracts", label: "Contracts", href: `/leads/${leadId}/contracts`, icon: (
@@ -132,9 +132,20 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                     {quickCreateItems.map(item => (
                         <button
                             key={item.label}
-                            onClick={() => {
+                            onClick={async () => {
                                 if (item.label === "Contract") {
                                     window.location.href = `/leads/${leadId}/contracts?action=create`;
+                                } else if (item.label === "Estimate") {
+                                    try {
+                                        const { createDraftLeadEstimate } = await import("@/lib/actions");
+                                        const estimate = await createDraftLeadEstimate(leadId);
+                                        if (estimate) {
+                                            window.location.href = `/leads/${leadId}/estimates/${estimate.id}`;
+                                        }
+                                    } catch (err) {
+                                        console.error("Failed to create estimate:", err);
+                                        toast.error("Failed to create estimate");
+                                    }
                                 } else {
                                     toast.info(`${item.label} coming soon`);
                                 }
