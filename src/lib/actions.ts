@@ -3004,19 +3004,51 @@ export async function subPortalDeleteCOI() {
 // ==========================================
 export async function getVendors() {
     "use server";
-    return prisma.vendor.findMany({ orderBy: { name: "asc" } });
+    return prisma.vendor.findMany({ 
+        orderBy: { name: "asc" },
+        include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
+    });
 }
 
-export async function createVendor(data: { name: string, contactName?: string, email?: string, phone?: string, address?: string, notes?: string }) {
+export async function createVendor(data: any) {
     "use server";
-    const v = await prisma.vendor.create({ data });
+    const { tagIds, files, ...vendorData } = data;
+
+    const v = await prisma.vendor.create({ 
+        data: {
+            ...vendorData,
+            tags: tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : undefined,
+            files: files?.length ? { create: files } : undefined
+        }
+    });
     revalidatePath("/company/vendors");
     return v;
 }
 
 export async function updateVendor(id: string, data: any) {
     "use server";
-    const v = await prisma.vendor.update({ where: { id }, data });
+    const { tagIds, files, ...vendorData } = data;
+
+    const v = await prisma.vendor.update({ 
+        where: { id }, 
+        data: {
+            ...vendorData,
+            tags: tagIds ? { set: tagIds.map((id: string) => ({ id })) } : undefined,
+        }
+    });
+
+    if (files && files.length > 0) {
+        await prisma.vendorFile.createMany({
+            data: files.map((f: any) => ({
+                name: f.name,
+                url: f.url,
+                size: f.size,
+                type: f.type,
+                vendorId: id
+            }))
+        });
+    }
+
     revalidatePath("/company/vendors");
     return v;
 }
@@ -3024,6 +3056,37 @@ export async function updateVendor(id: string, data: any) {
 export async function deleteVendor(id: string) {
     "use server";
     await prisma.vendor.delete({ where: { id } });
+    revalidatePath("/company/vendors");
+}
+
+export async function deleteVendorFile(id: string) {
+    "use server";
+    await prisma.vendorFile.delete({ where: { id } });
+    revalidatePath("/company/vendors");
+}
+
+export async function getVendorTags() {
+    "use server";
+    return prisma.vendorTag.findMany({ orderBy: { name: "asc" } });
+}
+
+export async function createVendorTag(name: string) {
+    "use server";
+    const tag = await prisma.vendorTag.create({ data: { name } });
+    revalidatePath("/company/vendors");
+    return tag;
+}
+
+export async function updateVendorTag(id: string, name: string) {
+    "use server";
+    const tag = await prisma.vendorTag.update({ where: { id }, data: { name } });
+    revalidatePath("/company/vendors");
+    return tag;
+}
+
+export async function deleteVendorTag(id: string) {
+    "use server";
+    await prisma.vendorTag.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }
 

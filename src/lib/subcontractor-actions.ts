@@ -2,6 +2,7 @@
 
 import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
+import { sendNotification } from "./email";
 
 export async function getProjectSubcontractors(projectId: string) {
     const allSubs = await prisma.subcontractor.findMany({
@@ -80,11 +81,38 @@ export async function inviteNewSubcontractor(projectId: string, data: {
         update: {}
     });
 
-    // Mock sending invite
+    // Send invite
     if (data.sendEmail) {
-        console.log(`[Email] Mock inviting subcontractor ${data.email} to project ${projectId}`);
+        const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/sub-portal/projects/${projectId}`;
+        
+        const html = `
+            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
+                <h2 style="color: #1e293b; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">Project Invitation</h2>
+                <p>Hello ${data.firstName || data.company},</p>
+                <p>You have been invited to collaborate on a Golden Touch Remodeling project as a subcontractor.</p>
+                <p>Please access the Subcontractor Portal to view project files, details, and schedules.</p>
+                
+                <div style="margin: 30px 0; text-align: center;">
+                    <a href="${portalUrl}" style="background-color: #0f172a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+                        Access Project Portal
+                    </a>
+                </div>
+                
+                <p>If you have any questions, please reply to this email or contact your project manager.</p>
+                <p style="color: #64748b; font-size: 14px; margin-top: 30px;">
+                    Best regards,<br/><strong>Golden Touch Remodeling</strong>
+                </p>
+            </div>
+        `;
+
+        await sendNotification(
+            data.email,
+            "You've been invited to a project - Golden Touch Remodeling",
+            html
+        );
     }
     if (data.sendText && data.phone) {
+        // Mock SMS for now unless Twilio is set up
         console.log(`[SMS] Mock inviting subcontractor ${data.phone} to project ${projectId}`);
     }
 
