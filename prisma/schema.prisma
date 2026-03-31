@@ -84,11 +84,22 @@ model Lead {
   files             ProjectFile[]
   folders           FileFolder[]
   tasks             LeadTask[]
+  notes             LeadNote[]
   meetings          LeadMeeting[]
   takeoffs          Takeoff[]
   leadMessages      LeadMessage[]
   message           String?   // Initial inquiry message from the client
   project           Project?  // reverse relation: the project created from this lead
+}
+
+model LeadNote {
+  id          String   @id @default(cuid())
+  leadId      String
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  content     String
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }
 
 model LeadTask {

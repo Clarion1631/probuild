@@ -346,6 +346,9 @@ export async function createLeadMeeting(leadId: string, data: {
     const startDate = new Date(data.scheduledAt);
     const endDate = new Date(startDate.getTime() + data.duration * 60000);
 
+    const lead = await prisma.lead.findUnique({ where: { id: leadId }, include: { client: true } });
+    if (!lead) throw new Error("Lead not found");
+
     const meeting = await prisma.leadMeeting.create({
         data: {
             leadId,
@@ -359,6 +362,55 @@ export async function createLeadMeeting(leadId: string, data: {
             description: data.description || null,
         },
     });
+
+    // Generate .ics string
+    const formatIcsDate = (date: Date) => date.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    const icsContent = `BEGIN:VCALENDAR
+VERSION:2.0
+CALSCALE:GREGORIAN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:${meeting.id}@probuild.goldentouchremodeling.com
+DTSTAMP:${formatIcsDate(new Date())}
+DTSTART:${formatIcsDate(startDate)}
+DTEND:${formatIcsDate(endDate)}
+SUMMARY:${data.title}
+DESCRIPTION:${data.description || 'Meeting scheduled via ProBuild.'}
+LOCATION:${data.location || data.videoApp || 'Remote'}
+ORGANIZER;CN="Golden Touch Remodeling":mailto:info@goldentouchremodeling.com
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN="${lead.client.name}":mailto:${lead.client.email || 'unknown@example.com'}
+END:VEVENT
+END:VCALENDAR`;
+
+    const icsBuffer = Buffer.from(icsContent, 'utf8');
+    const attachments = [{ filename: 'invite.ics', content: icsBuffer }];
+
+    try {
+        const { sendNotification } = await import('@/lib/email');
+
+        const companyEmail = 'jadkins@goldentouchremodeling.com';
+        
+        // 1. Send to internal team (for Google Calendar processing)
+        await sendNotification(
+            companyEmail,
+            `New Meeting Scheduled: ${data.title}`,
+            `<p>A new meeting was scheduled with ${lead.client.name} for ${startDate.toLocaleString()}. Check your calendar for details.</p>`,
+            attachments
+        );
+
+        // 2. Send to Client
+        if (lead.client.email) {
+            await sendNotification(
+                lead.client.email,
+                `Meeting Scheduled: ${data.title}`,
+                `<p>Hi ${lead.client.name},<br><br>We have scheduled a meeting to discuss your project: ${data.title}.<br>Time: ${startDate.toLocaleString()}<br><br>Please see the attached calendar invite.<br><br>Thanks,<br>Golden Touch Remodeling</p>`,
+                attachments
+            );
+        }
+    } catch (e) {
+        console.error("Failed to sequence calendar invites: ", e);
+    }
+
     revalidatePath(`/leads/${leadId}`);
     revalidatePath(`/leads/${leadId}/meetings`);
     return meeting;

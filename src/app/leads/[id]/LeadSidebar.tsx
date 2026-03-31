@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import MeetingPopover from "./MeetingPopover";
+import LeadNotesModal from "./LeadNotesModal";
 
 interface LeadSidebarProps {
     leadId: string;
@@ -14,6 +15,7 @@ interface LeadSidebarProps {
 export default function LeadSidebar({ leadId, leadName, clientName, onConvert }: LeadSidebarProps) {
     const [showMoreActions, setShowMoreActions] = useState(false);
     const [activeNav, setActiveNav] = useState("overview");
+    const [showNotes, setShowNotes] = useState(false);
 
     const navItems = [
         { key: "overview", label: "Overview", href: `/leads/${leadId}`, icon: (
@@ -64,7 +66,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         ), href: `/leads/${leadId}/meetings` },
         { label: "3D Floor Plan", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-        ), href: `/leads/${leadId}/floor-plans?action=create` },
+        ), action: "floorplan" },
         { label: "Note", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         ), action: "note" },
@@ -142,7 +144,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
             {/* Quick Create */}
             <div className="px-4 py-3 border-t border-hui-border">
                 <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-3">Quick Create</p>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 gap-2">
                     {/* Meeting popover (special handling) */}
                     <div className="col-span-1">
                         <MeetingPopover leadId={leadId} clientName={clientName} variant="grid" />
@@ -164,14 +166,18 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                                         console.error("Failed to create estimate:", err);
                                         toast.error("Failed to create estimate");
                                     }
-                                } else if (item.action === "note" || item.action === "call") {
+                                } else if (item.action === "floorplan") {
+                                    toast.info("Please convert to a robust Project first to access 3D Floor Planning.");
+                                } else if (item.action === "note") {
+                                    setShowNotes(true);
+                                } else if (item.action === "call") {
                                     toast.info(`${item.label} module has not been enabled for this tenant yet.`);
                                 }
                             }}
                             className="flex flex-col items-center justify-center gap-1.5 p-2 h-16 rounded border border-slate-200 hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-600 hover:text-slate-800 group"
                         >
                             <span className="text-slate-400 group-hover:text-slate-600 transition shrink-0">{item.icon}</span>
-                            <span className="text-[9px] font-medium leading-tight text-center truncate w-full px-1">{item.label}</span>
+                            <span className="text-[10px] font-medium leading-tight text-center w-full px-1">{item.label}</span>
                         </button>
                     ))}
                 </div>
@@ -224,6 +230,15 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                     Need more info?
                 </button>
             </div>
+
+            {/* Modals */}
+            {showNotes && (
+                <LeadNotesModal 
+                    leadId={leadId} 
+                    clientName={clientName} 
+                    onClose={() => setShowNotes(false)} 
+                />
+            )}
         </div>
     );
 }

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
 import EditLeadModal from "./EditLeadModal";
+import GoogleMapPreview from "@/components/GoogleMapPreview";
 
 interface LeadDetailsSidebarProps {
     leadId: string;
@@ -358,7 +359,8 @@ export default function LeadDetailsSidebar({
                         </div>
                         <div>
                             <p className="text-slate-500 text-xs font-medium mb-0.5">Project Location</p>
-                            <p className="text-hui-textMain">{location || "Not specified"}</p>
+                            <p className="text-hui-textMain mb-2">{location || "Not specified"}</p>
+                            {location && <GoogleMapPreview address={location} />}
                         </div>
                         <div>
                             <p className="text-slate-500 text-xs font-medium mb-0.5">Message</p>

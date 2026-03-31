@@ -2,6 +2,7 @@ import { useState } from "react";
 import { updateLeadInfo } from "@/lib/actions";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
+import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
 
 export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpen: boolean, onClose: () => void, lead: any, client: any }) {
     const router = useRouter();
@@ -95,8 +96,12 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                     {/* Middle Section */}
                     <div className="space-y-4">
                         <div className="relative">
-                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500">Lead Address</label>
-                            <input name="location" value={formData.location} onChange={handleChange} className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition" />
+                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500 z-10">Lead Address</label>
+                            <GoogleMapsAutocomplete 
+                                value={formData.location} 
+                                onChange={(val) => setFormData(p => ({ ...p, location: val }))}
+                                className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition" 
+                            />
                         </div>
 
                         <div className="grid grid-cols-2 gap-4 pt-2">
