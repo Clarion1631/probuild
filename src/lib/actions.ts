@@ -577,6 +577,12 @@ export async function convertLeadToProject(leadId: string) {
         data: { projectId: project.id, leadId: null },
     });
 
+    // Relink floor plans
+    await prisma.floorPlan.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
+
     // Update lead
     await prisma.lead.update({
         where: { id: leadId },
@@ -644,13 +650,17 @@ export async function getFloorPlan(id: string) {
     return await prisma.floorPlan.findUnique({ where: { id } });
 }
 
-export async function saveFloorPlanData(id: string, projectId: string, data: string) {
+export async function saveFloorPlanData(id: string, relatedId: string, data: string, isLead: boolean = false) {
     await prisma.floorPlan.update({
         where: { id },
         data: { data },
     });
 
-    revalidatePath(`/projects/${projectId}/floor-plans`);
+    if (isLead) {
+        revalidatePath(`/leads/${relatedId}/floor-plans`);
+    } else {
+        revalidatePath(`/projects/${relatedId}/floor-plans`);
+    }
     return { success: true };
 }
 
@@ -2973,5 +2983,175 @@ export async function subPortalDeleteCOI() {
     });
 
     revalidatePath(`/sub-portal`);
+    return { success: true };
+}
+
+// ==========================================
+// Vendors
+// ==========================================
+export async function getVendors() {
+    "use server";
+    return prisma.vendor.findMany({ orderBy: { name: "asc" } });
+}
+
+export async function createVendor(data: { name: string, contactName?: string, email?: string, phone?: string, address?: string, notes?: string }) {
+    "use server";
+    const v = await prisma.vendor.create({ data });
+    revalidatePath("/company/vendors");
+    return v;
+}
+
+export async function updateVendor(id: string, data: any) {
+    "use server";
+    const v = await prisma.vendor.update({ where: { id }, data });
+    revalidatePath("/company/vendors");
+    return v;
+}
+
+export async function deleteVendor(id: string) {
+    "use server";
+    await prisma.vendor.delete({ where: { id } });
+    revalidatePath("/company/vendors");
+}
+
+// ==========================================
+// Purchase Orders
+// ==========================================
+export async function getPurchaseOrders(projectId: string) {
+    "use server";
+    return prisma.purchaseOrder.findMany({
+        where: { projectId },
+        include: { vendor: true, items: true },
+        orderBy: { createdAt: "desc" }
+    });
+}
+
+export async function getPurchaseOrder(id: string) {
+    "use server";
+    return prisma.purchaseOrder.findUnique({
+        where: { id },
+        include: { vendor: true, items: { include: { costCode: true } } }
+    });
+}
+
+export async function createPurchaseOrder(projectId: string, data: any) {
+    "use server";
+    const count = await prisma.purchaseOrder.count({ where: { projectId } });
+    const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
+    
+    const { items, ...poData } = data;
+    
+    const po = await prisma.purchaseOrder.create({
+        data: {
+            ...poData,
+            projectId,
+            code,
+            items: {
+                create: items || []
+            }
+        }
+    });
+    revalidatePath(`/projects/${projectId}/purchase-orders`);
+    return po;
+}
+
+export async function updatePurchaseOrder(id: string, data: any) {
+    "use server";
+    const { items, vendorId, ...poData } = data;
+    
+    let updateData: any = { ...poData };
+    if (vendorId) updateData.vendorId = vendorId;
+
+    const po = await prisma.purchaseOrder.update({
+        where: { id },
+        data: updateData
+    });
+
+    if (items) {
+        await prisma.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: id } });
+        await prisma.purchaseOrder.update({
+            where: { id },
+            data: {
+                items: {
+                    create: items.map((i: any) => ({
+                        description: i.description,
+                        quantity: i.quantity,
+                        unitCost: i.unitCost,
+                        total: i.total,
+                        order: i.order,
+                        costCodeId: i.costCodeId,
+                        costTypeId: i.costTypeId
+                    }))
+                }
+            }
+        });
+    }
+
+    revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
+    revalidatePath(`/projects/${po.projectId}/purchase-orders`);
+    
+    return po;
+}
+
+export async function deletePurchaseOrder(id: string) {
+    "use server";
+    const po = await prisma.purchaseOrder.findUnique({ where: { id } });
+    if (!po) return;
+    await prisma.purchaseOrder.delete({ where: { id } });
+    revalidatePath(`/projects/${po.projectId}/purchase-orders`);
+}
+
+export async function updatePurchaseOrderStatus(id: string, status: string) {
+    "use server";
+    const po = await prisma.purchaseOrder.update({
+        where: { id },
+        data: { status }
+    });
+    revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
+    revalidatePath(`/projects/${po.projectId}/purchase-orders`);
+    return po;
+}
+
+export async function sendPurchaseOrder(id: string, toEmail: string, message: string) {
+    "use server";
+    const { sendNotification } = await import("./email");
+    const { generatePurchaseOrderPdf } = await import("./pdf");
+
+    const po = await prisma.purchaseOrder.findUnique({
+        where: { id },
+        include: { project: true, vendor: true }
+    });
+    if (!po) throw new Error("PO not found");
+
+    const pdfBuffer = await generatePurchaseOrderPdf(id);
+
+    const htmlContent = `
+        <div style="font-family: sans-serif; color: #333;">
+            <h2>Purchase Order ${po.code}</h2>
+            <p><strong>Project:</strong> ${po.project.name}</p>
+            <p><strong>Vendor:</strong> ${po.vendor.name}</p>
+            <hr />
+            <p>${message.replace(/\n/g, '<br/>')}</p>
+            <br />
+            <p>Please find the official Purchase Order attached as a PDF.</p>
+        </div>
+    `;
+
+    await sendNotification(
+        toEmail,
+        `Purchase Order ${po.code} - ${po.project.name}`,
+        htmlContent,
+        [{ filename: `PO_${po.code}.pdf`, content: pdfBuffer }]
+    );
+
+    // Update status to Sent
+    await updatePurchaseOrderStatus(id, "Sent");
+    
+    // Mark sentAt
+    await prisma.purchaseOrder.update({
+        where: { id },
+        data: { sentAt: new Date() }
+    });
+    
     return { success: true };
 }

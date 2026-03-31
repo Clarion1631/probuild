@@ -14,7 +14,8 @@ interface MessageData {
 
 interface ProjectChatProps {
     projectId: string;
-    perspective: "TEAM" | "CLIENT";
+    perspective: "TEAM" | "CLIENT" | "SUBCONTRACTOR";
+    subcontractorId?: string;
     currentUserName?: string;
     currentUserEmail?: string;
 }
@@ -22,6 +23,7 @@ interface ProjectChatProps {
 export default function ProjectChat({
     projectId,
     perspective,
+    subcontractorId,
     currentUserName = "Team Member",
     currentUserEmail,
 }: ProjectChatProps) {
@@ -34,7 +36,10 @@ export default function ProjectChat({
 
     const fetchMessages = useCallback(async () => {
         try {
-            const res = await fetch(`/api/messages?projectId=${projectId}`);
+            const url = subcontractorId 
+                ? `/api/messages?projectId=${projectId}&subcontractorId=${subcontractorId}`
+                : `/api/messages?projectId=${projectId}`;
+            const res = await fetch(url);
             if (!res.ok) return;
             const data = await res.json();
             setMessages(data.messages || []);
@@ -52,7 +57,7 @@ export default function ProjectChat({
         } finally {
             setLoading(false);
         }
-    }, [projectId, perspective]);
+    }, [projectId, perspective, subcontractorId]);
 
     useEffect(() => {
         fetchMessages();
@@ -83,6 +88,7 @@ export default function ProjectChat({
                     senderType: perspective,
                     senderName: currentUserName,
                     senderEmail: currentUserEmail,
+                    subcontractorId,
                 }),
             });
             if (res.ok) {

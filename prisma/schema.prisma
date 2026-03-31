@@ -163,8 +163,9 @@ model Project {
   subcontractorAccess SubcontractorProjectAccess[]
   takeoffs      Takeoff[]
   portalVisibility PortalVisibility?
-  messageThread    MessageThread?
+  messageThreads   MessageThread[]
   changeOrders     ChangeOrder[]
+  purchaseOrders   PurchaseOrder[]
 }
 
 model FloorPlan {
@@ -336,6 +337,7 @@ model CostCode {
   timeEntries   TimeEntry[]
   expenses      Expense[]
   changeOrderItems ChangeOrderItem[]
+  purchaseOrderItems PurchaseOrderItem[]
 }
 
 model CostType {
@@ -350,6 +352,7 @@ model CostType {
   timeEntries   TimeEntry[]
   expenses      Expense[]
   changeOrderItems ChangeOrderItem[]
+  purchaseOrderItems PurchaseOrderItem[]
 }
 
 model TimeEntry {
@@ -579,6 +582,7 @@ model Subcontractor {
   // Relations
   taskAssignments SubTaskAssignment[]
   projectAccess   SubcontractorProjectAccess[]
+  messageThreads  MessageThread[]
   
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
@@ -749,18 +753,22 @@ model PortalVisibility {
 }
 
 model MessageThread {
-  id        String    @id @default(cuid())
-  projectId String    @unique
-  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  messages  Message[]
-  createdAt DateTime  @default(now())
+  id              String         @id @default(cuid())
+  projectId       String
+  project         Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  subcontractorId String?
+  subcontractor   Subcontractor? @relation(fields: [subcontractorId], references: [id], onDelete: Cascade)
+  messages        Message[]
+  createdAt       DateTime       @default(now())
+
+  @@unique([projectId, subcontractorId])
 }
 
 model Message {
   id          String    @id @default(cuid())
   threadId    String
   thread      MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
-  senderType  String    // "CLIENT" or "TEAM"
+  senderType  String    // "CLIENT", "TEAM", or "SUBCONTRACTOR"
   senderName  String
   senderEmail String?
   body        String
@@ -857,4 +865,59 @@ model ChangeOrderPaymentSchedule {
   dueDate       DateTime?
   order         Int         @default(0)
   createdAt     DateTime    @default(now())
+}
+
+model Vendor {
+  id             String          @id @default(cuid())
+  name           String
+  contactName    String?
+  email          String?
+  phone          String?
+  address        String?
+  notes          String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  purchaseOrders PurchaseOrder[]
+}
+
+model PurchaseOrder {
+  id          String   @id @default(cuid())
+  code        String
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  vendorId    String
+  vendor      Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  status      String   @default("Draft") // Draft, Sent, Received, Cancelled
+  totalAmount Float    @default(0)
+  notes       String?
+  memos       String?
+  terms       String?
+  
+  sentAt      DateTime?
+  viewedAt    DateTime?
+  
+  items       PurchaseOrderItem[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  
+  description     String
+  quantity        Float         @default(1)
+  unitCost        Float         @default(0)
+  total           Float         @default(0)
+  order           Int           @default(0)
+  
+  costCodeId      String?
+  costCode        CostCode?     @relation(fields: [costCodeId], references: [id])
+  costTypeId      String?
+  costType        CostType?     @relation(fields: [costTypeId], references: [id])
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
 }

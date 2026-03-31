@@ -16,9 +16,10 @@ export default function GoogleMapsAutocomplete({ value, onChange, className, pla
         const loadGoogleMaps = () => {
             if (!window.google) {
                 const script = document.createElement("script");
-                script.src = `https://maps.googleapis.com/maps/api/js?key=${process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "AIzaSyALTSGHtNgwQNOaK2NL5FgJXzvfmNcu5Xw"}&libraries=places`;
+                (window as any).initGooglePlaces = initAutocomplete;
+                script.src = `https://maps.googleapis.com/maps/api/js?key=${process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "AIzaSyALTSGHtNgwQNOaK2NL5FgJXzvfmNcu5Xw"}&libraries=places&callback=initGooglePlaces`;
                 script.async = true;
-                script.onload = initAutocomplete;
+                script.defer = true;
                 document.head.appendChild(script);
             } else {
                 initAutocomplete();

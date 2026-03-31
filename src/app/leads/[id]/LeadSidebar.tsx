@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
+import { useRouter } from "next/navigation";
 import MeetingPopover from "./MeetingPopover";
 import LeadNotesModal from "./LeadNotesModal";
 
@@ -13,6 +14,7 @@ interface LeadSidebarProps {
 }
 
 export default function LeadSidebar({ leadId, leadName, clientName, onConvert }: LeadSidebarProps) {
+    const router = useRouter();
     const [showMoreActions, setShowMoreActions] = useState(false);
     const [activeNav, setActiveNav] = useState("overview");
     const [showNotes, setShowNotes] = useState(false);
@@ -167,7 +169,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                                         toast.error("Failed to create estimate");
                                     }
                                 } else if (item.action === "floorplan") {
-                                    toast.info("Please convert to a robust Project first to access 3D Floor Planning.");
+                                    router.push(`/leads/${leadId}/floor-plans`);
                                 } else if (item.action === "note") {
                                     setShowNotes(true);
                                 } else if (item.action === "call") {

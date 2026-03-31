@@ -24,9 +24,10 @@ import { toast } from "sonner";
 interface FloorPlanEditorProps {
     floorPlanId: string;
     projectId: string;
+    isLead?: boolean;
 }
 
-export default function FloorPlanEditor({ floorPlanId, projectId }: FloorPlanEditorProps) {
+export default function FloorPlanEditor({ floorPlanId, projectId, isLead = false }: FloorPlanEditorProps) {
     const router = useRouter();
     const [is3DView, setIs3DView] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
@@ -85,7 +86,7 @@ export default function FloorPlanEditor({ floorPlanId, projectId }: FloorPlanEdi
         setIsSaving(true);
         try {
             const data = getSerializableState();
-            await saveFloorPlanData(floorPlanId, projectId, data);
+            await saveFloorPlanData(floorPlanId, projectId, data, isLead);
             toast.success("Floor plan saved successfully!");
         } catch (err) {
             console.error("Failed to save floor plan:", err);

@@ -80,13 +80,22 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
                             <span>Started {new Date(project.createdAt).toLocaleDateString()}</span>
                         </div>
                     </div>
-                    <span className={`text-xs px-3 py-1 rounded-full font-semibold ${
-                        project.status === "Completed" ? "bg-emerald-100 text-emerald-700" :
-                        project.status === "In Progress" ? "bg-blue-100 text-blue-700" :
-                        "bg-slate-100 text-slate-600"
-                    }`}>
-                        {project.status}
-                    </span>
+                    <div className="flex flex-col items-end gap-3">
+                        <span className={`text-xs px-3 py-1 rounded-full font-semibold ${
+                            project.status === "Completed" ? "bg-emerald-100 text-emerald-700" :
+                            project.status === "In Progress" ? "bg-blue-100 text-blue-700" :
+                            "bg-slate-100 text-slate-600"
+                        }`}>
+                            {project.status}
+                        </span>
+                        <Link 
+                            href={`/sub-portal/projects/${projectId}/messages`}
+                            className="hui-btn hui-btn-secondary text-sm"
+                        >
+                            <svg className="w-4 h-4 mr-2 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                            Messages
+                        </Link>
+                    </div>
                 </div>
             </div>
 

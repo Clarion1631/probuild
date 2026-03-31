@@ -365,3 +365,228 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     const pdfBytes = await doc.save();
     return Buffer.from(pdfBytes);
 }
+
+export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
+    const po = await prisma.purchaseOrder.findUnique({
+        where: { id: poId },
+        include: {
+            items: { orderBy: { order: 'asc' } },
+            vendor: true,
+            project: { include: { client: true } },
+        },
+    });
+
+    if (!po) throw new Error('Purchase Order not found');
+
+    const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
+
+    const doc = await PDFDocument.create();
+    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const pageWidth = 612; // Letter width
+    const pageHeight = 792; // Letter height
+    const margin = 50;
+    const contentWidth = pageWidth - margin * 2;
+
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+        }
+    }
+
+    // --- Header accent bar ---
+    page.drawRectangle({
+        x: 0, y: pageHeight - 6, width: pageWidth, height: 6,
+        color: colors.primary, // Using primary color for header bar
+    });
+    y -= 34;
+
+    // --- Company Name ---
+    if (company?.companyName) {
+        page.drawText(company.companyName.toUpperCase(), {
+            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
+        });
+    }
+
+    // --- Title ---
+    y -= 30;
+    page.drawText('PURCHASE ORDER', {
+        x: margin, y, size: 22, font: helveticaBold, color: colors.textMain,
+    });
+
+    // --- PO Info ---
+    y -= 30;
+
+    // Left: Vendor info
+    page.drawText('VENDOR', {
+        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
+    });
+
+    if (po.vendor?.name) {
+        y -= 16;
+        page.drawText(po.vendor.name, {
+            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
+        });
+    }
+    if (po.vendor?.contactName) {
+        y -= 14;
+        page.drawText(po.vendor.contactName, {
+            x: margin, y, size: 9, font: helvetica, color: colors.textMain,
+        });
+    }
+    if (po.vendor?.email) {
+        y -= 14;
+        page.drawText(po.vendor.email, {
+            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
+        });
+    }
+
+    // Right side: PO # / Date
+    const rightX = pageWidth - margin;
+    let ry = y + (po.vendor?.email ? 44 : 30);
+
+    const drawRightLabel = (label: string, value: string, yPos: number) => {
+        page.drawText(label, {
+            x: rightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted,
+        });
+        const valueWidth = helveticaBold.widthOfTextAtSize(value, 9);
+        page.drawText(value, {
+            x: rightX - valueWidth, y: yPos, size: 9, font: helveticaBold, color: colors.textMain,
+        });
+    };
+
+    drawRightLabel('P.O. No.', po.code || '', ry);
+    ry -= 16;
+    drawRightLabel('Date', new Date(po.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
+    ry -= 16;
+    drawRightLabel('Project', po.project?.name || '', ry);
+
+    // --- Separator ---
+    y -= 20;
+    page.drawLine({
+        start: { x: margin, y }, end: { x: pageWidth - margin, y },
+        thickness: 0.5, color: colors.border,
+    });
+    y -= 20;
+
+    // --- Table Header ---
+    const cols = {
+        name: margin,
+        qty: margin + contentWidth * 0.55,
+        unitCost: margin + contentWidth * 0.75,
+        total: pageWidth - margin,
+    };
+
+    page.drawText('DESCRIPTION', {
+        x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
+    });
+    const qtyLabel = 'QTY';
+    const qtyWidth = helveticaBold.widthOfTextAtSize(qtyLabel, 8);
+    page.drawText(qtyLabel, {
+        x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+    });
+    const ucLabel = 'UNIT COST';
+    const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
+    page.drawText(ucLabel, {
+        x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+    });
+    const totalLabel = 'TOTAL';
+    const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
+    page.drawText(totalLabel, {
+        x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+    });
+
+    y -= 8;
+    page.drawLine({
+        start: { x: margin, y }, end: { x: pageWidth - margin, y },
+        thickness: 0.5, color: colors.border,
+    });
+    y -= 14;
+
+    // --- Table Rows ---
+    for (const item of po.items) {
+        checkNewPage(100);
+
+        // Truncate long descriptions
+        let displayName = item.description || '';
+        const maxNameWidth = contentWidth * 0.5;
+        while (helvetica.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) {
+            displayName = displayName.slice(0, -1);
+        }
+
+        page.drawText(displayName, {
+            x: cols.name, y, size: 10, font: helvetica, color: colors.textMain,
+        });
+
+        // Qty
+        const qtyStr = String(item.quantity || 0);
+        const qtyStrWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
+        page.drawText(qtyStr, {
+            x: cols.qty - qtyStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+        });
+
+        // Unit cost
+        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucStrWidth = helvetica.widthOfTextAtSize(ucStr, 10);
+        page.drawText(ucStr, {
+            x: cols.unitCost - ucStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+        });
+
+        // Total
+        const totalStr = formatCurrency(item.total || 0);
+        const totalStrWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
+        page.drawText(totalStr, {
+            x: cols.total - totalStrWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
+        });
+
+        y -= 20;
+    }
+
+    // --- Totals Section ---
+    y -= 10;
+    checkNewPage(120);
+    page.drawLine({
+        start: { x: margin + contentWidth * 0.5, y },
+        end: { x: pageWidth - margin, y },
+        thickness: 0.5, color: colors.border,
+    });
+    y -= 25;
+
+    const total = po.totalAmount || 0;
+
+    // Total line
+    const labelX = cols.unitCost - 60;
+    page.drawText('Total Amount', {
+        x: labelX, y: y, size: 14, font: helveticaBold, color: colors.textMain,
+    });
+    const totalStr2 = formatCurrency(total);
+    const totalWidth2 = helveticaBold.widthOfTextAtSize(totalStr2, 14);
+    page.drawText(totalStr2, {
+        x: cols.total - totalWidth2, y: y, size: 14, font: helveticaBold, color: colors.textMain,
+    });
+
+    // --- Notes and Terms ---
+    if (po.notes) {
+        y -= 40;
+        checkNewPage(80);
+        page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 14;
+        page.drawText(po.notes, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+    }
+    
+    if (po.terms) {
+        y -= 30;
+        checkNewPage(80);
+        page.drawText('Terms & Conditions:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 14;
+        page.drawText(po.terms, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+    }
+
+    const pdfBytes = await doc.save();
+    return Buffer.from(pdfBytes);
+}

@@ -7,6 +7,7 @@ interface JobCostingClientProps {
     estimates: any[];
     timeEntries: any[];
     expenses: any[];
+    purchaseOrders?: any[];
 }
 
 type CostCodeSummary = {
@@ -16,6 +17,7 @@ type CostCodeSummary = {
     budgetMaterial: number;
     actualLabor: number;
     actualMaterial: number;
+    committedMaterial: number;
 };
 
 type SortKey = "code" | "budget" | "actual" | "variance" | "pct";
@@ -31,7 +33,8 @@ export default function JobCostingClient({
     project,
     estimates,
     timeEntries,
-    expenses
+    expenses,
+    purchaseOrders = []
 }: JobCostingClientProps) {
     const [sortKey, setSortKey] = useState<SortKey>("code");
     const [sortDir, setSortDir] = useState<SortDir>("asc");
@@ -46,7 +49,7 @@ export default function JobCostingClient({
         const getGroup = (ccId: string | null, ccName: string, ccCode: string) => {
             const key = ccId || "unassigned";
             if (!map.has(key)) {
-                map.set(key, { code: ccCode || "N/A", name: ccName || "Unassigned", budgetLabor: 0, budgetMaterial: 0, actualLabor: 0, actualMaterial: 0 });
+                map.set(key, { code: ccCode || "N/A", name: ccName || "Unassigned", budgetLabor: 0, budgetMaterial: 0, actualLabor: 0, actualMaterial: 0, committedMaterial: 0 });
             }
             return map.get(key)!;
         };
@@ -66,15 +69,21 @@ export default function JobCostingClient({
             const group = getGroup(ex.costCodeId, ex.costCode?.name, ex.costCode?.code);
             group.actualMaterial += (ex.amount || 0);
         });
+        purchaseOrders.forEach(po => {
+            po.items?.forEach((item: any) => {
+                const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
+                group.committedMaterial += (item.total || 0);
+            });
+        });
         return Array.from(map.values());
-    }, [estimates, timeEntries, expenses]);
+    }, [estimates, timeEntries, expenses, purchaseOrders]);
 
     const sortedSummaries = useMemo(() => {
         return [...summaries].sort((a, b) => {
             const totalBudgetA = a.budgetLabor + a.budgetMaterial;
             const totalBudgetB = b.budgetLabor + b.budgetMaterial;
-            const totalActualA = a.actualLabor + a.actualMaterial;
-            const totalActualB = b.actualLabor + b.actualMaterial;
+            const totalActualA = a.actualLabor + a.actualMaterial + a.committedMaterial;
+            const totalActualB = b.actualLabor + b.actualMaterial + b.committedMaterial;
             let cmp = 0;
             switch (sortKey) {
                 case "code": cmp = a.code.localeCompare(b.code); break;
@@ -94,11 +103,13 @@ export default function JobCostingClient({
         return summaries.reduce((acc, curr) => ({
             budget: acc.budget + curr.budgetLabor + curr.budgetMaterial,
             actual: acc.actual + curr.actualLabor + curr.actualMaterial,
-            variance: acc.variance + ((curr.budgetLabor + curr.budgetMaterial) - (curr.actualLabor + curr.actualMaterial))
-        }), { budget: 0, actual: 0, variance: 0 });
+            committed: acc.committed + curr.committedMaterial,
+            variance: acc.variance + ((curr.budgetLabor + curr.budgetMaterial) - (curr.actualLabor + curr.actualMaterial + curr.committedMaterial))
+        }), { budget: 0, actual: 0, committed: 0, variance: 0 });
     }, [summaries]);
 
-    const budgetUsedPct = totals.budget > 0 ? (totals.actual / totals.budget) * 100 : 0;
+    const totalCost = totals.actual + totals.committed;
+    const budgetUsedPct = totals.budget > 0 ? (totalCost / totals.budget) * 100 : 0;
 
     const ThSortable = ({ label, sortK, className = "" }: { label: string; sortK: SortKey; className?: string }) => (
         <th className={`px-5 py-3.5 font-semibold cursor-pointer select-none hover:text-hui-primary transition group ${className}`} onClick={() => handleSort(sortK)}>
@@ -141,9 +152,19 @@ export default function JobCostingClient({
                         <div className="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center text-orange-600">
                             <svg className="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                         </div>
-                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Actual Cost</p>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Actual Costs</p>
                     </div>
                     <p className="text-2xl font-bold text-hui-textMain">${totals.actual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</p>
+                </div>
+
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-hui-border">
+                    <div className="flex items-center gap-3 mb-3">
+                        <div className="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center text-orange-600">
+                            <svg className="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15 8.25H9m6 3H9m3 6l-3-3h1.5a3 3 0 100-6M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                        </div>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Committed POs</p>
+                    </div>
+                    <p className="text-2xl font-bold text-amber-500">${totals.committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</p>
                 </div>
 
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-hui-border">
@@ -184,6 +205,7 @@ export default function JobCostingClient({
                             <ThSortable label="Phase / Cost Code" sortK="code" />
                             <ThSortable label="Budget" sortK="budget" className="text-right" />
                             <ThSortable label="Actual" sortK="actual" className="text-right" />
+                            <ThSortable label="Committed" sortK="actual" className="text-right" />
                             <ThSortable label="Variance" sortK="variance" className="text-right" />
                             <ThSortable label="% Used" sortK="pct" className="text-right" />
                         </tr>
@@ -205,8 +227,10 @@ export default function JobCostingClient({
                             sortedSummaries.map((s, i) => {
                                 const totalBudget = s.budgetLabor + s.budgetMaterial;
                                 const totalActual = s.actualLabor + s.actualMaterial;
-                                const variance = totalBudget - totalActual;
-                                const pctUsed = totalBudget > 0 ? (totalActual / totalBudget) * 100 : 0;
+                                const committed = s.committedMaterial;
+                                const totalCost = totalActual + committed;
+                                const variance = totalBudget - totalCost;
+                                const pctUsed = totalBudget > 0 ? (totalCost / totalBudget) * 100 : 0;
                                 return (
                                     <tr key={i} className="hover:bg-slate-50/80 transition group">
                                         <td className="px-5 py-4">
@@ -221,7 +245,8 @@ export default function JobCostingClient({
                                             </div>
                                         </td>
                                         <td className="px-5 py-4 text-right font-medium tabular-nums">${totalBudget.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                        <td className="px-5 py-4 text-right font-semibold tabular-nums">${totalActual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-5 py-4 text-right font-semibold tabular-nums text-slate-500">${totalActual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-5 py-4 text-right font-semibold tabular-nums text-amber-500">${committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
                                         <td className={`px-5 py-4 text-right font-semibold tabular-nums ${variance >= 0 ? "text-emerald-500" : "text-red-500"}`}>
                                             {variance >= 0 ? "+" : ""}${variance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                                         </td>
@@ -243,7 +268,8 @@ export default function JobCostingClient({
                             <tr className="text-sm font-bold text-hui-textMain">
                                 <td className="px-5 py-3.5">Totals</td>
                                 <td className="px-5 py-3.5 text-right tabular-nums">${totals.budget.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                <td className="px-5 py-3.5 text-right tabular-nums">${totals.actual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                <td className="px-5 py-3.5 text-right tabular-nums text-slate-500">${totals.actual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                <td className="px-5 py-3.5 text-right tabular-nums text-amber-500">${totals.committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
                                 <td className={`px-5 py-3.5 text-right tabular-nums ${totals.variance >= 0 ? "text-emerald-500" : "text-red-500"}`}>
                                     {totals.variance >= 0 ? "+" : ""}${totals.variance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                                 </td>

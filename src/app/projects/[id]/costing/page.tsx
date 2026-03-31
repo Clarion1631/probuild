@@ -64,6 +64,14 @@ export default async function JobCostingPage({
         include: { costCode: true }
     });
 
+    // Fetch Purchase Orders for "Committed Costs"
+    const purchaseOrders = await prisma.purchaseOrder.findMany({
+        where: { projectId },
+        include: {
+            items: { include: { costCode: true } }
+        }
+    });
+
     // We'll process the numbers on the client or server. Let's send raw to client for easy filtering if needed, 
     // or aggregate here. We'll aggregate on the client for flexibility.
 
@@ -73,6 +81,7 @@ export default async function JobCostingPage({
             estimates={estimates}
             timeEntries={timeEntries}
             expenses={expenses}
+            purchaseOrders={purchaseOrders}
         />
     );
 }
