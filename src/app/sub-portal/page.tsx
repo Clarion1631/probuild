@@ -8,21 +8,22 @@ export default async function SubPortalDashboard() {
     const sub = await getSubPortalSession();
     if (!sub) redirect("/sub-portal/login");
 
-    // Find all projects where this sub has task assignments
-    const assignments = await prisma.subTaskAssignment.findMany({
+    // Find all project accesses for this sub
+    const projectAccesses = await prisma.subcontractorProjectAccess.findMany({
         where: { subcontractorId: sub.id },
         include: {
-            task: {
-                include: {
-                    project: {
-                        select: { id: true, name: true, status: true, location: true, createdAt: true, color: true },
-                    },
-                },
-            },
-        },
+            project: {
+                select: { id: true, name: true, status: true, location: true, createdAt: true, color: true },
+            }
+        }
     });
 
-    // Group by project
+    // Find all task assignments to calculate task counts and status
+    const assignments = await prisma.subTaskAssignment.findMany({
+        where: { subcontractorId: sub.id },
+        include: { task: true }
+    });
+
     const projectMap = new Map<string, {
         id: string;
         name: string;
@@ -33,21 +34,25 @@ export default async function SubPortalDashboard() {
         taskCount: number;
     }>();
 
+    // Initialize map with all accessed projects
+    for (const access of projectAccesses) {
+        const p = access.project;
+        projectMap.set(p.id, {
+            id: p.id,
+            name: p.name,
+            status: p.status,
+            location: p.location,
+            createdAt: p.createdAt,
+            color: p.color,
+            taskCount: 0,
+        });
+    }
+
+    // Add task counts
     for (const a of assignments) {
-        const p = a.task.project;
-        const existing = projectMap.get(p.id);
+        const existing = projectMap.get(a.task.projectId);
         if (existing) {
             existing.taskCount += 1;
-        } else {
-            projectMap.set(p.id, {
-                id: p.id,
-                name: p.name,
-                status: p.status,
-                location: p.location,
-                createdAt: p.createdAt,
-                color: p.color,
-                taskCount: 1,
-            });
         }
     }
 
@@ -117,12 +122,12 @@ export default async function SubPortalDashboard() {
             <h2 className="text-lg font-bold text-hui-textMain mb-4">Your Projects</h2>
 
             {projects.length === 0 ? (
-                <div className="hui-card p-12 text-center flex flex-col items-center">
+                <div className="col-span-full hui-card p-12 text-center flex flex-col items-center">
                     <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mb-4">
                         <svg className="w-8 h-8 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
                     </div>
                     <p className="text-hui-textMuted mb-1 font-medium">No projects yet</p>
-                    <p className="text-sm text-hui-textMuted">Projects will appear here once tasks are assigned to you.</p>
+                    <p className="text-sm text-hui-textMuted">Projects will appear here once you are invited to them.</p>
                 </div>
             ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
