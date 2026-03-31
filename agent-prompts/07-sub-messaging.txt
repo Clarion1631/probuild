@@ -1,3 +1,4 @@
+TITLE: 07 - Sub Messaging
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -76,4 +77,5 @@ Build:
    - PM sends message → email goes to Subcontractor.email
 
 Follow HUI conventions. Reuse the chat components from Prompt #5 if applicable.
+
 

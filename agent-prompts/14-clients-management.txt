@@ -1,3 +1,4 @@
+TITLE: 14 - Clients Management
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -73,4 +74,5 @@ Build:
 4. LINK EXISTING — When creating a new Lead or Project, the client selector should search existing clients and offer "Create New" if not found.
 
 Use hui-card for containers, Avatar component for client initials, StatusBadge for project statuses.
+
 

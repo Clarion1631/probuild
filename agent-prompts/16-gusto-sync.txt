@@ -1,3 +1,4 @@
+TITLE: 16 - Gusto Sync
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -87,4 +88,5 @@ Build:
    - Sync history log
 
 Handle rate limiting and pagination from Gusto API. Show clear error messages if sync fails.
+
 

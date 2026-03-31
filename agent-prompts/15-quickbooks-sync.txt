@@ -1,3 +1,4 @@
+TITLE: 15 - Quickbooks Sync
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -78,4 +79,5 @@ Build:
    - Auto-sync toggle
 
 Handle token refresh automatically. Log all sync errors. Show sync status in the settings UI.
+
 

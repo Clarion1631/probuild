@@ -1,3 +1,4 @@
+TITLE: 12 - Budget Vs Actual
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -76,4 +77,5 @@ Build:
    - Total project spend exceeds 85% of total budget
 
 Use hui-card for chart containers, StatusBadge for status indicators.
+
 

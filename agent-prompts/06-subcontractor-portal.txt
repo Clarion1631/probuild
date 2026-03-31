@@ -1,3 +1,4 @@
+TITLE: 06 - Subcontractor Portal
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -78,4 +79,5 @@ Build:
 5. ADMIN INVITE — Add an "Invite to Portal" button on the subcontractor detail page in Company settings that triggers the magic link email.
 
 Use the HUI design system. Match the visual style of the client portal at src/app/portal/.
+
 

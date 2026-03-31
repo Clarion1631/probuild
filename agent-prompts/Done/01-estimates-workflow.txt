@@ -1,3 +1,4 @@
+TITLE: 01 - Estimates Workflow
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -79,4 +80,5 @@ Build these features:
 4. DUPLICATE ESTIMATE — Add a "Duplicate" action on the estimates list that deep-copies all EstimateItems.
 
 Follow HUI patterns: hui-card containers, hui-btn-primary for actions, hui-btn-secondary for cancel, hui-input for all form fields. Use Server Components by default, "use client" only when needed.
+
 

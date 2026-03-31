@@ -1,3 +1,4 @@
+TITLE: 09 - Leads Kanban
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -76,4 +77,5 @@ Build:
    - "Convert to Project" → existing flow
 
 Use hui-card for lane containers, smooth drag animations with Framer Motion.
+
 

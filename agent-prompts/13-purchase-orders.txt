@@ -1,3 +1,4 @@
+TITLE: 13 - Purchase Orders
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -69,4 +70,5 @@ Build:
 5. BUDGET INTEGRATION — PO amounts feed into the budget vs. actual tracking (committed costs).
 
 Add "Purchase Orders" to ProjectInnerSidebar. Use hui-card, hui-btn, hui-input patterns.
+
 

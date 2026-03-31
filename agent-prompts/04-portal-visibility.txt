@@ -1,3 +1,4 @@
+TITLE: 04 - Portal Visibility
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -74,4 +75,5 @@ Build:
 4. DEFAULT BEHAVIOR — When no PortalVisibility record exists, show everything except dailyLogs (match the defaults).
 
 Use hui-card, hui-btn for save, toggle switches with Tailwind for the admin settings.
+
 

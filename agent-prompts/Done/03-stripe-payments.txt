@@ -1,3 +1,4 @@
+TITLE: 03 - Stripe Payments
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -107,4 +108,5 @@ NOTE ON FEES (for the settings UI display):
 - ACH Bank Transfer: 0.8%, capped at $5.00 (best for large invoices)
 - Affirm: ~3-5% (absorbed by merchant, client pays 0% or low interest)
 - Klarna: ~3-5% (absorbed by merchant, client pays in 4 installments)
+
 

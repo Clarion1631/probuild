@@ -1,3 +1,4 @@
+TITLE: 17 - Reports Analytics
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -57,4 +58,5 @@ Build a page at src/app/reports/page.tsx with tabbed views:
 5. Add "Reports" to the sidebar, gated behind "financialReports" permission.
 
 Use hui-card for each report section. Build charts with SVG. Add date range filters.
+
 

@@ -1,3 +1,4 @@
+TITLE: 18 - Global Search
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -66,4 +67,5 @@ Build:
    - Loading spinner while searching
 
 Respect permissions: only return entities the user has access to (use getCurrentUserWithPermissions).
+
 

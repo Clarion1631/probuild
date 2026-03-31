@@ -1,3 +1,4 @@
+TITLE: 02 - Invoicing System
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -77,4 +78,5 @@ Build these features:
 4. CROSS-PROJECT INVOICES LIST — Create a global invoices page at src/app/invoices/page.tsx or wire into the Financials sidebar link showing all invoices across projects.
 
 Use hui-card, hui-btn, StatusBadge component. Follow the list page pattern from PROJECT_GUIDE.md §4.1.
+
 

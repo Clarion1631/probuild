@@ -1,3 +1,4 @@
+TITLE: 08 - Certificate Vault
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -91,4 +92,5 @@ Build:
    - Sends email alert to CompanySettings.notificationEmail listing expiring docs
 
 Use hui-card for containers, StatusBadge for status indicators, hui-btn for actions.
+
 

@@ -1,3 +1,4 @@
+TITLE: 11 - Daily Logs
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -78,4 +79,5 @@ Build:
 4. EXPORT — "Export PDF" button that generates a formatted daily log report.
 
 Add "Daily Logs" to ProjectInnerSidebar.tsx. Gate behind "dailyLogs" permission. Use hui-card for each log entry, hui-input for form fields.
+
 

@@ -1,3 +1,4 @@
+TITLE: 03b - Wisetack Financing
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -102,4 +103,5 @@ Build:
    - Note: "You pay $0 — the client pays interest on their loan"
 
 Add /api/webhook/wisetack to the middleware matcher exclusion list.
+
 

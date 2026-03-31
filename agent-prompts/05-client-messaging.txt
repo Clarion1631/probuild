@@ -1,3 +1,4 @@
+TITLE: 05 - Client Messaging
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -75,4 +76,5 @@ Build:
    - Use src/lib/email.ts for sending
 
 Guard the Messages tab visibility behind PortalVisibility.showMessages (from Prompt #4). Use hui-card for the chat container.
+
 

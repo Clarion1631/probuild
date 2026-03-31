@@ -82,6 +82,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 {/* Estimates Section */}
+                {visibility.showEstimates && (
                 <div>
                     <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
                         <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
@@ -110,8 +111,10 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                         </div>
                     )}
                 </div>
+                )}
 
                 {/* Invoices Section */}
+                {visibility.showInvoices && (
                 <div>
                     <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
                         <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" /></svg>
@@ -184,8 +187,10 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                         </div>
                     )}
                 </div>
+                )}
 
                 {/* Floor Plans Section */}
+                {visibility.showFiles && (
                 <div className="md:col-span-2 mt-4">
                     <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
                         <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" /></svg>
@@ -212,6 +217,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                         </div>
                     )}
                 </div>
+                )}
 
                 {/* Messages Section — guarded by PortalVisibility */}
                 {visibility.showMessages && (

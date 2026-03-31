@@ -2,6 +2,9 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import Avatar from "@/components/Avatar";
+import { useEditor, EditorContent } from '@tiptap/react';
+import StarterKit from '@tiptap/starter-kit';
+import Link from '@tiptap/extension-link';
 
 interface LeadMessageData {
     id: string;
@@ -61,6 +64,27 @@ export default function LeadMessaging({
     const pollRef = useRef<NodeJS.Timeout | null>(null);
     const aiMenuRef = useRef<HTMLDivElement>(null);
     const estimatePickerRef = useRef<HTMLDivElement>(null);
+
+    const editor = useEditor({
+        extensions: [
+            StarterKit,
+            Link.configure({
+                openOnClick: false,
+                HTMLAttributes: {
+                    class: 'text-indigo-600 underline cursor-pointer',
+                },
+            }),
+        ],
+        content: messageText || "",
+        onUpdate: ({ editor }) => {
+            setMessageText(editor.getHTML());
+        },
+        editorProps: {
+            attributes: {
+                class: 'min-h-[120px] max-h-[250px] overflow-y-auto resize-none text-sm text-hui-textMain focus:outline-none bg-transparent prose prose-sm prose-slate max-w-none px-3 py-2',
+            },
+        },
+    });
 
     const createdDate = new Date(createdAt);
     const daysSince = Math.floor((Date.now() - createdDate.getTime()) / (1000 * 60 * 60 * 24));
@@ -125,6 +149,7 @@ export default function LeadMessaging({
                 setAttachedEstimates([]);
                 setScheduledForDate("");
                 setCcEmailsText("");
+                editor?.commands.setContent("");
             } else {
                 const errData = await res.json().catch(() => ({}));
                 console.error("[Send] API error:", res.status, errData);
@@ -151,6 +176,7 @@ export default function LeadMessaging({
                 const data = await res.json();
                 if (data.suggestion) {
                     setMessageText(data.suggestion);
+                    editor?.commands.setContent(data.suggestion);
                 }
             } else {
                 const errData = await res.json().catch(() => ({}));
@@ -289,10 +315,10 @@ export default function LeadMessaging({
                                         )}
                                         <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${
                                             isOutbound
-                                                ? "bg-green-600 text-white rounded-br-md"
+                                                ? "bg-green-600 text-white rounded-br-md prose-invert prose-a:text-green-200"
                                                 : "bg-white text-hui-textMain border border-slate-200 rounded-bl-md"
                                         }`}>
-                                            <p className="whitespace-pre-wrap">{msg.body}</p>
+                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: msg.body }} />
 
                                             {/* Attachment chips */}
                                             {atts.length > 0 && (
@@ -413,24 +439,50 @@ export default function LeadMessaging({
                     </div>
                 </div>
 
-                {/* Text Area */}
+                {/* Text Area (Rich Text Editor) */}
                 <div className="px-5">
-                    <div className="relative">
-                        <textarea
-                            value={messageText}
-                            onChange={e => setMessageText(e.target.value)}
-                            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-                            placeholder="...or write a message"
-                            rows={3}
-                            className="w-full resize-none text-sm text-hui-textMain placeholder:text-slate-400 focus:outline-none py-2 border-none bg-transparent"
-                            disabled={sending}
-                        />
+                    <div className="relative border border-slate-200 rounded-lg bg-white overflow-hidden transition-all focus-within:ring-2 focus-within:ring-green-500 focus-within:border-green-500">
+                        {/* WYSIWYG Toolbar */}
+                        <div className="bg-slate-50 border-b border-slate-200 px-3 py-1.5 flex items-center gap-1">
+                            <button
+                                onClick={() => editor?.chain().focus().toggleBold().run()}
+                                className={`p-1.5 transition rounded font-bold text-sm leading-none h-7 w-7 flex items-center justify-center ${editor?.isActive('bold') ? 'bg-slate-200 text-slate-800' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}
+                                title="Bold"
+                            >
+                                B
+                            </button>
+                            <button
+                                onClick={() => editor?.chain().focus().toggleItalic().run()}
+                                className={`p-1.5 transition rounded italic text-sm font-serif leading-none h-7 w-7 flex items-center justify-center ${editor?.isActive('italic') ? 'bg-slate-200 text-slate-800' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}
+                                title="Italic"
+                            >
+                                I
+                            </button>
+                            <div className="w-px h-4 bg-slate-300 mx-1" />
+                            <button
+                                onClick={() => {
+                                    const url = window.prompt("Enter link URL");
+                                    if (url) {
+                                        editor?.chain().focus().extendMarkRange('link').setLink({ href: url }).run();
+                                    } else if (url === "") {
+                                        editor?.chain().focus().unsetLink().run();
+                                    }
+                                }}
+                                className={`transition rounded flex items-center justify-center h-7 w-7 ${editor?.isActive('link') ? 'bg-slate-200 text-slate-800' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}
+                                title="Link"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+                            </button>
+                        </div>
+                        
+                        <div className={`${sending ? 'opacity-50 pointer-events-none' : ''}`}>
+                            <EditorContent editor={editor} />
+                        </div>
+
                         {aiSuggesting && (
-                            <div className="absolute inset-0 flex items-center justify-center bg-white/80 rounded">
-                                <div className="flex items-center gap-2 text-sm text-indigo-600">
-                                    <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-                                    Writing with AI...
-                                </div>
+                            <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10 text-sm text-indigo-600 font-medium pb-8 border-t border-slate-200">
+                                <div className="w-4 h-4 mr-2 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+                                Writing with AI...
                             </div>
                         )}
                     </div>
@@ -539,13 +591,6 @@ export default function LeadMessaging({
                                     </div>
                                 )}
                             </div>
-
-                            <button className="p-1.5 text-slate-400 hover:text-slate-600 transition rounded font-bold text-sm" title="Bold">
-                                T
-                            </button>
-                            <button className="p-1.5 text-slate-400 hover:text-slate-600 transition rounded" title="Link">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
-                            </button>
                         </div>
                     </div>
 
@@ -642,9 +687,10 @@ export default function LeadMessaging({
                                         <p className="text-slate-600 mb-4 mt-0">From: <strong>Team</strong></p>
                                         
                                         <div className="bg-slate-50 rounded-lg p-4 my-4">
-                                            <p className="m-0 leading-relaxed whitespace-pre-wrap text-slate-800">
-                                                {messageText || "Your message will appear here..."}
-                                            </p>
+                                            <div 
+                                                className="m-0 leading-relaxed text-slate-800 prose prose-sm max-w-none prose-a:text-green-600"
+                                                dangerouslySetInnerHTML={{ __html: messageText || "Your message will appear here..." }}
+                                            />
                                         </div>
                                         
                                         {/* Estimate Links Preview */}

@@ -1,3 +1,4 @@
+TITLE: 21 - Mood Boards
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -66,4 +67,5 @@ Build:
    - "Submit Selections" button → notifies PM
 
 4. Add "Selections" to ProjectInnerSidebar. Use image grid layout with hui-card for each option.
+
 

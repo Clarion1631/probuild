@@ -1,3 +1,4 @@
+TITLE: 20 - Mobile App
 MANDATORY WORKFLOW:
 
 STEP 1 — READ CONTEXT:
@@ -64,4 +65,5 @@ Alternative (React Native — only if explicitly requested):
 - Offline support for time entries (sync when back online)
 
 Start with the PWA approach unless explicitly told otherwise.
+
 
