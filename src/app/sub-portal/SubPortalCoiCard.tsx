@@ -67,7 +67,7 @@ export default function SubPortalCoiCard({ subId, coiUploaded, coiExpiresAt: ini
         <div className="bg-white rounded-xl shadow-sm border border-hui-border overflow-hidden mb-8">
             <div className="p-4 border-b border-hui-border bg-slate-50/50 flex justify-between items-center">
                 <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Compliance Settings</h2>
-                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider ${uploaded ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
+                <span className={`text-[10px] leading-tight font-bold px-2.5 py-1 rounded-full uppercase tracking-wider ${uploaded ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
                     {uploaded ? "Compliant" : "Missing COI"}
                 </span>
             </div>
