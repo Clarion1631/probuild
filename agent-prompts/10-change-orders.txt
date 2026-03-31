@@ -25,6 +25,7 @@ STEP 5 — DEPLOY (MANDATORY):
 14. Push to trigger Vercel deployment: git push origin main
 15. Confirm the push succeeded and report the commit hash.
 16. Wait 30 seconds then verify the Vercel deployment URL is live (check https://probuild.vercel.app or the preview URL).
+16b. SELF-TESTING: You MUST use your browser_subagent tool to navigate to the live Vercel URL. Click through the feature you just built to verify it works and there are no UI bugs. If you find bugs, fix them and push again.
 
 STEP 6 — TESTING HANDOFF (MANDATORY — do NOT skip this):
 After deploying, you MUST provide the user with a detailed testing guide. Include ALL of the following:
@@ -74,3 +75,4 @@ Build:
    - Approve/reject buttons with signature pad (reuse SignaturePad.tsx)
 
 Add "changeOrders" to ProjectInnerSidebar.tsx navigation. Gate behind the existing "changeOrders" permission.
+
