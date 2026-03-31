@@ -30,16 +30,17 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 ## Existing Server Actions (src/lib/actions.ts — ADD here, don't create new files)
 
 ### Leads & Clients
-`getLeads` · `getLead` · `createLead` · `updateLeadStage` · `updateClient` · `getLeadTasks` · `createLeadTask` · `updateLeadTask` · `deleteLeadTask` · `getLeadMeetings` · `createLeadMeeting` · `updateLeadMeeting` · `deleteLeadMeeting`
+`getLeads` · `getLead` · `createLead` · `updateLeadStage` · `updateLeadMetadata` · `deleteLead` · `updateLeadAssignment` · `updateLeadInfo` · `getClients` · `getClient` · `createClient` · `updateClient` · `getLeadTasks` · `createLeadTask` · `updateLeadTask` · `deleteLeadTask` · `getLeadMeetings` · `createLeadMeeting` · `updateLeadMeeting` · `deleteLeadMeeting`
 
-### Projects
-`getProjects` · `getProject` · `getProjectLead` · `createProject` · `convertLeadToProject` · `linkProjectToLead` · `getLeadsForLinking` · `updateProjectStatus` · `updateProjectColor` · `updateProjectTags` · `deleteProjects`
+### Projects & Change Orders
+`getProjects` · `getProject` · `getProjectLead` · `createProject` · `convertLeadToProject` · `linkProjectToLead` · `getLeadsForLinking` · `updateProjectStatus` · `updateProjectColor` · `updateProjectTags` · `updateProjectName` · `deleteProjects`
+`createChangeOrder` · `getChangeOrders` · `getChangeOrder` · `updateChangeOrder` · `deleteChangeOrder` · `updateChangeOrderStatus` · `approveChangeOrder`
 
 ### Estimates
-`createDraftEstimate` · `createDraftLeadEstimate` · `getEstimate` · `getAllEstimates` · `saveEstimate` · `updateEstimateStatus` · `deleteEstimate` · `getEstimateForPortal` · `markEstimateViewed` · `approveEstimate` · `sendEstimateToClient`
+`createDraftEstimate` · `createDraftLeadEstimate` · `getEstimate` · `getAllEstimates` · `saveEstimate` · `updateEstimateStatus` · `deleteEstimate` · `duplicateEstimate` · `saveEstimateAsTemplate` · `getEstimateTemplates` · `createEstimateFromTemplate` · `getEstimateForPortal` · `markEstimateViewed` · `approveEstimate` · `sendEstimateToClient`
 
 ### Invoices (ALREADY EXIST)
-`createInvoiceFromEstimate` · `getInvoice` · `getProjectInvoices` · `recordPayment`
+`createInvoiceFromEstimate` · `getInvoice` · `getProjectInvoices` · `getAllInvoices` · `issueInvoice` · `deleteInvoice` · `updateInvoiceNotes` · `sendInvoiceToClient` · `getInvoiceForPortal` · `markInvoiceViewed` · `recordPayment`
 
 ### Contracts
 `getContracts` · `getContract` · `createContractFromTemplate` · `createContractBlank` · `updateContract` · `deleteContract` · `sendContractToClient` · `approveContract` · `getContractSigningHistory` · `markContractViewed`
@@ -51,10 +52,16 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 `addTaskComment` · `getTaskComments` · `addTaskPunchItem` · `togglePunchItem` · `deletePunchItem` · `getTaskPunchItems` · `assignUserToTask` · `unassignUserFromTask` · `assignSubToTask` · `unassignSubFromTask` · `aiGeneratePunchlist`
 
 ### Company & Settings
-`getCompanySettings` · `saveCompanySettings` · `getTeamMembers` · `getActiveSubcontractors` · `getDocumentTemplates` · `getDocumentTemplate` · `createDocumentTemplate` · `updateDocumentTemplate` · `deleteDocumentTemplate` · `updateCompanyProjectStatuses`
+`getCompanySettings` · `saveCompanySettings` · `getTeamMembers` · `getActiveSubcontractors` · `getCompanySubcontractorTrades` · `saveCompanySubcontractorTrades` · `getDocumentTemplates` · `getDocumentTemplate` · `createDocumentTemplate` · `updateDocumentTemplate` · `deleteDocumentTemplate` · `updateCompanyProjectStatuses`
 
-### Portal Visibility
-`getPortalVisibility` · `savePortalVisibility`
+### Communication & Messaging
+`getProjectMessages` · `getUnreadMessageCount`
+
+### Vendors & Purchase Orders
+`getVendors` · `createVendor` · `updateVendor` · `deleteVendor` · `getPurchaseOrders` · `getPurchaseOrder` · `createPurchaseOrder` · `updatePurchaseOrder` · `deletePurchaseOrder` · `updatePurchaseOrderStatus` · `sendPurchaseOrder`
+
+### Portals & Visibility
+`getPortalVisibility` · `savePortalVisibility` · `getSubcontractorExplicitProjects` · `saveSubcontractorExplicitProjects` · `uploadSubcontractorCOI` · `subPortalUploadCOI` · `deleteSubcontractorCOI` · `subPortalDeleteCOI`
 
 ### Floor Plans
 `createDraftFloorPlan` · `getFloorPlan` · `saveFloorPlanData`
@@ -63,7 +70,7 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 
 ## Existing API Routes (src/app/api/)
 
-`auth/[...nextauth]` · `ai-estimate` · `ai-schedule` · `clients` + `clients/[id]` + `clients/[id]/invite` · `cost-codes` · `cost-types` · `expenses` + `expenses/[id]` + `expenses/parse` · `files` + `files/folders` · `me/permissions` · `mobile/login` · `pdf/[id]` · `projects` + `projects/[id]` + `projects/[id]/buckets` + `projects/[id]/cost-codes` + `projects/[id]/crew` · `seed` · `subcontractors` + `subcontractors/[id]` · `takeoffs` + `takeoffs/[id]` + `takeoffs/ai-estimate` + `takeoffs/convert-to-estimate` + `takeoffs/register-file` + `takeoffs/upload` · `time-entries` · `users` + `users/[id]`
+`auth/[...nextauth]` · `ai-estimate` · `ai-schedule` · `clients` + `clients/[id]` + `clients/[id]/invite` · `cost-codes` · `cost-types` · `expenses` + `expenses/[id]` + `expenses/parse` · `files` + `files/folders` · `leads/[id]/notes/ai` · `leads/messages` + `leads/messages/suggest` · `me/permissions` · `messages/[id]/read` · `mobile/login` · `payments/create-session` · `pdf/[id]` · `projects` + `projects/[id]` + `projects/[id]/buckets` + `projects/[id]/cost-codes` + `projects/[id]/crew` · `seed` · `sub-portal/login` + `sub-portal/verify` · `subcontractors` + `subcontractors/[id]` · `takeoffs` + `takeoffs/[id]` + `takeoffs/ai-estimate` + `takeoffs/convert-to-estimate` + `takeoffs/register-file` + `takeoffs/upload` · `time-entries` · `users` + `users/[id]` · `webhook/stripe`
 
 ---
 
@@ -73,16 +80,19 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 `page.tsx` (Dashboard) · `login/` · `estimates/page.tsx` · `leads/page.tsx` · `time-clock/page.tsx`
 
 ### Projects (src/app/projects/)
-`page.tsx` (list) · `[id]/page.tsx` (detail) · `[id]/estimates/` (list + `[estimateId]/`) · `[id]/invoices/` (list + `[invoiceId]/` + `new/`) · `[id]/contracts/` · `[id]/schedule/` · `[id]/files/` · `[id]/floor-plans/` (list + `[floorPlanId]/`) · `[id]/takeoffs/` · `[id]/timeclock/` · `[id]/costing/` · `[id]/settings/`
+`page.tsx` (list) · `[id]/page.tsx` (detail) · `[id]/estimates/` (list + `[estimateId]/`) · `[id]/invoices/` (list + `[invoiceId]/` + `new/`) · `[id]/contracts/` · `[id]/schedule/` · `[id]/files/` · `[id]/floor-plans/` · `[id]/takeoffs/` · `[id]/timeclock/` · `[id]/costing/` · `[id]/settings/` · `[id]/change-orders/` · `[id]/messages/` · `[id]/messages/subs` · `[id]/purchase-orders/`
 
 ### Leads (src/app/leads/)
 `page.tsx` (list) · `[id]/page.tsx` (detail) · `[id]/estimates/[estimateId]/` · `[id]/contracts/` + `[contractId]/` · `[id]/files/` · `[id]/meetings/` · `[id]/tasks/` · `[id]/takeoffs/`
 
-### Portal (src/app/portal/)
-`page.tsx` (dashboard) · `projects/[id]/` · `estimates/[id]/` · `contracts/[id]/`
+### Client Portal (src/app/portal/)
+`page.tsx` (dashboard) · `projects/[id]/` · `estimates/[id]/` · `contracts/[id]/` · `invoices/[id]/` · `change-orders/[id]/`
+
+### Subcontractor Portal (src/app/sub-portal/)
+`login/` · `projects/` · `projects/[id]/` · `projects/[id]/messages/`
 
 ### Company (src/app/company/)
-`team-members/` (list + `[id]/`) · `subcontractors/` (list + `[id]/`) · `templates/` · `cost-codes/`
+`team-members/` (list + `[id]/`) · `subcontractors/` (list + `[id]/`) · `templates/` · `cost-codes/` · `vendors/`
 
 ### Settings & Manager
 `settings/company/` · `settings/cost-codes/` · `manager/schedule/` · `manager/time-entries/` · `manager/variance/`
@@ -103,7 +113,7 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 
 ## Prisma Models (prisma/schema.prisma — 30+ models)
 
-`User` · `Client` · `Lead` · `LeadTask` · `LeadMeeting` · `Project` · `FloorPlan` · `Estimate` · `EstimateItem` · `EstimatePaymentSchedule` · `Expense` · `Invoice` · `PaymentSchedule` · `Budget` · `CostCode` · `CostType` · `TimeEntry` · `Contract` · `ContractSigningRecord` · `CompanySettings` · `DocumentTemplate` · `ScheduleTask` · `TaskDependency` · `TaskComment` · `TaskPunchItem` · `TaskAssignment` · `Subcontractor` · `SubTaskAssignment` · `FileFolder` · `ProjectFile` · `UserPermission` · `ProjectAccess` · `Takeoff` · `TakeoffFile` · `PortalVisibility`
+`User` · `Client` · `Lead` · `LeadTask` · `LeadMeeting` · `Project` · `FloorPlan` · `Estimate` · `EstimateItem` · `EstimatePaymentSchedule` · `Expense` · `Invoice` · `PaymentSchedule` · `Budget` · `CostCode` · `CostType` · `TimeEntry` · `Contract` · `ContractSigningRecord` · `CompanySettings` · `DocumentTemplate` · `ScheduleTask` · `TaskDependency` · `TaskComment` · `TaskPunchItem` · `TaskAssignment` · `Subcontractor` · `SubcontractorTrade` · `SubTaskAssignment` · `FileFolder` · `ProjectFile` · `UserPermission` · `ProjectAccess` · `Takeoff` · `TakeoffFile` · `PortalVisibility` · `ChangeOrder` · `Vendor` · `PurchaseOrder` · `Message`
 
 ---
 

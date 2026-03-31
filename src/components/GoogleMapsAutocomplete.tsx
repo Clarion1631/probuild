@@ -5,11 +5,12 @@ import { useEffect, useRef } from "react";
 interface GoogleMapsAutocompleteProps {
     value: string;
     onChange: (value: string) => void;
+    onPlaceDetails?: (details: { address: string, city: string, state: string, zip: string }) => void;
     className?: string;
     placeholder?: string;
 }
 
-export default function GoogleMapsAutocomplete({ value, onChange, className, placeholder }: GoogleMapsAutocompleteProps) {
+export default function GoogleMapsAutocomplete({ value, onChange, onPlaceDetails, className, placeholder }: GoogleMapsAutocompleteProps) {
     const inputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
@@ -35,6 +36,30 @@ export default function GoogleMapsAutocomplete({ value, onChange, className, pla
                 const place = autocomplete.getPlace();
                 if (place && place.formatted_address) {
                     onChange(place.formatted_address);
+
+                    if (onPlaceDetails && place.address_components) {
+                        let street_number = "";
+                        let route = "";
+                        let city = "";
+                        let state = "";
+                        let zip = "";
+                        
+                        for (const component of place.address_components) {
+                            const componentType = component.types[0];
+                            if (componentType === "street_number") street_number = component.long_name;
+                            if (componentType === "route") route = component.long_name;
+                            if (componentType === "locality" || componentType === "postal_town") city = component.long_name;
+                            if (componentType === "administrative_area_level_1") state = component.short_name;
+                            if (componentType === "postal_code") zip = component.long_name;
+                        }
+
+                        onPlaceDetails({
+                            address: `${street_number} ${route}`.trim(),
+                            city,
+                            state,
+                            zip
+                        });
+                    }
                 }
             });
         };
