@@ -173,11 +173,29 @@ export default function TemplatesPage() {
         const end = ta.selectionEnd;
         const selected = form.body.substring(start, end);
         const text = form.body;
+        
+        const openTag = `<${tag}>`;
+        const closeTag = `</${tag}>`;
+        
+        const beforeSelection = text.substring(0, start);
+        const afterSelection = text.substring(end);
+        
+        // Toggle off if currently wrapped exactly by this tag
+        if (beforeSelection.endsWith(openTag) && afterSelection.startsWith(closeTag)) {
+            const newBody = text.substring(0, start - openTag.length) + selected + text.substring(end + closeTag.length);
+            setForm(prev => ({ ...prev, body: newBody }));
+            setTimeout(() => { 
+                ta.focus(); 
+                ta.setSelectionRange(start - openTag.length, end - openTag.length);
+            }, 0);
+            return;
+        }
+
         let insert: string;
         if (wrap) {
-            insert = `<${tag}>${selected || wrap}</${tag}>`;
+            insert = `${openTag}${selected || wrap}${closeTag}`;
         } else {
-            insert = `<${tag}>`;
+            insert = `${openTag}`;
         }
         const newBody = text.substring(0, start) + insert + text.substring(end);
         setForm(prev => ({ ...prev, body: newBody }));

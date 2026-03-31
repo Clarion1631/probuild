@@ -115,3 +115,5 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 4. **Use existing components** — check `src/components/` before creating new ones
 5. **AI model**: always use `gemini-3-flash-preview`
 6. **Auth bypass in dev**: middleware skips auth in development mode; AppLayout mocks an ADMIN session
+**CRITICAL RULE: NEVER CREATE "DUMMY" OR UNWIRED BUTTONS.** 
+7. **Every interactive element** (buttons, dropdowns, toggles) MUST be fully wired to either local state (Zustand/useState) or a functional backend server action. If you are building a UI and the backend logic is out of scope or undefined, **DO NOT ADD THE BUTTON**. Purely visual "placeholder" buttons are strictly forbidden.

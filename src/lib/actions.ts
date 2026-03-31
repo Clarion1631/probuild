@@ -2722,3 +2722,43 @@ export async function approveChangeOrder(id: string, signatureName: string, ipAd
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
 }
+
+export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
+    "use server";
+    
+    const file = formData.get("file") as File;
+    if (!file) throw new Error("No file uploaded");
+
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
+
+    const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+    const supabase = getSupabase();
+    if (!supabase) throw new Error("Storage not configured");
+
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storagePath = `subcontractors/${subcontractorId}/coi/${Date.now()}_${safeName}`;
+
+    const { error: uploadError } = await supabase.storage
+        .from(STORAGE_BUCKET)
+        .upload(storagePath, buffer, {
+            contentType: file.type || "application/octet-stream",
+            upsert: false,
+        });
+
+    if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+
+    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl || storagePath;
+
+    await prisma.subcontractor.update({
+        where: { id: subcontractorId },
+        data: {
+            coiFileUrl: publicUrl,
+            coiUploaded: true,
+        }
+    });
+
+    revalidatePath(`/company/subcontractors/${subcontractorId}`);
+    return { success: true, url: publicUrl };
+}
