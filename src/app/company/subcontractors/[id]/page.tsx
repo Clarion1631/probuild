@@ -167,7 +167,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
             const res = await uploadSubcontractorCOI(id, formData);
             
             // Overwrite local sub so UI updates to show compliant
-            setSub(prev => prev ? { ...prev, coiUploaded: true } : prev);
+            setSub(prev => prev ? { ...prev, coiUploaded: true, coiExpiresAt: res.coiExpiresAt ? new Date(res.coiExpiresAt).toISOString() : null } : prev);
             if (res.coiExpiresAt) {
                 setForm(f => ({ ...f, coiExpiresAt: new Date(res.coiExpiresAt!).toISOString().split('T')[0] }));
                 toast.success(`AI Detected Expiration Date: ${new Date(res.coiExpiresAt).toLocaleDateString()}`);

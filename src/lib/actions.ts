@@ -2831,9 +2831,9 @@ export async function subPortalUploadCOI(formData: FormData) {
 
 async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promise<Date | null> {
     if (!process.env.GEMINI_API_KEY) return null;
-    if (!mimeType.includes("pdf") && !mimeType.includes("image")) {
-        return null;
-    }
+    const cleanMime = mimeType.includes("pdf") ? "application/pdf" : 
+                      mimeType.includes("png") ? "image/png" :
+                      mimeType.includes("webp") ? "image/webp" : "image/jpeg";
     
     const { GoogleGenAI } = await import("@google/genai");
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -2848,16 +2848,22 @@ async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promi
                         {
                             inlineData: {
                                 data: buffer.toString("base64"),
-                                mimeType: mimeType,
+                                mimeType: cleanMime,
                             }
                         },
-                        { text: "Extract the exact expiration date of this Certificate of Insurance document. Respond ONLY with the date in YYYY-MM-DD format. If no clear expiration date is found, respond 'NULL'." }
+                        { text: `Extract the expiration date from this Certificate of Insurance (COI) document. Look for fields like 'Policy Expiration', 'Exp Date', 'Expiration', or 'Policy Ends'. 
+Respond ONLY with the single date translated into YYYY-MM-DD format.
+- If there are multiple policies (e.g. General Liability, Auto, Workers Comp), find the LATEST expiration date out of all the active policies.
+- Do not include any other words in your response.
+- If no dates can be found at all, respond with 'NULL'.` }
                     ]
                 }
             ]
         });
         
         const text = response.text?.trim() || "";
+        console.log("Raw AI COI Extraction Response:", text); // Debugging
+        
         if (text === "NULL" || !text) return null;
         
         // Extract YYYY-MM-DD from the response
@@ -2869,6 +2875,13 @@ async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promi
             const localDate = new Date(parsed.getTime() + userOffset);
             if (!isNaN(localDate.getTime())) return localDate;
         }
+        
+        // Final fallback: try standard js Date parsing if the text is short
+        if (text.length < 30) {
+            const parsedStr = new Date(text);
+            if (!isNaN(parsedStr.getTime())) return parsedStr;
+        }
+        
         return null;
     } catch (e) {
         console.error("AI COI Extraction Error:", e);
