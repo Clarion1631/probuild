@@ -7,6 +7,7 @@ import AddLeadModal from "@/app/leads/AddLeadModal";
 import { toast } from "sonner";
 import { updateProjectStatus, deleteProjects, updateProjectTags } from "@/lib/actions";
 import { CustomizeStatusModal, ManageStatusModal, ProjectStatus } from "./StatusModals";
+import ProjectsKanbanBoard from "./ProjectsKanbanBoard";
 
 const DEFAULT_PROJECT_STATUSES: ProjectStatus[] = [
     { value: "Open", label: "Open", color: "bg-blue-100 text-blue-700", dot: "bg-blue-500", rawColor: "#3b82f6", isActive: true },
@@ -121,25 +122,6 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     });
     const activeCount = projects.filter((p: any) => p.status !== "Closed" && p.status !== "Archived").length;
 
-    // Drag and Drop handlers
-    const handleDragStart = (e: React.DragEvent, projectId: string) => {
-        e.dataTransfer.setData("projectId", projectId);
-    };
-
-    const handleDragOver = (e: React.DragEvent) => {
-        e.preventDefault();
-    };
-
-    const handleDrop = async (e: React.DragEvent, newStatus: string) => {
-        e.preventDefault();
-        const projectId = e.dataTransfer.getData("projectId");
-        if (projectId) {
-            const project = projects.find((p: any) => p.id === projectId);
-            if (project && project.status !== newStatus) {
-                await handleStatusChange(projectId, newStatus);
-            }
-        }
-    };
 
     return (
         <div className="max-w-screen-2xl mx-auto px-4 md:px-8 pb-10">
@@ -218,77 +200,12 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
 
             {/* Kanban View */}
             {viewMode === "kanban" && (
-                <div className="flex gap-4 mb-4 overflow-x-auto pb-6 items-start">
-                     {activeStatuses.map(s => {
-                        const colProjects = filteredProjects.filter((p: any) => (p.status || "Open") === s.value);
-                        return (
-                            <div 
-                                key={s.value} 
-                                className="min-w-[260px] w-[260px] shrink-0 flex flex-col"
-                            >
-                                <div className="flex items-center justify-between mb-3 px-1">
-                                    <h3 className="font-semibold text-[13px] flex items-center gap-2 text-slate-700">
-                                        <div className="w-2 h-2 rounded-full" style={{ backgroundColor: s.rawColor }} />
-                                        {s.label} ({colProjects.length})
-                                    </h3>
-                                    <button onClick={() => setShowCustomizeModal(true)} className="text-slate-400 hover:text-slate-600 text-lg leading-none px-1">···</button>
-                                </div>
-                                {/* Drop zone container with soft outline */}
-                                <div 
-                                    className="flex flex-col gap-2 p-2 rounded-xl bg-[#eef0f4] border border-slate-200/60 min-h-[100px] transition-colors"
-                                    onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add("bg-blue-50", "border-blue-200"); }}
-                                    onDragLeave={(e) => { e.currentTarget.classList.remove("bg-blue-50", "border-blue-200"); }}
-                                    onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove("bg-blue-50", "border-blue-200"); handleDrop(e, s.value); }}
-                                >
-                                    {colProjects.map((project: any) => (
-                                        <div 
-                                            key={project.id}
-                                            draggable
-                                            onDragStart={(e) => { e.dataTransfer.setData("projectId", project.id); e.dataTransfer.effectAllowed = "move"; }}
-                                            className="bg-white rounded-lg shadow-sm hover:shadow border border-slate-200 cursor-grab active:cursor-grabbing group relative"
-                                        >
-                                            {/* Colored left border strip */}
-                                            <div className="absolute left-0 top-0 bottom-0 w-[4px] rounded-l-lg" style={{ backgroundColor: project.color || s.rawColor }} />
-                                            
-                                            <div className="pl-4 pr-3 py-3 flex flex-col gap-1.5">
-                                                <div className="flex justify-between items-start">
-                                                    <Link href={`/projects/${project.id}`} className="font-semibold text-[13px] text-slate-900 hover:text-indigo-600 line-clamp-1 pr-1">{project.name}</Link>
-                                                    <div className="relative" ref={openCardMenu === project.id ? cardMenuRef : undefined}>
-                                                        <button 
-                                                            onClick={(e) => { e.stopPropagation(); setOpenCardMenu(openCardMenu === project.id ? null : project.id); }}
-                                                            className="text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 -mt-0.5 -mr-0.5"
-                                                        >
-                                                            <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0-8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 16a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg>
-                                                        </button>
-                                                        {openCardMenu === project.id && (
-                                                            <div className="absolute right-0 top-6 z-50 bg-white rounded-lg shadow-lg border border-slate-200 py-1 min-w-[140px]">
-                                                                <button onClick={() => { router.push(`/projects/${project.id}`); setOpenCardMenu(null); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition">Edit</button>
-                                                                <button onClick={() => { toast.info("Pin feature coming soon"); setOpenCardMenu(null); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition">Pin Project</button>
-                                                                <button onClick={() => handleDeleteProject(project.id)} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition">Delete</button>
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                                
-                                                <div className="flex items-center gap-1.5 text-[12px] text-slate-500">
-                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                                                    <span className="truncate">{project.client?.name || "No Client"}</span>
-                                                </div>
-                                                {project.location && (
-                                                    <div className="flex items-center gap-1.5 text-[12px] text-slate-500">
-                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-                                                        <span className="truncate">{project.location}</span>
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
-                                    ))}
-
-                                </div>
-                            </div>
-                        );
-                     })}
-                </div>
+                <ProjectsKanbanBoard 
+                    projects={filteredProjects} 
+                    statuses={activeStatuses} 
+                    onStatusChange={handleStatusChange} 
+                    onCustomizeClick={() => setShowCustomizeModal(true)} 
+                />
             )}
 
             {/* List View */}
