@@ -2864,3 +2864,38 @@ async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promi
         return null;
     }
 }
+
+export async function deleteSubcontractorCOI(subcontractorId: string) {
+    "use server";
+    
+    await prisma.subcontractor.update({
+        where: { id: subcontractorId },
+        data: {
+            coiFileUrl: null,
+            coiUploaded: false,
+            coiExpiresAt: null,
+        }
+    });
+
+    revalidatePath(`/company/subcontractors/${subcontractorId}`);
+    return { success: true };
+}
+
+export async function subPortalDeleteCOI() {
+    "use server";
+    const { getSubPortalSession } = await import("@/lib/sub-portal-auth");
+    const sub = await getSubPortalSession();
+    if (!sub) throw new Error("Unauthorized");
+    
+    await prisma.subcontractor.update({
+        where: { id: sub.id },
+        data: {
+            coiFileUrl: null,
+            coiUploaded: false,
+            coiExpiresAt: null,
+        }
+    });
+
+    revalidatePath(`/sub-portal`);
+    return { success: true };
+}

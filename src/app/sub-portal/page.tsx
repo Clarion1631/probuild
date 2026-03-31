@@ -110,6 +110,7 @@ export default async function SubPortalDashboard() {
                 subId={sub.id} 
                 coiUploaded={sub.coiUploaded} 
                 coiExpiresAt={sub.coiExpiresAt} 
+                coiFileUrl={sub.coiFileUrl}
             />
 
             {/* Projects Grid */}
