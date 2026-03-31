@@ -1,5 +1,5 @@
-export const dynamic = "force-dynamic";
 "use client";
+export const dynamic = "force-dynamic";
 
 import Avatar from "@/components/Avatar";
 import { getLeads } from "@/lib/actions";
