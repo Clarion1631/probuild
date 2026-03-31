@@ -18,7 +18,10 @@ export async function getLeads() {
             }
         },
     });
-    return leads;
+    return leads.map((l: any) => ({
+        ...l,
+        client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
+    }));
 }
 
 export async function getLead(id: string) {
@@ -35,6 +38,9 @@ export async function getLead(id: string) {
             floorPlans: true
         },
     });
+    if (lead && !lead.client) {
+        (lead as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
+    }
     return lead;
 }
 
@@ -468,7 +474,10 @@ export async function getProjects() {
             estimates: true,
         },
     });
-    return projects;
+    return projects.map((p: any) => ({
+        ...p,
+        client: p.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
+    }));
 }
 
 export async function getProject(id: string) {
@@ -481,6 +490,9 @@ export async function getProject(id: string) {
             contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
         },
     });
+    if (project && !project.client) {
+        (project as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
+    }
     return project;
 }
 

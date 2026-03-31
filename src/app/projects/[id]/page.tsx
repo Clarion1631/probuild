@@ -1,7 +1,9 @@
-import { getProject, getScheduleTasks } from "@/lib/actions";
+import { getProject, getScheduleTasks, getPortalVisibility } from "@/lib/actions";
+import { getProjectSubcontractors } from "@/lib/subcontractor-actions";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import ProjectHeader from "./ProjectHeader";
+import ProjectDashboardsWidget from "@/components/ProjectDashboardsWidget";
 
 export const dynamic = "force-dynamic";
 
@@ -12,6 +14,9 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
 
     const tasks = await getScheduleTasks(id);
     const estimates = project.estimates || [];
+    
+    const portalVisibility = await getPortalVisibility(id);
+    const subList = await getProjectSubcontractors(id);
 
     // Real stats
     const totalBudget = estimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
@@ -134,6 +139,13 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
 
                 {/* Quick Links & Estimates */}
                 <div className="space-y-5">
+                    
+                    <ProjectDashboardsWidget 
+                        projectId={id}
+                        initialPortalVisibility={portalVisibility}
+                        initialSubcontractors={subList}
+                    />
+
                     {/* Quick Actions */}
                     <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm p-5">
                         <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Quick Actions</h3>

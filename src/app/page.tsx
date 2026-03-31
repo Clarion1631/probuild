@@ -34,7 +34,7 @@ export default async function Dashboard() {
                         <Link href={`/projects/${p.id}/estimates`} className="font-semibold text-hui-textMain hover:text-hui-primary transition-colors block">
                           {p.name}
                         </Link>
-                        <span className="text-xs text-hui-textMuted">{p.client.name}</span>
+                        <span className="text-xs text-hui-textMuted">{p.client?.name || "No Client"}</span>
                       </td>
                       <td className="px-4 py-3 text-right">
                         <StatusBadge status={p.status as StatusType} />
