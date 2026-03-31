@@ -1,10 +1,10 @@
 import Stripe from "stripe";
 
-if (!process.env.STRIPE_SECRET_KEY) {
-    throw new Error("Missing STRIPE_SECRET_KEY environment variable");
-}
+// We use a dummy key fallback during Next.js static build resolution 
+// to prevent Vercel from crashing if the secret isn't loaded in the CI pipeline.
+const stripeKey = process.env.STRIPE_SECRET_KEY || "sk_test_placeholder";
 
-export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+export const stripe = new Stripe(stripeKey, {
     // Note: Cast to any to avoid TS errors across different Stripe package versions
     apiVersion: "2024-12-18.acacia" as any, 
     appInfo: {
