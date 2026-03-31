@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import SubcontractorInviteForm from "./SubcontractorInviteForm";
-import { toggleSubcontractorProjectAccess } from "@/lib/subcontractor-actions";
+import { toggleSubcontractorProjectAccess, resendSubcontractorInvite } from "@/lib/subcontractor-actions";
 import Link from "next/link";
 
 type SubcontractorItem = {
@@ -26,6 +26,7 @@ export default function SubcontractorAssignmentModal({
     const [searchQuery, setSearchQuery] = useState("");
     const [showInviteForm, setShowInviteForm] = useState(false);
     const [isPending, startTransition] = useTransition();
+    const [resendingId, setResendingId] = useState<string | null>(null);
 
     if (showInviteForm) {
         return (
@@ -52,6 +53,16 @@ export default function SubcontractorAssignmentModal({
         startTransition(async () => {
             await toggleSubcontractorProjectAccess(projectId, sub.id, isAssigning);
         });
+    };
+
+    const handleResend = async (sub: SubcontractorItem) => {
+        setResendingId(sub.id);
+        try {
+            await resendSubcontractorInvite(projectId, sub.id);
+        } finally {
+            setResendingId(null);
+            alert(`Invite resent to ${sub.email || sub.companyName}`);
+        }
     };
 
     return (
@@ -110,16 +121,25 @@ export default function SubcontractorAssignmentModal({
                                             </div>
                                         </div>
                                     </Link>
-                                    <div className="shrink-0 pl-4">
+                                    <div className="shrink-0 pl-4 flex items-center gap-2">
                                         {sub.isAssigned ? (
-                                            <button 
-                                                disabled={isPending}
-                                                onClick={() => handleAssign(sub, false)}
-                                                className="hui-btn bg-green-50 text-green-700 hover:bg-red-50 hover:text-red-700 hover:border-red-200 border border-green-200 min-w-32 justify-center group-hover:block"
-                                            >
-                                                <span className="block group-hover:hidden group-focus:hidden group-active:hidden">Assigned ✓</span>
-                                                <span className="hidden group-hover:block group-focus:block group-active:block text-red-600">Remove</span>
-                                            </button>
+                                            <>
+                                                <button 
+                                                    disabled={resendingId === sub.id}
+                                                    onClick={() => handleResend(sub)}
+                                                    className="hui-btn bg-white hover:bg-slate-50 text-slate-600 border border-slate-200"
+                                                >
+                                                    {resendingId === sub.id ? "Sending..." : "Resend Invite"}
+                                                </button>
+                                                <button 
+                                                    disabled={isPending}
+                                                    onClick={() => handleAssign(sub, false)}
+                                                    className="hui-btn bg-green-50 text-green-700 hover:bg-red-50 hover:text-red-700 hover:border-red-200 border border-green-200 min-w-[100px] justify-center group-hover:block"
+                                                >
+                                                    <span className="block group-hover:hidden group-focus:hidden group-active:hidden">Assigned ✓</span>
+                                                    <span className="hidden group-hover:block group-focus:block group-active:block text-red-600">Remove</span>
+                                                </button>
+                                            </>
                                         ) : (
                                             <button 
                                                 disabled={isPending}
