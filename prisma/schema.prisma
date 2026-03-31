@@ -735,5 +735,8 @@ model LeadMessage {
   attachments String?   // JSON array: [{ type, id, name, url }]
   sentViaEmail Boolean  @default(false)
   sentViaSms   Boolean  @default(false)
+  status      String    @default("SENT") // SENT, SCHEDULED, FAILED
+  scheduledFor DateTime?
+  ccEmails    String?   // JSON array of emails
   createdAt   DateTime  @default(now())
 }

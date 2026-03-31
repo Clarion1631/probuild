@@ -8,7 +8,7 @@ export async function sendNotification(
     subject: string,
     htmlContent: string,
     attachments?: { filename: string, content: Buffer }[],
-    options?: { fromName?: string; replyTo?: string }
+    options?: { fromName?: string; replyTo?: string; cc?: string[] }
 ) {
     if (!toEmail) {
         console.log("No notification email configured. Skipping email dispatch.");
@@ -45,7 +45,8 @@ export async function sendNotification(
             subject: subject,
             html: htmlContent,
             text: textContent,
-            attachments: attachments
+            attachments: attachments,
+            cc: options?.cc
         });
         console.log("Email dispatched via Resend:", data);
     } catch (error) {

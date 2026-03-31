@@ -32,6 +32,8 @@ export async function POST(request: Request) {
         subject,
         channel = "email", // "email", "sms", or "both"
         attachments = [],  // [{ type: "estimate", id, name }]
+        scheduledFor,
+        ccEmails = [],
     } = body;
 
     if (!leadId || !messageBody) {
@@ -77,48 +79,54 @@ export async function POST(request: Request) {
         }
     }
 
-    // Build estimate links HTML for the email body
-    const estimateLinksHtml = resolvedAttachments
-        .filter(a => a.type === "estimate")
-        .map(a => `<a href="${a.url}" style="display: inline-block; background: #4c9a2a; color: #fff; text-decoration: none; padding: 10px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; margin: 4px 0;">View ${a.name}</a>`)
-        .join("<br/>");
+    // Check if scheduled
+    const parseDate = scheduledFor ? new Date(scheduledFor) : null;
+    const isScheduled = parseDate && parseDate > new Date();
 
     let sentViaEmail = false;
     let sentViaSms = false;
 
-    // Send email
-    if ((channel === "email" || channel === "both") && lead.client.email) {
-        const emailSubject = subject || `Message from ${companyName} about your project`;
-        await sendNotification(
-            lead.client.email,
-            emailSubject,
-            `<!DOCTYPE html>
-            <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-                <div style="text-align: center; margin-bottom: 32px;">
-                    <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
-                </div>
-                <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                    <p style="color: #666; margin: 0 0 8px;">From: <strong>${senderName}</strong></p>
-                    <div style="background: #f3f4f6; border-radius: 8px; padding: 16px; margin: 16px 0;">
-                        <p style="margin: 0; line-height: 1.6; white-space: pre-wrap;">${messageBody}</p>
-                    </div>
-                    ${estimateLinksHtml ? `<div style="margin-top: 20px; text-align: center;">${estimateLinksHtml}</div>` : ""}
-                </div>
-                <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
-            </body></html>`,
-            emailAttachments.length > 0 ? emailAttachments : undefined,
-            { fromName: companyName, replyTo: settings?.email || undefined }
-        );
-        sentViaEmail = true;
-    }
+    if (!isScheduled) {
+        // Build estimate links HTML for the email body
+        const estimateLinksHtml = resolvedAttachments
+            .filter(a => a.type === "estimate")
+            .map(a => `<a href="${a.url}" style="display: inline-block; background: #4c9a2a; color: #fff; text-decoration: none; padding: 10px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; margin: 4px 0;">View ${a.name}</a>`)
+            .join("<br/>");
 
-    // Send SMS
-    if ((channel === "sms" || channel === "both") && lead.client.primaryPhone) {
-        const smsBody = resolvedAttachments.length > 0
-            ? `${companyName}: ${messageBody}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
-            : `${companyName}: ${messageBody}`;
-        await sendSMS(lead.client.primaryPhone, smsBody);
-        sentViaSms = true;
+        // Send email
+        if ((channel === "email" || channel === "both") && lead.client.email) {
+            const emailSubject = subject || `Message from ${companyName} about your project`;
+            await sendNotification(
+                lead.client.email,
+                emailSubject,
+                `<!DOCTYPE html>
+                <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+                    <div style="text-align: center; margin-bottom: 32px;">
+                        <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
+                    </div>
+                    <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                        <p style="color: #666; margin: 0 0 8px;">From: <strong>${senderName}</strong></p>
+                        <div style="background: #f3f4f6; border-radius: 8px; padding: 16px; margin: 16px 0;">
+                            <p style="margin: 0; line-height: 1.6; white-space: pre-wrap;">${messageBody}</p>
+                        </div>
+                        ${estimateLinksHtml ? `<div style="margin-top: 20px; text-align: center;">${estimateLinksHtml}</div>` : ""}
+                    </div>
+                    <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
+                </body></html>`,
+                emailAttachments.length > 0 ? emailAttachments : undefined,
+                { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails.length > 0 ? ccEmails : undefined }
+            );
+            sentViaEmail = true;
+        }
+
+        // Send SMS
+        if ((channel === "sms" || channel === "both") && lead.client.primaryPhone) {
+            const smsBody = resolvedAttachments.length > 0
+                ? `${companyName}: ${messageBody}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
+                : `${companyName}: ${messageBody}`;
+            await sendSMS(lead.client.primaryPhone, smsBody);
+            sentViaSms = true;
+        }
     }
 
     // Persist message
@@ -134,6 +142,9 @@ export async function POST(request: Request) {
             attachments: resolvedAttachments.length > 0 ? JSON.stringify(resolvedAttachments) : null,
             sentViaEmail,
             sentViaSms,
+            status: isScheduled ? "SCHEDULED" : "SENT",
+            scheduledFor: isScheduled ? parseDate : null,
+            ccEmails: ccEmails.length > 0 ? JSON.stringify(ccEmails) : null
         },
     });
 

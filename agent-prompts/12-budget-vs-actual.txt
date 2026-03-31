@@ -16,7 +16,7 @@ STEP 3 — CODING RULES:
 9. EXTEND existing pages/components when possible rather than creating new ones.
 
 STEP 4 — VERIFY:
-10. Run `npm run dev` and visually verify your changes work in the browser.
+10. Do NOT run `npm run dev` or spin up a local server. Proceed directly to deploying to Vercel/Git.
 11. Run `npm run build` to confirm there are no build errors.
 
 STEP 5 — DEPLOY (MANDATORY):

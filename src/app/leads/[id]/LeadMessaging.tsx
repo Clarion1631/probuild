@@ -50,6 +50,13 @@ export default function LeadMessaging({
     const [showEstimatePicker, setShowEstimatePicker] = useState(false);
     const [aiSuggesting, setAiSuggesting] = useState(false);
     const [showAiMenu, setShowAiMenu] = useState(false);
+    
+    // Advanced Messaging States
+    const [ccEmailsText, setCcEmailsText] = useState("");
+    const [scheduledForDate, setScheduledForDate] = useState("");
+    const [showPreview, setShowPreview] = useState(false);
+    const [previewMode, setPreviewMode] = useState<"desktop" | "mobile">("desktop");
+
     const scrollRef = useRef<HTMLDivElement>(null);
     const pollRef = useRef<NodeJS.Timeout | null>(null);
     const aiMenuRef = useRef<HTMLDivElement>(null);
@@ -107,6 +114,8 @@ export default function LeadMessaging({
                     subject: `Message from Golden Touch Remodeling LLC about ${clientName}'s project`,
                     channel: sendMode,
                     attachments: attachedEstimates.map(e => ({ type: "estimate", id: e.id, name: e.code })),
+                    scheduledFor: scheduledForDate ? new Date(scheduledForDate).toISOString() : undefined,
+                    ccEmails: ccEmailsText.split(",").map(e => e.trim()).filter(Boolean),
                 }),
             });
             if (res.ok) {
@@ -114,6 +123,8 @@ export default function LeadMessaging({
                 setMessages(prev => [...prev, msg]);
                 setMessageText("");
                 setAttachedEstimates([]);
+                setScheduledForDate("");
+                setCcEmailsText("");
             } else {
                 const errData = await res.json().catch(() => ({}));
                 console.error("[Send] API error:", res.status, errData);
@@ -380,11 +391,21 @@ export default function LeadMessaging({
 
             {/* Compose Area */}
             <div className="border-t border-hui-border bg-white">
-                {/* To / Subject */}
+                {/* To / Subject / Cc */}
                 <div className="px-5 pt-4">
                     <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-2">
                         <span className="text-slate-500 font-medium w-16">To:</span>
                         <span className="text-hui-textMain font-medium">{clientName}</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-2">
+                        <span className="text-slate-500 font-medium w-16">Cc:</span>
+                        <input
+                            type="text"
+                            value={ccEmailsText}
+                            onChange={(e) => setCcEmailsText(e.target.value)}
+                            placeholder="Add team emails (comma separated)"
+                            className="flex-1 bg-transparent border-none outline-none text-hui-textMain text-sm placeholder:text-slate-300"
+                        />
                     </div>
                     <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-3">
                         <span className="text-slate-500 font-medium w-16">Subject:</span>
@@ -418,11 +439,12 @@ export default function LeadMessaging({
                 {/* Bottom Toolbar */}
                 <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        {/* Send button */}
+                        {/* Send button & Schedule picker */}
+                        <div className="flex items-center gap-2">
                             <button
                                 onClick={handleSend}
                                 disabled={!messageText.trim() || sending}
-                                className={`px-6 py-2 text-sm font-semibold rounded-lg transition shadow-sm ${
+                                className={`px-5 py-2 text-sm font-semibold rounded-lg transition shadow-sm ${
                                     messageText.trim() && !sending
                                         ? "bg-green-600 hover:bg-green-700 text-white"
                                         : "bg-slate-200 text-slate-400 cursor-not-allowed"
@@ -430,6 +452,14 @@ export default function LeadMessaging({
                             >
                                 {sending ? "Sending..." : "Send"}
                             </button>
+                            <input 
+                                type="datetime-local" 
+                                value={scheduledForDate}
+                                onChange={(e) => setScheduledForDate(e.target.value)}
+                                className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-2 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 text-slate-600 h-9"
+                                title="Schedule Send (leave blank to send now)"
+                            />
+                        </div>
 
                         {/* Email/SMS/Both toggle */}
                         <div className="flex items-center gap-3 px-3">
@@ -555,13 +585,90 @@ export default function LeadMessaging({
                             )}
                         </div>
 
-                        <button className="text-xs text-slate-500 hover:text-slate-700 transition flex items-center gap-1">
+                        <button 
+                            onClick={() => setShowPreview(true)}
+                            className="text-xs text-slate-500 hover:text-slate-700 transition flex items-center gap-1"
+                        >
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                             Preview
                         </button>
                     </div>
                 </div>
             </div>
+
+            {/* Preview Modal */}
+            {showPreview && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+                    <div className="bg-white rounded-xl shadow-2xl flex flex-col overflow-hidden max-h-[90vh] max-w-5xl w-full">
+                        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+                            <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                                Message Preview
+                            </h3>
+                            <div className="flex items-center gap-4">
+                                <div className="flex items-center bg-slate-200 rounded-lg p-1">
+                                    <button 
+                                        onClick={() => setPreviewMode("desktop")}
+                                        className={`px-3 py-1.5 text-xs font-semibold rounded-md transition ${previewMode === "desktop" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                                    >
+                                        Desktop
+                                    </button>
+                                    <button 
+                                        onClick={() => setPreviewMode("mobile")}
+                                        className={`px-3 py-1.5 text-xs font-semibold rounded-md transition ${previewMode === "mobile" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                                    >
+                                        Mobile
+                                    </button>
+                                </div>
+                                <button onClick={() => setShowPreview(false)} className="text-slate-400 hover:text-slate-600 transition">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                </button>
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-8 flex justify-center bg-slate-100">
+                            {/* Email Container Simulation */}
+                            <div 
+                                className={`bg-white shadow-sm ring-1 ring-slate-200 min-h-[400px] transition-all duration-300 ease-in-out ${previewMode === "desktop" ? "w-full max-w-2xl" : "w-[375px]"}`}
+                                style={{ fontFamily: "sans-serif" }}
+                            >
+                                <div className="p-8">
+                                    {/* Email Header */}
+                                    <div className="text-center mb-8">
+                                        <h1 className="text-2xl font-bold text-slate-900 m-0">Golden Touch Remodeling LLC</h1>
+                                    </div>
+                                    
+                                    {/* Email Body */}
+                                    <div className="border border-slate-200 rounded-xl p-8">
+                                        <p className="text-slate-600 mb-4 mt-0">From: <strong>Team</strong></p>
+                                        
+                                        <div className="bg-slate-50 rounded-lg p-4 my-4">
+                                            <p className="m-0 leading-relaxed whitespace-pre-wrap text-slate-800">
+                                                {messageText || "Your message will appear here..."}
+                                            </p>
+                                        </div>
+                                        
+                                        {/* Estimate Links Preview */}
+                                        {attachedEstimates.length > 0 && (
+                                            <div className="mt-6 text-center">
+                                                {attachedEstimates.map(est => (
+                                                    <div key={est.id} className="inline-block bg-green-600 text-white px-6 py-2.5 rounded-lg font-semibold text-sm m-1">
+                                                        View Estimate {est.code}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                    
+                                    {/* Email Footer */}
+                                    <p className="text-center text-slate-400 text-xs mt-6">
+                                        Golden Touch Remodeling LLC • 123 Main St, Anytown WA
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
