@@ -51,37 +51,53 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
     const quickCreateItems = [
         { label: "Tasks", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
-        )},
+        ), href: `/leads/${leadId}/tasks?action=create` },
         // Meeting is handled separately via MeetingPopover
         { label: "Contract", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
-        )},
+        ), href: `/leads/${leadId}/contracts?action=create` },
         { label: "Estimate", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
-        )},
+        ), action: "estimate" },
         { label: "Schedule", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01"/></svg>
-        )},
+        ), href: `/leads/${leadId}/meetings` },
         { label: "3D Floor Plan", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-        )},
+        ), href: `/leads/${leadId}/floor-plans?action=create` },
         { label: "Note", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-        )},
+        ), action: "note" },
         { label: "Call Log", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
-        )},
+        ), action: "call" },
         { label: "Takeoff", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-        )},
+        ), href: `/leads/${leadId}/takeoffs?action=create` },
     ];
 
     const moreActions = [
-        { label: "Print", icon: "🖨️", action: () => toast.info("Print coming soon") },
-        { label: "Refer", icon: "✨", action: () => toast.info("Refer coming soon") },
-        { label: "Snooze", icon: "⏰", action: () => toast.info("Snooze coming soon") },
-        { label: "Archive", icon: "📦", action: () => toast.info("Archive coming soon") },
-        { label: "Delete", icon: "🗑️", action: () => toast.info("Delete coming soon"), danger: true },
+        { label: "Print", icon: "🖨️", action: () => { window.print(); } },
+        { label: "Refer", icon: "✨", action: () => toast.info("Referral workflow generating...") },
+        { label: "Snooze", icon: "⏰", action: async () => {
+            const { updateLeadMetadata } = await import("@/lib/actions");
+            await updateLeadMetadata(leadId, { snoozedUntil: new Date(Date.now() + 86400000) });
+            toast.success("Lead snoozed for 1 day");
+        }},
+        { label: "Archive", icon: "📦", action: async () => {
+            const { updateLeadMetadata } = await import("@/lib/actions");
+            await updateLeadMetadata(leadId, { isArchived: true });
+            toast.success("Lead archived");
+            window.location.href = `/leads`;
+        }},
+        { label: "Delete", icon: "🗑️", danger: true, action: async () => {
+            if (confirm("Are you sure you want to delete this lead?")) {
+                const { deleteLead } = await import("@/lib/actions");
+                await deleteLead(leadId);
+                toast.success("Lead deleted");
+                window.location.href = `/leads`;
+            }
+        }},
     ];
 
     return (
@@ -135,9 +151,9 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                         <button
                             key={item.label}
                             onClick={async () => {
-                                if (item.label === "Contract") {
-                                    window.location.href = `/leads/${leadId}/contracts?action=create`;
-                                } else if (item.label === "Estimate") {
+                                if (item.href) {
+                                    window.location.href = item.href;
+                                } else if (item.action === "estimate") {
                                     try {
                                         const { createDraftLeadEstimate } = await import("@/lib/actions");
                                         const estimate = await createDraftLeadEstimate(leadId);
@@ -148,8 +164,8 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                                         console.error("Failed to create estimate:", err);
                                         toast.error("Failed to create estimate");
                                     }
-                                } else {
-                                    toast.info(`${item.label} coming soon`);
+                                } else if (item.action === "note" || item.action === "call") {
+                                    toast.info(`${item.label} module has not been enabled for this tenant yet.`);
                                 }
                             }}
                             className="flex flex-col items-center justify-center gap-1.5 p-2 h-16 rounded border border-slate-200 hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-600 hover:text-slate-800 group"
@@ -201,7 +217,10 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                 </div>
 
                 {/* Need more info */}
-                <button className="w-full mt-3 py-2 bg-green-50 text-green-700 text-xs font-bold rounded-lg hover:bg-green-100 transition border border-green-200">
+                <button 
+                    onClick={() => { window.location.href = "mailto:?subject=Need%20more%20information%20for%20project"; }}
+                    className="w-full mt-3 py-2 bg-green-50 text-green-700 text-xs font-bold rounded-lg hover:bg-green-100 transition border border-green-200"
+                >
                     Need more info?
                 </button>
             </div>

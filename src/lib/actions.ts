@@ -97,6 +97,13 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
     revalidatePath(`/leads/${id}`);
 }
 
+export async function deleteLead(id: string) {
+    await prisma.lead.delete({
+        where: { id }
+    });
+    revalidatePath(`/leads`);
+}
+
 export async function updateLeadAssignment(id: string, managerId: string | null) {
     await prisma.lead.update({
         where: { id },
@@ -2824,7 +2831,7 @@ export async function subPortalUploadCOI(formData: FormData) {
 
 async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promise<Date | null> {
     if (!process.env.GEMINI_API_KEY) return null;
-    if (!["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+    if (!mimeType.includes("pdf") && !mimeType.includes("image")) {
         return null;
     }
     
@@ -2853,10 +2860,14 @@ async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promi
         const text = response.text?.trim() || "";
         if (text === "NULL" || !text) return null;
         
-        // Verify it matches YYYY-MM-DD
-        if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
-            const parsed = new Date(text);
-            if (!isNaN(parsed.getTime())) return parsed;
+        // Extract YYYY-MM-DD from the response
+        const match = text.match(/\d{4}-\d{2}-\d{2}/);
+        if (match) {
+            const parsed = new Date(match[0]);
+            // Convert to local midnight to avoid timezone shifting
+            const userOffset = parsed.getTimezoneOffset() * 60000;
+            const localDate = new Date(parsed.getTime() + userOffset);
+            if (!isNaN(localDate.getTime())) return localDate;
         }
         return null;
     } catch (e) {
