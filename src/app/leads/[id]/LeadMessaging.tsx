@@ -55,10 +55,12 @@ export default function LeadMessaging({
     const [showAiMenu, setShowAiMenu] = useState(false);
     
     // Advanced Messaging States
-    const [ccEmailsText, setCcEmailsText] = useState("");
+    const [teamMembers, setTeamMembers] = useState<{id: string, name: string, email: string}[]>([]);
+    const [ccEmails, setCcEmails] = useState<string[]>([]);
     const [scheduledForDate, setScheduledForDate] = useState("");
     const [showPreview, setShowPreview] = useState(false);
     const [previewMode, setPreviewMode] = useState<"desktop" | "mobile">("desktop");
+    const [showCcDropdown, setShowCcDropdown] = useState(false);
 
     const scrollRef = useRef<HTMLDivElement>(null);
     const pollRef = useRef<NodeJS.Timeout | null>(null);
@@ -102,8 +104,19 @@ export default function LeadMessaging({
         }
     }, [leadId]);
 
+    const fetchTeamMembers = useCallback(async () => {
+        try {
+            const res = await fetch('/api/users');
+            if (res.ok) {
+                const data = await res.json();
+                setTeamMembers(data.users || []);
+            }
+        } catch {}
+    }, []);
+
     useEffect(() => {
         fetchMessages();
+        fetchTeamMembers();
         pollRef.current = setInterval(fetchMessages, 10000);
         return () => { if (pollRef.current) clearInterval(pollRef.current); };
     }, [fetchMessages]);
@@ -119,6 +132,8 @@ export default function LeadMessaging({
         function handleClick(e: MouseEvent) {
             if (aiMenuRef.current && !aiMenuRef.current.contains(e.target as Node)) setShowAiMenu(false);
             if (estimatePickerRef.current && !estimatePickerRef.current.contains(e.target as Node)) setShowEstimatePicker(false);
+            const target = e.target as HTMLElement;
+            if (!target.closest('.cc-dropdown-container')) setShowCcDropdown(false);
         }
         document.addEventListener("mousedown", handleClick);
         return () => document.removeEventListener("mousedown", handleClick);
@@ -139,7 +154,7 @@ export default function LeadMessaging({
                     channel: sendMode,
                     attachments: attachedEstimates.map(e => ({ type: "estimate", id: e.id, name: e.code })),
                     scheduledFor: scheduledForDate ? new Date(scheduledForDate).toISOString() : undefined,
-                    ccEmails: ccEmailsText.split(",").map(e => e.trim()).filter(Boolean),
+                    ccEmails: ccEmails,
                 }),
             });
             if (res.ok) {
@@ -148,7 +163,7 @@ export default function LeadMessaging({
                 setMessageText("");
                 setAttachedEstimates([]);
                 setScheduledForDate("");
-                setCcEmailsText("");
+                setCcEmails([]);
                 editor?.commands.setContent("");
             } else {
                 const errData = await res.json().catch(() => ({}));
@@ -423,15 +438,53 @@ export default function LeadMessaging({
                         <span className="text-slate-500 font-medium w-16">To:</span>
                         <span className="text-hui-textMain font-medium">{clientName}</span>
                     </div>
-                    <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-2">
+                    <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-2 relative cc-dropdown-container">
                         <span className="text-slate-500 font-medium w-16">Cc:</span>
-                        <input
-                            type="text"
-                            value={ccEmailsText}
-                            onChange={(e) => setCcEmailsText(e.target.value)}
-                            placeholder="Add team emails (comma separated)"
-                            className="flex-1 bg-transparent border-none outline-none text-hui-textMain text-sm placeholder:text-slate-300"
-                        />
+                        <div 
+                            className="flex-1 min-h-[24px] cursor-pointer flex items-center flex-wrap gap-1.5"
+                            onClick={() => setShowCcDropdown(!showCcDropdown)}
+                        >
+                            {ccEmails.length === 0 ? (
+                                <span className="text-slate-300">Select team members...</span>
+                            ) : (
+                                ccEmails.map(email => {
+                                    const tm = teamMembers.find(t => t.email === email);
+                                    return (
+                                        <span key={email} className="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full flex items-center gap-1 border border-slate-200 shadow-sm">
+                                            {tm ? tm.name : email}
+                                            <button 
+                                                onClick={(e) => { e.stopPropagation(); setCcEmails(prev => prev.filter(m => m !== email)); }}
+                                                className="hover:text-red-500 ml-0.5 translate-y-[0.5px]"
+                                            >×</button>
+                                        </span>
+                                    );
+                                })
+                            )}
+                        </div>
+                        {showCcDropdown && (
+                            <div className="absolute top-full left-16 mt-1 w-64 bg-white border border-slate-200 rounded-lg shadow-xl z-50 max-h-48 overflow-y-auto pt-1 pb-1">
+                                {teamMembers.map(member => (
+                                    <label key={member.id} className="flex items-center gap-3 px-3 py-2 hover:bg-slate-50 cursor-pointer transition">
+                                        <input 
+                                            type="checkbox"
+                                            checked={ccEmails.includes(member.email)}
+                                            onChange={(e) => {
+                                                if (e.target.checked) setCcEmails(prev => [...prev, member.email]);
+                                                else setCcEmails(prev => prev.filter(m => m !== member.email));
+                                            }}
+                                            className="w-3.5 h-3.5 text-green-600 focus:ring-green-500 rounded border-slate-300"
+                                        />
+                                        <div className="text-sm">
+                                            <p className="font-semibold text-hui-textMain leading-none">{member.name}</p>
+                                            <p className="text-[10px] text-slate-500 mt-0.5">{member.email}</p>
+                                        </div>
+                                    </label>
+                                ))}
+                                {teamMembers.length === 0 && (
+                                    <p className="text-xs text-slate-400 p-3 text-center">No team members found.</p>
+                                )}
+                            </div>
+                        )}
                     </div>
                     <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-3">
                         <span className="text-slate-500 font-medium w-16">Subject:</span>
@@ -445,14 +498,16 @@ export default function LeadMessaging({
                         {/* WYSIWYG Toolbar */}
                         <div className="bg-slate-50 border-b border-slate-200 px-3 py-1.5 flex items-center gap-1">
                             <button
-                                onClick={() => editor?.chain().focus().toggleBold().run()}
+                                type="button"
+                                onClick={(e) => { e.preventDefault(); editor?.chain().focus().toggleBold().run(); }}
                                 className={`p-1.5 transition rounded font-bold text-sm leading-none h-7 w-7 flex items-center justify-center ${editor?.isActive('bold') ? 'bg-slate-200 text-slate-800' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}
                                 title="Bold"
                             >
                                 B
                             </button>
                             <button
-                                onClick={() => editor?.chain().focus().toggleItalic().run()}
+                                type="button"
+                                onClick={(e) => { e.preventDefault(); editor?.chain().focus().toggleItalic().run(); }}
                                 className={`p-1.5 transition rounded italic text-sm font-serif leading-none h-7 w-7 flex items-center justify-center ${editor?.isActive('italic') ? 'bg-slate-200 text-slate-800' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}
                                 title="Italic"
                             >
@@ -460,7 +515,9 @@ export default function LeadMessaging({
                             </button>
                             <div className="w-px h-4 bg-slate-300 mx-1" />
                             <button
-                                onClick={() => {
+                                type="button"
+                                onClick={(e) => {
+                                    e.preventDefault();
                                     const url = window.prompt("Enter link URL");
                                     if (url) {
                                         editor?.chain().focus().extendMarkRange('link').setLink({ href: url }).run();
