@@ -66,9 +66,6 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         { label: "Schedule", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01"/></svg>
         ), href: `/leads/${leadId}/meetings` },
-        { label: "3D Floor Plan", icon: (
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-        ), action: "floorplan" },
         { label: "Note", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         ), action: "note" },
@@ -168,8 +165,6 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                                         console.error("Failed to create estimate:", err);
                                         toast.error("Failed to create estimate");
                                     }
-                                } else if (item.action === "floorplan") {
-                                    router.push(`/leads/${leadId}/floor-plans`);
                                 } else if (item.action === "note") {
                                     setShowNotes(true);
                                 } else if (item.action === "call") {
