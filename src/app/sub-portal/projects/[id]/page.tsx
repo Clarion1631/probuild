@@ -2,6 +2,7 @@ import { redirect, notFound } from "next/navigation";
 import { getSubPortalSession } from "@/lib/sub-portal-auth";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
+import ProjectViewTracker from "@/components/ProjectViewTracker";
 
 export default async function SubPortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const sub = await getSubPortalSession();
@@ -58,6 +59,7 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
 
     return (
         <div className="max-w-5xl mx-auto py-8">
+            <ProjectViewTracker projectId={projectId} subcontractorId={sub.id} />
             {/* Back Button */}
             <div className="mb-6">
                 <Link

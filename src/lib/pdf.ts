@@ -433,9 +433,10 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
             x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
         });
     }
-    if (po.vendor?.contactName) {
+    const vendorNameStr = [po.vendor?.firstName, po.vendor?.lastName].filter(Boolean).join(" ");
+    if (vendorNameStr) {
         y -= 14;
-        page.drawText(po.vendor.contactName, {
+        page.drawText(vendorNameStr, {
             x: margin, y, size: 9, font: helvetica, color: colors.textMain,
         });
     }

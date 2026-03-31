@@ -802,6 +802,7 @@ model SubcontractorProjectAccess {
   projectId        String
   project          Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
   createdAt        DateTime       @default(now())
+  viewedAt         DateTime?
   
   @@unique([subcontractorId, projectId])
 }

@@ -3,6 +3,7 @@
 import { useState, useTransition } from "react";
 import SubcontractorInviteForm from "./SubcontractorInviteForm";
 import { toggleSubcontractorProjectAccess } from "@/lib/subcontractor-actions";
+import Link from "next/link";
 
 type SubcontractorItem = {
     id: string;
@@ -96,19 +97,19 @@ export default function SubcontractorAssignmentModal({
                         <div className="divide-y divide-slate-50">
                             {filtered.map(sub => (
                                 <div key={sub.id} className="flex items-center justify-between p-4 hover:bg-slate-50 rounded-lg transition-colors group">
-                                    <div className="flex items-center gap-4 min-w-0">
+                                    <Link href={`/company/subcontractors/${sub.id}`} className="flex items-center gap-4 min-w-0 flex-1 hover:opacity-80 transition cursor-pointer">
                                         <div className="w-10 h-10 rounded-full bg-slate-200 flex items-center justify-center shrink-0 uppercase font-bold text-slate-500 text-sm">
                                             {sub.companyName.substring(0, 2)}
                                         </div>
                                         <div className="min-w-0">
-                                            <p className="font-semibold text-foreground truncate">{sub.companyName}</p>
+                                            <p className="font-semibold text-foreground truncate group-hover:text-hui-primary transition-colors">{sub.companyName}</p>
                                             <div className="flex items-center gap-2 text-xs text-muted-foreground truncate">
                                                 {sub.email && <span>{sub.email}</span>}
                                                 {sub.email && sub.phone && <span>|</span>}
                                                 {sub.phone && <span>{sub.phone}</span>}
                                             </div>
                                         </div>
-                                    </div>
+                                    </Link>
                                     <div className="shrink-0 pl-4">
                                         {sub.isAssigned ? (
                                             <button 

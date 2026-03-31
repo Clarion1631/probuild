@@ -119,3 +119,47 @@ export async function inviteNewSubcontractor(projectId: string, data: {
     revalidatePath(`/projects/${projectId}`);
     return { success: true, subId };
 }
+
+export async function markSubcontractorProjectViewed(projectId: string, subcontractorId: string) {
+    const access = await prisma.subcontractorProjectAccess.findUnique({
+        where: { subcontractorId_projectId: { subcontractorId, projectId } },
+        include: { subcontractor: true, project: { include: { client: true } } }
+    });
+
+    if (!access) return { success: false };
+
+    // If already viewed, do nothing to avoid spam
+    if (access.viewedAt) return { success: true };
+
+    // Mark as viewed
+    await prisma.subcontractorProjectAccess.update({
+        where: { id: access.id },
+        data: { viewedAt: new Date() }
+    });
+
+    // Notify Project Manager
+    const managers = await prisma.user.findMany({
+        where: { role: { in: ['ADMIN', 'MANAGER'] } },
+        take: 1
+    });
+
+    if (managers.length > 0) {
+        const pmEmail = managers[0].email;
+        const html = `
+            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
+                <h2 style="color: #1e293b; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">Project Seen!</h2>
+                <p>Hello,</p>
+                <p><strong>${access.subcontractor.companyName}</strong> has just accepted your invite and viewed the project: <strong>${access.project.name}</strong> on the Subcontractor Portal.</p>
+                <p>They now have access to the files, schedules, and details you've shared.</p>
+            </div>
+        `;
+
+        await sendNotification(
+            pmEmail,
+            `Subcontractor Viewed Project: ${access.project.name}`,
+            html
+        );
+    }
+
+    return { success: true };
+}

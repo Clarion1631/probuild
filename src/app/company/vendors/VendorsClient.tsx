@@ -1,75 +1,131 @@
 "use client";
 
-import { useState } from "react";
-import { createVendor, updateVendor, deleteVendor } from "@/lib/actions";
+import { useState, useRef } from "react";
+import { createVendor, updateVendor, deleteVendor, deleteVendorFile, createVendorTag, updateVendorTag, deleteVendorTag } from "@/lib/actions";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
+import { Plus, Search, MoreHorizontal, Settings, UploadCloud, X, FileText, Check, Trash2, Edit2 } from "lucide-react";
 
-export default function VendorsClient({ initialVendors }: { initialVendors: any[] }) {
+export default function VendorsClient({ initialVendors, initialTags }: { initialVendors: any[], initialTags: any[] }) {
     const router = useRouter();
     const [vendors, setVendors] = useState(initialVendors);
+    const [tags, setTags] = useState(initialTags);
     const [searchTerm, setSearchTerm] = useState("");
-    const [isMenuOpen, setIsMenuOpen] = useState(false);
-    const [selectedVendor, setSelectedVendor] = useState<any>(null);
+    
+    // UI State
+    const [isVendorModalOpen, setIsVendorModalOpen] = useState(false);
+    const [isTagsModalOpen, setIsTagsModalOpen] = useState(false);
+    const [isActionsMenuOpen, setIsActionsMenuOpen] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
+    
+    // Form State
+    const [selectedVendor, setSelectedVendor] = useState<any>(null);
+    const [formData, setFormData] = useState<any>({});
+    const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+    
+    // File State (Local files to be uploaded on save, or existing files for edit)
+    const [localFiles, setLocalFiles] = useState<File[]>([]);
+    const [existingFiles, setExistingFiles] = useState<any[]>([]);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // Form inputs
-    const [name, setName] = useState("");
-    const [contactName, setContactName] = useState("");
-    const [email, setEmail] = useState("");
-    const [phone, setPhone] = useState("");
-    const [address, setAddress] = useState("");
-    const [notes, setNotes] = useState("");
-
-    const openModal = (vendor?: any) => {
+    // Form Initializer
+    const openVendorModal = (vendor?: any) => {
         if (vendor) {
             setSelectedVendor(vendor);
-            setName(vendor.name);
-            setContactName(vendor.contactName || "");
-            setEmail(vendor.email || "");
-            setPhone(vendor.phone || "");
-            setAddress(vendor.address || "");
-            setNotes(vendor.notes || "");
+            setFormData({
+                name: vendor.name || "",
+                website: vendor.website || "",
+                description: vendor.description || "",
+                firstName: vendor.firstName || "",
+                lastName: vendor.lastName || "",
+                email: vendor.email || "",
+                phone: vendor.phone || "",
+                fax: vendor.fax || "",
+                address1: vendor.address1 || "",
+                address2: vendor.address2 || "",
+                city: vendor.city || "",
+                state: vendor.state || "",
+                zipCode: vendor.zipCode || "",
+                country: vendor.country || "",
+                paymentTerms: vendor.paymentTerms || "",
+                chargesTax: vendor.chargesTax || false,
+                accountNumber: vendor.accountNumber || "",
+                ein: vendor.ein || "",
+                notes: vendor.notes || "",
+            });
+            setSelectedTagIds(vendor.tags?.map((t:any) => t.id) || []);
+            setExistingFiles(vendor.files || []);
+            setLocalFiles([]);
         } else {
             setSelectedVendor(null);
-            setName("");
-            setContactName("");
-            setEmail("");
-            setPhone("");
-            setAddress("");
-            setNotes("");
+            setFormData({ chargesTax: false });
+            setSelectedTagIds([]);
+            setExistingFiles([]);
+            setLocalFiles([]);
         }
-        setIsMenuOpen(true);
+        setIsVendorModalOpen(true);
     };
 
-    const closeModal = () => {
-        setIsMenuOpen(false);
+    const closeVendorModal = () => {
+        setIsVendorModalOpen(false);
         setSelectedVendor(null);
     };
 
-    const handleSave = async (e: React.FormEvent) => {
+    // Submits the new/edited Vendor via FormData to handle file uploads
+    const handleSaveVendor = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!name.trim()) return toast.error("Vendor name is required");
+        if (!formData.name?.trim()) return toast.error("Company Name is required");
         setIsLoading(true);
 
-        const data = { name, contactName, email, phone, address, notes };
-
         try {
+            // First we need to handle file uploads if there are new local files.
+            // Ideally we do this by sending everything in a big FormData object to the server.
+            // But right now our action takes a JSON object. We will just upload via our generic endpoint or base64.
+            // For simplicity in UI, if there are files, we will hit a dedicated route, or base64 encode them for the action.
+            
+            const uploadedFiles = [];
+            if (localFiles.length > 0) {
+                // Quick Base64 upload approach for small files, or we could use FormData
+                for (const fl of localFiles) {
+                    const buffer = await fl.arrayBuffer();
+                    const base64 = Buffer.from(buffer).toString('base64');
+                    // We'll pass it to a new action, or just use the existing API if possible.
+                    // Let's pass it to createVendor/updateVendor and let server actions handle it (we'll need to modify actions to handle base64 if so).
+                    // Actually, passing raw ArrayBuffer is supported in modern Server Actions, but let's stick to easy JSON payloads.
+                    uploadedFiles.push({
+                        name: fl.name,
+                        type: fl.type,
+                        size: fl.size,
+                        base64Data: base64
+                    });
+                }
+            }
+
+            const payload = {
+                ...formData,
+                tagIds: selectedTagIds,
+                filesToUpload: uploadedFiles // We pass this specially
+            };
+
+            // Let's use standard JSON, we'll hit `/api/vendors/save` which we will build, or a Next API Route.
+            // Actually, we can use the server action directly if we pass Base64!
+            // Wait, we didn't add base64 parsing to `actions.ts`. Let's build a quick API route or just do it.
+            
+            // For now, let's just pass `payload` to an augmented server action we will write next.
+            let res;
             if (selectedVendor) {
-                await updateVendor(selectedVendor.id, data);
+                const { updateVendorWithFiles } = await import("@/lib/client-actions"); // We will create this
+                res = await updateVendorWithFiles(selectedVendor.id, payload);
                 toast.success("Vendor updated");
             } else {
-                await createVendor(data);
+                const { createVendorWithFiles } = await import("@/lib/client-actions");
+                res = await createVendorWithFiles(payload);
                 toast.success("Vendor added");
             }
-            router.refresh(); // Rely on server component to fetch fresh data
-            // Also optimistically update locally to avoid waiting
-            const newVendors = selectedVendor 
-                ? vendors.map(v => v.id === selectedVendor.id ? { ...v, ...data } : v)
-                : [...vendors, { id: Math.random().toString(), ...data, createdAt: new Date() }];
             
-            setVendors(newVendors as any);
-            closeModal();
+            setVendors(res.vendors); // Expecting action to return fresh list
+            closeVendorModal();
+            router.refresh();
         } catch (error: any) {
             toast.error(error.message || "Failed to save vendor");
         } finally {
@@ -77,93 +133,190 @@ export default function VendorsClient({ initialVendors }: { initialVendors: any[
         }
     };
 
-    const handleDelete = async (id: string, name: string) => {
-        if (!confirm(`Are you sure you want to delete ${name}? This action cannot be undone.`)) return;
-        setIsLoading(true);
-        try {
-            await deleteVendor(id);
-            toast.success("Vendor deleted");
-            setVendors(vendors.filter(v => v.id !== id));
-            router.refresh();
-        } catch (error: any) {
-            toast.error(error.message || "Failed to delete vendor");
-        } finally {
-            setIsLoading(false);
-        }
-    };
-
+    // Table filtering
     const filtered = vendors.filter(v => 
-        v.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
+        v.name?.toLowerCase().includes(searchTerm.toLowerCase()) || 
         v.contactName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
         v.email?.toLowerCase().includes(searchTerm.toLowerCase())
     );
 
+    const toggleTagSelection = (id: string) => {
+        setSelectedTagIds(prev => prev.includes(id) ? prev.filter(t => t !== id) : [...prev, id]);
+    };
+
+    // ----- Render Helpers -----
+    const renderManageTags = () => {
+        const [tagName, setTagName] = useState("");
+        const [editingTag, setEditingTag] = useState<any>(null);
+
+        const handleSaveTag = async () => {
+            if (!tagName.trim()) return;
+            try {
+                if (editingTag) {
+                    const res = await updateVendorTag(editingTag.id, tagName);
+                    setTags(tags.map(t => t.id === res.id ? res : t));
+                } else {
+                    const res = await createVendorTag(tagName);
+                    setTags([...tags, res]);
+                }
+                setTagName("");
+                setEditingTag(null);
+            } catch(e: any) { toast.error("Error saving tag"); }
+        };
+
+        const handleDeleteTag = async (id: string) => {
+            try {
+                await deleteVendorTag(id);
+                setTags(tags.filter(t => t.id !== id));
+            } catch(e) { toast.error("Error deleting tag"); }
+        };
+
+        return (
+            <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
+                <div className="bg-white rounded-xl shadow-xl max-w-md w-full max-h-[90vh] flex flex-col">
+                    <div className="px-6 py-4 border-b border-hui-border flex justify-between items-center sticky top-0 bg-white z-10">
+                        <h2 className="text-xl font-bold text-hui-textMain">Manage Tags</h2>
+                        <button onClick={() => setIsTagsModalOpen(false)} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
+                    </div>
+                    
+                    <div className="p-6 flex-1 overflow-y-auto">
+                        <div className="flex gap-2 mb-6">
+                            <input 
+                                type="text" 
+                                value={tagName} 
+                                onChange={e => setTagName(e.target.value)} 
+                                placeholder="New tag name"
+                                className="hui-input flex-1"
+                            />
+                            <button onClick={handleSaveTag} className="hui-btn hui-btn-primary hover:bg-slate-800">
+                                {editingTag ? <Check className="w-4 h-4"/> : <Plus className="w-4 h-4"/>}
+                            </button>
+                            {editingTag && (
+                                <button onClick={() => {setEditingTag(null); setTagName("");}} className="hui-btn hui-btn-secondary"><X className="w-4 h-4"/></button>
+                            )}
+                        </div>
+
+                        <ul className="divide-y divide-slate-100 border-t border-slate-100">
+                            {tags.map(t => (
+                                <li key={t.id} className="py-3 flex justify-between items-center group">
+                                    <span className="text-sm font-medium text-slate-700">{t.name}</span>
+                                    <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <button onClick={() => {setEditingTag(t); setTagName(t.name);}} className="text-slate-400 hover:text-hui-primary"><Edit2 className="w-4 h-4"/></button>
+                                        <button onClick={() => handleDeleteTag(t.id)} className="text-slate-400 hover:text-red-500"><Trash2 className="w-4 h-4"/></button>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
     return (
-        <div className="max-w-7xl mx-auto pb-20">
+        <div className="max-w-[1400px] mx-auto pb-20 p-4 sm:p-6">
             {/* Header */}
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
                 <div>
                     <h1 className="text-2xl font-bold text-hui-textMain">Vendors</h1>
-                    <p className="text-sm text-hui-textLight">Manage suppliers and vendors used for purchase orders.</p>
                 </div>
-                <button
-                    onClick={() => openModal()}
-                    className="hui-btn hui-btn-primary flex items-center gap-2"
-                >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
-                    Add Vendor
-                </button>
+                <div className="flex items-center gap-3">
+                    <div className="relative">
+                        <button 
+                            onClick={() => setIsActionsMenuOpen(!isActionsMenuOpen)}
+                            className="text-sm font-semibold flex items-center gap-1 hover:bg-slate-100 px-3 py-2 rounded transition text-slate-700"
+                        >
+                            Actions <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                        </button>
+                        {isActionsMenuOpen && (
+                            <div className="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border border-slate-100 py-1 z-20">
+                                <button className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 opacity-50 cursor-not-allowed">Import Vendor List</button>
+                                <button className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 opacity-50 cursor-not-allowed">Export Vendor List</button>
+                                <button onClick={() => { setIsActionsMenuOpen(false); setIsTagsModalOpen(true); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Manage Tags</button>
+                            </div>
+                        )}
+                    </div>
+                    <button
+                        onClick={() => openVendorModal()}
+                        className="hui-btn bg-slate-900 border-slate-900 text-white hover:bg-slate-800 flex items-center gap-2 font-bold"
+                    >
+                        Add Vendor
+                    </button>
+                </div>
             </div>
 
             {/* List View */}
             <div className="bg-white rounded-xl shadow-sm border border-hui-border overflow-hidden">
-                <div className="p-4 border-b border-hui-border bg-slate-50 flex items-center gap-4">
-                    <div className="relative flex-1 max-w-md">
-                        <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                <div className="p-4 border-b border-hui-border flex items-center gap-4">
+                    <div className="relative w-64">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                         <input
                             type="text"
-                            placeholder="Search vendors..."
+                            placeholder="Search"
                             value={searchTerm}
                             onChange={(e) => setSearchTerm(e.target.value)}
                             className="hui-input pl-9 w-full text-sm"
                         />
                     </div>
+                    <div className="flex gap-2">
+                        <button onClick={() => setIsTagsModalOpen(true)} className="hui-btn hui-btn-secondary text-xs h-9">Tags <span className="ml-1 opacity-50">▼</span></button>
+                        <button className="hui-btn hui-btn-secondary text-xs h-9">Type: Active <span className="ml-1 opacity-50">▼</span></button>
+                    </div>
                 </div>
 
                 <div className="overflow-x-auto">
-                    <table className="w-full text-left text-sm text-hui-textMain">
-                        <thead className="bg-slate-50 border-b border-hui-border text-[11px] uppercase text-hui-textMuted tracking-wider">
+                    <table className="w-full text-left text-sm whitespace-nowrap">
+                        <thead className="border-b border-hui-border text-xs font-semibold text-slate-500 bg-slate-50/50">
                             <tr>
-                                <th className="px-5 py-3 font-semibold">Vendor Name</th>
-                                <th className="px-5 py-3 font-semibold">Contact</th>
-                                <th className="px-5 py-3 font-semibold">Email</th>
-                                <th className="px-5 py-3 font-semibold">Phone</th>
-                                <th className="px-5 py-3 font-semibold text-right">Actions</th>
+                                <th className="pl-4 pr-2 py-3 w-8"><input type="checkbox" className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary pointer-events-none" /></th>
+                                <th className="px-5 py-3 font-semibold">Name <span className="opacity-50 text-[10px]">↕</span></th>
+                                <th className="px-5 py-3 font-semibold">Contact <span className="opacity-50 text-[10px]">↕</span></th>
+                                <th className="px-5 py-3 font-semibold">Tags</th>
+                                <th className="px-5 py-3 font-semibold">POs</th>
+                                <th className="px-5 py-3 font-semibold">Date Added <span className="opacity-50 text-[10px]">↕</span></th>
+                                <th className="px-5 py-3"></th>
                             </tr>
                         </thead>
-                        <tbody className="divide-y divide-slate-100 bg-white">
+                        <tbody className="divide-y divide-slate-100">
                             {filtered.length === 0 ? (
                                 <tr>
-                                    <td colSpan={5} className="px-5 py-8 text-center text-slate-400">
+                                    <td colSpan={7} className="px-5 py-12 text-center text-slate-400">
                                         No vendors found.
                                     </td>
                                 </tr>
                             ) : (
                                 filtered.map(v => (
-                                    <tr key={v.id} className="hover:bg-slate-50/50 transition">
-                                        <td className="px-5 py-4 font-medium">{v.name}</td>
-                                        <td className="px-5 py-4 text-slate-600">{v.contactName || "-"}</td>
-                                        <td className="px-5 py-4">
-                                            {v.email ? (
-                                                <a href={`mailto:${v.email}`} className="text-hui-primary hover:underline">{v.email}</a>
-                                            ) : "-"}
+                                    <tr key={v.id} className="hover:bg-slate-50/80 transition group cursor-pointer" onClick={() => openVendorModal(v)}>
+                                        <td className="pl-4 pr-2 py-4" onClick={e=>e.stopPropagation()}><input type="checkbox" className="rounded border-slate-300 pointer-events-none" /></td>
+                                        <td className="px-5 py-4 font-semibold text-hui-textMain">{v.name}</td>
+                                        <td className="px-5 py-4 text-slate-600 flex items-center gap-2">
+                                            {(v.firstName || v.lastName) && (
+                                                <div className="w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-bold">
+                                                    {(v.firstName?.[0] || "")}{(v.lastName?.[0] || "")}
+                                                </div>
+                                            )}
+                                            {v.firstName} {v.lastName}
+                                            {v.phone && <span className="text-slate-400 ml-1">{v.phone}</span>}
                                         </td>
-                                        <td className="px-5 py-4 text-slate-600">{v.phone || "-"}</td>
                                         <td className="px-5 py-4">
-                                            <div className="flex justify-end items-center gap-3">
-                                                <button onClick={() => openModal(v)} className="text-slate-400 hover:text-hui-primary font-medium text-xs uppercase tracking-wider">Edit</button>
-                                                <button onClick={() => handleDelete(v.id, v.name)} className="text-slate-400 hover:text-red-500 font-medium text-xs uppercase tracking-wider">Delete</button>
+                                            <div className="flex gap-1">
+                                                {v.tags?.map((t:any) => (
+                                                    <span key={t.id} className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-xs border border-slate-200">{t.name}</span>
+                                                ))}
                                             </div>
+                                        </td>
+                                        <td className="px-5 py-4 font-medium text-slate-600">
+                                            {v._count?.purchaseOrders > 0 ? (
+                                                <span className="flex items-center gap-1.5"><FileText className="w-3.5 h-3.5"/> {v._count.purchaseOrders} PO{v._count.purchaseOrders > 1 ? 's' : ''}</span>
+                                            ) : ""}
+                                        </td>
+                                        <td className="px-5 py-4 text-slate-500">
+                                            {new Date(v.createdAt).toLocaleDateString("en-US", {month:"short", day:"numeric", year:"numeric"})}
+                                        </td>
+                                        <td className="px-5 py-4 text-right">
+                                            <button onClick={(e) => {e.stopPropagation();}} className="text-slate-300 hover:text-slate-600 p-1">
+                                                <MoreHorizontal className="w-5 h-5" />
+                                            </button>
                                         </td>
                                     </tr>
                                 ))
@@ -173,56 +326,179 @@ export default function VendorsClient({ initialVendors }: { initialVendors: any[
                 </div>
             </div>
 
-            {/* Manage Vendor Modal */}
-            {isMenuOpen && (
+            {/* Manage Tags Modal */}
+            {isTagsModalOpen && renderManageTags()}
+
+            {/* Create / Edit Vendor Modal */}
+            {isVendorModalOpen && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-                    <div className="bg-white rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
-                        <div className="px-6 py-4 border-b border-hui-border flex justify-between items-center sticky top-0 bg-white z-10">
-                            <h2 className="text-lg font-bold text-hui-textMain">
-                                {selectedVendor ? 'Edit Vendor' : 'Add New Vendor'}
+                    <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[95vh] flex flex-col">
+                        <div className="px-8 py-5 border-b border-hui-border flex justify-between items-center bg-white z-10 shrink-0">
+                            <h2 className="text-2xl font-bold text-slate-800">
+                                {selectedVendor ? 'Edit Vendor' : 'Create New Vendor'}
                             </h2>
-                            <button onClick={closeModal} className="text-slate-400 hover:text-slate-600 text-2xl font-light">&times;</button>
+                            <button onClick={closeVendorModal} className="text-slate-400 hover:text-slate-600"><X className="w-6 h-6"/></button>
                         </div>
                         
-                        <form onSubmit={handleSave} className="p-6 space-y-4">
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Company Name *</label>
-                                <input required type="text" value={name} onChange={e => setName(e.target.value)} className="hui-input w-full" placeholder="e.g. Home Depot Pro" />
-                            </div>
-                            
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                <div>
-                                    <label className="block text-sm font-medium text-slate-700 mb-1">Contact Name</label>
-                                    <input type="text" value={contactName} onChange={e => setContactName(e.target.value)} className="hui-input w-full" />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-medium text-slate-700 mb-1">Phone</label>
-                                    <input type="tel" value={phone} onChange={e => setPhone(e.target.value)} className="hui-input w-full" />
-                                </div>
-                            </div>
+                        <div className="p-8 overflow-y-auto flex-1 bg-white">
+                            <form id="vendor-form" onSubmit={handleSaveVendor} className="space-y-10 max-w-2xl">
+                                
+                                {/* General Details */}
+                                <section>
+                                    <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-4">General Details</h3>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <input required type="text" placeholder="Company Name*" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} className="hui-input w-full" />
+                                        </div>
+                                        <div>
+                                            <input type="text" placeholder="Website" value={formData.website} onChange={e => setFormData({...formData, website: e.target.value})} className="hui-input w-full" />
+                                        </div>
+                                    </div>
+                                    <div className="mt-4">
+                                        <textarea placeholder="Description" rows={4} value={formData.description} onChange={e => setFormData({...formData, description: e.target.value})} className="hui-input w-full resize-none" />
+                                    </div>
+                                    <div className="mt-4 relative">
+                                        <div className="p-2 border border-slate-200 rounded-lg min-h-[42px] flex flex-wrap gap-2 items-center cursor-text bg-white">
+                                            {selectedTagIds.map(tid => {
+                                                const tg = tags.find(x => x.id === tid);
+                                                return tg ? (
+                                                    <span key={tid} className="bg-slate-100 text-slate-700 px-2 py-1 rounded text-xs flex items-center gap-1 border border-slate-200">
+                                                        {tg.name}
+                                                        <button type="button" onClick={()=>toggleTagSelection(tid)}><X className="w-3 h-3 hover:text-red-500"/></button>
+                                                    </span>
+                                                ) : null;
+                                            })}
+                                            <select 
+                                                className="bg-transparent border-0 focus:ring-0 p-0 text-sm text-slate-500 w-full max-w-[150px]"
+                                                onChange={e => {
+                                                    if (e.target.value && !selectedTagIds.includes(e.target.value)) {
+                                                        toggleTagSelection(e.target.value);
+                                                    }
+                                                    e.target.value = "";
+                                                }}
+                                            >
+                                                <option value="">Search & add tags</option>
+                                                {tags.filter(t => !selectedTagIds.includes(t.id)).map(t => (
+                                                    <option key={t.id} value={t.id}>{t.name}</option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                    </div>
+                                </section>
 
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
-                                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className="hui-input w-full" />
-                            </div>
+                                {/* Contact Info */}
+                                <section>
+                                    <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-4">Contact Info</h3>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <input type="text" placeholder="First Name" value={formData.firstName} onChange={e => setFormData({...formData, firstName: e.target.value})} className="hui-input w-full" />
+                                        <input type="text" placeholder="Last Name" value={formData.lastName} onChange={e => setFormData({...formData, lastName: e.target.value})} className="hui-input w-full" />
+                                        
+                                        <input type="email" placeholder="Email Address" value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} className="hui-input w-full" />
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <input type="tel" placeholder="Phone Number" value={formData.phone} onChange={e => setFormData({...formData, phone: e.target.value})} className="hui-input w-full" />
+                                            <input type="tel" placeholder="Fax Number" value={formData.fax} onChange={e => setFormData({...formData, fax: e.target.value})} className="hui-input w-full" />
+                                        </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Address</label>
-                                <input type="text" value={address} onChange={e => setAddress(e.target.value)} className="hui-input w-full" />
-                            </div>
+                                        <input type="text" placeholder="Address Line 1" value={formData.address1} onChange={e => setFormData({...formData, address1: e.target.value})} className="hui-input w-full" />
+                                        <input type="text" placeholder="Address Line 2" value={formData.address2} onChange={e => setFormData({...formData, address2: e.target.value})} className="hui-input w-full" />
+                                        
+                                        <input type="text" placeholder="City" value={formData.city} onChange={e => setFormData({...formData, city: e.target.value})} className="hui-input w-full" />
+                                        <input type="text" placeholder="State/Prov" value={formData.state} onChange={e => setFormData({...formData, state: e.target.value})} className="hui-input w-full" />
+                                        
+                                        <input type="text" placeholder="Zip Code" value={formData.zipCode} onChange={e => setFormData({...formData, zipCode: e.target.value})} className="hui-input w-full" />
+                                        <select value={formData.country} onChange={e => setFormData({...formData, country: e.target.value})} className="hui-input w-full text-slate-500">
+                                            <option value="">Country</option>
+                                            <option value="US">United States</option>
+                                            <option value="CA">Canada</option>
+                                        </select>
+                                    </div>
+                                </section>
 
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Internal Notes</label>
-                                <textarea value={notes} onChange={e => setNotes(e.target.value)} className="hui-input w-full p-2 h-24 text-sm" placeholder="Terms, account num, etc." />
-                            </div>
-                            
-                            <div className="pt-4 flex justify-end gap-3 border-t border-hui-border mt-6">
-                                <button type="button" onClick={closeModal} className="hui-btn hui-btn-secondary">Cancel</button>
-                                <button type="submit" disabled={isLoading} className="hui-btn hui-btn-primary disabled:opacity-50">
-                                    {isLoading ? 'Saving...' : 'Save Vendor'}
-                                </button>
-                            </div>
-                        </form>
+                                {/* Default Settings */}
+                                <section>
+                                    <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-4">Default Settings</h3>
+                                    <select value={formData.paymentTerms} onChange={e => setFormData({...formData, paymentTerms: e.target.value})} className="hui-input w-full mb-4 text-slate-500">
+                                        <option value="">Default Payment Terms</option>
+                                        <option value="Net 15">Net 15</option>
+                                        <option value="Net 30">Net 30</option>
+                                        <option value="Net 60">Net 60</option>
+                                        <option value="Due on Receipt">Due on Receipt</option>
+                                    </select>
+                                    <label className="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" checked={formData.chargesTax} onChange={e => setFormData({...formData, chargesTax: e.target.checked})} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary w-4 h-4" />
+                                        <span className="text-sm text-slate-700 font-medium">Charges Tax</span>
+                                    </label>
+                                </section>
+
+                                {/* Additional Info */}
+                                <section>
+                                    <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-4">Additional Info</h3>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                                        <input type="text" placeholder="Account Number" value={formData.accountNumber} onChange={e => setFormData({...formData, accountNumber: e.target.value})} className="hui-input w-full" />
+                                        <input type="text" placeholder="EIN" value={formData.ein} onChange={e => setFormData({...formData, ein: e.target.value})} className="hui-input w-full" />
+                                    </div>
+                                    <textarea placeholder="Internal Notes" rows={3} value={formData.notes} onChange={e => setFormData({...formData, notes: e.target.value})} className="hui-input w-full resize-none" />
+                                </section>
+
+                                {/* Attachments */}
+                                <section>
+                                    <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide mb-4">Attachments</h3>
+                                    <div 
+                                        className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center hover:bg-slate-50 transition cursor-pointer flex flex-col items-center justify-center gap-2 text-slate-500 font-medium"
+                                        onClick={() => fileInputRef.current?.click()}
+                                    >
+                                        <UploadCloud className="w-6 h-6 text-slate-400" />
+                                        <span><span className="text-slate-800 font-bold">Upload Files</span> or drag & drop here</span>
+                                        <input 
+                                            type="file" 
+                                            multiple 
+                                            className="hidden" 
+                                            ref={fileInputRef} 
+                                            onChange={(e) => {
+                                                if (e.target.files) {
+                                                    setLocalFiles([...localFiles, ...Array.from(e.target.files)]);
+                                                }
+                                            }} 
+                                        />
+                                    </div>
+                                    
+                                    {(localFiles.length > 0 || existingFiles.length > 0) && (
+                                        <ul className="mt-4 space-y-2">
+                                            {existingFiles.map(f => (
+                                                <li key={f.id} className="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-200">
+                                                    <a href={f.url} target="_blank" rel="noreferrer" className="text-sm font-medium text-blue-600 hover:underline flex items-center gap-2 max-w-sm truncate"><FileText className="w-4 h-4 shrink-0"/> {f.name}</a>
+                                                    <button type="button" onClick={async () => {
+                                                        if (confirm("Delete this file permanently?")) {
+                                                            await deleteVendorFile(f.id);
+                                                            setExistingFiles(existingFiles.filter(x => x.id !== f.id));
+                                                        }
+                                                    }} className="text-red-500 hover:bg-red-50 p-1.5 rounded"><Trash2 className="w-4 h-4"/></button>
+                                                </li>
+                                            ))}
+                                            {localFiles.map((f, i) => (
+                                                <li key={i} className="flex items-center justify-between p-3 bg-amber-50 rounded-lg border border-amber-200">
+                                                    <span className="text-sm font-medium text-amber-800 flex items-center gap-2 max-w-sm truncate"><FileText className="w-4 h-4 shrink-0"/> {f.name} (Pending...)</span>
+                                                    <button type="button" onClick={() => {
+                                                        setLocalFiles(localFiles.filter((_, idx) => idx !== i));
+                                                    }} className="text-amber-600 hover:bg-amber-100 p-1.5 rounded"><X className="w-4 h-4"/></button>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    )}
+                                </section>
+                            </form>
+                        </div>
+
+                        <div className="p-6 border-t border-hui-border bg-slate-50 shrink-0 flex justify-end gap-3 rounded-b-xl z-10">
+                            <button type="button" onClick={closeVendorModal} className="hui-btn bg-white hover:bg-slate-50 border-slate-200 text-slate-700 font-bold px-6">Cancel</button>
+                            <button type="button" form="vendor-form" onClick={(e) => {
+                                // Just a dummy for the Save & Add New button structure requested in screenshot
+                                handleSaveVendor(e);
+                            }} className="hui-btn bg-white hover:bg-slate-50 border-slate-200 text-slate-700 font-bold px-6">Save & Add New</button>
+                            <button type="submit" form="vendor-form" disabled={isLoading} className="hui-btn bg-slate-900 border-slate-900 text-white hover:bg-slate-800 px-8 font-bold disabled:opacity-50">
+                                {isLoading ? 'Saving...' : 'Save'}
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}
