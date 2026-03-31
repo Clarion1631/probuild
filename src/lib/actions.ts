@@ -2751,16 +2751,24 @@ export async function uploadSubcontractorCOI(subcontractorId: string, formData: 
     const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
     const publicUrl = urlData?.publicUrl || storagePath;
 
+    let coiExpiresAt: Date | null = null;
+    try {
+        coiExpiresAt = await extractCoiExpirationDate(file.type, buffer);
+    } catch (e) {
+        console.error("Failed to parse COI Expiration via AI:", e);
+    }
+
     await prisma.subcontractor.update({
         where: { id: subcontractorId },
         data: {
             coiFileUrl: publicUrl,
             coiUploaded: true,
+            ...(coiExpiresAt ? { coiExpiresAt } : {})
         }
     });
 
     revalidatePath(`/company/subcontractors/${subcontractorId}`);
-    return { success: true, url: publicUrl };
+    return { success: true, url: publicUrl, coiExpiresAt };
 }
 
 export async function subPortalUploadCOI(formData: FormData) {
@@ -2794,14 +2802,65 @@ export async function subPortalUploadCOI(formData: FormData) {
     const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
     const publicUrl = urlData?.publicUrl || storagePath;
 
+    let coiExpiresAt: Date | null = null;
+    try {
+        coiExpiresAt = await extractCoiExpirationDate(file.type, buffer);
+    } catch (e) {
+        console.error("Failed to parse COI Expiration via AI:", e);
+    }
+
     await prisma.subcontractor.update({
         where: { id: sub.id },
         data: {
             coiFileUrl: publicUrl,
             coiUploaded: true,
+            ...(coiExpiresAt ? { coiExpiresAt } : {})
         }
     });
 
     revalidatePath(`/sub-portal`);
-    return { success: true, url: publicUrl };
+    return { success: true, url: publicUrl, coiExpiresAt };
+}
+
+async function extractCoiExpirationDate(mimeType: string, buffer: Buffer): Promise<Date | null> {
+    if (!process.env.GEMINI_API_KEY) return null;
+    if (!["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+        return null;
+    }
+    
+    const { GoogleGenAI } = await import("@google/genai");
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-1.5-pro",
+            contents: [
+                {
+                    role: "user",
+                    parts: [
+                        {
+                            inlineData: {
+                                data: buffer.toString("base64"),
+                                mimeType: mimeType,
+                            }
+                        },
+                        { text: "Extract the exact expiration date of this Certificate of Insurance document. Respond ONLY with the date in YYYY-MM-DD format. If no clear expiration date is found, respond 'NULL'." }
+                    ]
+                }
+            ]
+        });
+        
+        const text = response.text?.trim() || "";
+        if (text === "NULL" || !text) return null;
+        
+        // Verify it matches YYYY-MM-DD
+        if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+            const parsed = new Date(text);
+            if (!isNaN(parsed.getTime())) return parsed;
+        }
+        return null;
+    } catch (e) {
+        console.error("AI COI Extraction Error:", e);
+        return null;
+    }
 }

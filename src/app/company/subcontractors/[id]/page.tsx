@@ -164,11 +164,16 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
             const formData = new FormData();
             formData.append("file", file);
             
-            await uploadSubcontractorCOI(id, formData);
+            const res = await uploadSubcontractorCOI(id, formData);
             
             // Overwrite local sub so UI updates to show compliant
             setSub(prev => prev ? { ...prev, coiUploaded: true } : prev);
-            toast.success("Certificate of Insurance uploaded successfully");
+            if (res.coiExpiresAt) {
+                setForm(f => ({ ...f, coiExpiresAt: new Date(res.coiExpiresAt!).toISOString().split('T')[0] }));
+                toast.success(`AI Detected Expiration Date: ${new Date(res.coiExpiresAt).toLocaleDateString()}`);
+            } else {
+                toast.success("Certificate of Insurance uploaded successfully");
+            }
         } catch (error: any) {
             toast.error(error.message || "Upload failed");
         } finally {

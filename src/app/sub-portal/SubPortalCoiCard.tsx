@@ -10,9 +10,10 @@ interface Props {
     coiExpiresAt: Date | null;
 }
 
-export default function SubPortalCoiCard({ subId, coiUploaded, coiExpiresAt }: Props) {
+export default function SubPortalCoiCard({ subId, coiUploaded, coiExpiresAt: initialExpires }: Props) {
     const [isUploading, setIsUploading] = useState(false);
     const [uploaded, setUploaded] = useState(coiUploaded);
+    const [localExpiresAt, setLocalExpiresAt] = useState<Date | null>(initialExpires);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     async function handleUploadCOI(e: React.ChangeEvent<HTMLInputElement>) {
@@ -24,10 +25,15 @@ export default function SubPortalCoiCard({ subId, coiUploaded, coiExpiresAt }: P
             const formData = new FormData();
             formData.append("file", file);
             
-            await subPortalUploadCOI(formData);
+            const res = await subPortalUploadCOI(formData);
             
             setUploaded(true);
-            toast.success("Certificate of Insurance uploaded successfully");
+            if (res.coiExpiresAt) {
+                setLocalExpiresAt(new Date(res.coiExpiresAt));
+                toast.success(`AI Extracted Expiration: ${new Date(res.coiExpiresAt).toLocaleDateString()}`);
+            } else {
+                toast.success("Certificate of Insurance uploaded successfully");
+            }
         } catch (error: any) {
             toast.error(error.message || "Upload failed");
         } finally {
@@ -49,7 +55,7 @@ export default function SubPortalCoiCard({ subId, coiUploaded, coiExpiresAt }: P
                     <h3 className="text-base font-semibold text-hui-textMain mb-1">Certificate of Insurance (COI)</h3>
                     <p className="text-sm text-slate-500 max-w-lg">
                         You must maintain an active Certificate of Insurance on file to be assigned to new projects.
-                        {uploaded && coiExpiresAt && ` Your current COI expires on ${new Date(coiExpiresAt).toLocaleDateString()}.`}
+                        {uploaded && localExpiresAt && ` Your current COI expires on ${new Date(localExpiresAt).toLocaleDateString()}.`}
                     </p>
                 </div>
 
