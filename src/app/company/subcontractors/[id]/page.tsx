@@ -3,6 +3,8 @@ import { useState, useEffect, use } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import TradeTagSelector from "@/components/TradeTagSelector";
+import ProjectAccessManager from "./ProjectAccessManager";
 
 interface TaskAssignment {
     taskId: string;
@@ -150,8 +152,9 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                             </div>
                             <div>
                                 <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Trade / Specialty</label>
-                                <input type="text" value={form.trade} onChange={e => setForm(f => ({ ...f, trade: e.target.value }))}
-                                    className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                <TradeTagSelector 
+                                    value={form.trade || ""} 
+                                    onChange={(val) => setForm(f => ({ ...f, trade: val }))}
                                 />
                             </div>
                         </div>
@@ -211,6 +214,8 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                             </button>
                         </div>
                     </div>
+
+                    <ProjectAccessManager subcontractorId={id} />
                 </div>
 
                 {/* Right Column: COI & Tasks */}

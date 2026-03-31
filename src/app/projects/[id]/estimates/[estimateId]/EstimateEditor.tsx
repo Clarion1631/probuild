@@ -31,6 +31,23 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [templateName, setTemplateName] = useState("");
     const [isSavingTemplate, setIsSavingTemplate] = useState(false);
     const [isDuplicating, setIsDuplicating] = useState(false);
+    const [selectedItemIds, setSelectedItemIds] = useState<string[]>([]);
+    const [isCreatingCO, setIsCreatingCO] = useState(false);
+
+    async function handleCreateChangeOrder() {
+        if (selectedItemIds.length === 0) return;
+        setIsCreatingCO(true);
+        try {
+            await handleSave();
+            const { createChangeOrder } = await import("@/lib/actions");
+            const res = await createChangeOrder(context.id, initialEstimate.id, selectedItemIds);
+            toast.success("Change Order drafted!");
+            router.push(`/projects/${context.id}/change-orders/${res.id}`);
+        } catch (e: any) {
+            toast.error(e.message || "Failed to create Change Order");
+            setIsCreatingCO(false);
+        }
+    }
 
     useEffect(() => {
         fetch('/api/cost-codes?active=true')
@@ -428,6 +445,15 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     >
                         {isSaving ? "Saving..." : "Save"}
                     </button>
+                    {context.type === "project" && selectedItemIds.length > 0 && (
+                        <button
+                            onClick={handleCreateChangeOrder}
+                            disabled={isCreatingCO}
+                            className="hui-btn hui-btn-primary bg-amber-600 hover:bg-amber-700 hover:border-amber-700 border-amber-600 text-white disabled:opacity-50"
+                        >
+                            {isCreatingCO ? "Creating..." : `Create Change Order (${selectedItemIds.length})`}
+                        </button>
+                    )}
                 </div>
             </div>
 
@@ -472,6 +498,14 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                             <div className="bg-white">
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
                                 <div className="w-8"></div>
+                                <div className="w-8 pt-0.5">
+                                    <input 
+                                        type="checkbox" 
+                                        checked={items.length > 0 && selectedItemIds.length === items.length}
+                                        onChange={(e) => setSelectedItemIds(e.target.checked ? items.map(i => i.id) : [])}
+                                        className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                    />
+                                </div>
                                 <div className="flex-1">Item Description</div>
                                 <div className="w-32">Phase</div>
                                 <div className="w-32">Type</div>
@@ -500,6 +534,17 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                             >
                                                                 <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab opacity-0 group-hover:opacity-100">
                                                                     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
+                                                                </div>
+                                                                <div className="w-8">
+                                                                    <input 
+                                                                        type="checkbox" 
+                                                                        checked={selectedItemIds.includes(item.id)}
+                                                                        onChange={(e) => {
+                                                                            if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]);
+                                                                            else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id));
+                                                                        }}
+                                                                        className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                                                    />
                                                                 </div>
                                                                 <div className="flex-1 flex flex-col">
                                                                     <input

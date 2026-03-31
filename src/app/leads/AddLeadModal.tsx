@@ -3,9 +3,12 @@
 import { useState } from "react";
 import { createLead } from "@/lib/actions";
 import { useRouter } from "next/navigation";
+import ClientCombobox from "@/components/ClientCombobox";
 
 export default function AddLeadModal({ onClose }: { onClose: () => void }) {
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [clientEmail, setClientEmail] = useState("");
+    const [clientPhone, setClientPhone] = useState("");
     const router = useRouter();
 
     async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -32,7 +35,7 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
 
     return (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-white rounded-lg p-6 w-[500px]">
+            <div className="bg-white rounded-lg p-6 w-[500px] shadow-xl max-h-[90vh] overflow-y-auto">
                 <h2 className="text-xl font-bold text-hui-textMain mb-4">Add New Lead</h2>
                 <form onSubmit={handleSubmit} className="space-y-4">
                     <div>
@@ -42,17 +45,23 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
                     <div className="grid grid-cols-2 gap-4">
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Client Name</label>
-                            <input name="clientName" required type="text" className="hui-input w-full" />
+                            <ClientCombobox 
+                                name="clientName" 
+                                onSelect={(client) => {
+                                    if (client.email) setClientEmail(client.email);
+                                    if (client.primaryPhone) setClientPhone(client.primaryPhone);
+                                }} 
+                            />
                         </div>
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Client Email</label>
-                            <input name="clientEmail" type="email" className="hui-input w-full" />
+                            <input name="clientEmail" type="email" value={clientEmail} onChange={e => setClientEmail(e.target.value)} className="hui-input w-full" placeholder="Optional" />
                         </div>
                     </div>
                     <div className="grid grid-cols-2 gap-4">
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Client Phone</label>
-                            <input name="clientPhone" type="text" className="hui-input w-full" />
+                            <input name="clientPhone" type="text" value={clientPhone} onChange={e => setClientPhone(e.target.value)} className="hui-input w-full" placeholder="Optional" />
                         </div>
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Project Location</label>

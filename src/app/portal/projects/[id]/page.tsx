@@ -43,6 +43,11 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                     }
                 }
             },
+            changeOrders: {
+                where: { status: { not: 'Draft' } },
+                orderBy: { createdAt: 'desc' },
+                include: { estimate: true }
+            },
             floorPlans: {
                 orderBy: { createdAt: 'desc' }
             }
@@ -105,6 +110,41 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                     <div className="flex justify-between text-sm text-hui-textMuted">
                                         <span>Total: ${(est.totalAmount || 0).toLocaleString()}</span>
                                         <span>{new Date(est.createdAt).toLocaleDateString()}</span>
+                                    </div>
+                                </Link>
+                            ))}
+                        </div>
+                    )}
+                </div>
+                )}
+
+                {/* Change Orders Section */}
+                {visibility.showChangeOrders && (
+                <div>
+                    <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
+                        <svg className="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
+                        Change Orders
+                    </h2>
+                    {(project.changeOrders || []).length === 0 ? (
+                        <div className="bg-hui-background border border-hui-border rounded-lg p-6 text-center text-hui-textMuted text-sm">
+                            No active Change Orders for this project.
+                        </div>
+                    ) : (
+                        <div className="space-y-3">
+                            {project.changeOrders.map((co: any) => (
+                                <Link href={`/portal/change-orders/${co.id}`} key={co.id} className="block hui-card p-4 hover:border-amber-300 hover:shadow-sm transition">
+                                    <div className="flex justify-between items-start mb-2">
+                                        <h3 className="font-semibold text-hui-textMain truncate pr-2">{co.title}</h3>
+                                        <span className={`text-xs px-2 py-1 rounded-full font-medium ${co.status === 'Approved' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
+                                            {co.status}
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between text-sm text-hui-textMuted">
+                                        <span>Amount: ${(co.totalAmount || 0).toLocaleString()}</span>
+                                        <span>{new Date(co.createdAt).toLocaleDateString()}</span>
+                                    </div>
+                                    <div className="mt-2 text-xs text-slate-400 truncate">
+                                        Original Est: {co.estimate?.title || co.estimate?.code}
                                     </div>
                                 </Link>
                             ))}

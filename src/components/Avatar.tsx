@@ -1,17 +1,21 @@
 interface AvatarProps {
-    name: string;
+    name?: string;
+    initials?: string;
     color?: "blue" | "green" | "orange" | "purple" | "pink";
+    size?: "sm" | "md" | "lg" | "xl";
 }
 
-export default function Avatar({ name, color = "blue" }: AvatarProps) {
-    const getInitials = (name: string) => {
-        return name
+export default function Avatar({ name, initials, color = "blue", size = "md" }: AvatarProps) {
+    const getInitials = (nameToParse: string) => {
+        return nameToParse
             .split(" ")
             .map((n) => n[0])
             .slice(0, 2)
             .join("")
             .toUpperCase();
     };
+
+    const displayInitials = initials || (name ? getInitials(name) : "?");
 
     const getColors = (c: string) => {
         switch (c) {
@@ -29,11 +33,24 @@ export default function Avatar({ name, color = "blue" }: AvatarProps) {
         }
     };
 
+    const getSize = (s: string) => {
+        switch (s) {
+            case "sm": return "w-6 h-6 text-[10px]";
+            case "lg": return "w-12 h-12 text-lg";
+            case "xl": return "w-16 h-16 text-xl";
+            case "md":
+            default:
+                return "w-8 h-8 text-xs";
+        }
+    };
+
     const colorClass = getColors(color);
+    const sizeClass = getSize(size);
 
     return (
-        <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold ${colorClass}`}>
-            {getInitials(name)}
+        <div className={`${sizeClass} rounded-full flex items-center justify-center font-semibold ${colorClass}`}>
+            {displayInitials}
         </div>
     );
 }
+

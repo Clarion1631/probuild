@@ -75,6 +75,56 @@ export async function createLead(data: { name: string; clientName: string; clien
     return { id: lead.id };
 }
 
+export async function getClients() {
+    return await prisma.client.findMany({
+        orderBy: { name: "asc" },
+        include: {
+            projects: {
+                include: { estimates: true }
+            },
+            leads: true
+        }
+    });
+}
+
+export async function getClient(id: string) {
+    return await prisma.client.findUnique({
+        where: { id },
+        include: {
+            projects: true,
+            leads: true,
+            invoices: true,
+        }
+    });
+}
+
+export async function createClient(data: { name: string; email?: string; companyName?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; internalNotes?: string }) {
+    "use server";
+    const initials = data.name
+        .split(" ")
+        .map((n) => n[0])
+        .join("")
+        .toUpperCase()
+        .slice(0, 2);
+
+    const client = await prisma.client.create({
+        data: {
+            name: data.name,
+            initials,
+            email: data.email || null,
+            companyName: data.companyName || null,
+            primaryPhone: data.primaryPhone || null,
+            addressLine1: data.addressLine1 || null,
+            city: data.city || null,
+            state: data.state || null,
+            zipCode: data.zipCode || null,
+            internalNotes: data.internalNotes || null,
+        },
+    });
+    revalidatePath("/clients");
+    return client;
+}
+
 export async function updateClient(clientId: string, data: { name?: string; email?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
     "use server";
     const client = await prisma.client.update({
@@ -2434,4 +2484,173 @@ export async function savePortalVisibility(projectId: string, data: {
     revalidatePath(`/projects/${projectId}/settings`);
     revalidatePath(`/portal/projects/${projectId}`);
     return { success: true };
+}
+
+// =============================================
+// Subcontractor Trades Config
+// =============================================
+
+export async function getCompanySubcontractorTrades() {
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    if (!settings?.subcontractorTrades) return [];
+    try {
+        return JSON.parse(settings.subcontractorTrades) as string[];
+    } catch {
+        return [];
+    }
+}
+
+export async function saveCompanySubcontractorTrades(trades: string[]) {
+    await prisma.companySettings.update({
+        where: { id: "singleton" },
+        data: { subcontractorTrades: JSON.stringify(trades) },
+    });
+    revalidatePath("/company/subcontractors");
+    return { success: true };
+}
+
+// =============================================
+// Subcontractor Project Access
+// =============================================
+
+export async function getSubcontractorExplicitProjects(subId: string) {
+    const accesses = await prisma.subcontractorProjectAccess.findMany({
+        where: { subcontractorId: subId },
+        select: { projectId: true },
+    });
+    return accesses.map(a => a.projectId);
+}
+
+export async function saveSubcontractorExplicitProjects(subId: string, projectIds: string[]) {
+    await prisma.$transaction([
+        prisma.subcontractorProjectAccess.deleteMany({ where: { subcontractorId: subId } }),
+        prisma.subcontractorProjectAccess.createMany({
+            data: projectIds.map(projectId => ({
+                subcontractorId: subId,
+                projectId
+            }))
+        })
+    ]);
+    revalidatePath(`/company/subcontractors/${subId}`);
+    return { success: true };
+}
+
+// =============================================
+// Change Orders CRUD
+// =============================================
+
+export async function createChangeOrder(projectId: string, estimateId: string, itemIds?: string[]) {
+    "use server";
+    const count = await prisma.changeOrder.count({ where: { projectId } });
+    const code = `CO-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        include: { items: true }
+    });
+    if (!estimate) throw new Error("Estimate not found");
+
+    const changeOrder = await prisma.changeOrder.create({
+        data: {
+            title: `Change Order for ${estimate.title}`,
+            projectId,
+            estimateId,
+            code,
+            status: "Draft",
+        }
+    });
+
+    if (itemIds && itemIds.length > 0) {
+        const selectedItems = estimate.items.filter(i => itemIds.includes(i.id));
+        for (const item of selectedItems) {
+            await prisma.changeOrderItem.create({
+                data: {
+                    changeOrderId: changeOrder.id,
+                    name: item.name,
+                    description: item.description,
+                    type: item.type,
+                    quantity: item.quantity,
+                    baseCost: item.baseCost,
+                    markupPercent: item.markupPercent,
+                    unitCost: item.unitCost,
+                    total: item.total,
+                    order: item.order,
+                    costCodeId: item.costCodeId,
+                    costTypeId: item.costTypeId,
+                }
+            });
+        }
+    }
+
+    revalidatePath(`/projects/${projectId}/change-orders`);
+    return { id: changeOrder.id };
+}
+
+export async function getChangeOrders(projectId: string) {
+    "use server";
+    return await prisma.changeOrder.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { estimate: { select: { title: true, code: true } } }
+    });
+}
+
+export async function getChangeOrder(id: string) {
+    "use server";
+    return await prisma.changeOrder.findUnique({
+        where: { id },
+        include: {
+            project: { include: { client: true } },
+            estimate: { select: { title: true, code: true } },
+            items: { orderBy: { order: "asc" } },
+            paymentSchedules: { orderBy: { order: "asc" } }
+        }
+    });
+}
+
+export async function updateChangeOrder(id: string, data: any) {
+    "use server";
+    const co = await prisma.changeOrder.update({
+        where: { id },
+        data
+    });
+    revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${co.projectId}/change-orders`);
+    return co;
+}
+
+export async function deleteChangeOrder(id: string) {
+    "use server";
+    const co = await prisma.changeOrder.findUnique({ where: { id } });
+    if (!co) return;
+    await prisma.changeOrder.delete({ where: { id } });
+    revalidatePath(`/projects/${co.projectId}/change-orders`);
+}
+
+export async function updateChangeOrderStatus(id: string, status: string, projectId: string) {
+    "use server";
+    await prisma.changeOrder.update({
+        where: { id },
+        data: { status }
+    });
+    revalidatePath(`/projects/${projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${projectId}/change-orders`);
+}
+
+export async function approveChangeOrder(id: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+    "use server";
+    const approvedAt = new Date();
+    const co = await prisma.changeOrder.update({
+        where: { id },
+        data: {
+            status: "Approved",
+            approvedBy: signatureName,
+            approvedAt,
+            clientSignatureUrl: signatureDataUrl || null,
+        },
+    });
+    
+    revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${co.projectId}/change-orders`);
+    return co;
 }

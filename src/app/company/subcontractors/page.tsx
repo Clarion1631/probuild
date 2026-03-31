@@ -2,6 +2,8 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
+import ManageTradesModal from "@/components/ManageTradesModal";
+import { getCompanySubcontractorTrades } from "@/lib/actions";
 
 interface Subcontractor {
     id: string;
@@ -18,11 +20,23 @@ export default function SubcontractorsPage() {
     const [subs, setSubs] = useState<Subcontractor[]>([]);
     const [search, setSearch] = useState("");
     const [statusFilter, setStatusFilter] = useState("ALL");
+    const [tradeFilter, setTradeFilter] = useState("ALL");
+    const [availableTrades, setAvailableTrades] = useState<string[]>([]);
+    const [showManageTrades, setShowManageTrades] = useState(false);
+    const [showActionsDropdown, setShowActionsDropdown] = useState(false);
     const [showAdd, setShowAdd] = useState(false);
     const [addForm, setAddForm] = useState({ companyName: "", contactName: "", email: "", phone: "", trade: "" });
     const [adding, setAdding] = useState(false);
 
-    useEffect(() => { fetchSubs(); }, []);
+    useEffect(() => { 
+        fetchSubs(); 
+        fetchTrades();
+    }, []);
+
+    async function fetchTrades() {
+        const trades = await getCompanySubcontractorTrades();
+        setAvailableTrades(trades);
+    }
 
     async function fetchSubs() {
         const res = await fetch("/api/subcontractors");
@@ -49,6 +63,11 @@ export default function SubcontractorsPage() {
 
     const filtered = subs.filter(s => {
         if (statusFilter !== "ALL" && s.status !== statusFilter) return false;
+        if (tradeFilter !== "ALL") {
+            if (!s.trade) return false;
+            const subTrades = s.trade.split(",").map(t => t.trim());
+            if (!subTrades.includes(tradeFilter)) return false;
+        }
         if (search && !s.companyName.toLowerCase().includes(search.toLowerCase()) && !s.email.toLowerCase().includes(search.toLowerCase())) return false;
         return true;
     });
@@ -60,12 +79,34 @@ export default function SubcontractorsPage() {
                     <h1 className="text-2xl font-bold text-hui-textMain">Subcontractors</h1>
                     <p className="text-sm text-slate-500 mt-1">{subs.length} Total</p>
                 </div>
-                <button
-                    onClick={() => setShowAdd(true)}
-                    className="bg-hui-primary text-white px-5 py-2.5 rounded-lg text-sm font-semibold hover:bg-indigo-700 transition shadow-sm"
-                >
-                    Add Subcontractor
-                </button>
+                <div className="flex items-center gap-3 relative">
+                    <button
+                        onClick={() => setShowActionsDropdown(!showActionsDropdown)}
+                        className="bg-white border border-hui-border text-slate-700 px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-slate-50 transition shadow-sm flex items-center gap-2"
+                    >
+                        Actions
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                    </button>
+                    {showActionsDropdown && (
+                        <>
+                            <div className="fixed inset-0 z-10" onClick={() => setShowActionsDropdown(false)}></div>
+                            <div className="absolute top-full right-[160px] mt-2 w-48 bg-white border border-slate-200 rounded-lg shadow-lg z-20 py-1">
+                                <button 
+                                    onClick={() => { setShowManageTrades(true); setShowActionsDropdown(false); }}
+                                    className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition"
+                                >
+                                    Manage Trades
+                                </button>
+                            </div>
+                        </>
+                    )}
+                    <button
+                        onClick={() => setShowAdd(true)}
+                        className="bg-hui-primary text-white px-5 py-2.5 rounded-lg text-sm font-semibold hover:bg-indigo-700 transition shadow-sm"
+                    >
+                        Add Subcontractor
+                    </button>
+                </div>
             </div>
 
             {/* Filters */}
@@ -77,6 +118,14 @@ export default function SubcontractorsPage() {
                         className="w-full pl-9 pr-4 py-2 border border-hui-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20 bg-white"
                     />
                 </div>
+                <select value={tradeFilter} onChange={e => setTradeFilter(e.target.value)}
+                    className="border border-hui-border rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-hui-primary/20 min-w-[140px]"
+                >
+                    <option value="ALL">Trade Types</option>
+                    {availableTrades.map(trade => (
+                        <option key={trade} value={trade}>{trade}</option>
+                    ))}
+                </select>
                 <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
                     className="border border-hui-border rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                 >
@@ -177,6 +226,15 @@ export default function SubcontractorsPage() {
                         </div>
                     </form>
                 </div>
+            )}
+
+            {showManageTrades && (
+                <ManageTradesModal 
+                    onClose={() => {
+                        setShowManageTrades(false);
+                        fetchTrades(); // Reload trades if they edited them
+                    }} 
+                />
             )}
         </div>
     );

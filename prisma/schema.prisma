@@ -134,9 +134,11 @@ model Project {
   files         ProjectFile[]
   folders       FileFolder[]
   userAccess    ProjectAccess[]
+  subcontractorAccess SubcontractorProjectAccess[]
   takeoffs      Takeoff[]
   portalVisibility PortalVisibility?
   messageThread    MessageThread?
+  changeOrders     ChangeOrder[]
 }
 
 model FloorPlan {
@@ -189,6 +191,7 @@ model Estimate {
   // Phase 9: Terms & Sending
   termsAndConditions String?   // Snapshot of T&C HTML at time of sending
   sentAt             DateTime? // When the estimate was emailed to the client
+  changeOrders       ChangeOrder[]
 }
 
 model EstimatePaymentSchedule {
@@ -306,6 +309,7 @@ model CostCode {
   estimateItems EstimateItem[]
   timeEntries   TimeEntry[]
   expenses      Expense[]
+  changeOrderItems ChangeOrderItem[]
 }
 
 model CostType {
@@ -319,6 +323,7 @@ model CostType {
   estimateItems EstimateItem[]
   timeEntries   TimeEntry[]
   expenses      Expense[]
+  changeOrderItems ChangeOrderItem[]
 }
 
 model TimeEntry {
@@ -415,6 +420,7 @@ model CompanySettings {
   logoUrl           String?
   notificationEmail String?  // Where to send View/Sign alerts
   projectStatuses   String?  // JSON string array of custom statues [{label, value, color, dot}, ...]
+  subcontractorTrades String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
   stripeEnabled     Boolean @default(false)
   enableCard        Boolean @default(true)
   enableBankTransfer Boolean @default(false)
@@ -534,6 +540,7 @@ model Subcontractor {
   
   // Relations
   taskAssignments SubTaskAssignment[]
+  projectAccess   SubcontractorProjectAccess[]
   
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
@@ -700,6 +707,7 @@ model PortalVisibility {
   showInvoices    Boolean @default(true)
   showContracts   Boolean @default(true)
   showMessages    Boolean @default(true)
+  showChangeOrders Boolean @default(true)
 }
 
 model MessageThread {
@@ -739,4 +747,76 @@ model LeadMessage {
   scheduledFor DateTime?
   ccEmails    String?   // JSON array of emails
   createdAt   DateTime  @default(now())
+}
+
+model SubcontractorProjectAccess {
+  id               String         @id @default(cuid())
+  subcontractorId  String
+  subcontractor    Subcontractor  @relation(fields: [subcontractorId], references: [id], onDelete: Cascade)
+  projectId        String
+  project          Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt        DateTime       @default(now())
+  
+  @@unique([subcontractorId, projectId])
+}
+
+model ChangeOrder {
+  id                  String   @id @default(cuid())
+  projectId           String
+  project             Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  estimateId          String
+  estimate            Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  code                String
+  title               String
+  description         String?
+  status              String   @default("Draft") // Draft, Sent, Approved, Declined
+  totalAmount         Float    @default(0)
+  balanceDue          Float    @default(0)
+  
+  termsAndConditions  String?
+  memos               String?
+  
+  clientSignatureUrl  String?
+  companySignatureUrl String?
+  approvedBy          String?
+  approvedAt          DateTime?
+  sentAt              DateTime?
+  viewedAt            DateTime?
+
+  items               ChangeOrderItem[]
+  paymentSchedules    ChangeOrderPaymentSchedule[]
+
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model ChangeOrderItem {
+  id             String      @id @default(cuid())
+  changeOrderId  String
+  changeOrder    ChangeOrder @relation(fields: [changeOrderId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  type           String      @default("Material")
+  quantity       Float       @default(1)
+  baseCost       Float?
+  markupPercent  Float       @default(25)
+  unitCost       Float       @default(0)
+  total          Float       @default(0)
+  order          Int         @default(0)
+  costCodeId     String?
+  costCode       CostCode?   @relation(fields: [costCodeId], references: [id])
+  costTypeId     String?
+  costType       CostType?   @relation(fields: [costTypeId], references: [id])
+  createdAt      DateTime    @default(now())
+}
+
+model ChangeOrderPaymentSchedule {
+  id            String      @id @default(cuid())
+  changeOrderId String
+  changeOrder   ChangeOrder @relation(fields: [changeOrderId], references: [id], onDelete: Cascade)
+  name          String
+  amount        Float
+  dueDate       DateTime?
+  order         Int         @default(0)
+  createdAt     DateTime    @default(now())
 }
