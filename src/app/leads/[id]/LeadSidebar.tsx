@@ -32,11 +32,8 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         { key: "meetings", label: "Meetings", href: `/leads/${leadId}/meetings`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01"/></svg>
         )},
-        { key: "3d-floor-plans", label: "3D Floor Plans", icon: (
+        { key: "3d-floor-plans", label: "3D Floor Plans", href: `/leads/${leadId}/floor-plans`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-        )},
-        { key: "schedule", label: "Schedule", icon: (
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
         )},
         { key: "files", label: "Files & Photos", icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
@@ -63,9 +60,6 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         { label: "Estimate", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
         ), action: "estimate" },
-        { label: "Schedule", icon: (
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01"/></svg>
-        ), href: `/leads/${leadId}/meetings` },
         { label: "Note", icon: (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         ), action: "note" },
@@ -125,8 +119,12 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                         key={item.key}
                         href={item.href || "#"}
                         onClick={(e) => {
-                            if (!item.href) e.preventDefault();
-                            setActiveNav(item.key);
+                            if (!item.href || item.key === "notes") {
+                                e.preventDefault();
+                                if (item.key === "notes") setShowNotes(true);
+                            } else {
+                                setActiveNav(item.key);
+                            }
                         }}
                         className={`flex items-center gap-3 px-4 py-2 text-sm transition-colors cursor-pointer ${
                             activeNav === item.key
