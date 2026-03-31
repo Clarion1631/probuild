@@ -133,6 +133,18 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 <span className="font-medium">All Projects</span>
             </Link>
 
+            {/* Client Portal Link */}
+            <div className="p-3 border-b border-hui-border bg-slate-50">
+                <Link 
+                    href={`/portal/projects/${projectId}`}
+                    target="_blank"
+                    className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-md bg-white border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-100 transition shadow-sm"
+                >
+                    <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+                    View Client Portal
+                </Link>
+            </div>
+
             <div className="p-4 border-b border-hui-border bg-white">
                 <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Project Menu</h2>
             </div>
