@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
         if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
         const body = await req.json();
-        const { companyName, contactName, email, phone, trade, licenseNumber } = body;
+        const { companyName, contactName, firstName, lastName, email, phone, trade, licenseNumber } = body;
 
         if (!companyName || !email) {
             return NextResponse.json({ error: "Company name and email are required" }, { status: 400 });
@@ -43,6 +43,8 @@ export async function POST(req: NextRequest) {
             data: {
                 companyName,
                 contactName,
+                firstName,
+                lastName,
                 email,
                 phone,
                 trade,

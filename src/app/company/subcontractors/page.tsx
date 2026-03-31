@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import ManageTradesModal from "@/components/ManageTradesModal";
+import TradeTagSelector from "@/components/TradeTagSelector";
 import { getCompanySubcontractorTrades } from "@/lib/actions";
 
 interface Subcontractor {
@@ -25,7 +26,7 @@ export default function SubcontractorsPage() {
     const [showManageTrades, setShowManageTrades] = useState(false);
     const [showActionsDropdown, setShowActionsDropdown] = useState(false);
     const [showAdd, setShowAdd] = useState(false);
-    const [addForm, setAddForm] = useState({ companyName: "", contactName: "", email: "", phone: "", trade: "" });
+    const [addForm, setAddForm] = useState({ companyName: "", firstName: "", lastName: "", email: "", phone: "", trade: "" });
     const [adding, setAdding] = useState(false);
 
     useEffect(() => { 
@@ -50,13 +51,16 @@ export default function SubcontractorsPage() {
             const res = await fetch("/api/subcontractors", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(addForm),
+                body: JSON.stringify({
+                    ...addForm,
+                    contactName: `${addForm.firstName} ${addForm.lastName}`.trim() || null
+                }),
             });
             const data = await res.json();
             if (!res.ok) { toast.error(data.error || "Failed to add Subcontractor"); return; }
             toast.success(`Added ${data.companyName}`);
             setShowAdd(false);
-            setAddForm({ companyName: "", contactName: "", email: "", phone: "", trade: "" });
+            setAddForm({ companyName: "", firstName: "", lastName: "", email: "", phone: "", trade: "" });
             fetchSubs();
         } catch { toast.error("Failed to add"); } finally { setAdding(false); }
     }
@@ -191,17 +195,24 @@ export default function SubcontractorsPage() {
                             </div>
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Contact Name</label>
-                                    <input type="text" value={addForm.contactName} onChange={e => setAddForm(p => ({ ...p, contactName: e.target.value }))}
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">First Name</label>
+                                    <input type="text" value={addForm.firstName} onChange={e => setAddForm(p => ({ ...p, firstName: e.target.value }))}
                                         className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                                     />
                                 </div>
                                 <div>
-                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Trade</label>
-                                    <input type="text" value={addForm.trade} onChange={e => setAddForm(p => ({ ...p, trade: e.target.value }))}
-                                        className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20" placeholder="e.g. Plumbing"
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Last Name</label>
+                                    <input type="text" value={addForm.lastName} onChange={e => setAddForm(p => ({ ...p, lastName: e.target.value }))}
+                                        className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                                     />
                                 </div>
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Trade</label>
+                                <TradeTagSelector 
+                                    value={addForm.trade} 
+                                    onChange={val => setAddForm(p => ({ ...p, trade: val }))}
+                                />
                             </div>
                             <div>
                                 <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Email *</label>

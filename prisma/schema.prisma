@@ -548,6 +548,18 @@ model Subcontractor {
   licenseNumber   String?
   status          String   @default("ACTIVE")  // ACTIVE, INACTIVE
   
+  // Expanded Details
+  firstName       String?
+  lastName        String?
+  website         String?
+  addressLine1    String?
+  addressLine2    String?
+  city            String?
+  state           String?
+  zip             String?
+  country         String?
+  internalNotes   String?
+  
   // Certificate of Insurance
   coiFileUrl      String?
   coiExpiresAt    DateTime?
