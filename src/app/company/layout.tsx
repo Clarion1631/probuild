@@ -14,7 +14,7 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
                 { name: "Team Members", href: "/company/team-members", icon: Users },
                 { name: "Clients", href: "#", icon: Users }, // Placeholder icon
                 { name: "Subcontractors", href: "/company/subcontractors", icon: Anchor },
-                { name: "Vendors", href: "#", icon: Anchor }, // Placeholder icon
+                { name: "Vendors", href: "/company/vendors", icon: Anchor },
             ]
         },
         {

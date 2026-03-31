@@ -19,8 +19,11 @@ export async function GET(req: NextRequest) {
             return NextResponse.redirect(new URL("/sub-portal/login?error=invalid_token", req.url));
         }
 
+        let nextUrl = req.nextUrl.searchParams.get("next") || "/sub-portal";
+        if (!nextUrl.startsWith("/sub-portal")) nextUrl = "/sub-portal";
+
         // Set httpOnly cookie with the subcontractor ID
-        const response = NextResponse.redirect(new URL("/sub-portal", req.url));
+        const response = NextResponse.redirect(new URL(nextUrl, req.url));
         response.cookies.set("sub_portal_token", token, {
             httpOnly: true,
             secure: process.env.NODE_ENV === "production",

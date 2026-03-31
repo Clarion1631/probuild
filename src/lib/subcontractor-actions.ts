@@ -3,6 +3,11 @@
 import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
+import { SignJWT } from "jose";
+
+const JWT_SECRET = new TextEncoder().encode(
+    process.env.SUB_PORTAL_SECRET || "sub-portal-dev-secret-change-me"
+);
 
 export async function getProjectSubcontractors(projectId: string) {
     const allSubs = await prisma.subcontractor.findMany({
@@ -83,7 +88,20 @@ export async function inviteNewSubcontractor(projectId: string, data: {
 
     // Send invite
     if (data.sendEmail) {
-        const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/sub-portal/projects/${projectId}`;
+        let portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/sub-portal/projects/${projectId}`;
+        
+        try {
+            // Generate a secure one-off magic link that auto-authenticates them and routes to the project
+            const token = await new SignJWT({ subId: subId!, email: data.email })
+                .setProtectedHeader({ alg: "HS256" })
+                .setIssuedAt()
+                .setExpirationTime("72h") // Invite links last longer than standard re-login ones
+                .sign(JWT_SECRET);
+                
+            portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/api/sub-portal/verify?token=${token}&next=/sub-portal/projects/${projectId}`;
+        } catch (e) {
+            console.error("Failed to generate magic invite link, sending static URL");
+        }
         
         const html = `
             <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
@@ -171,7 +189,19 @@ export async function resendSubcontractorInvite(projectId: string, subcontractor
 
     if (!sub || !sub.email) return { success: false, error: "Subcontractor has no email address." };
 
-    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/sub-portal/projects/${projectId}`;
+    let portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/sub-portal/projects/${projectId}`;
+    
+    try {
+        const token = await new SignJWT({ subId: sub.id, email: sub.email })
+            .setProtectedHeader({ alg: "HS256" })
+            .setIssuedAt()
+            .setExpirationTime("72h")
+            .sign(JWT_SECRET);
+            
+        portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/api/sub-portal/verify?token=${token}&next=/sub-portal/projects/${projectId}`;
+    } catch (e) {
+        console.error("Failed to generate magic invite link, sending static URL");
+    }
     
     const html = `
         <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
