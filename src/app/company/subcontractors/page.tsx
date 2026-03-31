@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 "use client";
 import { useState, useEffect } from "react";
 import Link from "next/link";
@@ -250,3 +251,4 @@ export default function SubcontractorsPage() {
         </div>
     );
 }
+

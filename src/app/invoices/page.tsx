@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 import { getAllInvoices } from "@/lib/actions";
 import GlobalInvoiceListClient from "./GlobalInvoiceListClient";
 
@@ -14,3 +15,4 @@ export default async function GlobalInvoicesPage() {
         </div>
     );
 }
+

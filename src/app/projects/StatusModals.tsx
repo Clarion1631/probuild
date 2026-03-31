@@ -97,6 +97,8 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
     const [localStatuses, setLocalStatuses] = useState<ProjectStatus[]>(statuses);
     const [newStatusName, setNewStatusName] = useState("");
     const [isAdding, setIsAdding] = useState(false);
+    const [editingValue, setEditingValue] = useState<string | null>(null);
+    const [editLabel, setEditLabel] = useState("");
 
     const handleSave = async () => {
         try {
@@ -110,6 +112,14 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
 
     const handleDelete = (value: string) => {
         setLocalStatuses(prev => prev.filter(s => s.value !== value));
+    };
+
+    const handleEditSave = (value: string) => {
+        if (!editLabel.trim()) return;
+        setLocalStatuses(prev => prev.map(s => 
+            s.value === value ? { ...s, label: editLabel.trim(), value: editLabel.trim() } : s
+        ));
+        setEditingValue(null);
     };
 
     const handleAdd = () => {
@@ -139,19 +149,38 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
                 
                 <div className="p-2 space-y-1">
                     {localStatuses.map((status) => (
-                        <div key={status.value} className="group flex items-center justify-between p-2 rounded-lg hover:bg-slate-50 border-b border-slate-100 last:border-0">
-                            <div className="flex items-center gap-3 relative">
-                                <div className={`w-3.5 h-3.5 rounded-full ring-2 ring-white shadow-sm ${status.dot}`} style={{ backgroundColor: status.rawColor }} />
-                                <span className="text-sm text-slate-700">{status.label}</span>
-                            </div>
-                            <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                <button className="text-slate-400 hover:text-slate-600">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
-                                </button>
-                                <button onClick={() => handleDelete(status.value)} className="text-slate-400 hover:text-red-500">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                                </button>
-                            </div>
+                        <div key={status.value} className="group flex items-center justify-between p-2 rounded-lg hover:bg-slate-50 border-b border-slate-100 last:border-0 min-h-[44px]">
+                            {editingValue === status.value ? (
+                                <div className="flex items-center gap-2 w-full animate-in fade-in">
+                                    <input 
+                                        autoFocus
+                                        type="text" 
+                                        value={editLabel}
+                                        onChange={e => setEditLabel(e.target.value)}
+                                        className="hui-input flex-1 py-1 text-sm bg-white" 
+                                        onKeyDown={e => {
+                                            if (e.key === 'Enter') handleEditSave(status.value);
+                                            if (e.key === 'Escape') setEditingValue(null);
+                                        }}
+                                    />
+                                    <button onClick={() => handleEditSave(status.value)} className="text-sm font-semibold text-indigo-600 hover:text-indigo-800 shrink-0">Save</button>
+                                </div>
+                            ) : (
+                                <>
+                                    <div className="flex items-center gap-3 relative w-full">
+                                        <div className={`w-3.5 h-3.5 shrink-0 rounded-full ring-2 ring-white shadow-sm ${status.dot}`} style={{ backgroundColor: status.rawColor }} />
+                                        <span className="text-sm text-slate-700 truncate">{status.label}</span>
+                                    </div>
+                                    <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity pl-2">
+                                        <button onClick={() => { setEditingValue(status.value); setEditLabel(status.label); }} className="text-slate-400 hover:text-indigo-600 p-1">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
+                                        </button>
+                                        <button onClick={() => handleDelete(status.value)} className="text-slate-400 hover:text-red-500 p-1">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                                        </button>
+                                    </div>
+                                </>
+                            )}
                         </div>
                     ))}
                 </div>

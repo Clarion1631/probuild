@@ -62,6 +62,27 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         }
     }
 
+    function generateId() {
+        return Math.random().toString(36).substr(2, 9);
+    }
+
+    function addItem() {
+        setItems([...items, {
+            id: generateId(),
+            name: "",
+            description: "",
+            quantity: 1,
+            unitCost: 0,
+            total: 0
+        }]);
+    }
+
+    function removeItem(index: number) {
+        const newItems = [...items];
+        newItems.splice(index, 1);
+        setItems(newItems);
+    }
+
     function updateItem(index: number, field: string, value: any) {
         const newItems = [...items];
         newItems[index][field] = value;
@@ -171,6 +192,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     <div className="w-24 text-right">Qty</div>
                                     <div className="w-32 text-right">Unit Cost</div>
                                     <div className="w-32 text-right">Total</div>
+                                    <div className="w-10"></div>
                                 </div>
 
                                 <div className="divide-y divide-slate-100">
@@ -206,12 +228,26 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                 <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
                                                     ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                                 </div>
+                                                <div className="w-10 pt-1.5 flex justify-end">
+                                                    <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
+                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                    </button>
+                                                </div>
                                             </div>
                                         );
                                     })}
                                     {items.length === 0 && (
                                         <div className="p-8 text-center text-slate-400 text-sm">No items attached to this Change Order.</div>
                                     )}
+                                </div>
+
+                                <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={addItem}>
+                                    <button className="text-sm font-semibold text-amber-600 group-hover:text-amber-700 flex items-center gap-2 transition">
+                                        <span className="bg-amber-50 text-amber-600 group-hover:bg-amber-100 rounded p-1">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                                        </span>
+                                        Add New Item
+                                    </button>
                                 </div>
                             </div>
 
