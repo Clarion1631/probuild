@@ -11,6 +11,10 @@ type VisibilityState = {
     showInvoices: boolean;
     showContracts: boolean;
     showMessages: boolean;
+    isPortalEnabled: boolean;
+    lastSharedAt?: Date | null;
+    lastShareEmailId?: string | null;
+    lastShareEmailStatus?: string | null;
 };
 
 const TOGGLE_CONFIG: { key: keyof VisibilityState; label: string; description: string }[] = [
@@ -53,7 +57,27 @@ export default function PortalVisibilityToggles({
 
     return (
         <div>
-            <div className="space-y-1">
+            <div className="flex items-center justify-between p-4 bg-slate-50 border border-slate-200 rounded-lg mb-6">
+                <div>
+                    <h3 className="font-semibold text-hui-textMain">Enable Client Dashboard</h3>
+                    <p className="text-sm text-hui-textMuted mt-0.5">Toggle whether the client can access the portal at all. If disabled, they will see an access suspended message.</p>
+                </div>
+                <button
+                    type="button"
+                    role="switch"
+                    aria-checked={state.isPortalEnabled}
+                    onClick={() => handleToggle('isPortalEnabled')}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-hui-primary focus:ring-offset-2 ${
+                        state.isPortalEnabled ? "bg-hui-primary" : "bg-slate-300"
+                    }`}
+                >
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-200 ease-in-out ${
+                        state.isPortalEnabled ? "translate-x-6" : "translate-x-1"
+                    }`} />
+                </button>
+            </div>
+
+            <div className={`space-y-1 transition-opacity duration-300 ${!state.isPortalEnabled ? 'opacity-50 pointer-events-none' : ''}`}>
                 {TOGGLE_CONFIG.map((toggle) => (
                     <label
                         key={toggle.key}

@@ -2595,6 +2595,10 @@ export async function getPortalVisibility(projectId: string) {
             showInvoices: true,
             showContracts: true,
             showMessages: true,
+            isPortalEnabled: true,
+            lastSharedAt: null,
+            lastShareEmailId: null,
+            lastShareEmailStatus: null,
         };
     }
     return record;
@@ -2608,6 +2612,7 @@ export async function savePortalVisibility(projectId: string, data: {
     showInvoices: boolean;
     showContracts: boolean;
     showMessages: boolean;
+    isPortalEnabled: boolean;
 }) {
     const record = await prisma.portalVisibility.upsert({
         where: { projectId },
@@ -2619,6 +2624,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showInvoices: data.showInvoices,
             showContracts: data.showContracts,
             showMessages: data.showMessages,
+            isPortalEnabled: data.isPortalEnabled,
         },
         create: {
             projectId,
@@ -2629,6 +2635,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showInvoices: data.showInvoices,
             showContracts: data.showContracts,
             showMessages: data.showMessages,
+            isPortalEnabled: data.isPortalEnabled,
         },
     });
     revalidatePath(`/projects/${projectId}/settings`);
@@ -2637,7 +2644,71 @@ export async function savePortalVisibility(projectId: string, data: {
 }
 
 // =============================================
-// Subcontractor Trades Config
+// Portal Dashboard Shared Actions
+// =============================================
+
+export async function emailPortalLinkToClient(projectId: string) {
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        include: { client: true }
+    });
+    
+    if (!project || !project.client.email) {
+        return { success: false, error: "Client email not found on project." };
+    }
+    
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || "http://localhost:3000";
+    const portalUrl = `${appUrl}/portal/projects/${projectId}`;
+    
+    // Send email using our enhanced library fn
+    const { sendNotification } = await import('@/lib/email');
+    const result = await sendNotification(
+        project.client.email,
+        `Your Dashboard for ${project.name} is Ready`,
+        `<p>Hi ${project.client.name},</p><p>We have updated the portal for your project: <strong>${project.name}</strong>.</p><p><a href="${portalUrl}" style="display:inline-block;padding:10px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:5px;">Access Your Client Dashboard</a></p><p>From here you can view estimates, invoices, updates, and more.</p><br/>Thanks,<br/>Golden Touch Remodeling`
+    );
+    
+    if (result.success && result.id) {
+        await prisma.portalVisibility.upsert({
+            where: { projectId },
+            update: {
+                lastSharedAt: new Date(),
+                lastShareEmailId: result.id,
+                lastShareEmailStatus: "delivered"
+            },
+            create: {
+                projectId,
+                lastSharedAt: new Date(),
+                lastShareEmailId: result.id,
+                lastShareEmailStatus: "delivered"
+            }
+        });
+        revalidatePath(`/projects/${projectId}/settings`);
+        return { success: true };
+    }
+    
+    return { success: false, error: "Failed to dispatch email." };
+}
+
+export async function checkPortalEmailStatus(projectId: string) {
+    const visibility = await prisma.portalVisibility.findUnique({ where: { projectId } });
+    if (!visibility?.lastShareEmailId) return null;
+    
+    const { checkEmailStatus } = await import('@/lib/email');
+    const status = await checkEmailStatus(visibility.lastShareEmailId);
+    
+    if (status && status !== visibility.lastShareEmailStatus) {
+        await prisma.portalVisibility.update({
+            where: { projectId },
+            data: { lastShareEmailStatus: status }
+        });
+        revalidatePath(`/projects/${projectId}/settings`);
+    }
+    
+    return status || visibility.lastShareEmailStatus;
+}
+
+// =============================================
 // =============================================
 
 export async function getCompanySubcontractorTrades() {

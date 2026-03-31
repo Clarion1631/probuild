@@ -62,6 +62,25 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
     const clientName = project.client.name || session?.user?.name || "Client";
     const clientEmail = project.client.email || email;
 
+    if (!visibility.isPortalEnabled) {
+        return (
+            <div className="max-w-3xl mx-auto py-16 px-4 text-center">
+                <div className="bg-white border text-center border-slate-200 rounded-xl p-8 shadow-sm">
+                    <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <svg className="w-8 h-8 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                    </div>
+                    <h2 className="text-2xl font-bold text-slate-800 mb-2">Access Suspended</h2>
+                    <p className="text-slate-500 mb-6 max-w-md mx-auto">
+                        Your contractor has currently paused access to this project's dashboard. Please contact them directly if you need to review any project materials or estimates.
+                    </p>
+                    <Link href="/portal" className="inline-flex justify-center items-center gap-2 hui-btn hui-btn-primary">
+                        Return to My Hub
+                    </Link>
+                </div>
+            </div>
+        );
+    }
+
     return (
         <div className="max-w-5xl mx-auto py-8">
             <div className="mb-6">

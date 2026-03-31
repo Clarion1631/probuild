@@ -9,10 +9,10 @@ export async function sendNotification(
     htmlContent: string,
     attachments?: { filename: string, content: Buffer }[],
     options?: { fromName?: string; replyTo?: string; cc?: string[] }
-) {
+): Promise<{ success: boolean; id?: string }> {
     if (!toEmail) {
         console.log("No notification email configured. Skipping email dispatch.");
-        return;
+        return { success: false };
     }
 
     if (resendApiKey === 're_dummy_fallback') {
@@ -25,7 +25,7 @@ export async function sendNotification(
             console.log(`Attached ${attachments.length} files.`);
         }
         console.log("-----------------------------------------");
-        return;
+        return { success: true, id: "mock_resend_id_123" };
     }
 
     // Strip HTML tags for plain text version (improves deliverability)
@@ -49,7 +49,20 @@ export async function sendNotification(
             cc: options?.cc
         });
         console.log("Email dispatched via Resend:", data);
+        return { success: true, id: data.data?.id };
     } catch (error) {
         console.error("Failed to send Resend email:", error);
+        return { success: false };
+    }
+}
+export async function checkEmailStatus(emailId: string): Promise<string | null> {
+    if (!emailId) return null;
+    if (resendApiKey === 're_dummy_fallback') return "delivered";
+    try {
+        const result = await resend.emails.get(emailId);
+        return result.data?.last_event || null;
+    } catch (error) {
+        console.error("Failed to check email status:", error);
+        return null;
     }
 }

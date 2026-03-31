@@ -23,6 +23,15 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
     const [formData, setFormData] = useState<any>({});
     const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
     
+    // Manage Tags Modal State
+    const [tagName, setTagName] = useState("");
+    const [editingTag, setEditingTag] = useState<any>(null);
+
+    // List selections and filters
+    const [selectedVendorIds, setSelectedVendorIds] = useState<string[]>([]);
+    const [filterStatus, setFilterStatus] = useState<"ACTIVE" | "INACTIVE" | "ALL">("ACTIVE");
+    const [rowActionMenuVendorId, setRowActionMenuVendorId] = useState<string | null>(null);
+    
     // File State (Local files to be uploaded on save, or existing files for edit)
     const [localFiles, setLocalFiles] = useState<File[]>([]);
     const [existingFiles, setExistingFiles] = useState<any[]>([]);
@@ -52,13 +61,14 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                 accountNumber: vendor.accountNumber || "",
                 ein: vendor.ein || "",
                 notes: vendor.notes || "",
+                status: vendor.status || "ACTIVE",
             });
             setSelectedTagIds(vendor.tags?.map((t:any) => t.id) || []);
             setExistingFiles(vendor.files || []);
             setLocalFiles([]);
         } else {
             setSelectedVendor(null);
-            setFormData({ chargesTax: false });
+            setFormData({ chargesTax: false, status: "ACTIVE" });
             setSelectedTagIds([]);
             setExistingFiles([]);
             setLocalFiles([]);
@@ -134,11 +144,15 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
     };
 
     // Table filtering
-    const filtered = vendors.filter(v => 
-        v.name?.toLowerCase().includes(searchTerm.toLowerCase()) || 
-        v.contactName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        v.email?.toLowerCase().includes(searchTerm.toLowerCase())
-    );
+    const filtered = vendors.filter(v => {
+        const matchesSearch = v.name?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+            v.contactName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+            v.email?.toLowerCase().includes(searchTerm.toLowerCase());
+        
+        const matchesStatus = filterStatus === "ALL" || (filterStatus === "ACTIVE" ? v.status === "ACTIVE" : v.status !== "ACTIVE");
+
+        return matchesSearch && matchesStatus;
+    });
 
     const toggleTagSelection = (id: string) => {
         setSelectedTagIds(prev => prev.includes(id) ? prev.filter(t => t !== id) : [...prev, id]);
@@ -146,9 +160,6 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
 
     // ----- Render Helpers -----
     const renderManageTags = () => {
-        const [tagName, setTagName] = useState("");
-        const [editingTag, setEditingTag] = useState<any>(null);
-
         const handleSaveTag = async () => {
             if (!tagName.trim()) return;
             try {
@@ -233,6 +244,18 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                                 <button className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 opacity-50 cursor-not-allowed">Import Vendor List</button>
                                 <button className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 opacity-50 cursor-not-allowed">Export Vendor List</button>
                                 <button onClick={() => { setIsActionsMenuOpen(false); setIsTagsModalOpen(true); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Manage Tags</button>
+                                {selectedVendorIds.length > 0 && (
+                                    <button onClick={async () => {
+                                        setIsActionsMenuOpen(false);
+                                        if (confirm(`Delete ${selectedVendorIds.length} vendors?`)) {
+                                            for (const id of selectedVendorIds) await deleteVendor(id);
+                                            setVendors(vendors.filter(v => !selectedVendorIds.includes(v.id)));
+                                            setSelectedVendorIds([]);
+                                            toast.success("Vendors deleted");
+                                            router.refresh();
+                                        }
+                                    }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Delete Selected</button>
+                                )}
                             </div>
                         )}
                     </div>
@@ -260,7 +283,15 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                     </div>
                     <div className="flex gap-2">
                         <button onClick={() => setIsTagsModalOpen(true)} className="hui-btn hui-btn-secondary text-xs h-9">Tags <span className="ml-1 opacity-50">▼</span></button>
-                        <button className="hui-btn hui-btn-secondary text-xs h-9">Type: Active <span className="ml-1 opacity-50">▼</span></button>
+                        <select 
+                            value={filterStatus}
+                            onChange={(e) => setFilterStatus(e.target.value as any)}
+                            className="hui-btn hui-btn-secondary text-xs h-9 pl-3 pr-8"
+                        >
+                            <option value="ACTIVE">Type: Active</option>
+                            <option value="INACTIVE">Type: Inactive</option>
+                            <option value="ALL">Type: All</option>
+                        </select>
                     </div>
                 </div>
 
@@ -268,7 +299,14 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                     <table className="w-full text-left text-sm whitespace-nowrap">
                         <thead className="border-b border-hui-border text-xs font-semibold text-slate-500 bg-slate-50/50">
                             <tr>
-                                <th className="pl-4 pr-2 py-3 w-8"><input type="checkbox" className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary pointer-events-none" /></th>
+                                <th className="pl-4 pr-2 py-3 w-8">
+                                    <input 
+                                        type="checkbox" 
+                                        className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary cursor-pointer" 
+                                        checked={filtered.length > 0 && selectedVendorIds.length === filtered.length}
+                                        onChange={(e) => setSelectedVendorIds(e.target.checked ? filtered.map(v => v.id) : [])}
+                                    />
+                                </th>
                                 <th className="px-5 py-3 font-semibold">Name <span className="opacity-50 text-[10px]">↕</span></th>
                                 <th className="px-5 py-3 font-semibold">Contact <span className="opacity-50 text-[10px]">↕</span></th>
                                 <th className="px-5 py-3 font-semibold">Tags</th>
@@ -287,8 +325,21 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                             ) : (
                                 filtered.map(v => (
                                     <tr key={v.id} className="hover:bg-slate-50/80 transition group cursor-pointer" onClick={() => openVendorModal(v)}>
-                                        <td className="pl-4 pr-2 py-4" onClick={e=>e.stopPropagation()}><input type="checkbox" className="rounded border-slate-300 pointer-events-none" /></td>
-                                        <td className="px-5 py-4 font-semibold text-hui-textMain">{v.name}</td>
+                                        <td className="pl-4 pr-2 py-4" onClick={e=>e.stopPropagation()}>
+                                            <input 
+                                                type="checkbox" 
+                                                className="rounded border-slate-300 text-hui-primary cursor-pointer" 
+                                                checked={selectedVendorIds.includes(v.id)}
+                                                onChange={(e) => {
+                                                    const checked = e.target.checked;
+                                                    setSelectedVendorIds(prev => checked ? [...prev, v.id] : prev.filter(id => id !== v.id));
+                                                }}
+                                            />
+                                        </td>
+                                        <td className="px-5 py-4 font-semibold text-hui-textMain">
+                                            {v.name}
+                                            {v.status !== 'ACTIVE' && <span className="ml-2 bg-slate-100 text-slate-500 text-[10px] uppercase px-1.5 py-0.5 rounded">Inactive</span>}
+                                        </td>
                                         <td className="px-5 py-4 text-slate-600 flex items-center gap-2">
                                             {(v.firstName || v.lastName) && (
                                                 <div className="w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-bold">
@@ -313,10 +364,30 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                                         <td className="px-5 py-4 text-slate-500">
                                             {new Date(v.createdAt).toLocaleDateString("en-US", {month:"short", day:"numeric", year:"numeric"})}
                                         </td>
-                                        <td className="px-5 py-4 text-right">
-                                            <button onClick={(e) => {e.stopPropagation();}} className="text-slate-300 hover:text-slate-600 p-1">
+                                        <td className="px-5 py-4 text-right relative">
+                                            <button 
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setRowActionMenuVendorId(rowActionMenuVendorId === v.id ? null : v.id);
+                                                }} 
+                                                className="text-slate-400 hover:text-slate-600 p-1 rounded hover:bg-slate-100"
+                                            >
                                                 <MoreHorizontal className="w-5 h-5" />
                                             </button>
+                                            {rowActionMenuVendorId === v.id && (
+                                                <div className="absolute right-5 top-10 mt-1 w-32 bg-white rounded-lg shadow-lg border border-slate-100 py-1 z-30" onClick={(e) => e.stopPropagation()}>
+                                                    <button onClick={() => { setRowActionMenuVendorId(null); openVendorModal(v); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Edit Record</button>
+                                                    <button onClick={async () => {
+                                                        setRowActionMenuVendorId(null);
+                                                        if (confirm("Delete this vendor permanently?")) {
+                                                            await deleteVendor(v.id);
+                                                            setVendors(vendors.filter(vx => vx.id !== v.id));
+                                                            toast.success("Vendor deleted");
+                                                            router.refresh();
+                                                        }
+                                                    }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Delete Vendor</button>
+                                                </div>
+                                            )}
                                         </td>
                                     </tr>
                                 ))
@@ -427,6 +498,10 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                                     <label className="flex items-center gap-2 cursor-pointer">
                                         <input type="checkbox" checked={formData.chargesTax} onChange={e => setFormData({...formData, chargesTax: e.target.checked})} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary w-4 h-4" />
                                         <span className="text-sm text-slate-700 font-medium">Charges Tax</span>
+                                    </label>
+                                    <label className="flex items-center gap-2 cursor-pointer mt-3">
+                                        <input type="checkbox" checked={formData.status === "ACTIVE"} onChange={e => setFormData({...formData, status: e.target.checked ? "ACTIVE" : "INACTIVE"})} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary w-4 h-4" />
+                                        <span className="text-sm text-slate-700 font-medium">Active Vendor</span>
                                     </label>
                                 </section>
 

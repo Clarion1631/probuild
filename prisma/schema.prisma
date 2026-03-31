@@ -750,6 +750,11 @@ model PortalVisibility {
   showContracts   Boolean @default(true)
   showMessages    Boolean @default(true)
   showChangeOrders Boolean @default(true)
+
+  isPortalEnabled Boolean @default(true)
+  lastSharedAt    DateTime?
+  lastShareEmailId String?
+  lastShareEmailStatus String? // "delivered", "opened", "clicked"
 }
 
 model MessageThread {
@@ -908,6 +913,7 @@ model Vendor {
   accountNumber    String?
   ein              String?
   notes            String?         @db.Text
+  status           String          @default("ACTIVE")
   
   tags             VendorTag[]
   files            VendorFile[]
