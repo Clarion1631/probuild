@@ -37,7 +37,7 @@ export default async function LeadFloorPlansPage({ params }: { params: Promise<{
             <LeadSidebar
                 leadId={lead.id}
                 leadName={lead.name}
-                clientName={lead.client.name}
+                clientName={lead.client?.name || "No Client"}
                 onConvert={handleConvert}
             />
 
@@ -103,14 +103,14 @@ export default async function LeadFloorPlansPage({ params }: { params: Promise<{
                 targetRevenue={lead.targetRevenue}
                 location={lead.location}
                 projectType={lead.projectType}
-                clientId={lead.client.id}
-                clientName={lead.client.name}
-                clientEmail={lead.client.email}
-                clientPhone={(lead.client as any).primaryPhone || null}
-                clientAddress={(lead.client as any).addressLine1 || null}
-                clientCity={(lead.client as any).city || null}
-                clientState={(lead.client as any).state || null}
-                clientZip={(lead.client as any).zipCode || null}
+                clientId={lead.client?.id || ""}
+                clientName={lead.client?.name || "No Client"}
+                clientEmail={lead.client?.email || null}
+                clientPhone={(lead.client as any)?.primaryPhone || null}
+                clientAddress={(lead.client as any)?.addressLine1 || null}
+                clientCity={(lead.client as any)?.city || null}
+                clientState={(lead.client as any)?.state || null}
+                clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={leadFull?.message || null}
             />
         </div>

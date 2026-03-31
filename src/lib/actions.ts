@@ -31,7 +31,8 @@ export async function getLead(id: string) {
             manager: true,
             tasks: {
                 orderBy: { createdAt: "desc" }
-            }
+            },
+            floorPlans: true
         },
     });
     return lead;
