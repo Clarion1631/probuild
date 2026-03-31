@@ -2525,8 +2525,8 @@ export async function updateCompanyProjectStatuses(statuses: string) {
 // ────────────────────────────────────────────────
 
 export async function getProjectMessages(projectId: string) {
-    let thread = await prisma.messageThread.findUnique({
-        where: { projectId },
+    let thread = await prisma.messageThread.findFirst({
+        where: { projectId, subcontractorId: null },
         include: {
             messages: { orderBy: { createdAt: "asc" } },
         },
@@ -2534,7 +2534,7 @@ export async function getProjectMessages(projectId: string) {
 
     if (!thread) {
         thread = await prisma.messageThread.create({
-            data: { projectId },
+            data: { projectId, subcontractorId: null },
             include: {
                 messages: { orderBy: { createdAt: "asc" } },
             },
@@ -2548,8 +2548,8 @@ export async function getUnreadMessageCount(projectId: string, forSenderType: "C
     // Count messages sent by the OTHER party that haven't been read
     const oppositeType = forSenderType === "TEAM" ? "CLIENT" : "TEAM";
 
-    const thread = await prisma.messageThread.findUnique({
-        where: { projectId },
+    const thread = await prisma.messageThread.findFirst({
+        where: { projectId, subcontractorId: null },
     });
 
     if (!thread) return 0;

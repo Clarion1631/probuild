@@ -10,7 +10,7 @@ import { usePermissions } from "@/components/PermissionsProvider";
 interface ProjectInnerSidebarProps {
     projectId: string;
     lead?: { id: string; name: string } | null;
-    availableLeads?: { id: string; name: string; stage: string; client: { name: string } }[];
+    availableLeads?: { id: string; name: string; stage: string; client: { name: string } | null }[];
     unreadMessageCount?: number;
 }
 
@@ -119,7 +119,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
     const filtered = availableLeads.filter(l =>
         l.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        l.client.name.toLowerCase().includes(searchTerm.toLowerCase())
+        (l.client?.name || "").toLowerCase().includes(searchTerm.toLowerCase())
     );
 
     return (
@@ -287,7 +287,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                                     >
                                         <div className="min-w-0">
                                             <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
-                                            <p className="text-xs text-slate-400">{l.client.name} · {l.stage}</p>
+                                            <p className="text-xs text-slate-400">{l.client?.name || "No client"} · {l.stage}</p>
                                         </div>
                                         <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
                                             Link →
