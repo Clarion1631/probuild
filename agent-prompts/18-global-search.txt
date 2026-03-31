@@ -25,17 +25,17 @@ STEP 5 — DEPLOY (MANDATORY):
 13. Commit with a descriptive message: git commit -m "feat: <short description of what was built/fixed>"
 14. Push to trigger Vercel deployment: git push origin main
 15. Confirm the push succeeded and report the commit hash.
-16. Wait 30 seconds then verify the Vercel deployment URL is live (check https://app.goldentouchremodeling.com or the preview URL).
+16. Wait 30 seconds then verify the Vercel deployment URL is live (check https://probuild.goldentouchremodeling.com or the preview URL).
 16b. SELF-TESTING: You MUST use your browser_subagent tool to navigate to the live Vercel URL. Click through the feature you just built to verify it works and there are no UI bugs. If you find bugs, fix them and push again.
 
 STEP 6 — TESTING HANDOFF (MANDATORY — do NOT skip this):
 After deploying, you MUST provide the user with a detailed testing guide. Include ALL of the following:
 
 17. SUMMARY — One paragraph explaining what was built/changed and where it lives.
-18. VERCEL URL — Provide the live deployment URL where the user can test (e.g., https://app.goldentouchremodeling.com).
+18. VERCEL URL — Provide the live deployment URL where the user can test (e.g., https://probuild.goldentouchremodeling.com).
 19. PAGES TO TEST — List every specific URL path the user should visit to test the feature. Use exact URLs like:
-    - https://app.goldentouchremodeling.com/projects/[pick-a-project-id]/change-orders
-    - https://app.goldentouchremodeling.com/portal/projects/[id]
+    - https://probuild.goldentouchremodeling.com/projects/[pick-a-project-id]/change-orders
+    - https://probuild.goldentouchremodeling.com/portal/projects/[id]
     (Replace IDs with actual record IDs if known, or tell the user how to find them.)
 20. STEP-BY-STEP TEST PLAN — Write a numbered checklist of exactly what to click, fill in, and verify. For example:
     a) Navigate to [URL]
@@ -67,6 +67,7 @@ Build:
    - Loading spinner while searching
 
 Respect permissions: only return entities the user has access to (use getCurrentUserWithPermissions).
+
 
 
 

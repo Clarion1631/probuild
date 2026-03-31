@@ -61,6 +61,7 @@ export default function LeadMessaging({
     const [showPreview, setShowPreview] = useState(false);
     const [previewMode, setPreviewMode] = useState<"desktop" | "mobile">("desktop");
     const [showCcDropdown, setShowCcDropdown] = useState(false);
+    const [customCcInput, setCustomCcInput] = useState("");
 
     const scrollRef = useRef<HTMLDivElement>(null);
     const pollRef = useRef<NodeJS.Timeout | null>(null);
@@ -109,7 +110,7 @@ export default function LeadMessaging({
             const res = await fetch('/api/users');
             if (res.ok) {
                 const data = await res.json();
-                setTeamMembers(data.users || []);
+                setTeamMembers(Array.isArray(data) ? data : []);
             }
         } catch {}
     }, []);
@@ -154,7 +155,7 @@ export default function LeadMessaging({
                     channel: sendMode,
                     attachments: attachedEstimates.map(e => ({ type: "estimate", id: e.id, name: e.code })),
                     scheduledFor: scheduledForDate ? new Date(scheduledForDate).toISOString() : undefined,
-                    ccEmails: ccEmails,
+                    ccEmails: Array.from(new Set([...ccEmails, ...customCcInput.split(",").map(x => x.trim()).filter(Boolean)])),
                 }),
             });
             if (res.ok) {
@@ -164,6 +165,7 @@ export default function LeadMessaging({
                 setAttachedEstimates([]);
                 setScheduledForDate("");
                 setCcEmails([]);
+                setCustomCcInput("");
                 editor?.commands.setContent("");
             } else {
                 const errData = await res.json().catch(() => ({}));
@@ -441,25 +443,40 @@ export default function LeadMessaging({
                     <div className="flex items-center gap-2 text-sm border-b border-slate-100 pb-2 mb-2 relative cc-dropdown-container">
                         <span className="text-slate-500 font-medium w-16">Cc:</span>
                         <div 
-                            className="flex-1 min-h-[24px] cursor-pointer flex items-center flex-wrap gap-1.5"
-                            onClick={() => setShowCcDropdown(!showCcDropdown)}
+                            className="flex-1 min-h-[24px] cursor-text flex items-center flex-wrap gap-1.5"
+                            onClick={() => setShowCcDropdown(true)}
                         >
-                            {ccEmails.length === 0 ? (
-                                <span className="text-slate-300">Select team members...</span>
-                            ) : (
-                                ccEmails.map(email => {
-                                    const tm = teamMembers.find(t => t.email === email);
-                                    return (
-                                        <span key={email} className="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full flex items-center gap-1 border border-slate-200 shadow-sm">
-                                            {tm ? tm.name : email}
-                                            <button 
-                                                onClick={(e) => { e.stopPropagation(); setCcEmails(prev => prev.filter(m => m !== email)); }}
-                                                className="hover:text-red-500 ml-0.5 translate-y-[0.5px]"
-                                            >×</button>
-                                        </span>
-                                    );
-                                })
-                            )}
+                            {ccEmails.map(email => {
+                                const tm = teamMembers.find(t => t.email === email);
+                                return (
+                                    <span key={email} className="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full flex items-center gap-1 border border-slate-200 shadow-sm">
+                                        {tm ? tm.name : email}
+                                        <button 
+                                            type="button"
+                                            onClick={(e) => { e.stopPropagation(); setCcEmails(prev => prev.filter(m => m !== email)); }}
+                                            className="hover:text-red-500 ml-0.5 translate-y-[0.5px]"
+                                        >×</button>
+                                    </span>
+                                );
+                            })}
+                            
+                            <input 
+                                type="text"
+                                className="bg-transparent border-none outline-none text-sm placeholder:text-slate-300 flex-1 min-w-[150px] m-0 p-0 shadow-none focus:ring-0"
+                                placeholder={ccEmails.length === 0 ? "Select or type emails..." : ""}
+                                value={customCcInput}
+                                onChange={(e) => setCustomCcInput(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if (e.key === "Enter" && customCcInput.trim()) {
+                                        e.preventDefault();
+                                        const emails = customCcInput.split(",").map(m => m.trim()).filter(Boolean);
+                                        setCcEmails(prev => Array.from(new Set([...prev, ...emails])));
+                                        setCustomCcInput("");
+                                    } else if (e.key === "Backspace" && customCcInput === "" && ccEmails.length > 0) {
+                                        setCcEmails(prev => prev.slice(0, -1));
+                                    }
+                                }}
+                            />
                         </div>
                         {showCcDropdown && (
                             <div className="absolute top-full left-16 mt-1 w-64 bg-white border border-slate-200 rounded-lg shadow-xl z-50 max-h-48 overflow-y-auto pt-1 pb-1">
