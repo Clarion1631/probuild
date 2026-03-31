@@ -11,6 +11,15 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
     const params = await props.params;
     const projectId = params.id;
 
+    const access = await prisma.subcontractorProjectAccess.findUnique({
+        where: { subcontractorId_projectId: { subcontractorId: sub.id, projectId } },
+        include: { project: true }
+    });
+
+    if (!access) return notFound();
+
+    const project = access.project;
+
     // Fetch tasks assigned to this subcontractor in this project
     const assignments = await prisma.subTaskAssignment.findMany({
         where: {
@@ -18,20 +27,11 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
             task: { projectId },
         },
         include: {
-            task: {
-                include: {
-                    project: {
-                        select: { id: true, name: true, status: true, location: true, createdAt: true, color: true },
-                    },
-                },
-            },
+            task: true,
         },
         orderBy: { task: { startDate: "asc" } },
     });
 
-    if (assignments.length === 0) return notFound();
-
-    const project = assignments[0].task.project;
     const tasks = assignments.map((a) => a.task);
 
     // Calculate progress stats
