@@ -65,6 +65,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
         internalNotes: "",
         licenseNumber: "",
         status: "",
+        coiExpiresAt: "",
     });
 
     useEffect(() => {
@@ -97,6 +98,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
             internalNotes: data.internalNotes || "",
             licenseNumber: data.licenseNumber || "",
             status: data.status || "ACTIVE",
+            coiExpiresAt: data.coiExpiresAt ? new Date(data.coiExpiresAt).toISOString().split('T')[0] : "",
         });
         setLoading(false);
     }
@@ -104,10 +106,11 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
     async function handleSave() {
         setSaving(true);
         try {
+            const submitData = { ...form, coiExpiresAt: form.coiExpiresAt ? new Date(form.coiExpiresAt).toISOString() : null };
             const res = await fetch(`/api/subcontractors/${id}`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(form)
+                body: JSON.stringify(submitData)
             });
             if (!res.ok) throw new Error("Failed to save");
             toast.success("Saved subcontractor details");
@@ -399,6 +402,16 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                                     </button>
                                 </div>
                             )}
+
+                            <div className="mt-5 pt-5 border-t border-slate-100">
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Expiration Date</label>
+                                <input 
+                                    type="date" 
+                                    value={form.coiExpiresAt} 
+                                    onChange={e => setForm(f => ({ ...f, coiExpiresAt: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
                         </div>
                     </div>
 
