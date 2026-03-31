@@ -7,9 +7,10 @@ import { toast } from "sonner";
 interface MeetingPopoverProps {
     leadId: string;
     clientName: string;
+    variant?: "default" | "grid";
 }
 
-export default function MeetingPopover({ leadId, clientName }: MeetingPopoverProps) {
+export default function MeetingPopover({ leadId, clientName, variant = "default" }: MeetingPopoverProps) {
     const [showPopover, setShowPopover] = useState(false);
     const [showScheduleModal, setShowScheduleModal] = useState(false);
     const popoverRef = useRef<HTMLDivElement>(null);
@@ -38,9 +39,13 @@ export default function MeetingPopover({ leadId, clientName }: MeetingPopoverPro
         <div className="relative" ref={popoverRef}>
             <button
                 onClick={() => setShowPopover(!showPopover)}
-                className="flex flex-col items-center gap-1.5 p-2.5 rounded-lg border border-slate-200 hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-600 hover:text-slate-800 group w-full"
+                className={`w-full flex flex-col items-center justify-center gap-1.5 transition-all text-slate-600 hover:text-slate-800 group ${
+                    variant === "grid" 
+                        ? "p-2 h-16 rounded border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
+                        : "p-2.5 rounded-lg border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
+                }`}
             >
-                <span className="text-slate-400 group-hover:text-slate-600 transition">
+                <span className="text-slate-400 group-hover:text-slate-600 transition shrink-0">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                         <rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>
                     </svg>

@@ -10,6 +10,12 @@ export async function getLeads() {
         include: {
             client: true,
             estimates: true,
+            manager: true,
+            tasks: {
+                where: { status: { not: "Done" } },
+                orderBy: { dueDate: "asc" },
+                take: 1
+            }
         },
     });
     return leads;
@@ -22,6 +28,10 @@ export async function getLead(id: string) {
             client: true,
             estimates: true,
             contracts: true,
+            manager: true,
+            tasks: {
+                orderBy: { createdAt: "desc" }
+            }
         },
     });
     return lead;
@@ -73,6 +83,64 @@ export async function createLead(data: { name: string; clientName: string; clien
 
     revalidatePath("/leads");
     return { id: lead.id };
+}
+
+export async function updateLeadMetadata(id: string, updates: { isUnread?: boolean; isArchived?: boolean; snoozedUntil?: Date | null; tags?: string; expectedProfit?: number; expectedStartDate?: Date | null; targetRevenue?: number }) {
+    await prisma.lead.update({
+        where: { id },
+        data: {
+            ...updates,
+            lastActivityAt: new Date()
+        }
+    });
+    revalidatePath(`/leads`);
+    revalidatePath(`/leads/${id}`);
+}
+
+export async function updateLeadAssignment(id: string, managerId: string | null) {
+    await prisma.lead.update({
+        where: { id },
+        data: { managerId }
+    });
+    revalidatePath(`/leads`);
+    revalidatePath(`/leads/${id}`);
+}
+
+export async function updateLeadInfo(id: string, data: any) {
+    // data contains all the EditLeadModal form data
+    const lead = await prisma.lead.findUnique({ where: { id }});
+    if (!lead) return;
+
+    await prisma.lead.update({
+        where: { id },
+        data: {
+            name: data.name,
+            source: data.source,
+            stage: data.stage,
+            location: data.location,
+            tags: data.tags,
+            targetRevenue: data.targetRevenue ? parseFloat(data.targetRevenue) : null,
+            expectedProfit: data.expectedProfit ? parseFloat(data.expectedProfit) : null,
+            projectType: data.projectType,
+            expectedStartDate: data.expectedStartDate ? new Date(data.expectedStartDate) : null,
+            message: data.message,
+            lastActivityAt: new Date()
+        }
+    });
+
+    // Also update client if passed in
+    if (data.clientName) {
+        await prisma.client.update({
+            where: { id: lead.clientId },
+            data: {
+                name: data.clientName,
+                addressLine1: data.location // Simple mapping for now
+            }
+        });
+    }
+
+    revalidatePath(`/leads`);
+    revalidatePath(`/leads/${id}`);
 }
 
 export async function getClients() {

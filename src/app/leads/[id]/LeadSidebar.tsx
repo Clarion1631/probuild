@@ -113,11 +113,11 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                         }}
                         className={`flex items-center gap-3 px-4 py-2 text-sm transition-colors cursor-pointer ${
                             activeNav === item.key
-                                ? "bg-green-50 text-green-800 font-medium border-r-2 border-green-600"
-                                : "text-hui-textMain hover:bg-slate-50"
+                                ? "text-green-700 font-bold border-l-4 border-green-600 bg-green-50/30"
+                                : "text-slate-600 hover:bg-slate-50 border-l-4 border-transparent"
                         }`}
                     >
-                        <span className={activeNav === item.key ? "text-green-700" : "text-slate-500"}>{item.icon}</span>
+                        <span className={activeNav === item.key ? "text-green-600" : "text-slate-400"}>{item.icon}</span>
                         {item.label}
                     </a>
                 ))}
@@ -126,9 +126,11 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
             {/* Quick Create */}
             <div className="px-4 py-3 border-t border-hui-border">
                 <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-3">Quick Create</p>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-3 gap-2">
                     {/* Meeting popover (special handling) */}
-                    <MeetingPopover leadId={leadId} clientName={clientName} />
+                    <div className="col-span-1">
+                        <MeetingPopover leadId={leadId} clientName={clientName} variant="grid" />
+                    </div>
                     {quickCreateItems.map(item => (
                         <button
                             key={item.label}
@@ -150,10 +152,10 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                                     toast.info(`${item.label} coming soon`);
                                 }
                             }}
-                            className="flex flex-col items-center gap-1.5 p-2.5 rounded-lg border border-slate-200 hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-600 hover:text-slate-800 group"
+                            className="flex flex-col items-center justify-center gap-1.5 p-2 h-16 rounded border border-slate-200 hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-600 hover:text-slate-800 group"
                         >
-                            <span className="text-slate-400 group-hover:text-slate-600 transition">{item.icon}</span>
-                            <span className="text-[10px] font-medium leading-tight text-center">{item.label}</span>
+                            <span className="text-slate-400 group-hover:text-slate-600 transition shrink-0">{item.icon}</span>
+                            <span className="text-[9px] font-medium leading-tight text-center truncate w-full px-1">{item.label}</span>
                         </button>
                     ))}
                 </div>
@@ -163,7 +165,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
             <div className="px-4 py-3 border-t border-hui-border">
                 <button
                     onClick={onConvert}
-                    className="w-full py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg transition shadow-sm hover:shadow"
+                    className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 border border-transparent text-white text-sm font-semibold rounded-lg transition shadow-sm hover:shadow"
                 >
                     Convert to Project
                 </button>
@@ -172,7 +174,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                 <div className="relative mt-3">
                     <button
                         onClick={() => setShowMoreActions(!showMoreActions)}
-                        className="w-full flex items-center justify-center gap-1 text-sm text-hui-textMain hover:text-green-700 transition font-medium py-1"
+                        className="w-full flex items-center justify-center gap-1 text-sm text-slate-700 hover:text-slate-900 transition font-medium py-1"
                     >
                         More Actions
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className={`transition-transform ${showMoreActions ? "rotate-180" : ""}`}>
@@ -187,7 +189,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                                     key={action.label}
                                     onClick={() => { action.action(); setShowMoreActions(false); }}
                                     className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-slate-50 transition ${
-                                        (action as any).danger ? "text-red-600 hover:bg-red-50" : "text-hui-textMain"
+                                        (action as any).danger ? "text-red-600 hover:bg-red-50" : "text-slate-700"
                                     }`}
                                 >
                                     <span>{action.icon}</span>
@@ -199,7 +201,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                 </div>
 
                 {/* Need more info */}
-                <button className="w-full mt-3 py-2 bg-amber-100 text-amber-800 text-xs font-bold rounded-lg hover:bg-amber-200 transition border border-amber-300">
+                <button className="w-full mt-3 py-2 bg-green-50 text-green-700 text-xs font-bold rounded-lg hover:bg-green-100 transition border border-green-200">
                     Need more info?
                 </button>
             </div>

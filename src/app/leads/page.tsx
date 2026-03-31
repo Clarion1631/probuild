@@ -74,35 +74,92 @@ export default function LeadsPage({ searchParams }: { searchParams: Promise<{ vi
                         </div>
                     ) : view === 'table' ? (
                         <div className="overflow-x-auto">
-                            <table className="min-w-full divide-y divide-slate-200">
-                                <thead className="bg-slate-50">
+                            <table className="min-w-max divide-y divide-slate-200">
+                                <thead className="bg-[#f9f8f6]">
                                     <tr>
-                                        <th scope="col" className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Lead Name</th>
-                                        <th scope="col" className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Stage</th>
-                                        <th scope="col" className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Client Name</th>
-                                        <th scope="col" className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Location</th>
-                                        <th scope="col" className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Lead Source</th>
+                                        <th scope="col" className="px-4 py-3 text-left w-12"><input type="checkbox" className="rounded border-slate-300 text-slate-800 focus:ring-slate-800 h-4 w-4" /></th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Lead Name</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Stage</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Client Name</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Lead Address</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Task</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Type & Source</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Tags</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Financials</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Activity</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">Managers</th>
+                                        <th scope="col" className="px-4 py-3 text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider"></th>
                                     </tr>
                                 </thead>
-                                <tbody className="bg-white divide-y divide-slate-200">
+                                <tbody className="bg-white divide-y divide-slate-100">
                                     {leads.map((l: any) => (
-                                        <tr key={l.id} className="hover:bg-slate-50 transition-colors cursor-pointer group" onClick={() => window.location.href = `/leads/${l.id}`}>
-                                            <td className="px-6 py-4 whitespace-nowrap">
-                                                <div className="text-sm font-medium text-slate-900 group-hover:text-blue-600 transition-colors">{l.name}</div>
+                                        <tr key={l.id} className={`transition-colors cursor-pointer group ${l.isUnread ? 'bg-slate-50/50 hover:bg-slate-50' : 'hover:bg-slate-50'}`} onClick={() => window.location.href = `/leads/${l.id}`}>
+                                            <td className="px-4 py-3 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                                                <input type="checkbox" className="rounded border-slate-300 text-slate-800 focus:ring-slate-800 h-4 w-4" />
                                             </td>
-                                            <td className="px-6 py-4 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
-                                                <LeadStageDropdown leadId={l.id} currentStage={l.stage} variant="pill" />
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap">
-                                                <div className="flex items-center">
-                                                    <div className="flex-shrink-0 h-8 w-8 mr-3">
-                                                        <Avatar name={l.client?.name || "Unknown"} color="blue" />
-                                                    </div>
-                                                    <div className="text-sm text-slate-900">{l.client?.name || "Unknown"}</div>
+                                            <td className="px-4 py-3 whitespace-nowrap">
+                                                <div className="flex items-center gap-2">
+                                                    {l.isUnread && <div className="w-2 h-2 rounded-full bg-blue-500" />}
+                                                    <div className={`text-sm font-bold text-slate-800 group-hover:text-blue-600 transition-colors ${!l.isUnread && 'font-medium'}`}>{l.name}</div>
                                                 </div>
                                             </td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{l.location}</td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{l.source}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                                                <LeadStageDropdown leadId={l.id} currentStage={l.stage} variant="pill" />
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap">
+                                                <div className="flex items-center gap-2">
+                                                    <div className="flex-shrink-0 h-6 w-6">
+                                                        <Avatar name={l.client?.name || "Unknown"} color="blue" />
+                                                    </div>
+                                                    <div className="text-sm font-medium text-slate-700">{l.client?.name || "Unknown"}</div>
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-slate-500 max-w-[150px] truncate">{l.location || "-"}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm" onClick={(e) => e.stopPropagation()}>
+                                                {l.tasks && l.tasks.length > 0 ? (
+                                                    <div className="flex items-center gap-1.5 px-2 py-1 bg-amber-50 rounded text-amber-700 font-medium">
+                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+                                                        {l.tasks[0].title}
+                                                    </div>
+                                                ) : (
+                                                    <button className="text-slate-400 hover:text-slate-700 font-medium py-1 px-2 hover:bg-slate-100 rounded transition">+ Add task</button>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap">
+                                                <div className="text-sm text-slate-700">{l.projectType || "-"}</div>
+                                                <div className="text-[10px] text-slate-400 mt-0.5">{l.source || "-"}</div>
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm" onClick={(e) => e.stopPropagation()}>
+                                                {l.tags ? (
+                                                    <div className="flex gap-1 overflow-x-auto max-w-[150px]">
+                                                        {l.tags.split(",").map((t: string) => <span key={t} className="bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded text-[10px] font-medium">{t.trim()}</span>)}
+                                                    </div>
+                                                ) : <button className="text-blue-500 hover:text-blue-700 font-medium text-xs border border-transparent hover:border-blue-200 hover:bg-blue-50 px-1.5 py-0.5 rounded transition">Add tags</button>}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-slate-500 text-right">
+                                                {l.targetRevenue ? `$${l.targetRevenue.toLocaleString()}` : "-"} <br/>
+                                                <span className="text-[10px] text-green-600 font-bold">{l.expectedProfit ? `+$${l.expectedProfit.toLocaleString()}` : ""}</span>
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap">
+                                                <div className="text-xs text-slate-500">Created: <span className="font-medium text-slate-700">{new Date(l.createdAt).toLocaleDateString()}</span></div>
+                                                <div className="text-[10px] text-slate-400 mt-0.5 max-w-[120px] truncate">Last Activity: {l.lastActivityAt ? new Date(l.lastActivityAt).toLocaleDateString() : "-"}</div>
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap">
+                                                {l.manager ? (
+                                                    <div className="flex-shrink-0 h-6 w-6" title={l.manager.name || l.manager.email}>
+                                                        <Avatar name={l.manager.name || l.manager.email} color="green" />
+                                                    </div>
+                                                ) : (
+                                                    <div className="w-6 h-6 rounded-full border border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:border-slate-500 hover:text-slate-600 transition" onClick={(e) => e.stopPropagation()} title="Assign Manager">
+                                                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
+                                                    </div>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-right" onClick={(e) => e.stopPropagation()}>
+                                                <button className="p-1.5 text-slate-400 hover:text-slate-800 hover:bg-slate-100 rounded transition relative">
+                                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+                                                </button>
+                                            </td>
                                         </tr>
                                     ))}
                                 </tbody>

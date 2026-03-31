@@ -25,6 +25,7 @@ model User {
   permissions      UserPermission?
   projectAccess    ProjectAccess[]
   leadTasks        LeadTask[]
+  managedLeads     Lead[]      @relation("LeadManager")
 }
 
 model Client {
@@ -63,6 +64,20 @@ model Lead {
   targetRevenue     Float?
   expectedStartDate DateTime?
   createdAt         DateTime  @default(now())
+  
+  // Houzz Pro Enhancements
+  tags              String?    // Comma separated tags
+  expectedProfit    Float?     
+  lastActivityAt    DateTime   @default(now())
+  
+  managerId         String?    
+  manager           User?      @relation("LeadManager", fields: [managerId], references: [id])
+  
+  isUnread          Boolean    @default(true)
+  snoozedUntil      DateTime?
+  isArchived        Boolean    @default(false)
+  
+  // Relations
   estimates         Estimate[]
   floorPlans        FloorPlan[]
   contracts         Contract[]

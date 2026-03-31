@@ -409,6 +409,19 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                             {isCreatingInvoice ? "Creating..." : "Create Invoice"}
                                         </button>
                                     )}
+                                    {context.type === "project" && selectedItemIds.length > 0 && (
+                                        <>
+                                            <div className="border-t border-hui-border my-1" />
+                                            <button
+                                                onClick={() => { handleCreateChangeOrder(); setShowMoreMenu(false); }}
+                                                disabled={isCreatingCO}
+                                                className="w-full text-left px-4 py-2.5 hover:bg-amber-50 flex items-center gap-2.5 text-amber-700 disabled:opacity-50"
+                                            >
+                                                <svg className="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
+                                                {isCreatingCO ? "Creating..." : `Create Change Order (${selectedItemIds.length})`}
+                                            </button>
+                                        </>
+                                    )}
                                     <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={() => { handleDelete(); setShowMoreMenu(false); }}
@@ -445,15 +458,6 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     >
                         {isSaving ? "Saving..." : "Save"}
                     </button>
-                    {context.type === "project" && selectedItemIds.length > 0 && (
-                        <button
-                            onClick={handleCreateChangeOrder}
-                            disabled={isCreatingCO}
-                            className="hui-btn hui-btn-primary bg-amber-600 hover:bg-amber-700 hover:border-amber-700 border-amber-600 text-white disabled:opacity-50"
-                        >
-                            {isCreatingCO ? "Creating..." : `Create Change Order (${selectedItemIds.length})`}
-                        </button>
-                    )}
                 </div>
             </div>
 

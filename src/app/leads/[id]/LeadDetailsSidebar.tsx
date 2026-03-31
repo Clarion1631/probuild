@@ -5,6 +5,7 @@ import { updateClient, updateLead } from "@/lib/actions";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
+import EditLeadModal from "./EditLeadModal";
 
 interface LeadDetailsSidebarProps {
     leadId: string;
@@ -59,6 +60,30 @@ export default function LeadDetailsSidebar({
     // Inline field editing
     const [editingField, setEditingField] = useState<string | null>(null);
     const [fieldValue, setFieldValue] = useState("");
+
+    // Modal state
+    const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+
+    // Mock full object for the modal based on existing props (usually you'd just pass the full object)
+    const mockLead = {
+        id: leadId,
+        name: leadName,
+        source: leadSource,
+        stage: leadStage,
+        expectedStartDate,
+        targetRevenue,
+        location,
+        projectType,
+        message: initialMessage,
+    };
+    const mockClient = {
+        name: clientName,
+        email: clientEmail,
+        primaryPhone: clientPhone,
+        addressLine1: clientAddress,
+        city: clientCity,
+        state: clientState,
+    };
 
     const handleSaveClient = async () => {
         setSavingClient(true);
@@ -234,8 +259,17 @@ export default function LeadDetailsSidebar({
                             </span>
                         </div>
                         <div className="flex items-center justify-between py-2">
-                            <span className="text-sm text-slate-600">Address</span>
-                            <span className="text-sm text-hui-textMain text-right max-w-[55%]">{formatAddress() || <span className="text-slate-400 italic">Not set</span>}</span>
+                            <span className="text-sm text-slate-600">Client Address</span>
+                            <span className="text-sm text-hui-textMain flex items-center justify-end gap-1.5 text-right w-2/3">
+                                {formatAddress() ? (
+                                    <>
+                                        <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition" title="Directions">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                        </a>
+                                        <span className="truncate">{formatAddress()}</span>
+                                    </>
+                                ) : <span className="text-slate-400 italic">Not set</span>}
+                            </span>
                         </div>
                     </div>
                 )}
@@ -243,15 +277,21 @@ export default function LeadDetailsSidebar({
 
             {/* Lead Details - Collapsible */}
             <div className="border-b border-hui-border">
-                <button
-                    onClick={() => setShowLeadDetails(!showLeadDetails)}
-                    className="w-full px-5 py-4 flex items-center justify-between text-sm font-bold text-hui-textMain hover:bg-slate-50 transition"
-                >
-                    Lead Details
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={`transition-transform ${showLeadDetails ? "" : "-rotate-90"}`}>
-                        <path d="M6 9l6 6 6-6"/>
-                    </svg>
-                </button>
+                <div className="w-full px-5 py-4 flex items-center justify-between hover:bg-slate-50 transition">
+                    <button
+                        onClick={() => setShowLeadDetails(!showLeadDetails)}
+                        className="flex items-center gap-2 text-sm font-bold text-hui-textMain"
+                    >
+                        Lead Details
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={`transition-transform ${showLeadDetails ? "" : "-rotate-90"}`}>
+                            <path d="M6 9l6 6 6-6"/>
+                        </svg>
+                    </button>
+                    <button onClick={() => setIsEditModalOpen(true)} className="text-xs text-slate-500 hover:text-slate-700 font-semibold transition flex items-center gap-1 group">
+                        Edit
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="group-hover:translate-y-px transition"><path d="M6 9l6 6 6-6"/></svg>
+                    </button>
+                </div>
 
                 {showLeadDetails && (
                     <div className="px-5 pb-4 space-y-0">
@@ -331,6 +371,13 @@ export default function LeadDetailsSidebar({
                     </div>
                 )}
             </div>
+            {/* Modal Injection */}
+            <EditLeadModal 
+                isOpen={isEditModalOpen} 
+                onClose={() => setIsEditModalOpen(false)} 
+                lead={mockLead} 
+                client={mockClient} 
+            />
         </div>
     );
 }
