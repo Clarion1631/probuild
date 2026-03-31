@@ -23,6 +23,16 @@ interface Subcontractor {
     coiFileUrl: string | null;
     coiExpiresAt: string | null;
     coiUploaded: boolean;
+    firstName: string | null;
+    lastName: string | null;
+    website: string | null;
+    addressLine1: string | null;
+    addressLine2: string | null;
+    city: string | null;
+    state: string | null;
+    zip: string | null;
+    country: string | null;
+    internalNotes: string | null;
     taskAssignments: TaskAssignment[];
 }
 
@@ -37,10 +47,19 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
     // Form state
     const [form, setForm] = useState({
         companyName: "",
-        contactName: "",
+        firstName: "",
+        lastName: "",
+        website: "",
         email: "",
         phone: "",
+        addressLine1: "",
+        addressLine2: "",
+        city: "",
+        state: "",
+        zip: "",
+        country: "United States",
         trade: "",
+        internalNotes: "",
         licenseNumber: "",
         status: "",
     });
@@ -60,10 +79,19 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
         setSub(data);
         setForm({
             companyName: data.companyName || "",
-            contactName: data.contactName || "",
+            firstName: data.firstName || "",
+            lastName: data.lastName || "",
+            website: data.website || "",
             email: data.email || "",
             phone: data.phone || "",
+            addressLine1: data.addressLine1 || "",
+            addressLine2: data.addressLine2 || "",
+            city: data.city || "",
+            state: data.state || "",
+            zip: data.zip || "",
+            country: data.country || "United States",
             trade: data.trade || "",
+            internalNotes: data.internalNotes || "",
             licenseNumber: data.licenseNumber || "",
             status: data.status || "ACTIVE",
         });
@@ -141,62 +169,137 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                 {/* Left Column: Details Form */}
                 <div className="lg:col-span-2 space-y-6">
                     <div className="bg-white rounded-xl shadow-sm border border-hui-border p-6">
-                        <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider mb-5">Company Details</h2>
-                        
+                        <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider mb-5">Contact Info</h2>
                         <div className="grid grid-cols-2 gap-5 mb-5">
                             <div>
-                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Company Name</label>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">First Name</label>
+                                <input type="text" value={form.firstName} onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Last Name</label>
+                                <input type="text" value={form.lastName} onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-5 mb-5">
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Company</label>
                                 <input type="text" value={form.companyName} onChange={e => setForm(f => ({ ...f, companyName: e.target.value }))}
-                                    className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                                 />
                             </div>
                             <div>
-                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Trade / Specialty</label>
-                                <TradeTagSelector 
-                                    value={form.trade || ""} 
-                                    onChange={(val) => setForm(f => ({ ...f, trade: val }))}
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Website</label>
+                                <input type="text" value={form.website} onChange={e => setForm(f => ({ ...f, website: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                                 />
                             </div>
                         </div>
 
-                        <div className="grid grid-cols-2 gap-5 mb-5">
-                            <div>
-                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Contact Name</label>
-                                <input type="text" value={form.contactName} onChange={e => setForm(f => ({ ...f, contactName: e.target.value }))}
-                                    className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
-                                />
-                            </div>
-                            <div>
-                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">License Number</label>
-                                <input type="text" value={form.licenseNumber} onChange={e => setForm(f => ({ ...f, licenseNumber: e.target.value }))}
-                                    className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
-                                />
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-5 mb-6">
+                        <div className="grid grid-cols-2 gap-5 mb-8">
                             <div>
                                 <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Email</label>
                                 <input type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))}
-                                    className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                                 />
                             </div>
                             <div>
-                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Phone</label>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Phone Number</label>
                                 <input type="tel" value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))}
-                                    className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
                                 />
                             </div>
                         </div>
 
-                        <div>
-                            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Status</label>
-                            <select value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value }))}
-                                className="w-full border border-hui-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
-                            >
-                                <option value="ACTIVE">Active</option>
-                                <option value="INACTIVE">Inactive</option>
-                            </select>
+                        <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider mb-5 border-t border-slate-100 pt-6">General Details</h2>
+                        
+                        <div className="grid grid-cols-2 gap-5 mb-5">
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Address Line 1</label>
+                                <input type="text" value={form.addressLine1} onChange={e => setForm(f => ({ ...f, addressLine1: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Address Line 2</label>
+                                <input type="text" value={form.addressLine2} onChange={e => setForm(f => ({ ...f, addressLine2: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-5 mb-5">
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">City</label>
+                                <input type="text" value={form.city} onChange={e => setForm(f => ({ ...f, city: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">State</label>
+                                <input type="text" value={form.state} onChange={e => setForm(f => ({ ...f, state: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-5 mb-5">
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Zip Code</label>
+                                <input type="text" value={form.zip} onChange={e => setForm(f => ({ ...f, zip: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Country</label>
+                                <select value={form.country} onChange={e => setForm(f => ({ ...f, country: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                >
+                                    <option value="United States">United States</option>
+                                    <option value="Canada">Canada</option>
+                                    <option value="Other">Other</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div className="mb-5">
+                            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Trade / Specialty</label>
+                            <TradeTagSelector 
+                                value={form.trade || ""} 
+                                onChange={(val) => setForm(f => ({ ...f, trade: val }))}
+                            />
+                        </div>
+
+                        <div className="mb-6">
+                            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Internal Notes</label>
+                            <textarea 
+                                value={form.internalNotes} 
+                                onChange={e => setForm(f => ({ ...f, internalNotes: e.target.value }))}
+                                rows={3}
+                                className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20 resize-y"
+                            ></textarea>
+                        </div>
+                        
+                        <div className="grid grid-cols-2 gap-5 pt-4 border-t border-slate-100">
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">License Number</label>
+                                <input type="text" value={form.licenseNumber} onChange={e => setForm(f => ({ ...f, licenseNumber: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Status</label>
+                                <select value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value }))}
+                                    className="w-full border border-hui-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-hui-primary/20"
+                                >
+                                    <option value="ACTIVE">Active</option>
+                                    <option value="INACTIVE">Inactive</option>
+                                </select>
+                            </div>
                         </div>
                     </div>
 
