@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { getSubPortalSession } from "@/lib/sub-portal-auth";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
+import SubPortalCoiCard from "./SubPortalCoiCard";
 
 export default async function SubPortalDashboard() {
     const sub = await getSubPortalSession();
@@ -103,6 +104,13 @@ export default async function SubPortalDashboard() {
                     </div>
                 </div>
             </div>
+
+            {/* Compliance COI Card */}
+            <SubPortalCoiCard 
+                subId={sub.id} 
+                coiUploaded={sub.coiUploaded} 
+                coiExpiresAt={sub.coiExpiresAt} 
+            />
 
             {/* Projects Grid */}
             <h2 className="text-lg font-bold text-hui-textMain mb-4">Your Projects</h2>
