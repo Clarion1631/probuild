@@ -18,12 +18,15 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
 
     const params = await props.params;
     const projectId = params.id;
+    
+    const userRole = (session?.user as any)?.role;
+    const isAdminOrManager = userRole === 'ADMIN' || userRole === 'MANAGER';
 
-    // Fetch the project BUT ensure it belongs to the logged-in client's email
+    // Fetch the project BUT ensure it belongs to the logged-in client's email (unless admin)
     const project = await prisma.project.findFirst({
         where: {
             id: projectId,
-            client: { email }
+            ...(isAdminOrManager ? {} : { client: { email } })
         },
         include: {
             client: true,
