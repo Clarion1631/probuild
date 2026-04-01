@@ -244,18 +244,6 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                                 <button className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 opacity-50 cursor-not-allowed">Import Vendor List</button>
                                 <button className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 opacity-50 cursor-not-allowed">Export Vendor List</button>
                                 <button onClick={() => { setIsActionsMenuOpen(false); setIsTagsModalOpen(true); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Manage Tags</button>
-                                {selectedVendorIds.length > 0 && (
-                                    <button onClick={async () => {
-                                        setIsActionsMenuOpen(false);
-                                        if (confirm(`Delete ${selectedVendorIds.length} vendors?`)) {
-                                            for (const id of selectedVendorIds) await deleteVendor(id);
-                                            setVendors(vendors.filter(v => !selectedVendorIds.includes(v.id)));
-                                            setSelectedVendorIds([]);
-                                            toast.success("Vendors deleted");
-                                            router.refresh();
-                                        }
-                                    }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Delete Selected</button>
-                                )}
                             </div>
                         )}
                     </div>
@@ -267,6 +255,35 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                     </button>
                 </div>
             </div>
+
+            {/* Bulk Actions Banner */}
+            {selectedVendorIds.length > 0 && (
+                <div className="bg-slate-900 border border-slate-800 text-white px-5 py-3 rounded-xl mb-4 flex items-center justify-between shadow-xl animate-in fade-in slide-in-from-bottom-2">
+                    <div className="flex items-center gap-3">
+                        <div className="bg-slate-800 rounded p-1.5 border border-slate-700"><Check className="w-4 h-4 text-emerald-400" /></div>
+                        <span className="font-medium">{selectedVendorIds.length} Vendor{selectedVendorIds.length > 1 ? 's' : ''} Selected</span>
+                    </div>
+                    <div className="flex gap-2">
+                        <button onClick={() => setSelectedVendorIds([])} className="text-slate-400 hover:text-white px-3 py-1.5 text-sm transition">Cancel</button>
+                        <button 
+                            onClick={async () => {
+                                if (confirm(`Delete ${selectedVendorIds.length} vendors?`)) {
+                                    setIsLoading(true);
+                                    for (const id of selectedVendorIds) await deleteVendor(id);
+                                    setVendors(vendors.filter(v => !selectedVendorIds.includes(v.id)));
+                                    setSelectedVendorIds([]);
+                                    setIsLoading(false);
+                                    toast.success("Vendors deleted");
+                                    router.refresh();
+                                }
+                            }} 
+                            className="bg-red-500 hover:bg-red-600 border border-red-500 hover:border-red-600 text-white px-4 py-1.5 rounded-lg text-sm font-bold transition flex items-center gap-2"
+                        >
+                            <Trash2 className="w-4 h-4"/> Delete Selected
+                        </button>
+                    </div>
+                </div>
+            )}
 
             {/* List View */}
             <div className="bg-white rounded-xl shadow-sm border border-hui-border overflow-hidden">
@@ -295,8 +312,8 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                     </div>
                 </div>
 
-                <div className="overflow-x-auto">
-                    <table className="w-full text-left text-sm whitespace-nowrap">
+                <div className="overflow-x-auto min-h-[350px]">
+                    <table className="w-full text-left text-sm whitespace-nowrap min-w-max">
                         <thead className="border-b border-hui-border text-xs font-semibold text-slate-500 bg-slate-50/50">
                             <tr>
                                 <th className="pl-4 pr-2 py-3 w-8">
@@ -375,8 +392,8 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                                                 <MoreHorizontal className="w-5 h-5" />
                                             </button>
                                             {rowActionMenuVendorId === v.id && (
-                                                <div className="absolute right-5 top-10 mt-1 w-32 bg-white rounded-lg shadow-lg border border-slate-100 py-1 z-30" onClick={(e) => e.stopPropagation()}>
-                                                    <button onClick={() => { setRowActionMenuVendorId(null); openVendorModal(v); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Edit Record</button>
+                                                <div className="absolute right-5 top-10 mt-1 w-36 bg-white rounded-lg shadow-[0_4px_20px_-4px_rgba(0,0,0,0.15)] border border-slate-200 py-1 z-30" onClick={(e) => e.stopPropagation()}>
+                                                    <button onClick={() => { setRowActionMenuVendorId(null); openVendorModal(v); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"><Edit2 className="w-3.5 h-3.5"/> Edit Record</button>
                                                     <button onClick={async () => {
                                                         setRowActionMenuVendorId(null);
                                                         if (confirm("Delete this vendor permanently?")) {
