@@ -2595,6 +2595,8 @@ export async function getPortalVisibility(projectId: string) {
             showInvoices: true,
             showContracts: true,
             showMessages: true,
+            showSelections: true,
+            showMoodBoards: true,
             isPortalEnabled: true,
             lastSharedAt: null,
             lastShareEmailId: null,
@@ -2612,6 +2614,8 @@ export async function savePortalVisibility(projectId: string, data: {
     showInvoices: boolean;
     showContracts: boolean;
     showMessages: boolean;
+    showSelections?: boolean;
+    showMoodBoards?: boolean;
     isPortalEnabled: boolean;
 }) {
     const record = await prisma.portalVisibility.upsert({
@@ -2624,6 +2628,8 @@ export async function savePortalVisibility(projectId: string, data: {
             showInvoices: data.showInvoices,
             showContracts: data.showContracts,
             showMessages: data.showMessages,
+            showSelections: data.showSelections ?? true,
+            showMoodBoards: data.showMoodBoards ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
         create: {
@@ -2635,6 +2641,8 @@ export async function savePortalVisibility(projectId: string, data: {
             showInvoices: data.showInvoices,
             showContracts: data.showContracts,
             showMessages: data.showMessages,
+            showSelections: data.showSelections ?? true,
+            showMoodBoards: data.showMoodBoards ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
     });
