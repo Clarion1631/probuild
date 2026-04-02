@@ -15,15 +15,16 @@ export default async function ManagerTimeEntriesPage() {
         return <div className="p-8 text-red-500">Access Denied. Managers Only.</div>;
     }
 
-    const entries = await (prisma as any).timeEntry?.findMany({
+    const entries = await prisma.timeEntry.findMany({
         include: {
             user: true,
             project: true,
-            budgetBucket: true
+            costCode: true,
+            costType: true
         },
         orderBy: { startTime: 'desc' },
-        take: 100 // Limit for display
-    }) || [];
+        take: 100
+    });
 
     const totalDuration = entries.reduce((acc: number, e: any) => acc + (e.durationHours || 0), 0);
     const totalCost = entries.reduce((acc: number, e: any) => acc + (e.laborCost || 0) + (e.burdenCost || 0), 0);
@@ -79,7 +80,7 @@ export default async function ManagerTimeEntriesPage() {
                                 </td>
                                 <td className="px-6 py-4 text-hui-textMuted">
                                     <div className="font-medium text-hui-textMain">{e.project.name}</div>
-                                    <div className="text-xs text-hui-textMuted">{e.budgetBucket?.name || "No Phase"}</div>
+                                    <div className="text-xs text-hui-textMuted">{e.costCode?.name || "No Code"}</div>
                                 </td>
                                 <td className="px-6 py-4 text-hui-textMuted">
                                     <div className="whitespace-nowrap">{new Date(e.startTime).toLocaleString()}</div>
