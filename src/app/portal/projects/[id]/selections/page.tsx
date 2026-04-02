@@ -7,22 +7,10 @@ import Link from "next/link";
 import PortalSelectionsClient from "./PortalSelectionsClient";
 
 export default async function PortalSelectionsPage(props: { params: Promise<{ id: string }> }) {
-    const session = await getServerSession(authOptions);
-    const email = session?.user?.email?.toLowerCase();
-
-    if (!email) {
-        return <div className="p-8 text-center">Please log in to access your portal.</div>;
-    }
-
     const { id } = await props.params;
-    const userRole = (session?.user as any)?.role;
-    const isAdminOrManager = userRole === "ADMIN" || userRole === "MANAGER";
 
     const project = await prisma.project.findFirst({
-        where: {
-            id,
-            ...(isAdminOrManager ? {} : { client: { email } }),
-        },
+        where: { id },
         include: { client: true },
     });
 

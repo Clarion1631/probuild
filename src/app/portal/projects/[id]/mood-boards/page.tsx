@@ -6,13 +6,6 @@ import { getPortalVisibility, getMoodBoards } from "@/lib/actions";
 import Link from "next/link";
 
 export default async function PortalMoodBoardsPage(props: { params: Promise<{ id: string }> }) {
-    const session = await getServerSession(authOptions);
-    const email = session?.user?.email?.toLowerCase();
-
-    if (!email) {
-        return <div className="p-8 text-center">Please log in to access your portal.</div>;
-    }
-
     const { id } = await props.params;
 
     const visibility = await getPortalVisibility(id);

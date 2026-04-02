@@ -6,13 +6,6 @@ import Link from "next/link";
 import PortalMoodBoardViewer from "./PortalMoodBoardViewer";
 
 export default async function PortalMoodBoardCanvasPage(props: { params: Promise<{ id: string; boardId: string }> }) {
-    const session = await getServerSession(authOptions);
-    const email = session?.user?.email?.toLowerCase();
-
-    if (!email) {
-        return <div className="p-8 text-center">Please log in to access your portal.</div>;
-    }
-
     const { id, boardId } = await props.params;
 
     const visibility = await getPortalVisibility(id);

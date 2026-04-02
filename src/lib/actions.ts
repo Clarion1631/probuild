@@ -2587,6 +2587,7 @@ export async function getPortalVisibility(projectId: string) {
     // Return defaults if no record exists
     if (!record) {
         return {
+            id: 'default',
             projectId,
             showSchedule: true,
             showFiles: true,
@@ -2595,6 +2596,7 @@ export async function getPortalVisibility(projectId: string) {
             showInvoices: true,
             showContracts: true,
             showMessages: true,
+            showChangeOrders: true,
             showSelections: true,
             showMoodBoards: true,
             isPortalEnabled: true,

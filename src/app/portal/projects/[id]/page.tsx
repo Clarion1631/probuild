@@ -9,25 +9,13 @@ import { getPortalVisibility } from "@/lib/actions";
 import PortalChatSection from "./PortalChatSection";
 
 export default async function PortalProjectDetail(props: { params: Promise<{ id: string }> }) {
-    const session = await getServerSession(authOptions);
-    const email = session?.user?.email?.toLowerCase();
-
-    if (!email) {
-        return <div className="p-8 text-center">Please log in to access your portal.</div>;
-    }
-
     const params = await props.params;
     const projectId = params.id;
     
-    const userRole = (session?.user as any)?.role;
-    const isAdminOrManager = userRole === 'ADMIN' || userRole === 'MANAGER';
-
-    // Fetch the project BUT ensure it belongs to the logged-in client's email (unless admin)
+    // Auth-less access: URL provides the capability, no session required
+    // We just fetch the project and its related data
     const project = await prisma.project.findFirst({
-        where: {
-            id: projectId,
-            ...(isAdminOrManager ? {} : { client: { email } })
-        },
+        where: { id: projectId },
         include: {
             client: true,
             estimates: {
@@ -64,13 +52,14 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
         }
     });
 
+
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const visibility = await getPortalVisibility(projectId);
 
     if (!project) return notFound();
 
-    const clientName = project.client.name || session?.user?.name || "Client";
-    const clientEmail = project.client.email || email;
+    const clientName = project.client?.name || "Client";
+    const clientEmail = project.client?.email || "";
 
     if (!visibility.isPortalEnabled) {
         return (
@@ -148,7 +137,6 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                 )}
 
                 {/* Change Orders Section */}
-                {visibility.showChangeOrders && (
                 <div>
                     <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
                         <svg className="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>

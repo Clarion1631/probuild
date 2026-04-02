@@ -51,6 +51,7 @@ model Client {
   projects Project[]
   leads    Lead[]
   invoices Invoice[]
+  retainers Retainer[]
 }
 
 model Lead {
@@ -170,6 +171,7 @@ model Project {
   selectionBoards     SelectionBoard[]
   dailyLogs           DailyLog[]
   moodBoards          MoodBoard[]
+  retainers           Retainer[]
 }
 
 model FloorPlan {
@@ -955,9 +957,27 @@ model PurchaseOrder {
   items    PurchaseOrderItem[]
   files    PurchaseOrderFile[]
   expenses Expense[]
+  messages PurchaseOrderMessage[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model PurchaseOrderMessage {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  
+  gmailMessageId  String?       @unique
+  body            String        @db.Text
+  senderEmail     String
+  senderName      String?
+  senderType      String        @default("VENDOR") // TEAM, VENDOR, AI
+  
+  isAttachment    Boolean       @default(false)
+  attachmentUrl   String?
+  
+  createdAt       DateTime      @default(now())
 }
 
 model PurchaseOrderFile {
@@ -1076,3 +1096,23 @@ model DailyLogPhoto {
   caption    String?
   createdAt  DateTime @default(now())
 }
+
+model Retainer {
+  id          String   @id @default(cuid())
+  code        String
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  clientId    String
+  client      Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  status      String   @default("Draft") // Draft, Sent, Partially Paid, Paid
+  totalAmount Float    @default(0)
+  balanceDue  Float    @default(0)
+  amountPaid  Float    @default(0)
+  notes       String?
+  issueDate   DateTime?
+  dueDate     DateTime?
+  sentAt      DateTime?
+  viewedAt    DateTime?
+  createdAt   DateTime @default(now())
+}
+
