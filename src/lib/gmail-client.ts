@@ -9,8 +9,8 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 
 // Support both local dev and production on Vercel
 const REDIRECT_URI = process.env.NODE_ENV === 'production'
-    ? `https://probuild.goldentouchremodeling.com/api/auth/callback/google` 
-    : 'http://localhost:3000/api/auth/callback/google';
+    ? `https://probuild.goldentouchremodeling.com/api/gmail/callback` 
+    : 'http://localhost:3000/api/gmail/callback';
 
 export const oauth2Client = new google.auth.OAuth2(
     GOOGLE_CLIENT_ID,
