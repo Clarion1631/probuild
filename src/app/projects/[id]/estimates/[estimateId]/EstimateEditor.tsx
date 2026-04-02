@@ -950,6 +950,13 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     </div>
                 </div>
             )}
+
+            {showVendorSelectModal && (
+                <SelectVendorModal 
+                    onSelect={handleCreatePurchaseOrder}
+                    onClose={() => setShowVendorSelectModal(false)}
+                />
+            )}
         </div>
     );
 }
