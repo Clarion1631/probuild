@@ -65,10 +65,10 @@ export default function IncomingPaymentsCard({ projectId, incoming }: { projectI
                         Add Income <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent isOpen={dropdownOpen} align="end" className="w-48">
-                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/estimates/new`); }}>New Estimate</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/estimates`); }}>New Estimate</DropdownMenuItem>
                         <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/invoices/new`); }}>New Invoice</DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/retainers/new`); }}>New Retainer</DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/change-orders/new`); }}>New Change Order</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/retainers`); }}>New Retainer</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/change-orders`); }}>New Change Order</DropdownMenuItem>
                     </DropdownMenuContent>
                 </div>
             </div>
