@@ -20,7 +20,8 @@ export default async function ManagerTimeEntriesPage() {
             user: true,
             project: true,
             costCode: true,
-            costType: true
+            costType: true,
+            estimateItem: true,
         },
         orderBy: { startTime: 'desc' },
         take: 100
@@ -80,7 +81,9 @@ export default async function ManagerTimeEntriesPage() {
                                 </td>
                                 <td className="px-6 py-4 text-hui-textMuted">
                                     <div className="font-medium text-hui-textMain">{e.project.name}</div>
-                                    <div className="text-xs text-hui-textMuted">{e.costCode?.name || "No Code"}</div>
+                                    <div className="text-xs text-hui-textMuted">
+                                        {e.estimateItem?.name || e.costCode?.name || "No Phase"}
+                                    </div>
                                 </td>
                                 <td className="px-6 py-4 text-hui-textMuted">
                                     <div className="whitespace-nowrap">{new Date(e.startTime).toLocaleString()}</div>

@@ -260,6 +260,7 @@ model EstimateItem {
   costCode      CostCode?      @relation(fields: [costCodeId], references: [id])
   costTypeId    String?
   costType      CostType?      @relation(fields: [costTypeId], references: [id])
+  timeEntries   TimeEntry[]
   createdAt     DateTime       @default(now())
 }
 
@@ -375,6 +376,9 @@ model TimeEntry {
   costCode   CostCode? @relation(fields: [costCodeId], references: [id])
   costTypeId String?
   costType   CostType? @relation(fields: [costTypeId], references: [id])
+
+  estimateItemId String?
+  estimateItem   EstimateItem? @relation(fields: [estimateItemId], references: [id])
 
   startTime     DateTime
   endTime       DateTime?
