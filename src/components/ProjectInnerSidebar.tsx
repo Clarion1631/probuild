@@ -35,55 +35,41 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
     const navSections: NavSection[] = [
         {
-            id: "overview",
-            title: "Overview",
-            items: [
-                { label: "Dashboard", href: `/projects/${projectId}` },
-            ],
-        },
-        {
             id: "planning",
             title: "Planning",
             items: [
                 { label: "Contracts", href: `/projects/${projectId}/contracts`, permission: "contracts" },
                 { label: "Estimates", href: `/projects/${projectId}/estimates`, permission: "estimates" },
                 { label: "Takeoffs", href: `/projects/${projectId}/takeoffs`, permission: "takeoffs" },
-                { label: "Selections", href: `/projects/${projectId}/selections` },
-                { label: "Mood Boards", href: `/projects/${projectId}/mood-boards` },
                 { label: "3D Floor Plans", href: `/projects/${projectId}/floor-plans`, permission: "floorPlans" },
+                { label: "Mood Boards", href: `/projects/${projectId}/mood-boards` },
+                { label: "Selection Boards", href: `/projects/${projectId}/selections` },
+                { label: "Selections Tracker", href: `/projects/${projectId}/selections-tracker` },
+                { label: "Bids", href: `/projects/${projectId}/bids` },
             ],
         },
         {
             id: "management",
             title: "Management",
             items: [
-                { label: "Schedule", href: `/projects/${projectId}/schedule`, permission: "schedules" },
                 { label: "Files & Photos", href: `/projects/${projectId}/files`, permission: "files" },
-                { label: "Messages", href: `/projects/${projectId}/messages` },
-                { label: "Sub Messages", href: `/projects/${projectId}/messages/subs` },
+                { label: "Schedule", href: `/projects/${projectId}/schedule`, permission: "schedules" },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
+                { label: "Client Dashboard", href: `/projects/${projectId}/client-dashboard` },
                 { label: "Daily Logs", href: `/projects/${projectId}/dailylogs`, permission: "dailyLogs" },
-                { label: "Time Clock", href: `/projects/${projectId}/timeclock`, permission: "timeClock" },
+                { label: "Time & Expenses", href: `/projects/${projectId}/timeclock`, permission: "timeClock" },
             ],
         },
         {
             id: "finance",
             title: "Finance",
             items: [
-                { label: "Purchase Orders", href: `/projects/${projectId}/purchase-orders`, permission: "financialReports" },
                 { label: "Invoices", href: `/projects/${projectId}/invoices`, permission: "invoices" },
+                { label: "Purchase Orders", href: `/projects/${projectId}/purchase-orders`, permission: "financialReports" },
                 { label: "Change Orders", href: `/projects/${projectId}/change-orders`, permission: "changeOrders" },
                 { label: "Retainers & Credits", href: `/projects/${projectId}/retainers` },
                 { label: "Budget", href: `/projects/${projectId}/budget` },
                 { label: "Financial Overview", href: `/projects/${projectId}/financial-overview` },
-                { label: "Job Costing", href: `/projects/${projectId}/costing`, permission: "financialReports" },
-            ],
-        },
-        {
-            id: "settings",
-            title: "Settings",
-            items: [
-                { label: "Project Settings", href: `/projects/${projectId}/settings` },
             ],
         },
     ];

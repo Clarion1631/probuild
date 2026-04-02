@@ -2,6 +2,8 @@ import { getMoodBoards, createMoodBoard, deleteMoodBoard } from "@/lib/actions";
 import Link from "next/link";
 import { revalidatePath } from "next/cache";
 
+import GenerateAIMoodBoardModal from "./GenerateAIMoodBoardModal";
+
 export default async function MoodBoardsPage(props: { params: Promise<{ id: string }> }) {
     const { id } = await props.params;
     const boards = await getMoodBoards(id);
@@ -25,7 +27,10 @@ export default async function MoodBoardsPage(props: { params: Promise<{ id: stri
         <div className="max-w-5xl mx-auto">
             <div className="flex items-center justify-between mb-6">
                 <div>
-                    <h1 className="text-2xl font-bold text-hui-textMain">Mood Boards</h1>
+                    <h1 className="text-2xl font-bold text-hui-textMain flex items-center gap-3">
+                        Mood Boards 
+                        <GenerateAIMoodBoardModal projectId={id} />
+                    </h1>
                     <p className="text-sm text-hui-textMuted mt-1">
                         Visual presentation canvases for design concepts.
                     </p>

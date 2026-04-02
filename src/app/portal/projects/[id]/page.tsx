@@ -168,7 +168,6 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                         </div>
                     )}
                 </div>
-                )}
 
                 {/* Invoices Section */}
                 {visibility.showInvoices && (
