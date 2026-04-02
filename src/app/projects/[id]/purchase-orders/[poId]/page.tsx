@@ -31,6 +31,10 @@ export default async function PurchaseOrderDetailPage({
             where: { id: poId },
             include: {
                 vendor: true,
+                files: true,
+                messages: {
+                    orderBy: { createdAt: "asc" }
+                },
                 items: {
                     orderBy: { order: "asc" },
                     include: { costCode: true }

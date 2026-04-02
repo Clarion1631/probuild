@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import StatusBadge from "@/components/StatusBadge";
 import Link from "next/link";
 import { Trash2, Plus, Upload, FileText, CheckCircle2 } from "lucide-react";
+import POMessageThread from "./POMessageThread";
 
 interface Context {
     projectId: string;
@@ -527,6 +528,10 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                         </div>
 
                     </div>
+                    {/* Messaging / Gmail Sync Thread */}
+                    {isEditing && (
+                        <POMessageThread poId={initialData.id} messages={initialData.messages || []} />
+                    )}
                 </div>
             </div>
         </div>

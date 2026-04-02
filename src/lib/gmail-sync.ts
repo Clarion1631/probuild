@@ -83,7 +83,7 @@ export async function syncPurchaseOrderEmails(purchaseOrderCode: string, purchas
                                 model: "gemini-3-flash-preview",
                                 contents: [
                                     "You are an automated logistics bot parsing a delivery document. Does this image look like a delivery ticket or material receipt? If so, simply list what was received.",
-                                    { inlineData: { data: attachData.data.data, mimeType: imagePart.mimeType } }
+                                    { inlineData: { data: attachData.data.data as string, mimeType: imagePart.mimeType || "image/jpeg" } }
                                 ]
                             });
                             
