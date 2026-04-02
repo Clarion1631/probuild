@@ -46,7 +46,7 @@ export default async function LeadTasksPage({ params }: { params: Promise<{ id: 
                 leadSource={lead.source}
                 leadStage={lead.stage}
                 expectedStartDate={lead.expectedStartDate?.toISOString().split("T")[0] || null}
-                targetRevenue={lead.targetRevenue}
+                targetRevenue={lead.targetRevenue ? Number(lead.targetRevenue) : null}
                 location={lead.location}
                 projectType={lead.projectType}
                 clientId={lead.client.id}
@@ -57,6 +57,7 @@ export default async function LeadTasksPage({ params }: { params: Promise<{ id: 
                 clientCity={(lead.client as any).city || null}
                 clientState={(lead.client as any).state || null}
                 clientZip={(lead.client as any).zipCode || null}
+                initialMessage={lead.message || null}
             />
         </div>
     );

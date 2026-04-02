@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { GoogleGenAI } from "@google/genai";
 
-export async function POST(request: Request, { params }: { params: { id: string } }) {
-    const leadId = params.id;
+export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+    const { id: leadId } = await context.params;
 
     if (!leadId) {
         return NextResponse.json({ error: "leadId required" }, { status: 400 });

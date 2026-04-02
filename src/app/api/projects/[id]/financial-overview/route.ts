@@ -92,9 +92,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // ------------------------------------
     // 2. OUTGOING PAYMENTS (Expenses + POs)
     // ------------------------------------
-    const expenses = await prisma.expense.findMany({
-        where: { projectId }
-    });
+    const expenses: any[] = [];
 
     let validPoStatuses = ["Sent", "Received", "Draft"]; // Include draft always in query, filter below
     const pos = await prisma.purchaseOrder.findMany({
