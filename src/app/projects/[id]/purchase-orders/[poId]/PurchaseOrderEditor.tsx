@@ -235,14 +235,16 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                             >
                                 Preview PDF
                             </a>
-                            <button
-                                onClick={handleSend}
-                                disabled={isSending}
-                                className="hui-btn hui-btn-secondary bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200"
-                            >
-                                {isSending ? "Sending..." : "Send via Email"}
-                            </button>
                         </>
+                    )}
+                    {isEditing && status !== "Draft" && (
+                        <button
+                            onClick={handleSend}
+                            disabled={isSending}
+                            className="hui-btn hui-btn-secondary bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200"
+                        >
+                            {isSending ? "Sending..." : "Send via Email"}
+                        </button>
                     )}
                     {isEditing && status !== "Approved" && (
                         <button
