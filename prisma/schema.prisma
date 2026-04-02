@@ -26,6 +26,7 @@ model User {
   projectAccess    ProjectAccess[]
   leadTasks        LeadTask[]
   managedLeads     Lead[]      @relation("LeadManager")
+  dailyLogs        DailyLog[]
 }
 
 model Client {
@@ -166,6 +167,8 @@ model Project {
   messageThreads   MessageThread[]
   changeOrders     ChangeOrder[]
   purchaseOrders   PurchaseOrder[]
+  selectionBoards  SelectionBoard[]
+  dailyLogs        DailyLog[]
 }
 
 model FloorPlan {
@@ -750,6 +753,7 @@ model PortalVisibility {
   showContracts   Boolean @default(true)
   showMessages    Boolean @default(true)
   showChangeOrders Boolean @default(true)
+  showSelections   Boolean @default(true)
 
   isPortalEnabled Boolean @default(true)
   lastSharedAt    DateTime?
@@ -963,4 +967,65 @@ model PurchaseOrderItem {
 
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+}
+
+model SelectionBoard {
+  id          String              @id @default(cuid())
+  projectId   String
+  project     Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  status      String              @default("Draft") // Draft, Sent, Selections Made
+  categories  SelectionCategory[]
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+}
+
+model SelectionCategory {
+  id        String            @id @default(cuid())
+  boardId   String
+  board     SelectionBoard    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  name      String
+  order     Int               @default(0)
+  options   SelectionOption[]
+  createdAt DateTime          @default(now())
+}
+
+model SelectionOption {
+  id          String            @id @default(cuid())
+  categoryId  String
+  category    SelectionCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  imageUrl    String?
+  price       Float?
+  vendorUrl   String?
+  selected    Boolean           @default(false)
+  order       Int               @default(0)
+  createdAt   DateTime          @default(now())
+}
+
+model DailyLog {
+  id                 String          @id @default(cuid())
+  projectId          String
+  project            Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdById        String
+  createdBy          User            @relation(fields: [createdById], references: [id])
+  date               DateTime
+  weather            String?         // e.g. "Sunny, 75°F"
+  crewOnSite         String?         // comma-separated names or free text
+  workPerformed      String          @db.Text
+  materialsDelivered String?         @db.Text
+  issues             String?         @db.Text
+  photos             DailyLogPhoto[]
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+}
+
+model DailyLogPhoto {
+  id          String   @id @default(cuid())
+  dailyLogId  String
+  dailyLog    DailyLog @relation(fields: [dailyLogId], references: [id], onDelete: Cascade)
+  url         String
+  caption     String?
+  createdAt   DateTime @default(now())
 }

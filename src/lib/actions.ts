@@ -3302,3 +3302,362 @@ export async function sendPurchaseOrder(id: string, toEmail: string, message: st
     
     return { success: true };
 }
+
+// =============================================
+// Selection Boards
+// =============================================
+
+export async function getSelectionBoards(projectId: string) {
+    return await prisma.selectionBoard.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: {
+            categories: {
+                orderBy: { order: "asc" },
+                include: {
+                    options: { orderBy: { order: "asc" } },
+                },
+            },
+        },
+    });
+}
+
+export async function getSelectionBoard(id: string) {
+    return await prisma.selectionBoard.findUnique({
+        where: { id },
+        include: {
+            project: { include: { client: true } },
+            categories: {
+                orderBy: { order: "asc" },
+                include: {
+                    options: { orderBy: { order: "asc" } },
+                },
+            },
+        },
+    });
+}
+
+export async function createSelectionBoard(projectId: string, title: string) {
+    const board = await prisma.selectionBoard.create({
+        data: { projectId, title },
+    });
+    revalidatePath(`/projects/${projectId}/selections`);
+    return board;
+}
+
+export async function updateSelectionBoard(id: string, data: { title?: string; status?: string }) {
+    const board = await prisma.selectionBoard.update({
+        where: { id },
+        data,
+    });
+    revalidatePath(`/projects/${board.projectId}/selections`);
+    return board;
+}
+
+export async function deleteSelectionBoard(id: string) {
+    const board = await prisma.selectionBoard.findUnique({ where: { id } });
+    if (!board) return { success: false };
+    await prisma.selectionBoard.delete({ where: { id } });
+    revalidatePath(`/projects/${board.projectId}/selections`);
+    return { success: true };
+}
+
+export async function createSelectionCategory(boardId: string, name: string) {
+    const maxOrder = await prisma.selectionCategory.aggregate({
+        where: { boardId },
+        _max: { order: true },
+    });
+    const cat = await prisma.selectionCategory.create({
+        data: { boardId, name, order: (maxOrder._max.order ?? -1) + 1 },
+    });
+    const board = await prisma.selectionBoard.findUnique({ where: { id: boardId } });
+    if (board) revalidatePath(`/projects/${board.projectId}/selections`);
+    return cat;
+}
+
+export async function updateSelectionCategory(id: string, data: { name?: string; order?: number }) {
+    return await prisma.selectionCategory.update({ where: { id }, data });
+}
+
+export async function deleteSelectionCategory(id: string) {
+    const cat = await prisma.selectionCategory.findUnique({ where: { id }, include: { board: true } });
+    if (!cat) return { success: false };
+    await prisma.selectionCategory.delete({ where: { id } });
+    revalidatePath(`/projects/${cat.board.projectId}/selections`);
+    return { success: true };
+}
+
+export async function createSelectionOption(categoryId: string, data: {
+    name: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendorUrl?: string;
+}) {
+    const maxOrder = await prisma.selectionOption.aggregate({
+        where: { categoryId },
+        _max: { order: true },
+    });
+    const option = await prisma.selectionOption.create({
+        data: {
+            categoryId,
+            name: data.name,
+            description: data.description || null,
+            imageUrl: data.imageUrl || null,
+            price: data.price ?? null,
+            vendorUrl: data.vendorUrl || null,
+            order: (maxOrder._max.order ?? -1) + 1,
+        },
+    });
+    const cat = await prisma.selectionCategory.findUnique({ where: { id: categoryId }, include: { board: true } });
+    if (cat) revalidatePath(`/projects/${cat.board.projectId}/selections`);
+    return option;
+}
+
+export async function updateSelectionOption(id: string, data: {
+    name?: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendorUrl?: string;
+    selected?: boolean;
+}) {
+    return await prisma.selectionOption.update({ where: { id }, data });
+}
+
+export async function deleteSelectionOption(id: string) {
+    const option = await prisma.selectionOption.findUnique({
+        where: { id },
+        include: { category: { include: { board: true } } },
+    });
+    if (!option) return { success: false };
+    await prisma.selectionOption.delete({ where: { id } });
+    revalidatePath(`/projects/${option.category.board.projectId}/selections`);
+    return { success: true };
+}
+
+export async function sendSelectionBoardToClient(boardId: string) {
+    const board = await prisma.selectionBoard.findUnique({
+        where: { id: boardId },
+        include: { project: { include: { client: true } } },
+    });
+    if (!board) throw new Error("Board not found");
+
+    await prisma.selectionBoard.update({
+        where: { id: boardId },
+        data: { status: "Sent" },
+    });
+
+    // Email the client
+    const clientEmail = board.project.client.email;
+    if (clientEmail) {
+        const settings = await getCompanySettings();
+        const portalUrl = `https://probuild.goldentouchremodeling.com/portal/projects/${board.projectId}/selections`;
+        await sendNotification(
+            clientEmail,
+            `Selection Board Ready: ${board.title}`,
+            `<div style="font-family: sans-serif; color: #333;">
+                <h2>Your Selection Board is Ready</h2>
+                <p>Hi ${board.project.client.name},</p>
+                <p>Your project manager has prepared a selection board "<strong>${board.title}</strong>" for the project <strong>${board.project.name}</strong>.</p>
+                <p>Please review the options and make your selections:</p>
+                <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
+                <p style="color:#666;font-size:13px;">— ${settings.companyName || 'Your Project Team'}</p>
+            </div>`
+        );
+    }
+
+    revalidatePath(`/projects/${board.projectId}/selections`);
+    return { success: true };
+}
+
+export async function submitClientSelections(boardId: string, selections: Record<string, string>) {
+    // selections is { categoryId: optionId }
+    const board = await prisma.selectionBoard.findUnique({
+        where: { id: boardId },
+        include: {
+            project: { include: { client: true } },
+            categories: { include: { options: true } },
+        },
+    });
+    if (!board) throw new Error("Board not found");
+
+    // Reset all options then set selected ones
+    for (const cat of board.categories) {
+        const selectedOptionId = selections[cat.id];
+        for (const opt of cat.options) {
+            await prisma.selectionOption.update({
+                where: { id: opt.id },
+                data: { selected: opt.id === selectedOptionId },
+            });
+        }
+    }
+
+    await prisma.selectionBoard.update({
+        where: { id: boardId },
+        data: { status: "Selections Made" },
+    });
+
+    // Notify PM
+    const settings = await getCompanySettings();
+    if (settings.notificationEmail) {
+        const selectedSummary = board.categories.map(cat => {
+            const selectedOpt = cat.options.find(o => selections[cat.id] === o.id);
+            return `<li><strong>${cat.name}:</strong> ${selectedOpt?.name || 'None'}</li>`;
+        }).join('');
+
+        await sendNotification(
+            settings.notificationEmail,
+            `✅ Selections Made — ${board.title}`,
+            `<div style="font-family: sans-serif; color: #333;">
+                <h3>Client Selections Submitted</h3>
+                <p><strong>${board.project.client.name}</strong> has made their selections for "<strong>${board.title}</strong>" on project <strong>${board.project.name}</strong>.</p>
+                <ul>${selectedSummary}</ul>
+            </div>`
+        );
+    }
+
+    revalidatePath(`/projects/${board.projectId}/selections`);
+    return { success: true };
+}
+
+export async function getSelectionBoardsForPortal(projectId: string) {
+    return await prisma.selectionBoard.findMany({
+        where: {
+            projectId,
+            status: { not: "Draft" },
+        },
+        orderBy: { createdAt: "desc" },
+        include: {
+            categories: {
+                orderBy: { order: "asc" },
+                include: {
+                    options: { orderBy: { order: "asc" } },
+                },
+            },
+        },
+    });
+}
+
+
+// =============================================
+// Daily Logs CRUD
+// =============================================
+
+export async function getDailyLogs(projectId: string) {
+    return await prisma.dailyLog.findMany({
+        where: { projectId },
+        orderBy: { date: "desc" },
+        include: {
+            createdBy: { select: { id: true, name: true, email: true } },
+            photos: { orderBy: { createdAt: "asc" } },
+        },
+    });
+}
+
+export async function getDailyLog(id: string) {
+    return await prisma.dailyLog.findUnique({
+        where: { id },
+        include: {
+            createdBy: { select: { id: true, name: true, email: true } },
+            photos: { orderBy: { createdAt: "asc" } },
+            project: { select: { id: true, name: true } },
+        },
+    });
+}
+
+export async function createDailyLog(projectId: string, data: {
+    date: string;
+    weather?: string;
+    crewOnSite?: string;
+    workPerformed: string;
+    materialsDelivered?: string;
+    issues?: string;
+    createdById: string;
+    photoUrls?: { url: string; caption?: string }[];
+}) {
+    const log = await prisma.dailyLog.create({
+        data: {
+            projectId,
+            date: new Date(data.date),
+            weather: data.weather || null,
+            crewOnSite: data.crewOnSite || null,
+            workPerformed: data.workPerformed,
+            materialsDelivered: data.materialsDelivered || null,
+            issues: data.issues || null,
+            createdById: data.createdById,
+            photos: data.photoUrls && data.photoUrls.length > 0 ? {
+                create: data.photoUrls.map(p => ({
+                    url: p.url,
+                    caption: p.caption || null,
+                })),
+            } : undefined,
+        },
+        include: { photos: true },
+    });
+
+    revalidatePath(`/projects/${projectId}/dailylogs`);
+    return log;
+}
+
+export async function updateDailyLog(id: string, data: {
+    date?: string;
+    weather?: string;
+    crewOnSite?: string;
+    workPerformed?: string;
+    materialsDelivered?: string;
+    issues?: string;
+}) {
+    const updateData: any = {};
+    if (data.date !== undefined) updateData.date = new Date(data.date);
+    if (data.weather !== undefined) updateData.weather = data.weather || null;
+    if (data.crewOnSite !== undefined) updateData.crewOnSite = data.crewOnSite || null;
+    if (data.workPerformed !== undefined) updateData.workPerformed = data.workPerformed;
+    if (data.materialsDelivered !== undefined) updateData.materialsDelivered = data.materialsDelivered || null;
+    if (data.issues !== undefined) updateData.issues = data.issues || null;
+
+    const log = await prisma.dailyLog.update({
+        where: { id },
+        data: updateData,
+    });
+
+    revalidatePath(`/projects/${log.projectId}/dailylogs`);
+    return log;
+}
+
+export async function deleteDailyLog(id: string) {
+    const log = await prisma.dailyLog.findUnique({ where: { id }, select: { projectId: true } });
+    if (!log) return { success: false };
+
+    await prisma.dailyLog.delete({ where: { id } });
+    revalidatePath(`/projects/${log.projectId}/dailylogs`);
+    return { success: true };
+}
+
+export async function addDailyLogPhotos(dailyLogId: string, photos: { url: string; caption?: string }[]) {
+    const log = await prisma.dailyLog.findUnique({ where: { id: dailyLogId }, select: { projectId: true } });
+    if (!log) throw new Error("Daily log not found");
+
+    await prisma.dailyLogPhoto.createMany({
+        data: photos.map(p => ({
+            dailyLogId,
+            url: p.url,
+            caption: p.caption || null,
+        })),
+    });
+
+    revalidatePath(`/projects/${log.projectId}/dailylogs`);
+    return { success: true };
+}
+
+export async function deleteDailyLogPhoto(photoId: string) {
+    const photo = await prisma.dailyLogPhoto.findUnique({
+        where: { id: photoId },
+        include: { dailyLog: { select: { projectId: true } } },
+    });
+    if (!photo) return { success: false };
+
+    await prisma.dailyLogPhoto.delete({ where: { id: photoId } });
+    revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
+    return { success: true };
+}
