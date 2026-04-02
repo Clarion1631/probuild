@@ -227,6 +227,14 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                             >
                                 Delete
                             </button>
+                            <a
+                                href={`/api/pdf/purchase-orders/${initialData.id}?inline=true`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="hui-btn hui-btn-secondary text-slate-600 hover:bg-slate-100"
+                            >
+                                Preview PDF
+                            </a>
                             <button
                                 onClick={handleSend}
                                 disabled={isSending}
