@@ -13,21 +13,34 @@ const DropdownMenu = ({ children }: { children: React.ReactNode }) => {
     return <div className="relative inline-block text-left">{children}</div>;
 };
 
-const DropdownMenuTrigger = ({ children, className }: any) => {
-    return <summary className={`cursor-pointer list-none ${className}`}>{children}</summary>;
+const DropdownMenuTrigger = ({ children, className, onClick }: any) => {
+    return <button onClick={onClick} className={`cursor-pointer focus:outline-none ${className}`}>{children}</button>;
 };
 
-const DropdownMenuContent = ({ children, className }: any) => {
-    return <div className={`absolute right-0 mt-2 w-48 rounded-md shadow-lg bg-white ring-1 ring-black ring-opacity-5 z-10 p-1 ${className}`}>{children}</div>;
+const DropdownMenuContent = ({ children, className, isOpen }: any) => {
+    if (!isOpen) return null;
+    return <div className={`absolute right-0 mt-2 w-48 rounded-md shadow-lg bg-white ring-1 ring-black ring-opacity-5 z-50 p-1 ${className}`}>{children}</div>;
 };
 
 const DropdownMenuItem = ({ children, onClick }: any) => {
-    return <div onClick={onClick} className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer rounded-sm">{children}</div>;
+    return <button onClick={onClick} className="w-full text-left block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer rounded-sm focus:outline-none">{children}</button>;
 };
 
 
 export default function IncomingPaymentsCard({ projectId, incoming }: { projectId: string; incoming: any }) {
     const router = useRouter();
+    const [dropdownOpen, setDropdownOpen] = useState(false);
+    const dropdownRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        function handleClickOutside(event: MouseEvent) {
+            if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+                setDropdownOpen(false);
+            }
+        }
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, []);
 
     const formatCurrency = (val: number) => 
         new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0);
@@ -47,17 +60,17 @@ export default function IncomingPaymentsCard({ projectId, incoming }: { projectI
                     Incoming Payments
                     <span title="Total Income: online payments/checks. Planned: future invoices/retainers. Overdue: past deadline." className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-gray-300 text-gray-400 text-[10px] cursor-help">i</span>
                 </h2>
-                <DropdownMenu>
-                    <DropdownMenuTrigger className="text-sm font-medium text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50 px-3 py-1.5 rounded transition flex items-center gap-1">
+                <div ref={dropdownRef} className="relative inline-block text-left">
+                    <DropdownMenuTrigger onClick={() => setDropdownOpen(!dropdownOpen)} className="text-sm font-medium text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50 px-3 py-1.5 rounded transition flex items-center gap-1">
                         Add Income <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
                     </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" className="w-48">
-                        <DropdownMenuItem onClick={() => router.push(`/projects/${projectId}/estimates/new`)}>New Estimate</DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => router.push(`/projects/${projectId}/invoices/new`)}>New Invoice</DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => router.push(`/projects/${projectId}/retainers/new`)}>New Retainer</DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => router.push(`/projects/${projectId}/change-orders/new`)}>New Change Order</DropdownMenuItem>
+                    <DropdownMenuContent isOpen={dropdownOpen} align="end" className="w-48">
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/estimates/new`); }}>New Estimate</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/invoices/new`); }}>New Invoice</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/retainers/new`); }}>New Retainer</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/change-orders/new`); }}>New Change Order</DropdownMenuItem>
                     </DropdownMenuContent>
-                </DropdownMenu>
+                </div>
             </div>
             
             <div className="py-4 px-6 flex-1 flex flex-col justify-center">

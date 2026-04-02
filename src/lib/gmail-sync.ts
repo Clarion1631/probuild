@@ -116,8 +116,8 @@ export async function syncPurchaseOrderEmails(purchaseOrderCode: string, purchas
         }
         
         return { success: true, count: messages.length };
-    } catch (error) {
+    } catch (error: any) {
         console.error("Failed to sync PO emails:", error);
-        return { success: false, error };
+        return { success: false, error: error.message || "Unknown error" };
     }
 }
