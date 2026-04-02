@@ -35,6 +35,8 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     const [isSaving, setIsSaving] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [isSending, setIsSending] = useState(false);
+    const [isApproving, setIsApproving] = useState(false);
+    const [isUploading, setIsUploading] = useState(false);
 
     // Dynamic calculations
     const totalAmount = items.reduce((acc, curr) => acc + (Number(curr.total) || 0), 0);
@@ -153,6 +155,51 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
         }
     };
 
+    const handleApprove = async () => {
+        if (!isEditing) return toast.error("Please save the PO first");
+        const sig = window.prompt("Type your name to digitally sign and approve this Purchase Order representing internal review:");
+        if (!sig) return;
+
+        setIsApproving(true);
+        try {
+            await approvePurchaseOrder(initialData.id, sig);
+            toast.success("Purchase Order Approved");
+            setStatus("Approved");
+            router.refresh();
+        } catch(e: any) {
+            toast.error(e.message || "Failed to approve");
+        } finally { setIsApproving(false); }
+    };
+
+    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!e.target.files || e.target.files.length === 0 || !isEditing) return;
+        setIsUploading(true);
+        try {
+            const file = e.target.files[0];
+            const data = new FormData();
+            data.append("file", file);
+            await uploadPurchaseOrderFile(initialData.id, data);
+            toast.success("File uploaded successfully");
+            router.refresh();
+        } catch(err: any) {
+            toast.error(err.message || "Failed to upload file");
+        } finally {
+            setIsUploading(false);
+            e.target.value = '';
+        }
+    };
+
+    const handleDeleteFile = async (fileId: string) => {
+        if (!confirm("Remove this attachment?")) return;
+        try {
+            await deletePurchaseOrderFile(fileId);
+            toast.success("Attachment removed");
+            router.refresh();
+        } catch(err: any) {
+            toast.error(err.message || "Failed to delete attachment");
+        }
+    };
+
     return (
         <div className="flex flex-col h-full bg-slate-50">
             {/* Top Navigation / Action Bar */}
@@ -188,6 +235,15 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                                 {isSending ? "Sending..." : "Send via Email"}
                             </button>
                         </>
+                    )}
+                    {isEditing && status !== "Approved" && (
+                        <button
+                            onClick={handleApprove}
+                            disabled={isApproving || isSaving}
+                            className="hui-btn hui-btn-secondary bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200"
+                        >
+                            {isApproving ? "Approving..." : "Approve"}
+                        </button>
                     )}
                     <button
                         onClick={handleSave}
@@ -378,8 +434,89 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                                 />
                             </div>
                         </div>
-                    </div>
+                        
+                        {/* Attachments & Expenses Panel */}
+                        <div className="space-y-6">
+                            {/* Attachments */}
+                            <div className="hui-card shadow-sm border border-hui-border flex flex-col">
+                                <div className="px-6 py-4 border-b border-hui-border bg-slate-50 flex items-center justify-between">
+                                    <h3 className="font-bold text-hui-textMain flex items-center gap-2">
+                                        <FileText className="w-4 h-4 text-slate-400" />
+                                        Attachments
+                                    </h3>
+                                    {isEditing && (
+                                        <label className="hui-btn hui-btn-secondary text-sm py-1.5 cursor-pointer">
+                                            {isUploading ? "Uploading..." : <><Upload className="w-4 h-4 mr-1"/> Upload File</>}
+                                            <input type="file" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
+                                        </label>
+                                    )}
+                                </div>
+                                <div className="p-4 flex-1">
+                                    {!initialData?.files?.length ? (
+                                        <div className="text-sm text-slate-400 italic text-center py-4">No files attached</div>
+                                    ) : (
+                                        <ul className="space-y-2">
+                                            {initialData.files.map((file: any) => (
+                                                <li key={file.id} className="flex flex-col sm:flex-row sm:items-center justify-between p-3 rounded-lg border border-slate-100 bg-slate-50/50 hover:bg-slate-50 transition gap-2">
+                                                    <div className="flex items-center gap-3 overflow-hidden">
+                                                        <div className="w-8 h-8 rounded bg-blue-100 text-blue-600 flex items-center justify-center shrink-0">
+                                                            <FileText className="w-4 h-4" />
+                                                        </div>
+                                                        <div className="overflow-hidden bg-transparent">
+                                                            <a href={file.url} target="_blank" rel="noreferrer" className="text-sm font-medium text-blue-600 hover:underline truncate block">
+                                                                {file.name}
+                                                            </a>
+                                                            <p className="text-xs text-slate-400">{(file.size / 1024 / 1024).toFixed(2)} MB • {new Date(file.createdAt).toLocaleDateString()}</p>
+                                                        </div>
+                                                    </div>
+                                                    <button onClick={() => handleDeleteFile(file.id)} className="text-slate-400 hover:text-red-600 p-2 ml-auto shrink-0 transition" title="Remove">
+                                                        <Trash2 className="w-4 h-4"/>
+                                                    </button>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            {/* Linked Expenses */}
+                            <div className="hui-card shadow-sm border border-hui-border flex flex-col">
+                                <div className="px-6 py-4 border-b border-hui-border bg-slate-50 flex flex-col gap-2">
+                                    <h3 className="font-bold text-hui-textMain flex items-center gap-2">
+                                        <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                                        Linked Bills (Expenses)
+                                    </h3>
+                                    <p className="text-xs text-slate-500">Expenses tracking this PO for 3-way match.</p>
+                                </div>
+                                <div className="p-4 flex-1">
+                                    {!initialData?.expenses?.length ? (
+                                        <div className="text-sm text-slate-400 italic text-center py-4">No bills have been linked to this PO yet.</div>
+                                    ) : (
+                                        <div className="space-y-4">
+                                            <ul className="space-y-2">
+                                                {initialData.expenses.map((expense: any) => (
+                                                    <li key={expense.id} className="flex items-center justify-between text-sm p-2 rounded bg-emerald-50/50 border border-emerald-100">
+                                                        <div className="flex flex-col">
+                                                            <span className="font-medium text-slate-700">{expense.description || "Vendor Bill"}</span>
+                                                            <span className="text-xs text-slate-500">{new Date(expense.createdAt).toLocaleDateString()}</span>
+                                                        </div>
+                                                        <span className="font-bold text-hui-textMain font-mono">${(Number(expense.amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                            <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-sm">
+                                                <span className="text-slate-600 font-semibold">Total Billed:</span>
+                                                <span className="font-bold text-emerald-600 font-mono">
+                                                    ${initialData.expenses.reduce((acc: number, e: any) => acc + (Number(e.amount) || 0), 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
 
+                    </div>
                 </div>
             </div>
         </div>

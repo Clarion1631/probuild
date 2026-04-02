@@ -20,6 +20,14 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
 
     const project = access.project;
 
+    // Fetch POs related to this Subcontractor (linked by Vendor email)
+    const vendor = await prisma.vendor.findFirst({ where: { email: sub.email } });
+    const purchaseOrders = vendor ? await prisma.purchaseOrder.findMany({
+        where: { projectId, vendorId: vendor.id, status: { not: "Draft" } },
+        include: { files: true },
+        orderBy: { createdAt: "desc" }
+    }) : [];
+
     // Fetch tasks assigned to this subcontractor in this project
     const assignments = await prisma.subTaskAssignment.findMany({
         where: {
@@ -199,6 +207,57 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
                     );
                 })}
             </div>
+
+            {/* Purchase Orders */}
+            {purchaseOrders.length > 0 && (
+                <div className="mt-12">
+                    <h2 className="text-lg font-bold text-hui-textMain mb-4 flex items-center gap-2">
+                        <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        Purchase Orders & Files ({purchaseOrders.length})
+                    </h2>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        {purchaseOrders.map((po) => (
+                            <div key={po.id} className="hui-card p-6 flex flex-col h-full border border-hui-border hover:border-slate-300 transition">
+                                <div className="flex justify-between items-start mb-4">
+                                    <div>
+                                        <p className="font-bold text-hui-textMain flex items-center gap-2">
+                                            {po.code} 
+                                        </p>
+                                        <p className="text-xs text-hui-textMuted mt-1">Issued: {new Date(po.createdAt).toLocaleDateString()}</p>
+                                    </div>
+                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full uppercase bg-blue-100 text-blue-700">
+                                        {po.status}
+                                    </span>
+                                </div>
+                                <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 mb-4 whitespace-pre-wrap text-sm text-slate-600 font-sans">
+                                    {po.terms || po.notes || "No additional terms provided."}
+                                </div>
+                                <div className="mt-auto">
+                                    <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-3">Attachments</p>
+                                    {!po.files || po.files.length === 0 ? (
+                                        <p className="text-sm text-slate-400 italic">No files attached.</p>
+                                    ) : (
+                                        <ul className="space-y-2">
+                                            {po.files.map((file: any) => (
+                                                <li key={file.id}>
+                                                    <a href={file.url} target="_blank" rel="noreferrer" className="flex items-center gap-2 p-2 rounded-lg bg-blue-50/50 hover:bg-blue-50 text-blue-700 transition border border-blue-100/50">
+                                                        <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                                                        </svg>
+                                                        <span className="text-sm font-medium truncate">{file.name}</span>
+                                                    </a>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

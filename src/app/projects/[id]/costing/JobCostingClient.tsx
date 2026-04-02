@@ -68,14 +68,26 @@ export default function JobCostingClient({
         expenses.forEach(ex => {
             const group = getGroup(ex.costCodeId, ex.costCode?.name, ex.costCode?.code);
             group.actualMaterial += (ex.amount || 0);
+            if (ex.purchaseOrderId) {
+                group.committedMaterial -= (ex.amount || 0);
+            }
         });
         purchaseOrders.forEach(po => {
-            po.items?.forEach((item: any) => {
-                const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
-                group.committedMaterial += (item.total || 0);
-            });
+            // Only count approved POs maybe? Or all POs. Usually committed means Approved. Wait, if status exists, let's check it. 
+            // In ProBuild, we want to see it but let's assume all POs fetched here are committed.
+            if (po.status !== "Draft") {
+                po.items?.forEach((item: any) => {
+                    const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
+                    group.committedMaterial += (item.total || 0);
+                });
+            }
         });
-        return Array.from(map.values());
+        
+        // Prevent negative committed material on over-billed POs
+        return Array.from(map.values()).map(v => ({
+            ...v,
+            committedMaterial: Math.max(0, v.committedMaterial)
+        }));
     }, [estimates, timeEntries, expenses, purchaseOrders]);
 
     const sortedSummaries = useMemo(() => {

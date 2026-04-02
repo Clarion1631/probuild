@@ -399,6 +399,32 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                 </div>
                 )}
 
+                {/* Mood Boards Section */}
+                {visibility.showMoodBoards && (
+                <div className="md:col-span-2 mt-4">
+                    <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-xl font-bold text-hui-textMain flex items-center gap-2">
+                            <svg className="w-5 h-5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                            Visual Mood Boards
+                        </h2>
+                        <Link href={`/portal/projects/${projectId}/mood-boards`} className="text-sm font-semibold text-indigo-500 hover:text-indigo-700 transition">
+                            View All →
+                        </Link>
+                    </div>
+                    <Link href={`/portal/projects/${projectId}/mood-boards`} className="block hui-card p-6 hover:border-indigo-500 hover:shadow-md transition text-center border-dashed">
+                        <div className="w-12 h-12 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-3">
+                            <svg className="w-6 h-6 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
+                            </svg>
+                        </div>
+                        <h3 className="text-base font-bold text-slate-800">View Design Concepts</h3>
+                        <p className="text-sm text-slate-500 mt-1">Explore visual layouts and material choices for your space.</p>
+                    </Link>
+                </div>
+                )}
+
                 {/* Messages Section — guarded by PortalVisibility */}
                 {visibility.showMessages && (
                     <div className="md:col-span-2 mt-4">
