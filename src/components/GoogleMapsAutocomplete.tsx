@@ -1,5 +1,11 @@
 "use client";
 
+declare global {
+    interface Window {
+        google: any;
+    }
+}
+
 import { useEffect, useRef } from "react";
 
 interface GoogleMapsAutocompleteProps {

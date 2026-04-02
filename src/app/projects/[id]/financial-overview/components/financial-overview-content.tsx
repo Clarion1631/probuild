@@ -1,13 +1,19 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Switch } from "@/components/ui/switch";
 import CashFlowCard from "./cash-flow-card";
 import IncomingPaymentsCard from "./incoming-payments-card";
 import OutgoingPaymentsCard from "./outgoing-payments-card";
 import CashFlowTrackerChart from "./cash-flow-tracker-chart";
 import FinancialItemsSection from "./financial-items-section";
-import { Skeleton } from "@/components/ui/skeleton";
+
+// Basic switch replacement
+const Switch = ({ checked, onCheckedChange, id }: any) => (
+    <div onClick={() => onCheckedChange(!checked)} className={`w-9 h-5 flex items-center rounded-full p-1 cursor-pointer transition-colors ${checked ? 'bg-black' : 'bg-gray-200'}`}>
+        <div className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${checked ? 'translate-x-4' : 'translate-x-0'}`} />
+    </div>
+);
+const Skeleton = ({ className }: { className?: string }) => <div className={`animate-pulse rounded-md bg-slate-200 ${className}`} />;
 
 export default function FinancialOverviewContent({ projectId, projectName }: { projectId: string; projectName: string }) {
     const [includeUnissued, setIncludeUnissued] = useState(false);

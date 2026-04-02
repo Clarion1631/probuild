@@ -1,6 +1,8 @@
 "use client";
 
-import { Card } from "@/components/ui/card";
+const Card = ({ className, children, onClick }: { className?: string, children: React.ReactNode, onClick?: () => void }) => (
+    <div onClick={onClick} className={`rounded-xl border bg-white text-slate-950 shadow ${className}`}>{children}</div>
+);
 import { PieChart, Pie, Cell, ResponsiveContainer } from "recharts";
 import { useRouter } from "next/navigation";
 import { Receipt } from "lucide-react";

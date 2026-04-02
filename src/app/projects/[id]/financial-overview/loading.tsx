@@ -1,5 +1,4 @@
-import { Skeleton } from "@/components/ui/skeleton";
-
+const Skeleton = ({ className }: { className?: string }) => <div className={`animate-pulse rounded-md bg-slate-200 ${className}`} />;
 export default function Loading() {
   return (
     <div className="flex-1 w-full p-8 max-w-7xl mx-auto">

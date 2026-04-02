@@ -1,9 +1,30 @@
 "use client";
 
-import { Card } from "@/components/ui/card";
+const Card = ({ className, children, onClick }: { className?: string, children: React.ReactNode, onClick?: () => void }) => (
+    <div onClick={onClick} className={`rounded-xl border bg-white text-slate-950 shadow ${className}`}>{children}</div>
+);
+
 import { PieChart, Pie, Cell, ResponsiveContainer } from "recharts";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
+
+// Basic dropdown replacement
+const DropdownMenu = ({ children }: { children: React.ReactNode }) => {
+    return <div className="relative inline-block text-left">{children}</div>;
+};
+
+const DropdownMenuTrigger = ({ children, className }: any) => {
+    return <summary className={`cursor-pointer list-none ${className}`}>{children}</summary>;
+};
+
+const DropdownMenuContent = ({ children, className }: any) => {
+    return <div className={`absolute right-0 mt-2 w-48 rounded-md shadow-lg bg-white ring-1 ring-black ring-opacity-5 z-10 p-1 ${className}`}>{children}</div>;
+};
+
+const DropdownMenuItem = ({ children, onClick }: any) => {
+    return <div onClick={onClick} className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer rounded-sm">{children}</div>;
+};
+
 
 export default function IncomingPaymentsCard({ projectId, incoming }: { projectId: string; incoming: any }) {
     const router = useRouter();

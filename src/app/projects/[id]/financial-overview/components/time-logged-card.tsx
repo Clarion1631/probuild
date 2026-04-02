@@ -1,6 +1,8 @@
 "use client";
 
-import { Card } from "@/components/ui/card";
+const Card = ({ className, children, onClick }: { className?: string, children: React.ReactNode, onClick?: () => void }) => (
+    <div onClick={onClick} className={`rounded-xl border bg-white text-slate-950 shadow ${className}`}>{children}</div>
+);
 import { Clock } from "lucide-react";
 import { useRouter } from "next/navigation";
 

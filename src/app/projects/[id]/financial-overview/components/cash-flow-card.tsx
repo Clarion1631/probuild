@@ -1,7 +1,8 @@
 "use client";
 
-import { Card } from "@/components/ui/card";
-
+const Card = ({ className, children, onClick }: { className?: string, children: React.ReactNode, onClick?: () => void }) => (
+    <div onClick={onClick} className={`rounded-xl border bg-white text-slate-950 shadow ${className}`}>{children}</div>
+);
 export default function CashFlowCard({ cashFlow }: { cashFlow: any }) {
     const formatCurrency = (val: number) => 
         new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0);
