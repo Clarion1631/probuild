@@ -81,7 +81,7 @@ export async function POST(req: Request) {
     if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
     const body = await req.json();
-    const { projectId, costCodeId, startTime, latitude, longitude } = body;
+    const { projectId, costCodeId, estimateItemId, startTime, latitude, longitude } = body;
 
     if (!projectId) {
         return NextResponse.json({ error: "Project ID is required" }, { status: 400 });
@@ -92,6 +92,7 @@ export async function POST(req: Request) {
             userId: user.id,
             projectId,
             costCodeId: costCodeId || null,
+            estimateItemId: estimateItemId || null,
             startTime: startTime ? new Date(startTime) : new Date(),
             latitude,
             longitude,

@@ -14,8 +14,8 @@ export default function TimeClockPage() {
     const [projects, setProjects] = useState<any[]>([]);
     const [selectedProject, setSelectedProject] = useState<string>("");
 
-    const [costCodes, setCostCodes] = useState<any[]>([]);
-    const [selectedCostCode, setSelectedCostCode] = useState<string>("");
+    const [budgetBuckets, setBudgetBuckets] = useState<any[]>([]);
+    const [selectedBucket, setSelectedBucket] = useState<string>("");
 
     useEffect(() => {
         // Fetch only projects the current user is assigned to
@@ -37,7 +37,7 @@ export default function TimeClockPage() {
                     setStatus("Clocked In");
                     setCurrentTimeEntryId(active.id);
                     setSelectedProject(active.projectId);
-                    setSelectedCostCode(active.costCodeId || "");
+                    setSelectedBucket(active.estimateItemId || "");
                 }
             })
             .catch(e => console.error("Could not fetch time entries", e));
@@ -45,20 +45,19 @@ export default function TimeClockPage() {
 
     useEffect(() => {
         if (!selectedProject) {
-            setCostCodes([]);
-            setSelectedCostCode("");
+            setBudgetBuckets([]);
+            setSelectedBucket("");
             return;
         }
 
-        // Fetch cost codes used in the selected project's estimates
-        fetch(`/api/projects/${selectedProject}/cost-codes`)
+        fetch(`/api/projects/${selectedProject}/estimate-items`)
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
-                    setCostCodes(data);
+                    setBudgetBuckets(data);
                 }
             })
-            .catch(e => console.error("Could not fetch cost codes", e));
+            .catch(e => console.error("Could not fetch estimate items", e));
 
     }, [selectedProject]);
 
@@ -101,7 +100,7 @@ export default function TimeClockPage() {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         projectId: selectedProject,
-                        costCodeId: selectedCostCode || null,
+                        estimateItemId: selectedBucket || null,
                         latitude: loc?.lat,
                         longitude: loc?.lng
                     })
@@ -133,18 +132,11 @@ export default function TimeClockPage() {
                 setStatus("Clocked Out");
                 setCurrentTimeEntryId(null);
                 setSelectedProject("");
-                setSelectedCostCode("");
+                setSelectedBucket("");
             } catch (err: any) {
                 setError(err.message);
             }
         }
-    };
-
-    const typeColors: Record<string, string> = {
-        Labor: "text-blue-600",
-        Material: "text-amber-600",
-        Subcontractor: "text-purple-600",
-        Equipment: "text-green-600",
     };
 
     return (
@@ -175,18 +167,18 @@ export default function TimeClockPage() {
                             )}
                         </div>
 
-                        {costCodes.length > 0 && (
+                        {budgetBuckets.length > 0 && (
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-2">Phase / Cost Code</label>
+                                <label className="block text-sm font-medium text-slate-700 mb-2">Budget Bucket (Phase)</label>
                                 <select
-                                    value={selectedCostCode}
-                                    onChange={(e) => setSelectedCostCode(e.target.value)}
+                                    value={selectedBucket}
+                                    onChange={(e) => setSelectedBucket(e.target.value)}
                                     className="hui-input"
                                 >
                                     <option value="">Select a Phase...</option>
-                                    {costCodes.map(cc => (
-                                        <option key={cc.id} value={cc.id}>
-                                            {cc.code} — {cc.name}
+                                    {budgetBuckets.map(b => (
+                                        <option key={b.id} value={b.id}>
+                                            {b.name}{b.costCode ? ` — ${b.costCode.code}` : ''}
                                         </option>
                                     ))}
                                 </select>
@@ -201,9 +193,9 @@ export default function TimeClockPage() {
                             <div className="text-sm text-green-800 font-medium">
                                 Currently working on: {projects.find(p => p.id === selectedProject)?.name || "Unknown Project"}
                             </div>
-                            {selectedCostCode && (
+                            {selectedBucket && (
                                 <div className="text-xs text-green-700 mt-1">
-                                    Phase: {costCodes.find(cc => cc.id === selectedCostCode)?.name || ""}
+                                    Phase: {budgetBuckets.find(b => b.id === selectedBucket)?.name || ""}
                                 </div>
                             )}
                         </div>
