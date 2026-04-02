@@ -52,7 +52,7 @@ next-env.d.ts
 /config/houzz-cookies.json
 
 # Uploaded files
+```
 public/uploads/
 .env*.local
-output/
 output/

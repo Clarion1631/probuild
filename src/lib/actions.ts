@@ -659,6 +659,18 @@ export async function createDraftFloorPlan(projectId: string) {
     return { id: floorPlan.id };
 }
 
+export async function createDraftLeadFloorPlan(leadId: string) {
+    const floorPlan = await prisma.floorPlan.create({
+        data: {
+            name: "New Floor Plan",
+            leadId,
+        },
+    });
+
+    revalidatePath(`/leads/${leadId}/floor-plans`);
+    return { id: floorPlan.id };
+}
+
 export async function getFloorPlan(id: string) {
     return await prisma.floorPlan.findUnique({ where: { id } });
 }

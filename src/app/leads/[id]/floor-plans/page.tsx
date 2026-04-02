@@ -1,4 +1,4 @@
-import { getLead, createDraftFloorPlan } from "@/lib/actions";
+import { getLead, createDraftLeadFloorPlan, convertLeadToProject } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import { BoxSelect } from "lucide-react";
 import LeadSidebar from "../LeadSidebar";
@@ -18,16 +18,18 @@ export default async function LeadFloorPlansPage({ params }: { params: Promise<{
         select: { message: true },
     });
 
+    const leadId = lead.id;
+    const resolvedParamsId = resolvedParams.id;
+
     async function handleNewFloorPlan() {
         "use server";
-        const result = await createDraftFloorPlan(resolvedParams.id);
-        redirect(`/leads/${resolvedParams.id}/floor-plans/${result.id}`);
+        const result = await createDraftLeadFloorPlan(resolvedParamsId);
+        redirect(`/leads/${resolvedParamsId}/floor-plans/${result.id}`);
     }
 
     async function handleConvert() {
         "use server";
-        const { convertLeadToProject } = await import("@/lib/actions");
-        await convertLeadToProject(lead!.id);
+        await convertLeadToProject(leadId);
         redirect(`/`);
     }
 
