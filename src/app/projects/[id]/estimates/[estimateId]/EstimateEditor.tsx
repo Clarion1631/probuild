@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
 import SendEstimateModal from "@/components/SendEstimateModal";
+import SelectVendorModal from "./SelectVendorModal";
 import { toast } from "sonner";
 
 export default function EstimateEditor({ context, initialEstimate }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any }) {
@@ -33,6 +34,8 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [isDuplicating, setIsDuplicating] = useState(false);
     const [selectedItemIds, setSelectedItemIds] = useState<string[]>([]);
     const [isCreatingCO, setIsCreatingCO] = useState(false);
+    const [showVendorSelectModal, setShowVendorSelectModal] = useState(false);
+    const [isCreatingPO, setIsCreatingPO] = useState(false);
 
     async function handleCreateChangeOrder() {
         if (selectedItemIds.length === 0) return;
@@ -45,7 +48,25 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             router.push(`/projects/${context.id}/change-orders/${res.id}`);
         } catch (e: any) {
             toast.error(e.message || "Failed to create Change Order");
+        } finally {
             setIsCreatingCO(false);
+        }
+    }
+
+    async function handleCreatePurchaseOrder(vendorId: string) {
+        if (selectedItemIds.length === 0) return;
+        setIsCreatingPO(true);
+        setShowVendorSelectModal(false);
+        try {
+            await handleSave();
+            const { createPurchaseOrderFromEstimate } = await import("@/lib/actions");
+            const res = await createPurchaseOrderFromEstimate(context.id, initialEstimate.id, selectedItemIds, vendorId);
+            toast.success("Purchase Order drafted!");
+            router.push(`/projects/${context.id}/purchase-orders/${res.id}`);
+        } catch (e: any) {
+            toast.error(e.message || "Failed to create Purchase Order");
+        } finally {
+            setIsCreatingPO(false);
         }
     }
 
@@ -414,11 +435,19 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                             <div className="border-t border-hui-border my-1" />
                                             <button
                                                 onClick={() => { handleCreateChangeOrder(); setShowMoreMenu(false); }}
-                                                disabled={isCreatingCO}
+                                                disabled={isCreatingCO || isCreatingPO}
                                                 className="w-full text-left px-4 py-2.5 hover:bg-amber-50 flex items-center gap-2.5 text-amber-700 disabled:opacity-50"
                                             >
                                                 <svg className="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
                                                 {isCreatingCO ? "Creating..." : `Create Change Order (${selectedItemIds.length})`}
+                                            </button>
+                                            <button
+                                                onClick={() => { setShowVendorSelectModal(true); setShowMoreMenu(false); }}
+                                                disabled={isCreatingCO || isCreatingPO}
+                                                className="w-full text-left px-4 py-2.5 hover:bg-emerald-50 flex items-center gap-2.5 text-emerald-700 disabled:opacity-50"
+                                            >
+                                                <svg className="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" /></svg>
+                                                {isCreatingPO ? "Creating PO..." : `Create Purchase Order (${selectedItemIds.length})`}
                                             </button>
                                         </>
                                     )}

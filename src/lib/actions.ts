@@ -3202,6 +3202,58 @@ export async function createPurchaseOrder(projectId: string, data: any) {
     return po;
 }
 
+export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
+    "use server";
+    
+    // Validate inputs
+    if (!itemIds || itemIds.length === 0) throw new Error("No items selected");
+    if (!vendorId) throw new Error("Vendor ID is required to create a Purchase Order");
+
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        include: { items: true }
+    });
+
+    if (!estimate) throw new Error("Estimate not found");
+
+    const selectedItems = estimate.items.filter((item: any) => itemIds.includes(item.id));
+    if (selectedItems.length === 0) throw new Error("No valid items found");
+
+    const totalAmount = selectedItems.reduce((acc: number, item: any) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+
+    // Get project PO count for the code
+    const count = await prisma.purchaseOrder.count({ where: { projectId } });
+    const nextNum = (count + 1).toString().padStart(3, '0');
+
+    // Create the PO
+    const newPo = await prisma.purchaseOrder.create({
+        data: {
+            projectId,
+            vendorId,
+            code: `PO-${nextNum}`,
+            status: "Draft",
+            totalAmount,
+            notes: `Auto-generated from Estimate: ${estimate.title}\n\nReview line items and update costs/quantities as needed.`,
+            memos: "",
+            terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
+            items: {
+                create: selectedItems.map((item: any, idx: number) => ({
+                    description: item.name + (item.description ? ` - ${item.description}` : ""),
+                    quantity: parseFloat(item.quantity) || 1,
+                    unitCost: parseFloat(item.unitCost) || 0,
+                    total: (parseFloat(item.quantity) || 1) * (parseFloat(item.unitCost) || 0),
+                    order: idx,
+                    costCodeId: item.costCodeId,
+                    costTypeId: item.costTypeId
+                }))
+            }
+        }
+    });
+
+    revalidatePath(`/projects/${projectId}/purchase-orders`);
+    return newPo;
+}
+
 export async function updatePurchaseOrder(id: string, data: any) {
     "use server";
     const { items, vendorId, ...poData } = data;

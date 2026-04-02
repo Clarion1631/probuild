@@ -69,7 +69,7 @@ Please extract and expand upon this information into the following structured fo
 Respond ONLY with valid JSON matching the schema provided.`;
 
         const response = await ai.models.generateContent({
-            model: "gemini-2.5-pro",
+            model: "gemini-3-flash-preview",
             contents: prompt,
             config: {
                 responseMimeType: "application/json",
