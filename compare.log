@@ -1,0 +1,430 @@
+2026-04-02 13:39:31,743  INFO      
+[Projects List]
+2026-04-02 13:39:31,865  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 13:39:37,787  INFO        [OK] Your site captured: Projects List (116,065 bytes)
+2026-04-02 13:39:37,798  INFO        Running Gemini diff for: Projects List
+2026-04-02 13:39:49,920  ERROR       Gemini diff failed for [Projects List]: Unterminated string starting at: line 7 column 5 (char 348)
+2026-04-02 13:39:49,921  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 7 column 5 (char 348)
+2026-04-02 13:39:50,931  INFO      
+[Project Overview]
+2026-04-02 13:39:50,999  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 13:39:55,642  INFO        [OK] Your site captured: Project Overview (116,065 bytes)
+2026-04-02 13:39:55,651  INFO        Running Gemini diff for: Project Overview
+2026-04-02 13:40:10,704  ERROR       Gemini diff failed for [Project Overview]: Unterminated string starting at: line 7 column 5 (char 349)
+2026-04-02 13:40:10,705  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 7 column 5 (char 349)
+2026-04-02 13:40:11,720  INFO      
+[Leads List]
+2026-04-02 13:40:11,791  INFO        -> Your site: https://probuild.goldentouchremodeling.com/leads
+2026-04-02 13:40:15,507  INFO        [OK] Your site captured: Leads List (119,435 bytes)
+2026-04-02 13:40:15,514  INFO        Running Gemini diff for: Leads List
+2026-04-02 13:40:29,445  ERROR       Gemini diff failed for [Leads List]: Expecting value: line 6 column 69 (char 367)
+2026-04-02 13:40:29,446  INFO        Score: 0/100 — Analysis failed: Expecting value: line 6 column 69 (char 367)
+2026-04-02 13:40:30,448  INFO      
+[Estimates]
+2026-04-02 13:40:30,518  INFO        -> Your site: https://probuild.goldentouchremodeling.com/estimates
+2026-04-02 13:40:35,535  INFO        [OK] Your site captured: Estimates (142,752 bytes)
+2026-04-02 13:40:35,542  INFO        Running Gemini diff for: Estimates
+2026-04-02 13:40:49,522  ERROR       Gemini diff failed for [Estimates]: Expecting value: line 6 column 60 (char 355)
+2026-04-02 13:40:49,523  INFO        Score: 0/100 — Analysis failed: Expecting value: line 6 column 60 (char 355)
+2026-04-02 13:40:50,535  INFO      
+[Invoices]
+2026-04-02 13:40:50,599  INFO        -> Your site: https://probuild.goldentouchremodeling.com/invoices
+2026-04-02 13:40:54,578  INFO        [OK] Your site captured: Invoices (61,368 bytes)
+2026-04-02 13:40:54,585  INFO        Running Gemini diff for: Invoices
+2026-04-02 13:41:09,429  ERROR       Gemini diff failed for [Invoices]: Unterminated string starting at: line 6 column 5 (char 299)
+2026-04-02 13:41:09,430  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 6 column 5 (char 299)
+2026-04-02 13:41:10,441  INFO      
+[Schedule]
+2026-04-02 13:41:10,511  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/schedule
+2026-04-02 13:41:14,896  INFO        [OK] Your site captured: Schedule (46,489 bytes)
+2026-04-02 13:41:14,904  INFO        Running Gemini diff for: Schedule
+2026-04-02 13:41:26,512  INFO        Score: 35/100 — The implementation significantly deviates from the reference design in terms of layout, functionality, and visual hierarchy, missing the core onboarding wizard and action controls.
+2026-04-02 13:41:27,516  INFO      
+[Time & Expenses]
+2026-04-02 13:41:27,581  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/time-entries
+2026-04-02 13:41:39,956  INFO        [OK] Your site captured: Time & Expenses (12,834 bytes)
+2026-04-02 13:41:39,962  INFO        Running Gemini diff for: Time & Expenses
+2026-04-02 13:41:46,918  INFO        Score: 0/100 — The implementation is completely non-functional, displaying a server-side exception error instead of the intended dashboard UI.
+2026-04-02 13:41:47,920  INFO      
+[Reports Overview]
+2026-04-02 13:41:47,986  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/variance
+2026-04-02 13:41:52,022  INFO        [OK] Your site captured: Reports Overview (53,959 bytes)
+2026-04-02 13:41:52,029  INFO        Running Gemini diff for: Reports Overview
+2026-04-02 13:42:05,820  ERROR       Gemini diff failed for [Reports Overview]: Expecting ',' delimiter: line 6 column 66 (char 368)
+2026-04-02 13:42:05,821  INFO        Score: 0/100 — Analysis failed: Expecting ',' delimiter: line 6 column 66 (char 368)
+2026-04-02 13:42:06,827  INFO      
+[Settings]
+2026-04-02 13:42:06,927  INFO        -> Your site: https://probuild.goldentouchremodeling.com/settings
+2026-04-02 13:42:21,426  INFO        [OK] Your site captured: Settings (28,698 bytes)
+2026-04-02 13:42:21,434  INFO        Running Gemini diff for: Settings
+2026-04-02 13:42:32,605  INFO        Score: 15/100 — The implementation is fundamentally broken, displaying a 404 error instead of the settings page, and the navigation sidebar significantly deviates from the reference design.
+2026-04-02 13:42:33,606  INFO      
+[Company]
+2026-04-02 13:42:33,701  INFO        -> Your site: https://probuild.goldentouchremodeling.com/company
+2026-04-02 13:42:47,948  INFO        [OK] Your site captured: Company (28,698 bytes)
+2026-04-02 13:42:47,955  INFO        Running Gemini diff for: Company
+2026-04-02 13:42:59,261  INFO        Score: 15/100 — The implementation is fundamentally broken, displaying a 404 error page instead of the required settings interface, with significant discrepancies in the sidebar and header components.
+2026-04-02 13:43:00,263  INFO      
+[Daily Logs]
+2026-04-02 13:43:00,334  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 13:43:04,271  INFO        [OK] Your site captured: Daily Logs (116,065 bytes)
+2026-04-02 13:43:04,278  INFO        Running Gemini diff for: Daily Logs
+2026-04-02 13:43:18,912  ERROR       Gemini diff failed for [Daily Logs]: Expecting ',' delimiter: line 20 column 138 (char 1242)
+2026-04-02 13:43:18,913  INFO        Score: 0/100 — Analysis failed: Expecting ',' delimiter: line 20 column 138 (char 1242)
+2026-04-02 13:43:20,031  INFO      
+Report saved -> output\report.html
+2026-04-02 13:43:20,031  INFO      Done! Open: output\report.html
+2026-04-02 13:45:04,222  INFO      
+[Projects List]
+2026-04-02 13:45:04,360  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 13:45:09,401  INFO        [OK] Your site captured: Projects List (116,068 bytes)
+2026-04-02 13:45:09,408  INFO        Running Gemini diff for: Projects List
+2026-04-02 13:45:09,409  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:45:22,467  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:45:22,471  ERROR       Gemini diff failed for [Projects List]: Unterminated string starting at: line 6 column 5 (char 262)
+2026-04-02 13:45:22,472  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 6 column 5 (char 262)
+2026-04-02 13:45:23,483  INFO      
+[Project Overview]
+2026-04-02 13:45:23,605  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 13:45:34,647  INFO        [OK] Your site captured: Project Overview (116,065 bytes)
+2026-04-02 13:45:34,656  INFO        Running Gemini diff for: Project Overview
+2026-04-02 13:45:34,657  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:45:46,462  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:45:46,463  ERROR       Gemini diff failed for [Project Overview]: Unterminated string starting at: line 25 column 22 (char 1340)
+2026-04-02 13:45:46,463  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 25 column 22 (char 1340)
+2026-04-02 13:45:47,474  INFO      
+[Leads List]
+2026-04-02 13:45:47,558  INFO        -> Your site: https://probuild.goldentouchremodeling.com/leads
+2026-04-02 13:45:51,476  INFO        [OK] Your site captured: Leads List (119,435 bytes)
+2026-04-02 13:45:51,488  INFO        Running Gemini diff for: Leads List
+2026-04-02 13:45:51,489  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:46:04,515  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:46:04,519  INFO        Score: 45/100 — The implementation is a simplified version of the reference design, missing significant functional components, navigation depth, and the dense data-grid aesthetic of the original CRM.
+2026-04-02 13:46:05,528  INFO      
+[Estimates]
+2026-04-02 13:46:05,599  INFO        -> Your site: https://probuild.goldentouchremodeling.com/estimates
+2026-04-02 13:46:10,163  INFO        [OK] Your site captured: Estimates (142,752 bytes)
+2026-04-02 13:46:10,169  INFO        Running Gemini diff for: Estimates
+2026-04-02 13:46:10,170  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:46:23,574  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:46:23,575  INFO        Score: 60/100 — The implementation captures the basic table structure but lacks the critical right-hand financial summary panel, advanced filtering options, and refined UI components like status badges and icons.
+2026-04-02 13:46:24,585  INFO      
+[Invoices]
+2026-04-02 13:46:24,652  INFO        -> Your site: https://probuild.goldentouchremodeling.com/invoices
+2026-04-02 13:46:28,689  INFO        [OK] Your site captured: Invoices (61,368 bytes)
+2026-04-02 13:46:28,696  INFO        Running Gemini diff for: Invoices
+2026-04-02 13:46:28,696  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:46:42,609  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:46:42,610  INFO        Score: 35/100 — The implementation significantly deviates from the reference design in terms of navigation structure, information density, and visual styling of core components.
+2026-04-02 13:46:43,620  INFO      
+[Schedule]
+2026-04-02 13:46:43,682  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/schedule
+2026-04-02 13:46:47,060  INFO        [OK] Your site captured: Schedule (46,489 bytes)
+2026-04-02 13:46:47,068  INFO        Running Gemini diff for: Schedule
+2026-04-02 13:46:47,069  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:46:59,023  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:46:59,043  ERROR       Gemini diff failed for [Schedule]: Expecting value: line 7 column 1 (char 327)
+2026-04-02 13:46:59,043  INFO        Score: 0/100 — Analysis failed: Expecting value: line 7 column 1 (char 327)
+2026-04-02 13:47:00,058  INFO      
+[Time & Expenses]
+2026-04-02 13:47:00,127  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/time-entries
+2026-04-02 13:47:12,685  INFO        [OK] Your site captured: Time & Expenses (12,834 bytes)
+2026-04-02 13:47:12,691  INFO        Running Gemini diff for: Time & Expenses
+2026-04-02 13:47:12,691  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:47:19,833  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:47:19,834  INFO        Score: 0/100 — The implementation is completely non-functional, displaying a server-side application error instead of the intended user interface.
+2026-04-02 13:47:20,848  INFO      
+[Reports Overview]
+2026-04-02 13:47:20,914  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/variance
+2026-04-02 13:47:24,788  INFO        [OK] Your site captured: Reports Overview (53,959 bytes)
+2026-04-02 13:47:24,795  INFO        Running Gemini diff for: Reports Overview
+2026-04-02 13:47:24,796  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:47:38,339  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:47:38,366  INFO        Score: 35/100 — The implementation significantly deviates from the reference design's visual language, particularly in the sidebar theme, card styling, and overall color palette.
+2026-04-02 13:47:39,368  INFO      
+[Settings]
+2026-04-02 13:47:39,442  INFO        -> Your site: https://probuild.goldentouchremodeling.com/settings
+2026-04-02 13:47:53,551  INFO        [OK] Your site captured: Settings (28,698 bytes)
+2026-04-02 13:47:53,564  INFO        Running Gemini diff for: Settings
+2026-04-02 13:47:53,564  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:48:06,307  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:48:06,309  ERROR       Gemini diff failed for [Settings]: Unterminated string starting at: line 6 column 5 (char 235)
+2026-04-02 13:48:06,309  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 6 column 5 (char 235)
+2026-04-02 13:48:07,318  INFO      
+[Company]
+2026-04-02 13:48:07,401  INFO        -> Your site: https://probuild.goldentouchremodeling.com/company
+2026-04-02 13:48:21,507  INFO        [OK] Your site captured: Company (28,698 bytes)
+2026-04-02 13:48:21,515  INFO        Running Gemini diff for: Company
+2026-04-02 13:48:21,515  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:48:33,276  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:48:33,279  INFO        Score: 5/100 — The implementation is fundamentally broken, displaying a 404 error page instead of the intended Company Info settings interface.
+2026-04-02 13:48:34,290  INFO      
+[Daily Logs]
+2026-04-02 13:48:34,364  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 13:48:38,458  INFO        [OK] Your site captured: Daily Logs (116,065 bytes)
+2026-04-02 13:48:38,465  INFO        Running Gemini diff for: Daily Logs
+2026-04-02 13:48:38,466  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:48:53,154  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:48:53,156  ERROR       Gemini diff failed for [Daily Logs]: Unterminated string starting at: line 32 column 21 (char 1773)
+2026-04-02 13:48:53,156  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 32 column 21 (char 1773)
+2026-04-02 13:48:54,279  INFO      
+Report saved -> output\report.html
+2026-04-02 13:48:54,280  INFO      Done! Open: output\report.html
+2026-04-02 13:50:10,227  INFO      
+[Projects List]
+2026-04-02 13:50:10,227  INFO        Using cached screenshot for: Projects List
+2026-04-02 13:50:10,230  INFO        Running Gemini diff for: Projects List
+2026-04-02 13:50:10,231  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:50:22,938  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:50:22,968  INFO        Score: 60/100 — The implementation captures the basic dashboard layout but misses key functional components like the summary cards and specific data columns.
+2026-04-02 13:50:23,984  INFO      
+[Project Overview]
+2026-04-02 13:50:23,985  INFO        Using cached screenshot for: Project Overview
+2026-04-02 13:50:23,987  INFO        Running Gemini diff for: Project Overview
+2026-04-02 13:50:23,987  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:50:35,774  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:50:35,803  INFO        Score: 35/100 — The implementation displays a project list view instead of the project dashboard shown in the reference, resulting in a complete mismatch of layout, components, and functionality.
+2026-04-02 13:50:36,816  INFO      
+[Leads List]
+2026-04-02 13:50:36,817  INFO        Using cached screenshot for: Leads List
+2026-04-02 13:50:36,818  INFO        Running Gemini diff for: Leads List
+2026-04-02 13:50:36,818  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:50:47,881  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:50:47,905  ERROR       Gemini diff failed for [Leads List]: Expecting property name enclosed in double quotes: line 43 column 172 (char 2311)
+2026-04-02 13:50:47,905  INFO        Score: 0/100 — Analysis failed: Expecting property name enclosed in double quotes: line 43 column 172 (char 2311)
+2026-04-02 13:50:48,911  INFO      
+[Estimates]
+2026-04-02 13:50:48,911  INFO        Using cached screenshot for: Estimates
+2026-04-02 13:50:48,912  INFO        Running Gemini diff for: Estimates
+2026-04-02 13:50:48,912  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:50:59,867  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:50:59,870  INFO        Score: 55/100 — The implementation captures the basic table structure but fails significantly on the overall layout, missing the entire right-hand summary panel and the complex nested navigation of the reference.
+2026-04-02 13:51:00,880  INFO      
+[Invoices]
+2026-04-02 13:51:00,880  INFO        Using cached screenshot for: Invoices
+2026-04-02 13:51:00,881  INFO        Running Gemini diff for: Invoices
+2026-04-02 13:51:00,881  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:51:14,790  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:51:14,812  ERROR       Gemini diff failed for [Invoices]: Unterminated string starting at: line 26 column 21 (char 1189)
+2026-04-02 13:51:14,812  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 26 column 21 (char 1189)
+2026-04-02 13:51:15,818  INFO      
+[Schedule]
+2026-04-02 13:51:15,819  INFO        Using cached screenshot for: Schedule
+2026-04-02 13:51:15,819  INFO        Running Gemini diff for: Schedule
+2026-04-02 13:51:15,820  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:51:27,716  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:51:27,733  ERROR       Gemini diff failed for [Schedule]: Unterminated string starting at: line 32 column 21 (char 1706)
+2026-04-02 13:51:27,733  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 32 column 21 (char 1706)
+2026-04-02 13:51:28,736  INFO      
+[Time & Expenses]
+2026-04-02 13:51:28,736  INFO        Using cached screenshot for: Time & Expenses
+2026-04-02 13:51:28,737  INFO        Running Gemini diff for: Time & Expenses
+2026-04-02 13:51:28,737  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:51:35,305  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:51:35,308  INFO        Score: 0/100 — The implementation is completely non-functional, displaying a server-side error message instead of the intended user interface.
+2026-04-02 13:51:36,316  INFO      
+[Reports Overview]
+2026-04-02 13:51:36,317  INFO        Using cached screenshot for: Reports Overview
+2026-04-02 13:51:36,318  INFO        Running Gemini diff for: Reports Overview
+2026-04-02 13:51:36,318  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:51:49,303  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:51:49,322  ERROR       Gemini diff failed for [Reports Overview]: Unterminated string starting at: line 31 column 22 (char 1613)
+2026-04-02 13:51:49,322  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 31 column 22 (char 1613)
+2026-04-02 13:51:50,332  INFO      
+[Settings]
+2026-04-02 13:51:50,333  INFO        Using cached screenshot for: Settings
+2026-04-02 13:51:50,334  INFO        Running Gemini diff for: Settings
+2026-04-02 13:51:50,334  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:52:02,853  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:52:02,878  ERROR       Gemini diff failed for [Settings]: Unterminated string starting at: line 29 column 22 (char 1245)
+2026-04-02 13:52:02,878  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 29 column 22 (char 1245)
+2026-04-02 13:52:03,881  INFO      
+[Company]
+2026-04-02 13:52:03,881  INFO        Using cached screenshot for: Company
+2026-04-02 13:52:03,882  INFO        Running Gemini diff for: Company
+2026-04-02 13:52:03,882  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:52:15,656  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:52:15,674  ERROR       Gemini diff failed for [Company]: Unterminated string starting at: line 1 column 654 (char 653)
+2026-04-02 13:52:15,674  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 1 column 654 (char 653)
+2026-04-02 13:52:16,677  INFO      
+[Daily Logs]
+2026-04-02 13:52:16,678  INFO        Using cached screenshot for: Daily Logs
+2026-04-02 13:52:16,679  INFO        Running Gemini diff for: Daily Logs
+2026-04-02 13:52:16,680  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:52:45,348  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:52:45,369  ERROR       Gemini diff failed for [Daily Logs]: Unterminated string starting at: line 32 column 21 (char 1905)
+2026-04-02 13:52:45,369  INFO        Score: 0/100 — Analysis failed: Unterminated string starting at: line 32 column 21 (char 1905)
+2026-04-02 13:52:46,467  INFO      
+Report saved -> output\report.html
+2026-04-02 13:52:46,467  INFO      Done! Open: output\report.html
+2026-04-02 13:53:34,859  INFO      
+[Projects List]
+2026-04-02 13:53:34,860  INFO        Using cached screenshot for: Projects List
+2026-04-02 13:53:34,861  INFO        Running Gemini diff for: Projects List
+2026-04-02 13:53:34,861  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:53:46,427  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:53:46,429  INFO        Score: 65/100 — The implementation captures the basic layout of a sidebar and project table but misses key functional components like the top project cards and specific data columns.
+2026-04-02 13:53:47,437  INFO      
+[Project Overview]
+2026-04-02 13:53:47,438  INFO        Using cached screenshot for: Project Overview
+2026-04-02 13:53:47,439  INFO        Running Gemini diff for: Project Overview
+2026-04-02 13:53:47,439  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:53:58,635  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:53:58,660  INFO        Score: 35/100 — The implementation displays a project list view instead of the project dashboard shown in the reference, resulting in a complete mismatch of layout, components, and functionality.
+2026-04-02 13:53:59,673  INFO      
+[Leads List]
+2026-04-02 13:53:59,674  INFO        Using cached screenshot for: Leads List
+2026-04-02 13:53:59,674  INFO        Running Gemini diff for: Leads List
+2026-04-02 13:53:59,674  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:54:10,772  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:54:10,792  INFO        Score: 45/100 — The implementation is a simplified version of the reference, missing critical navigation components, tabbed views, and multiple data columns in the leads table.
+2026-04-02 13:54:11,805  INFO      
+[Estimates]
+2026-04-02 13:54:11,805  INFO        Using cached screenshot for: Estimates
+2026-04-02 13:54:11,806  INFO        Running Gemini diff for: Estimates
+2026-04-02 13:54:11,806  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:54:23,683  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:54:23,707  INFO        Score: 55/100 — The implementation captures the basic table structure but fails to include the complex sidebar navigation, the right-hand summary panels, and specific component styling like status badges and brand-aligned button colors.
+2026-04-02 13:54:24,715  INFO      
+[Invoices]
+2026-04-02 13:54:24,716  INFO        Using cached screenshot for: Invoices
+2026-04-02 13:54:24,716  INFO        Running Gemini diff for: Invoices
+2026-04-02 13:54:24,716  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:54:34,931  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:54:34,960  INFO        Score: 65/100 — The implementation follows the general layout of a dashboard with summary cards and a data table, but deviates significantly in navigation structure, filter UI, and data formatting precision.
+2026-04-02 13:54:35,974  INFO      
+[Schedule]
+2026-04-02 13:54:35,974  INFO        Using cached screenshot for: Schedule
+2026-04-02 13:54:35,975  INFO        Running Gemini diff for: Schedule
+2026-04-02 13:54:35,975  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:54:47,296  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:54:47,316  INFO        Score: 45/100 — The implementation follows the basic layout structure of a sidebar and header but fails to replicate the specific UI components, onboarding flow, and refined styling of the reference design.
+2026-04-02 13:54:48,324  INFO      
+[Time & Expenses]
+2026-04-02 13:54:48,325  INFO        Using cached screenshot for: Time & Expenses
+2026-04-02 13:54:48,326  INFO        Running Gemini diff for: Time & Expenses
+2026-04-02 13:54:48,326  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:54:52,165  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:54:52,190  INFO        Score: 0/100 — The implementation is completely non-functional, displaying a server-side application error instead of the intended user interface.
+2026-04-02 13:54:53,202  INFO      
+[Reports Overview]
+2026-04-02 13:54:53,203  INFO        Using cached screenshot for: Reports Overview
+2026-04-02 13:54:53,204  INFO        Running Gemini diff for: Reports Overview
+2026-04-02 13:54:53,204  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:55:06,355  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:55:06,378  INFO        Score: 35/100 — The implementation fails to match the reference's dashboard layout, instead displaying a specific report view with inconsistent sidebar styling and an added top header.
+2026-04-02 13:55:07,385  INFO      
+[Settings]
+2026-04-02 13:55:07,385  INFO        Using cached screenshot for: Settings
+2026-04-02 13:55:07,386  INFO        Running Gemini diff for: Settings
+2026-04-02 13:55:07,386  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:55:19,458  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:55:19,478  INFO        Score: 5/100 — The implementation is fundamentally broken as it displays a 404 error page instead of the requested Company Info settings interface, and the navigation structure is completely different.
+2026-04-02 13:55:20,485  INFO      
+[Company]
+2026-04-02 13:55:20,485  INFO        Using cached screenshot for: Company
+2026-04-02 13:55:20,486  INFO        Running Gemini diff for: Company
+2026-04-02 13:55:20,486  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:55:29,274  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:55:29,276  INFO        Score: 15/100 — The implementation is fundamentally broken, displaying a 404 error page instead of the Company Info settings interface shown in the reference.
+2026-04-02 13:55:30,285  INFO      
+[Daily Logs]
+2026-04-02 13:55:30,286  INFO        Using cached screenshot for: Daily Logs
+2026-04-02 13:55:30,287  INFO        Running Gemini diff for: Daily Logs
+2026-04-02 13:55:30,287  INFO      AFC is enabled with max remote calls: 10.
+2026-04-02 13:55:43,500  INFO      HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent "HTTP/1.1 200 OK"
+2026-04-02 13:55:43,522  INFO        Score: 40/100 — The implementation displays a different functional page (Project List) than the reference (Daily Logs), and lacks the secondary navigation architecture and header utility elements.
+2026-04-02 13:55:44,610  INFO      
+Report saved -> output\report.html
+2026-04-02 13:55:44,610  INFO      Done! Open: output\report.html
+2026-04-02 14:25:43,096  INFO      
+[Projects List]
+2026-04-02 14:25:43,212  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 14:25:49,553  INFO        [OK] Your site captured: Projects List (116,065 bytes)
+2026-04-02 14:25:49,560  INFO        Running Claude diff for: Projects List
+2026-04-02 14:25:50,137  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:25:50,137  ERROR       Claude diff failed for [Projects List]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfeidV7jbM35StTSSAZE'}
+2026-04-02 14:25:50,138  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfeidV7jbM35StTSSAZE'}
+2026-04-02 14:25:51,141  INFO      
+[Project Overview]
+2026-04-02 14:25:51,203  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 14:25:55,612  INFO        [OK] Your site captured: Project Overview (116,065 bytes)
+2026-04-02 14:25:55,618  INFO        Running Claude diff for: Project Overview
+2026-04-02 14:25:55,972  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:25:55,973  ERROR       Claude diff failed for [Project Overview]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfej4n8kLXGvyvncEFJ9'}
+2026-04-02 14:25:55,974  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfej4n8kLXGvyvncEFJ9'}
+2026-04-02 14:25:56,984  INFO      
+[Leads List]
+2026-04-02 14:25:57,043  INFO        -> Your site: https://probuild.goldentouchremodeling.com/leads
+2026-04-02 14:26:00,263  INFO        [OK] Your site captured: Leads List (119,435 bytes)
+2026-04-02 14:26:00,269  INFO        Running Claude diff for: Leads List
+2026-04-02 14:26:00,622  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:00,622  ERROR       Claude diff failed for [Leads List]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfejQCgYQh3difBg8PMv'}
+2026-04-02 14:26:00,623  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfejQCgYQh3difBg8PMv'}
+2026-04-02 14:26:01,636  INFO      
+[Estimates]
+2026-04-02 14:26:01,693  INFO        -> Your site: https://probuild.goldentouchremodeling.com/estimates
+2026-04-02 14:26:06,247  INFO        [OK] Your site captured: Estimates (142,752 bytes)
+2026-04-02 14:26:06,254  INFO        Running Claude diff for: Estimates
+2026-04-02 14:26:06,812  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:06,812  ERROR       Claude diff failed for [Estimates]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfejrsZ3yiDW3RP3F4yF'}
+2026-04-02 14:26:06,812  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfejrsZ3yiDW3RP3F4yF'}
+2026-04-02 14:26:07,820  INFO      
+[Invoices]
+2026-04-02 14:26:07,874  INFO        -> Your site: https://probuild.goldentouchremodeling.com/invoices
+2026-04-02 14:26:12,212  INFO        [OK] Your site captured: Invoices (61,368 bytes)
+2026-04-02 14:26:12,218  INFO        Running Claude diff for: Invoices
+2026-04-02 14:26:12,446  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:12,447  ERROR       Claude diff failed for [Invoices]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfekHJEYtY3BfCZdDLs7'}
+2026-04-02 14:26:12,447  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfekHJEYtY3BfCZdDLs7'}
+2026-04-02 14:26:13,449  INFO      
+[Schedule]
+2026-04-02 14:26:13,500  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/schedule
+2026-04-02 14:26:17,604  INFO        [OK] Your site captured: Schedule (46,489 bytes)
+2026-04-02 14:26:17,611  INFO        Running Claude diff for: Schedule
+2026-04-02 14:26:17,944  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:17,944  ERROR       Claude diff failed for [Schedule]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfekgie1coKBnr4wo8D7'}
+2026-04-02 14:26:17,945  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfekgie1coKBnr4wo8D7'}
+2026-04-02 14:26:18,956  INFO      
+[Time & Expenses]
+2026-04-02 14:26:19,006  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/time-entries
+2026-04-02 14:26:31,728  INFO        [OK] Your site captured: Time & Expenses (12,834 bytes)
+2026-04-02 14:26:31,735  INFO        Running Claude diff for: Time & Expenses
+2026-04-02 14:26:32,002  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:32,002  ERROR       Claude diff failed for [Time & Expenses]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfemixMotoWgWqBpjxTU'}
+2026-04-02 14:26:32,003  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfemixMotoWgWqBpjxTU'}
+2026-04-02 14:26:33,009  INFO      
+[Reports Overview]
+2026-04-02 14:26:33,066  INFO        -> Your site: https://probuild.goldentouchremodeling.com/manager/variance
+2026-04-02 14:26:36,884  INFO        [OK] Your site captured: Reports Overview (53,959 bytes)
+2026-04-02 14:26:36,891  INFO        Running Claude diff for: Reports Overview
+2026-04-02 14:26:37,147  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:37,147  ERROR       Claude diff failed for [Reports Overview]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfen6xC4RTQqPqHg6AFB'}
+2026-04-02 14:26:37,148  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfen6xC4RTQqPqHg6AFB'}
+2026-04-02 14:26:38,156  INFO      
+[Settings]
+2026-04-02 14:26:38,223  INFO        -> Your site: https://probuild.goldentouchremodeling.com/settings
+2026-04-02 14:26:52,397  INFO        [OK] Your site captured: Settings (28,698 bytes)
+2026-04-02 14:26:52,403  INFO        Running Claude diff for: Settings
+2026-04-02 14:26:52,742  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:26:52,743  ERROR       Claude diff failed for [Settings]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfeoFUgMVrueqUWYV8Hd'}
+2026-04-02 14:26:52,743  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfeoFUgMVrueqUWYV8Hd'}
+2026-04-02 14:26:53,755  INFO      
+[Company]
+2026-04-02 14:26:53,816  INFO        -> Your site: https://probuild.goldentouchremodeling.com/company
+2026-04-02 14:27:08,146  INFO        [OK] Your site captured: Company (28,698 bytes)
+2026-04-02 14:27:08,152  INFO        Running Claude diff for: Company
+2026-04-02 14:27:08,537  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:27:08,537  ERROR       Claude diff failed for [Company]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfepR1wZ31mggbh51MCJ'}
+2026-04-02 14:27:08,538  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfepR1wZ31mggbh51MCJ'}
+2026-04-02 14:27:09,543  INFO      
+[Daily Logs]
+2026-04-02 14:27:09,594  INFO        -> Your site: https://probuild.goldentouchremodeling.com/projects
+2026-04-02 14:27:13,794  INFO        [OK] Your site captured: Daily Logs (116,065 bytes)
+2026-04-02 14:27:13,802  INFO        Running Claude diff for: Daily Logs
+2026-04-02 14:27:14,191  INFO      HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 400 Bad Request"
+2026-04-02 14:27:14,191  ERROR       Claude diff failed for [Daily Logs]: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfepqExsH4dAjZEvFefZ'}
+2026-04-02 14:27:14,192  INFO        Score: 0/100 — Analysis failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CZfepqExsH4dAjZEvFefZ'}
+2026-04-02 14:27:15,296  INFO      
+Report saved -> output\report.html
+2026-04-02 14:27:15,296  INFO      Done! Open: output\report.html

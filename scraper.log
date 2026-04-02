@@ -1,0 +1,327 @@
+2026-04-02 13:05:42,832  INFO      Starting — 1 URLs, headed=False
+2026-04-02 13:05:42,846  INFO      1 pages to scrape (skipping already-done).
+2026-04-02 13:05:43,750  INFO      Injected 24 session cookies.
+2026-04-02 13:05:43,754  INFO      [1/1] https://pro.houzz.com/manage/projects
+2026-04-02 13:06:15,557  INFO      Starting — 107 URLs, headed=False
+2026-04-02 13:06:15,560  INFO      106 pages to scrape (skipping already-done).
+2026-04-02 13:06:16,367  INFO      Injected 24 session cookies.
+2026-04-02 13:06:16,371  INFO      [1/106] https://pro.houzz.com/manage/projects/2340349/overview
+2026-04-02 13:06:16,503  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2340349/overview
+2026-04-02 13:06:25,711  INFO        [OK] Captured: "Fisher water damage | Houzz Pro" (769,021 chars, 398,654 bytes screenshot)
+2026-04-02 13:06:27,949  INFO      [2/106] https://pro.houzz.com/manage/d/projects/2340349/contracts
+2026-04-02 13:06:28,020  INFO        -> Navigating: https://pro.houzz.com/manage/d/projects/2340349/contracts
+2026-04-02 13:06:35,018  INFO        [OK] Captured: "Contracts | Fisher water damage | Houzz Pro" (587,392 chars, 94,491 bytes screenshot)
+2026-04-02 13:06:37,940  INFO      [3/106] https://pro.houzz.com/manage/d/contracts/4111290/edit
+2026-04-02 13:06:38,005  INFO        -> Navigating: https://pro.houzz.com/manage/d/contracts/4111290/edit
+2026-04-02 13:06:44,766  INFO        [OK] Captured: "Contracts | Fisher water damage | Houzz Pro" (698,125 chars, 168,037 bytes screenshot)
+2026-04-02 13:06:46,292  INFO      [4/106] https://pro.houzz.com/manage/d/projects/2340349/estimates
+2026-04-02 13:06:46,364  INFO        -> Navigating: https://pro.houzz.com/manage/d/projects/2340349/estimates
+2026-04-02 13:06:55,589  INFO        [OK] Captured: "Estimates | Fisher water damage | Houzz Pro" (660,269 chars, 166,327 bytes screenshot)
+2026-04-02 13:06:57,811  INFO      [5/106] https://pro.houzz.com/manage/d/estimates/5962494/edit
+2026-04-02 13:06:57,887  INFO        -> Navigating: https://pro.houzz.com/manage/d/estimates/5962494/edit
+2026-04-02 13:07:07,942  INFO        [OK] Captured: "Estimates | Fisher water damage | ES-10122 | Houzz Pro" (763,135 chars, 161,220 bytes screenshot)
+2026-04-02 13:07:10,878  INFO      [6/106] https://pro.houzz.com/manage/projects/2340349/mood-boards
+2026-04-02 13:07:10,942  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2340349/mood-boards
+2026-04-02 13:07:18,385  INFO        [OK] Captured: "Mood Boards | Fisher water damage | Houzz Pro" (598,756 chars, 123,970 bytes screenshot)
+2026-04-02 13:07:19,920  INFO      [7/106] https://pro.houzz.com/manage/moodboards/216622234
+2026-04-02 13:07:19,988  INFO        -> Navigating: https://pro.houzz.com/manage/moodboards/216622234
+2026-04-02 13:07:27,589  INFO        [OK] Captured: "Mood Boards | David Test | Kitchen Mood Board | Houzz Pro" (657,891 chars, 140,899 bytes screenshot)
+2026-04-02 13:07:29,815  INFO      [8/106] https://pro.houzz.com/manage/projects/2942703/takeoffs
+2026-04-02 13:07:29,893  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/takeoffs
+2026-04-02 13:07:36,582  INFO        [OK] Captured: "Takeoff | David Test | Houzz Pro" (595,086 chars, 81,891 bytes screenshot)
+2026-04-02 13:07:39,511  INFO      [9/106] https://pro.houzz.com/manage/tjp/canvas/3fb6ef1349625b175751c68734eb0a9b042b8c10/page/1.0
+2026-04-02 13:07:39,578  INFO        -> Navigating: https://pro.houzz.com/manage/tjp/canvas/3fb6ef1349625b175751c68734eb0a9b042b8c10/page/1.0
+2026-04-02 13:07:48,207  INFO        [OK] Captured: "Takeoff Software | David Test | Houzz" (533,802 chars, 169,450 bytes screenshot)
+2026-04-02 13:07:49,736  INFO      [10/106] https://pro.houzz.com/manage/projects/2942703/floor-plans
+2026-04-02 13:07:49,805  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/floor-plans
+2026-04-02 13:07:56,941  INFO        [OK] Captured: "3D Floor Plans | David Test | Houzz Pro" (604,318 chars, 157,031 bytes screenshot)
+2026-04-02 13:07:59,170  INFO      [11/106] https://pro.houzz.com/manage/floorplans/214199026
+2026-04-02 13:07:59,242  INFO        -> Navigating: https://pro.houzz.com/manage/floorplans/214199026
+2026-04-02 13:08:08,650  INFO        [OK] Captured: "3D Floor Plans | David Test | Untitled | Houzz Pro" (937,888 chars, 526,398 bytes screenshot)
+2026-04-02 13:08:11,587  INFO      [12/106] https://pro.houzz.com/manage/selections/projects/2942703/boards
+2026-04-02 13:08:12,204  INFO        -> Navigating: https://pro.houzz.com/manage/selections/projects/2942703/boards
+2026-04-02 13:08:19,277  INFO        [OK] Captured: "Houzz Pro: Manage" (526,265 chars, 54,418 bytes screenshot)
+2026-04-02 13:08:20,807  INFO      [13/106] https://pro.houzz.com/manage/selections/board/2350172
+2026-04-02 13:08:20,891  INFO        -> Navigating: https://pro.houzz.com/manage/selections/board/2350172
+2026-04-02 13:08:28,053  INFO        [OK] Captured: "Kitchen | Selection Boards | David Test | Houzz Pro" (586,457 chars, 274,315 bytes screenshot)
+2026-04-02 13:08:30,275  INFO      [14/106] https://pro.houzz.com/manage/bids/projects/2942703/bid-packages
+2026-04-02 13:08:30,341  INFO        -> Navigating: https://pro.houzz.com/manage/bids/projects/2942703/bid-packages
+2026-04-02 13:08:36,864  INFO        [OK] Captured: "Bid Management | David Test | Houzz Pro" (531,030 chars, 76,868 bytes screenshot)
+2026-04-02 13:08:39,790  INFO      [15/106] https://pro.houzz.com/manage/bids/bid-packages/100584/edit
+2026-04-02 13:08:39,857  INFO        -> Navigating: https://pro.houzz.com/manage/bids/bid-packages/100584/edit
+2026-04-02 13:08:46,496  INFO        [OK] Captured: "Test | Bid Management | David Test | Houzz Pro" (525,798 chars, 87,996 bytes screenshot)
+2026-04-02 13:08:48,024  INFO      [16/106] https://pro.houzz.com/manage/projects/2942703/files
+2026-04-02 13:08:48,091  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/files
+2026-04-02 13:08:55,560  INFO        [OK] Captured: "Files & Photos | David Test | Houzz Pro" (604,838 chars, 103,884 bytes screenshot)
+2026-04-02 13:08:57,794  INFO      [17/106] https://pro.houzz.com/manage/schedule/projects/2942703
+2026-04-02 13:08:57,859  INFO        -> Navigating: https://pro.houzz.com/manage/schedule/projects/2942703
+2026-04-02 13:09:05,067  INFO        [OK] Captured: "Houzz Pro: Manage" (536,195 chars, 77,845 bytes screenshot)
+2026-04-02 13:09:08,003  INFO      [18/106] https://pro.houzz.com/manage/tasks/projects/2942703
+2026-04-02 13:09:08,071  INFO        -> Navigating: https://pro.houzz.com/manage/tasks/projects/2942703
+2026-04-02 13:09:16,064  INFO        [OK] Captured: "Tasks | David Test | Houzz Pro" (556,184 chars, 110,085 bytes screenshot)
+2026-04-02 13:09:17,592  INFO      [19/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703
+2026-04-02 13:09:17,674  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703
+2026-04-02 13:09:25,896  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (569,864 chars, 493,982 bytes screenshot)
+2026-04-02 13:09:28,139  INFO      [20/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/messages
+2026-04-02 13:09:28,444  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/messages
+2026-04-02 13:09:36,737  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (556,378 chars, 140,321 bytes screenshot)
+2026-04-02 13:09:39,674  INFO      [21/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/contracts
+2026-04-02 13:09:39,746  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/contracts
+2026-04-02 13:09:47,266  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (527,665 chars, 63,312 bytes screenshot)
+2026-04-02 13:09:48,801  INFO      [22/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/financials
+2026-04-02 13:09:48,872  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/financials
+2026-04-02 13:09:56,400  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (537,313 chars, 76,574 bytes screenshot)
+2026-04-02 13:09:58,637  INFO      [23/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/online-payment-records
+2026-04-02 13:09:58,709  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/online-payment-records
+2026-04-02 13:10:06,493  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (532,338 chars, 71,269 bytes screenshot)
+2026-04-02 13:10:09,428  INFO      [24/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/selection-boards
+2026-04-02 13:10:09,495  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/selection-boards
+2026-04-02 13:10:16,701  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (527,843 chars, 66,073 bytes screenshot)
+2026-04-02 13:10:18,232  INFO      [25/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/mood-boards
+2026-04-02 13:10:18,306  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/mood-boards
+2026-04-02 13:10:25,216  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (525,612 chars, 58,160 bytes screenshot)
+2026-04-02 13:10:27,448  INFO      [26/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/3d-floor-plans
+2026-04-02 13:10:27,516  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/3d-floor-plans
+2026-04-02 13:10:35,746  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (525,794 chars, 73,117 bytes screenshot)
+2026-04-02 13:10:38,678  INFO      [27/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/tasks
+2026-04-02 13:10:38,750  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/tasks
+2026-04-02 13:10:46,937  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (525,604 chars, 63,346 bytes screenshot)
+2026-04-02 13:10:48,463  INFO      [28/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/schedule
+2026-04-02 13:10:48,535  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/schedule
+2026-04-02 13:10:55,657  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (544,100 chars, 74,606 bytes screenshot)
+2026-04-02 13:10:57,891  INFO      [29/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/files-and-photos
+2026-04-02 13:10:57,960  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/files-and-photos
+2026-04-02 13:11:06,191  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (534,072 chars, 72,495 bytes screenshot)
+2026-04-02 13:11:09,124  INFO      [30/106] https://pro.houzz.com/manage/cd/client-dash-edit/2942703/daily-logs
+2026-04-02 13:11:09,196  INFO        -> Navigating: https://pro.houzz.com/manage/cd/client-dash-edit/2942703/daily-logs
+2026-04-02 13:11:16,579  INFO        [OK] Captured: "Edit Client Dashboard | David Test | Houzz Pro" (526,267 chars, 60,836 bytes screenshot)
+2026-04-02 13:11:18,114  INFO      [31/106] https://pro.houzz.com/manage/projects/2942703/daily-logs
+2026-04-02 13:11:18,191  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/daily-logs
+2026-04-02 13:11:25,479  INFO        [OK] Captured: "Daily Logs | David Test | Houzz Pro" (595,218 chars, 99,334 bytes screenshot)
+2026-04-02 13:11:27,713  INFO      [32/106] https://pro.houzz.com/manage/projects/2942703/time-and-expenses
+2026-04-02 13:11:27,786  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/time-and-expenses
+2026-04-02 13:11:37,743  INFO        [OK] Captured: "Time & Expenses | David Test | Houzz Pro" (613,224 chars, 103,747 bytes screenshot)
+2026-04-02 13:11:40,713  INFO      [33/106] https://pro.houzz.com/manage/d/projects/2942703/request-payments
+2026-04-02 13:11:40,781  INFO        -> Navigating: https://pro.houzz.com/manage/d/projects/2942703/request-payments
+2026-04-02 13:11:48,244  INFO        [OK] Captured: "Invoices | David Test | Houzz Pro" (602,591 chars, 94,350 bytes screenshot)
+2026-04-02 13:11:49,777  INFO      [34/106] https://pro.houzz.com/manage/d/request-payments/6244036/edit/
+2026-04-02 13:11:49,854  INFO        -> Navigating: https://pro.houzz.com/manage/d/request-payments/6244036/edit/
+2026-04-02 13:12:01,033  INFO        [OK] Captured: "Invoices | David Test | IN-10046 | Houzz Pro" (716,987 chars, 129,788 bytes screenshot)
+2026-04-02 13:12:03,261  INFO      [35/106] https://pro.houzz.com/manage/d/purchase-documents/6244044/edit/
+2026-04-02 13:12:03,331  INFO        -> Navigating: https://pro.houzz.com/manage/d/purchase-documents/6244044/edit/
+2026-04-02 13:12:11,938  INFO        [OK] Captured: "Purchase Orders | David Test | Houzz Pro" (717,743 chars, 120,703 bytes screenshot)
+2026-04-02 13:12:14,867  INFO      [36/106] https://pro.houzz.com/manage/d/projects/2942703/change-orders
+2026-04-02 13:12:14,944  INFO        -> Navigating: https://pro.houzz.com/manage/d/projects/2942703/change-orders
+2026-04-02 13:12:24,859  INFO        [OK] Captured: "Change Orders | David Test | Houzz Pro" (604,574 chars, 96,997 bytes screenshot)
+2026-04-02 13:12:26,396  INFO      [37/106] https://pro.houzz.com/manage/d/change-orders/6244048/edit/
+2026-04-02 13:12:26,466  INFO        -> Navigating: https://pro.houzz.com/manage/d/change-orders/6244048/edit/
+2026-04-02 13:12:35,463  INFO        [OK] Captured: "Change Orders | David Test | CO-10006 | Houzz Pro" (718,558 chars, 131,158 bytes screenshot)
+2026-04-02 13:12:37,699  INFO      [38/106] https://pro.houzz.com/manage/projects/2942703/retainers-and-credits
+2026-04-02 13:12:37,771  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/retainers-and-credits
+2026-04-02 13:12:45,739  INFO        [OK] Captured: "Houzz Pro: Manage" (601,835 chars, 93,900 bytes screenshot)
+2026-04-02 13:12:48,673  INFO      [39/106] https://pro.houzz.com/manage/d/retainers/6244052/edit/
+2026-04-02 13:12:48,742  INFO        -> Navigating: https://pro.houzz.com/manage/d/retainers/6244052/edit/
+2026-04-02 13:12:58,317  INFO        [OK] Captured: "Retainers & Credits | David Test | RR-10003 | Houzz Pro" (659,206 chars, 117,404 bytes screenshot)
+2026-04-02 13:12:59,860  INFO      [40/106] https://pro.houzz.com/manage/reports/budget/2942703
+2026-04-02 13:13:00,137  INFO        -> Navigating: https://pro.houzz.com/manage/reports/budget/2942703
+2026-04-02 13:13:08,003  INFO        [OK] Captured: "Budget" (555,035 chars, 91,264 bytes screenshot)
+2026-04-02 13:13:10,227  INFO      [41/106] https://pro.houzz.com/manage/projects/2942703/financial-overview
+2026-04-02 13:13:10,298  INFO        -> Navigating: https://pro.houzz.com/manage/projects/2942703/financial-overview
+2026-04-02 13:13:17,247  INFO        [OK] Captured: "Financial Overview | David Test | Houzz Pro" (603,054 chars, 151,458 bytes screenshot)
+2026-04-02 13:13:20,172  INFO      [42/106] https://pro.houzz.com/manage/leads
+2026-04-02 13:13:20,243  INFO        -> Navigating: https://pro.houzz.com/manage/leads
+2026-04-02 13:13:29,728  INFO        [OK] Captured: "Houzz Pro - Lead Management" (873,191 chars, 223,205 bytes screenshot)
+2026-04-02 13:13:31,263  INFO      [43/106] https://pro.houzz.com/manage/leads/20778907
+2026-04-02 13:13:31,334  INFO        -> Navigating: https://pro.houzz.com/manage/leads/20778907
+2026-04-02 13:13:39,185  INFO        [OK] Captured: "Houzz Pro - Lead Management" (712,438 chars, 204,570 bytes screenshot)
+2026-04-02 13:13:41,417  INFO      [44/106] https://pro.houzz.com/manage/leads/20778907/notes
+2026-04-02 13:13:41,492  INFO        -> Navigating: https://pro.houzz.com/manage/leads/20778907/notes
+2026-04-02 13:13:49,360  INFO        [OK] Captured: "Houzz Pro - Lead Management" (600,505 chars, 158,345 bytes screenshot)
+2026-04-02 13:13:52,294  INFO      [45/106] https://pro.houzz.com/manage/tasks/leads/20778907
+2026-04-02 13:13:52,361  INFO        -> Navigating: https://pro.houzz.com/manage/tasks/leads/20778907
+2026-04-02 13:13:59,460  INFO        [OK] Captured: "Tasks | Justin Adkins | Houzz Pro" (572,975 chars, 90,629 bytes screenshot)
+2026-04-02 13:14:01,078  INFO      [46/106] https://pro.houzz.com/manage/leads/20778907/floorPlans
+2026-04-02 13:14:01,157  INFO        -> Navigating: https://pro.houzz.com/manage/leads/20778907/floorPlans
+2026-04-02 13:14:09,427  INFO        [OK] Captured: "Houzz Pro - Lead Management" (596,342 chars, 218,895 bytes screenshot)
+2026-04-02 13:14:11,650  INFO      [47/106] https://pro.houzz.com/manage/floorplans/new?iId=20778907
+2026-04-02 13:14:11,735  INFO        -> Navigating: https://pro.houzz.com/manage/floorplans/new?iId=20778907
+2026-04-02 13:14:20,459  INFO        [OK] Captured: "3D Floor Plans | Justin Adkins | Untitled | Houzz Pro" (807,144 chars, 113,860 bytes screenshot)
+2026-04-02 13:14:23,398  INFO      [48/106] https://pro.houzz.com/manage/schedule/leads/20778907
+2026-04-02 13:14:23,477  INFO        -> Navigating: https://pro.houzz.com/manage/schedule/leads/20778907
+2026-04-02 13:14:31,306  INFO        [OK] Captured: "Houzz Pro: Manage" (531,275 chars, 71,631 bytes screenshot)
+2026-04-02 13:14:32,834  INFO      [49/106] https://pro.houzz.com/manage/leads/20778907/files
+2026-04-02 13:14:32,904  INFO        -> Navigating: https://pro.houzz.com/manage/leads/20778907/files
+2026-04-02 13:14:39,844  INFO        [OK] Captured: "Houzz Pro - Lead Management" (595,597 chars, 172,050 bytes screenshot)
+2026-04-02 13:14:42,082  INFO      [50/106] https://pro.houzz.com/manage/leads/20778907/takeoffs
+2026-04-02 13:14:42,169  INFO        -> Navigating: https://pro.houzz.com/manage/leads/20778907/takeoffs
+2026-04-02 13:14:50,013  INFO        [OK] Captured: "Houzz Pro - Lead Management" (586,674 chars, 149,983 bytes screenshot)
+2026-04-02 13:14:52,944  INFO      [51/106] https://pro.houzz.com/manage/tjp/canvas/147167c2b058bbdc6f3c0fef9fee778834120822/page/1.0
+2026-04-02 13:14:53,010  INFO        -> Navigating: https://pro.houzz.com/manage/tjp/canvas/147167c2b058bbdc6f3c0fef9fee778834120822/page/1.0
+2026-04-02 13:15:01,072  INFO        [OK] Captured: "Takeoff Software | Justin Adkins | Houzz" (533,767 chars, 168,943 bytes screenshot)
+2026-04-02 13:15:02,605  INFO      [52/106] https://pro.houzz.com/manage/d/leads/20778907/estimates
+2026-04-02 13:15:02,671  INFO        -> Navigating: https://pro.houzz.com/manage/d/leads/20778907/estimates
+2026-04-02 13:15:11,334  INFO        [OK] Captured: "Estimates | Justin Adkins | Houzz Pro" (616,449 chars, 78,895 bytes screenshot)
+2026-04-02 13:15:13,567  INFO      [53/106] https://pro.houzz.com/manage/d/estimates/6244091/edit/
+2026-04-02 13:15:13,631  INFO        -> Navigating: https://pro.houzz.com/manage/d/estimates/6244091/edit/
+2026-04-02 13:15:22,706  INFO        [OK] Captured: "Estimates | Justin Adkins | ES-10132 | Houzz Pro" (715,777 chars, 131,201 bytes screenshot)
+2026-04-02 13:15:25,644  INFO      [54/106] https://pro.houzz.com/manage/d/leads/20778907/contracts
+2026-04-02 13:15:25,717  INFO        -> Navigating: https://pro.houzz.com/manage/d/leads/20778907/contracts
+2026-04-02 13:15:32,634  INFO        [OK] Captured: "Contracts | Justin Adkins | Houzz Pro" (600,363 chars, 76,841 bytes screenshot)
+2026-04-02 13:15:34,163  INFO      [55/106] https://pro.houzz.com/manage/d/contracts/6244093/edit
+2026-04-02 13:15:34,233  INFO        -> Navigating: https://pro.houzz.com/manage/d/contracts/6244093/edit
+2026-04-02 13:15:41,039  INFO        [OK] Captured: "Contracts | Justin Adkins | Houzz Pro" (578,965 chars, 57,157 bytes screenshot)
+2026-04-02 13:15:43,272  INFO      [56/106] https://pro.houzz.com/manage/py/online/setup
+2026-04-02 13:15:43,339  INFO        -> Navigating: https://pro.houzz.com/manage/py/online/setup
+2026-04-02 13:15:51,740  INFO        [OK] Captured: "Houzz Pro: Manage" (518,211 chars, 121,387 bytes screenshot)
+2026-04-02 13:15:54,675  INFO      [57/106] https://pro.houzz.com/manage/py/heloc
+2026-04-02 13:15:54,745  INFO        -> Navigating: https://pro.houzz.com/manage/py/heloc
+2026-04-02 13:16:01,841  INFO        [OK] Captured: "Houzz Pro: Manage" (483,483 chars, 875,793 bytes screenshot)
+2026-04-02 13:16:03,370  INFO      [58/106] https://pro.houzz.com/manage/py/financing?source=Self%20Discovery
+2026-04-02 13:16:03,466  INFO        -> Navigating: https://pro.houzz.com/manage/py/financing?source=Self%20Discovery
+2026-04-02 13:16:10,716  INFO        [OK] Captured: "Houzz Pro: Manage" (479,869 chars, 1,016,425 bytes screenshot)
+2026-04-02 13:16:12,949  INFO      [59/106] https://pro.houzz.com/manage/py/intuit
+2026-04-02 13:16:13,031  INFO        -> Navigating: https://pro.houzz.com/manage/py/intuit
+2026-04-02 13:16:19,628  INFO        [OK] Captured: "Houzz Pro: Manage" (480,714 chars, 765,897 bytes screenshot)
+2026-04-02 13:16:22,624  INFO      [60/106] https://pro.houzz.com/manage/reports/
+2026-04-02 13:16:23,312  INFO        -> Navigating: https://pro.houzz.com/manage/reports/
+2026-04-02 13:16:30,627  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (526,824 chars, 132,483 bytes screenshot)
+2026-04-02 13:16:32,163  INFO      [61/106] https://pro.houzz.com/manage/reports/PaymentsReport
+2026-04-02 13:16:32,248  INFO        -> Navigating: https://pro.houzz.com/manage/reports/PaymentsReport
+2026-04-02 13:16:40,169  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (715,725 chars, 486,507 bytes screenshot)
+2026-04-02 13:16:42,392  INFO      [62/106] https://pro.houzz.com/manage/reports/PayoutsReport
+2026-04-02 13:16:42,463  INFO        -> Navigating: https://pro.houzz.com/manage/reports/PayoutsReport
+2026-04-02 13:16:49,690  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (545,283 chars, 144,364 bytes screenshot)
+2026-04-02 13:16:52,627  INFO      [63/106] https://pro.houzz.com/manage/reports/OpenInvoicesReport
+2026-04-02 13:16:52,696  INFO        -> Navigating: https://pro.houzz.com/manage/reports/OpenInvoicesReport
+2026-04-02 13:16:59,472  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (580,256 chars, 156,391 bytes screenshot)
+2026-04-02 13:17:01,003  INFO      [64/106] https://pro.houzz.com/manage/reports/TaxesLiabilityReport
+2026-04-02 13:17:01,077  INFO        -> Navigating: https://pro.houzz.com/manage/reports/TaxesLiabilityReport
+2026-04-02 13:17:08,324  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (572,275 chars, 184,792 bytes screenshot)
+2026-04-02 13:17:10,561  INFO      [65/106] https://pro.houzz.com/manage/reports/IncomingTransactionsReport?groupBy=parentId
+2026-04-02 13:17:10,650  INFO        -> Navigating: https://pro.houzz.com/manage/reports/IncomingTransactionsReport?groupBy=parentId
+2026-04-02 13:17:20,727  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (1,631,102 chars, 1,808,670 bytes screenshot)
+2026-04-02 13:17:23,672  INFO      [66/106] https://pro.houzz.com/manage/reports/OutgoingTransactionsReport?groupBy=projectId
+2026-04-02 13:17:23,781  INFO        -> Navigating: https://pro.houzz.com/manage/reports/OutgoingTransactionsReport?groupBy=projectId
+2026-04-02 13:17:32,852  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (626,792 chars, 119,872 bytes screenshot)
+2026-04-02 13:17:34,386  INFO      [67/106] https://pro.houzz.com/manage/reports/TimeBillingReport?groupBy=houzzUserId
+2026-04-02 13:17:34,468  INFO        -> Navigating: https://pro.houzz.com/manage/reports/TimeBillingReport?groupBy=houzzUserId
+2026-04-02 13:17:46,531  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (2,145,169 chars, 3,348,757 bytes screenshot)
+2026-04-02 13:17:48,784  INFO      [68/106] https://pro.houzz.com/manage/reports/TimeBillingReport?groupBy=projectId
+2026-04-02 13:17:48,864  INFO        -> Navigating: https://pro.houzz.com/manage/reports/TimeBillingReport?groupBy=projectId
+2026-04-02 13:18:00,984  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (2,187,825 chars, 3,430,083 bytes screenshot)
+2026-04-02 13:18:03,935  INFO      [69/106] https://pro.houzz.com/manage/reports/GlobalTrackerReport
+2026-04-02 13:18:04,004  INFO        -> Navigating: https://pro.houzz.com/manage/reports/GlobalTrackerReport
+2026-04-02 13:18:11,580  INFO        [OK] Captured: "Financial Reports | Business Overview | Houzz Pro" (512,780 chars, 75,984 bytes screenshot)
+2026-04-02 13:18:13,111  INFO      [70/106] https://pro.houzz.com/manage/build/company/quickbooks/dashboard
+2026-04-02 13:18:13,181  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/dashboard
+2026-04-02 13:18:20,986  INFO        [OK] Captured: "Settings | Company | Integrations | Houzz Pro" (619,254 chars, 144,724 bytes screenshot)
+2026-04-02 13:18:23,217  INFO      [71/106] https://pro.houzz.com/manage/build/company/quickbooks/settings
+2026-04-02 13:18:23,290  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/settings
+2026-04-02 13:18:29,614  INFO        [OK] Captured: "Houzz Pro: Manage" (494,724 chars, 93,719 bytes screenshot)
+2026-04-02 13:18:32,541  INFO      [72/106] https://pro.houzz.com/manage/build/company/quickbooks/account-mappings/general
+2026-04-02 13:18:32,615  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/account-mappings/general
+2026-04-02 13:18:39,736  INFO        [OK] Captured: "Houzz Pro: Manage" (499,878 chars, 129,050 bytes screenshot)
+2026-04-02 13:18:41,255  INFO      [73/106] https://pro.houzz.com/manage/build/company/quickbooks/account-mappings/products
+2026-04-02 13:18:41,326  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/account-mappings/products
+2026-04-02 13:18:47,999  INFO        [OK] Captured: "Houzz Pro: Manage" (489,769 chars, 83,911 bytes screenshot)
+2026-04-02 13:18:50,226  INFO      [74/106] https://pro.houzz.com/manage/build/company/quickbooks/account-mappings/services
+2026-04-02 13:18:50,298  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/account-mappings/services
+2026-04-02 13:18:56,617  INFO        [OK] Captured: "Houzz Pro: Manage" (493,770 chars, 97,229 bytes screenshot)
+2026-04-02 13:18:59,543  INFO      [75/106] https://pro.houzz.com/manage/build/company/quickbooks/vendor-mapping
+2026-04-02 13:18:59,612  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/vendor-mapping
+2026-04-02 13:19:08,116  INFO        [OK] Captured: "Houzz Pro: Manage" (486,637 chars, 44,936 bytes screenshot)
+2026-04-02 13:19:09,638  INFO      [76/106] https://pro.houzz.com/manage/build/company/quickbooks/connection
+2026-04-02 13:19:09,704  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/quickbooks/connection
+2026-04-02 13:19:16,847  INFO        [OK] Captured: "Houzz Pro: Manage" (486,575 chars, 66,649 bytes screenshot)
+2026-04-02 13:19:19,067  INFO      [77/106] https://pro.houzz.com/settings/team-members
+2026-04-02 13:19:19,131  INFO        -> Navigating: https://pro.houzz.com/settings/team-members
+2026-04-02 13:19:26,553  INFO        [OK] Captured: "Team Members | Collaborators | Houzz Pro" (1,088,682 chars, 133,750 bytes screenshot)
+2026-04-02 13:19:29,493  INFO      [78/106] https://pro.houzz.com/settings/contacts
+2026-04-02 13:19:29,577  INFO        -> Navigating: https://pro.houzz.com/settings/contacts
+2026-04-02 13:19:36,537  INFO        [OK] Captured: "Contacts | Collaborators | Houzz Pro" (1,213,024 chars, 209,314 bytes screenshot)
+2026-04-02 13:19:38,080  INFO      [79/106] https://pro.houzz.com/settings/subcontractors
+2026-04-02 13:19:38,221  INFO        -> Navigating: https://pro.houzz.com/settings/subcontractors
+2026-04-02 13:19:46,121  INFO        [OK] Captured: "Subcontractors | Collaborators | Houzz Pro" (1,106,539 chars, 132,270 bytes screenshot)
+2026-04-02 13:19:48,359  INFO      [80/106] https://pro.houzz.com/settings/vendors
+2026-04-02 13:19:48,431  INFO        -> Navigating: https://pro.houzz.com/settings/vendors
+2026-04-02 13:19:55,348  INFO        [OK] Captured: "Vendors | Collaborators | Houzz Pro" (1,089,733 chars, 86,640 bytes screenshot)
+2026-04-02 13:19:58,284  INFO      [81/106] https://pro.houzz.com/settings/company-info
+2026-04-02 13:19:58,352  INFO        -> Navigating: https://pro.houzz.com/settings/company-info
+2026-04-02 13:20:06,216  INFO        [OK] Captured: "Settings | Company Settings | Company Info | Houzz Pro" (1,048,009 chars, 115,652 bytes screenshot)
+2026-04-02 13:20:07,751  INFO      [82/106] https://pro.houzz.com/settings/communication
+2026-04-02 13:20:07,819  INFO        -> Navigating: https://pro.houzz.com/settings/communication
+2026-04-02 13:20:14,496  INFO        [OK] Captured: "Settings | Company Settings | Communications | Houzz Pro" (1,068,869 chars, 92,173 bytes screenshot)
+2026-04-02 13:20:16,724  INFO      [83/106] https://pro.houzz.com/settings/notifications
+2026-04-02 13:20:16,796  INFO        -> Navigating: https://pro.houzz.com/settings/notifications
+2026-04-02 13:20:23,767  INFO        [OK] Captured: "Settings | Account Settings | Notifications | Houzz Pro" (1,070,649 chars, 117,118 bytes screenshot)
+2026-04-02 13:20:26,699  INFO      [84/106] https://pro.houzz.com/settings/cloud-storage
+2026-04-02 13:20:26,764  INFO        -> Navigating: https://pro.houzz.com/settings/cloud-storage
+2026-04-02 13:20:33,331  INFO        [OK] Captured: "Settings | Integrations | Google Drive | Houzz Pro" (1,048,822 chars, 61,748 bytes screenshot)
+2026-04-02 13:20:34,864  INFO      [85/106] https://pro.houzz.com/settings/zapier
+2026-04-02 13:20:34,943  INFO        -> Navigating: https://pro.houzz.com/settings/zapier
+2026-04-02 13:20:41,898  INFO        [OK] Captured: "Settings | Integrations | Zapier | Houzz Pro" (1,057,481 chars, 97,958 bytes screenshot)
+2026-04-02 13:20:44,148  INFO      [86/106] https://pro.houzz.com/settings/account-info
+2026-04-02 13:20:44,216  INFO        -> Navigating: https://pro.houzz.com/settings/account-info
+2026-04-02 13:20:51,079  INFO        [OK] Captured: "Account Info | Your Houzz Pro Account | Houzz Pro" (1,040,559 chars, 63,304 bytes screenshot)
+2026-04-02 13:20:54,020  INFO      [87/106] https://pro.houzz.com/settings/privacy-security
+2026-04-02 13:20:54,087  INFO        -> Navigating: https://pro.houzz.com/settings/privacy-security
+2026-04-02 13:21:00,579  INFO        [OK] Captured: "Account Info | Privacy & Security | Houzz Pro" (1,038,325 chars, 41,000 bytes screenshot)
+2026-04-02 13:21:02,109  INFO      [88/106] https://pro.houzz.com/templates
+2026-04-02 13:21:02,190  INFO        -> Navigating: https://pro.houzz.com/templates
+2026-04-02 13:21:08,491  INFO        [OK] Captured: "Templates | Library | Houzz Pro" (1,072,668 chars, 111,521 bytes screenshot)
+2026-04-02 13:21:10,720  INFO      [89/106] https://pro.houzz.com/manage/projects/project-templates
+2026-04-02 13:21:10,791  INFO        -> Navigating: https://pro.houzz.com/manage/projects/project-templates
+2026-04-02 13:21:17,036  INFO        [OK] Captured: "Global Templates | Projects | Houzz Pro" (506,270 chars, 61,217 bytes screenshot)
+2026-04-02 13:21:19,977  INFO      [90/106] https://pro.houzz.com/manage/d/contract-templates
+2026-04-02 13:21:20,216  INFO        -> Navigating: https://pro.houzz.com/manage/d/contract-templates
+2026-04-02 13:21:28,248  INFO        [OK] Captured: "Templates | Library | Houzz Pro" (571,727 chars, 113,020 bytes screenshot)
+2026-04-02 13:21:29,782  INFO      [91/106] https://pro.houzz.com/manage/d/templates
+2026-04-02 13:21:29,864  INFO        -> Navigating: https://pro.houzz.com/manage/d/templates
+2026-04-02 13:21:36,533  INFO        [OK] Captured: "Templates | Library | Houzz Pro" (561,884 chars, 119,088 bytes screenshot)
+2026-04-02 13:21:38,759  INFO      [92/106] https://pro.houzz.com/manage/floorplans/templates
+2026-04-02 13:21:38,829  INFO        -> Navigating: https://pro.houzz.com/manage/floorplans/templates
+2026-04-02 13:21:45,101  INFO        [OK] Captured: "Houzz Pro - 3D Floor Plans" (520,993 chars, 900,977 bytes screenshot)
+2026-04-02 13:21:48,024  INFO      [93/106] https://pro.houzz.com/manage/selections/templates/boards
+2026-04-02 13:21:48,092  INFO        -> Navigating: https://pro.houzz.com/manage/selections/templates/boards
+2026-04-02 13:21:54,710  INFO        [OK] Captured: "Templates | Selection Boards | Houzz Pro" (486,111 chars, 50,978 bytes screenshot)
+2026-04-02 13:21:56,240  INFO      [94/106] https://pro.houzz.com/manage/moodboards/templates
+2026-04-02 13:21:56,322  INFO        -> Navigating: https://pro.houzz.com/manage/moodboards/templates
+2026-04-02 13:22:02,364  INFO        [OK] Captured: "Templates | Mood Boards | Houzz Pro" (463,182 chars, 46,024 bytes screenshot)
+2026-04-02 13:22:04,596  INFO      [95/106] https://pro.houzz.com/manage/schedule/templates
+2026-04-02 13:22:04,703  INFO        -> Navigating: https://pro.houzz.com/manage/schedule/templates
+2026-04-02 13:22:12,031  INFO        [OK] Captured: "Global Templates | Schedule | Houzz Pro" (556,871 chars, 70,443 bytes screenshot)
+2026-04-02 13:22:14,970  INFO      [96/106] https://pro.houzz.com/manage/projects/task-templates
+2026-04-02 13:22:15,041  INFO        -> Navigating: https://pro.houzz.com/manage/projects/task-templates
+2026-04-02 13:22:21,422  INFO        [OK] Captured: "Global Templates | Tasks | Houzz Pro" (501,821 chars, 61,499 bytes screenshot)
+2026-04-02 13:22:22,946  INFO      [97/106] https://pro.houzz.com/manage/l/category-management
+2026-04-02 13:22:23,057  INFO        -> Navigating: https://pro.houzz.com/manage/l/category-management
+2026-04-02 13:22:31,344  INFO        [OK] Captured: "Houzz Pro: Manage" (586,296 chars, 100,822 bytes screenshot)
+2026-04-02 13:22:33,574  INFO      [98/106] https://pro.houzz.com/manage/l/my-items
+2026-04-02 13:22:33,645  INFO        -> Navigating: https://pro.houzz.com/manage/l/my-items
+2026-04-02 13:22:41,207  INFO        [OK] Captured: "Houzz Pro: Manage" (689,656 chars, 214,902 bytes screenshot)
+2026-04-02 13:22:44,132  INFO      [99/106] https://pro.houzz.com/manage/catalogs/
+2026-04-02 13:22:44,198  INFO        -> Navigating: https://pro.houzz.com/manage/catalogs/
+2026-04-02 13:22:50,391  INFO        [OK] Captured: "Houzz Pro: Manage" (497,203 chars, 71,114 bytes screenshot)
+2026-04-02 13:22:51,924  INFO      [100/106] https://pro.houzz.com/teamchat/channels/all
+2026-04-02 13:22:51,992  INFO        -> Navigating: https://pro.houzz.com/teamchat/channels/all
+2026-04-02 13:22:59,040  INFO        [OK] Captured: "" (1,072,396 chars, 101,655 bytes screenshot)
+2026-04-02 13:23:01,274  INFO      [101/106] https://pro.houzz.com/manage/build/company/addresses
+2026-04-02 13:23:01,343  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/addresses
+2026-04-02 13:23:07,818  INFO        [OK] Captured: "Houzz Pro: Manage" (490,287 chars, 70,364 bytes screenshot)
+2026-04-02 13:23:10,748  INFO      [102/106] https://pro.houzz.com/manage/build/company/salesTaxes
+2026-04-02 13:23:10,813  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/salesTaxes
+2026-04-02 13:23:18,073  INFO        [OK] Captured: "Houzz Pro: Manage" (515,228 chars, 115,382 bytes screenshot)
+2026-04-02 13:23:19,602  INFO      [103/106] https://pro.houzz.com/manage/build/company/features
+2026-04-02 13:23:19,667  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/features
+2026-04-02 13:23:26,045  INFO        [OK] Captured: "Houzz Pro: Manage" (495,090 chars, 61,664 bytes screenshot)
+2026-04-02 13:23:28,280  INFO      [104/106] https://pro.houzz.com/manage/projects/workday-exceptions
+2026-04-02 13:23:28,400  INFO        -> Navigating: https://pro.houzz.com/manage/projects/workday-exceptions
+2026-04-02 13:23:35,304  INFO        [OK] Captured: "Global Settings | Exceptions | Houzz Pro" (509,533 chars, 136,994 bytes screenshot)
+2026-04-02 13:23:38,231  INFO      [105/106] https://pro.houzz.com/manage/build/clipper-settings
+2026-04-02 13:23:38,300  INFO        -> Navigating: https://pro.houzz.com/manage/build/clipper-settings
+2026-04-02 13:23:46,210  INFO        [OK] Captured: "Houzz Pro: Manage" (494,218 chars, 172,063 bytes screenshot)
+2026-04-02 13:23:47,731  INFO      [106/106] https://pro.houzz.com/manage/build/company/calendarSettings
+2026-04-02 13:23:47,793  INFO        -> Navigating: https://pro.houzz.com/manage/build/company/calendarSettings
+2026-04-02 13:23:54,904  INFO        [OK] Captured: "Houzz Pro: Manage" (504,350 chars, 129,214 bytes screenshot)
+2026-04-02 13:23:55,040  INFO      
+Done. 106 scraped, 0 failed -> output/

@@ -54,3 +54,5 @@ next-env.d.ts
 # Uploaded files
 public/uploads/
 .env*.local
+output/
+output/
