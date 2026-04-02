@@ -25,7 +25,8 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
     
     // Manage Tags Modal State
     const [tagName, setTagName] = useState("");
-    const [editingTag, setEditingTag] = useState<any>(null);
+    const [editingTagId, setEditingTagId] = useState<string | null>(null);
+    const [editingTagName, setEditingTagName] = useState("");
 
     // List selections and filters
     const [filterStatus, setFilterStatus] = useState<"ACTIVE" | "INACTIVE" | "ALL">("ACTIVE");
@@ -159,25 +160,37 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
 
     // ----- Render Helpers -----
     const renderManageTags = () => {
-        const handleSaveTag = async () => {
+        // Create a brand new tag from the top input
+        const handleCreateTag = async () => {
             if (!tagName.trim()) return;
             try {
-                if (editingTag) {
-                    const res = await updateVendorTag(editingTag.id, tagName);
-                    setTags(tags.map(t => t.id === res.id ? res : t));
-                } else {
-                    const res = await createVendorTag(tagName);
-                    setTags([...tags, res]);
-                }
+                const res = await createVendorTag(tagName);
+                setTags([...tags, res]);
                 setTagName("");
-                setEditingTag(null);
             } catch(e: any) { toast.error("Error saving tag"); }
+        };
+
+        // Save an inline-edited tag
+        const handleSaveInlineEdit = async () => {
+            if (!editingTagId || !editingTagName.trim()) return;
+            try {
+                const res = await updateVendorTag(editingTagId, editingTagName);
+                setTags(tags.map(t => t.id === res.id ? res : t));
+                setEditingTagId(null);
+                setEditingTagName("");
+            } catch(e: any) { toast.error("Error saving tag"); }
+        };
+
+        const handleCancelInlineEdit = () => {
+            setEditingTagId(null);
+            setEditingTagName("");
         };
 
         const handleDeleteTag = async (id: string) => {
             try {
                 await deleteVendorTag(id);
                 setTags(tags.filter(t => t.id !== id));
+                if (editingTagId === id) handleCancelInlineEdit();
             } catch(e) { toast.error("Error deleting tag"); }
         };
 
@@ -186,24 +199,23 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                 <div className="bg-white rounded-xl shadow-xl max-w-md w-full max-h-[90vh] flex flex-col">
                     <div className="px-6 py-4 border-b border-hui-border flex justify-between items-center sticky top-0 bg-white z-10">
                         <h2 className="text-xl font-bold text-hui-textMain">Manage Tags</h2>
-                        <button onClick={() => setIsTagsModalOpen(false)} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
+                        <button onClick={() => { setIsTagsModalOpen(false); handleCancelInlineEdit(); }} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
                     </div>
                     
                     <div className="p-6 flex-1 overflow-y-auto">
+                        {/* Top input — always for creating NEW tags */}
                         <div className="flex gap-2 mb-6">
                             <input 
                                 type="text" 
                                 value={tagName} 
                                 onChange={e => setTagName(e.target.value)} 
+                                onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); handleCreateTag(); } }}
                                 placeholder="New tag name"
                                 className="hui-input flex-1"
                             />
-                            <button onClick={handleSaveTag} className="hui-btn hui-btn-primary hover:bg-slate-800">
-                                {editingTag ? <Check className="w-4 h-4"/> : <Plus className="w-4 h-4"/>}
+                            <button onClick={handleCreateTag} className="hui-btn hui-btn-primary hover:bg-slate-800">
+                                <Plus className="w-4 h-4"/>
                             </button>
-                            {editingTag && (
-                                <button onClick={() => {setEditingTag(null); setTagName("");}} className="hui-btn hui-btn-secondary"><X className="w-4 h-4"/></button>
-                            )}
                         </div>
 
                         {tags.length === 0 && (
@@ -214,11 +226,37 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                         <ul className="divide-y divide-slate-100 border-t border-slate-100 mt-4">
                             {tags.map(t => (
                                 <li key={t.id} className="py-3 flex justify-between items-center group">
-                                    <span className="text-sm font-medium text-slate-700">{t.name}</span>
-                                    <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        <button onClick={() => {setEditingTag(t); setTagName(t.name);}} className="text-slate-400 hover:text-hui-primary"><Edit2 className="w-4 h-4"/></button>
-                                        <button onClick={() => handleDeleteTag(t.id)} className="text-slate-400 hover:text-red-500"><Trash2 className="w-4 h-4"/></button>
-                                    </div>
+                                    {editingTagId === t.id ? (
+                                        /* ---- INLINE EDIT MODE ---- */
+                                        <div className="flex items-center gap-2 w-full">
+                                            <input
+                                                type="text"
+                                                value={editingTagName}
+                                                onChange={e => setEditingTagName(e.target.value)}
+                                                onKeyDown={e => {
+                                                    if (e.key === "Enter") { e.preventDefault(); handleSaveInlineEdit(); }
+                                                    if (e.key === "Escape") handleCancelInlineEdit();
+                                                }}
+                                                autoFocus
+                                                className="hui-input flex-1 text-sm py-1.5"
+                                            />
+                                            <button onClick={handleSaveInlineEdit} className="hui-btn hui-btn-primary hover:bg-slate-800 px-2 py-1.5">
+                                                <Check className="w-4 h-4"/>
+                                            </button>
+                                            <button onClick={handleCancelInlineEdit} className="hui-btn hui-btn-secondary px-2 py-1.5">
+                                                <X className="w-4 h-4"/>
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        /* ---- DISPLAY MODE ---- */
+                                        <>
+                                            <span className="text-sm font-medium text-slate-700">{t.name}</span>
+                                            <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                <button onClick={() => { setEditingTagId(t.id); setEditingTagName(t.name); }} className="text-slate-400 hover:text-hui-primary"><Edit2 className="w-4 h-4"/></button>
+                                                <button onClick={() => handleDeleteTag(t.id)} className="text-slate-400 hover:text-red-500"><Trash2 className="w-4 h-4"/></button>
+                                            </div>
+                                        </>
+                                    )}
                                 </li>
                             ))}
                         </ul>
