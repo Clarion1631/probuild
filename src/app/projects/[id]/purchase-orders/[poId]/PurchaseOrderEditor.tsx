@@ -1,12 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { createPurchaseOrder, updatePurchaseOrder, deletePurchaseOrder, sendPurchaseOrder } from "@/lib/actions";
+import { createPurchaseOrder, updatePurchaseOrder, deletePurchaseOrder, sendPurchaseOrder, approvePurchaseOrder, uploadPurchaseOrderFile, deletePurchaseOrderFile } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import StatusBadge from "@/components/StatusBadge";
 import Link from "next/link";
-import { Trash2, Plus } from "lucide-react";
+import { Trash2, Plus, Upload, FileText, CheckCircle2 } from "lucide-react";
 
 interface Context {
     projectId: string;

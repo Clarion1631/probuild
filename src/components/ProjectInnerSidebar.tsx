@@ -49,6 +49,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 { label: "Estimates", href: `/projects/${projectId}/estimates`, permission: "estimates" },
                 { label: "Takeoffs", href: `/projects/${projectId}/takeoffs`, permission: "takeoffs" },
                 { label: "Selections", href: `/projects/${projectId}/selections` },
+                { label: "Mood Boards", href: `/projects/${projectId}/mood-boards` },
                 { label: "3D Floor Plans", href: `/projects/${projectId}/floor-plans`, permission: "floorPlans" },
             ],
         },

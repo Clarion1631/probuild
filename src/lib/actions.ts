@@ -3177,7 +3177,7 @@ export async function getPurchaseOrder(id: string) {
     "use server";
     return prisma.purchaseOrder.findUnique({
         where: { id },
-        include: { vendor: true, items: { include: { costCode: true } } }
+        include: { vendor: true, items: { include: { costCode: true } }, files: true, expenses: { include: { costCode: true } } }
     });
 }
 
@@ -3258,6 +3258,77 @@ export async function updatePurchaseOrderStatus(id: string, status: string) {
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
     return po;
 }
+
+export async function approvePurchaseOrder(id: string, signatureName: string) {
+    "use server";
+    const approvedAt = new Date();
+    const po = await prisma.purchaseOrder.update({
+        where: { id },
+        data: {
+            status: "Approved",
+            approvedBy: signatureName,
+            approvedAt,
+        },
+    });
+    
+    revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
+    revalidatePath(`/projects/${po.projectId}/purchase-orders`);
+    return po;
+}
+
+export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
+    "use server";
+    const file = formData.get("file") as File;
+    if (!file) throw new Error("No file uploaded");
+
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
+
+    const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+    const supabase = getSupabase();
+    if (!supabase) throw new Error("Storage not configured");
+
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storagePath = `purchase-orders/${purchaseOrderId}/${Date.now()}_${safeName}`;
+
+    const { error: uploadError } = await supabase.storage
+        .from(STORAGE_BUCKET)
+        .upload(storagePath, buffer, {
+            contentType: file.type || "application/octet-stream",
+            upsert: false,
+        });
+
+    if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+
+    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl || storagePath;
+
+    const uploaded = await prisma.purchaseOrderFile.create({
+        data: {
+            purchaseOrderId,
+            name: file.name,
+            url: publicUrl,
+            size: file.size,
+            type: file.type || "application/octet-stream",
+        }
+    });
+
+    const po = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId } });
+    if (po) {
+        revalidatePath(`/projects/${po.projectId}/purchase-orders/${purchaseOrderId}`);
+    }
+    return uploaded;
+}
+
+export async function deletePurchaseOrderFile(fileId: string) {
+    "use server";
+    const file = await prisma.purchaseOrderFile.findUnique({ where: { id: fileId }, include: { purchaseOrder: true } });
+    if (!file) return;
+
+    await prisma.purchaseOrderFile.delete({ where: { id: fileId } });
+    revalidatePath(`/projects/${file.purchaseOrder.projectId}/purchase-orders/${file.purchaseOrderId}`);
+}
+
 
 export async function sendPurchaseOrder(id: string, toEmail: string, message: string) {
     "use server";
@@ -3659,5 +3730,97 @@ export async function deleteDailyLogPhoto(photoId: string) {
 
     await prisma.dailyLogPhoto.delete({ where: { id: photoId } });
     revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
+    return { success: true };
+}
+
+// =============================================
+// Mood Boards (Visual Canvas)
+// =============================================
+
+export async function getMoodBoards(projectId: string) {
+    return await prisma.moodBoard.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { items: true },
+    });
+}
+
+export async function getMoodBoard(id: string) {
+    return await prisma.moodBoard.findUnique({
+        where: { id },
+        include: { items: true, project: { include: { client: true } } },
+    });
+}
+
+export async function createMoodBoard(projectId: string, title: string) {
+    const board = await prisma.moodBoard.create({
+        data: { projectId, title },
+    });
+    revalidatePath(`/projects/${projectId}/mood-boards`);
+    return board;
+}
+
+export async function deleteMoodBoard(id: string) {
+    const board = await prisma.moodBoard.findUnique({ where: { id } });
+    if (!board) return { success: false };
+    await prisma.moodBoard.delete({ where: { id } });
+    revalidatePath(`/projects/${board.projectId}/mood-boards`);
+    return { success: true };
+}
+
+export async function saveMoodBoardItems(boardId: string, items: Array<{
+    id?: string;
+    type: string;
+    content: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    zIndex: number;
+}>) {
+    const board = await prisma.moodBoard.findUnique({ where: { id: boardId } });
+    if (!board) throw new Error("Board not found");
+
+    await prisma.$transaction(async (tx) => {
+        const currentItemIds = items.filter(i => i.id && !i.id.startsWith("temp-")).map(i => i.id as string);
+        await tx.moodBoardItem.deleteMany({
+            where: {
+                moodBoardId: boardId,
+                id: { notIn: currentItemIds }
+            }
+        });
+
+        for (const item of items) {
+            if (item.id && !item.id.startsWith("temp-")) {
+                await tx.moodBoardItem.update({
+                    where: { id: item.id },
+                    data: {
+                        type: item.type,
+                        content: item.content,
+                        x: item.x,
+                        y: item.y,
+                        width: item.width,
+                        height: item.height,
+                        zIndex: item.zIndex,
+                    }
+                });
+            } else {
+                await tx.moodBoardItem.create({
+                    data: {
+                        moodBoardId: boardId,
+                        type: item.type,
+                        content: item.content,
+                        x: item.x,
+                        y: item.y,
+                        width: item.width,
+                        height: item.height,
+                        zIndex: item.zIndex,
+                    }
+                });
+            }
+        }
+    });
+
+    revalidatePath(`/projects/${board.projectId}/mood-boards/${boardId}`);
     return { success: true };
 }

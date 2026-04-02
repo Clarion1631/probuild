@@ -53,6 +53,13 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
             },
             floorPlans: {
                 orderBy: { createdAt: 'desc' }
+            },
+            dailyLogs: {
+                orderBy: { date: 'desc' },
+                include: {
+                    photos: { orderBy: { createdAt: 'asc' } },
+                    createdBy: { select: { name: true, email: true } }
+                }
             }
         }
     });
@@ -273,6 +280,91 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                     <div className="p-4 flex justify-between items-center">
                                         <h3 className="font-semibold text-hui-textMain truncate">{plan.name}</h3>
                                         <span className="text-xs text-hui-textMuted">{new Date(plan.createdAt).toLocaleDateString()}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+                )}
+
+                {/* Daily Logs Section */}
+                {visibility.showDailyLogs && (
+                <div className="md:col-span-2 mt-4">
+                    <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
+                        <svg className="w-5 h-5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                        Daily Logs
+                    </h2>
+                    {(!project.dailyLogs || project.dailyLogs.length === 0) ? (
+                        <div className="bg-hui-background border border-hui-border rounded-lg p-6 text-center text-hui-textMuted text-sm">
+                            No daily logs have been published yet.
+                        </div>
+                    ) : (
+                        <div className="space-y-4">
+                            {project.dailyLogs.map((log: any) => (
+                                <div key={log.id} className="hui-card p-5 border-l-4 border-l-purple-500">
+                                    <div className="flex items-start justify-between mb-3 border-b border-slate-100 pb-3">
+                                        <div>
+                                            <h3 className="font-bold text-hui-textMain text-lg">
+                                                {new Date(log.date).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}
+                                            </h3>
+                                            <p className="text-xs text-hui-textMuted mt-1">
+                                                Logged by {log.createdBy.name || log.createdBy.email}
+                                            </p>
+                                        </div>
+                                        {/* Badges */}
+                                        <div className="flex items-center gap-2 flex-wrap justify-end">
+                                            {log.weather && (
+                                                <span className="inline-flex items-center gap-1 text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded-full border border-blue-100">
+                                                    ☁️ {log.weather}
+                                                </span>
+                                            )}
+                                            {log.crewOnSite && (
+                                                <span className="inline-flex items-center gap-1 text-xs bg-green-50 text-green-700 px-2 py-1 rounded-full border border-green-100">
+                                                    👥 Crew on Site
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="space-y-4">
+                                        <div>
+                                            <p className="text-xs font-bold text-hui-textMuted uppercase tracking-wider mb-1">Work Performed</p>
+                                            <div className="text-sm text-hui-textMain bg-slate-50 p-3 rounded-lg border border-slate-100 whitespace-pre-wrap leading-relaxed">
+                                                {log.workPerformed}
+                                            </div>
+                                        </div>
+                                        
+                                        {log.materialsDelivered && (
+                                            <div>
+                                                <p className="text-xs font-bold text-amber-600 uppercase tracking-wider mb-1">Materials Delivered</p>
+                                                <div className="text-sm text-hui-textMain bg-amber-50/50 p-3 rounded-lg border border-amber-100/50 whitespace-pre-wrap">
+                                                    {log.materialsDelivered}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {log.issues && (
+                                            <div>
+                                                <p className="text-xs font-bold text-red-600 uppercase tracking-wider mb-1">⚠️ Issues / Delays</p>
+                                                <div className="text-sm text-hui-textMain bg-red-50/50 p-3 rounded-lg border border-red-100/50 whitespace-pre-wrap">
+                                                    {log.issues}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {log.photos && log.photos.length > 0 && (
+                                            <div>
+                                                <p className="text-xs font-bold text-hui-textMuted uppercase tracking-wider mb-2">Photos</p>
+                                                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                                                    {log.photos.map((photo: any) => (
+                                                        <div key={photo.id} className="relative aspect-square rounded-lg overflow-hidden border border-slate-200">
+                                                            <img src={photo.url} alt="Daily Log Image" className="w-full h-full object-cover" />
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
                             ))}

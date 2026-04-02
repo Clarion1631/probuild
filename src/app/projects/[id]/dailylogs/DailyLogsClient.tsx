@@ -80,6 +80,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     const [deletingId, setDeletingId] = useState<string | null>(null);
     const [photoLightbox, setPhotoLightbox] = useState<{ url: string; caption: string | null } | null>(null);
     const [exporting, setExporting] = useState(false);
+    const [isGeneratingAI, setIsGeneratingAI] = useState(false);
 
     // Form state
     const [formDate, setFormDate] = useState(new Date().toISOString().split("T")[0]);
@@ -137,6 +138,46 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
         }
 
         return results;
+    };
+
+    const handleGenerateAI = async () => {
+        if (!formWork.trim()) {
+            toast.error("Please enter some brief notes in 'Work Performed' first.");
+            return;
+        }
+
+        setIsGeneratingAI(true);
+        try {
+            const res = await fetch("/api/ai/daily-logs", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    notes: formWork + (formMaterials ? `\nMaterials: ${formMaterials}` : '') + (formIssues ? `\nIssues: ${formIssues}` : ''),
+                    photoUrls: [] // Placeholder for future vision capability
+                })
+            });
+
+            if (!res.ok) throw new Error("Failed to generate AI report");
+            
+            const data = await res.json();
+            
+            if (data.workPerformed) setFormWork(data.workPerformed);
+            if (data.materialsDelivered) setFormMaterials(data.materialsDelivered);
+            if (data.issues) setFormIssues(data.issues);
+            
+            // If weather wasn't explicitly set by user, suggest it if AI found it
+            if (!formWeather && !formTemp && data.weather) {
+                // simple heuristic to put it in formTemp
+                setFormTemp(data.weather);
+            }
+
+            toast.success("AI draft generated successfully!");
+        } catch (error) {
+            console.error(error);
+            toast.error("Failed to generate AI report. Try again.");
+        } finally {
+            setIsGeneratingAI(false);
+        }
     };
 
     const handleSubmit = async (e: React.FormEvent) => {
@@ -574,11 +615,28 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
 
                             {/* Work Performed */}
                             <div>
-                                <label className="block text-sm font-medium text-hui-textMain mb-1">
-                                    Work Performed <span className="text-red-500">*</span>
-                                </label>
+                                <div className="flex items-center justify-between mb-1">
+                                    <label className="block text-sm font-medium text-hui-textMain">
+                                        Work Performed & Notes <span className="text-red-500">*</span>
+                                    </label>
+                                    <button
+                                        type="button"
+                                        onClick={handleGenerateAI}
+                                        disabled={isGeneratingAI}
+                                        className="text-xs font-semibold text-purple-600 bg-purple-50 hover:bg-purple-100 px-2 py-1 rounded-md flex items-center gap-1 transition disabled:opacity-50"
+                                    >
+                                        {isGeneratingAI ? (
+                                            <span className="w-3 h-3 border-2 border-purple-200 border-t-purple-600 rounded-full animate-spin" />
+                                        ) : (
+                                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                            </svg>
+                                        )}
+                                        {isGeneratingAI ? "Drafting..." : "✨ AI Draft"}
+                                    </button>
+                                </div>
                                 <textarea
-                                    placeholder="Describe the work completed today..."
+                                    placeholder="Type shorthand notes here, then click ✨ AI Draft to expand..."
                                     value={formWork}
                                     onChange={e => setFormWork(e.target.value)}
                                     className="hui-input w-full"
