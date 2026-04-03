@@ -40,6 +40,8 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     const [showManageModal, setShowManageModal] = useState(false);
     const [openCardMenu, setOpenCardMenu] = useState<string | null>(null);
     const cardMenuRef = useRef<HTMLDivElement>(null);
+    const [editingTagsId, setEditingTagsId] = useState<string | null>(null);
+    const [tagInput, setTagInput] = useState("");
 
     // Close card menu on click outside
     useEffect(() => {
@@ -82,6 +84,20 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
             toast.error("Failed to update status");
         } finally {
             setUpdatingId(null);
+        }
+    }
+
+    async function handleTagsSave(projectId: string) {
+        const tags = tagInput.trim();
+        try {
+            await updateProjectTags(projectId, tags);
+            setProjects((prev: any) => prev.map((p: any) => p.id === projectId ? { ...p, tags: tags || null } : p));
+            toast.success("Tags updated");
+        } catch {
+            toast.error("Failed to update tags");
+        } finally {
+            setEditingTagsId(null);
+            setTagInput("");
         }
     }
 
@@ -295,10 +311,28 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                             {project.code || "—"}
                                         </td>
                                         <td className="py-4 px-4">
-                                            {project.tags ? (
-                                                <span className="text-slate-600">{project.tags}</span>
+                                            {editingTagsId === project.id ? (
+                                                <div className="flex items-center gap-1">
+                                                    <input
+                                                        type="text"
+                                                        autoFocus
+                                                        value={tagInput}
+                                                        onChange={e => setTagInput(e.target.value)}
+                                                        onKeyDown={e => {
+                                                            if (e.key === "Enter") handleTagsSave(project.id);
+                                                            if (e.key === "Escape") { setEditingTagsId(null); setTagInput(""); }
+                                                        }}
+                                                        className="hui-input py-1 text-xs w-28"
+                                                        placeholder="e.g. kitchen"
+                                                    />
+                                                    <button onClick={() => handleTagsSave(project.id)} className="text-xs text-hui-primary font-medium hover:underline">Save</button>
+                                                </div>
+                                            ) : project.tags ? (
+                                                <button onClick={() => { setEditingTagsId(project.id); setTagInput(project.tags); }} className="text-slate-600 hover:text-hui-primary transition text-sm">
+                                                    {project.tags}
+                                                </button>
                                             ) : (
-                                                <button className="text-slate-400 hover:text-slate-700 font-medium flex items-center gap-1 transition">
+                                                <button onClick={() => { setEditingTagsId(project.id); setTagInput(""); }} className="text-slate-400 hover:text-slate-700 font-medium flex items-center gap-1 transition">
                                                     + Add Tags
                                                 </button>
                                             )}

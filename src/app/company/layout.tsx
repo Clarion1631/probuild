@@ -12,7 +12,7 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
             title: "Collaborators",
             items: [
                 { name: "Team Members", href: "/company/team-members", icon: Users },
-                { name: "Clients", href: "#", icon: Users }, // Placeholder icon
+                { name: "Clients", href: "/leads", icon: Users },
                 { name: "Subcontractors", href: "/company/subcontractors", icon: Anchor },
                 { name: "Vendors", href: "/company/vendors", icon: Anchor },
             ]
@@ -22,8 +22,8 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
             items: [
                 { name: "Templates", href: "/company/templates", icon: FileText },
                 { name: "Cost Codes & Phases", href: "/company/cost-codes", icon: FileText },
-                { name: "My Items", href: "#", icon: FileText }, // Placeholder icon
-                { name: "Catalogs", href: "#", icon: FileText }, // Placeholder icon
+                { name: "My Items", href: "/company/cost-codes", icon: FileText },
+                { name: "Catalogs", href: "/company/vendors", icon: FileText },
             ]
         }
     ];

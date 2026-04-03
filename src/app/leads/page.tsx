@@ -28,8 +28,8 @@ export default function LeadsPage({ searchParams }: { searchParams: Promise<{ vi
                         <p className="text-sm text-hui-textMuted mt-1">Manage all active leads and opportunities.</p>
                     </div>
                     <div className="flex items-center gap-3">
-                        <button className="hui-btn hui-btn-secondary">Contact Form</button>
-                        <button className="hui-btn hui-btn-secondary">Insights</button>
+                        <Link href="/settings/company" className="hui-btn hui-btn-secondary">Contact Form</Link>
+                        <Link href="/reports" className="hui-btn hui-btn-secondary">Insights</Link>
                         <AddLeadButton />
                     </div>
                 </div>

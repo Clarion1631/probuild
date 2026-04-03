@@ -18,7 +18,7 @@ const REPORT_SECTIONS = [
             {
                 title: "Open Invoices",
                 description: "View all unpaid and partially paid invoices, including aging information.",
-                href: "/invoices",
+                href: "/invoices?status=Issued",
             },
         ],
     },

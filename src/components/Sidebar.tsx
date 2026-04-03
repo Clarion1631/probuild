@@ -26,10 +26,10 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                             <div>
                                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Planning</h3>
                                 <ul className="space-y-2 text-sm">
-                                    {can("contracts") && <li><Link href="#" className="hover:text-hui-primary block transition">All Contracts</Link></li>}
+                                    {can("contracts") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Contracts</Link></li>}
                                     {can("estimates") && <li><Link href="/projects/all/estimates" className="hover:text-hui-primary block transition">All Estimates</Link></li>}
-                                    {can("takeoffs") && <li><Link href="#" className="hover:text-hui-primary block transition">All Takeoffs</Link></li>}
-                                    {can("floorPlans") && <li><Link href="#" className="hover:text-hui-primary block transition">All 3D Floor Plans</Link></li>}
+                                    {can("takeoffs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Takeoffs</Link></li>}
+                                    {can("floorPlans") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All 3D Floor Plans</Link></li>}
                                 </ul>
                             </div>
                         )}
@@ -39,8 +39,8 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
                                 <ul className="space-y-2 text-sm">
                                     {can("schedules") && <li><Link href="/manager/schedule" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>}
-                                    {can("dailyLogs") && <li><Link href="#" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>}
-                                    {can("timeClock") && <li><Link href="#" className="hover:text-hui-primary block transition">Time & Expenses</Link></li>}
+                                    {can("dailyLogs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>}
+                                    {can("timeClock") && <li><Link href="/time-clock" className="hover:text-hui-primary block transition">Time &amp; Expenses</Link></li>}
                                 </ul>
                             </div>
                         )}
@@ -50,7 +50,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Finance</h3>
                                 <ul className="space-y-2 text-sm">
                                     {can("invoices") && <li><Link href="/invoices" className="hover:text-hui-primary block transition">All Invoices</Link></li>}
-                                    {can("changeOrders") && <li><Link href="#" className="hover:text-hui-primary block transition">All Change Orders</Link></li>}
+                                    {can("changeOrders") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Change Orders</Link></li>}
                                 </ul>
                             </div>
                         )}
@@ -131,7 +131,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
             </nav>
 
             <div className="w-full flex flex-col items-center space-y-2 mt-auto">
-                <Link href="#" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-green-400 transition">
+                <Link href="/settings/company" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-green-400 transition">
                     <svg className="w-5 h-5 mb-1" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M11.3 1.046A12.014 12.014 0 0010 1C5.029 1 1 5.029 1 10c0 4.97 4.029 9 9 9 1.488 0 2.89-.358 4.148-1.006A7.472 7.472 0 0114.5 15C14.5 9.773 18.23 5.372 23 4.296A12.062 12.062 0 0011.3 1.046zM20.5 4a6.5 6.5 0 11-13 0 6.5 6.5 0 0113 0z" clipRule="evenodd" /></svg>
                     <span className="text-[10px] uppercase font-semibold">Upgrade</span>
                 </Link>

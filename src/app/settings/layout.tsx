@@ -22,17 +22,17 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
                             </Link>
                         </li>
                         <li>
-                            <Link 
-                                href="#" 
-                                className="block px-3 py-2 text-sm text-hui-textMuted hover:bg-slate-50 rounded-md transition-colors"
+                            <Link
+                                href="/settings/privacy"
+                                className={`block px-3 py-2 text-sm rounded-md transition-colors ${pathname === '/settings/privacy' ? 'font-medium bg-[#f5efe6] text-hui-textMain' : 'text-hui-textMuted hover:bg-slate-50'}`}
                             >
-                                Privacy & Security
+                                Privacy &amp; Security
                             </Link>
                         </li>
                         <li>
-                            <Link 
-                                href="#" 
-                                className="block px-3 py-2 text-sm text-hui-textMuted hover:bg-slate-50 rounded-md transition-colors"
+                            <Link
+                                href="/settings/language"
+                                className={`block px-3 py-2 text-sm rounded-md transition-colors ${pathname === '/settings/language' ? 'font-medium bg-[#f5efe6] text-hui-textMain' : 'text-hui-textMuted hover:bg-slate-50'}`}
                             >
                                 Language
                             </Link>

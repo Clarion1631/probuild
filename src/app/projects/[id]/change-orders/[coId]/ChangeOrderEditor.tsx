@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, approveChangeOrder } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -16,10 +16,28 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSaving, setIsSaving] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [activeTab, setActiveTab] = useState("builder"); // builder | details
+    const [showSignModal, setShowSignModal] = useState(false);
+    const [signName, setSignName] = useState("");
+    const [isSigning, setIsSigning] = useState(false);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
     const tax = subtotal * 0.087;
     const total = subtotal + tax;
+
+    async function handleSign() {
+        if (!signName.trim()) { toast.error("Please enter a name to sign"); return; }
+        setIsSigning(true);
+        try {
+            await approveChangeOrder(initialData.id, signName.trim(), "", navigator.userAgent);
+            toast.success("Change order signed");
+            setShowSignModal(false);
+            router.refresh();
+        } catch {
+            toast.error("Failed to sign change order");
+        } finally {
+            setIsSigning(false);
+        }
+    }
 
     async function handleSave() {
         if (isDeleting) return; // Prevent saving if we are in the middle of deleting
@@ -341,7 +359,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                 <p className="text-sm text-slate-700 font-medium">Ready to sign?</p>
                                                 <p className="text-xs text-slate-500 mt-1">Sign on behalf of the company.</p>
                                             </div>
-                                            <button className="text-amber-600 hover:text-amber-700 font-medium text-sm mt-1">Sign Now →</button>
+                                            <button onClick={() => setShowSignModal(true)} className="text-amber-600 hover:text-amber-700 font-medium text-sm mt-1">Sign Now →</button>
                                         </div>
                                     )}
                                 </div>
@@ -351,5 +369,43 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 )}
             </div>
         </div>
+
+        {showSignModal && (
+            <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-xl max-w-sm w-full border border-hui-border overflow-hidden">
+                    <div className="px-6 py-4 border-b border-hui-border flex items-center justify-between">
+                        <h2 className="text-lg font-bold text-hui-textMain">Sign Change Order</h2>
+                        <button onClick={() => setShowSignModal(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                        </button>
+                    </div>
+                    <div className="p-6 space-y-4">
+                        <p className="text-sm text-hui-textMuted">Type your full name to sign this change order on behalf of the company.</p>
+                        <div>
+                            <label className="block text-sm font-medium text-hui-textMain mb-1">Full Name <span className="text-red-500">*</span></label>
+                            <input
+                                type="text"
+                                className="hui-input w-full"
+                                placeholder="Your name"
+                                value={signName}
+                                onChange={e => setSignName(e.target.value)}
+                                onKeyDown={e => { if (e.key === "Enter") handleSign(); }}
+                                autoFocus
+                            />
+                        </div>
+                    </div>
+                    <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3">
+                        <button className="hui-btn hui-btn-secondary" onClick={() => setShowSignModal(false)}>Cancel</button>
+                        <button
+                            className="hui-btn hui-btn-primary disabled:opacity-50"
+                            disabled={!signName.trim() || isSigning}
+                            onClick={handleSign}
+                        >
+                            {isSigning ? "Signing…" : "Sign"}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
     );
 }

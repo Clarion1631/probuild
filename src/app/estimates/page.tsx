@@ -3,6 +3,7 @@ import { getAllEstimates } from "@/lib/actions";
 import Avatar from "@/components/Avatar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Link from "next/link";
+import NewEstimateButton from "./NewEstimateButton";
 export default async function EstimatesPage() {
     const estimates = await getAllEstimates();
 
@@ -12,7 +13,7 @@ export default async function EstimatesPage() {
                 <div className="flex items-center justify-between px-6 py-4">
                     <h1 className="text-xl font-bold text-hui-textMain">Estimates</h1>
                     <div className="flex items-center gap-3">
-                        <button className="hui-btn hui-btn-primary">New Estimate</button>
+                        <NewEstimateButton />
                     </div>
                 </div>
             </div>
