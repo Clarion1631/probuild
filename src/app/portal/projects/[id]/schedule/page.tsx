@@ -28,6 +28,7 @@ export default async function PortalSchedulePage(props: { params: Promise<{ id: 
         color: t.color,
         progress: t.progress,
         status: t.status,
+        type: t.type || "task",
         order: t.order,
         dependencies: (t.dependencies || []).map((d: any) => ({ 
             id: d.id, 

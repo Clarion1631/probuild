@@ -14,6 +14,7 @@ type Task = {
     color: string;
     progress: number;
     status: string;
+    type: "task" | "milestone";
     order: number;
     dependencies: Dependency[];
     assignments?: Assignment[];
@@ -154,7 +155,11 @@ export default function PortalGanttChart({ initialTasks }: { initialTasks: Task[
                     <div className="flex-1 overflow-y-auto">
                         {tasks.map(task => (
                             <div key={task.id} className="flex items-center px-4 border-b border-slate-100 hover:bg-slate-50 transition min-h-[44px]">
-                                <div className="w-2.5 h-2.5 rounded-full mr-3 shrink-0" style={{ backgroundColor: task.color }} />
+                                {task.type === "milestone" ? (
+                                    <div className="w-3 h-3 rotate-45 border-2 mr-3 shrink-0" style={{ backgroundColor: task.color, borderColor: task.color }} />
+                                ) : (
+                                    <div className="w-2.5 h-2.5 rounded-full mr-3 shrink-0" style={{ backgroundColor: task.color }} />
+                                )}
                                 <div className="flex-1 min-w-0 pr-2">
                                     <div className="text-xs font-medium text-slate-800 truncate" title={task.name}>{task.name}</div>
                                     {(task.assignments || []).length > 0 && (
@@ -211,8 +216,20 @@ export default function PortalGanttChart({ initialTasks }: { initialTasks: Task[
 
                         {tasks.map((task, idx) => {
                             const bar = getBarStyle(task);
+                            const topY = 36 + idx * ROW_HEIGHT;
+                            if (task.type === "milestone") {
+                                const cx = bar.left + 8;
+                                return (
+                                    <div key={task.id} className="absolute flex items-center" style={{ top: topY, left: cx - 12, width: 100, height: ROW_HEIGHT }}>
+                                        <div className="flex items-center gap-2">
+                                            <div className="w-4 h-4 rotate-45 border-2 shadow-sm shrink-0" style={{ backgroundColor: task.color, borderColor: task.color }} />
+                                            {colWidth > 10 && <span className="text-[10px] font-bold whitespace-nowrap" style={{ color: task.color }}>{task.name}</span>}
+                                        </div>
+                                    </div>
+                                );
+                            }
                             return (
-                                <div key={task.id} className="absolute flex items-center px-1" style={{ top: 36 + idx * ROW_HEIGHT, left: bar.left, width: bar.width, height: ROW_HEIGHT }}>
+                                <div key={task.id} className="absolute flex items-center px-1" style={{ top: topY, left: bar.left, width: bar.width, height: ROW_HEIGHT }}>
                                     <div className="w-full h-6 rounded-md shadow-sm relative overflow-hidden group border border-black/5" style={{ backgroundColor: task.color + "22" }}>
                                         <div className="absolute inset-0 rounded-md transition-all" style={{ width: `${task.progress}%`, backgroundColor: task.color }} />
                                         <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-md" style={{ backgroundColor: task.color }} />

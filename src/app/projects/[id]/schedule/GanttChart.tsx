@@ -1,17 +1,19 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
     importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
     aiGenerateSchedule,
     addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
-    assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask
+    assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
+    getEstimateItemsForProject,
 } from "@/lib/actions";
 import { toast } from "sonner";
 
 type EstimateSummary = { id: string; title: string; status: string };
+type EstimateItemSummary = { id: string; name: string; type: string; total: number; estimateId: string };
 type Dependency = { id: string; predecessorId: string; dependentId: string };
 type TeamMember = { id: string; name: string | null; email: string };
 type PunchItem = { id: string; name: string; completed: boolean; order: number };
@@ -28,6 +30,7 @@ type Task = {
     color: string;
     progress: number;
     status: string;
+    type: "task" | "milestone";
     assignee: string | null;
     order: number;
     estimatedHours: number | null;
@@ -36,6 +39,8 @@ type Task = {
     dependents: Dependency[];
     assignments?: Assignment[];
     subAssignments?: SubAssignment[];
+    estimateItemId?: string | null;
+    estimateItem?: EstimateItemSummary | null;
 };
 
 type ZoomLevel = "day" | "week" | "month";
@@ -55,14 +60,62 @@ function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
 function getMonday(d: Date) { const day = d.getDay(); const diff = d.getDate() - day + (day === 0 ? -6 : 1); return new Date(d.setDate(diff)); }
 function isWeekend(d: Date) { const day = d.getDay(); return day === 0 || day === 6; }
 function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
+function formatCurrency(n: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n); }
 
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [] }: {
+// --- Critical Path Algorithm ---
+function computeCriticalPath(tasks: Task[]): Set<string> {
+    if (tasks.length === 0) return new Set();
+    // Build duration map (days) and dependency graph
+    const dur: Record<string, number> = {};
+    const deps: Record<string, string[]> = {}; // task -> its predecessors
+    const successors: Record<string, string[]> = {}; // task -> its dependents
+    for (const t of tasks) {
+        dur[t.id] = Math.max(1, getDaysBetween(new Date(t.startDate), new Date(t.endDate)));
+        deps[t.id] = t.dependencies.map(d => d.predecessorId);
+        successors[t.id] = t.dependents.map(d => d.dependentId);
+    }
+    // Forward pass: earliest finish
+    const ef: Record<string, number> = {};
+    const topoOrder: string[] = [];
+    const visited = new Set<string>();
+    function visit(id: string, stack = new Set<string>()) {
+        if (visited.has(id)) return;
+        if (stack.has(id)) return; // cycle guard
+        stack.add(id);
+        for (const pred of (deps[id] || [])) visit(pred, stack);
+        visited.add(id);
+        topoOrder.push(id);
+    }
+    for (const t of tasks) visit(t.id);
+    for (const id of topoOrder) {
+        const predMaxEF = (deps[id] || []).reduce((m, pid) => Math.max(m, ef[pid] ?? 0), 0);
+        ef[id] = predMaxEF + dur[id];
+    }
+    // Backward pass: latest start
+    const projectEnd = Math.max(...Object.values(ef));
+    const ls: Record<string, number> = {};
+    for (const id of [...topoOrder].reverse()) {
+        const succMinLS = (successors[id] || []).reduce((m, sid) => Math.min(m, ls[sid] ?? Infinity), Infinity);
+        const lf = succMinLS === Infinity ? projectEnd : succMinLS;
+        ls[id] = lf - dur[id];
+    }
+    // Float = ls - (ef - dur) = ls - es
+    const critical = new Set<string>();
+    for (const id of topoOrder) {
+        const es = ef[id] - dur[id];
+        if (ls[id] - es <= 0) critical.add(id);
+    }
+    return critical;
+}
+
+export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system" }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
+    currentUserId?: string;
 }) {
     const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [zoom, setZoom] = useState<ZoomLevel>("week");
@@ -78,6 +131,9 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [editingHoursId, setEditingHoursId] = useState<string | null>(null);
     const [editHoursVal, setEditHoursVal] = useState("");
+    const [showCriticalPath, setShowCriticalPath] = useState(false);
+    const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
+    const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
     // Detail panel state
     const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
     const [panelTab, setPanelTab] = useState<"details" | "punch" | "conversation">("details");
@@ -87,12 +143,17 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [newComment, setNewComment] = useState("");
     const [isAiPunching, setIsAiPunching] = useState(false);
     const [showAssignMenu, setShowAssignMenu] = useState(false);
+    const [estimateItems, setEstimateItems] = useState<EstimateItemSummary[]>([]);
+    const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const [dragState, setDragState] = useState<{
         taskId: string; type: "move" | "resize-left" | "resize-right"; startX: number; origStart: Date; origEnd: Date;
     } | null>(null);
 
     const selectedTask = tasks.find(t => t.id === selectedTaskId);
+
+    // Critical path computation
+    const criticalPathIds = useMemo(() => computeCriticalPath(tasks), [tasks]);
 
     // AI Schedule handler
     async function handleAiSchedule(estimateId?: string) {
@@ -105,9 +166,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                 startDate: new Date(t.startDate).toISOString().split("T")[0],
                 endDate: new Date(t.endDate).toISOString().split("T")[0],
                 color: t.color, progress: 0, status: t.status,
+                type: "task",
                 assignee: null, order: t.order,
                 estimatedHours: t.estimatedHours, actualHours: 0,
                 dependencies: [], dependents: [], assignments: [],
+                estimateItemId: null, estimateItem: null,
             }));
             setTasks(prev => [...prev, ...newTasks]);
             toast.success(`AI generated ${newTasks.length} tasks`);
@@ -125,6 +188,13 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
             getTaskComments(selectedTaskId).then(comments => setComments(comments.map((c: any) => ({ ...c, createdAt: c.createdAt.toISOString?.() || c.createdAt }))));
         }
     }, [selectedTaskId]);
+
+    // Load estimate items for linking (lazy)
+    useEffect(() => {
+        if (showEstimateLinkMenu && estimateItems.length === 0) {
+            getEstimateItemsForProject(projectId).then(items => setEstimateItems(items as any));
+        }
+    }, [showEstimateLinkMenu]);
 
     // Timeline range
     const allDates = tasks.flatMap(t => [new Date(t.startDate), new Date(t.endDate)]);
@@ -176,14 +246,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         return task.progress;
     }
 
-    // Weekend columns for the timeline
     function getWeekendColumns() {
         const cols: { left: number; width: number }[] = [];
         let cursor = new Date(minDate);
         for (let i = 0; i < totalDays; i++) {
-            if (isWeekend(cursor)) {
-                cols.push({ left: i * colWidth, width: colWidth });
-            }
+            if (isWeekend(cursor)) cols.push({ left: i * colWidth, width: colWidth });
             cursor = addDays(cursor, 1);
         }
         return cols;
@@ -193,7 +260,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const headers = getHeaders();
     const weekendCols = getWeekendColumns();
 
-    // --- Drag handlers ---
+    // --- Drag handlers (mouse) ---
     const handleMouseDown = useCallback((e: React.MouseEvent, taskId: string, type: "move" | "resize-left" | "resize-right") => {
         e.preventDefault();
         const task = tasks.find(t => t.id === taskId);
@@ -201,19 +268,42 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         setDragState({ taskId, type, startX: e.clientX, origStart: new Date(task.startDate), origEnd: new Date(task.endDate) });
     }, [tasks]);
 
-    const handleMouseMove = useCallback((e: MouseEvent) => {
+    // --- Touch drag handlers ---
+    const handleTouchStart = useCallback((e: React.TouchEvent, taskId: string, type: "move" | "resize-left" | "resize-right") => {
+        e.preventDefault();
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return;
+        setDragState({ taskId, type, startX: e.touches[0].clientX, origStart: new Date(task.startDate), origEnd: new Date(task.endDate) });
+    }, [tasks]);
+
+    const applyDrag = useCallback((clientX: number) => {
         if (!dragState) return;
-        const dayDelta = Math.round((e.clientX - dragState.startX) / colWidth);
+        const dayDelta = Math.round((clientX - dragState.startX) / colWidth);
         if (dayDelta === 0) return;
         setTasks(prev => prev.map(t => {
             if (t.id !== dragState.taskId) return t;
-            if (dragState.type === "move") return { ...t, startDate: formatDate(addDays(dragState.origStart, dayDelta)), endDate: formatDate(addDays(dragState.origEnd, dayDelta)) };
-            if (dragState.type === "resize-right") { const ne = addDays(dragState.origEnd, dayDelta); return ne <= new Date(t.startDate) ? t : { ...t, endDate: formatDate(ne) }; }
-            const ns = addDays(dragState.origStart, dayDelta); return ns >= new Date(t.endDate) ? t : { ...t, startDate: formatDate(ns) };
+            const isMilestone = t.type === "milestone";
+            if (dragState.type === "move") {
+                const newStart = formatDate(addDays(dragState.origStart, dayDelta));
+                const newEnd = isMilestone ? newStart : formatDate(addDays(dragState.origEnd, dayDelta));
+                return { ...t, startDate: newStart, endDate: newEnd };
+            }
+            if (dragState.type === "resize-right" && !isMilestone) {
+                const ne = addDays(dragState.origEnd, dayDelta);
+                return ne <= new Date(t.startDate) ? t : { ...t, endDate: formatDate(ne) };
+            }
+            if (dragState.type === "resize-left" && !isMilestone) {
+                const ns = addDays(dragState.origStart, dayDelta);
+                return ns >= new Date(t.endDate) ? t : { ...t, startDate: formatDate(ns) };
+            }
+            return t;
         }));
     }, [dragState, colWidth]);
 
-    const handleMouseUp = useCallback(async () => {
+    const handleMouseMove = useCallback((e: MouseEvent) => applyDrag(e.clientX), [applyDrag]);
+    const handleTouchMove = useCallback((e: TouchEvent) => { e.preventDefault(); applyDrag(e.touches[0].clientX); }, [applyDrag]);
+
+    const finishDrag = useCallback(async () => {
         if (!dragState) return;
         const task = tasks.find(t => t.id === dragState.taskId);
         if (task) {
@@ -226,11 +316,14 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         setDragState(null);
     }, [dragState, tasks]);
 
+    const handleMouseUp = useCallback(() => finishDrag(), [finishDrag]);
+    const handleTouchEnd = useCallback(() => finishDrag(), [finishDrag]);
+
     async function cascadeDependents(taskId: string, dayDelta: number) {
         const deps = tasks.filter(t => t.dependencies.some(d => d.predecessorId === taskId));
         for (const dep of deps) {
             const ns = formatDate(addDays(new Date(dep.startDate), dayDelta));
-            const ne = formatDate(addDays(new Date(dep.endDate), dayDelta));
+            const ne = dep.type === "milestone" ? ns : formatDate(addDays(new Date(dep.endDate), dayDelta));
             setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, startDate: ns, endDate: ne } : t));
             await updateScheduleTask(dep.id, { startDate: ns, endDate: ne });
             await cascadeDependents(dep.id, dayDelta);
@@ -241,18 +334,58 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         if (dragState) {
             window.addEventListener("mousemove", handleMouseMove);
             window.addEventListener("mouseup", handleMouseUp);
-            return () => { window.removeEventListener("mousemove", handleMouseMove); window.removeEventListener("mouseup", handleMouseUp); };
+            window.addEventListener("touchmove", handleTouchMove, { passive: false });
+            window.addEventListener("touchend", handleTouchEnd);
+            return () => {
+                window.removeEventListener("mousemove", handleMouseMove);
+                window.removeEventListener("mouseup", handleMouseUp);
+                window.removeEventListener("touchmove", handleTouchMove);
+                window.removeEventListener("touchend", handleTouchEnd);
+            };
         }
-    }, [dragState, handleMouseMove, handleMouseUp]);
+    }, [dragState, handleMouseMove, handleMouseUp, handleTouchMove, handleTouchEnd]);
+
+    // Pinch-to-zoom
+    const pinchRef = useRef<{ dist: number; zoomed: boolean } | null>(null);
+    useEffect(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        const onTouchStart = (e: TouchEvent) => {
+            if (e.touches.length === 2) {
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                pinchRef.current = { dist: Math.hypot(dx, dy), zoomed: false };
+            }
+        };
+        const onTouchMove = (e: TouchEvent) => {
+            if (e.touches.length !== 2 || !pinchRef.current || pinchRef.current.zoomed) return;
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            const newDist = Math.hypot(dx, dy);
+            const ratio = newDist / pinchRef.current.dist;
+            if (ratio > 1.3) { setZoom(z => z === "month" ? "week" : z === "week" ? "day" : "day"); pinchRef.current.zoomed = true; }
+            else if (ratio < 0.7) { setZoom(z => z === "day" ? "week" : z === "week" ? "month" : "month"); pinchRef.current.zoomed = true; }
+        };
+        const onTouchEnd = () => { pinchRef.current = null; };
+        el.addEventListener("touchstart", onTouchStart, { passive: true });
+        el.addEventListener("touchmove", onTouchMove, { passive: true });
+        el.addEventListener("touchend", onTouchEnd);
+        return () => {
+            el.removeEventListener("touchstart", onTouchStart);
+            el.removeEventListener("touchmove", onTouchMove);
+            el.removeEventListener("touchend", onTouchEnd);
+        };
+    }, []);
 
     // --- Task CRUD ---
-    async function handleAddTask() {
+    async function handleAddTask(type: "task" | "milestone" = "task") {
         setIsAdding(true);
         try {
-            const start = formatDate(today); const end = formatDate(addDays(today, 5));
-            const task = await createScheduleTask(projectId, { name: "New Task", startDate: start, endDate: end });
-            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [] }]);
-            toast.success("Task added");
+            const start = formatDate(today);
+            const end = type === "milestone" ? start : formatDate(addDays(today, 5));
+            const task = await createScheduleTask(projectId, { name: type === "milestone" ? "New Milestone" : "New Task", startDate: start, endDate: end, type });
+            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
+            toast.success(type === "milestone" ? "Milestone added" : "Task added");
         } finally { setIsAdding(false); }
     }
     async function handleSaveName(taskId: string) { if (editName.trim()) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name: editName.trim() } : t)); await updateScheduleTask(taskId, { name: editName.trim() }); } setEditingId(null); }
@@ -262,16 +395,26 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     async function handleProgressChange(taskId: string, progress: number) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress } : t)); await updateScheduleTask(taskId, { progress }); }
     async function handleEstimatedHoursSave(taskId: string) { const h = parseFloat(editHoursVal); if (!isNaN(h) && h >= 0) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: h } : t)); await updateScheduleTask(taskId, { estimatedHours: h }); } setEditingHoursId(null); }
 
+    async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item } : t));
+        setShowEstimateLinkMenu(false);
+        await updateScheduleTask(taskId, { estimateItemId: item.id });
+        toast.success("Linked to estimate item");
+    }
+    async function handleUnlinkEstimateItem(taskId: string) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
+        await updateScheduleTask(taskId, { estimateItemId: null });
+        toast.success("Estimate link removed");
+    }
+
     async function handleImportEstimate(estimateId: string) {
         setIsImporting(true); setShowImportMenu(false);
         try {
             const newTasks = await importEstimateToSchedule(projectId, estimateId);
-            setTasks(prev => [...prev, ...newTasks.map((t: any) => ({ ...t, startDate: formatDate(new Date(t.startDate)), endDate: formatDate(new Date(t.endDate)), actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [] }))]);
+            setTasks(prev => [...prev, ...newTasks.map((t: any) => ({ ...t, startDate: formatDate(new Date(t.startDate)), endDate: formatDate(new Date(t.endDate)), type: "task", actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: t.estimateItemId || null, estimateItem: null }))]);
             toast.success(`Imported ${newTasks.length} tasks`);
         } catch { toast.error("Import failed"); } finally { setIsImporting(false); }
     }
-
-
 
     // --- Linking ---
     async function handleTaskClick(taskId: string) {
@@ -314,9 +457,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     }
     async function handleAddComment() {
         if (!newComment.trim() || !selectedTaskId) return;
-        // We'll use a hardcoded userId for now — in real app, this comes from session
         try {
-            const comment = await addTaskComment(selectedTaskId, "system", newComment.trim());
+            const comment = await addTaskComment(selectedTaskId, currentUserId, newComment.trim());
             setComments(prev => [...prev, { ...(comment as any), createdAt: new Date().toISOString() }]);
             setNewComment("");
         } catch { toast.error("Failed to add comment"); }
@@ -335,8 +477,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         await unassignUserFromTask(selectedTaskId, userId);
         setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: (t.assignments || []).filter(a => a.userId !== userId) } : t));
     }
-    
-    // Subcontractor assignments
     async function handleAssignSub(subcontractorId: string) {
         if (!selectedTaskId) return;
         try {
@@ -373,8 +513,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     <h2 className="text-xl font-bold text-hui-textMain">Build your schedule</h2>
                     <p className="text-sm text-hui-textMuted mt-2 max-w-md">Add tasks manually, import from an estimate, or let AI generate a smart schedule with dependencies.</p>
                 </div>
-                <div className="flex items-center gap-3">
-                    <button onClick={handleAddTask} className="hui-btn hui-btn-primary" disabled={isAdding}>+ Add First Task</button>
+                <div className="flex items-center gap-3 flex-wrap justify-center">
+                    <button onClick={() => handleAddTask("task")} className="hui-btn hui-btn-primary" disabled={isAdding}>+ Add First Task</button>
                     <div className="relative">
                         <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
                             className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
@@ -390,9 +530,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     </div>
                     {estimates.length > 0 && (
                         <div className="relative">
-                            <button onClick={() => setShowImportMenu(!showImportMenu)} disabled={isImporting}
-                                className="hui-btn hui-btn-secondary flex items-center gap-2"
-                            >{isImporting ? "Importing..." : "📋 Import"}</button>
+                            <button onClick={() => setShowImportMenu(!showImportMenu)} disabled={isImporting} className="hui-btn hui-btn-secondary flex items-center gap-2">{isImporting ? "Importing..." : "📋 Import"}</button>
                             {showImportMenu && (
                                 <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
                                     {estimates.map(est => (
@@ -415,7 +553,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
             {/* Toolbar */}
             <div className="bg-white border-b border-hui-border shrink-0 z-20 relative">
                 <div className="h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500" />
-                <div className="px-6 py-3 flex items-center justify-between">
+                <div className="px-6 py-3 flex items-center justify-between flex-wrap gap-2">
                     <div className="flex items-center gap-4">
                         <div>
                             <h1 className="text-lg font-bold text-hui-textMain">Schedule</h1>
@@ -430,13 +568,22 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             </div>
                         </div>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                             {(["day", "week", "month"] as ZoomLevel[]).map(z => (
                                 <button key={z} onClick={() => setZoom(z)} className={`px-3 py-1.5 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>{z}</button>
                             ))}
                         </div>
                         <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 300); }} className="hui-btn hui-btn-secondary text-xs py-1.5 px-3">Today</button>
+                        {/* Critical Path toggle */}
+                        <button
+                            onClick={() => setShowCriticalPath(v => !v)}
+                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${showCriticalPath ? "bg-red-50 text-red-700 border-red-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
+                            title="Highlight critical path"
+                        >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                            Critical Path
+                        </button>
                         <div className="relative">
                             <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
                                 className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiGenerating ? "bg-gradient-to-r from-purple-500 to-indigo-500 text-white border-purple-600 animate-pulse" : "bg-gradient-to-r from-purple-50 to-indigo-50 text-purple-700 border-purple-200 hover:shadow-md hover:from-purple-100 hover:to-indigo-100"}`}>
@@ -451,7 +598,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             )}
                         </div>
-                        <button onClick={handleAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Add Task</button>
+                        <button onClick={() => handleAddTask("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
+                        <button onClick={() => handleAddTask("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
+                            Milestone
+                        </button>
                         {/* More menu */}
                         <div className="relative">
                             <button onClick={() => setShowMoreMenu(!showMoreMenu)} className="hui-btn hui-btn-secondary text-xs py-1.5 px-2">
@@ -505,14 +656,25 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     <div className="flex-1 overflow-y-auto">
                         {tasks.map(task => {
                             const hasTimeData = task.actualHours > 0 && task.estimatedHours;
+                            const isCritical = showCriticalPath && criticalPathIds.has(task.id);
                             return (
                                 <div key={task.id}
                                     onClick={() => { if (linkMode === "__awaiting__") setLinkMode(task.id); else if (linkMode) handleTaskClick(task.id); else { setSelectedTaskId(task.id); setPanelTab("details"); } }}
-                                    className={`flex items-center px-3 border-b border-slate-100 hover:bg-slate-50/80 transition group cursor-pointer ${selectedTaskId === task.id ? "bg-indigo-50/60 ring-1 ring-indigo-200" : ""} ${linkMode === task.id ? "bg-amber-50 ring-1 ring-amber-300" : ""}`}
-                                    style={{ height: ROW_HEIGHT }}
+                                    className={`flex items-center px-3 border-b border-slate-100 hover:bg-slate-50/80 transition group cursor-pointer ${selectedTaskId === task.id ? "bg-indigo-50/60 ring-1 ring-inset ring-indigo-200" : ""} ${linkMode === task.id ? "bg-amber-50 ring-1 ring-inset ring-amber-300" : ""}`}
+                                    style={{ height: ROW_HEIGHT, borderLeft: isCritical ? "3px solid #ef4444" : "" }}
                                 >
                                     <div className="relative mr-2">
-                                        <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ring-slate-200" style={{ backgroundColor: task.color }} />
+                                        {task.type === "milestone" ? (
+                                            <button
+                                                onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }}
+                                                className="w-4 h-4 flex items-center justify-center"
+                                                title="Milestone"
+                                            >
+                                                <div className="w-3 h-3 rotate-45 border-2" style={{ backgroundColor: task.color, borderColor: task.color }} />
+                                            </button>
+                                        ) : (
+                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ring-slate-200" style={{ backgroundColor: task.color }} />
+                                        )}
                                         {colorPickerId === task.id && (
                                             <div className="absolute top-5 left-0 z-50 bg-white border border-hui-border rounded-lg shadow-xl p-1.5 flex gap-1 animate-in fade-in">
                                                 {PRESET_COLORS.map(c => (<button key={c} onClick={e => { e.stopPropagation(); handleColorChange(task.id, c); }} className="w-5 h-5 rounded-full hover:scale-125 transition" style={{ backgroundColor: c }} />))}
@@ -524,24 +686,24 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                             <input autoFocus className="hui-input text-xs py-1 w-full" value={editName} onChange={e => setEditName(e.target.value)} onBlur={() => handleSaveName(task.id)} onKeyDown={e => { if (e.key === "Enter") handleSaveName(task.id); }} onClick={e => e.stopPropagation()} />
                                         ) : (
                                             <div className="flex items-center gap-1">
-                                                {/* Crew avatars inline */}
                                                 {(task.assignments || []).slice(0, 2).map(a => (
                                                     <div key={a.userId} className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-700 text-[8px] font-bold flex items-center justify-center shrink-0" title={a.user.name || a.user.email}>
                                                         {getInitials(a.user.name, a.user.email)}
                                                     </div>
                                                 ))}
                                                 <button onClick={e => { if (!linkMode) { e.stopPropagation(); setEditingId(task.id); setEditName(task.name); }}} className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition">{task.name}</button>
+                                                {task.estimateItem && <span className="ml-1 text-[9px] text-blue-500 bg-blue-50 rounded px-1 shrink-0">$</span>}
                                             </div>
                                         )}
                                     </div>
                                     <div className="w-16 flex justify-center">
-                                        {editingHoursId === task.id ? (
+                                        {task.type !== "milestone" && (editingHoursId === task.id ? (
                                             <input autoFocus type="number" className="hui-input text-[10px] py-0.5 w-12 text-center" value={editHoursVal} onChange={e => setEditHoursVal(e.target.value)} onBlur={() => handleEstimatedHoursSave(task.id)} onKeyDown={e => { if (e.key === "Enter") handleEstimatedHoursSave(task.id); }} onClick={e => e.stopPropagation()} placeholder="hrs" />
                                         ) : (
                                             <button onClick={e => { e.stopPropagation(); setEditingHoursId(task.id); setEditHoursVal(task.estimatedHours?.toString() || ""); }} className={`text-[10px] px-1 py-0.5 rounded ${hasTimeData ? "bg-blue-50 text-blue-700 font-semibold" : "text-slate-300 hover:bg-slate-100"}`}>
                                                 {hasTimeData ? `${task.actualHours.toFixed(1)}/${task.estimatedHours}h` : task.estimatedHours ? `${task.estimatedHours}h` : "—"}
                                             </button>
-                                        )}
+                                        ))}
                                     </div>
                                     <div className="w-20 flex justify-center">
                                         <select value={task.status} onChange={e => { e.stopPropagation(); handleStatusChange(task.id, e.target.value); }} onClick={e => e.stopPropagation()} className={`text-[9px] font-semibold rounded-full px-1.5 py-0.5 border-0 cursor-pointer appearance-none text-center ${STATUS_COLORS[task.status] || "bg-slate-100 text-slate-700"}`}>
@@ -556,7 +718,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             );
                         })}
-                        <button onClick={handleAddTask} className="flex items-center px-3 w-full hover:bg-slate-50 transition text-xs text-indigo-500 font-medium gap-2" style={{ height: ROW_HEIGHT }} disabled={isAdding}>
+                        <button onClick={() => handleAddTask("task")} className="flex items-center px-3 w-full hover:bg-slate-50 transition text-xs text-indigo-500 font-medium gap-2" style={{ height: ROW_HEIGHT }} disabled={isAdding}>
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
                             {isAdding ? "Adding..." : "Add Task"}
                         </button>
@@ -581,14 +743,18 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         </div>
 
                         {/* Dependency arrows */}
-                        <svg className="absolute top-0 left-0 w-full h-full pointer-events-none z-[4]" style={{ width: timelineWidth, height: 44 + tasks.length * ROW_HEIGHT }}>
+                        <svg className="absolute top-0 left-0 pointer-events-none z-[4]" style={{ width: timelineWidth, height: 44 + tasks.length * ROW_HEIGHT }}>
                             <defs><marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#94a3b8" /></marker></defs>
                             {arrows.map((arrow, i) => {
                                 const ft = tasks.find(t => t.id === arrow.fromId), tt = tasks.find(t => t.id === arrow.toId);
                                 if (!ft || !tt) return null;
                                 const fb = getBarStyle(ft), tb = getBarStyle(tt);
-                                const x1 = fb.left + fb.width, y1 = 44 + tasks.indexOf(ft) * ROW_HEIGHT + ROW_HEIGHT / 2;
-                                const x2 = tb.left, y2 = 44 + tasks.indexOf(tt) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                                const fromIsMilestone = ft.type === "milestone";
+                                const toIsMilestone = tt.type === "milestone";
+                                const x1 = fromIsMilestone ? fb.left + 8 : fb.left + fb.width;
+                                const y1 = 44 + tasks.indexOf(ft) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                                const x2 = toIsMilestone ? tb.left + 8 : tb.left;
+                                const y2 = 44 + tasks.indexOf(tt) * ROW_HEIGHT + ROW_HEIGHT / 2;
                                 const mx = (x1 + x2) / 2;
                                 return (
                                     <g key={`a-${i}`}>
@@ -600,14 +766,53 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             })}
                         </svg>
 
-                        {/* Task Bars */}
+                        {/* Task Bars / Milestone Diamonds */}
                         {tasks.map((task, idx) => {
                             const bar = getBarStyle(task);
                             const ap = getAutoProgress(task);
+                            const isCritical = showCriticalPath && criticalPathIds.has(task.id);
+                            const topY = 44 + idx * ROW_HEIGHT;
+
+                            if (task.type === "milestone") {
+                                const cx = bar.left + 8; // center of diamond on start date
+                                const cy = topY + ROW_HEIGHT / 2;
+                                const size = 10;
+                                return (
+                                    <div key={task.id} className="absolute flex items-center justify-center" style={{ top: topY, left: cx - size - 4, width: (size + 4) * 2, height: ROW_HEIGHT }}>
+                                        <div
+                                            className={`relative cursor-pointer group select-none ${isCritical ? "drop-shadow-[0_0_6px_rgba(239,68,68,0.8)]" : ""}`}
+                                            onMouseDown={e => handleMouseDown(e, task.id, "move")}
+                                            onTouchStart={e => handleTouchStart(e, task.id, "move")}
+                                            title={task.name}
+                                        >
+                                            <div
+                                                className={`w-5 h-5 rotate-45 border-2 shadow-md transition-transform group-hover:scale-110 ${isCritical ? "ring-2 ring-red-400/50" : ""}`}
+                                                style={{ backgroundColor: task.color, borderColor: task.color }}
+                                            />
+                                            {/* Milestone label */}
+                                            {colWidth > 10 && (
+                                                <div className="absolute left-7 top-1/2 -translate-y-1/2 whitespace-nowrap text-[10px] font-bold pointer-events-none" style={{ color: task.color }}>
+                                                    {task.name}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            }
+
+                            // Regular task bar
                             return (
-                                <div key={task.id} className="absolute flex items-center" style={{ top: 44 + idx * ROW_HEIGHT + 10, left: bar.left, width: bar.width, height: ROW_HEIGHT - 20 }}>
-                                    <div className="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize z-10 hover:bg-black/10 rounded-l-lg" onMouseDown={e => handleMouseDown(e, task.id, "resize-left")} />
-                                    <div className="w-full h-full rounded-lg shadow-md hover:shadow-lg cursor-grab active:cursor-grabbing relative overflow-hidden group border border-black/[0.06] transition-shadow" style={{ backgroundColor: task.color + "18" }} onMouseDown={e => handleMouseDown(e, task.id, "move")}>
+                                <div key={task.id} className="absolute flex items-center" style={{ top: topY + 10, left: bar.left, width: bar.width, height: ROW_HEIGHT - 20 }}>
+                                    <div className="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize z-10 hover:bg-black/10 rounded-l-lg" onMouseDown={e => handleMouseDown(e, task.id, "resize-left")} onTouchStart={e => handleTouchStart(e, task.id, "resize-left")} />
+                                    <div
+                                        className={`w-full h-full rounded-lg shadow-md hover:shadow-lg cursor-grab active:cursor-grabbing relative overflow-hidden group border transition-shadow ${isCritical ? "ring-2 ring-red-400/60 shadow-[0_0_10px_rgba(239,68,68,0.25)]" : "border-black/[0.06]"}`}
+                                        style={{ backgroundColor: task.color + "18" }}
+                                        onMouseDown={e => handleMouseDown(e, task.id, "move")}
+                                        onTouchStart={e => handleTouchStart(e, task.id, "move")}
+                                        onMouseEnter={e => { if (task.estimateItem) { setHoveredTaskId(task.id); setTooltipPos({ x: e.clientX, y: e.clientY }); }}}
+                                        onMouseMove={e => { if (task.estimateItem) setTooltipPos({ x: e.clientX, y: e.clientY }); }}
+                                        onMouseLeave={() => setHoveredTaskId(null)}
+                                    >
                                         <div className="absolute inset-0 rounded-lg transition-all" style={{ width: `${ap}%`, background: `linear-gradient(135deg, ${task.color}cc, ${task.color}99)` }} />
                                         <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-lg" style={{ backgroundColor: task.color }} />
                                         <div className="relative z-[2] flex items-center justify-between h-full px-2.5 pl-3">
@@ -624,7 +829,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                             </div>
                                         )}
                                     </div>
-                                    <div className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize z-10 hover:bg-black/10 rounded-r-lg" onMouseDown={e => handleMouseDown(e, task.id, "resize-right")} />
+                                    <div className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize z-10 hover:bg-black/10 rounded-r-lg" onMouseDown={e => handleMouseDown(e, task.id, "resize-right")} onTouchStart={e => handleTouchStart(e, task.id, "resize-right")} />
                                 </div>
                             );
                         })}
@@ -638,7 +843,12 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     <div className="w-96 shrink-0 bg-white border-l border-hui-border flex flex-col z-10 shadow-lg animate-in slide-in-from-right-5">
                         {/* Panel Header */}
                         <div className="flex items-center justify-between px-4 py-3 border-b border-hui-border bg-slate-50">
-                            <h3 className="text-sm font-bold text-hui-textMain truncate flex-1">{selectedTask.name}</h3>
+                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                                {selectedTask.type === "milestone" && (
+                                    <div className="w-3 h-3 rotate-45 shrink-0" style={{ backgroundColor: selectedTask.color }} />
+                                )}
+                                <h3 className="text-sm font-bold text-hui-textMain truncate">{selectedTask.name}</h3>
+                            </div>
                             <button onClick={() => setSelectedTaskId(null)} className="text-slate-400 hover:text-slate-700 p-1 rounded-md hover:bg-slate-100 transition">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                             </button>
@@ -661,14 +871,66 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                             {STATUS_OPTIONS.map(s => (<option key={s} value={s}>{s}</option>))}
                                         </select>
                                     </div>
-                                    <div className="grid grid-cols-2 gap-3">
-                                        <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Start</label><div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.startDate}</div></div>
-                                        <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">End</label><div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.endDate}</div></div>
-                                    </div>
+                                    {selectedTask.type === "milestone" ? (
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Date</label>
+                                            <div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.startDate}</div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Start</label><div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.startDate}</div></div>
+                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">End</label><div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.endDate}</div></div>
+                                            </div>
+                                            <div>
+                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Estimated Hours</label>
+                                                <input type="number" value={selectedTask.estimatedHours ?? ""} onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) { setTasks(prev => prev.map(t => t.id === selectedTask.id ? { ...t, estimatedHours: v } : t)); updateScheduleTask(selectedTask.id, { estimatedHours: v }); }}} className="hui-input text-sm mt-1 w-full" placeholder="e.g. 40" />
+                                            </div>
+                                        </>
+                                    )}
+                                    {/* Estimate Item Link */}
                                     <div>
-                                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Estimated Hours</label>
-                                        <input type="number" value={selectedTask.estimatedHours ?? ""} onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) { setTasks(prev => prev.map(t => t.id === selectedTask.id ? { ...t, estimatedHours: v } : t)); updateScheduleTask(selectedTask.id, { estimatedHours: v }); }}} className="hui-input text-sm mt-1 w-full" placeholder="e.g. 40" />
+                                        <div className="flex items-center justify-between mb-2">
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Estimate Link</label>
+                                            {selectedTask.estimateItem ? (
+                                                <button onClick={() => handleUnlinkEstimateItem(selectedTask.id)} className="text-[10px] text-red-500 hover:text-red-700 font-semibold transition">Remove</button>
+                                            ) : (
+                                                <div className="relative">
+                                                    <button onClick={() => setShowEstimateLinkMenu(v => !v)} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Link</button>
+                                                    {showEstimateLinkMenu && (
+                                                        <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] max-h-60 overflow-y-auto py-1 animate-in fade-in">
+                                                            {estimateItems.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No estimate items found</div>}
+                                                            {estimateItems.map(item => (
+                                                                <button key={item.id} onClick={() => handleLinkEstimateItem(selectedTask.id, item)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs">
+                                                                    <div className="font-medium truncate">{item.name}</div>
+                                                                    <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
+                                                                </button>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                        {selectedTask.estimateItem ? (
+                                            <div className="bg-blue-50 rounded-lg px-3 py-2 border border-blue-100">
+                                                <div className="text-xs font-semibold text-blue-800 truncate">{selectedTask.estimateItem.name}</div>
+                                                <div className="flex items-center gap-3 mt-1">
+                                                    <span className="text-[10px] text-blue-600 capitalize">{selectedTask.estimateItem.type}</span>
+                                                    <span className="text-[10px] font-semibold text-blue-700">{formatCurrency(selectedTask.estimateItem.total)} budget</span>
+                                                    {selectedTask.estimatedHours && <span className="text-[10px] text-blue-500">{selectedTask.estimatedHours}h est.</span>}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <p className="text-xs text-slate-400 italic">Not linked to an estimate item</p>
+                                        )}
                                     </div>
+                                    {/* Critical Path indicator */}
+                                    {showCriticalPath && criticalPathIds.has(selectedTask.id) && (
+                                        <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                                            <span className="text-xs font-semibold text-red-700">On critical path</span>
+                                        </div>
+                                    )}
                                     {/* Assigned Members */}
                                     <div>
                                         <div className="flex items-center justify-between mb-2">
@@ -684,7 +946,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                                                 <span className="truncate">{m.name || m.email}</span>
                                                             </button>
                                                         ))}
-                                                        
                                                         <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 mt-1 border-t border-hui-border">Subcontractors</div>
                                                         {subcontractors.filter(s => !(selectedTask.subAssignments || []).some(a => a.subcontractorId === s.id)).map(s => (
                                                             <button key={s.id} onClick={() => handleAssignSub(s.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition flex items-center gap-2 text-xs">
@@ -692,7 +953,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                                                 <span className="truncate flex-1">{s.companyName}</span>
                                                             </button>
                                                         ))}
-                                                        
                                                         {teamMembers.length === 0 && subcontractors.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No options found</div>}
                                                     </div>
                                                 )}
@@ -771,6 +1031,25 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     </div>
                 )}
             </div>
+
+            {/* Hover tooltip for estimate budget */}
+            {hoveredTaskId && (() => {
+                const task = tasks.find(t => t.id === hoveredTaskId);
+                if (!task?.estimateItem) return null;
+                return (
+                    <div
+                        className="fixed z-[100] bg-slate-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl pointer-events-none"
+                        style={{ left: tooltipPos.x + 12, top: tooltipPos.y - 40 }}
+                    >
+                        <div className="font-semibold">{task.estimateItem.name}</div>
+                        <div className="flex items-center gap-3 mt-1 text-slate-300">
+                            <span>Budget: <span className="text-green-400 font-semibold">{formatCurrency(task.estimateItem.total)}</span></span>
+                            {task.estimatedHours && <span>{task.estimatedHours}h est.</span>}
+                            {task.actualHours > 0 && <span>{task.actualHours.toFixed(1)}h actual</span>}
+                        </div>
+                    </div>
+                );
+            })()}
         </div>
     );
 }
