@@ -23,7 +23,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         { key: "overview", label: "Overview", href: `/leads/${leadId}`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
         )},
-        { key: "notes", label: "Notes", icon: (
+        { key: "notes", label: "Notes", href: `/leads/${leadId}/notes`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         )},
         { key: "tasks", label: "Tasks", href: `/leads/${leadId}/tasks`, icon: (
@@ -119,9 +119,8 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
                         key={item.key}
                         href={item.href || "#"}
                         onClick={(e) => {
-                            if (!item.href || item.key === "notes") {
+                            if (!item.href) {
                                 e.preventDefault();
-                                if (item.key === "notes") setShowNotes(true);
                             } else {
                                 setActiveNav(item.key);
                             }

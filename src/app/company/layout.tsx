@@ -22,8 +22,8 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
             items: [
                 { name: "Templates", href: "/company/templates", icon: FileText },
                 { name: "Cost Codes & Phases", href: "/company/cost-codes", icon: FileText },
-                { name: "My Items", href: "/company/cost-codes", icon: FileText },
-                { name: "Catalogs", href: "/company/vendors", icon: FileText },
+                { name: "My Items", href: "/company/my-items", icon: FileText },
+                { name: "Catalogs", href: "/company/catalogs", icon: FileText },
             ]
         }
     ];
