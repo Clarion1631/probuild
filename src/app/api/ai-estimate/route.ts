@@ -1,6 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
+type CostCode = { id: string; code: string; name: string };
+type CostType = { id: string; name: string };
+type AiItem = {
+    name?: string;
+    description?: string;
+    costCode?: string;
+    costType?: string;
+    quantity?: number;
+    unitCost?: number;
+    total?: number;
+};
+type AiMilestone = { name?: string; percentage?: number };
+type AiData = { items: AiItem[]; paymentMilestones: AiMilestone[] };
+
 export async function POST(req: NextRequest) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -14,8 +28,8 @@ export async function POST(req: NextRequest) {
     }
 
     // Build lists of available phases and cost types for the AI
-    const phasesList = (costCodes || []).map((cc: any) => `${cc.code} — ${cc.name}`).join("\n");
-    const typesList = (costTypes || []).map((ct: any) => ct.name).join(", ");
+    const phasesList = (costCodes || []).map((cc: CostCode) => `${cc.code} — ${cc.name}`).join("\n");
+    const typesList = (costTypes || []).map((ct: CostType) => ct.name).join(", ");
 
     const prompt = `You are an expert residential remodeling estimator in Vancouver, WA (Clark County). Generate a detailed, realistic construction estimate with accurate 2024-2025 local market pricing.
 
@@ -122,7 +136,7 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
         }
 
-        let aiData: any;
+        let aiData: AiData;
         try {
             aiData = JSON.parse(rawText);
             // Handle both object format { items: [...], paymentMilestones: [...] } and legacy array format
@@ -158,7 +172,7 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
         }
 
         // Transform AI items into estimate items structure
-        const estimateItems = aiItems.map((item: any, idx: number) => ({
+        const estimateItems = aiItems.map((item: AiItem, idx: number) => ({
             id: `ai_${Date.now()}_${idx}`,
             name: item.name || "Unnamed Item",
             description: item.description || "",
@@ -172,10 +186,10 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             order: idx,
         }));
 
-        const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0);
+        const totalEstimate = estimateItems.reduce((sum: number, i) => sum + (i.total || 0), 0);
 
         // Build payment milestones with amounts based on total
-        const paymentMilestones = aiMilestones.map((m: any, idx: number) => ({
+        const paymentMilestones = aiMilestones.map((m: AiMilestone, idx: number) => ({
             id: `pm_${Date.now()}_${idx}`,
             name: m.name || `Payment ${idx + 1}`,
             percentage: String(m.percentage || 0),
@@ -189,8 +203,9 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             count: estimateItems.length,
             totalEstimate,
         });
-    } catch (err: any) {
+    } catch (err) {
         console.error("AI Estimate error:", err);
-        return NextResponse.json({ error: err.message || "Internal error" }, { status: 500 });
+        const message = err instanceof Error ? err.message : "Internal error";
+        return NextResponse.json({ error: message }, { status: 500 });
     }
 }

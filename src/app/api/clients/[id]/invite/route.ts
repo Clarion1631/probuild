@@ -57,7 +57,7 @@ export async function POST(
             try {
                 // Ensure the 'from' email is verified in Resend for the user's domain.
                 // If not, we just catch the error and continue.
-                const { data, error } = await resend.emails.send({
+                const { error } = await resend.emails.send({
                     from: 'ProBuild <notifications@goldentouchremodeling.com>',
                     to: emailToInvite,
                     subject: 'Invitation to Customer Portal',
@@ -104,9 +104,10 @@ export async function POST(
                     console.error("Resend API returned error:", error);
                     return NextResponse.json({ error: "Failed to send email: " + error.message }, { status: 400 });
                 }
-            } catch (emailError: any) {
+            } catch (emailError) {
                 console.error("Failed to send Resend email:", emailError);
-                return NextResponse.json({ error: "Exception sending email: " + emailError.message }, { status: 500 });
+                const msg = emailError instanceof Error ? emailError.message : "Unknown error";
+                return NextResponse.json({ error: "Exception sending email: " + msg }, { status: 500 });
             }
         } else {
             console.log(`[DEV MODE] Invite email would be sent to ${emailToInvite}: Login at ${appUrl}`);
@@ -114,8 +115,9 @@ export async function POST(
 
         return NextResponse.json({ success: true, user });
 
-    } catch (error: any) {
+    } catch (error) {
         console.error("Invite Error:", error);
-        return NextResponse.json({ error: "Internal Server Error", details: error.message }, { status: 500 });
+        const msg = error instanceof Error ? error.message : "Unknown error";
+        return NextResponse.json({ error: "Internal Server Error", details: msg }, { status: 500 });
     }
 }

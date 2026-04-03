@@ -14,7 +14,8 @@ export async function POST(request: Request) {
 
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-        const parts: any[] = [
+        type GeminiPart = { text: string } | { inlineData: { data: string; mimeType: string }; text?: string };
+        const parts: GeminiPart[] = [
             { text: `You are an expert interior designer. Create a mood board conceptualization based on this theme/prompt: "${prompt}". 
             
             Return a JSON object containing:
@@ -64,7 +65,7 @@ export async function POST(request: Request) {
         let parsed;
         try {
             parsed = JSON.parse(text.trim());
-        } catch(e) {
+        } catch {
             console.error("Failed to parse Gemini generated json:", text);
             return NextResponse.json({ error: "Failed to generate mood board" }, { status: 500 });
         }
@@ -75,7 +76,7 @@ export async function POST(request: Request) {
                 projectId,
                 title: parsed.title || "AI Generated Mood Board",
                 items: {
-                    create: parsed.items.map((item: any) => ({
+                    create: parsed.items.map((item: { type?: string; content?: string; x?: number; y?: number; width?: number; height?: number; zIndex?: number }) => ({
                         type: item.type || "TEXT",
                         content: item.content || "",
                         x: item.x || 0,
@@ -91,8 +92,9 @@ export async function POST(request: Request) {
 
         return NextResponse.json(board);
 
-    } catch (e: any) {
+    } catch (e) {
         console.error("AI Mood Board error:", e);
-        return NextResponse.json({ error: e.message || "Failed to process AI request" }, { status: 500 });
+        const message = e instanceof Error ? e.message : "Failed to process AI request";
+        return NextResponse.json({ error: message }, { status: 500 });
     }
 }

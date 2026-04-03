@@ -23,11 +23,18 @@ function getInitialWidgets(): Set<WidgetId> {
     return new Set(ALL_WIDGETS.map(w => w.id));
 }
 
+type Project = {
+    id: string;
+    name: string;
+    status: StatusType;
+    client?: { name?: string | null } | null;
+};
+
 export default function DashboardClient({
     projects,
     userName,
 }: {
-    projects: any[];
+    projects: Project[];
     userName: string | null;
 }) {
     const [visibleWidgets, setVisibleWidgets] = useState<Set<WidgetId>>(getInitialWidgets);
@@ -97,7 +104,7 @@ export default function DashboardClient({
                             <div className="p-0">
                                 <table className="w-full text-sm text-left">
                                     <tbody className="divide-y divide-gray-100">
-                                        {projects.slice(0, 5).map((p: any) => (
+                                        {projects.slice(0, 5).map((p) => (
                                             <tr key={p.id} className="hover:bg-slate-50 transition-colors group">
                                                 <td className="px-4 py-3">
                                                     <Link href={`/projects/${p.id}/estimates`} className="font-semibold text-hui-textMain hover:text-hui-primary transition-colors block">

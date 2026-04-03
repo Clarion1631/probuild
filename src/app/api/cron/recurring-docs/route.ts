@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { sendNotification } from '@/lib/email';
-import crypto from 'crypto';
 
 // Protect cron route against unauthorized access outside Vercel Cron
 const cronSecret = process.env.CRON_SECRET || "local-cron-secret-123";
@@ -126,8 +125,9 @@ export async function GET(req: Request) {
             processedRecordsCount: dueContracts.length,
             createdRecords
         });
-    } catch (error: any) {
+    } catch (error) {
         console.error("CRON Error processing recurring docs:", error);
-        return NextResponse.json({ error: error.message }, { status: 500 });
+        const msg = error instanceof Error ? error.message : "Unknown error";
+        return NextResponse.json({ error: msg }, { status: 500 });
     }
 }
