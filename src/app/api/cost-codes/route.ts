@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { code, name, description, type } = body;
+    const { code, name, description } = body;
 
     if (!code || !name) {
         return NextResponse.json({ error: "Code and Name are required" }, { status: 400 });
@@ -44,7 +44,6 @@ export async function POST(req: NextRequest) {
                 code: code.toUpperCase(),
                 name,
                 description: description || null,
-                type: type || "Labor",
             }
         });
         return NextResponse.json(costCode);
@@ -66,7 +65,7 @@ export async function PUT(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { id, code, name, description, type, isActive } = body;
+    const { id, code, name, description, isActive } = body;
 
     if (!id) return NextResponse.json({ error: "ID is required" }, { status: 400 });
 
@@ -77,7 +76,6 @@ export async function PUT(req: NextRequest) {
                 ...(code && { code: code.toUpperCase() }),
                 ...(name && { name }),
                 ...(description !== undefined && { description }),
-                ...(type && { type }),
                 ...(isActive !== undefined && { isActive }),
             }
         });

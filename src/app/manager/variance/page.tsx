@@ -22,7 +22,7 @@ export default async function VarianceReportPage() {
             estimates: {
                 include: {
                     items: {
-                        include: { costCode: true }
+                        include: { costCode: true, costType: true }
                     }
                 }
             },
@@ -59,7 +59,8 @@ export default async function VarianceReportPage() {
                                     actualLabor: 0,
                                 };
                             }
-                            if (item.type === 'Labor') {
+                            const itemCategory = item.costType?.name || item.type || "";
+                            if (itemCategory === 'Labor') {
                                 costCodeBudgets[ccId].laborBudget += item.total || 0;
                             } else {
                                 costCodeBudgets[ccId].materialBudget += item.total || 0;

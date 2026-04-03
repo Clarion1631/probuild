@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 
 interface JobCostingClientProps {
     project: { id: string; name: string };
@@ -80,7 +81,8 @@ export default function JobCostingClient({
             est.items.forEach((item: any) => {
                 const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
                 const total = (item.quantity * item.unitCost);
-                if (item.type?.toLowerCase().includes("labor")) group.budgetLabor += total;
+                const itemCategory = (item.costType?.name || item.type || "").toLowerCase();
+                if (itemCategory.includes("labor")) group.budgetLabor += total;
                 else group.budgetMaterial += total;
             });
         });
@@ -260,6 +262,48 @@ export default function JobCostingClient({
                     </div>
                 </div>
             </div>
+
+            {/* Budget vs Actual Chart */}
+            {sortedSummaries.length > 0 && (
+                <div className="bg-white rounded-xl shadow-sm border border-hui-border p-5 mb-6">
+                    <div className="flex items-center gap-2 mb-4">
+                        <ChartBarIcon />
+                        <h2 className="text-sm font-bold text-hui-textMain">Budget vs Actual by Phase</h2>
+                    </div>
+                    <ResponsiveContainer width="100%" height={280}>
+                        <BarChart
+                            data={sortedSummaries.map(s => ({
+                                name: s.code !== "N/A" ? s.code : s.name,
+                                fullName: s.name,
+                                Budget: parseFloat((s.budgetLabor + s.budgetMaterial).toFixed(2)),
+                                Actual: parseFloat((s.actualLabor + s.actualMaterial).toFixed(2)),
+                                Committed: parseFloat(s.committedMaterial.toFixed(2)),
+                            }))}
+                            margin={{ top: 4, right: 8, left: 8, bottom: 4 }}
+                            barCategoryGap="30%"
+                            barGap={2}
+                        >
+                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                            <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#94a3b8" }} axisLine={false} tickLine={false} />
+                            <YAxis
+                                tick={{ fontSize: 11, fill: "#94a3b8" }}
+                                axisLine={false}
+                                tickLine={false}
+                                tickFormatter={v => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v}`}
+                            />
+                            <Tooltip
+                                formatter={(value: number, name: string) => [`$${value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, name]}
+                                labelFormatter={(label, payload) => payload?.[0]?.payload?.fullName ?? label}
+                                contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }}
+                            />
+                            <Legend iconType="circle" iconSize={8} wrapperStyle={{ fontSize: 12 }} />
+                            <Bar dataKey="Budget" fill="#3b82f6" radius={[3, 3, 0, 0]} />
+                            <Bar dataKey="Actual" fill="#f97316" radius={[3, 3, 0, 0]} />
+                            <Bar dataKey="Committed" fill="#f59e0b" radius={[3, 3, 0, 0]} />
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+            )}
 
             {/* Cost Breakdown Table */}
             <div className="bg-white rounded-xl shadow-sm border border-hui-border overflow-hidden">

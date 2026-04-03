@@ -123,6 +123,85 @@ export async function POST(req: Request) {
                 }
                 break;
             }
+            case "charge.refunded": {
+                const charge = event.data.object as any;
+                const paymentIntentId: string | null = charge.payment_intent ?? null;
+                if (!paymentIntentId) break;
+
+                // Find the payment schedule tied to this payment intent and reverse it
+                const schedule = await prisma.paymentSchedule.findFirst({
+                    where: { stripePaymentIntentId: paymentIntentId },
+                    include: { invoice: true },
+                });
+                if (!schedule) break;
+
+                const refundedAmount = (charge.amount_refunded ?? 0) / 100; // Stripe amounts are in cents
+
+                await prisma.paymentSchedule.update({
+                    where: { id: schedule.id },
+                    data: { status: "Pending", paidAt: null },
+                });
+
+                // Restore invoice balance
+                await prisma.invoice.update({
+                    where: { id: schedule.invoice.id },
+                    data: {
+                        balanceDue: (schedule.invoice.balanceDue || 0) + refundedAmount,
+                        status: "Sent",
+                    },
+                });
+
+                const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                if (refundSettings?.notificationEmail) {
+                    await sendNotification(
+                        refundSettings.notificationEmail,
+                        `Refund Issued: Invoice ${schedule.invoice.code}`,
+                        `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2>Refund Processed</h2>
+                            <p>A refund of <strong>$${refundedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong> was issued for Invoice #${schedule.invoice.code} (milestone: ${schedule.name}).</p>
+                            <p>The payment schedule has been reset to Pending and the invoice balance restored.</p>
+                        </div>`
+                    );
+                }
+                break;
+            }
+            case "charge.dispute.created": {
+                const dispute = event.data.object as any;
+                const disputeSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                if (disputeSettings?.notificationEmail) {
+                    await sendNotification(
+                        disputeSettings.notificationEmail,
+                        `🚨 Payment Dispute Filed`,
+                        `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2>Payment Dispute Opened</h2>
+                            <p>A dispute has been filed for <strong>$${((dispute.amount ?? 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong>.</p>
+                            <p>Reason: ${dispute.reason ?? "Not specified"}</p>
+                            <p>Dispute ID: ${dispute.id}</p>
+                            <p>Please respond in your <a href="https://dashboard.stripe.com/disputes">Stripe dashboard</a> before the deadline.</p>
+                        </div>`
+                    );
+                }
+                break;
+            }
+            case "checkout.session.expired": {
+                const expired = event.data.object as any;
+                const expiredMeta = expired.metadata;
+                if (!expiredMeta?.paymentScheduleId) break;
+
+                const expiredSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                if (expiredSettings?.notificationEmail) {
+                    await sendNotification(
+                        expiredSettings.notificationEmail,
+                        `Checkout Session Expired`,
+                        `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2>Checkout Session Expired</h2>
+                            <p>A customer did not complete their payment for milestone ID <strong>${expiredMeta.paymentScheduleId}</strong>.</p>
+                            <p>The checkout link has expired. You may resend the invoice if needed.</p>
+                        </div>`
+                    );
+                }
+                break;
+            }
             default:
                 // Intentionally unhandled — Stripe sends many event types
                 break;

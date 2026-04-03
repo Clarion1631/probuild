@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Part } from "@google/genai";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 
@@ -35,10 +35,11 @@ export async function POST(req: NextRequest) {
 
     try {
         const body = await req.json();
-        const { notes, photoUrls } = body;
+        const { notes, photos } = body as {
+            notes: string;
+            photos?: { data: string; mimeType: string }[];
+        };
 
-        // Note: For now we're just parsing the shorthand text. In the future, we can add vision capabilities
-        // to parse the photos, or video capabilities by passing the uploaded file URIs to the Gemini API.
         // TODO: Video daily logs — use Gemini 1.5 Pro with file URI once video upload is wired
 
         if (!notes) {
@@ -52,15 +53,17 @@ export async function POST(req: NextRequest) {
 
         const ai = new GoogleGenAI({ apiKey });
 
-        const prompt = `You are an expert construction site superintendent. 
-Your task is to take rough, shorthand field notes from a worker and turn them into a clear, professional daily log report.
+        const hasPhotos = Array.isArray(photos) && photos.length > 0;
+
+        const prompt = `You are an expert construction site superintendent.
+Your task is to take rough, shorthand field notes${hasPhotos ? " and site photos" : ""} from a worker and turn them into a clear, professional daily log report.
 The report will be visible to both the internal team and the customer, so maintain a professional, reassuring tone.
 
 Here are the raw notes from the field today:
 """
 ${notes}
 """
-
+${hasPhotos ? `\n${photos!.length} site photo(s) are attached. Describe any visible progress, materials, equipment, or conditions you can identify from the photos and incorporate that into the workPerformed description.\n` : ""}
 Please extract and expand upon this information into the following structured format exactly:
 - workPerformed: Detail what was done today. Make it read well.
 - materialsDelivered: Any materials.
@@ -69,13 +72,26 @@ Please extract and expand upon this information into the following structured fo
 
 Respond ONLY with valid JSON matching the schema provided.`;
 
+        const parts: Part[] = [{ text: prompt }];
+
+        if (hasPhotos) {
+            for (const photo of photos!) {
+                parts.push({
+                    inlineData: {
+                        mimeType: photo.mimeType,
+                        data: photo.data,
+                    },
+                });
+            }
+        }
+
         const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: prompt,
+            model: "gemini-2.0-flash",
+            contents: { parts },
             config: {
                 responseMimeType: "application/json",
                 responseSchema: responseSchema as any,
-                temperature: 0.3, // Low temp for more factual formatting
+                temperature: 0.3,
             }
         });
 
@@ -87,8 +103,9 @@ Respond ONLY with valid JSON matching the schema provided.`;
 
         return NextResponse.json(json);
 
-    } catch (error: any) {
-        console.error("AI Daily Log Error:", error);
+    } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : "Unknown error";
+        console.error("AI Daily Log Error:", msg);
         return NextResponse.json({ error: "Failed to generate AI report" }, { status: 500 });
     }
 }

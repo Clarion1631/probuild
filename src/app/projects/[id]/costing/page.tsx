@@ -43,7 +43,8 @@ export default async function JobCostingPage({
         include: {
             items: {
                 include: {
-                    costCode: true
+                    costCode: true,
+                    costType: true,
                 }
             }
         }

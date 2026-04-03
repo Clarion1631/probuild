@@ -140,6 +140,19 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
         return results;
     };
 
+    const readFileAsBase64 = (file: File): Promise<{ data: string; mimeType: string }> =>
+        new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+                const result = reader.result as string;
+                // result is "data:image/jpeg;base64,<data>" — strip the prefix
+                const data = result.split(",")[1];
+                resolve({ data, mimeType: file.type || "image/jpeg" });
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+        });
+
     const handleGenerateAI = async () => {
         if (!formWork.trim()) {
             toast.error("Please enter some brief notes in 'Work Performed' first.");
@@ -148,12 +161,16 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
 
         setIsGeneratingAI(true);
         try {
+            const photos = formPhotos.length > 0
+                ? await Promise.all(formPhotos.map(readFileAsBase64))
+                : undefined;
+
             const res = await fetch("/api/ai/daily-logs", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     notes: formWork + (formMaterials ? `\nMaterials: ${formMaterials}` : '') + (formIssues ? `\nIssues: ${formIssues}` : ''),
-                    photoUrls: [] // Placeholder for future vision capability
+                    photos,
                 })
             });
 
@@ -654,7 +671,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                                             </svg>
                                         )}
-                                        {isGeneratingAI ? "Drafting..." : "✨ AI Draft"}
+                                        {isGeneratingAI ? "Drafting..." : formPhotos.length > 0 ? `✨ AI Draft (${formPhotos.length} photo${formPhotos.length > 1 ? "s" : ""})` : "✨ AI Draft"}
                                     </button>
                                 </div>
                                 <textarea

@@ -481,15 +481,19 @@ export async function getProjects() {
 }
 
 export async function getProject(id: string) {
-    const project = await prisma.project.findUnique({
-        where: { id },
-        include: {
-            client: true,
-            estimates: true,
-            floorPlans: true,
-            contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
-        },
-    });
+    const include = {
+        client: true,
+        estimates: true,
+        floorPlans: true,
+        contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
+    } as const;
+
+    // Support both CUID and friendly numeric ID in URL params
+    const numericId = /^\d+$/.test(id) ? parseInt(id, 10) : null;
+    const project = numericId
+        ? await prisma.project.findFirst({ where: { number: numericId }, include })
+        : await prisma.project.findUnique({ where: { id }, include });
+
     if (project && !project.client) {
         (project as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
     }
