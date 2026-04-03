@@ -6,7 +6,6 @@ const fromNumber = process.env.TWILIO_PHONE_NUMBER;
 
 export async function sendSMS(toPhone: string, body: string) {
     if (!toPhone) {
-        console.log("No phone number provided. Skipping SMS.");
         return;
     }
 
@@ -37,7 +36,6 @@ export async function sendSMS(toPhone: string, body: string) {
             from: fromNumber,
             to: normalized,
         });
-        console.log("SMS sent via Twilio:", message.sid);
         return message;
     } catch (error) {
         console.error("Failed to send Twilio SMS:", error);

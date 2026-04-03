@@ -63,16 +63,16 @@ Now that all pages/routes exist, focus shifts to: making them production-quality
 
 ### Next Sessions (pick any order)
 
-**Session 8 — Invoice & Leads Polish**
-- [ ] Invoice page: 4 stat cards (Total Invoiced, Collected, Outstanding, Overdue), status tabs with count badges, column reorder
-- [ ] Leads list: tabbed views (All, Hot, Won, Lost), sortable columns, lead scoring button
-- [ ] Daily logs: weather icon picker, photo thumbnails in list view
+~~**Session 8 — Invoice & Leads Polish**~~ ✅ DONE (2026-04-03)
+- [x] Invoice page: 4 stat cards (Total Invoiced, Collected, Outstanding, Overdue), status tabs with count badges, column reorder
+- [x] Leads list: tabbed views (All, Hot, Won, Lost), sortable columns, lead scoring button
+- [x] Daily logs: weather icon picker, photo thumbnails in list view
 
-**Session 9 — Real Email & SMS + Console Log Cleanup**
-- [ ] Wire `src/lib/email.ts` to Resend API (RESEND_API_KEY already in Vercel)
-- [ ] Wire `src/lib/sms.ts` to Twilio (TWILIO_* keys already in Vercel)
-- [ ] Remove all production console.logs
-- [ ] Add error boundaries to all page layouts
+~~**Session 9 — Real Email & SMS + Console Log Cleanup**~~ ✅ DONE (2026-04-03)
+- [x] Wire `src/lib/email.ts` to Resend API — already real; keys live in Vercel
+- [x] Wire `src/lib/sms.ts` to Twilio — already real; wired subcontractor invite SMS
+- [x] Remove all production console.logs (email, sms, supabase init, approveEstimate, COI debug, stripe webhook)
+- [x] Add error boundaries to all page layouts (projects, settings, reports, company, portal, sub-portal)
 
 **Session 10 — Financial Precision + Friendly IDs**
 - [ ] Migrate all Float money fields to Decimal (prevents rounding errors)
@@ -111,8 +111,8 @@ Now that all pages/routes exist, focus shifts to: making them production-quality
 ## 🔴 Critical (Fix Now)
 
 - [ ] **Financial Float → Decimal** — all money fields use Float, causing precision errors. Migrate to Decimal
-- [ ] **Mock email/SMS** — `src/lib/email.ts` and `src/lib/sms.ts` are mock. Wire real Resend + Twilio
-- [ ] **Remove console.logs** — 8+ production console.logs across actions.ts, email.ts, sms.ts, stripe webhook
+- [x] **Mock email/SMS** — Resend + Twilio already wired; subcontractor SMS now live (2026-04-03)
+- [x] **Remove console.logs** — removed from email.ts, sms.ts, supabase.ts, actions.ts, stripe webhook (2026-04-03)
 - [x] **Hardcoded "Justin Account"** — replaced with session user name (2026-04-03)
 - [x] **Project Overview 404** — /overview redirect added (2026-04-03)
 - [x] **Dead buttons** — audited and wired across app (2026-04-03)

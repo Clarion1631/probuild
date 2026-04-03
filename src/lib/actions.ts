@@ -963,7 +963,6 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                             folderId: folder.id,
                         },
                     });
-                    console.log(`[approveEstimate] Filed signed PDF to project ${estimate.projectId} / Signed Documents`);
                 } else {
                     console.error("[approveEstimate] Supabase upload failed:", uploadError);
                 }
@@ -3094,8 +3093,6 @@ Respond ONLY with the single date translated into YYYY-MM-DD format.
         });
         
         const text = response.text?.trim() || "";
-        console.log("Raw AI COI Extraction Response:", text); // Debugging
-        
         if (text === "NULL" || !text) return null;
         
         // Extract YYYY-MM-DD from the response

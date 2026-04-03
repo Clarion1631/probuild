@@ -3,6 +3,7 @@
 import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
+import { sendSMS } from "./sms";
 import { SignJWT } from "jose";
 
 const JWT_SECRET = new TextEncoder().encode(
@@ -130,8 +131,10 @@ export async function inviteNewSubcontractor(projectId: string, data: {
         );
     }
     if (data.sendText && data.phone) {
-        // Mock SMS for now unless Twilio is set up
-        console.log(`[SMS] Mock inviting subcontractor ${data.phone} to project ${projectId}`);
+        await sendSMS(
+            data.phone,
+            `You've been invited to a project by Golden Touch Remodeling. Access your portal at ${process.env.NEXT_PUBLIC_APP_URL || 'https://probuild-amber.vercel.app'}/sub-portal`
+        );
     }
 
     revalidatePath(`/projects/${projectId}`);

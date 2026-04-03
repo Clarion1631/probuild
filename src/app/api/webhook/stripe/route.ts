@@ -124,7 +124,8 @@ export async function POST(req: Request) {
                 break;
             }
             default:
-                console.log(`Unhandled event type ${event.type}`);
+                // Intentionally unhandled — Stripe sends many event types
+                break;
         }
     } catch (error) {
         console.error("Error processing webhook:", error);

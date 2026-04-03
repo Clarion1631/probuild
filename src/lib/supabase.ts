@@ -13,8 +13,6 @@ export function getSupabase(): SupabaseClient | null {
     const supabaseUrl = process.env.SUPABASE_URL || "";
     const supabaseKey = process.env.SUPABASE_SERVICE_KEY || "";
 
-    console.log("[Supabase] Init:", { hasUrl: !!supabaseUrl, hasKey: !!supabaseKey, urlPrefix: supabaseUrl.substring(0, 30) });
-
     if (supabaseUrl && supabaseKey) {
         _supabase = createClient(supabaseUrl, supabaseKey);
     }

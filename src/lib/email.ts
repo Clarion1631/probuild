@@ -11,7 +11,6 @@ export async function sendNotification(
     options?: { fromName?: string; replyTo?: string; cc?: string[] }
 ): Promise<{ success: boolean; id?: string }> {
     if (!toEmail) {
-        console.log("No notification email configured. Skipping email dispatch.");
         return { success: false };
     }
 
@@ -48,7 +47,6 @@ export async function sendNotification(
             attachments: attachments,
             cc: options?.cc
         });
-        console.log("Email dispatched via Resend:", data);
         return { success: true, id: data.data?.id };
     } catch (error) {
         console.error("Failed to send Resend email:", error);
