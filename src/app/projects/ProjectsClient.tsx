@@ -139,10 +139,39 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     const activeCount = projects.filter((p: any) => p.status !== "Closed" && p.status !== "Archived").length;
 
 
+    // Stat card computations
+    const totalCount = projects.length;
+    const inProgressCount = projects.filter((p: any) => p.status === "In Progress" || p.status === "Open").length;
+    const completedCount = projects.filter((p: any) => p.status === "Done" || p.status === "Closed").length;
+    const totalRevenue = projects.reduce((sum: number, p: any) => {
+        const est = (p.estimates || []).reduce((s: number, e: any) => s + (e.totalAmount || 0), 0);
+        return sum + est;
+    }, 0);
+
     return (
         <div className="max-w-screen-2xl mx-auto px-4 md:px-8 pb-10">
+            {/* Stat Cards */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-6 mb-6">
+                <div className="hui-card p-4">
+                    <p className="text-xs text-hui-textMuted font-medium">Total Projects</p>
+                    <p className="text-3xl font-bold text-hui-textMain mt-1">{totalCount}</p>
+                </div>
+                <div className="hui-card p-4">
+                    <p className="text-xs text-hui-textMuted font-medium">In Progress</p>
+                    <p className="text-3xl font-bold text-blue-600 mt-1">{inProgressCount}</p>
+                </div>
+                <div className="hui-card p-4">
+                    <p className="text-xs text-hui-textMuted font-medium">Completed</p>
+                    <p className="text-3xl font-bold text-green-600 mt-1">{completedCount}</p>
+                </div>
+                <div className="hui-card p-4">
+                    <p className="text-xs text-hui-textMuted font-medium">Total Revenue</p>
+                    <p className="text-3xl font-bold text-hui-textMain mt-1">${totalRevenue.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}</p>
+                </div>
+            </div>
+
             {/* Header */}
-            <div className="flex items-center justify-between mb-8 pt-4">
+            <div className="flex items-center justify-between mb-8">
                 <div className="flex items-center gap-4">
                     <h1 className="text-2xl font-bold text-hui-textMain">All Projects ({projects.length})</h1>
                 </div>

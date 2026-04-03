@@ -1,5 +1,6 @@
 import { getProject, getScheduleTasks, getPortalVisibility } from "@/lib/actions";
 import { getProjectSubcontractors } from "@/lib/subcontractor-actions";
+import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import ProjectHeader from "./ProjectHeader";
@@ -12,11 +13,21 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     const project = await getProject(id);
     if (!project) notFound();
 
-    const tasks = await getScheduleTasks(id);
+    const [tasks, portalVisibility, subList, recentActivity] = await Promise.all([
+        getScheduleTasks(id),
+        getPortalVisibility(id),
+        getProjectSubcontractors(id),
+        Promise.all([
+            prisma.dailyLog.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, date: true, workPerformed: true, createdAt: true } }),
+            prisma.changeOrder.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, title: true, status: true, createdAt: true } }),
+            prisma.invoice.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, code: true, status: true, totalAmount: true, createdAt: true } }),
+        ]).then(([logs, cos, invs]) => [
+            ...logs.map(l => ({ type: "dailylog" as const, id: l.id, label: `Daily log · ${new Date(l.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`, sub: l.workPerformed.slice(0, 60), date: new Date(l.createdAt), href: `/projects/${id}/dailylogs` })),
+            ...cos.map(c => ({ type: "changeorder" as const, id: c.id, label: `Change order · ${c.title}`, sub: c.status, date: new Date(c.createdAt), href: `/projects/${id}/change-orders/${c.id}` })),
+            ...invs.map(i => ({ type: "invoice" as const, id: i.id, label: `Invoice ${i.code}`, sub: `${i.status} · $${i.totalAmount.toLocaleString()}`, date: new Date(i.createdAt), href: `/projects/${id}/invoices/${i.id}` })),
+        ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 8)),
+    ]);
     const estimates = project.estimates || [];
-    
-    const portalVisibility = await getPortalVisibility(id);
-    const subList = await getProjectSubcontractors(id);
 
     // Real stats
     const totalBudget = estimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
@@ -177,24 +188,37 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                         </div>
                     </div>
 
-                    {/* Recent Estimates */}
+                    {/* Recent Activity */}
                     <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
                         <div className="px-5 py-3.5 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white">
-                            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Recent Estimates</h3>
+                            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Recent Activity</h3>
                         </div>
                         <div className="divide-y divide-slate-100">
-                            {estimates.length === 0 && (
-                                <div className="px-5 py-6 text-center text-xs text-slate-400">No estimates yet</div>
+                            {recentActivity.length === 0 && (
+                                <div className="px-5 py-6 text-center text-xs text-slate-400">No activity yet</div>
                             )}
-                            {estimates.slice(0, 4).map((est: any) => (
-                                <Link key={est.id} href={`/projects/${id}/estimates/${est.id}`} className="px-5 py-3.5 flex items-center justify-between hover:bg-slate-50/50 transition block">
-                                    <div className="min-w-0">
-                                        <p className="text-xs font-medium text-hui-textMain truncate">{est.title}</p>
-                                        <p className="text-[10px] text-slate-400">{new Date(est.createdAt).toLocaleDateString()}</p>
-                                    </div>
-                                    <span className="text-xs font-semibold text-slate-600 shrink-0 ml-2">${(est.totalAmount || 0).toLocaleString()}</span>
-                                </Link>
-                            ))}
+                            {recentActivity.map(event => {
+                                const iconColor = event.type === "dailylog" ? "#22c55e" : event.type === "changeorder" ? "#f59e0b" : "#6366f1";
+                                const iconPath = event.type === "dailylog"
+                                    ? "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                                    : event.type === "changeorder"
+                                    ? "M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                                    : "M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6";
+                                return (
+                                    <Link key={`${event.type}-${event.id}`} href={event.href} className="px-5 py-3 flex items-start gap-3 hover:bg-slate-50/50 transition">
+                                        <div className="w-6 h-6 rounded-full flex items-center justify-center shrink-0 mt-0.5" style={{ backgroundColor: `${iconColor}18` }}>
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={iconColor} strokeWidth="1.5">
+                                                <path strokeLinecap="round" strokeLinejoin="round" d={iconPath} />
+                                            </svg>
+                                        </div>
+                                        <div className="min-w-0 flex-1">
+                                            <p className="text-xs font-medium text-hui-textMain truncate">{event.label}</p>
+                                            <p className="text-[10px] text-slate-400 truncate">{event.sub}</p>
+                                        </div>
+                                        <span className="text-[10px] text-slate-400 shrink-0">{event.date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>
+                                    </Link>
+                                );
+                            })}
                         </div>
                     </div>
                 </div>
