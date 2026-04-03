@@ -58,13 +58,25 @@ log = logging.getLogger(__name__)
 
 # ── Your site config ───────────────────────────────────────────────────────────
 
-YOUR_SITE = "https://probuild.goldentouchremodeling.com"
+YOUR_SITE_PROD  = "https://probuild.goldentouchremodeling.com"
+YOUR_SITE_LOCAL = "http://localhost:3000"
+YOUR_SITE       = YOUR_SITE_PROD  # overridden by --local flag at runtime
 
+# Production cookies (https://probuild.goldentouchremodeling.com)
 YOUR_COOKIES = {
     "__Secure-next-auth.session-token": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..YDidKiPDnOol8kvu.BUemfQ7D7-0V9tbkSoQqdSyry-88489OUsnV7KHJAB30RozRmJ76eA3nBgEwrGtUD-c4nZ395GnZzbJYF38ioZkKcQWsI4o19fes6aPso3UzHkRtdWUNG0wZnOS2DyX54lbsRu-DJ-RLr7_d4D9VB6FxXoQKDiy2_ydvGY9ek-7iHItH8Hvwt412Vp80GAhH_lXuoN0tsoBRNnCww6TQFkloZm1B7yQy16oJERzIicELhSlL1zg3eEe3t1dIVN8n74fRD33E54Plzi6MulxJPe7ciKHifqlaj46B2yXZ0tGjW_WX9YQzFXjspTLPId4Cm_q1ls5UabzOlDzt_W4fJT6Sekj6eOquLxaJwYC8_Dh5odoHvVvACMD2Ym5ADdYZxmW-skfZkEG1jRHAUHA.1izopklWK3CvyrfAEetNTg",
     "__Host-next-auth.csrf-token":      "ab734cf73becd41688eb7559fa30936e9af3cab47c41ebcf736f24188e738388%7Cd89e8e21dcf887d0e6f10adfcd433c9036eef41a4ea212e3b4a2eb520d6e68a2",
     "__Secure-next-auth.callback-url":  "https%3A%2F%2Fprobuild.goldentouchremodeling.com%2F",
     "_ga":                              "GA1.1.1853466886.1750206219",
+}
+
+# Local cookies (http://localhost:3000)
+# To populate: run `npm run dev`, sign in, then export cookies from browser DevTools
+# next-auth uses non-__Secure- prefixed cookies on localhost
+YOUR_COOKIES_LOCAL = {
+    "next-auth.session-token": "",   # paste from browser DevTools after signing in locally
+    "next-auth.csrf-token":    "",
+    "next-auth.callback-url":  "http%3A%2F%2Flocalhost%3A3000%2F",
 }
 
 # ── URL mapping: Houzz Pro URL → Your App path ────────────────────────────────
@@ -80,7 +92,7 @@ URL_MAP = {
 
     "Project Overview":
         ("https://pro.houzz.com/manage/projects/2340349/overview",
-         "/projects"),  # update with your project ID when ready
+         "/projects/cmn7tlgiv0001phwqjzwk75or/overview"),
 
     # ── Leads ─────────────────────────────────────────────────────────────────
     "Leads List":
@@ -100,7 +112,7 @@ URL_MAP = {
     # ── Schedule ──────────────────────────────────────────────────────────────
     "Schedule":
         ("https://pro.houzz.com/manage/schedule/projects/2942703",
-         "/manager/schedule"),
+         "/projects/cmn7tlgiv0001phwqjzwk75or/schedule"),
 
     # ── Time & Expenses ───────────────────────────────────────────────────────
     "Time & Expenses":
@@ -110,7 +122,7 @@ URL_MAP = {
     # ── Reports ───────────────────────────────────────────────────────────────
     "Reports Overview":
         ("https://pro.houzz.com/manage/reports/",
-         "/manager/variance"),
+         "/reports"),
 
     # ── Settings ──────────────────────────────────────────────────────────────
     "Settings":
@@ -124,7 +136,7 @@ URL_MAP = {
     # ── Daily Logs ────────────────────────────────────────────────────────────
     "Daily Logs":
         ("https://pro.houzz.com/manage/projects/2942703/daily-logs",
-         "/projects"),  # update path when daily logs page exists
+         "/projects/cmn7tlgiv0001phwqjzwk75or/dailylogs"),
 }
 
 # ── Screenshot output dir ──────────────────────────────────────────────────────
@@ -134,7 +146,21 @@ COMPARE_DIR = os.path.join(config.OUTPUT_DIR, "compare")
 
 # ── Cookie builder ─────────────────────────────────────────────────────────────
 
-def build_your_cookies() -> list[dict]:
+def build_your_cookies(local: bool = False) -> list[dict]:
+    if local:
+        return [
+            {
+                "name":     name,
+                "value":    value,
+                "domain":   "localhost",
+                "path":     "/",
+                "secure":   False,
+                "httpOnly": True,
+                "sameSite": "Lax",
+            }
+            for name, value in YOUR_COOKIES_LOCAL.items()
+            if value
+        ]
     return [
         {
             "name":     name,
@@ -251,7 +277,12 @@ def run_claude_diff(client: anthropic.Anthropic, houzz_bytes: bytes, yours_bytes
             }],
         )
 
-        return json.loads(response.content[0].text)
+        text = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-z]*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text.strip())
+        return json.loads(text)
 
     except Exception as exc:
         log.error(f"  Claude diff failed for [{label}]: {exc}")
@@ -430,7 +461,7 @@ def build_report(results: list[dict]) -> str:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-async def run(pages: dict, use_ai: bool, force: bool):
+async def run(pages: dict, use_ai: bool, force: bool, local: bool = False):
     os.makedirs(COMPARE_DIR, exist_ok=True)
 
     client = None
@@ -452,7 +483,7 @@ async def run(pages: dict, use_ai: bool, force: bool):
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-        await context.add_cookies(build_your_cookies())
+        await context.add_cookies(build_your_cookies(local=local))
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -512,10 +543,19 @@ if __name__ == "__main__":
     parser.add_argument("--page",  help="Compare a single page by label key")
     parser.add_argument("--no-ai", action="store_true", help="Skip Claude analysis, screenshots only")
     parser.add_argument("--force", action="store_true", help="Re-screenshot even if cached")
+    parser.add_argument("--local", action="store_true", help="Screenshot localhost:3000 instead of production")
     args = parser.parse_args()
 
     if not config.ANTHROPIC_API_KEY:
         raise SystemExit("Set ANTHROPIC_API_KEY in config.py first.")
+
+    # Override YOUR_SITE globally when --local is set
+    if args.local:
+        global YOUR_SITE
+        YOUR_SITE = YOUR_SITE_LOCAL
+        log.info("Mode: LOCAL (localhost:3000) — make sure `npm run dev` is running")
+    else:
+        log.info(f"Mode: PRODUCTION ({YOUR_SITE_PROD})")
 
     if args.page:
         key = args.page
@@ -525,5 +565,5 @@ if __name__ == "__main__":
     else:
         pages = URL_MAP
 
-    report = asyncio.run(run(pages, use_ai=not args.no_ai, force=args.force))
+    report = asyncio.run(run(pages, use_ai=not args.no_ai, force=args.force or args.local, local=args.local))
     log.info(f"Done! Open: {report}")

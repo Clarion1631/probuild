@@ -1,7 +1,6 @@
 import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import { getProjectLead, getLeadsForLinking, getUnreadMessageCount } from "@/lib/actions";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
+import { authOptions, getSessionOrDev } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 
@@ -15,7 +14,7 @@ export default async function ProjectLayout({
     const { id } = await params;
 
     // --- Permission check: does this user have access to this project? ---
-    const session = await getServerSession(authOptions);
+    const session = await getSessionOrDev();
     if (!session?.user?.email) redirect("/login");
 
     const user = await prisma.user.findUnique({
@@ -23,12 +22,13 @@ export default async function ProjectLayout({
         select: { id: true, role: true },
     });
 
-    if (!user) redirect("/login");
+    if (!user && process.env.NODE_ENV !== "development") redirect("/login");
+    const effectiveUser = user ?? { id: "dev", role: "ADMIN" };
 
     // Non-admin/manager users must have explicit ProjectAccess
-    if (user.role !== "ADMIN" && user.role !== "MANAGER") {
+    if (effectiveUser.role !== "ADMIN" && effectiveUser.role !== "MANAGER") {
         const access = await prisma.projectAccess.findUnique({
-            where: { userId_projectId: { userId: user.id, projectId: id } },
+            where: { userId_projectId: { userId: effectiveUser.id, projectId: id } },
         });
         if (!access) {
             // Also check crew assignment as fallback

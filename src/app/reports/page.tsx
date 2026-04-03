@@ -1,6 +1,5 @@
 import Link from "next/link";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { authOptions, getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 
@@ -55,11 +54,14 @@ const REPORT_SECTIONS = [
 ];
 
 export default async function ReportsPage() {
-    const session = await getServerSession(authOptions);
+    const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
 
     const user = await prisma.user.findUnique({ where: { email: session.user.email! } });
-    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER" && user.role !== "FINANCE")) {
+    if (!user && process.env.NODE_ENV !== "development") {
+        return <div className="p-8 text-red-500">Access Denied.</div>;
+    }
+    if (user && user.role !== "ADMIN" && user.role !== "MANAGER" && user.role !== "FINANCE") {
         return <div className="p-8 text-red-500">Access Denied.</div>;
     }
 

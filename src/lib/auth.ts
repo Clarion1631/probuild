@@ -59,3 +59,26 @@ export const authOptions: NextAuthOptions = {
     },
     secret: process.env.NEXTAUTH_SECRET,
 };
+
+const DEV_SESSION = {
+    user: { name: "Dev User", email: "gtrsupport@goldentouchremodeling.com", image: "", role: "ADMIN" },
+    expires: new Date(Date.now() + 86400_000).toISOString(),
+};
+
+/**
+ * Like getServerSession but returns a mock ADMIN session in development
+ * when no real session exists. Lets server components render without auth
+ * during local `npm run dev` testing.
+ */
+export async function getDevSession() {
+    if (process.env.NODE_ENV !== "development") return null;
+    return DEV_SESSION as any;
+}
+
+export async function getSessionOrDev() {
+    const { getServerSession } = await import("next-auth");
+    const session = await getServerSession(authOptions);
+    if (session) return session;
+    if (process.env.NODE_ENV === "development") return DEV_SESSION as any;
+    return null;
+}
