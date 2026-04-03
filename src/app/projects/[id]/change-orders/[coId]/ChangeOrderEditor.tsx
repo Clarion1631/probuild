@@ -109,6 +109,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     }
 
     return (
+        <>
         <div className="flex flex-col h-full bg-slate-50">
             {/* Top Navigation / Action Bar */}
             <div className="bg-white border-b border-hui-border px-6 py-4 items-center flex justify-between shadow-sm z-10 sticky top-0">
@@ -407,5 +408,6 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 </div>
             </div>
         )}
+        </>
     );
 }
