@@ -74,10 +74,10 @@ Now that all pages/routes exist, focus shifts to: making them production-quality
 - [x] Remove all production console.logs (email, sms, supabase init, approveEstimate, COI debug, stripe webhook)
 - [x] Add error boundaries to all page layouts (projects, settings, reports, company, portal, sub-portal)
 
-**Session 10 — Financial Precision + Friendly IDs**
-- [ ] Migrate all Float money fields to Decimal (prevents rounding errors)
-- [ ] Add `number Int @unique @default(autoincrement())` to Project, Lead, Estimate, Invoice, Contract, ChangeOrder, PurchaseOrder
-- [ ] Update route segments to use numeric IDs
+~~**Session 10 — Financial Precision + Friendly IDs**~~ ✅ Migration SQL ready (2026-04-03)
+- [x] `migrations/session10_float_to_decimal.sql` — 30 ALTER COLUMN statements for all money fields
+- [x] `migrations/session10_friendly_ids_and_integration.sql` — SERIAL number columns on 7 models + integrationData TEXT on CompanySettings
+- [ ] **PENDING (needs Windows):** Run both via apply_schema.ps1 → `./node_modules/.bin/prisma generate` → update schema.prisma Float→Decimal
 
 **Session 11 — QuickBooks Integration**
 - [ ] GL account mapping table in settings
