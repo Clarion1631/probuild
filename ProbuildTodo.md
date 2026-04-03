@@ -1,16 +1,40 @@
 # ProBuild — Todo & Improvement List
-_Last updated: 2026-04-02_
+_Last updated: 2026-04-03_
 
 ---
 
 ## 🔴 Critical (Fix Now)
 
-- [ ] **Hardcoded "Justin Account"** on dashboard — replace with session user name (`/src/app/page.tsx` line ~13)
+- [x] **Hardcoded "Justin Account"** on dashboard — replaced with session user name (2026-04-03)
 - [ ] **Financial Float → Decimal** — all money fields in Prisma schema use Float, causing precision errors. Migrate to Decimal
 - [ ] **Mock email/SMS** — `src/lib/email.ts` and `src/lib/sms.ts` are still mock implementations. Wire real Resend + Twilio
 - [ ] **Remove console.logs** — 8+ production console.logs across actions.ts, email.ts, sms.ts, stripe webhook, API routes
-- [ ] **Project Overview uses local DB ID** — always query prod project IDs via API, not local DB (see CLAUDE.md)
-- [ ] **Dead buttons** — audit every page for unlinked buttons/nav items and wire them intelligently
+- [x] **Project Overview uses local DB ID** — fixed: /overview route redirects to /projects/[id] (2026-04-03)
+- [x] **Dead buttons** — audited and wired across Sidebar, Company, Leads, Estimates, Reports, Projects, Change Orders (2026-04-03)
+
+---
+
+## 🏗️ Schedule Page — Full Rebuild (High Priority Feature)
+
+**Goal:** Professional, usable, AI-powered Gantt chart that contractors and clients actually use daily.
+
+### Core requirements
+- [ ] **Full Gantt chart** — drag-to-resize tasks, drag-to-move, dependency arrows between tasks, today line, zoom levels (week/month/quarter)
+- [ ] **AI schedule generation from estimate** — button to "Build Schedule from Estimate": sends estimate line items to AI, returns suggested tasks with durations, dependencies, and assigned trades. User reviews and confirms before saving.
+- [ ] **Task assignment** — each task assignable to a team member, subcontractor, or trade. Shows avatar/name on Gantt bar.
+- [ ] **Estimate item linking** — tasks can be linked to an estimate line item (cost code/type). Budget vs actual hours visible on hover.
+- [ ] **Status tracking** — tasks have status: Not Started / In Progress / Complete / Blocked. Color-coded on Gantt.
+- [ ] **Client dashboard toggle** — schedule visible in client portal as a read-only view. Client can see task status and dates but not internal costs. Toggle per-project in settings.
+- [ ] **Mobile-friendly** — scroll/pinch on Gantt, tap to view task detail.
+- [ ] **Milestone markers** — special milestone task type shown as diamond on Gantt.
+- [ ] **Critical path highlight** — visually show which tasks are blocking the end date.
+
+### Technical notes
+- Use a Gantt library (recommend `@dhx/trial-gantt` or build with `react-grid-layout` + SVG for dependency lines)
+- AI generation: POST estimate items to `/api/ai/schedule` → Gemini Flash → return structured task list
+- Client portal toggle: add `scheduleVisibleToClient: Boolean` to Project schema
+- Keep tasks in existing Task model but add `ganttOrder`, `startDate`, `endDate`, `dependsOnTaskId`, `estimateItemId` fields
+- Gantt should be the default view on `/projects/[id]/schedule`
 
 ---
 
@@ -20,10 +44,10 @@ _Last updated: 2026-04-02_
 - [ ] **Error boundaries** — add to all page layouts, currently no centralized error handling
 - [ ] **Form validation with Zod** — installed but underutilized. Add server-side validation with proper error propagation
 - [ ] **Job Costing UI** — `/projects/[id]/costing/` delegates to JobCostingClient but implementation unclear — verify and complete
-- [ ] **Reports page** — "Open Invoices" links to /invoices twice. Fix + add export (PDF/Excel) functionality
+- [ ] **Reports page** — add export (PDF/Excel) functionality
 - [ ] **Stripe webhook** — unhandled event types being silently dropped. Add proper handling or logging
-- [ ] **Customize Dashboard button** — wired to nothing. Implement or remove
-- [ ] **Add To-Do on dashboard** — creates empty state instead of actually creating a task
+- [x] **Customize Dashboard button** — implemented with localStorage widget toggle (2026-04-03)
+- [x] **Add To-Do on dashboard** — wired to /manager/schedule (2026-04-03)
 
 ---
 
@@ -38,11 +62,13 @@ _Last updated: 2026-04-02_
 - Safe to do now — no external URLs to break yet
 
 ### Pages to complete
-- [ ] **Settings page** — currently 404ing in production. Fix runtime error
-- [ ] **Company page** — currently 404ing in production. Fix runtime error
-- [ ] **Daily Logs** — route not mapped in compare.py, showing /projects instead
-- [ ] **Project Overview** — showing list instead of detail view
-- [ ] **Leads List** — missing tabbed views and columns vs Houzz Pro
+- [x] **Settings page** — fixed, now 72/100 (2026-04-03)
+- [x] **Company page** — fixed, now 75/100 (2026-04-03)
+- [x] **Daily Logs** — route mapped in compare.py, now 72/100 (2026-04-03)
+- [x] **Project Overview** — /overview redirect added, now 72/100 (2026-04-03)
+- [ ] **Leads List** — missing tabbed views and columns vs Houzz Pro (72/100)
+- [ ] **Invoices** — significant layout/color/hierarchy gaps vs Houzz Pro (45/100)
+- [ ] **Schedule** — fundamentally different layout; needs full Gantt rebuild (35/100)
 
 ### UI Components missing
 - [ ] Button loading/disabled states
@@ -56,6 +82,32 @@ _Last updated: 2026-04-02_
 - [ ] Cost variance charts
 - [ ] Revenue trend charts
 - [ ] Project profitability visualization
+
+---
+
+## 🤖 AI Features — Infrastructure Already Ready (Gemini + Anthropic configured)
+
+### Already built (verify they're wired in UI)
+- [x] AI Estimate Generation — `/api/ai-estimate/route.ts`
+- [x] AI Schedule Building — `/api/ai-schedule/route.ts`
+- [x] AI Daily Log Enhancement — `/api/ai/daily-logs/route.ts`
+- [x] AI Mood Board Generation — `/api/ai/mood-board/route.ts`
+- [x] AI Lead Note Summary — `/api/leads/[id]/notes/ai/route.ts`
+- [x] Takeoff-to-Estimate Conversion — `/api/takeoffs/ai-estimate/route.ts`
+
+### High impact — build next
+- [ ] **Lead Scoring** — "AI Score Lead" button on `/leads/[id]` → analyze messages, notes, meetings, stage → return close probability %, quality rating, recommended next actions → endpoint: `/api/leads/[id]/score`
+- [ ] **Cost Forecast** — "AI Cost Forecast" card on `/projects/[id]/costing` → compare estimate vs actuals (time entries + expenses + POs) → predict final cost, flag overruns → endpoint: `/api/projects/[id]/cost-forecast`
+- [ ] **Contract Drafting from Estimate** — "AI Draft Contract" button on contracts page → auto-generate contract with merge fields from estimate + project + client data → endpoint: `/api/contracts/ai-draft`
+- [ ] **Schedule Risk Analysis** — "AI Risk Analysis" button on schedule page → analyze tasks, crew, dependencies → flag critical path gaps, recommend buffers → endpoint: `/api/projects/[id]/schedule-risk` (pair with Gantt rebuild)
+- [ ] **Takeoff Refinement** — "AI Refine Items" in takeoffs → deeper plan analysis, detect missing items, suggest markup adjustments → endpoint: `/api/takeoffs/ai-refine`
+
+### Medium impact
+- [ ] **Daily Log Photo Analysis** — "AI Photo Analysis" after photo upload in daily logs → Gemini Vision extracts work progress, flags issues, auto-populates workPerformed field → endpoint: `/api/ai/daily-logs/photo-analysis`
+- [ ] **Invoice Optimization** — "AI Invoice Plan" button → suggest milestone split, due dates, payment terms based on project scope → endpoint: `/api/invoices/ai-optimize`
+- [ ] **Variance Analysis Narrative** — "AI Variance Report" on job costing → human-readable explanation of why costs vary (delays, scope creep, material waste) → endpoint: `/api/projects/[id]/variance-analysis`
+- [ ] **Subcontractor Recommendations** — "AI Suggest Subs" on project → rank subs by past performance, availability, specialty match, cost → endpoint: `/api/projects/[id]/recommend-subs`
+- [ ] **COI Extraction** — "AI Extract COI" in files/subcontractors → parse uploaded insurance PDFs → extract carrier, coverage limits, expiration, flag upcoming expirations → endpoint: `/api/documents/ai-extract-coi`
 
 ---
 
@@ -74,7 +126,26 @@ _Last updated: 2026-04-02_
 
 ---
 
-## 📊 QA Scores (April 2, 2026)
+## 📊 QA Scores
+
+### April 3, 2026 (after session 2 fixes)
+
+| Page | Score | Change | Notes |
+|------|-------|--------|-------|
+| Company | 75 | +60 | Was 404 |
+| Projects List | 72 | +7 | |
+| Project Overview | 72 | +37 | Was 404 (showing list) |
+| Leads List | 72 | +27 | |
+| Estimates | 72 | +17 | |
+| Time & Expenses | 72 | +72 | Was server exception |
+| Reports Overview | 62 | +27 | |
+| Settings | 72 | +67 | Was 404 |
+| Daily Logs | 72 | +32 | Was route not mapped |
+| Invoices | 45 | -20 | Layout/hierarchy gaps |
+| Schedule | 35 | -10 | Needs full Gantt rebuild |
+| **Overall** | **~67/100** | **+25** | |
+
+### April 2, 2026 (baseline)
 
 | Page | Score | Root Cause |
 |------|-------|------------|
