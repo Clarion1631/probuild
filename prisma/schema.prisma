@@ -173,6 +173,7 @@ model Project {
   dailyLogs           DailyLog[]
   moodBoards          MoodBoard[]
   retainers           Retainer[]
+  bidPackages         BidPackage[]
 }
 
 model FloorPlan {
@@ -549,13 +550,14 @@ model TaskDependency {
 }
 
 model TaskComment {
-  id        String       @id @default(cuid())
-  taskId    String
-  task      ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  userId    String
-  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  text      String
-  createdAt DateTime     @default(now())
+  id                String       @id @default(cuid())
+  taskId            String
+  task              ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId            String?
+  user              User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  subcontractorName String?      // display name for sub-portal comments
+  text              String
+  createdAt         DateTime     @default(now())
 }
 
 model TaskPunchItem {
@@ -1149,4 +1151,45 @@ model CatalogItem {
   imageUrl    String?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+}
+
+model BidPackage {
+  id          String       @id @default(cuid())
+  projectId   String
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  dueDate     DateTime?
+  status      String       @default("Draft") // Draft, Open, Awarded, Closed
+  totalBudget Float?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  scopes      BidScope[]
+  invitations BidInvitation[]
+}
+
+model BidScope {
+  id           String     @id @default(cuid())
+  packageId    String
+  package      BidPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  name         String
+  description  String?
+  budgetAmount Float?
+  order        Int        @default(0)
+  createdAt    DateTime   @default(now())
+}
+
+model BidInvitation {
+  id               String     @id @default(cuid())
+  packageId        String
+  package          BidPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  subcontractorId  String?
+  email            String
+  status           String     @default("Invited") // Invited, Viewed, Submitted, Declined, Awarded
+  bidAmount        Float?
+  notes            String?
+  sentAt           DateTime?
+  respondedAt      DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
 }

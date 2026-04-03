@@ -2053,6 +2053,49 @@ export async function getEstimateItemsForProject(projectId: string) {
     });
 }
 
+export async function getScheduleTasksForSub(projectId: string, subcontractorId: string) {
+    return prisma.scheduleTask.findMany({
+        where: {
+            projectId,
+            subAssignments: { some: { subcontractorId } },
+        },
+        orderBy: { order: "asc" },
+        include: {
+            dependencies: true,
+            comments: { include: { user: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: "asc" } },
+            timeEntries: { select: { durationHours: true } },
+            assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
+            subAssignments: { include: { subcontractor: true } },
+            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true } },
+        },
+    });
+}
+
+export async function addTaskCommentAsSub(taskId: string, subcontractorId: string, text: string) {
+    const sub = await prisma.subcontractor.findUnique({ where: { id: subcontractorId }, select: { companyName: true, contactName: true } });
+    const displayName = sub?.contactName || sub?.companyName || "Subcontractor";
+    const comment = await prisma.taskComment.create({
+        data: { taskId, userId: null, text, subcontractorName: displayName },
+    });
+    revalidatePath(`/projects`);
+    return comment;
+}
+
+export async function updateTaskStatusAsSub(taskId: string, subcontractorId: string, status: string) {
+    const allowed = ["In Progress", "Complete"];
+    if (!allowed.includes(status)) throw new Error("Invalid status");
+    const assignment = await prisma.subTaskAssignment.findUnique({
+        where: { subcontractorId_taskId: { subcontractorId, taskId } },
+    });
+    if (!assignment) throw new Error("Not assigned to this task");
+    const task = await prisma.scheduleTask.update({
+        where: { id: taskId },
+        data: { status },
+    });
+    revalidatePath(`/projects`);
+    return task;
+}
+
 export async function createScheduleTask(projectId: string, data: {
     name: string;
     startDate: string;
@@ -4015,5 +4058,117 @@ export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
     "use server";
     await prisma.scheduleTask.delete({ where: { id: taskId } });
     revalidatePath(`/leads/${leadId}/schedule`);
+    return { success: true };
+}
+
+// ─── Bid Packages ─────────────────────────────────────────────────────────
+
+export async function getProjectBidPackages(projectId: string) {
+    return prisma.bidPackage.findMany({
+        where: { projectId },
+        include: { scopes: { orderBy: { order: "asc" } }, invitations: true },
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+export async function getBidPackage(id: string) {
+    return prisma.bidPackage.findUnique({
+        where: { id },
+        include: {
+            scopes: { orderBy: { order: "asc" } },
+            invitations: { orderBy: { createdAt: "asc" } },
+            project: { select: { id: true, name: true } },
+        },
+    });
+}
+
+export async function createBidPackage(projectId: string, data: {
+    title: string;
+    description?: string;
+    dueDate?: Date | null;
+    totalBudget?: number | null;
+}) {
+    "use server";
+    const pkg = await prisma.bidPackage.create({
+        data: { projectId, ...data },
+    });
+    revalidatePath(`/projects/${projectId}/bid-packages`);
+    return pkg;
+}
+
+export async function updateBidPackage(id: string, projectId: string, data: {
+    title?: string;
+    description?: string;
+    dueDate?: Date | null;
+    status?: string;
+    totalBudget?: number | null;
+}) {
+    "use server";
+    const pkg = await prisma.bidPackage.update({ where: { id }, data });
+    revalidatePath(`/projects/${projectId}/bid-packages`);
+    revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
+    return pkg;
+}
+
+export async function deleteBidPackage(id: string, projectId: string) {
+    "use server";
+    await prisma.bidPackage.delete({ where: { id } });
+    revalidatePath(`/projects/${projectId}/bid-packages`);
+    return { success: true };
+}
+
+export async function addBidScope(packageId: string, projectId: string, data: {
+    name: string;
+    description?: string;
+    budgetAmount?: number | null;
+}) {
+    "use server";
+    const scope = await prisma.bidScope.create({
+        data: { packageId, ...data },
+    });
+    revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
+    return scope;
+}
+
+export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
+    "use server";
+    await prisma.bidScope.delete({ where: { id: scopeId } });
+    revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
+    return { success: true };
+}
+
+export async function inviteSubToBid(packageId: string, projectId: string, data: {
+    email: string;
+    subcontractorId?: string;
+}) {
+    "use server";
+    const inv = await prisma.bidInvitation.create({
+        data: { packageId, email: data.email, subcontractorId: data.subcontractorId || null, sentAt: new Date() },
+    });
+    revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
+    return inv;
+}
+
+export async function recordBidResponse(invitationId: string, packageId: string, projectId: string, data: {
+    status: string;
+    bidAmount?: number | null;
+    notes?: string;
+}) {
+    "use server";
+    const inv = await prisma.bidInvitation.update({
+        where: { id: invitationId },
+        data: { ...data, respondedAt: new Date() },
+    });
+    revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
+    return inv;
+}
+
+export async function awardBid(packageId: string, invitationId: string, projectId: string) {
+    "use server";
+    await prisma.$transaction([
+        prisma.bidInvitation.update({ where: { id: invitationId }, data: { status: "Awarded" } }),
+        prisma.bidPackage.update({ where: { id: packageId }, data: { status: "Awarded" } }),
+    ]);
+    revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return { success: true };
 }
