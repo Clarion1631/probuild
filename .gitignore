@@ -56,3 +56,6 @@ next-env.d.ts
 public/uploads/
 .env*.local
 output/
+config.py
+config.py
+__pycache__/

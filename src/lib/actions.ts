@@ -2040,7 +2040,16 @@ export async function getScheduleTasks(projectId: string) {
             timeEntries: { select: { durationHours: true } },
             assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
             subAssignments: { include: { subcontractor: true } },
+            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true } },
         },
+    });
+}
+
+export async function getEstimateItemsForProject(projectId: string) {
+    return prisma.estimateItem.findMany({
+        where: { estimate: { projectId }, parentId: null },
+        orderBy: { order: "asc" },
+        select: { id: true, name: true, type: true, total: true, estimateId: true },
     });
 }
 
@@ -2052,22 +2061,25 @@ export async function createScheduleTask(projectId: string, data: {
     status?: string;
     assignee?: string;
     parentId?: string;
+    type?: string;
 }) {
     const maxOrder = await prisma.scheduleTask.aggregate({
         where: { projectId },
         _max: { order: true },
     });
+    const isMilestone = data.type === "milestone";
     const task = await prisma.scheduleTask.create({
         data: {
             projectId,
             name: data.name,
             startDate: new Date(data.startDate),
-            endDate: new Date(data.endDate),
+            endDate: isMilestone ? new Date(data.startDate) : new Date(data.endDate),
             color: data.color || "#4c9a2a",
             status: data.status || "Not Started",
             assignee: data.assignee || null,
             parentId: data.parentId || null,
             order: (maxOrder._max.order ?? -1) + 1,
+            type: data.type || "task",
         },
     });
     revalidatePath(`/projects/${projectId}/schedule`);
@@ -2084,6 +2096,8 @@ export async function updateScheduleTask(taskId: string, data: {
     assignee?: string;
     order?: number;
     estimatedHours?: number | null;
+    type?: string;
+    estimateItemId?: string | null;
 }) {
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
@@ -2095,6 +2109,12 @@ export async function updateScheduleTask(taskId: string, data: {
     if (data.assignee !== undefined) updateData.assignee = data.assignee;
     if (data.order !== undefined) updateData.order = data.order;
     if (data.estimatedHours !== undefined) updateData.estimatedHours = data.estimatedHours;
+    if (data.type !== undefined) updateData.type = data.type;
+    if (data.estimateItemId !== undefined) updateData.estimateItemId = data.estimateItemId;
+    // Milestones always have same start and end date
+    if (data.type === "milestone" && updateData.startDate) {
+        updateData.endDate = updateData.startDate;
+    }
 
     const task = await prisma.scheduleTask.update({
         where: { id: taskId },
@@ -2187,6 +2207,7 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
                 order: order++,
                 status: "Not Started",
                 estimatedHours,
+                estimateItemId: item.id,
             },
         });
         created.push(task);

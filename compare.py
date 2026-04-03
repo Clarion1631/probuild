@@ -137,6 +137,46 @@ URL_MAP = {
     "Daily Logs":
         ("https://pro.houzz.com/manage/projects/2942703/daily-logs",
          "/projects/cmn7tlgiv0001phwqjzwk75or/dailylogs"),
+
+    # ── Client Portal Config ──────────────────────────────────────────────────
+    "Client Portal Config":
+        ("https://pro.houzz.com/manage/cd/client-dash-edit/2942703",
+         "/projects/cmn7tlgiv0001phwqjzwk75or/client-portal"),
+
+    # ── Project Tasks ─────────────────────────────────────────────────────────
+    "Project Tasks":
+        ("https://pro.houzz.com/manage/tasks/projects/2942703",
+         "/projects/cmn7tlgiv0001phwqjzwk75or/tasks"),
+
+    # ── Reports ───────────────────────────────────────────────────────────────
+    "Report: Open Invoices":
+        ("https://pro.houzz.com/manage/reports/OpenInvoicesReport",
+         "/reports/open-invoices"),
+
+    "Report: Payments":
+        ("https://pro.houzz.com/manage/reports/PaymentsReport",
+         "/reports/payments"),
+
+    "Report: Time Billing":
+        ("https://pro.houzz.com/manage/reports/TimeBillingReport?groupBy=houzzUserId",
+         "/reports/time-billing"),
+
+    "Report: Global Tracker":
+        ("https://pro.houzz.com/manage/reports/GlobalTrackerReport",
+         "/reports/global-tracker"),
+
+    # ── Settings ──────────────────────────────────────────────────────────────
+    "Settings: Notifications":
+        ("https://pro.houzz.com/settings/notifications",
+         "/settings/notifications"),
+
+    "Settings: Payment Methods":
+        ("https://pro.houzz.com/manage/py/online/setup",
+         "/settings/payment-methods"),
+
+    "Settings: Integrations":
+        ("https://pro.houzz.com/manage/build/company/quickbooks/dashboard",
+         "/settings/integrations"),
 }
 
 # ── Screenshot output dir ──────────────────────────────────────────────────────

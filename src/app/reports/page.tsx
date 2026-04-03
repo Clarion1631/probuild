@@ -10,14 +10,14 @@ const REPORT_SECTIONS = [
         heading: "Payments",
         reports: [
             {
-                title: "Invoices & Payments",
-                description: "Detailed report of all invoices, payment status, amounts collected, and outstanding balances.",
-                href: "/invoices",
+                title: "Payments Received",
+                description: "Detailed breakdown of all payments collected, grouped by project or by month.",
+                href: "/reports/payments",
             },
             {
                 title: "Open Invoices",
-                description: "View all unpaid and partially paid invoices, including aging information.",
-                href: "/invoices?status=Issued",
+                description: "View all unpaid and partially paid invoices with aging buckets (30/60/90+ days).",
+                href: "/reports/open-invoices",
             },
         ],
     },
@@ -29,6 +29,11 @@ const REPORT_SECTIONS = [
                 description: "Compare estimated vs. actual labor costs across all active projects by cost code.",
                 href: "/manager/variance",
             },
+            {
+                title: "Global Tracker",
+                description: "Cross-project status overview: budget, invoiced, paid, schedule progress, last activity.",
+                href: "/reports/global-tracker",
+            },
         ],
     },
     {
@@ -36,8 +41,8 @@ const REPORT_SECTIONS = [
         reports: [
             {
                 title: "Time Billing Report",
-                description: "Review all time entries by employee and project, including billable hours and labor costs.",
-                href: "/manager/time-entries",
+                description: "Review all time entries by employee or by project, including billable hours and labor costs.",
+                href: "/reports/time-billing",
             },
         ],
     },

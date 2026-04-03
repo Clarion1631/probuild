@@ -1,17 +1,21 @@
 import { getProject, getScheduleTasks, getTeamMembers, getActiveSubcontractors } from "@/lib/actions";
+import { getSessionOrDev } from "@/lib/auth";
 import GanttChart from "./GanttChart";
 
 export const dynamic = "force-dynamic";
 
 export default async function SchedulePage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
-    const [project, rawTasks, teamMembers, subcontractors] = await Promise.all([
+    const [project, rawTasks, teamMembers, subcontractors, session] = await Promise.all([
         getProject(id),
         getScheduleTasks(id),
         getTeamMembers(),
         getActiveSubcontractors(),
+        getSessionOrDev(),
     ]);
     if (!project) return <div className="p-6 text-hui-textMuted">Project not found</div>;
+
+    const currentUserId = (session?.user as any)?.id || "system";
 
     const tasks = rawTasks.map((t: any) => ({
         id: t.id,
@@ -21,6 +25,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
         color: t.color,
         progress: t.progress,
         status: t.status,
+        type: t.type || "task",
         assignee: t.assignee,
         order: t.order,
         estimatedHours: t.estimatedHours ?? null,
@@ -29,6 +34,8 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
         dependents: (t.dependents || []).map((d: any) => ({ id: d.id, predecessorId: d.predecessorId, dependentId: d.dependentId })),
         assignments: (t.assignments || []).map((a: any) => ({ id: a.id, userId: a.userId, user: a.user })),
         subAssignments: (t.subAssignments || []).map((a: any) => ({ id: a.id, subcontractorId: a.subcontractorId, subcontractor: a.subcontractor })),
+        estimateItemId: t.estimateItemId ?? null,
+        estimateItem: t.estimateItem ?? null,
     }));
 
     const estimates = (project.estimates || []).map((e: any) => ({ id: e.id, title: e.title, status: e.status }));
@@ -42,6 +49,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
                 estimates={estimates}
                 teamMembers={teamMembers as any}
                 subcontractors={subcontractors as any}
+                currentUserId={currentUserId}
             />
         </div>
     );

@@ -260,8 +260,9 @@ model EstimateItem {
   costCode      CostCode?      @relation(fields: [costCodeId], references: [id])
   costTypeId    String?
   costType      CostType?      @relation(fields: [costTypeId], references: [id])
-  timeEntries   TimeEntry[]
-  createdAt     DateTime       @default(now())
+  timeEntries    TimeEntry[]
+  scheduleTasks  ScheduleTask[]
+  createdAt      DateTime       @default(now())
 }
 
 model Expense {
@@ -504,6 +505,9 @@ model ScheduleTask {
   children       ScheduleTask[] @relation("SubTasks")
   order          Int            @default(0)
   status         String         @default("Not Started")
+  type           String         @default("task") // "task" | "milestone"
+  estimateItemId String?
+  estimateItem   EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
