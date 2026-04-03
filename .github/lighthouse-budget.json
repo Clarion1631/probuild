@@ -1,0 +1,16 @@
+[
+  {
+    "path": "/*",
+    "scores": [
+      { "category": "performance",    "minScore": 0.7 },
+      { "category": "accessibility",  "minScore": 0.9 },
+      { "category": "best-practices", "minScore": 0.85 },
+      { "category": "seo",            "minScore": 0.9 }
+    ],
+    "timings": [
+      { "metric": "first-contentful-paint",  "budget": 3000 },
+      { "metric": "interactive",             "budget": 6000 },
+      { "metric": "speed-index",             "budget": 4000 }
+    ]
+  }
+]
