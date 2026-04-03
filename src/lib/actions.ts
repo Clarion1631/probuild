@@ -3919,3 +3919,101 @@ export async function saveMoodBoardItems(boardId: string, items: Array<{
     revalidatePath(`/projects/${board.projectId}/mood-boards/${boardId}`);
     return { success: true };
 }
+
+// ─── Catalog Items ─────────────────────────────────────────────────────────
+
+export async function createCatalogItem(data: {
+    name: string;
+    description?: string;
+    unitCost: number;
+    unit?: string;
+    costCodeId?: string;
+}) {
+    "use server";
+    const item = await prisma.catalogItem.create({
+        data: {
+            name: data.name,
+            description: data.description || null,
+            unitCost: data.unitCost,
+            unit: data.unit || "each",
+            costCodeId: data.costCodeId || null,
+        },
+        include: { costCode: { select: { code: true, name: true } } },
+    });
+    revalidatePath("/company/my-items");
+    return item;
+}
+
+export async function updateCatalogItem(id: string, data: {
+    name?: string;
+    description?: string;
+    unitCost?: number;
+    unit?: string;
+    costCodeId?: string | null;
+    isActive?: boolean;
+}) {
+    "use server";
+    const item = await prisma.catalogItem.update({
+        where: { id },
+        data,
+        include: { costCode: { select: { code: true, name: true } } },
+    });
+    revalidatePath("/company/my-items");
+    return item;
+}
+
+export async function deleteCatalogItem(id: string) {
+    "use server";
+    await prisma.catalogItem.delete({ where: { id } });
+    revalidatePath("/company/my-items");
+    return { success: true };
+}
+
+// ─── Lead Schedule ────────────────────────────────────────────────────────
+
+export async function getLeadScheduleTasks(leadId: string) {
+    return prisma.scheduleTask.findMany({
+        where: { leadId },
+        orderBy: { order: "asc" },
+    });
+}
+
+export async function createLeadScheduleTask(leadId: string, data: {
+    name: string;
+    startDate: Date;
+    endDate: Date;
+}) {
+    "use server";
+    const task = await prisma.scheduleTask.create({
+        data: {
+            leadId,
+            name: data.name,
+            startDate: data.startDate,
+            endDate: data.endDate,
+        },
+    });
+    revalidatePath(`/leads/${leadId}/schedule`);
+    return task;
+}
+
+export async function updateLeadScheduleTask(taskId: string, leadId: string, data: {
+    name?: string;
+    status?: string;
+    startDate?: Date;
+    endDate?: Date;
+}) {
+    "use server";
+    const task = await prisma.scheduleTask.update({
+        where: { id: taskId },
+        data,
+    });
+    revalidatePath(`/leads/${leadId}/schedule`);
+    return task;
+}
+
+export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
+    "use server";
+    await prisma.scheduleTask.delete({ where: { id: taskId } });
+    revalidatePath(`/leads/${leadId}/schedule`);
+    return { success: true };
+}

@@ -80,18 +80,19 @@ model Lead {
   isArchived   Boolean   @default(false)
 
   // Relations
-  estimates    Estimate[]
-  floorPlans   FloorPlan[]
-  contracts    Contract[]
-  files        ProjectFile[]
-  folders      FileFolder[]
-  tasks        LeadTask[]
-  notes        LeadNote[]
-  meetings     LeadMeeting[]
-  takeoffs     Takeoff[]
-  leadMessages LeadMessage[]
-  message      String? // Initial inquiry message from the client
-  project      Project? // reverse relation: the project created from this lead
+  estimates      Estimate[]
+  floorPlans     FloorPlan[]
+  contracts      Contract[]
+  files          ProjectFile[]
+  folders        FileFolder[]
+  tasks          LeadTask[]
+  notes          LeadNote[]
+  meetings       LeadMeeting[]
+  takeoffs       Takeoff[]
+  leadMessages   LeadMessage[]
+  scheduleTasks  ScheduleTask[]
+  message        String? // Initial inquiry message from the client
+  project        Project? // reverse relation: the project created from this lead
 }
 
 model LeadNote {
@@ -350,6 +351,7 @@ model CostCode {
   expenses           Expense[]
   changeOrderItems   ChangeOrderItem[]
   purchaseOrderItems PurchaseOrderItem[]
+  catalogItems       CatalogItem[]
 }
 
 model CostType {
@@ -476,6 +478,14 @@ model CompanySettings {
   cardProcessingRate Float   @default(2.9)
   cardProcessingFlat Float   @default(0.30)
 
+  // Calendar settings
+  workDays      String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
+  workdayStart  String? // e.g. "07:00"
+  workdayEnd    String? // e.g. "17:00"
+
+  // Sales taxes
+  salesTaxes String? // JSON array: [{name, rate, isDefault}]
+
   updatedAt DateTime @updatedAt
 }
 
@@ -491,8 +501,10 @@ model DocumentTemplate {
 
 model ScheduleTask {
   id             String         @id @default(cuid())
-  projectId      String
-  project        Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId      String?
+  project        Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId         String?
+  lead           Lead?          @relation(fields: [leadId], references: [id], onDelete: Cascade)
   name           String
   startDate      DateTime
   endDate        DateTime
@@ -1124,3 +1136,17 @@ model Retainer {
   createdAt   DateTime @default(now())
 }
 
+
+model CatalogItem {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  unitCost    Float     @default(0)
+  unit        String    @default("each")
+  costCodeId  String?
+  costCode    CostCode? @relation(fields: [costCodeId], references: [id])
+  isActive    Boolean   @default(true)
+  imageUrl    String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
