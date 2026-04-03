@@ -1,54 +1,55 @@
 "use client";
 import { toast } from "sonner";
+import Link from "next/link";
 
 const INTEGRATIONS = [
     {
         name: "QuickBooks Online",
-        description: "Sync invoices, payments, expenses, and vendor data with QuickBooks.",
-        icon: "/quickbooks-logo.png",
+        description: "Sync invoices, estimates, and expenses with QuickBooks. Map cost codes to GL accounts.",
         iconFallback: "QB",
         iconColor: "bg-green-100 text-green-700",
-        status: "coming_soon",
+        status: "available",
+        href: "/settings/integrations/quickbooks",
+    },
+    {
+        name: "Gusto Payroll",
+        description: "Export time entries for payroll. Map team members to Gusto employees.",
+        iconFallback: "GT",
+        iconColor: "bg-pink-100 text-pink-700",
+        status: "available",
+        href: "/settings/integrations/gusto",
     },
     {
         name: "Zapier",
         description: "Connect ProBuild to 5,000+ apps. Automate workflows without code.",
-        icon: null,
         iconFallback: "ZP",
         iconColor: "bg-orange-100 text-orange-700",
         status: "coming_soon",
+        href: null,
     },
     {
         name: "Google Drive",
         description: "Sync project files and documents with your Google Drive.",
-        icon: null,
         iconFallback: "GD",
         iconColor: "bg-blue-100 text-blue-700",
         status: "coming_soon",
+        href: null,
     },
     {
         name: "Dropbox",
         description: "Automatically back up project files to Dropbox.",
-        icon: null,
         iconFallback: "DB",
         iconColor: "bg-indigo-100 text-indigo-700",
         status: "coming_soon",
+        href: null,
     },
     {
         name: "Google Calendar",
         description: "Sync project schedules and tasks with Google Calendar.",
-        icon: null,
         iconFallback: "GC",
         iconColor: "bg-red-100 text-red-700",
         status: "coming_soon",
-    },
-    {
-        name: "Gmail",
-        description: "Send and receive project emails directly inside ProBuild.",
-        icon: null,
-        iconFallback: "GM",
-        iconColor: "bg-rose-100 text-rose-700",
-        status: "coming_soon",
+        href: null,
     },
 ];
 
@@ -69,16 +70,26 @@ export default function IntegrationsPage() {
                             </div>
                             <div>
                                 <div className="font-semibold text-hui-textMain text-sm">{integration.name}</div>
-                                <div className="text-xs text-hui-textMuted bg-slate-100 px-2 py-0.5 rounded inline-block mt-0.5">Coming Soon</div>
+                                {integration.status === "available" ? (
+                                    <div className="text-xs text-green-700 bg-green-100 px-2 py-0.5 rounded inline-block mt-0.5">Available</div>
+                                ) : (
+                                    <div className="text-xs text-hui-textMuted bg-slate-100 px-2 py-0.5 rounded inline-block mt-0.5">Coming Soon</div>
+                                )}
                             </div>
                         </div>
                         <p className="text-sm text-hui-textMuted">{integration.description}</p>
-                        <button
-                            className="hui-btn hui-btn-secondary text-sm mt-auto"
-                            onClick={() => toast.info(`${integration.name} integration coming soon`)}
-                        >
-                            Connect
-                        </button>
+                        {integration.href ? (
+                            <Link href={integration.href} className="hui-btn hui-btn-secondary text-sm mt-auto text-center">
+                                Configure
+                            </Link>
+                        ) : (
+                            <button
+                                className="hui-btn hui-btn-secondary text-sm mt-auto"
+                                onClick={() => toast.info(`${integration.name} integration coming soon`)}
+                            >
+                                Connect
+                            </button>
+                        )}
                     </div>
                 ))}
             </div>

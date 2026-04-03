@@ -36,6 +36,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [isCreatingCO, setIsCreatingCO] = useState(false);
     const [showVendorSelectModal, setShowVendorSelectModal] = useState(false);
     const [isCreatingPO, setIsCreatingPO] = useState(false);
+    const [isSyncingQB, setIsSyncingQB] = useState(false);
 
     async function handleCreateChangeOrder() {
         if (selectedItemIds.length === 0) return;
@@ -67,6 +68,31 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             toast.error(e.message || "Failed to create Purchase Order");
         } finally {
             setIsCreatingPO(false);
+        }
+    }
+
+    async function handleSyncQB() {
+        setIsSyncingQB(true);
+        setShowMoreMenu(false);
+        try {
+            const res = await fetch("/api/quickbooks/sync", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ type: "estimate", id: initialEstimate.id }),
+            });
+            const data = await res.json();
+            if (data.notConnected) {
+                toast.error("QuickBooks not connected — go to Settings → Integrations to connect.");
+                return;
+            }
+            if (!res.ok) throw new Error(data.error || "Sync failed");
+            toast.success("Estimate synced to QuickBooks!", {
+                action: data.qbUrl ? { label: "View in QB", onClick: () => window.open(data.qbUrl, "_blank") } : undefined,
+            });
+        } catch (e: any) {
+            toast.error(e.message || "Failed to sync to QuickBooks");
+        } finally {
+            setIsSyncingQB(false);
         }
     }
 
@@ -451,6 +477,15 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                             </button>
                                         </>
                                     )}
+                                    <div className="border-t border-hui-border my-1" />
+                                    <button
+                                        onClick={handleSyncQB}
+                                        disabled={isSyncingQB}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-green-50 flex items-center gap-2.5 text-green-700 disabled:opacity-50"
+                                    >
+                                        <span className="w-4 h-4 text-[11px] font-bold flex items-center justify-center">QB</span>
+                                        {isSyncingQB ? "Syncing…" : "Sync to QuickBooks"}
+                                    </button>
                                     <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={() => { handleDelete(); setShowMoreMenu(false); }}

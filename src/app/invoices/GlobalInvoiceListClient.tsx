@@ -3,6 +3,7 @@
 import { useState, useMemo } from "react";
 import Link from "next/link";
 import StatusBadge from "@/components/StatusBadge";
+import { toast } from "sonner";
 
 const STATUS_TABS = ["All", "Draft", "Issued", "Paid", "Overdue", "Partially Paid"] as const;
 
@@ -29,6 +30,40 @@ function TabButton({ active, onClick, count, children }: {
                     {count}
                 </span>
             )}
+        </button>
+    );
+}
+
+function QBSyncButton({ invoiceId }: { invoiceId: string }) {
+    const [syncing, setSyncing] = useState(false);
+    async function handleSync() {
+        setSyncing(true);
+        try {
+            const res = await fetch("/api/quickbooks/sync", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ type: "invoice", id: invoiceId }),
+            });
+            const data = await res.json();
+            if (data.notConnected) { toast.error("Connect QuickBooks in Settings → Integrations first."); return; }
+            if (!res.ok) throw new Error(data.error || "Sync failed");
+            toast.success("Invoice synced to QuickBooks!", {
+                action: data.qbUrl ? { label: "View in QB", onClick: () => window.open(data.qbUrl, "_blank") } : undefined,
+            });
+        } catch (e: any) {
+            toast.error(e.message || "QB sync failed");
+        } finally {
+            setSyncing(false);
+        }
+    }
+    return (
+        <button
+            onClick={handleSync}
+            disabled={syncing}
+            title="Sync to QuickBooks"
+            className="text-xs font-bold text-green-700 bg-green-50 hover:bg-green-100 border border-green-200 px-2 py-1 rounded disabled:opacity-50 transition"
+        >
+            {syncing ? "…" : "QB"}
         </button>
     );
 }
@@ -190,6 +225,7 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
                             <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("issueDate")}>
                                 Issued <SortIcon col="issueDate" />
                             </th>
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">QB</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -230,6 +266,9 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
                                     {inv.issueDate
                                         ? new Date(inv.issueDate).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
                                         : new Date(inv.createdAt).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}
+                                </td>
+                                <td className="px-6 py-4">
+                                    <QBSyncButton invoiceId={inv.id} />
                                 </td>
                             </tr>
                         ))}
