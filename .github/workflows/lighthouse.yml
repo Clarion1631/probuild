@@ -1,0 +1,31 @@
+name: Lighthouse CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  lighthouse:
+    name: Lighthouse Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for Vercel deployment
+        uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
+        id: wait-for-vercel
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          max_timeout: 120
+        continue-on-error: true
+
+      - name: Run Lighthouse on production
+        uses: treosh/lighthouse-ci-action@v11
+        with:
+          urls: |
+            https://probuild-amber.vercel.app
+            https://probuild-amber.vercel.app/dashboard
+          budgetPath: .github/lighthouse-budget.json
+          uploadArtifacts: true
+          temporaryPublicStorage: true
