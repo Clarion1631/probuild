@@ -1,4 +1,4 @@
-import { NextAuthOptions } from "next-auth";
+import { NextAuthOptions, getServerSession } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import { prisma } from "@/lib/prisma";
 
@@ -76,9 +76,12 @@ export async function getDevSession() {
 }
 
 export async function getSessionOrDev() {
-    const { getServerSession } = await import("next-auth");
-    const session = await getServerSession(authOptions);
-    if (session) return session;
+    try {
+        const session = await getServerSession(authOptions);
+        if (session) return session;
+    } catch {
+        // getServerSession can throw when NEXTAUTH_SECRET is missing, etc.
+    }
     if (process.env.NODE_ENV === "development") return DEV_SESSION as any;
     return null;
 }

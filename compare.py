@@ -551,7 +551,6 @@ if __name__ == "__main__":
 
     # Override YOUR_SITE globally when --local is set
     if args.local:
-        global YOUR_SITE
         YOUR_SITE = YOUR_SITE_LOCAL
         log.info("Mode: LOCAL (localhost:3000) — make sure `npm run dev` is running")
     else:
