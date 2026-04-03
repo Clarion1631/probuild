@@ -1,18 +1,18 @@
-# ProBuild — Houzz Pro Parity Build Plan
-_Last updated: 2026-04-02_
+# ProBuild — Build Plan
+_Last updated: 2026-04-03_
 
 ---
 
-## 🗺️ Active Build Plan (Session Roadmap)
+## 🗺️ Build Plan — Phase 1 Complete
 
-Current score: **~67/100** across 11 tracked pages. Execute sessions in order below.
+All 7 parity sessions completed. Build passes clean. All routes deployed to production.
 
 > **Schema migration note:** `npx prisma db push` hangs interactively in WSL.
 > Use the PowerShell Supabase Management API script instead:
 > `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
 > Then: `./node_modules/.bin/prisma generate` (via git bash)
 
-### Verification loop (after every session)
+### Verification loop
 ```
 npm run build              # must pass 0 errors
 git push origin main       # triggers Vercel deploy
@@ -22,113 +22,79 @@ git push origin main       # triggers Vercel deploy
 ---
 
 ### ~~Session 1 — Settings, Client Portal, Reports Layout~~ ✅ DONE
-Completed 2026-04-03: reports/layout, settings expansion (notifications, payment-methods, integrations), client-portal, dead link fixes, bid-packages stub
-
----
+Completed 2026-04-03
 
 ### ~~Session 2 — Project Tasks, Lead Notes, Company Sidebar~~ ✅ DONE
-Completed 2026-04-03: project tasks page, lead notes route, company stubs (my-items, catalogs), dead link fixes
-
----
+Completed 2026-04-03
 
 ### ~~Gantt Polish (unplanned)~~ ✅ DONE
-Completed 2026-04-03: milestones (diamond rendering), critical path algorithm + toggle, estimate item linking, touch/pinch support, fixed hardcoded userId
+Completed 2026-04-03
 
----
+### ~~Session 3 — Report Sub-pages + Global Tracker~~ ✅ DONE
+Completed 2026-04-03: open-invoices, payments, time-billing, global-tracker
 
-### Session 3 — Report Sub-pages + Global Tracker (+12, adds 4 tracked pages)
-Items: T1-4, T1-5, T2-1
-
-- [ ] **T1-4** `src/app/reports/open-invoices/page.tsx` — invoices where status in [Issued, Overdue]; aging buckets (0–30, 31–60, 61–90, 90+)
-- [ ] **T1-5a** `src/app/reports/payments/page.tsx` — PaymentSchedule where status=Paid; group by project/month
-- [ ] **T1-5b** `src/app/reports/time-billing/page.tsx` — TimeEntry groupBy employee|project via searchParam
-- [ ] **T2-1** `src/app/reports/global-tracker/page.tsx` — all projects: budget, invoiced/paid, schedule %, last activity
+### ~~Session 4 — Visual Polish~~ ✅ DONE
+Completed 2026-04-03: stat cards on projects list, activity feed on project overview
 
 
 ---
 
-### Session 4 — Visual Polish on Existing Pages (+10 avg)
-Items: Projects list stat cards, Invoice polish, Project overview activity feed
+### ~~Session 4 — Visual Polish~~ ✅ DONE
+Completed 2026-04-03: stat cards on projects list, activity feed on project overview
 
-- [ ] **Projects list** — add 4 stat cards (Total, In Progress, Completed, Revenue); audit table columns
-- [ ] **Invoice polish** — 4 stat cards (Total Invoiced, Collected, Outstanding, Overdue); status tabs with count badges; fix column order to match Houzz Pro
-- [ ] **Project overview** — "Quick Actions" grid + Recent Activity feed (merge DailyLog + ChangeOrder + Invoice events)
-- [ ] **Daily logs** — weather icon picker; photo thumbnails in list
+### ~~Session 5 — Lead Schedule, My Items, Settings Completion~~ ✅ DONE
+Completed 2026-04-03: settings/calendar, settings/contacts, settings/sales-taxes, lead schedule, catalog items
 
----
+### ~~Session 6 — Templates Hub + Schedule Gantt Final Polish~~ ✅ DONE
+Completed 2026-04-03: templates hub (4 sub-routes: docs, schedules, selections, mood-boards)
 
-### Session 5 — Lead Schedule, My Items, Settings Completion (adds 4 pages)
-Items: T2-2, T2-3, T2-4, T2-5, T2-6
+### ~~Session 7 — Bid Packages~~ ✅ DONE
+Completed 2026-04-03: full bid packages with 3-section editor, schema, actions
 
-Schema changes needed (apply via PS1 script):
-```sql
--- T2-2: make ScheduleTask.projectId nullable, add leadId
-ALTER TABLE "ScheduleTask" ALTER COLUMN "projectId" DROP NOT NULL;
-ALTER TABLE "ScheduleTask" ADD COLUMN IF NOT EXISTS "leadId" TEXT;
+### ~~Sub-Contractor Portal~~ ✅ DONE
+Completed 2026-04-03: sub-portal with schedule access, status updates, comments
 
--- T2-3: CatalogItem model
-CREATE TABLE IF NOT EXISTS "CatalogItem" (
-  "id" TEXT NOT NULL PRIMARY KEY,
-  "name" TEXT NOT NULL, "description" TEXT, "unitCost" FLOAT NOT NULL,
-  "unit" TEXT, "costCodeId" TEXT, "isActive" BOOLEAN DEFAULT true,
-  "imageUrl" TEXT, "createdAt" TIMESTAMPTZ DEFAULT now()
-);
-
--- T2-5: CompanySettings work calendar
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "workDays" TEXT;
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "workdayStart" TEXT;
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "workdayEnd" TEXT;
-
--- T2-6: sales taxes
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "salesTaxes" TEXT;
-```
-
-- [ ] **T2-2** `/leads/[id]/schedule` — task list view for lead-scoped tasks; fix LeadSidebar "Schedule" href
-- [ ] **T2-3** `/company/my-items` — CRUD table + inline add/edit; `/company/catalogs` — vendor list + PDF upload
-- [ ] **T2-4** `/settings/contacts` — Client CRUD table; name, email, phone, project count; add to settings/layout.tsx
-- [ ] **T2-5** `/settings/calendar` — 7-day checkbox grid + start/end time inputs
-- [ ] **T2-6** `/settings/sales-taxes` — CRUD table of tax rates with default toggle
 
 ---
 
-### Session 6 — Templates Hub + Schedule Gantt Final Polish
-Items: T2-7, T3-2
+## 🗺️ Phase 2 — Polish, Integrations & AI
 
-Schema changes:
-```sql
-ALTER TABLE "SelectionBoard" ADD COLUMN IF NOT EXISTS "isTemplate" BOOLEAN DEFAULT false;
-ALTER TABLE "MoodBoard" ADD COLUMN IF NOT EXISTS "isTemplate" BOOLEAN DEFAULT false;
-CREATE TABLE IF NOT EXISTS "ScheduleTemplate" ("id" TEXT NOT NULL PRIMARY KEY, "name" TEXT NOT NULL, "createdAt" TIMESTAMPTZ DEFAULT now());
-CREATE TABLE IF NOT EXISTS "ScheduleTemplateTask" ("id" TEXT NOT NULL PRIMARY KEY, "templateId" TEXT NOT NULL, "name" TEXT NOT NULL, "durationDays" INT NOT NULL, "order" INT DEFAULT 0, "dependsOn" TEXT);
-```
+Now that all pages/routes exist, focus shifts to: making them production-quality, wiring real integrations, and adding AI automation.
 
-- [ ] **T2-7** Templates hub:
-  - [ ] `src/app/templates/page.tsx` — card grid linking to sub-pages
-  - [ ] `src/app/templates/schedules/page.tsx` — list + "Apply to Project"
-  - [ ] `src/app/templates/selections/page.tsx`
-  - [ ] `src/app/templates/mood-boards/page.tsx`
-- [ ] **T3-2** Schedule Gantt final polish (most already done — verify and fill gaps):
-  - [ ] Milestone task type — diamond shape on Gantt bar
-  - [ ] Critical path highlighting — shade non-critical tasks
-  - [ ] Client portal read-only view toggle (add `scheduleVisibleToClient Boolean` to Project)
+### Next Sessions (pick any order)
 
----
+**Session 8 — Invoice & Leads Polish**
+- [ ] Invoice page: 4 stat cards (Total Invoiced, Collected, Outstanding, Overdue), status tabs with count badges, column reorder
+- [ ] Leads list: tabbed views (All, Hot, Won, Lost), sortable columns, lead scoring button
+- [ ] Daily logs: weather icon picker, photo thumbnails in list view
 
-### Session 7 — Bid Packages (New Feature)
-Items: T3-1
+**Session 9 — Real Email & SMS + Console Log Cleanup**
+- [ ] Wire `src/lib/email.ts` to Resend API (RESEND_API_KEY already in Vercel)
+- [ ] Wire `src/lib/sms.ts` to Twilio (TWILIO_* keys already in Vercel)
+- [ ] Remove all production console.logs
+- [ ] Add error boundaries to all page layouts
 
-Schema changes:
-```sql
-CREATE TABLE IF NOT EXISTS "BidPackage" ("id" TEXT NOT NULL PRIMARY KEY, "projectId" TEXT NOT NULL, "title" TEXT NOT NULL, "description" TEXT, "dueDate" TIMESTAMPTZ, "status" TEXT DEFAULT 'Draft', "totalBudget" FLOAT, "createdAt" TIMESTAMPTZ DEFAULT now());
-CREATE TABLE IF NOT EXISTS "BidScope" ("id" TEXT NOT NULL PRIMARY KEY, "packageId" TEXT NOT NULL, "name" TEXT NOT NULL, "description" TEXT, "budgetAmount" FLOAT, "order" INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS "BidInvitation" ("id" TEXT NOT NULL PRIMARY KEY, "packageId" TEXT NOT NULL, "subcontractorId" TEXT, "email" TEXT NOT NULL, "status" TEXT DEFAULT 'Invited', "bidAmount" FLOAT, "sentAt" TIMESTAMPTZ);
-```
+**Session 10 — Financial Precision + Friendly IDs**
+- [ ] Migrate all Float money fields to Decimal (prevents rounding errors)
+- [ ] Add `number Int @unique @default(autoincrement())` to Project, Lead, Estimate, Invoice, Contract, ChangeOrder, PurchaseOrder
+- [ ] Update route segments to use numeric IDs
 
-- [ ] `src/app/projects/[id]/bid-packages/page.tsx` — list with status, # invitations, due date
-- [ ] `src/app/projects/[id]/bid-packages/[bidId]/edit/page.tsx` — 3-section editor: details, scope, invite subs
-- [ ] New actions: `createBidPackage`, `updateBidPackage`, `addBidScope`, `inviteSubToBid`, `recordBidResponse`, `awardBid`
-- [ ] Fix ProjectInnerSidebar "Bids" href → `/projects/${projectId}/bid-packages`
+**Session 11 — QuickBooks Integration**
+- [ ] GL account mapping table in settings
+- [ ] Manual sync button for estimates/invoices/expenses
+- [ ] Two-way sync architecture (see VISION.md)
 
+**Session 12 — Gusto + Email Receipt Capture**
+- [ ] Gusto time export: employee name, hours, date
+- [ ] Email receipt capture: forward-to address + AI parsing (Gemini Vision)
+- [ ] Bookkeeper approval queue → QB sync
+
+**Session 13 — AI Features (High Impact)**
+- [ ] Lead Scoring — close probability %, quality rating
+- [ ] Cost Forecast — predict final cost, flag overruns
+- [ ] Contract Drafting from Estimate
+- [ ] Schedule Risk Analysis
+- [ ] Daily Log Photo Analysis (Gemini Vision)
 
 ---
 
@@ -257,14 +223,14 @@ CREATE TABLE IF NOT EXISTS "BidInvitation" ("id" TEXT NOT NULL PRIMARY KEY, "pac
 
 ## ✅ Completed
 
-- [x] Schedule Gantt rebuilt — drag/resize, dependency arrows, AI generation, punch list, comments, team assignment, subcontractor assignment (2026-04-02)
-- [x] ScheduleTask schema — added `type`, `estimateItemId` columns via Supabase Management API (2026-04-02)
-- [x] Prisma client regenerated (2026-04-02)
-- [x] compare.py --local flag added for instant local feedback loop
-- [x] Time & Expenses — fixed budgetBucket → costCode + costType (2026-04-02)
-- [x] SENTRY_AUTH_TOKEN + SENTRY_ORG added to Vercel
-- [x] config.py gitignored
-- [x] Hardcoded "Justin Account" → session user name (2026-04-03)
-- [x] Dead buttons audited and wired across Sidebar, Company, Leads, Estimates, Reports, Projects, Change Orders (2026-04-03)
-- [x] Project Overview /overview redirect added (2026-04-03)
-- [x] Customize Dashboard with localStorage widget toggle (2026-04-03)
+- [x] All 7 parity sessions completed (2026-04-03)
+- [x] Sub-contractor portal with schedule access (2026-04-03)
+- [x] Schedule Gantt: drag/resize, dependencies, AI generation, milestones, critical path, punch list, comments, team/sub assignment, touch support (2026-04-02–03)
+- [x] Report sub-pages: open-invoices, payments, time-billing, global-tracker (2026-04-03)
+- [x] Templates hub: schedules, selections, mood-boards (2026-04-03)
+- [x] Bid packages: full 3-section editor (2026-04-03)
+- [x] Settings: calendar, contacts, sales-taxes, notifications, payment-methods, integrations (2026-04-03)
+- [x] Visual polish: stat cards on projects list, activity feed on project overview (2026-04-03)
+- [x] Production fix: DATABASE_URL credentials + pgbouncer flag (2026-04-03)
+- [x] VISION.md, DESIGN_SYSTEM.md created (2026-04-03)
+- [x] CLAUDE.md rewritten with efficiency rules (2026-04-03)

@@ -296,12 +296,64 @@ This is the moat. Competitors can copy features. They can't copy your data.
 - `openweathermap-api` or similar — weather data for schedule intelligence
 - `date-fns` — date manipulation for schedule calculations
 
+### External Integrations
+
+**Gusto (Payroll) — Export Only**
+- Simple CSV/API export: employee name (team member), hours, date
+- One "Export to Gusto" button on time clock page → generates the pay period export
+- Map ProBuild team members to Gusto employee IDs (one-time setup in settings)
+- ProBuild tracks hourly + burden rate for job costing; Gusto handles actual payroll
+
+**QuickBooks (Accounting) — Two-Way Sync**
+ProBuild manages job-level operations. QuickBooks manages the books. They share data via manual sync + future auto-sync.
+
+Architecture:
+```
+ProBuild                          QuickBooks
+─────────                         ──────────
+Cost Codes/Phases  ←── map to ──→  GL Accounts (Chart of Accounts)
+Expenses           ──── push ───→  Bills / Expenses (coded to job + GL)
+Invoices           ──── push ───→  AR Invoices
+Sub Payments       ──── push ───→  AP Bills
+Estimates          ──── push ───→  Estimates (manual sync button)
+Payments received  ←── pull ────  Payment receipts
+```
+
+- **GL Account Mapping** — settings page: map each ProBuild cost code to a QB GL account. One-time setup. This is how ProBuild operations flow into the books correctly.
+- **Manual "Sync to QuickBooks" button** on expenses, invoices, and estimates. Bookkeeper reviews before pushing. No auto-sync initially — too risky for accounting data.
+- **Estimates sync** — push approved estimates to QB as estimates. When invoiced, create QB invoice linked to the estimate.
+- AI: flag when ProBuild job costs don't match QB GL entries (reconciliation assistant)
+
+**Overhead:** Let QuickBooks manage overhead (rent, insurance, office). ProBuild only tracks job costs (labor, materials, subs, POs). Clean separation — no duplication.
+
+**Email Receipt Capture (AI-Powered)**
+The real-world flow: Lowe's sends a receipt email. Amazon has order confirmations. Field crew buys something at Ace Hardware and takes a photo. AI handles all three:
+
+1. **Email forwarding** — receipts@probuild... (or similar inbound address)
+   - Lowe's emailed receipts → AI reads HTML/PDF, extracts line items, total, tax, store location
+   - Amazon order confirmations → AI reads order details, maps to PO/job number if present
+2. **Photo capture** — crew takes photo of receipt in app
+   - Gemini Vision extracts vendor, amount, date, items, tax
+3. **AI auto-coding** — for all receipt sources:
+   - Matches to active project using: PO/job number on receipt, vendor history, recent PO matching, active project context
+   - Codes to cost code/phase/category
+   - Confidence score: high = auto-approve, low = bookkeeper review queue
+4. **Bookkeeper approval** — review queue shows AI-coded expenses, one-click approve → syncs to QB
+5. **Future: mobile app** — gas receipts, hardware store, field expenses captured instantly
+
+**Houzz Pro Data Migration**
+- Large CSV export from Houzz available — clients, projects, estimates, invoices, time entries
+- Migration script: `scripts/import-houzz-csv.ts` — maps Houzz columns to ProBuild schema
+- Seeds the AI pricing engine and duration predictions from day one
+- Priority: after core Sessions 3-7 complete and schema is stable
+
 ### Data Strategy
 Every user action trains the system:
 - Completed estimates feed the pricing engine
 - Time entries feed duration predictions
-- Payment history feeds collection predictions
+- Payment history feed collection predictions
 - Lead outcomes feed the scoring model
 - Change orders feed scope detection
+- Receipt patterns feed auto-coding accuracy
 
 After 6-12 months of data, ProBuild knows YOUR business better than you do.

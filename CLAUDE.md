@@ -20,6 +20,9 @@
 ## Product Vision
 See **VISION.md** — AI-first remodeling platform. Every feature should ask: "What can AI do here so the human doesn't have to?"
 
+## Design System
+See **DESIGN_SYSTEM.md** — standardized colors, typography, page layouts, and components. Every new page must follow one of the 4 layout templates (List, Form, Editor, Full-Width Tool). Use shared components: StatCard, TabButton, EmptyState, StatusBadge.
+
 ## Active Build Plan
 See **ProbuildTodo.md** — execute sessions in order (Sessions 3–7 remain).
 Sessions 1–2 + Gantt polish are complete. Each session lists specific files, actions, and schema changes.
@@ -75,9 +78,13 @@ python compare.py --local --page "Page Name"   # single page local test
 - **GoldenTouch Pro URL** is `https://probuild-amber.vercel.app` — that's the live Vercel deployment
 - **WSL env vars** — `setx` vars (VERCEL_TOKEN, STRIPE_API_KEY, etc.) are Windows-only, NOT available in WSL
 
+## Feature Decision Rule
+Before building anything, answer: **"What remodeling problem does this solve, for which role, and can AI automate it?"**
+If a feature doesn't map to a real workflow step for a real role (estimator, PM, field crew, bookkeeper, owner, client, sub), don't build it. No redundancy.
+
 ## Coding rules
 
-- **Design system** — use `hui-btn`, `hui-card`, `hui-input` etc. Never raw Tailwind for those elements
+- **Design system** — follow `DESIGN_SYSTEM.md`. Use `hui-btn`, `hui-card`, `hui-input`, shared components (StatCard, TabButton, EmptyState, StatusBadge). Every page follows one of the 4 layout templates.
 - **Server actions** — go in `src/lib/actions.ts` by default; existing split files (client-actions.ts, lead-note-actions.ts, subcontractor-actions.ts) are legacy — don't add new ones
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
@@ -88,9 +95,17 @@ python compare.py --local --page "Page Name"   # single page local test
 - **Toasts** — use `sonner` (already in layout), not any other toast library
 - **Existing routes** — api, company, estimates, invoices, leads, login, manager, portal, projects, reports, settings, sub-portal, time-clock — don't duplicate
 
+## Efficiency rules (token management)
+- **Full context, minimum tokens** — read the 4 reference docs (CLAUDE.md, VISION.md, DESIGN_SYSTEM.md, ProbuildTodo.md) for context, then build. Don't explore the codebase unless you're editing a file you haven't seen.
+- **Use CLIs with `--json` flags** — `gh --json`, `vercel --json`, `supabase` CLI. Not MCPs.
+- **Use Sonnet for implementation** — only use Opus for complex architecture/planning decisions
+- **Run parallel sub-agents** for independent work (e.g. building 3 report pages simultaneously in separate agents)
+- **Don't re-read large files** — if you already know the structure, reference it. GanttChart.tsx is 17k tokens — don't read it unless editing it.
+- **Batch tool calls** — make independent reads/greps/globs in parallel, not sequential
+- **Auth is already configured** — gh (keyring), vercel ($VERCEL_TOKEN), supabase ($SUPABASE_ACCESS_TOKEN), stripe ($STRIPE_API_KEY), sentry ($SENTRY_AUTH_TOKEN). Don't re-authenticate or verify credentials unless something fails.
+
 ## Dead buttons / unlinked UI
 - While working on any page, audit all buttons, links, and nav items for dead ends
 - **Always fix, never remove** — wire to the correct route or server action
 - Wiring must be intelligent — a "New Invoice" button should open an invoice form, not just navigate to /invoices
 - If the target page/modal doesn't exist yet, build a minimal but real version — not a placeholder
-- Keep a running list in HANDOFF.md under "Dead UI" of anything found but not yet fixed in the current session
