@@ -13,8 +13,8 @@ model User {
   name             String?
   role             String           @default("FIELD_CREW") // ADMIN, MANAGER, FIELD_CREW, FINANCE
   status           String           @default("PENDING") // PENDING, ACTIVATED, DISABLED
-  hourlyRate       Float            @default(0)
-  burdenRate       Float            @default(0)
+  hourlyRate       Decimal            @default(0)
+  burdenRate       Decimal            @default(0)
   pinCode          String? // Used for mobile app quick login
   invitedAt        DateTime?        @default(now())
   timeEntries      TimeEntry[]
@@ -64,13 +64,13 @@ model Lead {
   source            String? // My website, Houzz, Manually created lead
   projectType       String?
   location          String?
-  targetRevenue     Float?
+  targetRevenue     Decimal?
   expectedStartDate DateTime?
   createdAt         DateTime  @default(now())
 
   // Houzz Pro Enhancements
   tags           String? // Comma separated tags
-  expectedProfit Float?
+  expectedProfit Decimal?
   lastActivityAt DateTime @default(now())
 
   managerId String?
@@ -206,8 +206,8 @@ model Estimate {
   status           String                    @default("Sent") // Invoiced, Partially Paid, Sent, Approved
   privacy          String                    @default("Shared") // Shared, Private
   createdAt        DateTime                  @default(now())
-  totalAmount      Float
-  balanceDue       Float
+  totalAmount      Decimal
+  balanceDue       Decimal
   items            EstimateItem[]
   expenses         Expense[]
   paymentSchedules EstimatePaymentSchedule[]
@@ -238,7 +238,7 @@ model EstimatePaymentSchedule {
   estimate   Estimate  @relation(fields: [estimateId], references: [id], onDelete: Cascade)
   name       String
   percentage Float? // Optional: represent this payment as a % of the total
-  amount     Float
+  amount     Decimal
   dueDate    DateTime?
   order      Int       @default(0)
   createdAt  DateTime  @default(now())
@@ -252,10 +252,10 @@ model EstimateItem {
   description   String?
   type          String         @default("Material") // Legacy fallback
   quantity      Float          @default(1)
-  baseCost      Float? // Raw cost before markup (internal only)
+  baseCost      Decimal? // Raw cost before markup (internal only)
   markupPercent Float          @default(25) // Markup percentage (internal only)
-  unitCost      Float          @default(0) // Sell price = baseCost * (1 + markupPercent/100)
-  total         Float          @default(0)
+  unitCost      Decimal          @default(0) // Sell price = baseCost * (1 + markupPercent/100)
+  total         Decimal          @default(0)
   order         Int            @default(0)
   parentId      String?
   parent        EstimateItem?  @relation("SubItems", fields: [parentId], references: [id], onDelete: Cascade)
@@ -280,7 +280,7 @@ model Expense {
   costCode    CostCode?     @relation(fields: [costCodeId], references: [id])
   costTypeId  String?
   costType    CostType?     @relation(fields: [costTypeId], references: [id])
-  amount      Float
+  amount      Decimal
   vendor      String?
   date        DateTime?
   description String?
@@ -302,8 +302,8 @@ model Invoice {
   clientId    String
   client      Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
   status      String    @default("Draft") // Draft, Issued, Paid, Overdue
-  totalAmount Float     @default(0)
-  balanceDue  Float     @default(0)
+  totalAmount Decimal     @default(0)
+  balanceDue  Decimal     @default(0)
   notes       String?
   issueDate   DateTime?
   sentAt      DateTime?
@@ -318,7 +318,7 @@ model PaymentSchedule {
   invoiceId             String
   invoice               Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   name                  String
-  amount                Float
+  amount                Decimal
   status                String    @default("Pending") // Pending, Paid, Canceled
   dueDate               DateTime?
   paymentDate           DateTime?
@@ -335,8 +335,8 @@ model Budget {
   project             Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   estimateId          String   @unique
   estimate            Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  totalLaborBudget    Float    @default(0)
-  totalMaterialBudget Float    @default(0)
+  totalLaborBudget    Decimal    @default(0)
+  totalMaterialBudget Decimal    @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 }
@@ -394,8 +394,8 @@ model TimeEntry {
   latitude  Float?
   longitude Float?
 
-  laborCost  Float?
-  burdenCost Float?
+  laborCost  Decimal?
+  burdenCost Decimal?
 
   scheduleTaskId String?
   scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id])
@@ -480,8 +480,8 @@ model CompanySettings {
 
   // Processing Fees
   passProcessingFee  Boolean @default(false)
-  cardProcessingRate Float   @default(2.9)
-  cardProcessingFlat Float   @default(0.30)
+  cardProcessingRate Decimal   @default(2.9)
+  cardProcessingFlat Decimal   @default(0.30)
 
   // Calendar settings
   workDays      String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
@@ -764,9 +764,9 @@ model EstimateTemplateItem {
   description   String?
   type          String           @default("Material")
   quantity      Float            @default(1)
-  baseCost      Float?
+  baseCost      Decimal?
   markupPercent Float            @default(25)
-  unitCost      Float            @default(0)
+  unitCost      Decimal            @default(0)
   order         Int              @default(0)
   parentId      String?
   costCodeId    String?
@@ -861,8 +861,8 @@ model ChangeOrder {
   title       String
   description String?
   status      String   @default("Draft") // Draft, Sent, Approved, Declined
-  totalAmount Float    @default(0)
-  balanceDue  Float    @default(0)
+  totalAmount Decimal    @default(0)
+  balanceDue  Decimal    @default(0)
 
   termsAndConditions String?
   memos              String?
@@ -889,10 +889,10 @@ model ChangeOrderItem {
   description   String?
   type          String      @default("Material")
   quantity      Float       @default(1)
-  baseCost      Float?
+  baseCost      Decimal?
   markupPercent Float       @default(25)
-  unitCost      Float       @default(0)
-  total         Float       @default(0)
+  unitCost      Decimal       @default(0)
+  total         Decimal       @default(0)
   order         Int         @default(0)
   costCodeId    String?
   costCode      CostCode?   @relation(fields: [costCodeId], references: [id])
@@ -906,7 +906,7 @@ model ChangeOrderPaymentSchedule {
   changeOrderId String
   changeOrder   ChangeOrder @relation(fields: [changeOrderId], references: [id], onDelete: Cascade)
   name          String
-  amount        Float
+  amount        Decimal
   dueDate       DateTime?
   order         Int         @default(0)
   createdAt     DateTime    @default(now())
@@ -971,7 +971,7 @@ model PurchaseOrder {
   vendorId    String
   vendor      Vendor  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
   status      String  @default("Draft") // Draft, Sent, Received, Cancelled
-  totalAmount Float   @default(0)
+  totalAmount Decimal   @default(0)
   notes       String?
   memos       String?
   terms       String?
@@ -1026,8 +1026,8 @@ model PurchaseOrderItem {
 
   description String
   quantity    Float  @default(1)
-  unitCost    Float  @default(0)
-  total       Float  @default(0)
+  unitCost    Decimal  @default(0)
+  total       Decimal  @default(0)
   order       Int    @default(0)
 
   costCodeId String?
@@ -1067,7 +1067,7 @@ model SelectionOption {
   name        String
   description String?
   imageUrl    String?
-  price       Float?
+  price       Decimal?
   vendorUrl   String?
   selected    Boolean           @default(false)
   order       Int               @default(0)
@@ -1133,9 +1133,9 @@ model Retainer {
   clientId    String
   client      Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
   status      String   @default("Draft") // Draft, Sent, Partially Paid, Paid
-  totalAmount Float    @default(0)
-  balanceDue  Float    @default(0)
-  amountPaid  Float    @default(0)
+  totalAmount Decimal    @default(0)
+  balanceDue  Decimal    @default(0)
+  amountPaid  Decimal    @default(0)
   notes       String?
   issueDate   DateTime?
   dueDate     DateTime?
@@ -1149,7 +1149,7 @@ model CatalogItem {
   id          String    @id @default(cuid())
   name        String
   description String?
-  unitCost    Float     @default(0)
+  unitCost    Decimal     @default(0)
   unit        String    @default("each")
   costCodeId  String?
   costCode    CostCode? @relation(fields: [costCodeId], references: [id])
@@ -1167,7 +1167,7 @@ model BidPackage {
   description String?
   dueDate     DateTime?
   status      String       @default("Draft") // Draft, Open, Awarded, Closed
-  totalBudget Float?
+  totalBudget Decimal?
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
   scopes      BidScope[]
@@ -1180,7 +1180,7 @@ model BidScope {
   package      BidPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
   name         String
   description  String?
-  budgetAmount Float?
+  budgetAmount Decimal?
   order        Int        @default(0)
   createdAt    DateTime   @default(now())
 }
@@ -1192,7 +1192,7 @@ model BidInvitation {
   subcontractorId  String?
   email            String
   status           String     @default("Invited") // Invited, Viewed, Submitted, Declined, Awarded
-  bidAmount        Float?
+  bidAmount        Decimal?
   notes            String?
   sentAt           DateTime?
   respondedAt      DateTime?
