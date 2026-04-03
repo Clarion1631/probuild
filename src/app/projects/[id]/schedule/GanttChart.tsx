@@ -127,6 +127,9 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [showImportMenu, setShowImportMenu] = useState(false);
     const [isAiGenerating, setIsAiGenerating] = useState(false);
     const [showAiMenu, setShowAiMenu] = useState(false);
+    const [isAiRisk, setIsAiRisk] = useState(false);
+    const [showRiskPanel, setShowRiskPanel] = useState(false);
+    const [riskAnalysis, setRiskAnalysis] = useState<string | null>(null);
     const [linkMode, setLinkMode] = useState<string | null>(null);
     const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [editingHoursId, setEditingHoursId] = useState<string | null>(null);
@@ -178,6 +181,26 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
             toast.error(e.message || "AI schedule generation failed");
         } finally {
             setIsAiGenerating(false);
+        }
+    }
+
+    // AI Risk Analysis handler
+    async function handleAiRisk() {
+        setIsAiRisk(true);
+        try {
+            const res = await fetch("/api/ai/schedule-risk", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId, tasks }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Risk analysis failed");
+            setRiskAnalysis(data.analysis);
+            setShowRiskPanel(true);
+        } catch (e: any) {
+            toast.error(e.message || "Schedule risk analysis failed");
+        } finally {
+            setIsAiRisk(false);
         }
     }
 
@@ -583,6 +606,14 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         >
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
                             Critical Path
+                        </button>
+                        <button
+                            onClick={handleAiRisk}
+                            disabled={isAiRisk || tasks.length === 0}
+                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiRisk ? "bg-amber-500 text-white border-amber-600 animate-pulse" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
+                            title="AI schedule risk analysis"
+                        >
+                            ⚠️ {isAiRisk ? "Analyzing…" : "AI Risk"}
                         </button>
                         <div className="relative">
                             <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
@@ -1050,6 +1081,32 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     </div>
                 );
             })()}
+
+            {/* AI Risk Analysis panel */}
+            {showRiskPanel && riskAnalysis && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center">
+                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowRiskPanel(false)} />
+                    <div className="relative bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col">
+                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xl">⚠️</span>
+                                <h2 className="font-bold text-hui-textMain text-lg">Schedule Risk Analysis</h2>
+                            </div>
+                            <button onClick={() => setShowRiskPanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-5 overflow-y-auto flex-1">
+                            <div className="prose prose-sm max-w-none text-hui-textMain whitespace-pre-wrap text-sm leading-relaxed">
+                                {riskAnalysis}
+                            </div>
+                        </div>
+                        <div className="p-4 border-t border-hui-border">
+                            <button onClick={() => setShowRiskPanel(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

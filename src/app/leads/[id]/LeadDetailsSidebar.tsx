@@ -66,6 +66,32 @@ export default function LeadDetailsSidebar({
     // Modal state
     const [isEditModalOpen, setIsEditModalOpen] = useState(false);
 
+    // AI Score state
+    const [isScoringLead, setIsScoringLead] = useState(false);
+    const [showScorePanel, setShowScorePanel] = useState(false);
+    const [scoreAnalysis, setScoreAnalysis] = useState<string | null>(null);
+    const [scoreProbability, setScoreProbability] = useState<number | null>(null);
+
+    async function handleScoreLead() {
+        setIsScoringLead(true);
+        try {
+            const res = await fetch("/api/ai/lead-score", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ leadId }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Scoring failed");
+            setScoreAnalysis(data.analysis);
+            setScoreProbability(data.probability);
+            setShowScorePanel(true);
+        } catch (e: any) {
+            toast.error(e.message || "Lead scoring failed");
+        } finally {
+            setIsScoringLead(false);
+        }
+    }
+
     // Mock full object for the modal based on existing props (usually you'd just pass the full object)
     const mockLead = {
         id: leadId,
@@ -391,12 +417,57 @@ export default function LeadDetailsSidebar({
                     </div>
                 )}
             </div>
+            {/* AI Score Lead */}
+            <div className="px-5 pb-5">
+                <button
+                    onClick={handleScoreLead}
+                    disabled={isScoringLead}
+                    className="w-full hui-btn bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                    {scoreProbability !== null && !isScoringLead ? (
+                        <>✨ AI Score: {scoreProbability}% close</>
+                    ) : (
+                        <>✨ {isScoringLead ? "Analyzing…" : "AI Score Lead"}</>
+                    )}
+                </button>
+            </div>
+
+            {/* AI Score Panel */}
+            {showScorePanel && scoreAnalysis && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center">
+                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowScorePanel(false)} />
+                    <div className="relative bg-white rounded-xl shadow-2xl max-w-lg w-full mx-4 max-h-[80vh] flex flex-col">
+                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xl">✨</span>
+                                <h2 className="font-bold text-hui-textMain text-lg">Lead Score Analysis</h2>
+                                {scoreProbability !== null && (
+                                    <span className="text-sm font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">{scoreProbability}% close</span>
+                                )}
+                            </div>
+                            <button onClick={() => setShowScorePanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-5 overflow-y-auto flex-1">
+                            <pre className="whitespace-pre-wrap text-sm text-hui-textMain font-sans leading-relaxed">{scoreAnalysis}</pre>
+                        </div>
+                        <div className="p-4 border-t border-hui-border flex gap-2">
+                            <button onClick={() => setShowScorePanel(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
+                            <button onClick={handleScoreLead} disabled={isScoringLead} className="hui-btn text-sm disabled:opacity-50">
+                                {isScoringLead ? "Re-scoring…" : "Re-score"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Modal Injection */}
-            <EditLeadModal 
-                isOpen={isEditModalOpen} 
-                onClose={() => setIsEditModalOpen(false)} 
-                lead={mockLead} 
-                client={mockClient} 
+            <EditLeadModal
+                isOpen={isEditModalOpen}
+                onClose={() => setIsEditModalOpen(false)}
+                lead={mockLead}
+                client={mockClient}
             />
         </div>
     );

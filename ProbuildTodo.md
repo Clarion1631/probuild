@@ -79,22 +79,26 @@ Now that all pages/routes exist, focus shifts to: making them production-quality
 - [x] `migrations/session10_friendly_ids_and_integration.sql` — SERIAL number columns on 7 models + integrationData TEXT on CompanySettings
 - [ ] **PENDING (needs Windows):** Run both via apply_schema.ps1 → `./node_modules/.bin/prisma generate` → update schema.prisma Float→Decimal
 
-**Session 11 — QuickBooks Integration**
-- [ ] GL account mapping table in settings
-- [ ] Manual sync button for estimates/invoices/expenses
-- [ ] Two-way sync architecture (see VISION.md)
+~~**Session 11 — QuickBooks Integration**~~ ✅ DONE (2026-04-03)
+- [x] GL account mapping table in settings/integrations/quickbooks (per cost code)
+- [x] Manual "Sync to QB" button on EstimateEditor (⋮ menu) and invoice list (QB column)
+- [x] OAuth2 flow: /api/quickbooks/auth → /api/quickbooks/callback, tokens in Supabase Storage
+- [x] Setup: add QB_CLIENT_ID + QB_CLIENT_SECRET to Vercel from developer.intuit.com
 
-**Session 12 — Gusto + Email Receipt Capture**
-- [ ] Gusto time export: employee name, hours, date
-- [ ] Email receipt capture: forward-to address + AI parsing (Gemini Vision)
-- [ ] Bookkeeper approval queue → QB sync
+~~**Session 12 — Gusto + Email Receipt Capture**~~ ✅ DONE (2026-04-03)
+- [x] Gusto OAuth + employee mapping (settings/integrations/gusto)
+- [x] "Export to Gusto" button on Time & Expenses → CSV (name, UUID, hours, date, project)
+- [x] AI receipt parsing: POST /api/receipts/parse (Gemini Vision → vendor, total, items, confidence)
+- [x] Bookkeeper review queue: /manager/receipts (approve → Reviewed, reject → delete)
+- [x] "Receipt Queue" added to Finance nav in sidebar
+- [x] Setup: add GUSTO_CLIENT_ID + GUSTO_CLIENT_SECRET to Vercel from Gusto Developer Portal
 
-**Session 13 — AI Features (High Impact)**
-- [ ] Lead Scoring — close probability %, quality rating
-- [ ] Cost Forecast — predict final cost, flag overruns
-- [ ] Contract Drafting from Estimate
-- [ ] Schedule Risk Analysis
-- [ ] Daily Log Photo Analysis (Gemini Vision)
+~~**Session 13 — AI Features (High Impact)**~~ ✅ DONE (2026-04-03)
+- [x] Lead Scoring — "AI Score Lead" in lead detail sidebar → close probability %, quality rating, next actions
+- [x] Cost Forecast — "AI Cost Forecast" button on Job Costing page → final cost prediction, overrun flags
+- [x] Contract Drafting — "AI Draft Contract" button on Contracts page → full HTML contract with merge fields
+- [x] Schedule Risk — "AI Risk" button in Gantt toolbar → overdue tasks, critical path gaps, buffers
+- [ ] Daily Log Photo Analysis — deferred (AI daily log route exists at /api/ai/daily-logs)
 
 ---
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { toast } from "sonner";
 
 interface JobCostingClientProps {
     project: { id: string; name: string };
@@ -38,6 +39,28 @@ export default function JobCostingClient({
 }: JobCostingClientProps) {
     const [sortKey, setSortKey] = useState<SortKey>("code");
     const [sortDir, setSortDir] = useState<SortDir>("asc");
+    const [isForecast, setIsForecast] = useState(false);
+    const [showForecast, setShowForecast] = useState(false);
+    const [forecastAnalysis, setForecastAnalysis] = useState<string | null>(null);
+
+    async function handleCostForecast() {
+        setIsForecast(true);
+        try {
+            const res = await fetch("/api/ai/cost-forecast", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId: project.id }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Forecast failed");
+            setForecastAnalysis(data.analysis);
+            setShowForecast(true);
+        } catch (e: any) {
+            toast.error(e.message || "Cost forecast failed");
+        } finally {
+            setIsForecast(false);
+        }
+    }
 
     const handleSort = (key: SortKey) => {
         if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -137,15 +160,48 @@ export default function JobCostingClient({
     return (
         <div className="w-full max-w-6xl mx-auto pb-20">
             {/* Header */}
-            <div className="flex items-center gap-3 mb-6">
-                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-white shadow-lg shadow-emerald-500/20">
-                    <ChartBarIcon />
+            <div className="flex items-center justify-between gap-3 mb-6">
+                <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-white shadow-lg shadow-emerald-500/20">
+                        <ChartBarIcon />
+                    </div>
+                    <div>
+                        <h1 className="text-2xl font-bold text-hui-textMain">Job Costing</h1>
+                        <p className="text-sm text-hui-textLight">Budget vs actuals for {project.name}</p>
+                    </div>
                 </div>
-                <div>
-                    <h1 className="text-2xl font-bold text-hui-textMain">Job Costing</h1>
-                    <p className="text-sm text-hui-textLight">Budget vs actuals for {project.name}</p>
-                </div>
+                <button
+                    onClick={handleCostForecast}
+                    disabled={isForecast}
+                    className="hui-btn bg-gradient-to-r from-amber-50 to-orange-50 border-amber-200 text-amber-700 hover:from-amber-100 hover:to-orange-100 text-sm flex items-center gap-2 disabled:opacity-50"
+                >
+                    🔮 {isForecast ? "Forecasting…" : "AI Cost Forecast"}
+                </button>
             </div>
+
+            {/* AI Cost Forecast Panel */}
+            {showForecast && forecastAnalysis && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center">
+                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowForecast(false)} />
+                    <div className="relative bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col">
+                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xl">🔮</span>
+                                <h2 className="font-bold text-hui-textMain text-lg">AI Cost Forecast</h2>
+                            </div>
+                            <button onClick={() => setShowForecast(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-5 overflow-y-auto flex-1">
+                            <pre className="whitespace-pre-wrap text-sm text-hui-textMain font-sans leading-relaxed">{forecastAnalysis}</pre>
+                        </div>
+                        <div className="p-4 border-t border-hui-border">
+                            <button onClick={() => setShowForecast(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Summary Cards */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">

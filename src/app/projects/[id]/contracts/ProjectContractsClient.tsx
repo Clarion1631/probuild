@@ -91,6 +91,9 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
     const [historyModal, setHistoryModal] = useState<string | null>(null);
     const [signingHistory, setSigningHistory] = useState<SigningRecord[]>([]);
     const [loadingHistory, setLoadingHistory] = useState(false);
+    const [isDraftingContract, setIsDraftingContract] = useState(false);
+    const [showDraftPanel, setShowDraftPanel] = useState(false);
+    const [draftedHtml, setDraftedHtml] = useState<string | null>(null);
 
     // ─── EDITOR STATE ───
     const [editingContract, setEditingContract] = useState<any>(null);
@@ -147,6 +150,25 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
             toast.error(e.message || "Failed to update contract");
         } finally { setSaving(false); }
     };
+
+    async function handleDraftContract() {
+        setIsDraftingContract(true);
+        try {
+            const res = await fetch("/api/ai/draft-contract", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Draft failed");
+            setDraftedHtml(data.contractHtml);
+            setShowDraftPanel(true);
+        } catch (e: any) {
+            toast.error(e.message || "Contract drafting failed");
+        } finally {
+            setIsDraftingContract(false);
+        }
+    }
 
     const handleCreate = async () => {
         if (!selectedTemplate) return;
@@ -353,8 +375,56 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                     <h1 className="text-xl font-bold text-hui-textMain">Contracts & Lien Releases</h1>
                     <p className="text-sm text-hui-textMuted">{projectName} · {clientName}</p>
                 </div>
-                <button onClick={() => setShowModal(true)} className="hui-btn hui-btn-primary">+ Create</button>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={handleDraftContract}
+                        disabled={isDraftingContract}
+                        className="hui-btn bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 text-sm flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                        ✨ {isDraftingContract ? "Drafting…" : "AI Draft Contract"}
+                    </button>
+                    <button onClick={() => setShowModal(true)} className="hui-btn hui-btn-primary">+ Create</button>
+                </div>
             </div>
+
+            {/* AI Draft Contract Panel */}
+            {showDraftPanel && draftedHtml && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center">
+                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowDraftPanel(false)} />
+                    <div className="relative bg-white rounded-xl shadow-2xl max-w-3xl w-full mx-4 max-h-[85vh] flex flex-col">
+                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xl">✨</span>
+                                <h2 className="font-bold text-hui-textMain text-lg">AI Drafted Contract</h2>
+                            </div>
+                            <button onClick={() => setShowDraftPanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-5 overflow-y-auto flex-1">
+                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-xs text-amber-800">
+                                ⚠️ Review this AI draft carefully before use. Add it to a contract template for client signing.
+                            </div>
+                            <div
+                                className="prose prose-sm max-w-none"
+                                dangerouslySetInnerHTML={{ __html: draftedHtml }}
+                            />
+                        </div>
+                        <div className="p-4 border-t border-hui-border flex gap-2">
+                            <button onClick={() => setShowDraftPanel(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
+                            <button
+                                onClick={() => {
+                                    navigator.clipboard.writeText(draftedHtml);
+                                    toast.success("Contract HTML copied to clipboard");
+                                }}
+                                className="hui-btn text-sm"
+                            >
+                                Copy HTML
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {initialContracts.length === 0 ? (
                 <div className="text-center py-16 bg-white border border-slate-200 rounded-xl">
