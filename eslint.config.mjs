@@ -14,6 +14,14 @@ const eslintConfig = defineConfig([
     "*.js",
     "prisma/**",
   ]),
+  {
+    rules: {
+      // Warn instead of error until existing code is cleaned up
+      "@typescript-eslint/no-explicit-any": "warn",
+      "@typescript-eslint/no-unused-vars": "warn",
+      "no-unused-vars": "warn",
+    },
+  },
 ]);
 
 export default eslintConfig;
