@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { prisma } from "@/lib/prisma";
+import Anthropic from "@anthropic-ai/sdk";
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
 Analyze this receipt image and extract the following information as JSON:
@@ -48,20 +48,28 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "No image data provided" }, { status: 400 });
         }
 
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-            return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+        if (!process.env.ANTHROPIC_API_KEY) {
+            return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
         }
 
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const safeMime = (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mimeType)
+            ? mimeType
+            : "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
 
-        const result = await model.generateContent([
-            RECEIPT_PROMPT,
-            { inlineData: { data: imageBase64, mimeType } },
-        ]);
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const result = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 1024,
+            messages: [{
+                role: "user",
+                content: [
+                    { type: "image", source: { type: "base64", media_type: safeMime, data: imageBase64 } },
+                    { type: "text", text: RECEIPT_PROMPT },
+                ],
+            }],
+        });
 
-        const text = result.response.text().trim();
+        const text = (result.content[0] as { type: "text"; text: string }).text.trim();
         let parsed: Record<string, unknown>;
         try {
             parsed = JSON.parse(text);

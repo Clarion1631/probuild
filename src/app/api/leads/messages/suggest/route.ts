@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { GoogleGenAI } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 
 // POST /api/leads/messages/suggest — AI-generated message suggestion
 export async function POST(request: Request) {
@@ -11,7 +11,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "leadId required" }, { status: 400 });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!process.env.ANTHROPIC_API_KEY) {
         return NextResponse.json({ error: "AI not configured" }, { status: 500 });
     }
 
@@ -42,7 +42,7 @@ export async function POST(request: Request) {
 
     // Schedule + daily log context populated from the linked project below
     let scheduleContext = "";
-    let dailyLogContext = "";
+    const dailyLogContext = "";
 
     // Also check if this lead was converted and has a linked project
     const linkedProject = await prisma.project.findUnique({
@@ -102,7 +102,7 @@ export async function POST(request: Request) {
             contextPrompt = "Write a professional and concise reply based on the conversation context. Be helpful and action-oriented.";
     }
 
-    const systemPrompt = `You are a professional message assistant for ${companyName}, a construction/remodeling company. 
+    const systemPrompt = `You are a professional message assistant for ${companyName}, a construction/remodeling company.
 Write messages on behalf of the team to send to clients. Keep messages:
 - Professional but warm and personable
 - Concise (2-4 sentences max, unless schedule update)
@@ -133,15 +133,15 @@ ${dailyLogContext}
 TASK: ${contextPrompt}`;
 
     try {
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-        const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: [
-                { role: "user", parts: [{ text: systemPrompt + "\n\n" + userPrompt }] },
-            ],
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 512,
+            system: systemPrompt,
+            messages: [{ role: "user", content: userPrompt }],
         });
 
-        const suggestion = response.text?.trim() || "";
+        const suggestion = (response.content[0] as { type: "text"; text: string }).text?.trim() || "";
 
         return NextResponse.json({ suggestion });
     } catch (e: any) {

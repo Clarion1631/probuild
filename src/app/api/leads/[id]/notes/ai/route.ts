@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { GoogleGenAI } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
     const { id: leadId } = await context.params;
@@ -9,7 +9,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         return NextResponse.json({ error: "leadId required" }, { status: 400 });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!process.env.ANTHROPIC_API_KEY) {
         return NextResponse.json({ error: "AI not configured" }, { status: 500 });
     }
 
@@ -58,13 +58,14 @@ ${messageHistory || "None"}
 
 Please provide a short, factual summary of exactly what the client wants, where we are in the pipeline, and the logical next action. Do NOT write an email prompt, just internal notes. Format as a pure string.`;
 
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-        const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 1024,
+            messages: [{ role: "user", content: prompt }],
         });
 
-        const suggestion = response.text?.trim() || "";
+        const suggestion = (response.content[0] as { type: "text"; text: string }).text?.trim() || "";
         return NextResponse.json({ suggestion });
 
     } catch (e: any) {

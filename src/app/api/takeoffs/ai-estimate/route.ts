@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    if (!process.env.ANTHROPIC_API_KEY) {
+        return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
     }
 
     const body = await req.json();
@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
 
         if (pastEstimates.length > 0) {
             const summaries = pastEstimates.map(est => {
-                const itemSummary = est.items.slice(0, 10).map(i => 
+                const itemSummary = est.items.slice(0, 10).map(i =>
                     `  - ${i.name}: qty ${i.quantity} × $${i.unitCost} = $${i.total}`
                 ).join("\n");
                 return `Estimate "${est.title}" (${est.project?.type || "General"}, $${est.totalAmount.toLocaleString()}):\n${itemSummary}`;
@@ -61,7 +61,7 @@ export async function POST(req: NextRequest) {
     const typesList = costTypes.map(ct => ct.name).join(", ");
 
     // Build file descriptions
-    const fileDescriptions = takeoff.files.map(f => 
+    const fileDescriptions = takeoff.files.map(f =>
         `- ${f.name} (${f.mimeType}, ${(f.size / 1024).toFixed(0)}KB)`
     ).join("\n");
 
@@ -69,10 +69,14 @@ export async function POST(req: NextRequest) {
     const resolvedProjectType = projectType || takeoff.project?.type || takeoff.lead?.projectType || "General Remodeling";
     const resolvedLocation = location || takeoff.project?.location || takeoff.lead?.location || "Vancouver, WA";
 
-    // Build the prompt parts — we'll send plan images to Gemini Vision if available
-    const parts: any[] = [];
+    // Build content blocks — include images and PDFs via Claude's vision/document API
+    type ImageBlock = { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } };
+    type DocumentBlock = { type: "document"; source: { type: "base64"; media_type: "application/pdf"; data: string } };
+    type TextBlock = { type: "text"; text: string };
+    type ContentBlock = ImageBlock | DocumentBlock | TextBlock;
 
-    // Try to include uploaded images directly in the Gemini request (vision capability)
+    const contentBlocks: ContentBlock[] = [];
+
     const imageFiles = takeoff.files.filter(f => f.mimeType.startsWith("image/"));
     const pdfFiles = takeoff.files.filter(f => f.mimeType === "application/pdf");
 
@@ -83,11 +87,13 @@ export async function POST(req: NextRequest) {
             if (imgResp.ok) {
                 const buffer = await imgResp.arrayBuffer();
                 const base64 = Buffer.from(buffer).toString("base64");
-                parts.push({
-                    inlineData: {
-                        mimeType: img.mimeType,
-                        data: base64,
-                    }
+                const rawMime = img.mimeType;
+                const safeMime = (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(rawMime)
+                    ? rawMime
+                    : "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+                contentBlocks.push({
+                    type: "image",
+                    source: { type: "base64", media_type: safeMime, data: base64 },
                 });
             }
         } catch (err) {
@@ -95,18 +101,16 @@ export async function POST(req: NextRequest) {
         }
     }
 
-    // For PDF files, fetch and include as inline data (Gemini supports PDF)
+    // For PDF files, fetch and include as document blocks
     for (const pdf of pdfFiles.slice(0, 3)) {
         try {
             const pdfResp = await fetch(pdf.url);
             if (pdfResp.ok) {
                 const buffer = await pdfResp.arrayBuffer();
                 const base64 = Buffer.from(buffer).toString("base64");
-                parts.push({
-                    inlineData: {
-                        mimeType: "application/pdf",
-                        data: base64,
-                    }
+                contentBlocks.push({
+                    type: "document",
+                    source: { type: "base64", media_type: "application/pdf", data: base64 },
                 });
             }
         } catch (err) {
@@ -161,7 +165,7 @@ CRITICAL INSTRUCTIONS:
 CLARK COUNTY, WA PRICING REFERENCE (2024-2025):
   * General labor: $50-70/hr (WA rates, no income tax adjustment)
   * Skilled carpenter: $60-85/hr
-  * Electrician sub: $90-130/hr  
+  * Electrician sub: $90-130/hr
   * Plumber sub: $95-140/hr
   * HVAC sub: $100-150/hr
   * Demolition: $1,800-4,500 per room
@@ -268,148 +272,99 @@ Return ONLY a JSON object:
 
 Sort items by phase code, then by cost type within each phase. Be thorough and professional.`;
 
-    parts.push({ text: textPrompt });
+    contentBlocks.push({ type: "text", text: textPrompt });
 
     try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 90000); // 90s for vision
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 8192,
+            messages: [{ role: "user", content: contentBlocks as any }],
+        });
 
-        const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                signal: controller.signal,
-                body: JSON.stringify({
-                    contents: [{ parts }],
-                    generationConfig: {
-                        temperature: 0.7,
-                        responseMimeType: "application/json",
-                    },
-                }),
-            }
-        );
+        const rawText = (response.content[0] as { type: "text"; text: string }).text;
 
-        clearTimeout(timeout);
-
-        if (!geminiResponse.ok) {
-            const errorText = await geminiResponse.text();
-            console.error("Gemini API error:", geminiResponse.status, errorText);
-            
-            // Fallback: retry with same model
-            const fallbackResponse = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        contents: [{ parts }],
-                        generationConfig: {
-                            temperature: 0.7,
-                            responseMimeType: "application/json",
-                        },
-                    }),
-                }
-            );
-
-            if (!fallbackResponse.ok) {
-                const fbError = await fallbackResponse.text();
-                console.error("Fallback Gemini API error:", fbError);
-                return NextResponse.json({ error: "AI request failed — check API key and model availability", detail: fbError }, { status: 502 });
-            }
-
-            // Use fallback response
-            return processGeminiResponse(fallbackResponse, takeoffId, costCodes, costTypes);
+        if (!rawText) {
+            return NextResponse.json({ error: "No response from AI" }, { status: 502 });
         }
 
-        return processGeminiResponse(geminiResponse, takeoffId, costCodes, costTypes);
+        let aiData: any;
+        try {
+            aiData = JSON.parse(rawText);
+            if (Array.isArray(aiData)) {
+                aiData = { items: aiData, paymentMilestones: [], summary: "", planAnalysis: null };
+            }
+        } catch {
+            const objMatch = rawText.match(/\{[\s\S]*\}/);
+            const arrMatch = rawText.match(/\[[\s\S]*\]/);
+            if (objMatch) {
+                aiData = JSON.parse(objMatch[0]);
+                if (Array.isArray(aiData)) aiData = { items: aiData, paymentMilestones: [], summary: "", planAnalysis: null };
+            } else if (arrMatch) {
+                aiData = { items: JSON.parse(arrMatch[0]), paymentMilestones: [], summary: "", planAnalysis: null };
+            } else {
+                return NextResponse.json({ error: "Could not parse AI response" }, { status: 502 });
+            }
+        }
+
+        const aiItems = aiData.items || [];
+        const aiMilestones = aiData.paymentMilestones || [];
+        const aiSummary = aiData.summary || "";
+        const planAnalysis = aiData.planAnalysis || null;
+
+        // Map cost codes and cost types to IDs
+        const codeMap: Record<string, string> = {};
+        for (const cc of costCodes) codeMap[cc.code] = cc.id;
+
+        const typeMap: Record<string, string> = {};
+        for (const ct of costTypes) typeMap[ct.name] = ct.id;
+
+        const estimateItems = aiItems.map((item: any, idx: number) => ({
+            id: `ai_${Date.now()}_${idx}`,
+            name: item.name || "Unnamed Item",
+            description: item.description || "",
+            type: item.costType || "Material",
+            quantity: item.quantity || 1,
+            unit: item.unit || "each",
+            unitCost: item.unitCost || 0,
+            total: item.total || (item.quantity || 1) * (item.unitCost || 0),
+            parentId: null,
+            costCodeId: codeMap[item.costCode] || null,
+            costTypeId: typeMap[item.costType] || null,
+            costCode: item.costCode || "",
+            order: idx,
+            isAllowance: item.isAllowance || false,
+        }));
+
+        const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0);
+
+        const paymentMilestones = aiMilestones.map((m: any, idx: number) => ({
+            id: `pm_${Date.now()}_${idx}`,
+            name: m.name || `Payment ${idx + 1}`,
+            percentage: String(m.percentage || 0),
+            amount: ((m.percentage || 0) / 100 * totalEstimate).toFixed(2),
+            dueDate: "",
+        }));
+
+        // Save the AI data to the takeoff
+        await prisma.takeoff.update({
+            where: { id: takeoffId },
+            data: {
+                aiEstimateData: JSON.stringify({ items: estimateItems, paymentMilestones, summary: aiSummary, totalEstimate, planAnalysis }),
+                status: "In Progress",
+            },
+        });
+
+        return NextResponse.json({
+            items: estimateItems,
+            paymentMilestones,
+            summary: aiSummary,
+            planAnalysis,
+            count: estimateItems.length,
+            totalEstimate,
+        });
     } catch (err: any) {
         console.error("AI Takeoff Estimate error:", err);
         return NextResponse.json({ error: err.message || "Internal error" }, { status: 500 });
     }
-}
-
-async function processGeminiResponse(geminiResponse: Response, takeoffId: string, costCodes: any[], costTypes: any[]) {
-    const geminiData = await geminiResponse.json();
-    const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!rawText) {
-        return NextResponse.json({ error: "No response from AI" }, { status: 502 });
-    }
-
-    let aiData: any;
-    try {
-        aiData = JSON.parse(rawText);
-        if (Array.isArray(aiData)) {
-            aiData = { items: aiData, paymentMilestones: [], summary: "", planAnalysis: null };
-        }
-    } catch {
-        const objMatch = rawText.match(/\{[\s\S]*\}/);
-        const arrMatch = rawText.match(/\[[\s\S]*\]/);
-        if (objMatch) {
-            aiData = JSON.parse(objMatch[0]);
-            if (Array.isArray(aiData)) aiData = { items: aiData, paymentMilestones: [], summary: "", planAnalysis: null };
-        } else if (arrMatch) {
-            aiData = { items: JSON.parse(arrMatch[0]), paymentMilestones: [], summary: "", planAnalysis: null };
-        } else {
-            return NextResponse.json({ error: "Could not parse AI response" }, { status: 502 });
-        }
-    }
-
-    const aiItems = aiData.items || [];
-    const aiMilestones = aiData.paymentMilestones || [];
-    const aiSummary = aiData.summary || "";
-    const planAnalysis = aiData.planAnalysis || null;
-
-    // Map cost codes and cost types to IDs
-    const codeMap: Record<string, string> = {};
-    for (const cc of costCodes) codeMap[cc.code] = cc.id;
-
-    const typeMap: Record<string, string> = {};
-    for (const ct of costTypes) typeMap[ct.name] = ct.id;
-
-    const estimateItems = aiItems.map((item: any, idx: number) => ({
-        id: `ai_${Date.now()}_${idx}`,
-        name: item.name || "Unnamed Item",
-        description: item.description || "",
-        type: item.costType || "Material",
-        quantity: item.quantity || 1,
-        unit: item.unit || "each",
-        unitCost: item.unitCost || 0,
-        total: item.total || (item.quantity || 1) * (item.unitCost || 0),
-        parentId: null,
-        costCodeId: codeMap[item.costCode] || null,
-        costTypeId: typeMap[item.costType] || null,
-        costCode: item.costCode || "",
-        order: idx,
-        isAllowance: item.isAllowance || false,
-    }));
-
-    const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0);
-
-    const paymentMilestones = aiMilestones.map((m: any, idx: number) => ({
-        id: `pm_${Date.now()}_${idx}`,
-        name: m.name || `Payment ${idx + 1}`,
-        percentage: String(m.percentage || 0),
-        amount: ((m.percentage || 0) / 100 * totalEstimate).toFixed(2),
-        dueDate: "",
-    }));
-
-    // Save the AI data to the takeoff
-    await prisma.takeoff.update({
-        where: { id: takeoffId },
-        data: {
-            aiEstimateData: JSON.stringify({ items: estimateItems, paymentMilestones, summary: aiSummary, totalEstimate, planAnalysis }),
-            status: "In Progress",
-        },
-    });
-
-    return NextResponse.json({
-        items: estimateItems,
-        paymentMilestones,
-        summary: aiSummary,
-        planAnalysis,
-        count: estimateItems.length,
-        totalEstimate,
-    });
 }

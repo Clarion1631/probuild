@@ -2,11 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     const session = await getServerSession(authOptions);
     if (!session?.user) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+        return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
     }
 
     const { id } = await params;
@@ -24,11 +29,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     if (!lead) {
         return NextResponse.json({ error: "Lead not found" }, { status: 404 });
-    }
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
     }
 
     const daysSinceActivity = Math.floor(
@@ -70,28 +70,22 @@ Return ONLY a JSON object with these exact fields:
 }`;
 
     try {
-        const res = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        responseMimeType: "application/json",
-                        temperature: 0.3,
-                    },
-                }),
-            }
-        );
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 512,
+            messages: [{ role: "user", content: prompt }],
+        });
 
-        if (!res.ok) {
-            throw new Error(`Gemini API error: ${res.status}`);
+        const text = (response.content[0] as { type: "text"; text: string }).text || "{}";
+
+        let result: { score?: number; rating?: string; summary?: string; topFactors?: string[] };
+        try {
+            result = JSON.parse(text);
+        } catch {
+            const match = text.match(/\{[\s\S]*\}/);
+            result = match ? JSON.parse(match[0]) : {};
         }
-
-        const data = await res.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-        const result = JSON.parse(text);
 
         return NextResponse.json({
             score: Math.min(100, Math.max(0, result.score || 0)),

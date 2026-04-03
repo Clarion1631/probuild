@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    if (!process.env.ANTHROPIC_API_KEY) {
+        return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
     }
 
     const { projectId, estimateId } = await req.json();
@@ -97,35 +97,20 @@ Return ONLY a JSON array of objects, nothing else. Each object must have exactly
 { "name": string, "startDate": "YYYY-MM-DD", "endDate": "YYYY-MM-DD", "color": "#hex" }`;
 
     try {
-        const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        temperature: 0.7,
-                        responseMimeType: "application/json",
-                    },
-                }),
-            }
-        );
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 2048,
+            messages: [{ role: "user", content: prompt }],
+        });
 
-        if (!geminiResponse.ok) {
-            const errorText = await geminiResponse.text();
-            console.error("Gemini API error:", errorText);
-            return NextResponse.json({ error: "Gemini API request failed" }, { status: 502 });
-        }
-
-        const geminiData = await geminiResponse.json();
-        const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+        const rawText = (response.content[0] as { type: "text"; text: string }).text;
 
         if (!rawText) {
-            return NextResponse.json({ error: "No response from Gemini" }, { status: 502 });
+            return NextResponse.json({ error: "No response from AI" }, { status: 502 });
         }
 
-        // Parse the JSON array from Gemini's response
+        // Parse the JSON array from Claude's response
         let aiTasks: { name: string; startDate: string; endDate: string; color: string }[];
         try {
             aiTasks = JSON.parse(rawText);

@@ -1,8 +1,8 @@
 export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI } from "@google/genai";
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
+import Anthropic from "@anthropic-ai/sdk";
 
 
 export async function POST(req: NextRequest) {
@@ -29,32 +29,35 @@ export async function POST(req: NextRequest) {
 
         const publicUrl = `/uploads/receipts/${filename}`;
 
-        // Call Gemini API to parse the receipt
-        if (!process.env.GEMINI_API_KEY) {
-            console.error("GEMINI_API_KEY is missing");
+        if (!process.env.ANTHROPIC_API_KEY) {
+            console.error("ANTHROPIC_API_KEY is missing");
             return NextResponse.json({ error: "AI Parsing is not configured on this server." }, { status: 500 });
         }
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-        const response = await ai.models.generateContent({
-            model: "gemini-3-pro-preview",
-            contents: [
-                {
-                    role: 'user',
-                    parts: [
-                        { text: "Extract the following from this receipt: amount (number), vendor name, date (YYYY-MM-DD), and a brief description of what was purchased. Return ONLY a valid JSON object with the keys 'amount', 'vendor', 'date', and 'description'." },
-                        {
-                            inlineData: {
-                                data: buffer.toString("base64"),
-                                mimeType: file.type
-                            }
-                        }
-                    ]
-                }
-            ]
+        const safeMime = (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(file.type)
+            ? file.type
+            : "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 1024,
+            messages: [{
+                role: "user",
+                content: [
+                    {
+                        type: "image",
+                        source: { type: "base64", media_type: safeMime, data: buffer.toString("base64") },
+                    },
+                    {
+                        type: "text",
+                        text: "Extract the following from this receipt: amount (number), vendor name, date (YYYY-MM-DD), and a brief description of what was purchased. Return ONLY a valid JSON object with the keys 'amount', 'vendor', 'date', and 'description'.",
+                    },
+                ],
+            }],
         });
 
-        const aiText = response.text || "";
+        const aiText = (response.content[0] as { type: "text"; text: string }).text || "";
         // Extremely simple JSON extraction just in case it's wrapped in markdown
         const jsonMatch = aiText.match(/```json\n([\s\S]*?)\n```/) || aiText.match(/\{[\s\S]*\}/);
         let entryData = {};
@@ -62,7 +65,7 @@ export async function POST(req: NextRequest) {
             try {
                 entryData = JSON.parse(jsonMatch[1] || jsonMatch[0]);
             } catch (e) {
-                console.error("Failed to parse Gemini JSON:", e);
+                console.error("Failed to parse Claude JSON:", e);
             }
         }
 

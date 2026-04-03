@@ -37,8 +37,9 @@ export async function POST(req: NextRequest) {
         const body = await req.json();
         const { notes, photoUrls } = body;
 
-        // Note: For now we're just parsing the shorthand text. In the future, we can add vision capabilities 
+        // Note: For now we're just parsing the shorthand text. In the future, we can add vision capabilities
         // to parse the photos, or video capabilities by passing the uploaded file URIs to the Gemini API.
+        // TODO: Video daily logs — use Gemini 1.5 Pro with file URI once video upload is wired
 
         if (!notes) {
             return NextResponse.json({ error: "Notes are required" }, { status: 400 });
