@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
 
     const { projectId, estimateId } = await req.json();
     if (!projectId) return NextResponse.json({ error: "projectId required" }, { status: 400 });
@@ -73,10 +72,13 @@ Use HTML formatting with <h2> for sections, <p> for paragraphs, <ul>/<li> for li
 Use {{client_name}}, {{project_name}}, {{date}}, {{SIGNATURE_BLOCK}} as merge fields.
 Write in a professional but accessible tone appropriate for Clark County, WA homeowners.`;
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const result = await model.generateContent(prompt);
-    const contractHtml = result.response.text().trim()
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4096,
+        messages: [{ role: "user", content: prompt }],
+    });
+    const contractHtml = response.content[0].text.trim()
         .replace(/^```html\n?/, "")
         .replace(/\n?```$/, "");
 

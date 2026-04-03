@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
 
     const { leadId } = await req.json();
     if (!leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
@@ -67,10 +66,13 @@ RECOMMENDED NEXT ACTIONS:
 
 CONFIDENCE NOTE: [1-2 sentences on what would increase or decrease this score]`;
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const result = await model.generateContent(prompt);
-    const analysis = result.response.text().trim();
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4096,
+        messages: [{ role: "user", content: prompt }],
+    });
+    const analysis = response.content[0].text.trim();
 
     // Parse probability
     const probMatch = analysis.match(/CLOSE PROBABILITY:\s*(\d+)%/);

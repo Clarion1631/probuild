@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
 
 interface ScheduleTask {
@@ -16,8 +16,7 @@ interface ScheduleTask {
 }
 
 export async function POST(req: NextRequest) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
 
     const { projectId, tasks }: { projectId: string; tasks: ScheduleTask[] } = await req.json();
     if (!projectId || !tasks) return NextResponse.json({ error: "projectId and tasks required" }, { status: 400 });
@@ -78,10 +77,13 @@ RESOURCE RISKS:
 FORECAST: At this pace, the project is [on track | X days behind | X days ahead].
 Recommended completion adjustment: [date or "none needed"].`;
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const result = await model.generateContent(prompt);
-    const analysis = result.response.text().trim();
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4096,
+        messages: [{ role: "user", content: prompt }],
+    });
+    const analysis = response.content[0].text.trim();
 
     return NextResponse.json({ success: true, analysis });
 }

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import Anthropic from "@anthropic-ai/sdk";
 
 type CostCode = { id: string; code: string; name: string };
 type CostType = { id: string; name: string };
@@ -16,9 +17,8 @@ type AiMilestone = { name?: string; percentage?: number };
 type AiData = { items: AiItem[]; paymentMilestones: AiMilestone[] };
 
 export async function POST(req: NextRequest) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    if (!process.env.ANTHROPIC_API_KEY) {
+        return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
     }
 
     const { projectName, projectType, description, location, costCodes, costTypes } = await req.json();
@@ -102,35 +102,14 @@ Return ONLY a JSON object (NOT an array) with two keys:
 Sort items by phase code, then by cost type within each phase. Make the estimate thorough and professional.`;
 
     try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 55000); // 55s timeout
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await anthropic.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            messages: [{ role: "user", content: prompt }],
+        });
 
-        const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                signal: controller.signal,
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        temperature: 0.7,
-                        responseMimeType: "application/json",
-                    },
-                }),
-            }
-        );
-
-        clearTimeout(timeout);
-
-        if (!geminiResponse.ok) {
-            const errorText = await geminiResponse.text();
-            console.error("Gemini API error:", errorText);
-            return NextResponse.json({ error: "AI request failed" }, { status: 502 });
-        }
-
-        const geminiData = await geminiResponse.json();
-        const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+        const rawText = response.content[0].text;
 
         if (!rawText) {
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
