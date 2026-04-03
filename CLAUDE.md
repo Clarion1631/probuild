@@ -1,32 +1,41 @@
-# CLAUDE.md — houzz-scrape project context
+# CLAUDE.md — ProBuild Project Context
 
-## What this project does
-Visual QA pipeline: scrape Houzz Pro → screenshot GoldenTouch Pro → Claude Haiku diffs them → HTML report.
+## What this project is
+**ProBuild** — a construction/contractor management platform (competitor to Houzz Pro). Built with Next.js, Prisma, Supabase, deployed on Vercel.
 
 ## Key paths
 | Thing | Path |
 |---|---|
 | This project (Windows) | `C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site` |
-| This project (WSL) | `/mnt/c/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site` |
-| compare.py | Run from project root — `python compare.py` |
-| Scraped Houzz pages | `output/pages/<md5>/` (107 pages, already done) |
-| QA report | `output/report.html` |
-| Cached screenshots | `output/compare/` |
+| GitHub | https://github.com/Clarion1631/probuild |
+| Production | https://probuild.goldentouchremodeling.com |
+| Vercel preview | https://probuild-amber.vercel.app |
+| Known prod project ID | `cmn7tlgiv0001phwqjzwk75or` |
 
-## Probuild stack
-- Next.js, npm, Prisma, Tailwind
-- GitHub: https://github.com/Clarion1631/probuild
+## Stack
+- Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
+- Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
 - Vercel auto-deploys on push to `main`
-- **Deploy workflow:** edit files in probuild repo → `git add` → `git commit` → `git push origin main` → Vercel deploys automatically
 
-## WSL env vars
-- `setx` env vars (VERCEL_TOKEN, STRIPE_API_KEY, etc.) are Windows-only — NOT available in WSL
-- To check Vercel deploy status from WSL: `gh run list --repo Clarion1631/probuild --limit 5`
-- To check latest deploy: `gh api repos/Clarion1631/probuild/actions/runs --jq '.workflow_runs[0] | {status,conclusion,created_at}'`
+## Product Vision
+See **VISION.md** — AI-first remodeling platform. Every feature should ask: "What can AI do here so the human doesn't have to?"
+
+## Active Build Plan
+See **ProbuildTodo.md** — execute sessions in order (Sessions 3–7 remain).
+Sessions 1–2 + Gantt polish are complete. Each session lists specific files, actions, and schema changes.
+
+## Development workflow
+```
+1. Pick next session from ProbuildTodo.md
+2. Make changes
+3. npm run build          # must pass 0 errors
+4. git push origin main   # triggers Vercel deploy
+5. Click through affected pages on prod to verify
+6. Mark items done in ProbuildTodo.md
+```
 
 ## Dev server — clean start
 ```bash
-# Kill any zombie processes and start fresh
 kill -9 $(lsof -ti tcp:3000,3001,3002) 2>/dev/null; rm -f .next/dev/lock; sleep 2
 npm run dev > /tmp/devserver.log 2>&1 &
 sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
@@ -34,97 +43,37 @@ sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
 - Always use port 3000 — if it's taken, kill it, don't switch ports
 - If still failing, `rm -rf .next && npm run dev`
 
-## Running the pipeline
+## Schema migrations
+> `npx prisma db push` hangs interactively. `prisma migrate dev` fails (port 5432 blocked on free tier).
+
+**Working approach:**
+1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
+2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
+3. Regenerate: `"C:\Program Files\Git\bin\bash.exe" -c "cd '/c/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site' && ./node_modules/.bin/prisma generate"`
+4. Update `prisma/schema.prisma` to match the SQL changes
+
+## Critical database config
+- **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this. Without it: `42P05 prepared statement already exists` and the site goes down.
+- Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
+- DIRECT_URL uses port 5432 on `db.ghzdbzdnwjxazvmcefbh.supabase.co` (for migrations only)
+
+## compare.py (optional — QA tool, not daily workflow)
+Legacy Houzz Pro visual comparison tool. Useful for quarterly sanity checks only.
 ```bash
-# Full fresh comparison (re-screenshots everything)
-python compare.py --force
-
-# Single page test
-python compare.py --page "Leads List"
-
-# Screenshots only, no AI
-python compare.py --no-ai
-
-# Re-scrape Houzz (only if cookies expire or new pages needed)
-python scraper.py
+python compare.py --force     # full production comparison
+python compare.py --local --page "Page Name"   # single page local test
 ```
-
-## API keys (config.py)
-- `ANTHROPIC_API_KEY` — Claude Haiku, used by compare.py for visual diffs
-- `GEMINI_API_KEY` — Gemini Flash, used by cloner.py only
-- `SCRAPINGBEE_API_KEY` — unused
-
-## Active Build Plan
-See **ProbuildTodo.md** in this repo root — execute sessions in order (Session 1 → 7).
-Current score: ~67/100. Each session has specific files, actions, and compare.py entries.
-
-> **Schema migration:** `npx prisma db push` hangs interactively in WSL. Use:
-> `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
-> Then regenerate: `"C:\Program Files\Git\bin\bash.exe" -c "cd '/c/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site' && ./node_modules/.bin/prisma generate"`
-
-## Last known scores (April 3, 2026 — 67/100 overall)
-| Page | Score | Notes |
-|---|---|---|
-| Company | 75 | Fixed |
-| Projects List | 72 | |
-| Project Overview | 72 | Fixed (was 404) |
-| Leads List | 72 | |
-| Estimates | 72 | |
-| Time & Expenses | 72 | Fixed (was server error) |
-| Settings | 72 | Fixed (was 404) |
-| Daily Logs | 72 | Fixed (was unmapped) |
-| Reports Overview | 62 | Needs layout sidebar |
-| Invoices | 45 | Layout/hierarchy gaps |
-| Schedule | 35 | Gantt rebuilt — needs rescore |
-| **Overall** | **~67/100** | |
+- `config.py` has API keys (gitignored) — ANTHROPIC_API_KEY, GEMINI_API_KEY
+- Do not run compare.py as part of normal development — use ProbuildTodo.md as the roadmap instead
 
 ## Production data
-- **Never use local DB IDs in compare.py URL_MAP** — local and prod IDs differ
-- Query prod project IDs via the live API (cookies already in compare.py):
-  ```bash
-  curl -s "https://probuild.goldentouchremodeling.com/api/projects" \
-    -H "Cookie: __Secure-next-auth.session-token=<token from YOUR_COOKIES in compare.py>" \
-    | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); JSON.parse(d).forEach(p=>console.log(p.id, p.name))"
-  ```
-- Known prod project ID: `cmn7tlgiv0001phwqjzwk75or` (use this in URL_MAP for Project Overview)
+- Known prod project ID: `cmn7tlgiv0001phwqjzwk75or`
 - Do NOT try psql, prisma direct connect, or supabase CLI to query prod — use the API
 
 ## Common pitfalls
-
-- **ANTHROPIC_API_KEY** is in `config.py` — do not prompt the user for it or look for it in env vars
-- **Houzz scraped pages** live at `output/pages/` in this repo — if empty, copy from `/home/jitters/projects/houzz-scrape-new/output/`
-- **config.py is gitignored** — never commit it, never push it, it contains secrets
-- **compare.py runs from repo root** — never cd elsewhere before running it
-- **GoldenTouch Pro URL** is `https://probuild-amber.vercel.app` — that's the live site compare.py screenshots
-- **Do not re-scrape Houzz** unless cookies have expired — the 107 pages are already cached in `output/pages/`
-
-## URL_MAP issues to fix (compare.py)
-- `Project Overview` → needs real probuild project ID in path
-- `Daily Logs` → route doesn't exist yet in probuild
-- `Settings` → 404
-- `Company` → 404
-- `Time & Expenses` → server error
-
-## Cookie expiry
-When you see 401/403 or login redirects:
-- **Houzz cookies** → re-export from browser → update `SESSION_COOKIES` in `config.py`
-- **GoldenTouch cookies** → re-export from browser → update `YOUR_COOKIES` in `compare.py`
-- Critical Houzz cookie: `_ivy_session_key`
-- Critical GoldenTouch cookie: `__Secure-next-auth.session-token`
-
-## Workflow for fixing UI issues
-1. Run `npm run dev` in a separate terminal (keep it running)
-2. Run `python compare.py --local --page "Page Name"` to get current diff
-3. Read the issue descriptions in the report
-4. Make fixes in the repo
-5. Re-run `python compare.py --local --page "Page Name"` to verify score improved (--local always forces fresh screenshots)
-6. Once happy: `git add . && git commit -m "fix: ..." && git push origin main` → Vercel auto-deploys
-
-## Important
-- Always test with `--local` first — instant feedback, no waiting for Vercel
-- Only push to main when the local score has improved
-- Never test against production to verify fixes — that wastes a deploy cycle
-- `--force` is only needed on production runs to bust the screenshot cache
+- **config.py is gitignored** — never commit it, it contains secrets
+- **GoldenTouch Pro URL** is `https://probuild-amber.vercel.app` — that's the live Vercel deployment
+- **WSL env vars** — `setx` vars (VERCEL_TOKEN, STRIPE_API_KEY, etc.) are Windows-only, NOT available in WSL
 
 ## Coding rules
 

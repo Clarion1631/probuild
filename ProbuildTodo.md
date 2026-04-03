@@ -14,43 +14,25 @@ Current score: **~67/100** across 11 tracked pages. Execute sessions in order be
 
 ### Verification loop (after every session)
 ```
-npm run build                          # must pass 0 errors
-git push origin main                   # triggers Vercel deploy
-gh api repos/Clarion1631/probuild/commits/HEAD/statuses   # wait for green
-python compare.py --force              # updated production scores
-python compare.py --local --page "Page Name"   # in-session feedback
+npm run build              # must pass 0 errors
+git push origin main       # triggers Vercel deploy
+# click through affected pages on prod to verify
 ```
 
 ---
 
-### Session 1 — Settings, Client Portal, Reports Layout (+20 avg)
-Items: T1-2, T1-6, Visual Polish: reports/layout, dead sidebar quick-fixes
-
-- [ ] **T1-2** `/projects/[id]/client-portal` — server component, import existing `PortalVisibilityToggles.tsx`; fix sidebar href `client-dashboard` → `client-portal`
-- [ ] **T1-6** Settings sidebar expansion — add nav items + 3 new pages:
-  - [ ] `src/app/settings/notifications/page.tsx`
-  - [ ] `src/app/settings/payment-methods/page.tsx`
-  - [ ] `src/app/settings/integrations/page.tsx`
-  - [ ] `src/app/settings/layout.tsx` — rename "Your Houzz Pro Account" → "Company Info"; add Business + Team sections
-- [ ] **Reports layout** — `src/app/reports/layout.tsx` with secondary sidebar nav (fixes Reports 62→75+)
-- [ ] **Dead link quick-fixes** (2 lines each):
-  - [ ] ProjectInnerSidebar: "Selections Tracker" → redirect to `/selections`
-  - [ ] ProjectInnerSidebar: "Budget" → redirect to `/financial-overview`
-
-compare.py: Add "Client Portal Config" entry
+### ~~Session 1 — Settings, Client Portal, Reports Layout~~ ✅ DONE
+Completed 2026-04-03: reports/layout, settings expansion (notifications, payment-methods, integrations), client-portal, dead link fixes, bid-packages stub
 
 ---
 
-### Session 2 — Project Tasks, Lead Notes, Company Sidebar (+8 avg, fixes 5 dead links)
-Items: T1-1, T1-3, dead company/sidebar links
+### ~~Session 2 — Project Tasks, Lead Notes, Company Sidebar~~ ✅ DONE
+Completed 2026-04-03: project tasks page, lead notes route, company stubs (my-items, catalogs), dead link fixes
 
-- [ ] **T1-1** `/projects/[id]/tasks` — server component + `TasksClient.tsx` (two tabs: Tasks grouped by status, Punchlist per task); reuse `getScheduleTasks()`, `togglePunchItem()`, `addTaskPunchItem()`
-- [ ] **T1-3** `/leads/[id]/notes` — server component; reuse `getLeadNotes()`, `createLeadNote()`; update LeadSidebar "Notes" from modal → href
-- [ ] Fix `company/layout.tsx` dead hrefs:
-  - [ ] "My Items" → `/company/my-items` (create stub page for now)
-  - [ ] "Catalogs" → `/company/catalogs` (create stub page for now)
+---
 
-compare.py: Add "Project Tasks" entry
+### ~~Gantt Polish (unplanned)~~ ✅ DONE
+Completed 2026-04-03: milestones (diamond rendering), critical path algorithm + toggle, estimate item linking, touch/pinch support, fixed hardcoded userId
 
 ---
 
@@ -62,7 +44,6 @@ Items: T1-4, T1-5, T2-1
 - [ ] **T1-5b** `src/app/reports/time-billing/page.tsx` — TimeEntry groupBy employee|project via searchParam
 - [ ] **T2-1** `src/app/reports/global-tracker/page.tsx` — all projects: budget, invoiced/paid, schedule %, last activity
 
-compare.py: Add Open Invoices, Payments, Time Billing, Global Tracker entries
 
 ---
 
@@ -148,7 +129,6 @@ CREATE TABLE IF NOT EXISTS "BidInvitation" ("id" TEXT NOT NULL PRIMARY KEY, "pac
 - [ ] New actions: `createBidPackage`, `updateBidPackage`, `addBidScope`, `inviteSubToBid`, `recordBidResponse`, `awardBid`
 - [ ] Fix ProjectInnerSidebar "Bids" href → `/projects/${projectId}/bid-packages`
 
-compare.py: Add "Bid Packages" entry
 
 ---
 
@@ -158,7 +138,7 @@ compare.py: Add "Bid Packages" entry
 - `src/app/company/layout.tsx` — company sidebar has wrong hrefs
 - `src/lib/actions.ts` — all new server actions (no new split files per CLAUDE.md)
 - `prisma/schema.prisma` — all schema changes
-- `compare.py` — add URL_MAP entry for every new page built
+- `compare.py` — optional QA tool for quarterly sanity checks only
 
 ---
 
