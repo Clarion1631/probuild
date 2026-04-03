@@ -51,6 +51,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                                 <ul className="space-y-2 text-sm">
                                     {can("invoices") && <li><Link href="/invoices" className="hover:text-hui-primary block transition">All Invoices</Link></li>}
                                     {can("changeOrders") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Change Orders</Link></li>}
+                                    {can("invoices") && <li><Link href="/manager/receipts" className="hover:text-hui-primary block transition">Receipt Queue</Link></li>}
                                 </ul>
                             </div>
                         )}
