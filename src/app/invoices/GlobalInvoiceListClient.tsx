@@ -9,6 +9,30 @@ const STATUS_TABS = ["All", "Draft", "Issued", "Paid", "Overdue", "Partially Pai
 type SortKey = "code" | "project" | "client" | "status" | "totalAmount" | "balanceDue" | "issueDate";
 type SortDir = "asc" | "desc";
 
+function TabButton({ active, onClick, count, children }: {
+    active: boolean; onClick: () => void; count?: number; children: React.ReactNode;
+}) {
+    return (
+        <button
+            onClick={onClick}
+            className={`px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${
+                active
+                    ? "border-hui-primary text-hui-primary"
+                    : "border-transparent text-hui-textMuted hover:text-hui-textMain"
+            }`}
+        >
+            {children}
+            {count !== undefined && count > 0 && (
+                <span className={`ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full ${
+                    active ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
+                }`}>
+                    {count}
+                </span>
+            )}
+        </button>
+    );
+}
+
 export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] }) {
     const [activeTab, setActiveTab] = useState<string>("All");
     const [sortKey, setSortKey] = useState<SortKey>("issueDate");
@@ -27,7 +51,6 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
     const filtered = useMemo(() => {
         let list = invoices;
 
-        // Search
         if (searchTerm) {
             const q = searchTerm.toLowerCase();
             list = list.filter(inv =>
@@ -37,12 +60,10 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
             );
         }
 
-        // Status filter
         if (activeTab !== "All") {
             list = list.filter(inv => inv.status === activeTab);
         }
 
-        // Sort
         list = [...list].sort((a, b) => {
             let aVal: any, bVal: any;
             switch (sortKey) {
@@ -63,10 +84,13 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
         return list;
     }, [invoices, activeTab, sortKey, sortDir, searchTerm]);
 
-    // Metrics
-    const totalAmount = invoices.reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
-    const balanceDue = invoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
-    const totalPaid = totalAmount - balanceDue;
+    // Stat calculations
+    const totalInvoiced = invoices.reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
+    const totalBalanceDue = invoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
+    const collected = totalInvoiced - totalBalanceDue;
+    const overdueAmount = invoices
+        .filter(i => i.status === "Overdue")
+        .reduce((sum, i) => sum + (i.balanceDue || 0), 0);
     const overdueCount = invoices.filter(i => i.status === "Overdue").length;
 
     const SortIcon = ({ col }: { col: SortKey }) => {
@@ -85,109 +109,103 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
             {/* Header */}
             <div className="flex justify-between items-center">
                 <div>
-                    <h1 className="text-2xl font-bold text-hui-textMain">All Invoices</h1>
-                    <p className="text-sm text-hui-textMuted mt-1">Financial overview across all projects</p>
-                </div>
-            </div>
-
-            {/* Metrics Grid */}
-            <div className="grid grid-cols-4 gap-4">
-                <div className="hui-card p-5">
-                    <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Total Invoiced</p>
-                    <p className="text-2xl font-bold text-hui-textMain">${totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                    <p className="text-xs text-hui-textMuted mt-1">{invoices.length} invoice{invoices.length !== 1 ? 's' : ''}</p>
-                </div>
-                <div className="hui-card p-5">
-                    <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Total Paid</p>
-                    <p className="text-2xl font-bold text-hui-primary">${totalPaid.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                    <p className="text-xs text-hui-textMuted mt-1">{invoices.filter(i => i.status === "Paid").length} paid in full</p>
-                </div>
-                <div className="hui-card p-5">
-                    <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Outstanding</p>
-                    <p className={`text-2xl font-bold ${balanceDue > 0 ? 'text-red-600' : 'text-emerald-600'}`}>${balanceDue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                    <p className="text-xs text-hui-textMuted mt-1">{invoices.filter(i => i.balanceDue > 0).length} unpaid</p>
-                </div>
-                <div className="hui-card p-5">
-                    <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Overdue</p>
-                    <p className={`text-2xl font-bold ${overdueCount > 0 ? 'text-red-600' : 'text-emerald-600'}`}>{overdueCount}</p>
-                    <p className="text-xs text-hui-textMuted mt-1">{overdueCount > 0 ? 'Needs attention' : 'All current'}</p>
-                </div>
-            </div>
-
-            {/* Filter Bar */}
-            <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1 bg-white border border-hui-border rounded-lg p-1 flex-1">
-                    {STATUS_TABS.map(tab => {
-                        const count = tab === "All" ? invoices.length : invoices.filter(i => i.status === tab).length;
-                        return (
-                            <button
-                                key={tab}
-                                onClick={() => setActiveTab(tab)}
-                                className={`px-4 py-1.5 text-sm font-medium rounded-md transition ${
-                                    activeTab === tab
-                                        ? "bg-hui-primary text-white shadow-sm"
-                                        : "text-hui-textMuted hover:text-hui-textMain hover:bg-slate-50"
-                                }`}
-                            >
-                                {tab}
-                                {count > 0 && (
-                                    <span className={`ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full ${
-                                        activeTab === tab ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'
-                                    }`}>
-                                        {count}
-                                    </span>
-                                )}
-                            </button>
-                        );
-                    })}
+                    <h1 className="text-xl font-bold text-hui-textMain">All Invoices</h1>
+                    <p className="text-sm text-hui-textMuted mt-1">{invoices.length} invoice{invoices.length !== 1 ? "s" : ""} across all projects</p>
                 </div>
                 <input
                     type="text"
                     placeholder="Search invoices..."
                     value={searchTerm}
                     onChange={e => setSearchTerm(e.target.value)}
-                    className="hui-input w-64"
+                    className="hui-input w-56"
                 />
+            </div>
+
+            {/* Stat Cards */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="hui-card p-5">
+                    <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Total Invoiced</p>
+                    <p className="text-2xl font-bold text-hui-textMain">${totalInvoiced.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                    <p className="text-xs text-hui-textMuted mt-1">{invoices.length} invoice{invoices.length !== 1 ? "s" : ""}</p>
+                </div>
+                <div className="hui-card p-5">
+                    <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Collected</p>
+                    <p className="text-2xl font-bold text-hui-primary">${collected.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                    <p className="text-xs text-hui-textMuted mt-1">{invoices.filter(i => i.status === "Paid").length} paid in full</p>
+                </div>
+                <div className="hui-card p-5">
+                    <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Outstanding</p>
+                    <p className={`text-2xl font-bold ${totalBalanceDue > 0 ? "text-amber-600" : "text-emerald-600"}`}>${totalBalanceDue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                    <p className="text-xs text-hui-textMuted mt-1">{invoices.filter(i => i.balanceDue > 0).length} unpaid</p>
+                </div>
+                <div className="hui-card p-5">
+                    <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Overdue</p>
+                    <p className={`text-2xl font-bold ${overdueCount > 0 ? "text-red-600" : "text-emerald-600"}`}>
+                        {overdueCount > 0 ? `$${overdueAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "$0.00"}
+                    </p>
+                    <p className="text-xs text-hui-textMuted mt-1">{overdueCount > 0 ? `${overdueCount} overdue` : "All current"}</p>
+                </div>
+            </div>
+
+            {/* Filter Tabs */}
+            <div className="flex items-center gap-0 border-b border-hui-border overflow-x-auto">
+                {STATUS_TABS.map(tab => {
+                    const count = tab === "All" ? invoices.length : invoices.filter(i => i.status === tab).length;
+                    return (
+                        <TabButton
+                            key={tab}
+                            active={activeTab === tab}
+                            onClick={() => setActiveTab(tab)}
+                            count={tab === "All" ? undefined : count}
+                        >
+                            {tab}
+                        </TabButton>
+                    );
+                })}
             </div>
 
             {/* Table */}
             <div className="hui-card overflow-hidden">
                 <table className="w-full text-sm text-left">
-                    <thead className="bg-slate-50 text-hui-textMuted border-b border-hui-border">
+                    <thead className="bg-slate-50 border-b border-hui-border">
                         <tr>
-                            <th className="px-6 py-3 font-medium cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("code")}>
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("code")}>
                                 Invoice # <SortIcon col="code" />
                             </th>
-                            <th className="px-6 py-3 font-medium cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("project")}>
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("project")}>
                                 Project <SortIcon col="project" />
                             </th>
-                            <th className="px-6 py-3 font-medium cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("client")}>
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("client")}>
                                 Client <SortIcon col="client" />
                             </th>
-                            <th className="px-6 py-3 font-medium cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("status")}>
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("status")}>
                                 Status <SortIcon col="status" />
                             </th>
-                            <th className="px-6 py-3 font-medium text-right cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("totalAmount")}>
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider text-right cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("totalAmount")}>
                                 Total <SortIcon col="totalAmount" />
                             </th>
-                            <th className="px-6 py-3 font-medium text-right cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("balanceDue")}>
-                                Balance <SortIcon col="balanceDue" />
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider text-right cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("balanceDue")}>
+                                Balance Due <SortIcon col="balanceDue" />
                             </th>
-                            <th className="px-6 py-3 font-medium cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("issueDate")}>
-                                Date <SortIcon col="issueDate" />
+                            <th className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider cursor-pointer select-none hover:text-hui-textMain" onClick={() => handleSort("issueDate")}>
+                                Issued <SortIcon col="issueDate" />
                             </th>
                         </tr>
                     </thead>
-                    <tbody className="divide-y divide-hui-border">
+                    <tbody className="divide-y divide-slate-100">
                         {filtered.length === 0 && (
                             <tr>
-                                <td colSpan={7} className="px-6 py-12 text-center text-hui-textMuted">
+                                <td colSpan={7} className="px-6 py-16 text-center">
                                     <div className="flex flex-col items-center justify-center">
-                                        <svg className="w-12 h-12 mb-3 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                        <p className="text-base font-medium text-hui-textMain mb-1">
+                                        <div className="w-14 h-14 bg-slate-100 rounded-2xl flex items-center justify-center mb-3">
+                                            <svg className="w-7 h-7 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                            </svg>
+                                        </div>
+                                        <p className="text-base font-semibold text-hui-textMain mb-1">
                                             {searchTerm ? "No matching invoices" : activeTab === "All" ? "No invoices yet" : `No ${activeTab.toLowerCase()} invoices`}
                                         </p>
-                                        <p className="text-sm">
+                                        <p className="text-sm text-hui-textMuted">
                                             {searchTerm ? "Try a different search term." : "Create invoices from project estimates to see them here."}
                                         </p>
                                     </div>
@@ -207,11 +225,11 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
                                 <td className="px-6 py-4 text-hui-textMuted">{inv.client?.name || "—"}</td>
                                 <td className="px-6 py-4"><StatusBadge status={inv.status} /></td>
                                 <td className="px-6 py-4 text-right text-hui-textMain">${(inv.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                <td className="px-6 py-4 text-right font-medium text-hui-textMain">${(inv.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                <td className="px-6 py-4 text-hui-textMuted">
+                                <td className="px-6 py-4 text-right font-semibold text-hui-textMain">${(inv.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                <td className="px-6 py-4 text-hui-textMuted text-sm">
                                     {inv.issueDate
-                                        ? new Date(inv.issueDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
-                                        : new Date(inv.createdAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+                                        ? new Date(inv.issueDate).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+                                        : new Date(inv.createdAt).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}
                                 </td>
                             </tr>
                         ))}

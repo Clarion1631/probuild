@@ -398,6 +398,28 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                                                     <p className="text-xs text-hui-textMuted mt-0.5 truncate">
                                                                         {log.workPerformed.substring(0, 120)}{log.workPerformed.length > 120 ? "..." : ""}
                                                                     </p>
+                                                                    {log.photos.length > 0 && (
+                                                                        <div className="flex items-center gap-1.5 mt-2">
+                                                                            {log.photos.slice(0, 4).map((photo: DailyLogPhoto) => (
+                                                                                <div
+                                                                                    key={photo.id}
+                                                                                    className="w-10 h-10 rounded-md overflow-hidden border border-slate-200 shrink-0 cursor-pointer hover:ring-2 hover:ring-hui-primary transition"
+                                                                                    onClick={e => { e.stopPropagation(); setPhotoLightbox(photo); }}
+                                                                                >
+                                                                                    <img
+                                                                                        src={photo.url}
+                                                                                        alt={photo.caption || "photo"}
+                                                                                        className="w-full h-full object-cover"
+                                                                                    />
+                                                                                </div>
+                                                                            ))}
+                                                                            {log.photos.length > 4 && (
+                                                                                <div className="w-10 h-10 rounded-md bg-slate-100 border border-slate-200 flex items-center justify-center shrink-0">
+                                                                                    <span className="text-[10px] font-semibold text-hui-textMuted">+{log.photos.length - 4}</span>
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    )}
                                                                 </div>
                                                             </div>
 
