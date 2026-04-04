@@ -128,9 +128,7 @@ function num(v: unknown): number {
 
 function fmtMoney(v: number): string {
     const abs = Math.abs(v);
-    const s = abs >= 1000
-        ? "$" + abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-        : "$" + abs.toFixed(2);
+    const s = "$" + abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return v < 0 ? `(${s})` : s;
 }
 

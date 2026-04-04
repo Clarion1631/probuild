@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { authOptions, getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import { formatCurrency } from "@/lib/utils";
 
 interface Props {
     searchParams: Promise<{ userId?: string; projectId?: string; dateFrom?: string; dateTo?: string; tab?: string }>;
@@ -145,11 +146,11 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                 </div>
                 <div className="hui-card p-6 border-l-[3px] border-l-[#f97316]">
                     <div className="text-xs font-medium text-hui-textMuted mb-1">Total Billable</div>
-                    <div className="text-3xl font-bold text-hui-textMain">${totalBillable.toFixed(2)}</div>
+                    <div className="text-3xl font-bold text-hui-textMain">{formatCurrency(totalBillable)}</div>
                 </div>
                 <div className="hui-card p-6 border-l-[3px] border-l-[#10b981]">
                     <div className="text-xs font-medium text-hui-textMuted mb-1">Total Cost</div>
-                    <div className="text-3xl font-bold text-hui-textMain">${totalCost.toFixed(2)}</div>
+                    <div className="text-3xl font-bold text-hui-textMain">{formatCurrency(totalCost)}</div>
                 </div>
                 <div className="hui-card p-6 border-l-[3px] border-l-[#ec4899]">
                     <div className="text-xs font-medium text-hui-textMuted mb-1">Entries</div>
@@ -178,7 +179,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                             <div className="flex justify-between items-center px-6 py-3 bg-slate-50 border-b border-hui-border">
                                 <span className="font-semibold text-hui-textMain">{project.name}</span>
                                 <span className="text-sm text-hui-textMuted tabular-nums">
-                                    {pHours.toFixed(2)}h &middot; ${pCost.toFixed(2)}
+                                    {pHours.toFixed(2)}h &middot; {formatCurrency(pCost)}
                                 </span>
                             </div>
                             <table className="w-full text-left text-sm">
@@ -221,10 +222,10 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {e.durationHours ? `${e.durationHours.toFixed(2)}` : '—'}
                                                 </td>
                                                 <td className="px-5 py-3 text-right text-hui-textMuted tabular-nums text-xs">
-                                                    ${rate.toFixed(2)}/h
+                                                    {formatCurrency(rate)}/h
                                                 </td>
                                                 <td className="px-5 py-3 text-right font-medium text-hui-textMain tabular-nums text-xs">
-                                                    ${total.toFixed(2)}
+                                                    {formatCurrency(total)}
                                                 </td>
                                                 <td className="px-5 py-3 text-center text-xs">
                                                     {e.editedByManagerId ? (
@@ -242,7 +243,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                         <td colSpan={3} className="px-5 py-2 text-xs font-semibold text-hui-textMuted">Subtotal</td>
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{pHours.toFixed(2)}</td>
                                         <td />
-                                        <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">${pCost.toFixed(2)}</td>
+                                        <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{formatCurrency(pCost)}</td>
                                         <td />
                                     </tr>
                                 </tfoot>

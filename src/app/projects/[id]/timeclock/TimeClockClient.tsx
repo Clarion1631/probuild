@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useMemo } from "react";
+import { formatCurrency } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { createTimeEntry, updateTimeEntry, deleteTimeEntry } from "./actions";
@@ -292,7 +293,7 @@ export default function TimeClockClient({
                     </div>
                     <div>
                         <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Total Cost</p>
-                        <p className="text-xl font-bold text-hui-textMain">${totalCost.toFixed(2)}</p>
+                        <p className="text-xl font-bold text-hui-textMain">{formatCurrency(totalCost)}</p>
                     </div>
                 </div>
             </div>
@@ -380,7 +381,7 @@ export default function TimeClockClient({
                                         }
                                     </td>
                                     <td className="px-5 py-3.5 text-right font-semibold tabular-nums">
-                                        ${(entry.laborCost || 0).toFixed(2)}
+                                        {formatCurrency(entry.laborCost || 0)}
                                     </td>
                                     <td className="px-5 py-3.5 text-right">
                                         {(isAdminOrManager || entry.userId === currentUser.id) && (
@@ -411,7 +412,7 @@ export default function TimeClockClient({
                             <tr className="text-sm font-bold text-hui-textMain">
                                 <td className="px-5 py-3" colSpan={3}>Totals</td>
                                 <td className="px-5 py-3 text-right tabular-nums">{parseFloat(totalHours.toFixed(2))}h</td>
-                                <td className="px-5 py-3 text-right tabular-nums">${totalCost.toFixed(2)}</td>
+                                <td className="px-5 py-3 text-right tabular-nums">{formatCurrency(totalCost)}</td>
                                 <td></td>
                             </tr>
                         </tfoot>

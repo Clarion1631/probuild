@@ -2,6 +2,7 @@
 export const dynamic = "force-dynamic";
 
 import { useState, useEffect } from "react";
+import { formatCurrency } from "@/lib/utils";
 import Link from "next/link";
 import { toast } from "sonner";
 
@@ -188,7 +189,7 @@ export default function TeamPage() {
                                                 </span>
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
-                                                ${(user.hourlyRate ?? 0).toFixed(2)}
+                                                {formatCurrency(user.hourlyRate ?? 0)}
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <Link
