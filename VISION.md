@@ -264,6 +264,54 @@ This is the moat. Competitors can copy features. They can't copy your data.
 
 ---
 
+## Houzz Pro Competitive Intelligence (Captured Live April 3-4, 2026)
+
+_Full capture data: `output/LIVE_CAPTURE_NOTES.md`_
+
+### Their Core Financial Pipeline (Must Match)
+```
+Estimate (hierarchical sections > items, Material/Labor/Service types)
+  → Payment Schedule (milestones: Description, Due Date, Amount, Status)
+    → Budget (Revised Est = Original + COs, Actual = Expenses + Time + POs)
+      → Variance (per-line-item when expenses/time linked to estimate items)
+        → Financial Overview (Cash Flow, Incoming/Outgoing, gauge chart, timeline)
+```
+
+### Key Patterns We Must Replicate
+1. **Selection-based actions** — checking estimate line items scopes "Create Invoice/CO/PO" to selected items only (partial billing)
+2. **Company-wide document numbering** — ES-10085, IN-10046, CO-10006, PO-10012, RR-10003, EX-100001 (auto-increment, not per-project)
+3. **Estimate-to-Budget linking** — expenses and time entries linked to estimate line items create per-line variance tracking
+4. **Per-entry QuickBooks sync** — checkbox on each expense entry, filter by sync status
+5. **Processing Fee Markup** — hidden from client view, visible internally only
+6. **Activity Stream** — every document has a timestamped log of views, sends, edits, approvals, payments
+
+### Where We Already Win
+| Area | Houzz Pro | ProBuild |
+|------|-----------|----------|
+| AI Estimate from plans | ✅ Basic | ✅ Better (Gemini Vision) |
+| AI Schedule from estimate | ✅ | ✅ Already built |
+| AI Daily Log | ❌ Manual only | ✅ Photo + voice analysis |
+| Predictive cost at completion | ❌ | 🔜 Planned |
+| AI Change Order detection | ❌ | 🔜 Planned |
+| Lead scoring | ❌ | 🔜 Planned |
+| Weather-aware scheduling | ❌ | 🔜 Planned |
+| Historical pricing engine | ❌ | 🔜 Planned |
+
+### Where They Beat Us (Gap to Close)
+| Area | Houzz Pro | ProBuild |
+|------|-----------|----------|
+| Budget module with variance | ✅ Full | ❌ Not built |
+| Financial Overview dashboard | ✅ Full | ❌ Not built |
+| Receipt OCR (AutoMate) | ✅ | ❌ Not built |
+| Payment schedule on estimates | ✅ | ❌ Not built |
+| Hierarchical estimate items | ✅ Sections > Items | ❌ Flat list |
+| Selection-based partial billing | ✅ | ❌ Not built |
+| Document numbering system | ✅ Company-wide | ❌ Using CUIDs |
+| Takeoff measurement canvas | ✅ Full PDF editor | ❌ Not built |
+| 3D Floor Plans | ✅ | ❌ Not built |
+
+---
+
 ## What Makes This Different
 
 | Traditional App | ProBuild |

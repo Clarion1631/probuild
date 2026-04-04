@@ -57,48 +57,156 @@ Completed 2026-04-03: sub-portal with schedule access, status updates, comments
 
 ---
 
-## 🗺️ Phase 2 — Polish, Integrations & AI
+## 🗺️ Phase 2 — Houzz Pro Feature Parity + AI Differentiation
 
-Now that all pages/routes exist, focus shifts to: making them production-quality, wiring real integrations, and adding AI automation.
+_Updated 2026-04-04 after live Houzz Pro capture session (see `output/LIVE_CAPTURE_NOTES.md`)_
 
-### Next Sessions (pick any order)
+Phase 1 built all routes. Phase 2 makes them real — informed by exact Houzz Pro UX captured live.
 
-~~**Session 8 — Invoice & Leads Polish**~~ ✅ DONE (2026-04-03)
-- [x] Invoice page: 4 stat cards (Total Invoiced, Collected, Outstanding, Overdue), status tabs with count badges, column reorder
-- [x] Leads list: tabbed views (All, Hot, Won, Lost), sortable columns, lead scoring button
-- [x] Daily logs: weather icon picker, photo thumbnails in list view
+### ✅ Sessions 8-13 — Completed by Phantom Agent (2026-04-03)
 
-~~**Session 9 — Real Email & SMS + Console Log Cleanup**~~ ✅ DONE (2026-04-03)
-- [x] Wire `src/lib/email.ts` to Resend API — already real; keys live in Vercel
-- [x] Wire `src/lib/sms.ts` to Twilio — already real; wired subcontractor invite SMS
-- [x] Remove all production console.logs (email, sms, supabase init, approveEstimate, COI debug, stripe webhook)
-- [x] Add error boundaries to all page layouts (projects, settings, reports, company, portal, sub-portal)
+| Session | What Got Built |
+|---------|---------------|
+| 8 — Invoice & Leads Polish | 4 stat cards, status tabs, lead scoring button, weather picker |
+| 9 — Email/SMS + Cleanup | Resend + Twilio wired, console.logs removed, error boundaries added |
+| 10 — Financial Precision | Migration SQL ready (Float→Decimal + friendly IDs) — **PENDING: run via apply_schema.ps1** |
+| 11 — QuickBooks | GL mapping, Sync to QB button, OAuth2 flow |
+| 12 — Gusto + Receipts | Gusto OAuth, CSV export, AI receipt parsing (Gemini Vision), bookkeeper queue |
+| 13 — AI Features | Lead Scoring, Cost Forecast, Contract Drafting, Schedule Risk |
 
-~~**Session 10 — Financial Precision + Friendly IDs**~~ ✅ Migration SQL ready (2026-04-03)
-- [x] `migrations/session10_float_to_decimal.sql` — 30 ALTER COLUMN statements for all money fields
-- [x] `migrations/session10_friendly_ids_and_integration.sql` — SERIAL number columns on 7 models + integrationData TEXT on CompanySettings
-- [ ] **PENDING (needs Windows):** Run both via apply_schema.ps1 → `./node_modules/.bin/prisma generate` → update schema.prisma Float→Decimal
+---
 
-~~**Session 11 — QuickBooks Integration**~~ ✅ DONE (2026-04-03)
-- [x] GL account mapping table in settings/integrations/quickbooks (per cost code)
-- [x] Manual "Sync to QB" button on EstimateEditor (⋮ menu) and invoice list (QB column)
-- [x] OAuth2 flow: /api/quickbooks/auth → /api/quickbooks/callback, tokens in Supabase Storage
-- [x] Setup: add QB_CLIENT_ID + QB_CLIENT_SECRET to Vercel from developer.intuit.com
+### 🔥 Sprint A — Financial Pipeline (THE critical workflow)
+_Houzz Pro's #1 power feature: Estimate → Budget → Variance with per-line-item tracking_
 
-~~**Session 12 — Gusto + Email Receipt Capture**~~ ✅ DONE (2026-04-03)
-- [x] Gusto OAuth + employee mapping (settings/integrations/gusto)
-- [x] "Export to Gusto" button on Time & Expenses → CSV (name, UUID, hours, date, project)
-- [x] AI receipt parsing: POST /api/receipts/parse (Gemini Vision → vendor, total, items, confidence)
-- [x] Bookkeeper review queue: /manager/receipts (approve → Reviewed, reject → delete)
-- [x] "Receipt Queue" added to Finance nav in sidebar
-- [x] Setup: add GUSTO_CLIENT_ID + GUSTO_CLIENT_SECRET to Vercel from Gusto Developer Portal
+**A1. Estimate Editor Rebuild**
+- [ ] Hierarchical line items: Sections (collapsible headers) > Items (indented under sections)
+- [ ] Item type selector: Material | Labor | Material & Labor | Service
+- [ ] Per-item fields: Name, Description, Qty, Unit Cost, Markup %, Total
+- [ ] Summary block: Subtotal, Markup, Tax, Total — with "Processing Fee Markup" (hidden from client toggle)
+- [ ] Selection-based actions: checking item checkboxes scopes "Create Invoice/CO/PO" to selected items only (partial billing)
+- [ ] Payment Schedule section: milestones with Description, Due Date, Amount, Status (Pending/Sent/Paid)
+- [ ] "Log Payment" modal + "Schedule a Payment" inline row add
+- [ ] General Info section: Title, Project, Client, Expiration Date
+- [ ] Document sections: Items, Payments, Files, Terms & Conditions, Memo, Signature, Activity Stream
+- [ ] Right sidebar: Overview tab (status, amounts, dates), Activity tab
+- [ ] Actions dropdown: Duplicate, Preview, Send, Download PDF, Create Invoice, Create CO, Create PO, Archive
+- [ ] Document status flow: Draft → Sent → Viewed → Approved → Invoiced → Paid
 
-~~**Session 13 — AI Features (High Impact)**~~ ✅ DONE (2026-04-03)
-- [x] Lead Scoring — "AI Score Lead" in lead detail sidebar → close probability %, quality rating, next actions
-- [x] Cost Forecast — "AI Cost Forecast" button on Job Costing page → final cost prediction, overrun flags
-- [x] Contract Drafting — "AI Draft Contract" button on Contracts page → full HTML contract with merge fields
-- [x] Schedule Risk — "AI Risk" button in Gantt toolbar → overdue tasks, critical path gaps, buffers
-- [ ] Daily Log Photo Analysis — deferred (AI daily log route exists at /api/ai/daily-logs)
+**A2. Company-Wide Document Numbering**
+- [ ] Auto-increment reference numbers across ALL document types:
+  - ES-NNNNN (Estimates), IN-NNNNN (Invoices), CO-NNNNN (Change Orders)
+  - PO-NNNNN (Purchase Orders), RR-NNNNN (Retainers), EX-NNNNN (Expenses), PM-NNNNN (Payments)
+- [ ] Schema: add `referenceNumber String @unique` to each model + company-level counter table
+- [ ] Display in list views and document headers
+
+**A3. Budget Module (NEW — doesn't exist yet)**
+- [ ] URL: `/projects/[id]/budget`
+- [ ] 4-panel summary bar with ℹ️ tooltips:
+  - Revised Estimated Cost = Original Est + Change Orders (markup included)
+  - Actual = linked Expenses + Time Entries + POs (taxes excluded)
+  - Variance = Revised - Actual ($ and %, green when positive)
+  - Invoiced = total invoiced to client (taxes excluded, shows %)
+- [ ] Table: Name | Original Est | Revised Est | Actual | Variance ($) | Variance (%) | Invoiced ($) | Invoiced (%)
+- [ ] View by: Category dropdown
+- [ ] Budget Settings modal: Sync Documents (which statuses count) + Customize Columns (toggle/reorder)
+- [ ] "Generate Report" button (PDF/CSV export)
+- [ ] "Preview & Share" button (client-facing view)
+- [ ] **Linking mechanism**: Expenses and Time Entries link to estimate line items for per-line variance
+
+**A4. Financial Overview Dashboard (NEW)**
+- [ ] URL: `/projects/[id]/financial-overview`
+- [ ] "Include unissued documents" toggle (top-right)
+- [ ] Three top panels:
+  - Cash Flow: Current $ + Margin, Forecasted $ + Margin
+  - Incoming Payments: gauge chart + Current/Scheduled/Overdue breakdown + "Add Income"
+  - Outgoing Payments: Current/Planned/Overdue + "Add Expense"
+- [ ] Cash Flow Tracker: bar chart (6-month rolling) with 5 series (Incoming, Forecasted Incoming, Outgoing, Forecasted Outgoing, Overdue)
+- [ ] Financial Items: Time Logged | Uninvoiced Items | Estimate Status (Pending Approval $ / Uninvoiced $)
+
+---
+
+### 🔧 Sprint B — Time & Expenses (feeds Budget)
+
+**B1. Time Tracking Improvements**
+- [ ] Two-tab layout: Time | Expenses
+- [ ] Time summary bar: Total Duration, Total Billable, Total Invoiced, Total Cost (non-billable)
+- [ ] Filters: Team Members, Date Range, Service
+- [ ] New Time Entry modal: Reported By, Service, Hourly Rate, Taxable/Billable toggles, Date, Hours, Description, Attach Files, "Log Another Entry"
+- [ ] "Manage Time Services" settings page (service catalog)
+- [ ] Actions: Import/Export Time Entries
+- [ ] "Create Invoice" from selected time entries
+
+**B2. Expense Tracking + AI Receipt OCR**
+- [ ] Expense summary bar: Total Billable, Total Invoiced, Total Cost (non-billable)
+- [ ] Additional filter: Sync to QuickBooks
+- [ ] Table columns: + Quantity, Cost, Sync status, Payment Method
+- [ ] New Expense Entry modal: Upload Files area with "AI AutoMate will fill in the details" (Gemini Vision receipt OCR)
+- [ ] Fields: Reported By, Service, Payment Method, Cost, Taxable/Billable, Reference Number (auto EX-NNNNN), Sync to QuickBooks toggle, Date, Qty, Description
+- [ ] "Manage Expense Services" settings page
+
+---
+
+### 💅 Sprint C — Polish & Infrastructure
+
+**C1. Financial Precision**
+- [ ] Migrate all Float money fields to Decimal (prevents rounding errors)
+- [ ] Add `number Int @unique @default(autoincrement())` to all document models
+- [ ] Update route segments to use numeric IDs
+
+**C2. Real Notifications**
+- [ ] Wire `src/lib/email.ts` to Resend API (RESEND_API_KEY already in Vercel)
+- [ ] Wire `src/lib/sms.ts` to Twilio (TWILIO_* keys already in Vercel)
+- [ ] Remove all production console.logs
+- [ ] Add error boundaries to all page layouts
+
+**C3. Invoice & Leads Polish**
+- [ ] Invoice page: 4 stat cards, status tabs with count badges, column reorder
+- [ ] Leads list: tabbed views (All, Hot, Won, Lost), sortable columns
+- [ ] Daily logs: weather icon picker, photo thumbnails
+
+---
+
+### 🔗 Sprint D — Integrations
+
+**D1. QuickBooks Integration**
+- [ ] GL account mapping table in settings
+- [ ] Per-entry "Sync to QuickBooks" toggle (like Houzz Pro)
+- [ ] Manual sync button for estimates/invoices/expenses
+- [ ] Sync status column in expense list view
+
+**D2. Gusto + Email Receipt Capture**
+- [ ] Gusto time export: employee name, hours, date
+- [ ] Email receipt capture: forward-to address + AI parsing
+- [ ] Bookkeeper approval queue → QB sync
+
+---
+
+### 🤖 Sprint E — AI Differentiation (What Houzz Pro CAN'T do)
+
+**E1. Already Built (maintain/improve)**
+- [x] AI Estimate Generation
+- [x] AI Schedule Building
+- [x] AI Punchlist Generation
+- [x] AI Daily Log Enhancement
+- [x] AI Mood Board Generation
+- [x] AI Lead Note Summary
+- [x] Takeoff-to-Estimate Conversion
+
+**E2. Match Houzz Pro AI**
+- [ ] Receipt OCR (AutoMate equivalent) — Gemini Vision on upload
+- [ ] AI Schedule from Estimate (already built — verify quality matches Houzz)
+
+**E3. Leapfrog Houzz Pro (they don't have these)**
+- [ ] Lead Scoring — close probability %, quality rating, next actions
+- [ ] Predictive Cost at Completion — AI flags overruns weeks early
+- [ ] AI Change Order Detection — from daily logs ("client asked to move outlet")
+- [ ] Contract Drafting from Estimate — one-click complete contract
+- [ ] Schedule Risk Analysis — critical path gaps, buffer recommendations
+- [ ] AI Monthly Business Summary — auto-generated owner report
+- [ ] Weather-Aware Scheduling — exterior task flagging
+- [ ] Sub Performance Scoring — on-time %, quality, responsiveness
+- [ ] Historical Pricing Engine — "your average kitchen demo is $2,400"
 
 ---
 
