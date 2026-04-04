@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getNextDocumentNumber } from "@/lib/actions";
 
 export async function POST(req: NextRequest) {
   try {
@@ -26,9 +27,12 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    const referenceNumber = await getNextDocumentNumber("EXPENSE");
+
     const newExpense = await prisma.expense.create({
       data: {
         estimateId,
+        referenceNumber,
         itemId: itemId || null,
         amount: parseFloat(amount) || 0,
         vendor: vendor || null,

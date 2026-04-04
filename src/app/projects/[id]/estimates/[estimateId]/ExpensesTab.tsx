@@ -3,13 +3,7 @@
 import { useState, useRef } from "react";
 import { toast } from "sonner";
 
-export default function ExpensesTab({
-  estimateId,
-  items,
-}: {
-  estimateId: string;
-  items: any[];
-}) {
+export default function ExpensesTab({ estimateId, items }: { estimateId: string; items: any[] }) {
   const [expenses, setExpenses] = useState<any[]>(items.flatMap((item) => item.expenses || []));
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
@@ -336,9 +330,12 @@ export default function ExpensesTab({
                     <p className="font-medium text-slate-800">
                       {expense.vendor || "Unknown Vendor"}
                     </p>
-                    <p className="text-xs text-slate-500">
-                      {new Date(expense.createdAt).toLocaleDateString()}
-                    </p>
+                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                      {expense.referenceNumber && (
+                        <span className="font-mono text-slate-400">{expense.referenceNumber}</span>
+                      )}
+                      <span>{new Date(expense.createdAt).toLocaleDateString()}</span>
+                    </div>
                   </div>
                   <div className="w-1/4">
                     <p className="text-sm text-slate-700">{expense.description || "—"}</p>
