@@ -4173,3 +4173,74 @@ export async function awardBid(packageId: string, invitationId: string, projectI
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return { success: true };
 }
+
+// ── Retainers ──────────────────────────────────────────────
+
+export async function createRetainer(projectId: string, data: {
+    totalAmount: number;
+    notes?: string;
+    dueDate?: string;
+}) {
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { clientId: true },
+    });
+    if (!project || !project.clientId) throw new Error("Project or client not found");
+
+    const count = await prisma.retainer.count({ where: { projectId } });
+    const nextNum = (count + 1).toString().padStart(3, '0');
+
+    const retainer = await prisma.retainer.create({
+        data: {
+            projectId,
+            clientId: project.clientId,
+            code: `RT-${nextNum}`,
+            totalAmount: data.totalAmount,
+            balanceDue: data.totalAmount,
+            amountPaid: 0,
+            notes: data.notes || null,
+            dueDate: data.dueDate ? new Date(data.dueDate) : null,
+            issueDate: new Date(),
+            status: "Draft",
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}/retainers`);
+    return retainer;
+}
+
+export async function updateRetainer(id: string, data: {
+    totalAmount?: number;
+    notes?: string;
+    dueDate?: string | null;
+    status?: string;
+}) {
+    const existing = await prisma.retainer.findUnique({ where: { id }, select: { projectId: true, amountPaid: true } });
+    if (!existing) throw new Error("Retainer not found");
+
+    const updateData: any = {};
+    if (data.totalAmount !== undefined) {
+        updateData.totalAmount = data.totalAmount;
+        updateData.balanceDue = data.totalAmount - Number(existing.amountPaid);
+    }
+    if (data.notes !== undefined) updateData.notes = data.notes || null;
+    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? new Date(data.dueDate) : null;
+    if (data.status !== undefined) {
+        updateData.status = data.status;
+        if (data.status === "Sent" && !updateData.sentAt) updateData.sentAt = new Date();
+    }
+
+    const retainer = await prisma.retainer.update({ where: { id }, data: updateData });
+    revalidatePath(`/projects/${existing.projectId}/retainers`);
+    revalidatePath(`/projects/${existing.projectId}/retainers/${id}`);
+    return retainer;
+}
+
+export async function deleteRetainer(id: string) {
+    const retainer = await prisma.retainer.findUnique({ where: { id }, select: { projectId: true } });
+    if (!retainer) return { success: false };
+
+    await prisma.retainer.delete({ where: { id } });
+    revalidatePath(`/projects/${retainer.projectId}/retainers`);
+    return { success: true };
+}
