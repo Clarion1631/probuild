@@ -9,7 +9,7 @@ import SendEstimateModal from "@/components/SendEstimateModal";
 import SelectVendorModal from "./SelectVendorModal";
 import { toast } from "sonner";
 
-export default function EstimateEditor({ context, initialEstimate }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any }) {
+export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -108,7 +108,9 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     }, []);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const tax = subtotal * 0.087;
+    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.087;
+    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.7%)";
+    const tax = subtotal * taxRate;
     const total = subtotal + tax;
 
     // Internal margin calculations
@@ -270,7 +272,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     order: index
                 }));
                 const newSubtotal = newItems.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-                const newTotal = newSubtotal + newSubtotal * 0.087;
+                const newTotal = newSubtotal + newSubtotal * taxRate;
                 await saveEstimate(initialEstimate.id, context.id, context.type, {
                     title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
                 }, mappedItems);
@@ -818,7 +820,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                         <span className="text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>Estimated Tax (8.7%)</span>
+                                        <span>{taxName}</span>
                                         <span className="text-slate-800">${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
