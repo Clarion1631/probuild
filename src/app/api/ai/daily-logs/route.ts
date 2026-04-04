@@ -86,7 +86,7 @@ Respond ONLY with valid JSON matching the schema provided.`;
         }
 
         const response = await ai.models.generateContent({
-            model: "gemini-2.0-flash",
+            model: "gemini-3.0-flash-preview",
             contents: { parts },
             config: {
                 responseMimeType: "application/json",
