@@ -17,6 +17,10 @@ type TimeEntryDetailed = {
     endTime: Date | null;
     durationHours: number | null;
     laborCost: number | null;
+    isBillable: boolean;
+    isTaxable: boolean;
+    costRate: number | null;
+    description: string | null;
     user: { id: string; name: string | null; email: string };
     costCode: CostCodeBasic | null;
 };
@@ -107,6 +111,10 @@ export default function TimeClockClient({
     const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
     const [hours, setHours] = useState("");
     const [manualCost, setManualCost] = useState("");
+    const [isBillable, setIsBillable] = useState(true);
+    const [isTaxable, setIsTaxable] = useState(true);
+    const [costRate, setCostRate] = useState("");
+    const [description, setDescription] = useState("");
 
     const isAdminOrManager = currentUser.role === "ADMIN" || currentUser.role === "MANAGER";
 
@@ -150,6 +158,8 @@ export default function TimeClockClient({
     // Totals
     const totalHours = useMemo(() => sortedEntries.reduce((s, e) => s + (e.durationHours || 0), 0), [sortedEntries]);
     const totalCost = useMemo(() => sortedEntries.reduce((s, e) => s + (e.laborCost || 0), 0), [sortedEntries]);
+    const totalBillable = useMemo(() => sortedEntries.filter(e => e.isBillable).reduce((s, e) => s + (e.laborCost || 0), 0), [sortedEntries]);
+    const totalNonBillable = useMemo(() => sortedEntries.filter(e => !e.isBillable).reduce((s, e) => s + (e.laborCost || 0), 0), [sortedEntries]);
 
     const openModal = (entry?: TimeEntryDetailed) => {
         if (entry) {
@@ -158,6 +168,10 @@ export default function TimeClockClient({
             setSelectedCostCodeId(entry.costCodeId || "");
             const d = new Date(entry.startTime);
             setDate(d.toISOString().split('T')[0]);
+            setIsBillable(entry.isBillable ?? true);
+            setIsTaxable(entry.isTaxable ?? true);
+            setCostRate(entry.costRate != null ? entry.costRate.toString() : "");
+            setDescription(entry.description || "");
             if (entry.durationHours === 0 && entry.laborCost !== null) {
                 setEntryType("unit");
                 setManualCost(entry.laborCost.toString());
@@ -175,22 +189,38 @@ export default function TimeClockClient({
             setDate(new Date().toISOString().split('T')[0]);
             setHours("");
             setManualCost("");
+            setIsBillable(true);
+            setIsTaxable(true);
+            setDescription("");
+            // Auto-fill cost rate from current user's hourly rate
+            const me = teamMembers.find(u => u.id === currentUser.id);
+            setCostRate(me?.hourlyRate ? me.hourlyRate.toString() : "");
         }
         setIsModalOpen(true);
     };
 
     const closeModal = () => setIsModalOpen(false);
 
-    const handleSubmit = async (e: React.FormEvent) => {
+    // Live cost preview: costRate × hours (or manual cost for unit entries)
+    const computedCost = useMemo(() => {
+        if (entryType === "hourly") {
+            const h = parseFloat(hours) || 0;
+            const rate = parseFloat(costRate) || 0;
+            return h * rate;
+        }
+        return parseFloat(manualCost) || 0;
+    }, [entryType, hours, costRate, manualCost]);
+
+    const handleSubmit = async (e: React.FormEvent, logAnother = false) => {
         e.preventDefault();
         setIsSubmitting(true);
         try {
-            const selectedUser = teamMembers.find(u => u.id === selectedUserId);
             let duration = 0;
             let cost = 0;
             if (entryType === "hourly") {
                 duration = parseFloat(hours) || 0;
-                cost = duration * (selectedUser?.hourlyRate || 0);
+                const rate = parseFloat(costRate) || 0;
+                cost = duration * rate;
             } else {
                 duration = 0;
                 cost = parseFloat(manualCost) || 0;
@@ -201,7 +231,11 @@ export default function TimeClockClient({
                 costCodeId: selectedCostCodeId || null,
                 date,
                 durationHours: duration,
-                laborCost: cost
+                laborCost: cost,
+                isBillable,
+                isTaxable,
+                costRate: costRate ? parseFloat(costRate) : null,
+                description: description.trim() || undefined,
             };
             if (editId) {
                 await updateTimeEntry(editId, payload);
@@ -211,7 +245,16 @@ export default function TimeClockClient({
                 toast.success("Time entry added");
             }
             router.refresh();
-            closeModal();
+            if (logAnother) {
+                // Reset form for next entry but keep user, date, cost code
+                setEditId(null);
+                setHours("");
+                setManualCost("");
+                setDescription("");
+                toast.success("Entry saved — log another");
+            } else {
+                closeModal();
+            }
         } catch (error: any) {
             toast.error(error.message || "Something went wrong");
         } finally {
@@ -267,23 +310,23 @@ export default function TimeClockClient({
             </div>
 
             {/* Summary Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
                 <div className="bg-white rounded-xl p-4 border border-hui-border shadow-sm flex items-center gap-4">
                     <div className="w-10 h-10 rounded-lg bg-blue-50 flex items-center justify-center text-blue-600">
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" /></svg>
+                        <ClockIcon />
                     </div>
                     <div>
-                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Entries</p>
-                        <p className="text-xl font-bold text-hui-textMain">{sortedEntries.length}</p>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Total Duration</p>
+                        <p className="text-xl font-bold text-hui-textMain">{parseFloat(totalHours.toFixed(2))}h</p>
                     </div>
                 </div>
                 <div className="bg-white rounded-xl p-4 border border-hui-border shadow-sm flex items-center gap-4">
                     <div className="w-10 h-10 rounded-lg bg-emerald-50 flex items-center justify-center text-emerald-600">
-                        <ClockIcon />
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                     </div>
                     <div>
-                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Total Hours</p>
-                        <p className="text-xl font-bold text-hui-textMain">{parseFloat(totalHours.toFixed(2))}h</p>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Total Billable</p>
+                        <p className="text-xl font-bold text-emerald-600">${totalBillable.toFixed(2)}</p>
                     </div>
                 </div>
                 <div className="bg-white rounded-xl p-4 border border-hui-border shadow-sm flex items-center gap-4">
@@ -293,6 +336,15 @@ export default function TimeClockClient({
                     <div>
                         <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Total Cost</p>
                         <p className="text-xl font-bold text-hui-textMain">${totalCost.toFixed(2)}</p>
+                    </div>
+                </div>
+                <div className="bg-white rounded-xl p-4 border border-hui-border shadow-sm flex items-center gap-4">
+                    <div className="w-10 h-10 rounded-lg bg-slate-100 flex items-center justify-center text-slate-500">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
+                    </div>
+                    <div>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Non-Billable</p>
+                        <p className="text-xl font-bold text-slate-500">${totalNonBillable.toFixed(2)}</p>
                     </div>
                 </div>
             </div>
@@ -331,13 +383,14 @@ export default function TimeClockClient({
                             <ThSortable label="Cost Code" sortK="costCode" />
                             <ThSortable label="Hours" sortK="hours" className="text-right" />
                             <ThSortable label="Cost" sortK="cost" className="text-right" />
+                            <th className="px-5 py-3.5 font-semibold text-center">Billable</th>
                             <th className="px-5 py-3.5 font-semibold text-right">Actions</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                         {sortedEntries.length === 0 ? (
                             <tr>
-                                <td colSpan={6} className="px-6 py-12 text-center">
+                                <td colSpan={7} className="px-6 py-12 text-center">
                                     <div className="flex flex-col items-center gap-2">
                                         <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center text-slate-300">
                                             <ClockIcon />
@@ -382,6 +435,18 @@ export default function TimeClockClient({
                                     <td className="px-5 py-3.5 text-right font-semibold tabular-nums">
                                         ${(entry.laborCost || 0).toFixed(2)}
                                     </td>
+                                    <td className="px-5 py-3.5 text-center">
+                                        <div className="flex flex-wrap items-center justify-center gap-1">
+                                            {entry.isBillable ? (
+                                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-100">Billable</span>
+                                            ) : (
+                                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-500 border border-slate-200">Non-billable</span>
+                                            )}
+                                            {entry.isTaxable && (
+                                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-50 text-blue-700 border border-blue-100">Taxable</span>
+                                            )}
+                                        </div>
+                                    </td>
                                     <td className="px-5 py-3.5 text-right">
                                         {(isAdminOrManager || entry.userId === currentUser.id) && (
                                             <div className="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition">
@@ -413,6 +478,7 @@ export default function TimeClockClient({
                                 <td className="px-5 py-3 text-right tabular-nums">{parseFloat(totalHours.toFixed(2))}h</td>
                                 <td className="px-5 py-3 text-right tabular-nums">${totalCost.toFixed(2)}</td>
                                 <td></td>
+                                <td></td>
                             </tr>
                         </tfoot>
                     )}
@@ -442,7 +508,11 @@ export default function TimeClockClient({
                                     <label className="flex items-center gap-1.5 text-sm font-semibold text-hui-textMain mb-1.5">
                                         <UserIcon /> Team Member
                                     </label>
-                                    <select className="hui-input w-full" value={selectedUserId} onChange={(e) => setSelectedUserId(e.target.value)} required>
+                                    <select className="hui-input w-full" value={selectedUserId} onChange={(e) => {
+                                        setSelectedUserId(e.target.value);
+                                        const member = teamMembers.find(u => u.id === e.target.value);
+                                        if (member?.hourlyRate) setCostRate(member.hourlyRate.toString());
+                                    }} required>
                                         {teamMembers.map(m => (
                                             <option key={m.id} value={m.id}>{m.name || m.email}</option>
                                         ))}
@@ -495,8 +565,70 @@ export default function TimeClockClient({
                                     </div>
                                 )}
                             </div>
+                            {/* Cost Rate + Live Preview */}
+                            <div>
+                                <label className="block text-sm font-semibold text-hui-textMain mb-1">Cost Rate ($/hr)</label>
+                                <input type="number" step="0.01" min="0" className="hui-input w-full" value={costRate} onChange={(e) => setCostRate(e.target.value)} placeholder="Auto-filled from employee record" />
+                                <p className="text-xs text-slate-400 mt-1">Employee&apos;s cost rate — auto-filled from profile</p>
+                            </div>
+                            {/* Live Cost Preview */}
+                            {(entryType === "hourly" && parseFloat(hours) > 0 && parseFloat(costRate) > 0) && (
+                                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-blue-50 border border-blue-100 text-sm">
+                                    <svg className="w-4 h-4 text-blue-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                    <span className="text-blue-700">
+                                        {parseFloat(hours)}h &times; ${parseFloat(costRate).toFixed(2)}/hr = <strong>${computedCost.toFixed(2)}</strong>
+                                    </span>
+                                </div>
+                            )}
+
+                            {/* Billable & Taxable Toggles */}
+                            <div className="space-y-3 pt-1">
+                                <div className="flex items-center justify-between py-1">
+                                    <div>
+                                        <label className="text-sm font-semibold text-hui-textMain">Billable</label>
+                                        <p className="text-xs text-slate-400">Include in client invoicing</p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsBillable(!isBillable)}
+                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${isBillable ? "bg-emerald-500" : "bg-slate-300"}`}
+                                    >
+                                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${isBillable ? "translate-x-6" : "translate-x-1"}`} />
+                                    </button>
+                                </div>
+                                <div className="flex items-center justify-between py-1">
+                                    <div>
+                                        <label className="text-sm font-semibold text-hui-textMain">Taxable</label>
+                                        <p className="text-xs text-slate-400">Subject to sales tax</p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsTaxable(!isTaxable)}
+                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${isTaxable ? "bg-blue-500" : "bg-slate-300"}`}
+                                    >
+                                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${isTaxable ? "translate-x-6" : "translate-x-1"}`} />
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Description */}
+                            <div>
+                                <label className="block text-sm font-semibold text-hui-textMain mb-1">Description</label>
+                                <textarea className="hui-input w-full" rows={2} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What was done..." />
+                            </div>
+
                             <div className="pt-4 flex gap-3 justify-end">
                                 <button type="button" onClick={closeModal} className="hui-btn-secondary px-4 py-2 rounded-lg" disabled={isSubmitting}>Cancel</button>
+                                {!editId && (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => handleSubmit(e as any, true)}
+                                        className="px-4 py-2 rounded-lg text-sm font-medium border border-blue-200 text-blue-700 bg-blue-50 hover:bg-blue-100 transition"
+                                        disabled={isSubmitting}
+                                    >
+                                        {isSubmitting ? "Saving..." : "Save & Log Another"}
+                                    </button>
+                                )}
                                 <button type="submit" className="hui-btn-primary px-5 py-2 rounded-lg" disabled={isSubmitting}>
                                     {isSubmitting ? "Saving..." : "Save Entry"}
                                 </button>

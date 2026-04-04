@@ -390,6 +390,11 @@ model TimeEntry {
   startTime     DateTime
   endTime       DateTime?
   durationHours Float?
+  description   String?
+
+  isBillable Boolean  @default(true)
+  isTaxable  Boolean  @default(true)
+  costRate   Decimal? // Auto-filled from employee hourlyRate
 
   latitude  Float?
   longitude Float?
