@@ -56,7 +56,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
                 { label: "Client Dashboard", href: `/projects/${projectId}/client-portal` },
                 { label: "Daily Logs", href: `/projects/${projectId}/dailylogs`, permission: "dailyLogs" },
-                { label: "Time & Expenses", href: `/projects/${projectId}/timeclock`, permission: "timeClock" },
+                { label: "Time & Expenses", href: `/projects/${projectId}/time-expenses`, permission: "timeClock" },
             ],
         },
         {
