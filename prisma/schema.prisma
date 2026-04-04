@@ -27,6 +27,7 @@ model User {
   leadTasks        LeadTask[]
   managedLeads     Lead[]           @relation("LeadManager")
   dailyLogs        DailyLog[]
+  expenses         Expense[]
 }
 
 model Client {
@@ -176,6 +177,7 @@ model Project {
   moodBoards          MoodBoard[]
   retainers           Retainer[]
   bidPackages         BidPackage[]
+  expenses            Expense[]
 }
 
 model FloorPlan {
@@ -272,8 +274,10 @@ model EstimateItem {
 
 model Expense {
   id          String        @id @default(cuid())
-  estimateId  String
-  estimate    Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  estimateId  String?
+  estimate    Estimate?     @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
   itemId      String?
   item        EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
   costCodeId  String?
@@ -285,12 +289,25 @@ model Expense {
   date        DateTime?
   description String?
   receiptUrl  String?
-  status      String        @default("Pending") // Pending, Reviewed
+  status      String        @default("Pending") // Pending, Reviewed, Approved
+
+  // B2 fields
+  quantity       Int       @default(1)
+  paymentMethod  String?   // Cash, Credit Card, Check, Company Card, etc.
+  isBillable     Boolean   @default(true)
+  isTaxable      Boolean   @default(true)
+  referenceNumber String?  // Auto EX-NNNNN
+  service        String?   // Expense service category
+  syncToQB       Boolean   @default(false)
+
+  reportedById String?
+  reportedBy   User?      @relation(fields: [reportedById], references: [id])
 
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Invoice {
