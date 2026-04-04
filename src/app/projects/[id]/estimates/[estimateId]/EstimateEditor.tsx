@@ -7,9 +7,10 @@ import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
 import SendEstimateModal from "@/components/SendEstimateModal";
 import SelectVendorModal from "./SelectVendorModal";
+import LogPaymentModal from "./LogPaymentModal";
 import { toast } from "sonner";
 
-export default function EstimateEditor({ context, initialEstimate }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any }) {
+export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -37,6 +38,10 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     const [showVendorSelectModal, setShowVendorSelectModal] = useState(false);
     const [isCreatingPO, setIsCreatingPO] = useState(false);
     const [isSyncingQB, setIsSyncingQB] = useState(false);
+    const [showPaymentModal, setShowPaymentModal] = useState(false);
+    const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
+    const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
+    const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
 
     async function handleCreateChangeOrder() {
         if (selectedItemIds.length === 0) return;
@@ -108,8 +113,11 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
     }, []);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const tax = subtotal * 0.087;
-    const total = subtotal + tax;
+    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.087;
+    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.7%)";
+    const processingFee = processingFeeMarkup > 0 ? subtotal * (processingFeeMarkup / 100) : 0;
+    const tax = subtotal * taxRate;
+    const total = subtotal + tax + processingFee;
 
     // Internal margin calculations
     const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
@@ -129,7 +137,9 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
         }));
 
         await saveEstimate(initialEstimate.id, context.id, context.type, {
-            title, code, status, totalAmount: total, paymentSchedules: mappedSchedules
+            title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
+            processingFeeMarkup, hideProcessingFee,
+            expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -270,7 +280,7 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     order: index
                 }));
                 const newSubtotal = newItems.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-                const newTotal = newSubtotal + newSubtotal * 0.087;
+                const newTotal = newSubtotal + newSubtotal * taxRate;
                 await saveEstimate(initialEstimate.id, context.id, context.type, {
                     title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
                 }, mappedItems);
@@ -358,7 +368,23 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                     </button>
                     <div className="h-4 w-px bg-hui-border"></div>
                     <span className="text-sm font-medium text-hui-textMain">{code}</span>
-                    <span className="px-2 py-0.5 rounded text-xs bg-slate-100 text-hui-textMuted border border-hui-border">{status}</span>
+                    <select
+                        value={status}
+                        onChange={e => setStatus(e.target.value)}
+                        className={`px-2 py-0.5 rounded text-xs font-semibold border cursor-pointer ${
+                            status === "Draft" ? "bg-slate-100 text-slate-600 border-slate-200" :
+                            status === "Sent" ? "bg-amber-50 text-amber-700 border-amber-200" :
+                            status === "Viewed" ? "bg-blue-50 text-blue-700 border-blue-200" :
+                            status === "Approved" ? "bg-green-50 text-green-700 border-green-200" :
+                            status === "Invoiced" ? "bg-teal-50 text-teal-700 border-teal-200" :
+                            status === "Paid" ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+                            "bg-slate-100 text-hui-textMuted border-hui-border"
+                        }`}
+                    >
+                        {["Draft", "Sent", "Viewed", "Approved", "Invoiced", "Paid"].map(s => (
+                            <option key={s} value={s}>{s}</option>
+                        ))}
+                    </select>
                 </div>
 
                 {/* Tabs Middle */}
@@ -477,6 +503,13 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                             </button>
                                         </>
                                     )}
+                                    <button
+                                        onClick={() => { setShowPaymentModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-emerald-50 flex items-center gap-2.5 text-emerald-700"
+                                    >
+                                        <svg className="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                        Log Payment
+                                    </button>
                                     <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={handleSyncQB}
@@ -487,6 +520,23 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                         {isSyncingQB ? "Syncing…" : "Sync to QuickBooks"}
                                     </button>
                                     <div className="border-t border-hui-border my-1" />
+                                    <button
+                                        onClick={async () => {
+                                            setShowMoreMenu(false);
+                                            try {
+                                                const { archiveEstimate } = await import("@/lib/actions");
+                                                const res = await archiveEstimate(initialEstimate.id);
+                                                toast.success(res.archived ? "Estimate archived" : "Estimate unarchived");
+                                                router.refresh();
+                                            } catch (err: any) {
+                                                toast.error(err.message || "Failed to archive");
+                                            }
+                                        }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-amber-50 flex items-center gap-2.5 text-amber-700"
+                                    >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" /></svg>
+                                        {initialEstimate.archivedAt ? "Unarchive" : "Archive"}
+                                    </button>
                                     <button
                                         onClick={() => { handleDelete(); setShowMoreMenu(false); }}
                                         disabled={isDeleting}
@@ -557,6 +607,14 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                             
                                             <label className="text-slate-500 font-medium">Date Issued</label>
                                             <span className="text-right font-medium text-slate-800 px-2 py-1">{new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}</span>
+
+                                            <label className="text-slate-500 font-medium">Expires</label>
+                                            <input
+                                                type="date"
+                                                value={expirationDate}
+                                                onChange={e => setExpirationDate(e.target.value)}
+                                                className="font-medium text-slate-800 focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 -mr-2 text-right bg-transparent transition text-sm"
+                                            />
                                         </div>
                                     </div>
                                 </div>
@@ -619,8 +677,15 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                                         type="text"
                                                                         value={item.name}
                                                                         onChange={e => updateItem(index, "name", e.target.value)}
-                                                                        placeholder="Item name / description"
+                                                                        placeholder="Item name"
                                                                         className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
+                                                                    />
+                                                                    <textarea
+                                                                        value={item.description || ""}
+                                                                        onChange={e => updateItem(index, "description", e.target.value)}
+                                                                        placeholder="Description (optional)"
+                                                                        rows={1}
+                                                                        className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 -ml-2 transition text-xs text-hui-textMuted resize-none mt-0.5"
                                                                     />
                                                                     {!isSubItem && (
                                                                         <button onClick={() => addItem(item.id)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit mt-1 opacity-0 group-hover:opacity-100 transition">
@@ -811,9 +876,45 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                         <span className="text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>Estimated Tax (8.7%)</span>
+                                        <span>{taxName}</span>
                                         <span className="text-slate-800">${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
+                                    {/* Processing Fee Markup — hidden from client view by default */}
+                                    {(viewMode === "internal" || !hideProcessingFee) && (
+                                        <div className="flex justify-between items-center text-slate-500 font-medium">
+                                            <div className="flex items-center gap-2">
+                                                <span>Processing Fee{processingFeeMarkup > 0 ? ` (${processingFeeMarkup}%)` : ""}</span>
+                                                {viewMode === "internal" && (
+                                                    <button
+                                                        onClick={() => setHideProcessingFee(!hideProcessingFee)}
+                                                        title={hideProcessingFee ? "Hidden from client" : "Visible to client"}
+                                                        className="text-slate-400 hover:text-slate-600 transition"
+                                                    >
+                                                        {hideProcessingFee ? (
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                                                        ) : (
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                        )}
+                                                    </button>
+                                                )}
+                                            </div>
+                                            {viewMode === "internal" ? (
+                                                <div className="flex items-center gap-1">
+                                                    <input
+                                                        type="number"
+                                                        value={processingFeeMarkup}
+                                                        onChange={e => setProcessingFeeMarkup(parseFloat(e.target.value) || 0)}
+                                                        className="w-16 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-0.5 text-right text-sm"
+                                                        step="0.5"
+                                                        min="0"
+                                                    />
+                                                    <span className="text-xs text-slate-400">%</span>
+                                                </div>
+                                            ) : (
+                                                <span className="text-slate-800">${processingFee.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                            )}
+                                        </div>
+                                    )}
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
                                     <div className="flex justify-between text-xl font-extrabold text-slate-900">
                                         <span>Total</span>
@@ -987,9 +1088,18 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
             )}
 
             {showVendorSelectModal && (
-                <SelectVendorModal 
+                <SelectVendorModal
                     onSelect={handleCreatePurchaseOrder}
                     onClose={() => setShowVendorSelectModal(false)}
+                />
+            )}
+
+            {showPaymentModal && (
+                <LogPaymentModal
+                    estimateId={initialEstimate.id}
+                    balanceDue={Number(initialEstimate.balanceDue) || 0}
+                    onClose={() => setShowPaymentModal(false)}
+                    onSaved={() => router.refresh()}
                 />
             )}
         </div>

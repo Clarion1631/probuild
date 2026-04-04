@@ -1,4 +1,4 @@
-import { getEstimate, getProject } from "@/lib/actions";
+import { getEstimate, getProject, getCompanySettings } from "@/lib/actions";
 import EstimateEditor from "./EstimateEditor";
 import { notFound } from "next/navigation";
 
@@ -10,13 +10,23 @@ export default async function EstimatePage({
     params: Promise<{ id: string; estimateId: string }>
 }) {
     const resolvedParams = await params;
-    const project = await getProject(resolvedParams.id);
-    const estimate = await getEstimate(resolvedParams.estimateId);
+    const [project, estimate, settings] = await Promise.all([
+        getProject(resolvedParams.id),
+        getEstimate(resolvedParams.estimateId),
+        getCompanySettings(),
+    ]);
 
     if (!project) return <div>Project not found</div>;
-    if (!estimate) { 
+    if (!estimate) {
         notFound();
     }
+
+    // Parse sales taxes from company settings
+    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
+    try {
+        salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
+    } catch { /* ignore parse errors */ }
+    const defaultTax = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
 
     return (
         <div className="flex h-[calc(100vh-64px)] -m-6 overflow-hidden">
@@ -31,6 +41,7 @@ export default async function EstimatePage({
                         location: project.location || undefined
                     }}
                     initialEstimate={estimate}
+                    defaultTax={defaultTax}
                 />
             </div>
         </div>
