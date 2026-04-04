@@ -12,6 +12,10 @@ export async function createTimeEntry(data: {
     date: string;
     durationHours: number;
     laborCost: number;
+    isBillable?: boolean;
+    isTaxable?: boolean;
+    costRate?: number | null;
+    description?: string;
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
@@ -26,7 +30,11 @@ export async function createTimeEntry(data: {
             costCodeId: data.costCodeId,
             startTime,
             durationHours: data.durationHours,
-            laborCost: data.laborCost
+            laborCost: data.laborCost,
+            isBillable: data.isBillable ?? true,
+            isTaxable: data.isTaxable ?? true,
+            costRate: data.costRate ?? null,
+            description: data.description || null,
         }
     });
 
@@ -41,6 +49,10 @@ export async function updateTimeEntry(id: string, data: {
     date: string;
     durationHours: number;
     laborCost: number;
+    isBillable?: boolean;
+    isTaxable?: boolean;
+    costRate?: number | null;
+    description?: string;
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
@@ -54,7 +66,11 @@ export async function updateTimeEntry(id: string, data: {
             costCodeId: data.costCodeId,
             startTime,
             durationHours: data.durationHours,
-            laborCost: data.laborCost
+            laborCost: data.laborCost,
+            isBillable: data.isBillable ?? true,
+            isTaxable: data.isTaxable ?? true,
+            costRate: data.costRate ?? null,
+            description: data.description || null,
         }
     });
 

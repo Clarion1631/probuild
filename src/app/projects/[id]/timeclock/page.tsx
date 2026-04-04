@@ -47,7 +47,14 @@ export default async function TimeClockPage({
             costCode: { select: { id: true, name: true, code: true } }
         },
         orderBy: { startTime: 'desc' }
-    });
+    }).then(entries => entries.map(e => ({
+        ...e,
+        isBillable: (e as any).isBillable ?? true,
+        isTaxable: (e as any).isTaxable ?? true,
+        costRate: (e as any).costRate != null ? Number((e as any).costRate) : null,
+        description: (e as any).description ?? null,
+        laborCost: e.laborCost != null ? Number(e.laborCost) : null,
+    })));
 
     const costCodes = await prisma.costCode.findMany({
         where: { isActive: true },
@@ -58,7 +65,10 @@ export default async function TimeClockPage({
         where: { status: { not: "DISABLED" } },
         select: { id: true, name: true, email: true, hourlyRate: true },
         orderBy: { name: 'asc' }
-    });
+    }).then(users => users.map(u => ({
+        ...u,
+        hourlyRate: u.hourlyRate != null ? Number(u.hourlyRate) : 0,
+    })));
 
     return (
         <TimeClockClient 
