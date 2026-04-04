@@ -115,7 +115,7 @@ interface BudgetLineItem {
 
 type SortKey = "name" | "originalEst" | "revisedEst" | "actual" | "varianceDollar" | "variancePct" | "invoiced";
 type SortDir = "asc" | "desc";
-type ViewBy = "all" | "costCode" | "costType" | "itemType";
+type ViewBy = "all" | "category" | "costCode" | "costType" | "itemType";
 
 // ─── Helpers ────────────────────────────────────────────────────
 function num(v: unknown): number {
@@ -191,6 +191,7 @@ export default function BudgetClient({ project, data }: { project: { id: string;
         coApproved: true,
         coDraft: false,
     });
+    const [collapsed, setCollapsed] = useState(false);
     const [visibleColumns, setVisibleColumns] = useState({
         originalEst: true,
         revisedEst: true,
@@ -220,6 +221,10 @@ export default function BudgetClient({ project, data }: { project: { id: string;
         const groupMap = new Map<string, BudgetLineItem>();
 
         function getGroupKey(item: { costCode?: { code: string; name: string } | null; costType?: { name: string } | null; type?: string; name?: string }): { key: string; name: string; category: string } {
+            if (viewBy === "category" && item.costCode) {
+                const cat = item.costCode.code.split("-")[0] || item.costCode.code;
+                return { key: `cat-${cat}`, name: `Category ${cat}`, category: "Category" };
+            }
             if (viewBy === "costCode" && item.costCode) {
                 return { key: `cc-${item.costCode.code}`, name: `${item.costCode.code} — ${item.costCode.name}`, category: "Cost Code" };
             }
@@ -409,6 +414,15 @@ export default function BudgetClient({ project, data }: { project: { id: string;
                 </div>
                 <div className="flex items-center gap-2">
                     <button
+                        onClick={() => setCollapsed(c => !c)}
+                        className="hui-btn bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-2 rounded-lg flex items-center gap-1.5"
+                    >
+                        <svg className={`w-4 h-4 transition-transform ${collapsed ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                        </svg>
+                        {collapsed ? "Expand All" : "Collapse All"}
+                    </button>
+                    <button
                         onClick={() => setShowSettings(true)}
                         className="hui-btn bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-2 rounded-lg flex items-center gap-1.5"
                     >
@@ -420,12 +434,23 @@ export default function BudgetClient({ project, data }: { project: { id: string;
                     </button>
                     <button
                         onClick={handleExportCSV}
-                        className="hui-btn bg-hui-primary text-white hover:bg-blue-600 text-sm px-4 py-2 rounded-lg flex items-center gap-1.5"
+                        className="hui-btn bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-2 rounded-lg flex items-center gap-1.5"
                     >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                         </svg>
                         Generate Report
+                    </button>
+                    <button
+                        onClick={() => {
+                            window.open(`/portal/projects/${project.id}/budget`, "_blank");
+                        }}
+                        className="hui-btn bg-hui-primary text-white hover:bg-hui-primaryHover text-sm px-4 py-2 rounded-lg flex items-center gap-1.5"
+                    >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+                        </svg>
+                        Preview & Share
                     </button>
                 </div>
             </div>
@@ -474,6 +499,7 @@ export default function BudgetClient({ project, data }: { project: { id: string;
                         className="hui-input text-sm py-1.5 px-3 rounded-lg border-slate-300"
                     >
                         <option value="all">Line Items</option>
+                        <option value="category">Category</option>
                         <option value="costCode">Cost Code</option>
                         <option value="costType">Cost Type</option>
                         <option value="itemType">Item Type</option>
@@ -553,7 +579,7 @@ export default function BudgetClient({ project, data }: { project: { id: string;
                                     )}
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-100">
+                            <tbody className={`divide-y divide-slate-100 ${collapsed ? "hidden" : ""}`}>
                                 {sortedItems.map(row => (
                                     <tr key={row.key} className="hover:bg-slate-50 transition">
                                         <td className="px-4 py-3 font-medium text-hui-textMain">{row.name}</td>
