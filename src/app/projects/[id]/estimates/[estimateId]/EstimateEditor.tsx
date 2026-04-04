@@ -39,6 +39,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [isSyncingQB, setIsSyncingQB] = useState(false);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
+    const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
 
     async function handleCreateChangeOrder() {
         if (selectedItemIds.length === 0) return;
@@ -136,6 +137,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         await saveEstimate(initialEstimate.id, context.id, context.type, {
             title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
             processingFeeMarkup, hideProcessingFee,
+            expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -579,6 +581,14 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                             
                                             <label className="text-slate-500 font-medium">Date Issued</label>
                                             <span className="text-right font-medium text-slate-800 px-2 py-1">{new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}</span>
+
+                                            <label className="text-slate-500 font-medium">Expires</label>
+                                            <input
+                                                type="date"
+                                                value={expirationDate}
+                                                onChange={e => setExpirationDate(e.target.value)}
+                                                className="font-medium text-slate-800 focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 -mr-2 text-right bg-transparent transition text-sm"
+                                            />
                                         </div>
                                     </div>
                                 </div>
