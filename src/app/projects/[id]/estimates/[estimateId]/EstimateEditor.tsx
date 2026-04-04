@@ -364,7 +364,23 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     </button>
                     <div className="h-4 w-px bg-hui-border"></div>
                     <span className="text-sm font-medium text-hui-textMain">{code}</span>
-                    <span className="px-2 py-0.5 rounded text-xs bg-slate-100 text-hui-textMuted border border-hui-border">{status}</span>
+                    <select
+                        value={status}
+                        onChange={e => setStatus(e.target.value)}
+                        className={`px-2 py-0.5 rounded text-xs font-semibold border cursor-pointer ${
+                            status === "Draft" ? "bg-slate-100 text-slate-600 border-slate-200" :
+                            status === "Sent" ? "bg-amber-50 text-amber-700 border-amber-200" :
+                            status === "Viewed" ? "bg-blue-50 text-blue-700 border-blue-200" :
+                            status === "Approved" ? "bg-green-50 text-green-700 border-green-200" :
+                            status === "Invoiced" ? "bg-teal-50 text-teal-700 border-teal-200" :
+                            status === "Paid" ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+                            "bg-slate-100 text-hui-textMuted border-hui-border"
+                        }`}
+                    >
+                        {["Draft", "Sent", "Viewed", "Approved", "Invoiced", "Paid"].map(s => (
+                            <option key={s} value={s}>{s}</option>
+                        ))}
+                    </select>
                 </div>
 
                 {/* Tabs Middle */}
