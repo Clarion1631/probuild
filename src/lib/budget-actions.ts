@@ -5,7 +5,16 @@ import { prisma } from "@/lib/prisma";
 export async function getBudgetData(projectId: string) {
     const estimates = await prisma.estimate.findMany({
         where: { projectId },
-        include: {
+        select: {
+            id: true,
+            number: true,
+            title: true,
+            code: true,
+            status: true,
+            totalAmount: true,
+            balanceDue: true,
+            createdAt: true,
+            projectId: true,
             items: {
                 include: { costCode: true, costType: true },
                 orderBy: { order: "asc" },

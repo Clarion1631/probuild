@@ -4,12 +4,41 @@ import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
 
+// Safe estimate include that omits columns not yet migrated to the database.
+// Remove this wrapper once the DB Push workflow succeeds and the Estimate table
+// has: processingFeeMarkup, hideProcessingFee, expirationDate, archivedAt.
+const safeEstimateInclude = {
+    select: {
+        id: true,
+        number: true,
+        title: true,
+        projectId: true,
+        leadId: true,
+        code: true,
+        status: true,
+        privacy: true,
+        createdAt: true,
+        totalAmount: true,
+        balanceDue: true,
+        items: true,
+        expenses: true,
+        paymentSchedules: true,
+        approvedBy: true,
+        approvedAt: true,
+        approvalIp: true,
+        approvalUserAgent: true,
+        signatureUrl: true,
+        contractId: true,
+        viewedAt: true,
+    },
+} as const;
+
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
         orderBy: { createdAt: "desc" },
         include: {
             client: true,
-            estimates: true,
+            estimates: safeEstimateInclude,
             manager: true,
             tasks: {
                 where: { status: { not: "Done" } },
@@ -29,7 +58,7 @@ export async function getLead(id: string) {
         where: { id },
         include: {
             client: true,
-            estimates: true,
+            estimates: safeEstimateInclude,
             contracts: true,
             manager: true,
             tasks: {
@@ -162,7 +191,7 @@ export async function getClients() {
         orderBy: { name: "asc" },
         include: {
             projects: {
-                include: { estimates: true }
+                include: { estimates: safeEstimateInclude }
             },
             leads: true
         }
@@ -471,7 +500,7 @@ export async function getProjects() {
         orderBy: { viewedAt: "desc" },
         include: {
             client: true,
-            estimates: true,
+            estimates: safeEstimateInclude,
         },
     });
     return projects.map((p: any) => ({
@@ -483,7 +512,7 @@ export async function getProjects() {
 export async function getProject(id: string) {
     const include = {
         client: true,
-        estimates: true,
+        estimates: safeEstimateInclude,
         floorPlans: true,
         contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
     } as const;
