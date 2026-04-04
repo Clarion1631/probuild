@@ -619,8 +619,15 @@ export default function EstimateEditor({ context, initialEstimate }: { context: 
                                                                         type="text"
                                                                         value={item.name}
                                                                         onChange={e => updateItem(index, "name", e.target.value)}
-                                                                        placeholder="Item name / description"
+                                                                        placeholder="Item name"
                                                                         className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
+                                                                    />
+                                                                    <textarea
+                                                                        value={item.description || ""}
+                                                                        onChange={e => updateItem(index, "description", e.target.value)}
+                                                                        placeholder="Description (optional)"
+                                                                        rows={1}
+                                                                        className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 -ml-2 transition text-xs text-hui-textMuted resize-none mt-0.5"
                                                                     />
                                                                     {!isSubItem && (
                                                                         <button onClick={() => addItem(item.id)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit mt-1 opacity-0 group-hover:opacity-100 transition">
