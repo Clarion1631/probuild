@@ -521,6 +521,23 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     </button>
                                     <div className="border-t border-hui-border my-1" />
                                     <button
+                                        onClick={async () => {
+                                            setShowMoreMenu(false);
+                                            try {
+                                                const { archiveEstimate } = await import("@/lib/actions");
+                                                const res = await archiveEstimate(initialEstimate.id);
+                                                toast.success(res.archived ? "Estimate archived" : "Estimate unarchived");
+                                                router.refresh();
+                                            } catch (err: any) {
+                                                toast.error(err.message || "Failed to archive");
+                                            }
+                                        }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-amber-50 flex items-center gap-2.5 text-amber-700"
+                                    >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" /></svg>
+                                        {initialEstimate.archivedAt ? "Unarchive" : "Archive"}
+                                    </button>
+                                    <button
                                         onClick={() => { handleDelete(); setShowMoreMenu(false); }}
                                         disabled={isDeleting}
                                         className="w-full text-left px-4 py-2.5 hover:bg-red-50 flex items-center gap-2.5 text-red-600 disabled:opacity-50"
