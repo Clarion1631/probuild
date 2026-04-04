@@ -15,15 +15,17 @@ export async function sendNotification(
     }
 
     if (resendApiKey === 're_dummy_fallback') {
-        console.log("-----------------------------------------");
-        console.log(`[MOCK EMAIL NOTIFICATION]`);
-        console.log(`To: ${toEmail}`);
-        console.log(`Subject: ${subject}`);
-        console.log(`Content: ${htmlContent.substring(0, 100)}...`);
-        if (attachments) {
-            console.log(`Attached ${attachments.length} files.`);
+        if (process.env.NODE_ENV !== 'production') {
+            console.log("-----------------------------------------");
+            console.log(`[MOCK EMAIL NOTIFICATION]`);
+            console.log(`To: ${toEmail}`);
+            console.log(`Subject: ${subject}`);
+            console.log(`Content: ${htmlContent.substring(0, 100)}...`);
+            if (attachments) {
+                console.log(`Attached ${attachments.length} files.`);
+            }
+            console.log("-----------------------------------------");
         }
-        console.log("-----------------------------------------");
         return { success: true, id: "mock_resend_id_123" };
     }
 

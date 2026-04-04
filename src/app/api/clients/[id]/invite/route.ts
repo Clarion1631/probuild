@@ -110,7 +110,9 @@ export async function POST(
                 return NextResponse.json({ error: "Exception sending email: " + msg }, { status: 500 });
             }
         } else {
-            console.log(`[DEV MODE] Invite email would be sent to ${emailToInvite}: Login at ${appUrl}`);
+            if (process.env.NODE_ENV !== 'production') {
+                console.log(`[DEV MODE] Invite email would be sent to ${emailToInvite}: Login at ${appUrl}`);
+            }
         }
 
         return NextResponse.json({ success: true, user });

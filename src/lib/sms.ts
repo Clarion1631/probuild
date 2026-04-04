@@ -20,12 +20,14 @@ export async function sendSMS(toPhone: string, body: string) {
     }
 
     if (!accountSid || !authToken || !fromNumber) {
-        console.log("-----------------------------------------");
-        console.log(`[MOCK SMS NOTIFICATION]`);
-        console.log(`To: ${normalized}`);
-        console.log(`From: ${fromNumber || '+10000000000'}`);
-        console.log(`Body: ${body}`);
-        console.log("-----------------------------------------");
+        if (process.env.NODE_ENV !== 'production') {
+            console.log("-----------------------------------------");
+            console.log(`[MOCK SMS NOTIFICATION]`);
+            console.log(`To: ${normalized}`);
+            console.log(`From: ${fromNumber || '+10000000000'}`);
+            console.log(`Body: ${body}`);
+            console.log("-----------------------------------------");
+        }
         return;
     }
 
