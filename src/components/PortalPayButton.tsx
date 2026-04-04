@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { formatCurrency } from "@/lib/utils";
 
 export default function PortalPayButton({ 
     paymentScheduleId, 
@@ -138,17 +139,17 @@ export default function PortalPayButton({
                         <div className="bg-gray-50 p-6 space-y-3">
                             <div className="flex justify-between text-sm text-gray-600">
                                 <span>Milestone Amount</span>
-                                <span>${amount.toFixed(2)}</span>
+                                <span>{formatCurrency(amount)}</span>
                             </div>
                             {passFee && isFeeMethod && (
                                 <div className="flex justify-between text-sm text-gray-600 border-b border-gray-200 pb-3">
                                     <span>Processing Fee ({rate}%)</span>
-                                    <span>${feeAmount.toFixed(2)}</span>
+                                    <span>{formatCurrency(feeAmount)}</span>
                                 </div>
                             )}
                             <div className="flex justify-between text-lg font-bold text-gray-900 pt-1">
                                 <span>Total to Pay</span>
-                                <span>${totalAmount.toFixed(2)}</span>
+                                <span>{formatCurrency(totalAmount)}</span>
                             </div>
 
                             <button

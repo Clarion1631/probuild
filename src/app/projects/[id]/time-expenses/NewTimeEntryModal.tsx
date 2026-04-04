@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { createTimeEntry } from "@/lib/time-expense-actions";
+import { formatCurrency } from "@/lib/utils";
 
 interface Props {
     projectId: string;
@@ -119,7 +120,7 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
 
                     {(parseFloat(hours) || 0) > 0 && (
                         <div className="bg-slate-50 rounded-lg p-3 text-sm text-slate-600">
-                            <span className="font-medium">{hours}h</span> x <span className="font-medium">${effectiveRate.toFixed(2)}/hr</span> = <span className="font-bold text-hui-textMain">${totalCost.toFixed(2)}</span>
+                            <span className="font-medium">{hours}h</span> x <span className="font-medium">{formatCurrency(effectiveRate)}/hr</span> = <span className="font-bold text-hui-textMain">{formatCurrency(totalCost)}</span>
                         </div>
                     )}
 

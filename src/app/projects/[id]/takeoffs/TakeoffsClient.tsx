@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
+import { formatCurrency } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
@@ -765,7 +766,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                 <td className="px-4 py-3 text-right text-slate-500 whitespace-nowrap align-top">{item.unit || "ea"}</td>
                                                                 {viewMode === "internal" && (<>
                                                                     <td className="px-4 py-3 text-right text-blue-700 font-semibold bg-blue-50/40 whitespace-nowrap align-top">
-                                                                        ${baseCost.toFixed(2)}
+                                                                        {formatCurrency(baseCost)}
                                                                     </td>
                                                                     <td className="px-4 py-3 bg-blue-50/40 align-top">
                                                                         {isTax ? (
@@ -794,7 +795,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                         )}
                                                                     </td>
                                                                 </>)}
-                                                                <td className="px-4 py-3 text-right text-slate-800 font-medium whitespace-nowrap align-top">${item.unitCost?.toFixed(2)}</td>
+                                                                <td className="px-4 py-3 text-right text-slate-800 font-medium whitespace-nowrap align-top">{formatCurrency(item.unitCost)}</td>
                                                                 <td className="px-4 py-3 text-right font-bold text-slate-900 whitespace-nowrap align-top">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                                                             </tr>
                                                         );
