@@ -37,6 +37,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showVendorSelectModal, setShowVendorSelectModal] = useState(false);
     const [isCreatingPO, setIsCreatingPO] = useState(false);
     const [isSyncingQB, setIsSyncingQB] = useState(false);
+    const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
+    const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
 
     async function handleCreateChangeOrder() {
         if (selectedItemIds.length === 0) return;
@@ -110,8 +112,9 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
     const taxRate = defaultTax ? defaultTax.rate / 100 : 0.087;
     const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.7%)";
+    const processingFee = processingFeeMarkup > 0 ? subtotal * (processingFeeMarkup / 100) : 0;
     const tax = subtotal * taxRate;
-    const total = subtotal + tax;
+    const total = subtotal + tax + processingFee;
 
     // Internal margin calculations
     const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
@@ -131,7 +134,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         }));
 
         await saveEstimate(initialEstimate.id, context.id, context.type, {
-            title, code, status, totalAmount: total, paymentSchedules: mappedSchedules
+            title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
+            processingFeeMarkup, hideProcessingFee,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -823,6 +827,42 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         <span>{taxName}</span>
                                         <span className="text-slate-800">${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
+                                    {/* Processing Fee Markup — hidden from client view by default */}
+                                    {(viewMode === "internal" || !hideProcessingFee) && (
+                                        <div className="flex justify-between items-center text-slate-500 font-medium">
+                                            <div className="flex items-center gap-2">
+                                                <span>Processing Fee{processingFeeMarkup > 0 ? ` (${processingFeeMarkup}%)` : ""}</span>
+                                                {viewMode === "internal" && (
+                                                    <button
+                                                        onClick={() => setHideProcessingFee(!hideProcessingFee)}
+                                                        title={hideProcessingFee ? "Hidden from client" : "Visible to client"}
+                                                        className="text-slate-400 hover:text-slate-600 transition"
+                                                    >
+                                                        {hideProcessingFee ? (
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                                                        ) : (
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                        )}
+                                                    </button>
+                                                )}
+                                            </div>
+                                            {viewMode === "internal" ? (
+                                                <div className="flex items-center gap-1">
+                                                    <input
+                                                        type="number"
+                                                        value={processingFeeMarkup}
+                                                        onChange={e => setProcessingFeeMarkup(parseFloat(e.target.value) || 0)}
+                                                        className="w-16 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-0.5 text-right text-sm"
+                                                        step="0.5"
+                                                        min="0"
+                                                    />
+                                                    <span className="text-xs text-slate-400">%</span>
+                                                </div>
+                                            ) : (
+                                                <span className="text-slate-800">${processingFee.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                            )}
+                                        </div>
+                                    )}
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
                                     <div className="flex justify-between text-xl font-extrabold text-slate-900">
                                         <span>Total</span>

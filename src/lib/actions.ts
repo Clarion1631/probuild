@@ -1147,6 +1147,9 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             status: data.status,
             totalAmount: data.totalAmount,
             balanceDue: data.totalAmount,
+            ...(data.processingFeeMarkup !== undefined && { processingFeeMarkup: data.processingFeeMarkup }),
+            ...(data.hideProcessingFee !== undefined && { hideProcessingFee: data.hideProcessingFee }),
+            ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
         },
     });
 

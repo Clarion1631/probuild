@@ -214,6 +214,12 @@ model Estimate {
   budget           Budget?
   takeoff          Takeoff?
 
+  // Processing fee & expiration
+  processingFeeMarkup Decimal?
+  hideProcessingFee   Boolean   @default(true)
+  expirationDate      DateTime?
+  archivedAt          DateTime?
+
   // Phase 7: Contracts & Approvals
   approvedBy        String?
   approvedAt        DateTime?
