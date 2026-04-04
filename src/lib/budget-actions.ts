@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 
 export async function getBudgetData(projectId: string) {
     const estimates = await prisma.estimate.findMany({
-        where: { projectId, isArchived: false },
+        where: { projectId },
         include: {
             items: {
                 include: { costCode: true, costType: true },
