@@ -66,6 +66,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 { label: "Invoices", href: `/projects/${projectId}/invoices`, permission: "invoices" },
                 { label: "Purchase Orders", href: `/projects/${projectId}/purchase-orders`, permission: "financialReports" },
                 { label: "Change Orders", href: `/projects/${projectId}/change-orders`, permission: "changeOrders" },
+                { label: "Budget", href: `/projects/${projectId}/budget`, permission: "financialReports" },
                 { label: "Retainers & Credits", href: `/projects/${projectId}/retainers` },
                 { label: "Financial Overview", href: `/projects/${projectId}/financial-overview` },
             ],

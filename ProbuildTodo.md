@@ -79,26 +79,17 @@ Phase 1 built all routes. Phase 2 makes them real — informed by exact Houzz Pr
 ### 🔥 Sprint A — Financial Pipeline (THE critical workflow)
 _Houzz Pro's #1 power feature: Estimate → Budget → Variance with per-line-item tracking_
 
-**A1. Estimate Editor Rebuild**
-- [ ] Hierarchical line items: Sections (collapsible headers) > Items (indented under sections)
-- [ ] Item type selector: Material | Labor | Material & Labor | Service
-- [ ] Per-item fields: Name, Description, Qty, Unit Cost, Markup %, Total
-- [ ] Summary block: Subtotal, Markup, Tax, Total — with "Processing Fee Markup" (hidden from client toggle)
-- [ ] Selection-based actions: checking item checkboxes scopes "Create Invoice/CO/PO" to selected items only (partial billing)
-- [ ] Payment Schedule section: milestones with Description, Due Date, Amount, Status (Pending/Sent/Paid)
-- [ ] "Log Payment" modal + "Schedule a Payment" inline row add
-- [ ] General Info section: Title, Project, Client, Expiration Date
-- [ ] Document sections: Items, Payments, Files, Terms & Conditions, Memo, Signature, Activity Stream
-- [ ] Right sidebar: Overview tab (status, amounts, dates), Activity tab
-- [ ] Actions dropdown: Duplicate, Preview, Send, Download PDF, Create Invoice, Create CO, Create PO, Archive
-- [ ] Document status flow: Draft → Sent → Viewed → Approved → Invoiced → Paid
+**~~A1. Estimate Editor Rebuild~~** ✅ DONE
+Completed prior session — all 12 features implemented in EstimateEditor.tsx (1250+ lines)
 
-**A2. Company-Wide Document Numbering**
-- [ ] Auto-increment reference numbers across ALL document types:
-  - ES-NNNNN (Estimates), IN-NNNNN (Invoices), CO-NNNNN (Change Orders)
-  - PO-NNNNN (Purchase Orders), RR-NNNNN (Retainers), EX-NNNNN (Expenses), PM-NNNNN (Payments)
-- [ ] Schema: add `referenceNumber String @unique` to each model + company-level counter table
-- [ ] Display in list views and document headers
+**~~A2. Company-Wide Document Numbering~~** ✅ DONE
+Completed 2026-04-04:
+- [x] DocumentCounter model added to schema (atomic upsert-based auto-increment)
+- [x] Auto-increment reference numbers: ES-NNNNN, IN-NNNNN, CO-NNNNN, PO-NNNNN, RR-NNNNN, EX-NNNNN, PM-NNNNN
+- [x] All 6 document creation functions updated (createDraftEstimate, createDraftLeadEstimate, createEstimateFromTemplate, duplicateEstimate, createInvoiceFromEstimate, createChangeOrder, createPurchaseOrder, createPurchaseOrderFromEstimate)
+- [x] referenceNumber field added to Expense model
+- [x] Migration SQL at `migrations/a2_document_numbering.sql` — **PENDING: run via apply_schema.ps1**
+- [x] List views + editor headers already display `code` field (no UI changes needed)
 
 **A3. Budget Module (NEW — doesn't exist yet)**
 - [ ] URL: `/projects/[id]/budget`
