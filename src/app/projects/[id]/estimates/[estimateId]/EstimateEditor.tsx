@@ -9,7 +9,11 @@ import {
   saveEstimateAsTemplate,
   archiveEstimate,
   logEstimatePayment,
+  uploadEstimateFile,
+  listEstimateFiles,
+  deleteEstimateFile,
 } from "@/lib/actions";
+import type { EstimateFileInfo } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -106,6 +110,11 @@ export default function EstimateEditor({
   const [isCreatingPO, setIsCreatingPO] = useState(false);
   const [isSyncingQB, setIsSyncingQB] = useState(false);
 
+  // Files state
+  const [attachedFiles, setAttachedFiles] = useState<EstimateFileInfo[]>([]);
+  const [isUploadingFile, setIsUploadingFile] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // New A1 state
   const [expirationDate, setExpirationDate] = useState(
     initialEstimate.expirationDate
@@ -141,6 +150,10 @@ export default function EstimateEditor({
       .then((data) => {
         if (Array.isArray(data)) setCostTypes(data);
       })
+      .catch(() => {});
+    // Load existing files from storage
+    listEstimateFiles(initialEstimate.id)
+      .then(setAttachedFiles)
       .catch(() => {});
   }, []);
 
@@ -384,6 +397,36 @@ export default function EstimateEditor({
       router.refresh();
     } catch {
       toast.error("Failed to log payment");
+    }
+  }
+
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setIsUploadingFile(true);
+    for (let i = 0; i < files.length; i++) {
+      const formData = new FormData();
+      formData.append("file", files[i]);
+      try {
+        const uploaded = await uploadEstimateFile(initialEstimate.id, formData);
+        setAttachedFiles((prev) => [uploaded, ...prev]);
+      } catch {
+        toast.error(`Failed to upload ${files[i].name}`);
+      }
+    }
+    setIsUploadingFile(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    toast.success("File(s) uploaded");
+  }
+
+  async function handleDeleteFile(file: EstimateFileInfo) {
+    if (!confirm(`Delete "${file.name}"?`)) return;
+    try {
+      await deleteEstimateFile(initialEstimate.id, file.storagePath);
+      setAttachedFiles((prev) => prev.filter((f) => f.storagePath !== file.storagePath));
+      toast.success("File deleted");
+    } catch {
+      toast.error("Failed to delete file");
     }
   }
 
@@ -1441,17 +1484,86 @@ export default function EstimateEditor({
                 <h3 className="flex items-center gap-2 font-bold tracking-tight text-slate-800">
                   <PaperclipIcon className="h-4 w-4 text-slate-400" />
                   Files & Attachments
+                  {attachedFiles.length > 0 && (
+                    <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                      {attachedFiles.length}
+                    </span>
+                  )}
                 </h3>
+                <div>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileUpload}
+                    multiple
+                    className="hidden"
+                    accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.gif,.svg,.dwg,.dxf"
+                  />
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isUploadingFile}
+                    className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    {isUploadingFile ? <Spinner /> : <PlusIcon size={12} />}
+                    Upload
+                  </button>
+                </div>
               </div>
-              <div className="m-4 rounded-lg border-2 border-dashed border-slate-200 p-8 text-center">
-                <PaperclipIcon className="mx-auto mb-2 h-8 w-8 text-slate-300" />
-                <p className="text-sm font-medium text-slate-500">
-                  Drop files here or click to upload
-                </p>
-                <p className="mt-1 text-xs text-slate-400">
-                  Attach plans, specs, or reference documents
-                </p>
-              </div>
+
+              {attachedFiles.length === 0 ? (
+                <div
+                  className="m-4 cursor-pointer rounded-lg border-2 border-dashed border-slate-200 p-8 text-center transition hover:border-slate-300 hover:bg-slate-50/50"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <PaperclipIcon className="mx-auto mb-2 h-8 w-8 text-slate-300" />
+                  <p className="text-sm font-medium text-slate-500">
+                    Drop files here or click to upload
+                  </p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Plans, specs, photos, reference documents
+                  </p>
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-50">
+                  {attachedFiles.map((file) => (
+                    <div
+                      key={file.storagePath}
+                      className="flex items-center justify-between px-6 py-3 hover:bg-slate-50"
+                    >
+                      <div className="flex min-w-0 items-center gap-3">
+                        <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-slate-100">
+                          <DocIcon size={14} className="text-slate-500" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium text-slate-800">{file.name}</p>
+                          <p className="text-[10px] text-slate-400">
+                            {file.size > 0 ? `${(file.size / 1024).toFixed(0)} KB` : ""}{" "}
+                            {file.type.split("/").pop()?.toUpperCase()}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <a
+                          href={file.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+                          title="Download"
+                        >
+                          <DownloadIcon />
+                        </a>
+                        <button
+                          onClick={() => handleDeleteFile(file)}
+                          className="rounded p-1 text-slate-400 transition hover:bg-red-50 hover:text-red-600"
+                          title="Delete"
+                        >
+                          <TrashIcon />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* ─── Terms & Conditions ─── */}
