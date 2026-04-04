@@ -1426,7 +1426,6 @@ export default function EstimateEditor({
             >
               <ExpensesTab
                 estimateId={initialEstimate.id}
-                projectId={context.type === "project" ? context.id : ""}
                 items={items.filter((i) => !i.isSection)}
               />
             </div>

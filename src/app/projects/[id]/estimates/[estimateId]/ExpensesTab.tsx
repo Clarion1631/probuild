@@ -5,11 +5,9 @@ import { toast } from "sonner";
 
 export default function ExpensesTab({
   estimateId,
-  projectId,
   items,
 }: {
   estimateId: string;
-  projectId: string;
   items: any[];
 }) {
   const [expenses, setExpenses] = useState<any[]>(items.flatMap((item) => item.expenses || []));
