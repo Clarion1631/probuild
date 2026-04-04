@@ -1,4 +1,4 @@
-import StatusBadge, { StatusType } from "@/components/StatusBadge";
+import StatusBadge from "@/components/StatusBadge";
 import {
   getProject,
   createDraftEstimate,
