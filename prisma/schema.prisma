@@ -230,6 +230,13 @@ model Estimate {
   termsAndConditions String? // Snapshot of T&C HTML at time of sending
   sentAt             DateTime? // When the estimate was emailed to the client
   changeOrders       ChangeOrder[]
+
+  // Phase 10: Estimate Editor Rebuild (A1)
+  expirationDate      DateTime?
+  memo                String?
+  processingFeePercent Float?    // Hidden from client, added to total
+  showProcessingFee   Boolean   @default(false)
+  isArchived          Boolean   @default(false)
 }
 
 model EstimatePaymentSchedule {
@@ -240,6 +247,9 @@ model EstimatePaymentSchedule {
   percentage Float? // Optional: represent this payment as a % of the total
   amount     Decimal
   dueDate    DateTime?
+  status     String    @default("Pending") // Pending, Sent, Paid
+  paidAt     DateTime?
+  paidAmount Decimal?
   order      Int       @default(0)
   createdAt  DateTime  @default(now())
 }
@@ -250,7 +260,8 @@ model EstimateItem {
   estimate      Estimate       @relation(fields: [estimateId], references: [id], onDelete: Cascade)
   name          String
   description   String?
-  type          String         @default("Material") // Legacy fallback
+  isSection     Boolean        @default(false) // true = collapsible section header
+  type          String         @default("Material") // Material, Labor, Material & Labor, Service
   quantity      Float          @default(1)
   baseCost      Decimal? // Raw cost before markup (internal only)
   markupPercent Float          @default(25) // Markup percentage (internal only)
@@ -271,21 +282,22 @@ model EstimateItem {
 }
 
 model Expense {
-  id          String        @id @default(cuid())
-  estimateId  String
-  estimate    Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  itemId      String?
-  item        EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
-  costCodeId  String?
-  costCode    CostCode?     @relation(fields: [costCodeId], references: [id])
-  costTypeId  String?
-  costType    CostType?     @relation(fields: [costTypeId], references: [id])
-  amount      Decimal
-  vendor      String?
-  date        DateTime?
-  description String?
-  receiptUrl  String?
-  status      String        @default("Pending") // Pending, Reviewed
+  id              String        @id @default(cuid())
+  referenceNumber String?       // EX-NNNNN — auto-generated on create
+  estimateId      String
+  estimate        Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  itemId          String?
+  item            EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  costCodeId      String?
+  costCode        CostCode?     @relation(fields: [costCodeId], references: [id])
+  costTypeId      String?
+  costType        CostType?     @relation(fields: [costTypeId], references: [id])
+  amount          Decimal
+  vendor          String?
+  date            DateTime?
+  description     String?
+  receiptUrl      String?
+  status          String        @default("Pending") // Pending, Reviewed
 
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
@@ -1198,4 +1210,13 @@ model BidInvitation {
   respondedAt      DateTime?
   createdAt        DateTime   @default(now())
   updatedAt        DateTime   @updatedAt
+}
+
+// Phase 10: Company-Wide Document Numbering (A2)
+model DocumentCounter {
+  id        String   @id @default(cuid())
+  type      String   @unique // ESTIMATE, INVOICE, CHANGE_ORDER, PURCHASE_ORDER, RETAINER, EXPENSE, PAYMENT
+  prefix    String   // ES, IN, CO, PO, RR, EX, PM
+  nextNumber Int     @default(1)
+  updatedAt DateTime @updatedAt
 }

@@ -4,6 +4,32 @@ import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
 
+// ─── Document Numbering (A2) ─────────────────────────────────────
+const DOC_PREFIXES: Record<string, string> = {
+    ESTIMATE: "ES",
+    INVOICE: "IN",
+    CHANGE_ORDER: "CO",
+    PURCHASE_ORDER: "PO",
+    RETAINER: "RR",
+    EXPENSE: "EX",
+    PAYMENT: "PM",
+};
+
+async function getNextDocumentNumber(type: string): Promise<string> {
+    const prefix = DOC_PREFIXES[type];
+    if (!prefix) throw new Error(`Unknown document type: ${type}`);
+
+    // Atomic upsert: creates counter on first use, increments on subsequent calls
+    const counter = await prisma.documentCounter.upsert({
+        where: { type },
+        update: { nextNumber: { increment: 1 } },
+        create: { type, prefix, nextNumber: 2 }, // First doc gets number 1 (nextNumber-1)
+    });
+
+    const num = counter.nextNumber - 1;
+    return `${prefix}-${String(num).padStart(5, "0")}`;
+}
+
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
         orderBy: { createdAt: "desc" },
@@ -614,7 +640,7 @@ export async function convertLeadToProject(leadId: string) {
 }
 
 export async function createDraftEstimate(projectId: string) {
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+    const code = await getNextDocumentNumber("ESTIMATE");
 
     const estimate = await prisma.estimate.create({
         data: {
@@ -633,7 +659,7 @@ export async function createDraftEstimate(projectId: string) {
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+    const code = await getNextDocumentNumber("ESTIMATE");
 
     const estimate = await prisma.estimate.create({
         data: {
@@ -1147,6 +1173,11 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             status: data.status,
             totalAmount: data.totalAmount,
             balanceDue: data.totalAmount,
+            ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate ? new Date(data.expirationDate) : null }),
+            ...(data.memo !== undefined && { memo: data.memo || null }),
+            ...(data.processingFeePercent !== undefined && { processingFeePercent: data.processingFeePercent ? parseFloat(data.processingFeePercent) : null }),
+            ...(data.showProcessingFee !== undefined && { showProcessingFee: !!data.showProcessingFee }),
+            ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions || null }),
         },
     });
 
@@ -1163,7 +1194,8 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 estimateId,
                 name: item.name,
                 description: item.description || "",
-                type: item.type,
+                isSection: !!item.isSection,
+                type: item.type || "Material",
                 quantity: parseFloat(item.quantity) || 0,
                 baseCost: item.baseCost != null ? parseFloat(item.baseCost) || 0 : null,
                 markupPercent: parseFloat(item.markupPercent) ?? 25,
@@ -1189,6 +1221,9 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
                 amount: parseFloat(schedule.amount) || 0,
                 dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
+                status: schedule.status || "Pending",
+                paidAt: schedule.paidAt ? new Date(schedule.paidAt) : null,
+                paidAmount: schedule.paidAmount ? parseFloat(schedule.paidAmount) : null,
                 order: schedule.order ?? scheduleOrder++,
             },
         });
@@ -1211,6 +1246,41 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     return { success: true };
 }
 
+export async function archiveEstimate(estimateId: string) {
+    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    if (!estimate) throw new Error("Estimate not found");
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: { isArchived: !estimate.isArchived },
+    });
+    if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
+    if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
+    return { isArchived: !estimate.isArchived };
+}
+
+export async function logEstimatePayment(scheduleId: string, amount: number, paidAt?: string) {
+    const schedule = await prisma.estimatePaymentSchedule.findUnique({
+        where: { id: scheduleId },
+        include: { estimate: true },
+    });
+    if (!schedule) throw new Error("Payment schedule not found");
+    await prisma.estimatePaymentSchedule.update({
+        where: { id: scheduleId },
+        data: {
+            status: "Paid",
+            paidAmount: amount,
+            paidAt: paidAt ? new Date(paidAt) : new Date(),
+        },
+    });
+    if (schedule.estimate.projectId) {
+        revalidatePath(`/projects/${schedule.estimate.projectId}/estimates/${schedule.estimateId}`);
+    }
+    if (schedule.estimate.leadId) {
+        revalidatePath(`/leads/${schedule.estimate.leadId}/estimates/${schedule.estimateId}`);
+    }
+    return { success: true };
+}
+
 export async function createInvoiceFromEstimate(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
@@ -1218,7 +1288,7 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
     if (!project) throw new Error("Project not found");
 
-    const code = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
+    const code = await getNextDocumentNumber("INVOICE");
 
     const invoice = await prisma.invoice.create({
         data: {
@@ -1490,7 +1560,7 @@ export async function duplicateEstimate(estimateId: string) {
     });
     if (!original) throw new Error("Estimate not found");
 
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+    const code = await getNextDocumentNumber("ESTIMATE");
 
     const newEstimate = await prisma.estimate.create({
         data: {
@@ -1611,7 +1681,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
     });
     if (!template) throw new Error("Template not found");
 
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
+    const code = await getNextDocumentNumber("ESTIMATE");
 
     const estimate = await prisma.estimate.create({
         data: {
@@ -2892,8 +2962,7 @@ export async function saveSubcontractorExplicitProjects(subId: string, projectId
 
 export async function createChangeOrder(projectId: string, estimateId: string, itemIds?: string[]) {
     "use server";
-    const count = await prisma.changeOrder.count({ where: { projectId } });
-    const code = `CO-${Math.floor(1000 + Math.random() * 9000)}`;
+    const code = await getNextDocumentNumber("CHANGE_ORDER");
 
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
@@ -3311,8 +3380,7 @@ export async function getPurchaseOrder(id: string) {
 
 export async function createPurchaseOrder(projectId: string, data: any) {
     "use server";
-    const count = await prisma.purchaseOrder.count({ where: { projectId } });
-    const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
+    const code = await getNextDocumentNumber("PURCHASE_ORDER");
     
     const { items, ...poData } = data;
     
@@ -3349,16 +3417,14 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
 
     const totalAmount = selectedItems.reduce((acc: number, item: any) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
 
-    // Get project PO count for the code
-    const count = await prisma.purchaseOrder.count({ where: { projectId } });
-    const nextNum = (count + 1).toString().padStart(3, '0');
+    const code = await getNextDocumentNumber("PURCHASE_ORDER");
 
     // Create the PO
     const newPo = await prisma.purchaseOrder.create({
         data: {
             projectId,
             vendorId,
-            code: `PO-${nextNum}`,
+            code,
             status: "Draft",
             totalAmount,
             notes: `Auto-generated from Estimate: ${estimate.title}\n\nReview line items and update costs/quantities as needed.`,
