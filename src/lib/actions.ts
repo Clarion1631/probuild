@@ -20,7 +20,13 @@ export async function getLeads() {
     });
     return leads.map((l: any) => ({
         ...l,
-        client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
+        client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" },
+        estimates: (l.estimates || []).map((e: any) => ({
+            ...e,
+            totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+            balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+            processingFeeMarkup: e.processingFeeMarkup != null ? Number(e.processingFeeMarkup) : null,
+        })),
     }));
 }
 
@@ -476,7 +482,13 @@ export async function getProjects() {
     });
     return projects.map((p: any) => ({
         ...p,
-        client: p.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
+        client: p.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" },
+        estimates: (p.estimates || []).map((e: any) => ({
+            ...e,
+            totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+            balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+            processingFeeMarkup: e.processingFeeMarkup != null ? Number(e.processingFeeMarkup) : null,
+        })),
     }));
 }
 
