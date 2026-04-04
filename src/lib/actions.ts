@@ -1214,6 +1214,40 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     return { success: true };
 }
 
+export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
+    "use server";
+    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    if (!estimate) throw new Error("Estimate not found");
+
+    const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
+    const scheduleCount = await prisma.estimatePaymentSchedule.count({ where: { estimateId } });
+
+    await prisma.estimatePaymentSchedule.create({
+        data: {
+            estimateId,
+            name: `Payment — ${data.paymentMethod} (${refNum})`,
+            amount: data.amount,
+            dueDate: new Date(data.date),
+            order: scheduleCount,
+        },
+    });
+
+    // Update balance
+    const newBalance = Math.max(0, Number(estimate.balanceDue) - data.amount);
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: {
+            balanceDue: newBalance,
+            ...(newBalance === 0 ? { status: "Paid" } : {}),
+        },
+    });
+
+    if (estimate.projectId) {
+        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+    }
+    return { success: true };
+}
+
 export async function createInvoiceFromEstimate(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");

@@ -7,6 +7,7 @@ import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
 import SendEstimateModal from "@/components/SendEstimateModal";
 import SelectVendorModal from "./SelectVendorModal";
+import LogPaymentModal from "./LogPaymentModal";
 import { toast } from "sonner";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
@@ -37,6 +38,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showVendorSelectModal, setShowVendorSelectModal] = useState(false);
     const [isCreatingPO, setIsCreatingPO] = useState(false);
     const [isSyncingQB, setIsSyncingQB] = useState(false);
+    const [showPaymentModal, setShowPaymentModal] = useState(false);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
@@ -501,6 +503,13 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                             </button>
                                         </>
                                     )}
+                                    <button
+                                        onClick={() => { setShowPaymentModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-emerald-50 flex items-center gap-2.5 text-emerald-700"
+                                    >
+                                        <svg className="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                        Log Payment
+                                    </button>
                                     <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={handleSyncQB}
@@ -1062,9 +1071,18 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             )}
 
             {showVendorSelectModal && (
-                <SelectVendorModal 
+                <SelectVendorModal
                     onSelect={handleCreatePurchaseOrder}
                     onClose={() => setShowVendorSelectModal(false)}
+                />
+            )}
+
+            {showPaymentModal && (
+                <LogPaymentModal
+                    estimateId={initialEstimate.id}
+                    balanceDue={Number(initialEstimate.balanceDue) || 0}
+                    onClose={() => setShowPaymentModal(false)}
+                    onSaved={() => router.refresh()}
                 />
             )}
         </div>
