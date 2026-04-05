@@ -791,14 +791,25 @@ export async function getEstimateForPortal(id: string) {
 export async function getAllEstimates() {
     return await prisma.estimate.findMany({
         orderBy: { createdAt: "desc" },
-        include: {
+        select: {
+            id: true,
+            number: true,
+            title: true,
+            projectId: true,
+            leadId: true,
+            code: true,
+            status: true,
+            privacy: true,
+            createdAt: true,
+            totalAmount: true,
+            balanceDue: true,
             project: {
-                include: { client: true }
+                select: { name: true, client: { select: { name: true } } }
             },
             lead: {
-                include: { client: true }
-            }
-        }
+                select: { name: true, client: { select: { name: true } } }
+            },
+        },
     });
 }
 
