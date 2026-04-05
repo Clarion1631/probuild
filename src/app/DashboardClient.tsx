@@ -5,12 +5,14 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Avatar from "@/components/Avatar";
+import { toast } from "sonner";
 
 const ALL_WIDGETS = [
     { id: "projects", label: "Projects" },
     { id: "todo", label: "To-Do Next 7 Days" },
     { id: "create", label: "Create New" },
     { id: "quicklinks", label: "Quick Links" },
+    { id: "ai-summary", label: "AI Monthly Summary" },
 ] as const;
 
 type WidgetId = typeof ALL_WIDGETS[number]["id"];
@@ -41,6 +43,22 @@ export default function DashboardClient({
     const router = useRouter();
     const [visibleWidgets, setVisibleWidgets] = useState<Set<WidgetId>>(getInitialWidgets);
     const [customizeOpen, setCustomizeOpen] = useState(false);
+    const [aiSummary, setAiSummary] = useState<string | null>(null);
+    const [isLoadingSummary, setIsLoadingSummary] = useState(false);
+
+    async function handleGenerateSummary() {
+        setIsLoadingSummary(true);
+        try {
+            const res = await fetch("/api/ai/business-summary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed to generate summary");
+            setAiSummary(data.summary);
+        } catch (err: any) {
+            toast.error(err.message || "Failed to generate summary");
+        } finally {
+            setIsLoadingSummary(false);
+        }
+    }
 
     function toggleWidget(id: WidgetId) {
         setVisibleWidgets(prev => {
@@ -149,6 +167,46 @@ export default function DashboardClient({
                                 <Link href="/manager/schedule" className="mt-4 text-hui-primary font-medium text-sm hover:underline">
                                     Add a To-Do
                                 </Link>
+                            </div>
+                        </div>
+                    )}
+                    {/* AI Monthly Summary Widget */}
+                    {show("ai-summary") && (
+                        <div className="hui-card">
+                            <div className="p-4 border-b border-hui-border flex justify-between items-center">
+                                <h2 className="font-semibold text-lg text-hui-textMain flex items-center gap-2">
+                                    <svg className="w-5 h-5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+                                    AI Monthly Summary
+                                </h2>
+                                <button
+                                    onClick={handleGenerateSummary}
+                                    disabled={isLoadingSummary}
+                                    className="hui-btn hui-btn-primary text-xs px-3 py-1.5"
+                                >
+                                    {isLoadingSummary ? "Analyzing..." : aiSummary ? "Refresh" : "Generate"}
+                                </button>
+                            </div>
+                            <div className="p-4">
+                                {isLoadingSummary ? (
+                                    <div className="space-y-3 animate-pulse">
+                                        <div className="h-4 bg-slate-100 rounded w-3/4"></div>
+                                        <div className="h-4 bg-slate-100 rounded w-full"></div>
+                                        <div className="h-4 bg-slate-100 rounded w-5/6"></div>
+                                        <div className="h-4 bg-slate-100 rounded w-2/3"></div>
+                                        <div className="h-4 bg-slate-100 rounded w-full"></div>
+                                        <div className="h-4 bg-slate-100 rounded w-4/5"></div>
+                                    </div>
+                                ) : aiSummary ? (
+                                    <div className="text-sm text-hui-textMain whitespace-pre-wrap leading-relaxed font-mono bg-slate-50 p-4 rounded-lg border border-slate-100 max-h-96 overflow-y-auto">
+                                        {aiSummary}
+                                    </div>
+                                ) : (
+                                    <div className="text-center py-6 text-hui-textMuted">
+                                        <svg className="w-10 h-10 mx-auto mb-3 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+                                        <p className="text-sm font-medium">AI-powered business intelligence</p>
+                                        <p className="text-xs mt-1">Click Generate to get your monthly snapshot — revenue trends, project margins, cash flow outlook, and top risks.</p>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     )}
