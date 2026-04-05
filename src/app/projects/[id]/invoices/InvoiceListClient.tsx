@@ -50,7 +50,13 @@ export default function InvoiceListClient({ project, invoices }: { project: any;
     const totalAmount = invoices.reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
     const balanceDue = invoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
     const totalPaid = totalAmount - balanceDue;
-    const overdueInvoices = invoices.filter(inv => inv.status === "Overdue");
+    const now = new Date();
+    const overdueInvoices = invoices.filter(inv => {
+        if (inv.status === "Paid") return false;
+        if (inv.status === "Overdue") return true;
+        const due = inv.dueDate ? new Date(inv.dueDate) : null;
+        return due !== null && due < now;
+    });
     const overdueAmount = overdueInvoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
 
     const SortIcon = ({ col }: { col: SortKey }) => {
