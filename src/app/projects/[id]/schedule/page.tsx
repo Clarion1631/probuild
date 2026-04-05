@@ -1,17 +1,19 @@
-import { getProject, getScheduleTasks, getTeamMembers, getActiveSubcontractors } from "@/lib/actions";
+import { getProject, getScheduleTasks, getTeamMembers, getActiveSubcontractors, getPortalVisibility } from "@/lib/actions";
 import { getSessionOrDev } from "@/lib/auth";
 import GanttChart from "./GanttChart";
+import SchedulePublishButton from "./SchedulePublishButton";
 
 export const dynamic = "force-dynamic";
 
 export default async function SchedulePage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
-    const [project, rawTasks, teamMembers, subcontractors, session] = await Promise.all([
+    const [project, rawTasks, teamMembers, subcontractors, session, portalVisibility] = await Promise.all([
         getProject(id),
         getScheduleTasks(id),
         getTeamMembers(),
         getActiveSubcontractors(),
         getSessionOrDev(),
+        getPortalVisibility(id),
     ]);
     if (!project) return <div className="p-6 text-hui-textMuted">Project not found</div>;
 
@@ -42,15 +44,27 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
 
     return (
         <div className="flex flex-col h-[calc(100vh-64px)] -m-6 overflow-hidden bg-hui-background">
-            <GanttChart
-                projectId={id}
-                projectName={project.name}
-                initialTasks={tasks}
-                estimates={estimates}
-                teamMembers={teamMembers as any}
-                subcontractors={subcontractors as any}
-                currentUserId={currentUserId}
-            />
+            <div className="flex items-center justify-between px-4 py-2 border-b border-hui-border bg-white">
+                <div className="flex items-center gap-2">
+                    <h2 className="text-sm font-semibold text-hui-textMain">Schedule</h2>
+                    <span className="text-xs text-hui-textMuted">({tasks.length} tasks)</span>
+                </div>
+                <SchedulePublishButton
+                    projectId={id}
+                    initialPublished={portalVisibility.showSchedule}
+                />
+            </div>
+            <div className="flex-1 overflow-hidden">
+                <GanttChart
+                    projectId={id}
+                    projectName={project.name}
+                    initialTasks={tasks}
+                    estimates={estimates}
+                    teamMembers={teamMembers as any}
+                    subcontractors={subcontractors as any}
+                    currentUserId={currentUserId}
+                />
+            </div>
         </div>
     );
 }
