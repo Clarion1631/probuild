@@ -9,6 +9,8 @@ const NAV_SECTIONS = [
         items: [
             { label: "Payments Received", href: "/reports/payments" },
             { label: "Open Invoices", href: "/reports/open-invoices" },
+            { label: "Payouts", href: "/reports/payouts" },
+            { label: "Transactions", href: "/reports/transactions" },
         ],
     },
     {
