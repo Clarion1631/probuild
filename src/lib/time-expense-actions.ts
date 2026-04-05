@@ -127,7 +127,39 @@ export async function deleteExpense(id: string, projectId: string) {
     revalidatePath(`/projects/${projectId}/budget`);
 }
 
-// ─── Data Fetching ─────────────────────────────────────────────
+// ─── Individual Data Fetching ─────────────────────────────────
+
+export async function getTimeEntries(projectId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+
+    return prisma.timeEntry.findMany({
+        where: { projectId },
+        include: {
+            user: { select: { id: true, name: true, email: true, hourlyRate: true } },
+            costCode: { select: { id: true, name: true, code: true } },
+            costType: { select: { id: true, name: true } },
+        },
+        orderBy: { startTime: "desc" },
+    });
+}
+
+export async function getExpenses(projectId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+
+    return prisma.expense.findMany({
+        where: { estimate: { projectId } },
+        include: {
+            costCode: { select: { id: true, name: true, code: true } },
+            costType: { select: { id: true, name: true } },
+            item: { select: { id: true, name: true } },
+        },
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+// ─── Combined Data Fetching ───────────────────────────────────
 
 export async function getTimeExpenseData(projectId: string) {
     const timeEntries = await prisma.timeEntry.findMany({
