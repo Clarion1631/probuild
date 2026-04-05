@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Users, Building, FileText, Anchor } from "lucide-react";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 export default function CompanyLayout({ children }: { children: React.ReactNode }) {
     const pathname = usePathname();
@@ -68,7 +69,9 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
 
             {/* Main Content Area */}
             <main className="flex-1 flex flex-col overflow-y-auto w-full bg-hui-background">
-                {children}
+                <ErrorBoundary fallbackTitle="Company error">
+                    {children}
+                </ErrorBoundary>
             </main>
         </div>
     );

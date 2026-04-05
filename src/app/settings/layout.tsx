@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 export default function SettingsLayout({ children }: { children: React.ReactNode }) {
     const pathname = usePathname();
@@ -57,7 +58,9 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
             </aside>
             {/* Content */}
             <main className="flex-1 overflow-y-auto bg-hui-background h-full w-full">
-                {children}
+                <ErrorBoundary fallbackTitle="Settings error">
+                    {children}
+                </ErrorBoundary>
             </main>
         </div>
     );

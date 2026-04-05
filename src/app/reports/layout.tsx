@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 const NAV_SECTIONS = [
     {
@@ -75,7 +76,9 @@ export default function ReportsLayout({ children }: { children: React.ReactNode 
 
             {/* Content */}
             <main className="flex-1 overflow-y-auto bg-hui-background h-full w-full">
-                {children}
+                <ErrorBoundary fallbackTitle="Reports error">
+                    {children}
+                </ErrorBoundary>
             </main>
         </div>
     );
