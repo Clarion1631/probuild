@@ -2837,6 +2837,19 @@ export async function getUnreadMessageCount(projectId: string, forSenderType: "C
 
 
 
+export async function toggleSchedulePublished(projectId: string, published: boolean) {
+    const existing = await prisma.portalVisibility.findUnique({ where: { projectId } });
+    if (existing) {
+        await prisma.portalVisibility.update({ where: { projectId }, data: { showSchedule: published } });
+    } else {
+        await prisma.portalVisibility.create({
+            data: { projectId, showSchedule: published, showFiles: true, showDailyLogs: false, showEstimates: true, showInvoices: true, showContracts: true, showMessages: true, isPortalEnabled: true },
+        });
+    }
+    revalidatePath(`/projects/${projectId}`);
+    return { published };
+}
+
 export async function getPortalVisibility(projectId: string) {
     const record = await prisma.portalVisibility.findUnique({
         where: { projectId },

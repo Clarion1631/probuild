@@ -9,6 +9,7 @@ import {
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
     assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
     getEstimateItemsForProject,
+    toggleSchedulePublished, getPortalVisibility,
 } from "@/lib/actions";
 import { toast } from "sonner";
 
@@ -148,12 +149,29 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [showAssignMenu, setShowAssignMenu] = useState(false);
     const [estimateItems, setEstimateItems] = useState<EstimateItemSummary[]>([]);
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
+    const [isPublished, setIsPublished] = useState(false);
+    const [isPublishing, setIsPublishing] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const [dragState, setDragState] = useState<{
         taskId: string; type: "move" | "resize-left" | "resize-right"; startX: number; origStart: Date; origEnd: Date;
     } | null>(null);
 
     const selectedTask = tasks.find(t => t.id === selectedTaskId);
+
+    useEffect(() => {
+        getPortalVisibility(projectId).then(v => setIsPublished(v.showSchedule));
+    }, [projectId]);
+
+    async function handleTogglePublish() {
+        setIsPublishing(true);
+        try {
+            const next = !isPublished;
+            await toggleSchedulePublished(projectId, next);
+            setIsPublished(next);
+            toast.success(next ? "Schedule published to client portal" : "Schedule hidden from client portal");
+        } catch { toast.error("Failed to update publish status"); }
+        finally { setIsPublishing(false); }
+    }
 
     // Critical path computation
     const criticalPathIds = useMemo(() => computeCriticalPath(tasks), [tasks]);
@@ -614,6 +632,15 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             title="AI schedule risk analysis"
                         >
                             ⚠️ {isAiRisk ? "Analyzing…" : "AI Risk"}
+                        </button>
+                        <button
+                            onClick={handleTogglePublish}
+                            disabled={isPublishing}
+                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isPublished ? "bg-green-50 text-green-700 border-green-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
+                            title={isPublished ? "Schedule is visible to client — click to hide" : "Publish schedule to client portal"}
+                        >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={isPublished ? "M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" : "M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M3 3l18 18"} /></svg>
+                            {isPublishing ? "Updating…" : isPublished ? "Published" : "Publish to Client"}
                         </button>
                         <div className="relative">
                             <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
