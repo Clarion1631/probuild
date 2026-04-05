@@ -4503,6 +4503,19 @@ export async function deleteRetainer(id: string) {
     return { success: true };
 }
 
+// --- Schedule Baseline ---
+export async function setScheduleBaseline(projectId: string) {
+    const tasks = await prisma.scheduleTask.findMany({ where: { projectId } });
+    for (const task of tasks) {
+        await prisma.scheduleTask.update({
+            where: { id: task.id },
+            data: { baselineStartDate: task.startDate, baselineEndDate: task.endDate },
+        });
+    }
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return { count: tasks.length };
+}
+
 // --- Calendar Sync ---
 export async function syncScheduleToCalendar(projectId: string) {
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL || (process.env.NODE_ENV === 'production' ? 'https://probuild.goldentouchremodeling.com' : 'http://localhost:3000');
