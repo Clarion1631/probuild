@@ -19,6 +19,16 @@ const REPORT_SECTIONS = [
                 description: "View all unpaid and partially paid invoices with aging buckets (30/60/90+ days).",
                 href: "/reports/open-invoices",
             },
+            {
+                title: "Payouts",
+                description: "All outgoing payments including expenses, purchase orders, and subcontractor payments with monthly summaries.",
+                href: "/reports/payouts",
+            },
+            {
+                title: "Transactions",
+                description: "Combined view of all incoming and outgoing transactions with net cash flow analysis by project.",
+                href: "/reports/transactions",
+            },
         ],
     },
     {
