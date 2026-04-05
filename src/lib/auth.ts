@@ -1,14 +1,39 @@
 import { NextAuthOptions, getServerSession } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
+import CredentialsProvider from "next-auth/providers/credentials";
 import { prisma } from "@/lib/prisma";
 
+const providers: NextAuthOptions["providers"] = [
+    GoogleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID || "",
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
+    }),
+];
+
+// Test-only credentials provider — only active when PLAYWRIGHT_TEST_SECRET is set
+if (process.env.PLAYWRIGHT_TEST_SECRET) {
+    providers.push(
+        CredentialsProvider({
+            name: "Test",
+            credentials: {
+                email: { type: "text" },
+                secret: { type: "text" },
+            },
+            async authorize(credentials) {
+                if (credentials?.secret !== process.env.PLAYWRIGHT_TEST_SECRET) return null;
+                if (!credentials.email) return null;
+                const user = await prisma.user.findUnique({
+                    where: { email: credentials.email.toLowerCase() },
+                });
+                if (!user) return null;
+                return { id: user.id, name: user.name, email: user.email };
+            },
+        })
+    );
+}
+
 export const authOptions: NextAuthOptions = {
-    providers: [
-        GoogleProvider({
-            clientId: process.env.GOOGLE_CLIENT_ID || "",
-            clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
-        }),
-    ],
+    providers,
     pages: {
         signIn: "/login",
         error: "/login?error=AccessDenied",
