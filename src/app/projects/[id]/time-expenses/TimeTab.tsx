@@ -3,6 +3,8 @@
 import { useMemo, useState, useCallback } from "react";
 import { toast } from "sonner";
 import { deleteTimeEntry, getTimeEntries } from "@/lib/time-expense-actions";
+import { createInvoiceFromTimeEntries } from "@/lib/actions";
+import { useRouter } from "next/navigation";
 
 interface TimeEntry {
     id: string;
@@ -35,9 +37,11 @@ function fmtMoney(v: number): string {
 }
 
 export default function TimeTab({ projectId, entries: initialEntries, onAddNew, currentUser }: Props) {
+    const router = useRouter();
     const [entries, setEntries] = useState<TimeEntry[]>(initialEntries);
     const [filter, setFilter] = useState("");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
 
     const refreshEntries = useCallback(async () => {
         try {
@@ -149,13 +153,25 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                     />
                     {selectedIds.size > 0 && (
                         <button
-                            onClick={() => toast.info("Create Invoice from selected entries — coming soon")}
-                            className="hui-btn hui-btn-green text-sm px-3 py-1.5 flex items-center gap-1.5"
+                            onClick={async () => {
+                                setIsCreatingInvoice(true);
+                                try {
+                                    const res = await createInvoiceFromTimeEntries(projectId, Array.from(selectedIds));
+                                    toast.success("Invoice created from time entries");
+                                    router.push(`/projects/${res.projectId}/invoices/${res.id}`);
+                                } catch (err: any) {
+                                    toast.error(err.message || "Failed to create invoice");
+                                } finally {
+                                    setIsCreatingInvoice(false);
+                                }
+                            }}
+                            disabled={isCreatingInvoice}
+                            className="hui-btn hui-btn-green text-sm px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50"
                         >
                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                             </svg>
-                            Create Invoice ({selectedIds.size})
+                            {isCreatingInvoice ? "Creating..." : `Create Invoice (${selectedIds.size})`}
                         </button>
                     )}
                 </div>

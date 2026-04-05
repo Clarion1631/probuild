@@ -1355,6 +1355,57 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     return { id: invoice.id, projectId: estimate.projectId };
 }
 
+export async function createInvoiceFromTimeEntries(projectId: string, timeEntryIds: string[]) {
+    "use server";
+    if (!timeEntryIds.length) throw new Error("No time entries selected");
+
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) throw new Error("Project not found");
+
+    const entries = await prisma.timeEntry.findMany({
+        where: { id: { in: timeEntryIds } },
+        include: { user: true, costCode: true },
+    });
+
+    if (!entries.length) throw new Error("No matching time entries found");
+
+    const totalAmount = entries.reduce((sum, e) => sum + (Number(e.laborCost) || 0), 0);
+    const code = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const invoice = await prisma.invoice.create({
+        data: {
+            code,
+            projectId,
+            clientId: project.clientId,
+            status: "Draft",
+            totalAmount,
+            balanceDue: totalAmount,
+        },
+    });
+
+    // Create one payment schedule entry per time entry as line items
+    for (const entry of entries) {
+        const label = [
+            entry.user?.name || "Labor",
+            entry.costCode ? `(${entry.costCode.code})` : "",
+            `— ${Number(entry.durationHours || 0).toFixed(1)}h`,
+            `on ${new Date(entry.startTime).toLocaleDateString()}`,
+        ].filter(Boolean).join(" ");
+
+        await prisma.paymentSchedule.create({
+            data: {
+                invoiceId: invoice.id,
+                name: label,
+                amount: Number(entry.laborCost) || 0,
+                status: "Pending",
+            },
+        });
+    }
+
+    revalidatePath(`/projects/${projectId}/invoices`);
+    return { id: invoice.id, projectId };
+}
+
 export async function getInvoice(id: string) {
     const invoice = await prisma.invoice.findUnique({
         where: { id },
