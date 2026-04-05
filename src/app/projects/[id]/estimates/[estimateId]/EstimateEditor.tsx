@@ -44,6 +44,10 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
     const [showSidebar, setShowSidebar] = useState(false);
     const [sidebarTab, setSidebarTab] = useState<"overview" | "activity">("overview");
+    const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
+    const [showTerms, setShowTerms] = useState(false);
+    const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
+    const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
 
     function handleCreateAssembly() {
         if (selectedItemIds.length < 2) {
@@ -173,6 +177,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
             processingFeeMarkup, hideProcessingFee,
             expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
+            memo: memo || null,
+            termsAndConditions: termsAndConditions || null,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -1017,6 +1023,18 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     + Add milestone
                                 </button>
                             </div>
+                        </div>
+
+                        {/* Memo / Notes */}
+                        <div className="mt-8 mx-2">
+                            <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block px-1">Memo / Notes</label>
+                            <textarea
+                                value={memo}
+                                onChange={e => setMemo(e.target.value)}
+                                placeholder="Add a memo or note for this estimate (visible on the estimate document)..."
+                                className="w-full border border-slate-200 rounded-lg px-4 py-3 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-300 resize-none transition bg-white"
+                                rows={3}
+                            />
                         </div>
 
                         {/* Terms & Conditions Section */}
