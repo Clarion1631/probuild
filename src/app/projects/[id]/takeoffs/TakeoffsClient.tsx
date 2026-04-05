@@ -796,7 +796,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                     </td>
                                                                 </>)}
                                                                 <td className="px-4 py-3 text-right text-slate-800 font-medium whitespace-nowrap align-top">{formatCurrency(item.unitCost)}</td>
-                                                                <td className="px-4 py-3 text-right font-bold text-slate-900 whitespace-nowrap align-top">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                                <td className="px-4 py-3 text-right font-bold text-slate-900 whitespace-nowrap align-top">{formatCurrency(item.total)}</td>
                                                             </tr>
                                                         );
                                                     })}
@@ -805,7 +805,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                     <tr className="bg-slate-100 border-t-2 border-slate-300">
                                                         <td colSpan={viewMode === "internal" ? 8 : 6} className="px-4 py-4 text-right font-bold text-base text-slate-900">TOTAL</td>
                                                         <td className="px-4 py-4 text-right font-bold text-base text-green-700">
-                                                            ${((adjustedItems || parsedAiData.items || []).reduce((s: number, i: any) => s + (i.total || 0), 0) || parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                            {formatCurrency((adjustedItems || parsedAiData.items || []).reduce((s: number, i: any) => s + (Number(i.total) || 0), 0) || parsedAiData.totalEstimate || 0)}
                                                         </td>
                                                     </tr>
                                                 </tfoot>

@@ -86,7 +86,7 @@ export default function ReceiptQueueClient({ expenses: initialExpenses, projects
                                 <span>
                                     <strong>Amount:</strong>{" "}
                                     <span className="text-hui-textMain font-semibold">
-                                        ${exp.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                        ${Number(exp.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                                     </span>
                                 </span>
                                 {exp.date && (

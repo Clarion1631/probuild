@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 export default function InvoiceEditor({ project, initialInvoice }: { project: any, initialInvoice: any }) {
     const router = useRouter();
@@ -224,15 +225,15 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                             <div className="flex justify-between items-center bg-slate-50 p-5 rounded-lg border border-hui-border">
                                 <div>
                                     <p className="text-hui-textMuted text-sm mb-1">Total Amount</p>
-                                    <p className="text-2xl font-bold text-hui-textMain">${(initialInvoice.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                    <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(initialInvoice.totalAmount)}</p>
                                 </div>
                                 <div className="text-center">
                                     <p className="text-hui-textMuted text-sm mb-1">Paid</p>
-                                    <p className="text-2xl font-bold text-hui-primary">${((initialInvoice.totalAmount || 0) - (initialInvoice.balanceDue || 0)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                    <p className="text-2xl font-bold text-hui-primary">{formatCurrency((Number(initialInvoice.totalAmount) || 0) - (Number(initialInvoice.balanceDue) || 0))}</p>
                                 </div>
                                 <div className="text-right">
                                     <p className="text-hui-textMuted text-sm mb-1">Balance Due</p>
-                                    <p className={`text-2xl font-bold ${initialInvoice.balanceDue > 0 ? 'text-red-600' : 'text-emerald-600'}`}>${(initialInvoice.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                    <p className={`text-2xl font-bold ${initialInvoice.balanceDue > 0 ? 'text-red-600' : 'text-emerald-600'}`}>{formatCurrency(initialInvoice.balanceDue)}</p>
                                 </div>
                             </div>
                         </div>
@@ -312,7 +313,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 <StatusBadge status={payment.status} />
                                             </td>
                                             <td className="px-6 py-4 text-right font-medium text-hui-textMain">
-                                                ${(payment.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                {formatCurrency(payment.amount)}
                                             </td>
                                             <td className="px-6 py-4 text-right text-hui-textMuted">
                                                 {payment.paymentDate

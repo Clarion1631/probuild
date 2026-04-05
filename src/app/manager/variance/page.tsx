@@ -103,15 +103,15 @@ export default async function VarianceReportPage() {
                                 <div className="text-right">
                                     <div className="text-sm text-hui-textMuted mb-1">Total Labor Variance</div>
                                     <div className={`text-xl font-bold ${isOverBudget ? 'text-red-600' : 'text-green-600'}`}>
-                                        {isOverBudget ? '-' : '+'}${Math.abs(projectVariance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                        {isOverBudget ? '-' : '+'}${Number(Math.abs(projectVariance)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                     </div>
                                 </div>
                             </div>
 
                             <div className="p-6">
                                 <div className="flex justify-between text-sm mb-2">
-                                    <span className="font-medium text-hui-textMain">Budgeted Labor: ${totalLaborBudget.toLocaleString()}</span>
-                                    <span className="font-medium text-hui-textMain">Actual Labor + Burden: ${totalActualLabor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                    <span className="font-medium text-hui-textMain">Budgeted Labor: ${Number(totalLaborBudget).toLocaleString()}</span>
+                                    <span className="font-medium text-hui-textMain">Actual Labor + Burden: ${Number(totalActualLabor).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                 </div>
                                 <div className="w-full bg-slate-100 rounded-full h-3 mb-8 overflow-hidden flex">
                                     <div
@@ -132,14 +132,14 @@ export default async function VarianceReportPage() {
                                                 </div>
                                                 <div className="w-1/4 text-sm">
                                                     <div className="text-hui-textMuted">Budget</div>
-                                                    <div className="font-medium text-hui-textMain">${phase.laborBudget.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                                    <div className="font-medium text-hui-textMain">${Number(phase.laborBudget).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                                                 </div>
                                                 <div className="w-1/4 text-sm">
                                                     <div className="text-hui-textMuted">Actual (w/ Burden)</div>
-                                                    <div className="font-medium text-hui-textMain">${phase.actualLabor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                                    <div className="font-medium text-hui-textMain">${Number(phase.actualLabor).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                                                 </div>
                                                 <div className={`w-1/4 text-sm text-right font-bold ${variance < 0 ? 'text-red-600' : 'text-green-600'}`}>
-                                                    {variance < 0 ? '-' : '+'}${Math.abs(variance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                    {variance < 0 ? '-' : '+'}${Number(Math.abs(variance)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                                 </div>
                                             </div>
                                         );

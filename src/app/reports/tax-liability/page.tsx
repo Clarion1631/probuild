@@ -76,7 +76,7 @@ export default async function TaxLiabilityPage() {
 
     const months = Object.values(byMonth);
 
-    const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 });
+    const fmt = (n: number | any) => Number(n).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 });
 
     return (
         <div className="max-w-5xl mx-auto py-8 px-6 space-y-6">

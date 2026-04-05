@@ -171,7 +171,7 @@ export default function PortalSelectionsClient({ boards }: { boards: Board[] }) 
                                                         <div className="flex justify-between items-start mb-2 gap-2">
                                                             <h4 className="font-bold text-slate-800 leading-tight">{opt.name}</h4>
                                                             {opt.price != null && (
-                                                                <span className="font-semibold text-slate-600 shrink-0">+${opt.price.toLocaleString()}</span>
+                                                                <span className="font-semibold text-slate-600 shrink-0">+${Number(opt.price).toLocaleString()}</span>
                                                             )}
                                                         </div>
                                                         

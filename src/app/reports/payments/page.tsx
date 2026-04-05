@@ -35,7 +35,7 @@ export default async function PaymentsReportPage() {
     }
     const months = Object.keys(byMonth);
 
-    const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
+    const fmt = (n: number | any) => Number(n).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
 
     return (
         <div className="max-w-5xl mx-auto py-8 px-6 space-y-6">

@@ -20,7 +20,7 @@ export default async function GlobalTrackerPage() {
         },
     });
 
-    const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
+    const fmt = (n: number | any) => Number(n).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
 
     type Row = {
         id: string;

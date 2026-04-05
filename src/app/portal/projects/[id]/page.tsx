@@ -6,6 +6,7 @@ import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import PortalPayButton from "@/components/PortalPayButton";
 import { getPortalVisibility } from "@/lib/actions";
+import { formatCurrency } from "@/lib/utils";
 
 export default async function PortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const params = await props.params;
@@ -125,7 +126,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                         </span>
                                     </div>
                                     <div className="flex justify-between text-sm text-hui-textMuted">
-                                        <span>Total: ${(est.totalAmount || 0).toLocaleString()}</span>
+                                        <span>Total: {formatCurrency(est.totalAmount)}</span>
                                         <span>{new Date(est.createdAt).toLocaleDateString()}</span>
                                     </div>
                                 </Link>
@@ -178,7 +179,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                         </span>
                                     </div>
                                     <div className="flex justify-between text-sm text-hui-textMuted">
-                                        <span>Amount: ${(co.totalAmount || 0).toLocaleString()}</span>
+                                        <span>Amount: {formatCurrency(co.totalAmount)}</span>
                                         <span>{new Date(co.createdAt).toLocaleDateString()}</span>
                                     </div>
                                     <div className="mt-2 text-xs text-slate-400 truncate">
@@ -214,8 +215,8 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                         </span>
                                     </div>
                                     <div className="flex justify-between text-sm mb-4">
-                                        <span className="text-hui-textMuted">Amount: ${(inv.totalAmount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                                        <span className="font-medium text-hui-textMain">Due: ${(inv.balanceDue || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-hui-textMuted">Amount: {formatCurrency(inv.totalAmount)}</span>
+                                        <span className="font-medium text-hui-textMain">Due: {formatCurrency(inv.balanceDue)}</span>
                                     </div>
                                     
                                     {inv.payments && inv.payments.length > 0 && (
@@ -252,7 +253,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                                                                 settings={settings}
                                                             />
                                                         ) : (
-                                                            <span className="text-sm font-medium text-hui-textMain">${payment.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                                            <span className="text-sm font-medium text-hui-textMain">{formatCurrency(payment.amount)}</span>
                                                         )}
                                                     </div>
                                                 </div>

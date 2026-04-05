@@ -5,6 +5,7 @@ import { updateChangeOrder, deleteChangeOrder, approveChangeOrder } from "@/lib/
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
+import { formatCurrency } from "@/lib/utils";
 
 export default function ChangeOrderEditor({ context, initialData }: { context: any, initialData: any }) {
     const router = useRouter();
@@ -258,7 +259,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     />
                                                 </div>
                                                 <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
-                                                    ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                    {formatCurrency(itemTotal)}
                                                 </div>
                                                 <div className="w-10 pt-1.5 flex justify-end">
                                                     <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
@@ -287,16 +288,16 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <div className="w-80 space-y-4 text-sm">
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>Change Order Subtotal</span>
-                                        <span className="text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>Estimated Tax (8.7%)</span>
-                                        <span className="text-slate-800">${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-slate-800">{formatCurrency(tax)}</span>
                                     </div>
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
                                     <div className="flex justify-between text-xl font-extrabold text-slate-900">
                                         <span>Revised Amount</span>
-                                        <span className="text-amber-600">${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-amber-600">{formatCurrency(total)}</span>
                                     </div>
                                 </div>
                             </div>

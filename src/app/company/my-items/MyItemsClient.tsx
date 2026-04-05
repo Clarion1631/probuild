@@ -117,7 +117,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
         });
     }
 
-    const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+    const fmt = (n: number) => Number(n).toLocaleString("en-US", { style: "currency", currency: "USD" });
 
     return (
         <div className="max-w-4xl mx-auto py-8 px-6 space-y-6">

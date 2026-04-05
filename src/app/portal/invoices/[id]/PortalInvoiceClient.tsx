@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from "react";
 import { markInvoiceViewed } from "@/lib/actions";
 import PortalPayButton from "@/components/PortalPayButton";
+import { formatCurrency } from "@/lib/utils";
 
 export default function PortalInvoiceClient({ initialInvoice, companySettings }: { initialInvoice: any, companySettings?: any }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
@@ -99,16 +100,16 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                         <div className="flex justify-between items-center">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Total Amount</p>
-                                <p className="text-2xl font-bold text-slate-800">${(initialInvoice.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                <p className="text-2xl font-bold text-slate-800">{formatCurrency(initialInvoice.totalAmount)}</p>
                             </div>
                             <div className="text-center">
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Paid</p>
-                                <p className="text-2xl font-bold text-green-600">${totalPaid.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                <p className="text-2xl font-bold text-green-600">{formatCurrency(totalPaid)}</p>
                             </div>
                             <div className="text-right">
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Balance Due</p>
                                 <p className={`text-2xl font-bold ${initialInvoice.balanceDue > 0 ? 'text-red-600' : 'text-green-600'}`}>
-                                    ${(initialInvoice.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                    {formatCurrency(initialInvoice.balanceDue)}
                                 </p>
                             </div>
                         </div>
@@ -163,7 +164,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                                             </div>
                                             <div className="flex items-center gap-4">
                                                 <span className="font-semibold text-slate-800 text-lg">
-                                                    ${(payment.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                    {formatCurrency(payment.amount)}
                                                 </span>
                                                 {!isPaidItem && (
                                                     <PortalPayButton 

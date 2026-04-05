@@ -166,7 +166,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                 </div>
                 <div className="hui-card p-4">
                     <p className="text-xs text-hui-textMuted font-medium">Total Revenue</p>
-                    <p className="text-3xl font-bold text-hui-textMain mt-1">{totalRevenue.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 0 })}</p>
+                    <p className="text-3xl font-bold text-hui-textMain mt-1">{Number(totalRevenue).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 0 })}</p>
                 </div>
             </div>
 

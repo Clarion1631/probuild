@@ -5,6 +5,7 @@ import { approveChangeOrder } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -180,8 +181,8 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                                 <div className="font-medium text-slate-800">{item.name}</div>
                                             </td>
                                             <td className="py-3 text-center text-slate-600">{item.quantity}</td>
-                                            <td className="py-3 text-right text-slate-600">${parseFloat(item.unitCost).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                            <td className="py-3 text-right font-medium text-slate-800">${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                            <td className="py-3 text-right text-slate-600">{formatCurrency(item.unitCost)}</td>
+                                            <td className="py-3 text-right font-medium text-slate-800">{formatCurrency(itemTotal)}</td>
                                         </tr>
                                     );
                                 })}
@@ -196,15 +197,15 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                             <div className="w-72">
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
                                     <span>Subtotal</span>
-                                    <span>${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                    <span>{formatCurrency(subtotal)}</span>
                                 </div>
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
                                     <span>Tax (8.7%)</span>
-                                    <span>${tax.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                    <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-amber-600">
                                     <span>Revised Amount</span>
-                                    <span>${total.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                    <span>{formatCurrency(total)}</span>
                                 </div>
                             </div>
                         </div>

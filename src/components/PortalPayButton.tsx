@@ -81,7 +81,7 @@ export default function PortalPayButton({
                 onClick={handleButtonClick}
                 className="flex-shrink-0 w-full sm:w-auto px-4 py-2 bg-hui-primary hover:bg-hui-primaryHover text-white text-sm font-medium rounded-md shadow-sm transition-colors flex items-center justify-center gap-2"
             >
-                {label} - ${(amount).toLocaleString()}
+                {label} - ${Number(amount).toLocaleString()}
             </button>
 
             {isModalOpen && (

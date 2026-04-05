@@ -25,7 +25,7 @@ export default function TimeBillingClient({ entries, groupBy }: Props) {
     const totalHours = entries.reduce((s, e) => s + (e.durationHours ?? 0), 0);
     const totalCost = entries.reduce((s, e) => s + (e.laborCost ?? 0), 0);
 
-    const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
+    const fmt = (n: number | any) => Number(n).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
     const fmtH = (n: number) => `${n.toFixed(1)}h`;
 
     // Group entries

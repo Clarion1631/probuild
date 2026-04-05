@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
+import { formatCurrency } from "@/lib/utils";
 
 export default function PortalEstimateClient({ initialEstimate, companySettings }: { initialEstimate: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -183,8 +184,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                     {item.description && <div className="text-xs text-slate-500 mt-0.5">{item.description}</div>}
                                                 </td>
                                                 <td className="py-3 text-center text-slate-600">{!hasSubItems ? item.quantity : ""}</td>
-                                                <td className="py-3 text-right text-slate-600">{!hasSubItems ? `$${item.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ""}</td>
-                                                <td className="py-3 text-right font-medium text-slate-800">${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                <td className="py-3 text-right text-slate-600">{!hasSubItems ? formatCurrency(item.unitCost) : ""}</td>
+                                                <td className="py-3 text-right font-medium text-slate-800">{formatCurrency(itemTotal)}</td>
                                             </tr>
                                             {hasSubItems && item.subItems.map((sub: any) => (
                                                 <tr key={sub.id}>
@@ -195,8 +196,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                         {sub.description && <div className="text-xs text-slate-400 ml-5 mt-0.5">{sub.description}</div>}
                                                     </td>
                                                     <td className="py-2.5 text-center text-slate-500">{sub.quantity}</td>
-                                                    <td className="py-2.5 text-right text-slate-500">${sub.unitCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                                    <td className="py-2.5 text-right text-slate-700">${sub.total.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                    <td className="py-2.5 text-right text-slate-500">{formatCurrency(sub.unitCost)}</td>
+                                                    <td className="py-2.5 text-right text-slate-700">{formatCurrency(sub.total)}</td>
                                                 </tr>
                                             ))}
                                         </React.Fragment>
@@ -210,15 +211,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                             <div className="w-72">
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
                                     <span>Subtotal</span>
-                                    <span>${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                    <span>{formatCurrency(subtotal)}</span>
                                 </div>
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
                                     <span>Tax (8.7%)</span>
-                                    <span>${tax.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                    <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-slate-800">
                                     <span>Total</span>
-                                    <span>${total.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                    <span>{formatCurrency(total)}</span>
                                 </div>
                             </div>
                         </div>
@@ -237,7 +238,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                         </div>
                                         <div className="flex gap-6 items-center">
                                             <span className="text-slate-500 text-xs">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : "TBD"}</span>
-                                            <span className="font-semibold text-slate-800 w-24 text-right">${p.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                            <span className="font-semibold text-slate-800 w-24 text-right">{formatCurrency(p.amount)}</span>
                                         </div>
                                     </div>
                                 ))}

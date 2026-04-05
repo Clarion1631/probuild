@@ -5,6 +5,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import ProjectHeader from "./ProjectHeader";
 import ProjectDashboardsWidget from "@/components/ProjectDashboardsWidget";
+import { formatCurrency } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
@@ -24,7 +25,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         ]).then(([logs, cos, invs]) => [
             ...logs.map(l => ({ type: "dailylog" as const, id: l.id, label: `Daily log · ${new Date(l.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`, sub: l.workPerformed.slice(0, 60), date: new Date(l.createdAt), href: `/projects/${id}/dailylogs` })),
             ...cos.map(c => ({ type: "changeorder" as const, id: c.id, label: `Change order · ${c.title}`, sub: c.status, date: new Date(c.createdAt), href: `/projects/${id}/change-orders/${c.id}` })),
-            ...invs.map(i => ({ type: "invoice" as const, id: i.id, label: `Invoice ${i.code}`, sub: `${i.status} · $${i.totalAmount.toLocaleString()}`, date: new Date(i.createdAt), href: `/projects/${id}/invoices/${i.id}` })),
+            ...invs.map(i => ({ type: "invoice" as const, id: i.id, label: `Invoice ${i.code}`, sub: `${i.status} · ${formatCurrency(i.totalAmount)}`, date: new Date(i.createdAt), href: `/projects/${id}/invoices/${i.id}` })),
         ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 8)),
     ]);
     const estimates = project.estimates || [];
@@ -58,7 +59,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                 <div className="bg-white rounded-xl border border-slate-200/80 p-5 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden">
                     <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-indigo-400 to-blue-500" />
                     <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-1.5">Budget</p>
-                    <p className="text-2xl font-bold text-hui-textMain">${totalBudget.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                    <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(totalBudget)}</p>
                     <p className="text-[10px] text-slate-400 mt-1">{estimates.length} estimate{estimates.length !== 1 ? 's' : ''}</p>
                 </div>
                 <div className="bg-white rounded-xl border border-slate-200/80 p-5 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden">
