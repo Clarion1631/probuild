@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Avatar from "@/components/Avatar";
 
@@ -37,6 +38,7 @@ export default function DashboardClient({
     projects: Project[];
     userName: string | null;
 }) {
+    const router = useRouter();
     const [visibleWidgets, setVisibleWidgets] = useState<Set<WidgetId>>(getInitialWidgets);
     const [customizeOpen, setCustomizeOpen] = useState(false);
 
@@ -105,11 +107,15 @@ export default function DashboardClient({
                                 <table className="w-full text-sm text-left">
                                     <tbody className="divide-y divide-gray-100">
                                         {projects.slice(0, 5).map((p) => (
-                                            <tr key={p.id} className="hover:bg-slate-50 transition-colors group">
+                                            <tr
+                                                key={p.id}
+                                                onClick={() => router.push(`/projects/${p.id}/overview`)}
+                                                className="hover:bg-slate-50 transition-colors group cursor-pointer"
+                                            >
                                                 <td className="px-4 py-3">
-                                                    <Link href={`/projects/${p.id}/estimates`} className="font-semibold text-hui-textMain hover:text-hui-primary transition-colors block">
+                                                    <span className="font-semibold text-hui-textMain group-hover:text-hui-primary transition-colors block">
                                                         {p.name}
-                                                    </Link>
+                                                    </span>
                                                     <span className="text-xs text-hui-textMuted">{p.client?.name || "No Client"}</span>
                                                 </td>
                                                 <td className="px-4 py-3 text-right">
