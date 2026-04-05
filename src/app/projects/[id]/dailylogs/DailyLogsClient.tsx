@@ -81,6 +81,9 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     const [photoLightbox, setPhotoLightbox] = useState<{ url: string; caption: string | null } | null>(null);
     const [exporting, setExporting] = useState(false);
     const [isGeneratingAI, setIsGeneratingAI] = useState(false);
+    const [isDetectingCO, setIsDetectingCO] = useState(false);
+    const [coDetections, setCoDetections] = useState<string | null>(null);
+    const [showCOModal, setShowCOModal] = useState(false);
 
     // Form state
     const [formDate, setFormDate] = useState(new Date().toISOString().split("T")[0]);
@@ -274,6 +277,29 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
         }
     };
 
+    const handleDetectChangeOrders = async () => {
+        setIsDetectingCO(true);
+        try {
+            const res = await fetch("/api/ai/change-order-detect", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+            });
+            if (!res.ok) {
+                const data = await res.json();
+                throw new Error(data.error || "Failed to detect change orders");
+            }
+            const data = await res.json();
+            setCoDetections(data.detections);
+            setShowCOModal(true);
+        } catch (error: any) {
+            console.error(error);
+            toast.error(error.message || "Failed to detect change orders. Try again.");
+        } finally {
+            setIsDetectingCO(false);
+        }
+    };
+
     // Group logs by month/year
     const groupedLogs: Record<string, DailyLog[]> = {};
     for (const log of logs) {
@@ -294,6 +320,24 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                     </p>
                 </div>
                 <div className="flex items-center gap-3">
+                    <button
+                        onClick={handleDetectChangeOrders}
+                        disabled={isDetectingCO || logs.length === 0}
+                        className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border transition bg-gradient-to-r from-orange-50 to-amber-50 text-orange-700 border-orange-200 hover:from-orange-100 hover:to-amber-100 disabled:opacity-50"
+                    >
+                        {isDetectingCO ? (
+                            <span className="w-4 h-4 border-2 border-orange-300 border-t-orange-600 rounded-full animate-spin" />
+                        ) : (
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                            </svg>
+                        )}
+                        {isDetectingCO ? (
+                            <span className="animate-pulse">Scanning Logs...</span>
+                        ) : (
+                            "AI Detect Change Orders"
+                        )}
+                    </button>
                     <button
                         onClick={handleExportPdf}
                         disabled={exporting || logs.length === 0}
@@ -769,6 +813,32 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                 </button>
                             </div>
                         </form>
+                    </div>
+                </div>
+            )}
+
+            {/* AI Change Order Detection Modal */}
+            {showCOModal && coDetections && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center">
+                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowCOModal(false)} />
+                    <div className="relative bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col">
+                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xl">📋</span>
+                                <h2 className="font-bold text-hui-textMain text-lg">AI Change Order Detection</h2>
+                            </div>
+                            <button onClick={() => setShowCOModal(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-5 overflow-y-auto flex-1">
+                            <div className="prose prose-sm max-w-none text-hui-textMain whitespace-pre-wrap text-sm leading-relaxed">
+                                {coDetections}
+                            </div>
+                        </div>
+                        <div className="p-4 border-t border-hui-border">
+                            <button onClick={() => setShowCOModal(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
+                        </div>
                     </div>
                 </div>
             )}
