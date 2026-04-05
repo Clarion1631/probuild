@@ -239,6 +239,18 @@ model Estimate {
   termsAndConditions String? // Snapshot of T&C HTML at time of sending
   sentAt             DateTime? // When the estimate was emailed to the client
   changeOrders       ChangeOrder[]
+  files              EstimateFile[]
+}
+
+model EstimateFile {
+  id         String   @id @default(cuid())
+  name       String
+  url        String
+  size       Int
+  type       String // Mime type
+  estimateId String
+  estimate   Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
 }
 
 model EstimatePaymentSchedule {

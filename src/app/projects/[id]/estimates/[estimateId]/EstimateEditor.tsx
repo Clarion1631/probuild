@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -47,6 +47,44 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
     const [showTerms, setShowTerms] = useState(false);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
+    const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
+    const [isUploadingFile, setIsUploadingFile] = useState(false);
+
+    async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        setIsUploadingFile(true);
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            await uploadEstimateFile(initialEstimate.id, formData);
+            const files = await getEstimateFiles(initialEstimate.id);
+            setEstimateFiles(files);
+            toast.success("File uploaded");
+        } catch (err: any) {
+            toast.error(err.message || "Failed to upload file");
+        } finally {
+            setIsUploadingFile(false);
+            e.target.value = "";
+        }
+    }
+
+    async function handleDeleteFile(fileId: string) {
+        if (!confirm("Delete this file?")) return;
+        try {
+            await deleteEstimateFile(fileId);
+            setEstimateFiles(prev => prev.filter(f => f.id !== fileId));
+            toast.success("File deleted");
+        } catch {
+            toast.error("Failed to delete file");
+        }
+    }
+
+    function formatFileSize(bytes: number): string {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+        return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    }
 
     function handleCreateAssembly() {
         if (selectedItemIds.length < 2) {
@@ -1034,6 +1072,34 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 className="w-full border border-slate-200 rounded-lg px-4 py-3 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-300 resize-none transition bg-white"
                                 rows={3}
                             />
+                        </div>
+
+                        {/* Files Section */}
+                        <div className="mt-8 mx-2">
+                            <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block px-1">Attached Files</label>
+                            <div className="bg-white rounded-xl border border-slate-200 p-4">
+                                {estimateFiles.length > 0 && (
+                                    <div className="space-y-2 mb-3">
+                                        {estimateFiles.map((f: any) => (
+                                            <div key={f.id} className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2 group">
+                                                <a href={f.url} target="_blank" rel="noreferrer" className="flex items-center gap-2 text-sm text-hui-textMain hover:text-hui-primary transition truncate">
+                                                    <svg className="w-4 h-4 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+                                                    <span className="truncate">{f.name}</span>
+                                                    <span className="text-xs text-slate-400 flex-shrink-0">{formatFileSize(f.size)}</span>
+                                                </a>
+                                                <button onClick={() => handleDeleteFile(f.id)} className="text-slate-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition ml-2" title="Delete">
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg>
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                                <label className={`flex items-center justify-center gap-2 border-2 border-dashed border-slate-200 rounded-lg px-4 py-3 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/30 transition ${isUploadingFile ? "opacity-50 pointer-events-none" : ""}`}>
+                                    <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                                    <span className="text-sm text-slate-500">{isUploadingFile ? "Uploading..." : "Upload File"}</span>
+                                    <input type="file" className="hidden" onChange={handleFileUpload} disabled={isUploadingFile} />
+                                </label>
+                            </div>
                         </div>
 
                         {/* Terms & Conditions Section */}

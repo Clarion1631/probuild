@@ -738,6 +738,9 @@ export async function getEstimate(id: string) {
                 orderBy: { order: "asc" },
             },
             expenses: true,
+            files: {
+                orderBy: { createdAt: "desc" },
+            },
         },
     });
     return estimate;
@@ -3555,6 +3558,72 @@ export async function deletePurchaseOrderFile(fileId: string) {
 
     await prisma.purchaseOrderFile.delete({ where: { id: fileId } });
     revalidatePath(`/projects/${file.purchaseOrder.projectId}/purchase-orders/${file.purchaseOrderId}`);
+}
+
+export async function uploadEstimateFile(estimateId: string, formData: FormData) {
+    "use server";
+    const file = formData.get("file") as File;
+    if (!file) throw new Error("No file uploaded");
+
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
+
+    const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+    const supabase = getSupabase();
+    if (!supabase) throw new Error("Storage not configured");
+
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storagePath = `estimates/${estimateId}/${Date.now()}_${safeName}`;
+
+    const { error: uploadError } = await supabase.storage
+        .from(STORAGE_BUCKET)
+        .upload(storagePath, buffer, {
+            contentType: file.type || "application/octet-stream",
+            upsert: false,
+        });
+
+    if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+
+    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl || storagePath;
+
+    const uploaded = await prisma.estimateFile.create({
+        data: {
+            estimateId,
+            name: file.name,
+            url: publicUrl,
+            size: file.size,
+            type: file.type || "application/octet-stream",
+        }
+    });
+
+    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    if (estimate?.projectId) {
+        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+    }
+    if (estimate?.leadId) {
+        revalidatePath(`/leads/${estimate.leadId}`);
+    }
+    return uploaded;
+}
+
+export async function deleteEstimateFile(fileId: string) {
+    "use server";
+    const file = await prisma.estimateFile.findUnique({ where: { id: fileId }, include: { estimate: true } });
+    if (!file) return;
+
+    await prisma.estimateFile.delete({ where: { id: fileId } });
+    if (file.estimate.projectId) {
+        revalidatePath(`/projects/${file.estimate.projectId}/estimates/${file.estimateId}`);
+    }
+}
+
+export async function getEstimateFiles(estimateId: string) {
+    "use server";
+    return prisma.estimateFile.findMany({
+        where: { estimateId },
+        orderBy: { createdAt: "desc" },
+    });
 }
 
 
