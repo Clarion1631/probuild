@@ -1,0 +1,20 @@
+name: QA Trigger — Kick P2 on PR
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+jobs:
+  notify-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post QA kick to Slack
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "<@U0AR8C72MQR> QA needed on PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}\nBranch: `${{ github.head_ref }}`\n\n1. `cd /app/repos/probuild && git fetch origin && git checkout ${{ github.head_ref }} && git pull origin ${{ github.head_ref }}`\n2. `bun install && bunx prisma generate`\n3. `bunx playwright test`\n4. Post results here. If PASS, merge PR #${{ github.event.pull_request.number }} with `gh pr merge ${{ github.event.pull_request.number }} --squash`"
+            }
