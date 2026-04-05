@@ -9,6 +9,7 @@ import SendEstimateModal from "@/components/SendEstimateModal";
 import SelectVendorModal from "./SelectVendorModal";
 import LogPaymentModal from "./LogPaymentModal";
 import { toast } from "sonner";
+import ReusableSignaturePad from "@/components/ReusableSignaturePad";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
@@ -49,6 +50,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
     const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
     const [isUploadingFile, setIsUploadingFile] = useState(false);
+    const [signatureUrl, setSignatureUrl] = useState<string | null>(initialEstimate.signatureUrl || null);
     const [assemblies, setAssemblies] = useState<any[]>([]);
     const [showAssemblyDropdown, setShowAssemblyDropdown] = useState(false);
     const [assemblyName, setAssemblyName] = useState("");
@@ -280,6 +282,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
             memo: memo || null,
             termsAndConditions: termsAndConditions || null,
+            signatureUrl: signatureUrl || null,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -1245,6 +1248,38 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         />
                                     </div>
                                 )}
+                            </div>
+                        </div>
+
+                        {/* Signature Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <div className="flex items-center justify-between px-6 py-4">
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Client Signature</span>
+                                        {signatureUrl && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">Signed</span>}
+                                    </div>
+                                    {signatureUrl && (
+                                        <button onClick={() => setSignatureUrl(null)} className="text-xs text-red-500 hover:text-red-700 font-medium">Clear Signature</button>
+                                    )}
+                                </div>
+                                <div className="px-6 pb-5 border-t border-slate-100">
+                                    {signatureUrl ? (
+                                        <div className="mt-3 bg-slate-50 rounded-lg p-4 border border-slate-100 flex items-center gap-4">
+                                            <img src={signatureUrl} alt="Client signature" className="max-h-20 rounded" />
+                                            <div>
+                                                <p className="text-xs text-green-600 font-semibold">Signature captured</p>
+                                                <p className="text-xs text-slate-400 mt-0.5">Will be saved with the estimate</p>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="mt-3">
+                                            <p className="text-xs text-slate-500 mb-3">Draw signature below. This will be included on the signed estimate.</p>
+                                            <ReusableSignaturePad onSignatureChange={(dataUrl: string | null) => setSignatureUrl(dataUrl)} />
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                         </div>
 

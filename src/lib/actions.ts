@@ -1184,6 +1184,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
             ...(data.memo !== undefined && { memo: data.memo }),
             ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+            ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
         },
     });
 
