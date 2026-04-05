@@ -1752,6 +1752,40 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
 }
 
 // =============================================
+// Assembly (Reusable Item Bundles)
+// =============================================
+
+export async function saveItemsAsAssembly(name: string, items: { name: string; description?: string; type: string; quantity: number; baseCost: number; markupPercent: number; unitCost: number; order: number; parentId?: string | null; costCodeId?: string | null; costTypeId?: string | null; isSection?: boolean }[]) {
+    const template = await prisma.estimateTemplate.create({
+        data: {
+            name,
+            items: {
+                create: items.map((item, idx) => ({
+                    name: item.name,
+                    description: item.description || "",
+                    type: item.type,
+                    quantity: item.quantity,
+                    baseCost: item.baseCost || 0,
+                    markupPercent: item.markupPercent,
+                    unitCost: item.unitCost || 0,
+                    order: idx,
+                    parentId: item.parentId || null,
+                    costCodeId: item.costCodeId || null,
+                    costTypeId: item.costTypeId || null,
+                })),
+            },
+        },
+        include: { items: true },
+    });
+    return { id: template.id, name: template.name, itemCount: template.items.length };
+}
+
+export async function deleteAssembly(templateId: string) {
+    await prisma.estimateTemplate.delete({ where: { id: templateId } });
+    return { success: true };
+}
+
+// =============================================
 // Document Templates CRUD
 // =============================================
 

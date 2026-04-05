@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -49,6 +49,15 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
     const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
     const [isUploadingFile, setIsUploadingFile] = useState(false);
+    const [assemblies, setAssemblies] = useState<any[]>([]);
+    const [showAssemblyDropdown, setShowAssemblyDropdown] = useState(false);
+    const [assemblyName, setAssemblyName] = useState("");
+    const [showAssemblyNameModal, setShowAssemblyNameModal] = useState(false);
+    const [isSavingAssembly, setIsSavingAssembly] = useState(false);
+
+    useEffect(() => {
+        getEstimateTemplates().then(setAssemblies).catch(() => {});
+    }, []);
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const file = e.target.files?.[0];
@@ -91,30 +100,85 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             toast.error("Select at least 2 items to create an assembly");
             return;
         }
+        setAssemblyName("");
+        setShowAssemblyNameModal(true);
+    }
+
+    async function handleSaveAssembly() {
+        if (!assemblyName.trim()) {
+            toast.error("Enter a name for the assembly");
+            return;
+        }
+        setIsSavingAssembly(true);
+        try {
+            const selectedItems = items.filter(item => selectedItemIds.includes(item.id));
+            await saveItemsAsAssembly(assemblyName.trim(), selectedItems.map((item, idx) => ({
+                name: item.name,
+                description: item.description || "",
+                type: item.type,
+                quantity: item.quantity,
+                baseCost: Number(item.baseCost) || 0,
+                markupPercent: item.markupPercent,
+                unitCost: Number(item.unitCost) || 0,
+                order: idx,
+                costCodeId: item.costCodeId,
+                costTypeId: item.costTypeId,
+            })));
+            // Also group in current estimate
+            const sectionId = generateId();
+            const newItems = items.map(item =>
+                selectedItemIds.includes(item.id) ? { ...item, parentId: sectionId } : item
+            );
+            const insertAt = newItems.findIndex(item => item.parentId === sectionId);
+            newItems.splice(insertAt, 0, {
+                id: sectionId, name: assemblyName.trim(), description: "", type: "Section",
+                quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
+                parentId: null, costCodeId: null, costTypeId: null, isSection: true,
+            });
+            setItems(newItems);
+            setSelectedItemIds([]);
+            setShowAssemblyNameModal(false);
+            const updated = await getEstimateTemplates();
+            setAssemblies(updated);
+            toast.success(`Assembly "${assemblyName.trim()}" saved`);
+        } catch (err: any) {
+            toast.error(err.message || "Failed to save assembly");
+        } finally {
+            setIsSavingAssembly(false);
+        }
+    }
+
+    function handleInsertAssembly(assembly: any) {
+        const newItems = [...items];
         const sectionId = generateId();
-        const sectionName = "Assembly";
-        const newItems = items.map(item =>
-            selectedItemIds.includes(item.id) ? { ...item, parentId: sectionId } : item
-        );
-        const insertAt = newItems.findIndex(item => item.parentId === sectionId);
-        newItems.splice(insertAt, 0, {
-            id: sectionId,
-            name: sectionName,
-            description: "",
-            type: "Section",
-            quantity: 1,
-            baseCost: 0,
-            markupPercent: 0,
-            unitCost: 0,
-            total: 0,
-            parentId: null,
-            costCodeId: null,
-            costTypeId: null,
-            isSection: true,
+        newItems.push({
+            id: sectionId, name: assembly.name, description: "", type: "Section",
+            quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
+            parentId: null, costCodeId: null, costTypeId: null, isSection: true,
         });
+        for (const tItem of assembly.items) {
+            newItems.push({
+                id: generateId(), name: tItem.name, description: tItem.description || "",
+                type: tItem.type, quantity: tItem.quantity,
+                baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                unitCost: Number(tItem.unitCost) || 0,
+                total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+            });
+        }
         setItems(newItems);
-        setSelectedItemIds([]);
-        toast.success("Assembly created");
+        setShowAssemblyDropdown(false);
+        toast.success(`Inserted "${assembly.name}"`);
+    }
+
+    async function handleDeleteAssembly(assemblyId: string, e: React.MouseEvent) {
+        e.stopPropagation();
+        if (!confirm("Delete this assembly?")) return;
+        try {
+            await deleteAssembly(assemblyId);
+            setAssemblies(prev => prev.filter(a => a.id !== assemblyId));
+            toast.success("Assembly deleted");
+        } catch { toast.error("Failed to delete assembly"); }
     }
 
     async function handleCreateChangeOrder() {
@@ -658,18 +722,72 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 </div>
             </div>
 
-            {/* Selected Items Action Bar */}
-            {selectedItemIds.length > 0 && (
-                <div className="bg-amber-50 border-b border-amber-200 px-6 py-2 flex items-center gap-3 text-sm">
-                    <span className="font-medium text-amber-800">{selectedItemIds.length} item{selectedItemIds.length > 1 ? 's' : ''} selected</span>
-                    <div className="h-4 w-px bg-amber-300"></div>
-                    <button onClick={handleCreateAssembly} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-amber-300 text-amber-800 hover:bg-amber-100 flex items-center gap-1.5">
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
-                        Create Assembly
-                    </button>
-                    <button onClick={() => setSelectedItemIds([])} className="text-amber-600 hover:text-amber-800 text-xs font-medium ml-auto">
-                        Clear selection
-                    </button>
+            {/* Selected Items Action Bar + Insert Assembly */}
+            <div className="bg-amber-50 border-b border-amber-200 px-6 py-2 flex items-center gap-3 text-sm">
+                {selectedItemIds.length > 0 ? (
+                    <>
+                        <span className="font-medium text-amber-800">{selectedItemIds.length} item{selectedItemIds.length > 1 ? 's' : ''} selected</span>
+                        <div className="h-4 w-px bg-amber-300"></div>
+                        <button onClick={handleCreateAssembly} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-amber-300 text-amber-800 hover:bg-amber-100 flex items-center gap-1.5">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                            Save as Assembly
+                        </button>
+                        <button onClick={() => setSelectedItemIds([])} className="text-amber-600 hover:text-amber-800 text-xs font-medium ml-auto">
+                            Clear selection
+                        </button>
+                    </>
+                ) : (
+                    <div className="relative">
+                        <button onClick={() => setShowAssemblyDropdown(!showAssemblyDropdown)} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-amber-300 text-amber-800 hover:bg-amber-100 flex items-center gap-1.5">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                            Insert Assembly
+                            <svg className="w-3 h-3 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                        </button>
+                        {showAssemblyDropdown && (
+                            <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-50 w-72 max-h-64 overflow-y-auto">
+                                {assemblies.length === 0 ? (
+                                    <div className="p-4 text-center text-slate-400 text-xs">No saved assemblies yet. Select items and click &quot;Save as Assembly&quot; to create one.</div>
+                                ) : (
+                                    assemblies.map(a => (
+                                        <div key={a.id} onClick={() => handleInsertAssembly(a)} className="px-4 py-3 hover:bg-slate-50 cursor-pointer border-b border-slate-50 last:border-0 flex items-center justify-between group">
+                                            <div>
+                                                <p className="text-sm font-medium text-slate-800">{a.name}</p>
+                                                <p className="text-xs text-slate-400">{a.items.length} item{a.items.length !== 1 ? 's' : ''}</p>
+                                            </div>
+                                            <button onClick={(e) => handleDeleteAssembly(a.id, e)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition p-1" title="Delete assembly">
+                                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                            </button>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            {/* Assembly Name Modal */}
+            {showAssemblyNameModal && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" onClick={() => setShowAssemblyNameModal(false)}>
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-96" onClick={e => e.stopPropagation()}>
+                        <h3 className="text-lg font-bold text-slate-800 mb-1">Save Assembly</h3>
+                        <p className="text-sm text-slate-500 mb-4">Name this bundle so you can reuse it across estimates (e.g., &quot;Standard Bathroom Demo&quot;).</p>
+                        <input
+                            autoFocus
+                            type="text"
+                            value={assemblyName}
+                            onChange={e => setAssemblyName(e.target.value)}
+                            onKeyDown={e => e.key === "Enter" && handleSaveAssembly()}
+                            placeholder="Assembly name..."
+                            className="hui-input w-full mb-4"
+                        />
+                        <div className="flex justify-end gap-2">
+                            <button onClick={() => setShowAssemblyNameModal(false)} className="hui-btn hui-btn-secondary text-sm">Cancel</button>
+                            <button onClick={handleSaveAssembly} disabled={isSavingAssembly} className="hui-btn hui-btn-primary text-sm">
+                                {isSavingAssembly ? "Saving..." : "Save Assembly"}
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
 
