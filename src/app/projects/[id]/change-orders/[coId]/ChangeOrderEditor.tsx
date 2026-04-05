@@ -142,6 +142,22 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 </div>
 
                 <div className="flex items-center gap-2">
+                    <a
+                        href={`/api/pdf/change-orders/${initialData.id}?inline=true`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="hui-btn hui-btn-secondary text-slate-600 hover:bg-slate-100"
+                    >
+                        Preview PDF
+                    </a>
+                    <a
+                        href={`/api/pdf/change-orders/${initialData.id}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="hui-btn hui-btn-secondary text-slate-600 hover:bg-slate-100"
+                    >
+                        Download PDF
+                    </a>
                     <button
                         onClick={handleDelete}
                         disabled={isDeleting}

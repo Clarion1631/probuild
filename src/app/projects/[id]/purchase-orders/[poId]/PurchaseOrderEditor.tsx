@@ -236,6 +236,14 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                             >
                                 Preview PDF
                             </a>
+                            <a
+                                href={`/api/pdf/purchase-orders/${initialData.id}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="hui-btn hui-btn-secondary text-slate-600 hover:bg-slate-100"
+                            >
+                                Download PDF
+                            </a>
                         </>
                     )}
                     {isEditing && status !== "Draft" && (

@@ -477,7 +477,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         Customer Portal
                                     </button>
                                     <a
-                                        href={`/api/pdf/${initialEstimate.id}?inline=true`}
+                                        href={`/api/pdf/estimates/${initialEstimate.id}?inline=true`}
                                         target="_blank"
                                         onClick={() => setShowMoreMenu(false)}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
@@ -486,7 +486,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         Preview PDF
                                     </a>
                                     <a
-                                        href={`/api/pdf/${initialEstimate.id}`}
+                                        href={`/api/pdf/estimates/${initialEstimate.id}`}
                                         target="_blank"
                                         onClick={() => setShowMoreMenu(false)}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"

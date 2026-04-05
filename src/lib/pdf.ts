@@ -591,3 +591,304 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     const pdfBytes = await doc.save();
     return Buffer.from(pdfBytes);
 }
+
+export async function generateInvoicePdf(invoiceId: string): Promise<Buffer> {
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        include: {
+            payments: { orderBy: { name: 'asc' } },
+            project: { include: { client: true } },
+            client: true,
+        },
+    });
+
+    if (!invoice) throw new Error('Invoice not found');
+
+    const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
+
+    const doc = await PDFDocument.create();
+    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const pageWidth = 612;
+    const pageHeight = 792;
+    const margin = 50;
+    const contentWidth = pageWidth - margin * 2;
+
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+        }
+    }
+
+    page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: colors.primary });
+    y = pageHeight - 40;
+
+    if (company?.companyName) {
+        page.drawText(company.companyName.toUpperCase(), { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
+    }
+
+    y -= 30;
+    page.drawText('INVOICE', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
+
+    y -= 30;
+    const clientName = invoice.client?.name || '';
+    const clientEmail = invoice.client?.email || '';
+
+    page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
+    if (clientName) { y -= 16; page.drawText(clientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
+    if (clientEmail) { y -= 14; page.drawText(clientEmail, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted }); }
+
+    const rightX = pageWidth - margin;
+    let ry = y + (clientEmail ? 30 : 16);
+
+    const drawRL = (label: string, value: string, yPos: number) => {
+        page.drawText(label, { x: rightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
+        const vw = helveticaBold.widthOfTextAtSize(value, 9);
+        page.drawText(value, { x: rightX - vw, y: yPos, size: 9, font: helveticaBold, color: colors.textMain });
+    };
+
+    drawRL('Invoice No.', invoice.code || '', ry);
+    ry -= 16;
+    drawRL('Date', new Date(invoice.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
+    ry -= 16;
+    drawRL('Status', invoice.status || 'Draft', ry);
+    ry -= 16;
+    drawRL('Project', invoice.project?.name || '', ry);
+
+    y -= 20;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 20;
+
+    // Payment schedule table
+    const invCols = { name: margin, status: margin + contentWidth * 0.45, dueDate: margin + contentWidth * 0.65, amount: pageWidth - margin };
+
+    page.drawText('PAYMENT', { x: invCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const sLabel = 'STATUS'; const sW = helveticaBold.widthOfTextAtSize(sLabel, 8);
+    page.drawText(sLabel, { x: invCols.status - sW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const dLabel = 'DUE DATE'; const dW = helveticaBold.widthOfTextAtSize(dLabel, 8);
+    page.drawText(dLabel, { x: invCols.dueDate - dW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const aLabel = 'AMOUNT'; const aW = helveticaBold.widthOfTextAtSize(aLabel, 8);
+    page.drawText(aLabel, { x: invCols.amount - aW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+
+    y -= 8;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 14;
+
+    for (const payment of invoice.payments) {
+        checkNewPage(60);
+
+        let displayName = payment.name || '';
+        const maxNameWidth = contentWidth * 0.4;
+        while (helvetica.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) displayName = displayName.slice(0, -1);
+
+        page.drawText(displayName, { x: invCols.name, y, size: 10, font: helvetica, color: colors.textMain });
+
+        const statusStr = payment.status || 'Pending';
+        const statusW = helvetica.widthOfTextAtSize(statusStr, 10);
+        page.drawText(statusStr, { x: invCols.status - statusW, y, size: 10, font: helvetica, color: payment.status === 'Paid' ? colors.primary : colors.textMuted });
+
+        const dueDateStr = payment.dueDate ? new Date(payment.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+        const dueDateW = helvetica.widthOfTextAtSize(dueDateStr, 10);
+        page.drawText(dueDateStr, { x: invCols.dueDate - dueDateW, y, size: 10, font: helvetica, color: colors.textMuted });
+
+        const amtStr = formatCurrency(Number(payment.amount) || 0);
+        const amtW = helveticaBold.widthOfTextAtSize(amtStr, 10);
+        page.drawText(amtStr, { x: invCols.amount - amtW, y, size: 10, font: helveticaBold, color: colors.textMain });
+
+        y -= 20;
+    }
+
+    // Totals
+    y -= 10;
+    checkNewPage(80);
+    page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 25;
+
+    const invLabelX = margin + contentWidth * 0.5;
+    const totalAmt = Number(invoice.totalAmount) || 0;
+    const balanceDue = Number(invoice.balanceDue) || 0;
+
+    page.drawText('Total Amount', { x: invLabelX, y, size: 10, font: helvetica, color: colors.textMuted });
+    const totalStr = formatCurrency(totalAmt);
+    const totalW = helvetica.widthOfTextAtSize(totalStr, 10);
+    page.drawText(totalStr, { x: invCols.amount - totalW, y, size: 10, font: helvetica, color: colors.textMain });
+    y -= 22;
+
+    page.drawText('Balance Due', { x: invLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
+    const balStr = formatCurrency(balanceDue);
+    const balW = helveticaBold.widthOfTextAtSize(balStr, 14);
+    page.drawText(balStr, { x: invCols.amount - balW, y, size: 14, font: helveticaBold, color: colors.primary });
+
+    if (invoice.notes) {
+        y -= 40;
+        checkNewPage(80);
+        page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 14;
+        page.drawText(invoice.notes, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+    }
+
+    const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
+    page.drawText(footerText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
+
+    const pdfBytes = await doc.save();
+    return Buffer.from(pdfBytes);
+}
+
+export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
+    const co = await prisma.changeOrder.findUnique({
+        where: { id: coId },
+        include: {
+            items: { orderBy: { order: 'asc' } },
+            paymentSchedules: { orderBy: { order: 'asc' } },
+            project: { include: { client: true } },
+            estimate: true,
+        },
+    });
+
+    if (!co) throw new Error('Change Order not found');
+
+    const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
+
+    const doc = await PDFDocument.create();
+    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const pageWidth = 612;
+    const pageHeight = 792;
+    const margin = 50;
+    const contentWidth = pageWidth - margin * 2;
+
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+        }
+    }
+
+    page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: colors.primary });
+    y = pageHeight - 40;
+
+    if (company?.companyName) {
+        page.drawText(company.companyName.toUpperCase(), { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
+    }
+
+    y -= 30;
+    page.drawText('CHANGE ORDER', { x: margin, y, size: 22, font: helveticaBold, color: colors.textMain });
+
+    y -= 22;
+    if (co.title) {
+        page.drawText(co.title, { x: margin, y, size: 12, font: helvetica, color: colors.textMain });
+        y -= 10;
+    }
+
+    y -= 20;
+    const coClientName = co.project?.client?.name || '';
+    page.drawText('CLIENT', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
+    if (coClientName) { y -= 16; page.drawText(coClientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
+
+    const coRightX = pageWidth - margin;
+    let coRy = y + (coClientName ? 16 : 0);
+
+    const drawCORL = (label: string, value: string, yPos: number) => {
+        page.drawText(label, { x: coRightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
+        const vw = helveticaBold.widthOfTextAtSize(value, 9);
+        page.drawText(value, { x: coRightX - vw, y: yPos, size: 9, font: helveticaBold, color: colors.textMain });
+    };
+
+    drawCORL('C.O. No.', co.code || '', coRy);
+    coRy -= 16;
+    drawCORL('Date', new Date(co.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), coRy);
+    coRy -= 16;
+    drawCORL('Status', co.status || 'Draft', coRy);
+    coRy -= 16;
+    drawCORL('Project', co.project?.name || '', coRy);
+
+    y -= 20;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 20;
+
+    if (co.description) {
+        page.drawText('Description:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 14;
+        page.drawText(co.description, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+        y -= 20;
+    }
+
+    // Items table
+    const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
+
+    page.drawText('ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const coQtyLabel = 'QTY'; const coQtyW = helveticaBold.widthOfTextAtSize(coQtyLabel, 8);
+    page.drawText(coQtyLabel, { x: coCols.qty - coQtyW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const coUcLabel = 'UNIT COST'; const coUcW = helveticaBold.widthOfTextAtSize(coUcLabel, 8);
+    page.drawText(coUcLabel, { x: coCols.unitCost - coUcW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const coTLabel = 'TOTAL'; const coTW = helveticaBold.widthOfTextAtSize(coTLabel, 8);
+    page.drawText(coTLabel, { x: coCols.total - coTW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+
+    y -= 8;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 14;
+
+    for (const item of co.items) {
+        checkNewPage(60);
+
+        let displayName = item.name || '';
+        const maxNameWidth = contentWidth * 0.5;
+        while (helvetica.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) displayName = displayName.slice(0, -1);
+
+        page.drawText(displayName, { x: coCols.name, y, size: 10, font: helvetica, color: colors.textMain });
+
+        const qtyStr = String(item.quantity || 0);
+        const qtyStrW = helvetica.widthOfTextAtSize(qtyStr, 10);
+        page.drawText(qtyStr, { x: coCols.qty - qtyStrW, y, size: 10, font: helvetica, color: colors.textMuted });
+
+        const ucStr = formatCurrency(Number(item.unitCost) || 0);
+        const ucStrW = helvetica.widthOfTextAtSize(ucStr, 10);
+        page.drawText(ucStr, { x: coCols.unitCost - ucStrW, y, size: 10, font: helvetica, color: colors.textMuted });
+
+        const itemTotalStr = formatCurrency(Number(item.total) || 0);
+        const itemTotalW = helveticaBold.widthOfTextAtSize(itemTotalStr, 10);
+        page.drawText(itemTotalStr, { x: coCols.total - itemTotalW, y, size: 10, font: helveticaBold, color: colors.textMain });
+
+        y -= 20;
+    }
+
+    // Total
+    y -= 10;
+    checkNewPage(80);
+    page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 25;
+
+    const coLabelX = coCols.unitCost - 60;
+    const coTotal = Number(co.totalAmount) || 0;
+
+    page.drawText('Change Order Total', { x: coLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
+    const coTotalStr = formatCurrency(coTotal);
+    const coTotalW = helveticaBold.widthOfTextAtSize(coTotalStr, 14);
+    page.drawText(coTotalStr, { x: coCols.total - coTotalW, y, size: 14, font: helveticaBold, color: colors.primary });
+
+    // Signature
+    if (co.status === 'Approved' && co.approvedBy) {
+        y -= 50;
+        checkNewPage(100);
+        page.drawText('Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        y -= 20;
+        page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 15;
+        page.drawText(`Date: ${co.approvedAt ? new Date(co.approvedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+    }
+
+    const coFooterText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
+    page.drawText(coFooterText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
+
+    const pdfBytes = await doc.save();
+    return Buffer.from(pdfBytes);
+}
