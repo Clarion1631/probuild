@@ -6,6 +6,8 @@ import Providers from "@/components/Providers";
 import AppLayout from "@/components/AppLayout";
 import { Toaster } from "sonner";
 import { getCompanySettings } from "@/lib/actions";
+import { getSessionOrDev } from "@/lib/auth";
+import HelpChatWidget from "@/components/HelpChatWidget";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -28,8 +30,10 @@ export default async function RootLayout({
   children: React.ReactNode;
 }>) {
   let settings = null;
+  let session: any = null;
   try {
     settings = await getCompanySettings();
+    session = await getSessionOrDev();
   } catch {
     // During build-time static generation, DATABASE_URL may not exist — gracefully skip.
   }
@@ -42,6 +46,10 @@ export default async function RootLayout({
             {children}
           </AppLayout>
         </Providers>
+        <HelpChatWidget
+          userId={session?.user?.id}
+          userRole={session?.user?.role}
+        />
         <Toaster position="bottom-right" richColors />
       </body>
     </html>
