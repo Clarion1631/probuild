@@ -1,4 +1,5 @@
 import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import { getProjectLead, getLeadsForLinking, getUnreadMessageCount } from "@/lib/actions";
 import { authOptions, getSessionOrDev } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -53,7 +54,9 @@ export default async function ProjectLayout({
                 unreadMessageCount={unreadCount}
             />
             <div className="flex-1 p-6 overflow-y-auto w-full">
-                {children}
+                <ErrorBoundary fallbackTitle="Project error">
+                    {children}
+                </ErrorBoundary>
             </div>
         </div>
     );
