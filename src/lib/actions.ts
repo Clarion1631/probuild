@@ -2889,6 +2889,7 @@ export async function savePortalVisibility(projectId: string, data: {
     showMessages: boolean;
     showSelections?: boolean;
     showMoodBoards?: boolean;
+    paymentRemindersEnabled?: boolean;
     isPortalEnabled: boolean;
 }) {
     const record = await prisma.portalVisibility.upsert({
@@ -2903,6 +2904,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            paymentRemindersEnabled: data.paymentRemindersEnabled ?? false,
             isPortalEnabled: data.isPortalEnabled,
         },
         create: {
@@ -2916,6 +2918,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            paymentRemindersEnabled: data.paymentRemindersEnabled ?? false,
             isPortalEnabled: data.isPortalEnabled,
         },
     });
@@ -4501,4 +4504,31 @@ export async function deleteRetainer(id: string) {
     await prisma.retainer.delete({ where: { id } });
     revalidatePath(`/projects/${retainer.projectId}/retainers`);
     return { success: true };
+}
+
+// =============================================
+// Payment Reminders
+// =============================================
+
+export async function getProjectsWithPaymentReminders() {
+    const projects = await prisma.project.findMany({
+        where: {
+            portalVisibility: {
+                paymentRemindersEnabled: true,
+            },
+            invoices: {
+                some: {
+                    status: "Overdue",
+                },
+            },
+        },
+        include: {
+            client: true,
+            invoices: {
+                where: { status: "Overdue" },
+            },
+            portalVisibility: true,
+        },
+    });
+    return projects;
 }
