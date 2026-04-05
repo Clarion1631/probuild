@@ -506,9 +506,10 @@ model CompanySettings {
   cardProcessingFlat Decimal   @default(0.30)
 
   // Calendar settings
-  workDays      String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
-  workdayStart  String? // e.g. "07:00"
-  workdayEnd    String? // e.g. "17:00"
+  workDays           String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
+  workdayStart       String? // e.g. "07:00"
+  workdayEnd         String? // e.g. "17:00"
+  workdayExceptions  String? // JSON array: [{date, label, type: "holiday"|"workday"}]
 
   // Sales taxes
   salesTaxes String? // JSON array: [{name, rate, isDefault}]

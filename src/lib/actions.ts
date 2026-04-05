@@ -4543,3 +4543,21 @@ export async function deleteDocumentComment(commentId: string) {
     await prisma.documentComment.delete({ where: { id: commentId } });
     return { success: true };
 }
+
+// ========== WORKDAY EXCEPTIONS ==========
+
+export async function getWorkdayExceptions(): Promise<{ date: string; label: string; type: "holiday" | "workday" }[]> {
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { workdayExceptions: true } });
+    if (!settings?.workdayExceptions) return [];
+    try { return JSON.parse(settings.workdayExceptions); } catch { return []; }
+}
+
+export async function saveWorkdayExceptions(exceptions: { date: string; label: string; type: "holiday" | "workday" }[]) {
+    await prisma.companySettings.upsert({
+        where: { id: "singleton" },
+        update: { workdayExceptions: JSON.stringify(exceptions) },
+        create: { id: "singleton", workdayExceptions: JSON.stringify(exceptions) },
+    });
+    revalidatePath("/settings/calendar/exceptions");
+    return { success: true };
+}
