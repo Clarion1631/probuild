@@ -13,6 +13,7 @@ type VisibilityState = {
     showMessages: boolean;
     showSelections?: boolean;
     showMoodBoards?: boolean;
+    paymentRemindersEnabled?: boolean;
     isPortalEnabled: boolean;
     lastSharedAt?: Date | null;
     lastShareEmailId?: string | null;
@@ -29,6 +30,7 @@ const TOGGLE_CONFIG: { key: keyof VisibilityState; label: string; description: s
     { key: "showFiles", label: "Files & Documents", description: "Client can browse project files and documents" },
     { key: "showDailyLogs", label: "Daily Logs", description: "Client can view daily project logs and notes" },
     { key: "showMessages", label: "Messages", description: "Client can send and receive messages" },
+    { key: "paymentRemindersEnabled", label: "Payment Reminders", description: "Send automatic email reminders for overdue invoices" },
 ];
 
 export default function PortalVisibilityToggles({
