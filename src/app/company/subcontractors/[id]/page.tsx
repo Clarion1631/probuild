@@ -45,6 +45,9 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
     const [saving, setSaving] = useState(false);
     const [inviting, setInviting] = useState(false);
     const [uploadingCoi, setUploadingCoi] = useState(false);
+    const [scoringPerformance, setScoringPerformance] = useState(false);
+    const [showScoreModal, setShowScoreModal] = useState(false);
+    const [scoreAnalysis, setScoreAnalysis] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     
     // Form state
@@ -179,6 +182,25 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
         } finally {
             setUploadingCoi(false);
             if (fileInputRef.current) fileInputRef.current.value = "";
+        }
+    }
+
+    async function handleScorePerformance() {
+        setScoringPerformance(true);
+        try {
+            const res = await fetch("/api/ai/sub-performance", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ subcontractorId: id }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Scoring failed");
+            setScoreAnalysis(data.analysis);
+            setShowScoreModal(true);
+        } catch (e: any) {
+            toast.error(e.message || "Performance scoring failed");
+        } finally {
+            setScoringPerformance(false);
         }
     }
 
@@ -341,6 +363,17 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                             Delete Subcontractor
                         </button>
                         <div className="flex items-center gap-3">
+                            <button
+                                onClick={handleScorePerformance}
+                                disabled={scoringPerformance}
+                                className="hui-btn bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 px-5 py-2.5 text-sm flex items-center gap-2 disabled:opacity-50"
+                            >
+                                {scoringPerformance ? (
+                                    <><svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Analyzing...</>
+                                ) : (
+                                    <>&#x2728; AI Score Performance</>
+                                )}
+                            </button>
                             <button onClick={handleInviteToPortal} disabled={inviting} className="hui-btn hui-btn-secondary px-5 py-2.5 text-sm flex items-center gap-2 disabled:opacity-50">
                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
                                 {inviting ? "Sending..." : "Invite to Portal"}
@@ -466,6 +499,33 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                     </div>
                 </div>
             </div>
+
+            {/* AI Performance Score Modal */}
+            {showScoreModal && scoreAnalysis && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center">
+                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowScoreModal(false)} />
+                    <div className="relative bg-white rounded-xl shadow-2xl max-w-lg w-full mx-4 max-h-[80vh] flex flex-col">
+                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xl">&#x2728;</span>
+                                <h2 className="font-bold text-hui-textMain text-lg">Subcontractor Performance Score</h2>
+                            </div>
+                            <button onClick={() => setShowScoreModal(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-5 overflow-y-auto flex-1">
+                            <pre className="whitespace-pre-wrap text-sm text-hui-textMain font-sans leading-relaxed">{scoreAnalysis}</pre>
+                        </div>
+                        <div className="p-4 border-t border-hui-border flex gap-2">
+                            <button onClick={() => setShowScoreModal(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
+                            <button onClick={handleScorePerformance} disabled={scoringPerformance} className="hui-btn text-sm disabled:opacity-50">
+                                {scoringPerformance ? "Re-scoring..." : "Re-score"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
