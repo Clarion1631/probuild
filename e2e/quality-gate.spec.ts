@@ -4,10 +4,10 @@ import { test, expect, type Page } from "@playwright/test";
 // Known-bad patterns that must NEVER appear on any page
 // ---------------------------------------------------------------------------
 const FORBIDDEN_PATTERNS = [
-  /\$0[0-9]{4,}/, // $079261-style currency bug
-  /NaN/,
-  /\bundefined\b/,
-  /Something went wrong/,
+  { pattern: /\$0[0-9]{4,}/, label: "$079261-style currency bug" },
+  { pattern: /NaN/, label: "NaN value" },
+  { pattern: /\bundefined\b/, label: "undefined value" },
+  { pattern: /Something went wrong/, label: "error boundary" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -24,19 +24,15 @@ async function assertCleanPage(page: Page, path: string) {
 
   // 2. No forbidden text in the rendered body
   const body = await page.locator("body").innerText();
-  for (const pattern of FORBIDDEN_PATTERNS) {
-    expect(
-      body,
-      `${path} contains forbidden pattern: ${pattern}`
-    ).not.toMatch(pattern);
+  for (const { pattern, label } of FORBIDDEN_PATTERNS) {
+    expect(body, `${path} contains forbidden pattern: ${label}`).not.toMatch(
+      pattern
+    );
   }
-
-  // 3. No uncaught JS errors (collected via page.on('pageerror'))
-  // — handled per-test below
 }
 
 // ---------------------------------------------------------------------------
-// Collect console errors per test
+// Collect JS errors per test
 // ---------------------------------------------------------------------------
 let pageErrors: Error[] = [];
 
@@ -54,28 +50,65 @@ test.afterEach(async ({}, testInfo) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Quality-gate tests: every critical route loads cleanly
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SECTION 1: Page Load — every critical route loads without crashes
+// ===========================================================================
 
 test.describe("Quality Gate — Page Load", () => {
-  // Auth / entry
-  test("login page loads", async ({ page }) => {
+  test("/login loads", async ({ page }) => {
     await assertCleanPage(page, "/login");
   });
 
-  // Core pages (dev mode auto-authenticates as ADMIN)
+  // Core list pages
   const coreRoutes = [
     "/projects",
     "/leads",
     "/estimates",
     "/invoices",
     "/time-clock",
-    "/settings",
-    "/settings/profile",
+    "/templates",
   ];
 
   for (const route of coreRoutes) {
+    test(`${route} loads cleanly`, async ({ page }) => {
+      await assertCleanPage(page, route);
+    });
+  }
+
+  // Settings pages
+  const settingsRoutes = [
+    "/settings",
+    "/settings/profile",
+    "/settings/company",
+    "/settings/notifications",
+    "/settings/sales-taxes",
+    "/settings/payment-methods",
+    "/settings/integrations",
+    "/settings/contacts",
+    "/settings/cost-codes",
+    "/settings/calendar",
+    "/settings/language",
+    "/settings/privacy",
+  ];
+
+  for (const route of settingsRoutes) {
+    test(`${route} loads cleanly`, async ({ page }) => {
+      await assertCleanPage(page, route);
+    });
+  }
+
+  // Company pages
+  const companyRoutes = [
+    "/company",
+    "/company/catalogs",
+    "/company/cost-codes",
+    "/company/my-items",
+    "/company/subcontractors",
+    "/company/team-members",
+    "/company/vendors",
+  ];
+
+  for (const route of companyRoutes) {
     test(`${route} loads cleanly`, async ({ page }) => {
       await assertCleanPage(page, route);
     });
@@ -86,6 +119,7 @@ test.describe("Quality Gate — Page Load", () => {
     "/manager/schedule",
     "/manager/receipts",
     "/manager/variance",
+    "/manager/time-entries",
   ];
 
   for (const route of managerRoutes) {
@@ -96,6 +130,7 @@ test.describe("Quality Gate — Page Load", () => {
 
   // Reports
   const reportRoutes = [
+    "/reports",
     "/reports/time-billing",
     "/reports/open-invoices",
     "/reports/payments",
@@ -109,15 +144,33 @@ test.describe("Quality Gate — Page Load", () => {
     });
   }
 
-  // Templates
-  test("/templates loads cleanly", async ({ page }) => {
-    await assertCleanPage(page, "/templates");
+  // Template sub-pages
+  const templateRoutes = [
+    "/templates/mood-boards",
+    "/templates/schedules",
+    "/templates/selections",
+  ];
+
+  for (const route of templateRoutes) {
+    test(`${route} loads cleanly`, async ({ page }) => {
+      await assertCleanPage(page, route);
+    });
+  }
+
+  // Portal entry points (may redirect — check for no 5xx)
+  test("/portal loads or redirects cleanly", async ({ page }) => {
+    const res = await page.goto("/portal", { waitUntil: "networkidle" });
+    expect(res?.status()).toBeLessThan(500);
+  });
+
+  test("/sub-portal/login loads cleanly", async ({ page }) => {
+    await assertCleanPage(page, "/sub-portal/login");
   });
 });
 
-// ---------------------------------------------------------------------------
-// Quality Gate — Decimal serialization (Prisma Decimal object leak)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SECTION 2: Decimal serialization (Prisma Decimal object leak)
+// ===========================================================================
 
 test.describe("Quality Gate — Decimal Serialization", () => {
   const DECIMAL_RE = /\[object Object\]|Decimal|BigNumber/;
@@ -132,40 +185,49 @@ test.describe("Quality Gate — Decimal Serialization", () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Quality Gate — Currency formatting spot-checks
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SECTION 3: Currency Formatting — no Decimal display bugs
+// ===========================================================================
 
 test.describe("Quality Gate — Currency Formatting", () => {
-  test("estimates list shows valid currency", async ({ page }) => {
-    await page.goto("/estimates", { waitUntil: "networkidle" });
-    const body = await page.locator("body").innerText();
+  const moneyPages = [
+    "/estimates",
+    "/invoices",
+    "/projects",
+    "/reports/payments",
+  ];
 
-    // If any dollar amounts exist, they should be formatted correctly
-    const dollarAmounts = body.match(/\$[\d,.]+/g) || [];
-    for (const amount of dollarAmounts) {
-      // Valid: $0.00, $1,234.56, $100 — Invalid: $079261
-      expect(amount).not.toMatch(/\$0[0-9]{4,}/);
-    }
-  });
+  for (const route of moneyPages) {
+    test(`${route} shows valid currency formatting`, async ({ page }) => {
+      await page.goto(route, { waitUntil: "networkidle" });
+      const body = await page.locator("body").innerText();
 
-  test("invoices list shows valid currency", async ({ page }) => {
-    await page.goto("/invoices", { waitUntil: "networkidle" });
-    const body = await page.locator("body").innerText();
-
-    const dollarAmounts = body.match(/\$[\d,.]+/g) || [];
-    for (const amount of dollarAmounts) {
-      expect(amount).not.toMatch(/\$0[0-9]{4,}/);
-    }
-  });
+      const dollarAmounts = body.match(/\$[\d,.]+/g) || [];
+      for (const amount of dollarAmounts) {
+        // Invalid: $079261, $012345 — leading zero followed by 4+ digits
+        expect(amount, `Bad currency on ${route}: ${amount}`).not.toMatch(
+          /\$0[0-9]{4,}/
+        );
+      }
+    });
+  }
 });
 
-// ---------------------------------------------------------------------------
-// Quality Gate — No console errors on key pages
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SECTION 4: JS Errors — no uncaught exceptions on critical pages
+// ===========================================================================
 
 test.describe("Quality Gate — JS Errors", () => {
-  const criticalPages = ["/projects", "/leads", "/estimates", "/invoices"];
+  const criticalPages = [
+    "/projects",
+    "/leads",
+    "/estimates",
+    "/invoices",
+    "/time-clock",
+    "/reports",
+    "/settings",
+    "/company",
+  ];
 
   for (const route of criticalPages) {
     test(`${route} has no uncaught JS errors`, async ({ page }) => {
@@ -182,9 +244,9 @@ test.describe("Quality Gate — JS Errors", () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Quality Gate — Auth redirect (unauthenticated users see login, not crash)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SECTION 5: Auth redirect (unauthenticated users see login, not crash)
+// ===========================================================================
 
 test("unauthenticated visit redirects or shows login", async ({ browser }) => {
   const context = await browser.newContext();
@@ -196,11 +258,34 @@ test("unauthenticated visit redirects or shows login", async ({ browser }) => {
   const hasLogin =
     url.includes("/login") ||
     url.includes("/api/auth") ||
-    (await page.locator('button:has-text("Sign"), a:has-text("Sign")').count()) > 0;
+    (await page
+      .locator('button:has-text("Sign"), a:has-text("Sign")')
+      .count()) > 0;
 
   const crashed = await page.locator("text=Something went wrong").count();
   expect(crashed, "Page crashed instead of showing auth flow").toBe(0);
   expect(hasLogin || url.includes("localhost:3000")).toBeTruthy();
 
   await context.close();
+});
+
+// ===========================================================================
+// SECTION 6: Accessibility basics — no images without alt text
+// ===========================================================================
+
+test.describe("Quality Gate — Accessibility Basics", () => {
+  const keyPages = ["/projects", "/leads", "/estimates", "/invoices"];
+
+  for (const route of keyPages) {
+    test(`${route} has no images without alt text`, async ({ page }) => {
+      await page.goto(route, { waitUntil: "networkidle" });
+
+      const imagesWithoutAlt = await page.locator("img:not([alt])").count();
+
+      expect(
+        imagesWithoutAlt,
+        `${route} has ${imagesWithoutAlt} images without alt attribute`
+      ).toBe(0);
+    });
+  }
 });

@@ -7,6 +7,8 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? "github" : "list",
+  timeout: 30_000,
+  expect: { timeout: 10_000 },
   use: {
     baseURL: process.env.BASE_URL || "http://localhost:3000",
     trace: "on-first-retry",
@@ -21,7 +23,7 @@ export default defineConfig({
   webServer: process.env.CI
     ? undefined
     : {
-        command: "bun run dev",
+        command: "npm run dev",
         url: "http://localhost:3000",
         reuseExistingServer: true,
         timeout: 120_000,
