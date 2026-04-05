@@ -16,8 +16,8 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
 
     // Calculate real stats
     const approvedEstimates = estimates.filter((e: any) => e.status === 'Approved' || e.status === 'Sent');
-    const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
-    const totalAll = estimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
+    const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
+    const totalAll = estimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const winRate = estimates.length > 0 ? Math.round((approvedEstimates.length / estimates.length) * 100) : 0;
 
     async function handleNewEstimate() {
@@ -123,7 +123,7 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                             </Link>
                                         </td>
                                         <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
-                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">${Number(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                                         <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
                                         <td className="px-4 py-4 flex items-center gap-1 justify-end">
                                             <form action={handleDuplicate}>

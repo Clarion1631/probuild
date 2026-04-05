@@ -40,7 +40,7 @@ export default async function EstimatePage({
                         clientEmail: project.client.email || undefined,
                         location: project.location || undefined
                     }}
-                    initialEstimate={estimate}
+                    initialEstimate={JSON.parse(JSON.stringify(estimate))}
                     defaultTax={defaultTax}
                 />
             </div>
