@@ -229,6 +229,9 @@ model Estimate {
   contractId        String?
   contract          Contract? @relation(fields: [contractId], references: [id])
 
+  // Memo / notes
+  memo String?
+
   // Phase 8: Tracking
   viewedAt DateTime?
 

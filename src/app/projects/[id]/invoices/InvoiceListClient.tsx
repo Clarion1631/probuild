@@ -50,6 +50,8 @@ export default function InvoiceListClient({ project, invoices }: { project: any;
     const totalAmount = invoices.reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
     const balanceDue = invoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
     const totalPaid = totalAmount - balanceDue;
+    const overdueInvoices = invoices.filter(inv => inv.status === "Overdue");
+    const overdueAmount = overdueInvoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
 
     const SortIcon = ({ col }: { col: SortKey }) => {
         if (sortKey !== col) return <svg className="w-3 h-3 text-slate-300 ml-1 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" /></svg>;
@@ -76,7 +78,7 @@ export default function InvoiceListClient({ project, invoices }: { project: any;
             </div>
 
             {/* Metrics Grid */}
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-4 gap-4">
                 <div className="hui-card p-5">
                     <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Total Invoiced</p>
                     <p className="text-2xl font-bold text-hui-textMain">${totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
@@ -88,6 +90,15 @@ export default function InvoiceListClient({ project, invoices }: { project: any;
                 <div className="hui-card p-5">
                     <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Balance Due</p>
                     <p className={`text-2xl font-bold ${balanceDue > 0 ? 'text-red-600' : 'text-emerald-600'}`}>${balanceDue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                </div>
+                <div className="hui-card p-5 border-l-4 border-l-red-500">
+                    <p className="text-xs text-hui-textMuted font-medium uppercase tracking-wider mb-1">Overdue</p>
+                    <p className={`text-2xl font-bold ${overdueInvoices.length > 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+                        ${overdueAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </p>
+                    {overdueInvoices.length > 0 && (
+                        <p className="text-xs text-red-500 mt-1 font-medium">{overdueInvoices.length} invoice{overdueInvoices.length > 1 ? 's' : ''} overdue</p>
+                    )}
                 </div>
             </div>
 
