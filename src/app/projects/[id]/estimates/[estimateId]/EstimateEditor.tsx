@@ -47,7 +47,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
     const [showTerms, setShowTerms] = useState(false);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
-    const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
 
     function handleCreateAssembly() {
         if (selectedItemIds.length < 2) {
@@ -1065,8 +1064,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             </div>
                         </div>
 
-                        {/* Internal Memo Section (only in internal view) */}
-                        {viewMode === "internal" && (
+                        {/* Internal Memo Section (only in internal view) — disabled: uses same memo field */}
+                        {false && viewMode === "internal" && (
                             <div className="mt-6 mx-2">
                                 <div className="bg-amber-50/50 rounded-xl border border-amber-200 overflow-hidden">
                                     <div className="flex items-center gap-2 px-6 py-3">

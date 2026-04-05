@@ -11,10 +11,11 @@ import { toast } from "sonner";
 
 type SortKey = "name" | "stage" | "client" | "source" | "projectType" | "targetRevenue" | "lastActivity";
 type SortDir = "asc" | "desc";
-type TabKey = "All" | "Hot" | "Won" | "Lost";
+type TabKey = "All" | "Hot" | "Qualified" | "Won" | "Lost";
 
 // "Hot" = mid-funnel active stages
 const HOT_STAGES = ["Connected", "Estimate Sent"];
+const QUALIFIED_STAGES = ["Followed Up", "Connected"];
 const WON_STAGE = "Won";
 const LOST_STAGE = "Closed";
 
@@ -113,6 +114,7 @@ export default function LeadsPage() {
     const tabCounts = useMemo(() => ({
         All: leads.length,
         Hot: leads.filter(l => HOT_STAGES.includes(l.stage)).length,
+        Qualified: leads.filter(l => QUALIFIED_STAGES.includes(l.stage)).length,
         Won: leads.filter(l => l.stage === WON_STAGE).length,
         Lost: leads.filter(l => l.stage === LOST_STAGE).length,
     }), [leads]);
@@ -122,6 +124,7 @@ export default function LeadsPage() {
 
         // Tab filter
         if (activeTab === "Hot") list = list.filter(l => HOT_STAGES.includes(l.stage));
+        else if (activeTab === "Qualified") list = list.filter(l => QUALIFIED_STAGES.includes(l.stage));
         else if (activeTab === "Won") list = list.filter(l => l.stage === WON_STAGE);
         else if (activeTab === "Lost") list = list.filter(l => l.stage === LOST_STAGE);
 
@@ -221,7 +224,7 @@ export default function LeadsPage() {
             {/* Tabs + Search */}
             <div className="flex items-end justify-between border-b border-hui-border mb-4">
                 <div className="flex gap-0">
-                    {(["All", "Hot", "Won", "Lost"] as TabKey[]).map(tab => (
+                    {(["All", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
                         <TabButton
                             key={tab}
                             active={activeTab === tab}
