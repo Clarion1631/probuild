@@ -4502,3 +4502,20 @@ export async function deleteRetainer(id: string) {
     revalidatePath(`/projects/${retainer.projectId}/retainers`);
     return { success: true };
 }
+
+// --- Calendar Sync ---
+export async function syncScheduleToCalendar(projectId: string) {
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || (process.env.NODE_ENV === 'production' ? 'https://probuild.goldentouchremodeling.com' : 'http://localhost:3000');
+    const res = await fetch(`${baseUrl}/api/calendar/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId }),
+    });
+    return res.json();
+}
+
+export async function getCalendarStatus() {
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || (process.env.NODE_ENV === 'production' ? 'https://probuild.goldentouchremodeling.com' : 'http://localhost:3000');
+    const res = await fetch(`${baseUrl}/api/calendar/status`);
+    return res.json();
+}
