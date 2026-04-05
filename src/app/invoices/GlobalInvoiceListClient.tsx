@@ -4,6 +4,7 @@ import { useState, useMemo } from "react";
 import Link from "next/link";
 import StatusBadge from "@/components/StatusBadge";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 const STATUS_TABS = ["All", "Draft", "Issued", "Paid", "Overdue", "Partially Paid"] as const;
 
@@ -106,8 +107,8 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
                 case "project": aVal = a.project?.name || ""; bVal = b.project?.name || ""; break;
                 case "client": aVal = a.client?.name || ""; bVal = b.client?.name || ""; break;
                 case "status": aVal = a.status; bVal = b.status; break;
-                case "totalAmount": aVal = a.totalAmount || 0; bVal = b.totalAmount || 0; break;
-                case "balanceDue": aVal = a.balanceDue || 0; bVal = b.balanceDue || 0; break;
+                case "totalAmount": aVal = Number(a.totalAmount || 0); bVal = Number(b.totalAmount || 0); break;
+                case "balanceDue": aVal = Number(a.balanceDue || 0); bVal = Number(b.balanceDue || 0); break;
                 case "issueDate":
                     aVal = a.issueDate ? new Date(a.issueDate).getTime() : new Date(a.createdAt).getTime();
                     bVal = b.issueDate ? new Date(b.issueDate).getTime() : new Date(b.createdAt).getTime();
@@ -120,12 +121,12 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
     }, [invoices, activeTab, sortKey, sortDir, searchTerm]);
 
     // Stat calculations
-    const totalInvoiced = invoices.reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
-    const totalBalanceDue = invoices.reduce((sum, inv) => sum + (inv.balanceDue || 0), 0);
+    const totalInvoiced = invoices.reduce((sum, inv) => sum + Number(inv.totalAmount || 0), 0);
+    const totalBalanceDue = invoices.reduce((sum, inv) => sum + Number(inv.balanceDue || 0), 0);
     const collected = totalInvoiced - totalBalanceDue;
     const overdueAmount = invoices
         .filter(i => i.status === "Overdue")
-        .reduce((sum, i) => sum + (i.balanceDue || 0), 0);
+        .reduce((sum, i) => sum + Number(i.balanceDue || 0), 0);
     const overdueCount = invoices.filter(i => i.status === "Overdue").length;
 
     const SortIcon = ({ col }: { col: SortKey }) => {
@@ -160,23 +161,23 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Total Invoiced</p>
-                    <p className="text-2xl font-bold text-hui-textMain">${totalInvoiced.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                    <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(totalInvoiced)}</p>
                     <p className="text-xs text-hui-textMuted mt-1">{invoices.length} invoice{invoices.length !== 1 ? "s" : ""}</p>
                 </div>
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Collected</p>
-                    <p className="text-2xl font-bold text-hui-primary">${collected.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                    <p className="text-2xl font-bold text-hui-primary">{formatCurrency(collected)}</p>
                     <p className="text-xs text-hui-textMuted mt-1">{invoices.filter(i => i.status === "Paid").length} paid in full</p>
                 </div>
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Outstanding</p>
-                    <p className={`text-2xl font-bold ${totalBalanceDue > 0 ? "text-amber-600" : "text-emerald-600"}`}>${totalBalanceDue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                    <p className={`text-2xl font-bold ${totalBalanceDue > 0 ? "text-amber-600" : "text-emerald-600"}`}>{formatCurrency(totalBalanceDue)}</p>
                     <p className="text-xs text-hui-textMuted mt-1">{invoices.filter(i => i.balanceDue > 0).length} unpaid</p>
                 </div>
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Overdue</p>
                     <p className={`text-2xl font-bold ${overdueCount > 0 ? "text-red-600" : "text-emerald-600"}`}>
-                        {overdueCount > 0 ? `$${overdueAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "$0.00"}
+                        {overdueCount > 0 ? formatCurrency(overdueAmount) : "$0.00"}
                     </p>
                     <p className="text-xs text-hui-textMuted mt-1">{overdueCount > 0 ? `${overdueCount} overdue` : "All current"}</p>
                 </div>
@@ -260,8 +261,8 @@ export default function GlobalInvoiceListClient({ invoices }: { invoices: any[] 
                                 </td>
                                 <td className="px-6 py-4 text-hui-textMuted">{inv.client?.name || "—"}</td>
                                 <td className="px-6 py-4"><StatusBadge status={inv.status} /></td>
-                                <td className="px-6 py-4 text-right text-hui-textMain">${(inv.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                                <td className="px-6 py-4 text-right font-semibold text-hui-textMain">${(inv.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                <td className="px-6 py-4 text-right text-hui-textMain">{formatCurrency(inv.totalAmount)}</td>
+                                <td className="px-6 py-4 text-right font-semibold text-hui-textMain">{formatCurrency(inv.balanceDue)}</td>
                                 <td className="px-6 py-4 text-hui-textMuted text-sm">
                                     {inv.issueDate
                                         ? new Date(inv.issueDate).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })

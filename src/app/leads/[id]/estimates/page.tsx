@@ -2,6 +2,7 @@ import { getLead, createDraftLeadEstimate } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import StatusBadge from "@/components/StatusBadge";
+import { formatCurrency } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
@@ -14,8 +15,8 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
     const estimates = lead.estimates || [];
 
     const approvedEstimates = estimates.filter((e: any) => e.status === "Approved" || e.status === "Sent");
-    const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
-    const totalAll = estimates.reduce((sum: number, e: any) => sum + (e.totalAmount || 0), 0);
+    const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
+    const totalAll = estimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
 
     async function handleNewEstimate() {
         "use server";
@@ -51,13 +52,13 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm relative overflow-hidden">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-green-400 to-emerald-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Approved</p>
-                            <p className="text-2xl font-bold text-slate-900">${totalApproved.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-2xl font-bold text-slate-900">{formatCurrency(totalApproved)}</p>
                             <p className="text-[10px] text-slate-400 mt-1">{approvedEstimates.length} approved</p>
                         </div>
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm relative overflow-hidden">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-400 to-indigo-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Value</p>
-                            <p className="text-2xl font-bold text-blue-600">${totalAll.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-2xl font-bold text-blue-600">{formatCurrency(totalAll)}</p>
                             <p className="text-[10px] text-slate-400 mt-1">Across all estimates</p>
                         </div>
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm relative overflow-hidden">
@@ -108,7 +109,7 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                                             </Link>
                                         </td>
                                         <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
-                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">{formatCurrency(est.totalAmount)}</td>
                                         <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
                                         <td className="px-4 py-4">
                                             <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">

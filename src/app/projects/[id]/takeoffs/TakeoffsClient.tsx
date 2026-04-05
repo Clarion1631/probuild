@@ -603,7 +603,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                     <div className="flex items-center justify-between bg-slate-900 rounded-xl px-6 py-4 text-white">
                                         <div>
                                             <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Total Estimate</p>
-                                            <p className="text-3xl font-bold">${(parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                                            <p className="text-3xl font-bold">{formatCurrency(parsedAiData.totalEstimate)}</p>
                                         </div>
                                         <div className="flex items-center gap-4">
                                             <div className="text-right">
@@ -699,11 +699,11 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                     <div className="flex items-center gap-8">
                                                         <div>
                                                             <span className="text-slate-400 uppercase text-[10px] font-semibold tracking-wider">Total Cost</span>
-                                                            <p className="text-sm font-bold">${totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                                            <p className="text-sm font-bold">{formatCurrency(totalCost)}</p>
                                                         </div>
                                                         <div>
                                                             <span className="text-slate-400 uppercase text-[10px] font-semibold tracking-wider">Markup</span>
-                                                            <p className="text-sm font-bold text-emerald-400">+${totalMarkup.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                                            <p className="text-sm font-bold text-emerald-400">+{formatCurrency(totalMarkup)}</p>
                                                         </div>
                                                         <div>
                                                             <span className="text-slate-400 uppercase text-[10px] font-semibold tracking-wider">Profit Margin</span>
@@ -712,7 +712,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                     </div>
                                                     <div className="text-right">
                                                         <span className="text-slate-400 uppercase text-[10px] font-semibold tracking-wider">Sell Price</span>
-                                                        <p className="text-xl font-bold">${totalSell.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                                        <p className="text-xl font-bold">{formatCurrency(totalSell)}</p>
                                                     </div>
                                                 </div>
                                             );
@@ -796,7 +796,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                     </td>
                                                                 </>)}
                                                                 <td className="px-4 py-3 text-right text-slate-800 font-medium whitespace-nowrap align-top">{formatCurrency(item.unitCost)}</td>
-                                                                <td className="px-4 py-3 text-right font-bold text-slate-900 whitespace-nowrap align-top">${item.total?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                                                <td className="px-4 py-3 text-right font-bold text-slate-900 whitespace-nowrap align-top">{formatCurrency(item.total)}</td>
                                                             </tr>
                                                         );
                                                     })}
@@ -805,7 +805,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                     <tr className="bg-slate-100 border-t-2 border-slate-300">
                                                         <td colSpan={viewMode === "internal" ? 8 : 6} className="px-4 py-4 text-right font-bold text-base text-slate-900">TOTAL</td>
                                                         <td className="px-4 py-4 text-right font-bold text-base text-green-700">
-                                                            ${((adjustedItems || parsedAiData.items || []).reduce((s: number, i: any) => s + (i.total || 0), 0) || parsedAiData.totalEstimate || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                            {formatCurrency((adjustedItems || parsedAiData.items || []).reduce((s: number, i: any) => s + Number(i.total || 0), 0) || parsedAiData.totalEstimate || 0)}
                                                         </td>
                                                     </tr>
                                                 </tfoot>
@@ -821,7 +821,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                 {parsedAiData.paymentMilestones.map((m: any, idx: number) => (
                                                     <div key={idx} className="bg-slate-50 rounded-lg p-3 border border-slate-100">
                                                         <p className="text-xs text-slate-500 font-medium">{m.name}</p>
-                                                        <p className="text-lg font-bold text-hui-textMain">${parseFloat(m.amount).toLocaleString()}</p>
+                                                        <p className="text-lg font-bold text-hui-textMain">{formatCurrency(m.amount)}</p>
                                                         <p className="text-[10px] text-slate-400">{m.percentage}% of total</p>
                                                     </div>
                                                 ))}
@@ -1052,7 +1052,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                         {hasAi && (
                                             <div className="text-right">
                                                 <p className="text-xs text-slate-400">AI Estimate</p>
-                                                <p className="text-sm font-bold text-green-700">${aiData?.totalEstimate?.toLocaleString()}</p>
+                                                <p className="text-sm font-bold text-green-700">{formatCurrency(aiData?.totalEstimate)}</p>
                                             </div>
                                         )}
                                         <button onClick={e => { e.stopPropagation(); handleDelete(t.id); }}

@@ -2,6 +2,7 @@
 
 import { useState, useRef } from "react";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 export default function ExpensesTab({ estimateId, projectId, items }: { estimateId: string, projectId: string, items: any[] }) {
     const [expenses, setExpenses] = useState<any[]>(items.flatMap(item => item.expenses || []));
@@ -155,7 +156,7 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
     const varianceByItem = items.reduce((acc, item) => {
         const itemExpenses = expenses.filter(e => e.itemId === item.id);
         const actualCost = itemExpenses.reduce((sum, e) => sum + e.amount, 0);
-        const budgetedCost = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
+        const budgetedCost = Number(item.quantity || 0) * Number(item.unitCost || 0);
         acc.push({ ...item, actualCost, budgetedCost, variance: budgetedCost - actualCost });
         return acc;
     }, []);
@@ -196,16 +197,16 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                 <div className="grid grid-cols-3 gap-6">
                     <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
                         <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">Total Budget</p>
-                        <p className="text-3xl font-extrabold text-slate-800">${totalBudget.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                        <p className="text-3xl font-extrabold text-slate-800">{formatCurrency(totalBudget)}</p>
                     </div>
                     <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
                         <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">Actual Cost</p>
-                        <p className="text-3xl font-extrabold text-slate-800">${totalActual.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                        <p className="text-3xl font-extrabold text-slate-800">{formatCurrency(totalActual)}</p>
                     </div>
                     <div className={`p-6 rounded-xl border ${totalVariance >= 0 ? "bg-emerald-50 border-emerald-100" : "bg-red-50 border-red-100"}`}>
                         <p className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${totalVariance >= 0 ? "text-emerald-600" : "text-red-600"}`}>Variance</p>
                         <p className={`text-3xl font-extrabold ${totalVariance >= 0 ? "text-emerald-700" : "text-red-700"}`}>
-                            {totalVariance >= 0 ? "+" : "-"}${Math.abs(totalVariance).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                            {totalVariance >= 0 ? "+" : "-"}{formatCurrency(Math.abs(totalVariance))}
                         </p>
                     </div>
                 </div>
@@ -289,7 +290,7 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                                         </span>
                                     </div>
                                     <div className="w-1/4 text-right flex items-center justify-end gap-4">
-                                        <span className="font-bold text-slate-900">${expense.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                        <span className="font-bold text-slate-900">{formatCurrency(expense.amount)}</span>
                                         {expense.receiptUrl && (
                                             <a href={expense.receiptUrl} target="_blank" className="text-blue-500 hover:underline text-xs flex items-center gap-1" title="View Receipt">
                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" /></svg>
@@ -364,7 +365,7 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                                             <option value="">Select an estimate item...</option>
                                             {items.map(item => (
                                                 <option key={item.id} value={item.id}>
-                                                    {item.name} {item.type ? `(${item.type})` : ''} - Budget: ${(item.quantity * item.unitCost).toLocaleString()}
+                                                    {item.name} {item.type ? `(${item.type})` : ''} - Budget: ${Number(Number(item.quantity) * Number(item.unitCost)).toLocaleString()}
                                                 </option>
                                             ))}
                                         </select>

@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createInvoiceFromEstimate } from "@/lib/actions";
 import StatusBadge from "@/components/StatusBadge";
+import { formatCurrency } from "@/lib/utils";
 
 export default function NewInvoiceClient({ project, estimates }: { project: any, estimates: any[] }) {
     const router = useRouter();
@@ -12,7 +13,7 @@ export default function NewInvoiceClient({ project, estimates }: { project: any,
     const sortedEstimates = [...estimates].sort((a, b) => {
         if (a.status === "Approved" && b.status !== "Approved") return -1;
         if (b.status === "Approved" && a.status !== "Approved") return 1;
-        return (b.totalAmount || 0) - (a.totalAmount || 0);
+        return Number(b.totalAmount || 0) - Number(a.totalAmount || 0);
     });
 
     async function handleGenerate(estimateId: string) {
@@ -46,7 +47,7 @@ export default function NewInvoiceClient({ project, estimates }: { project: any,
                                 <StatusBadge status={est.status} />
                             </div>
                             <p className="text-sm text-hui-textMuted mb-1">{est.code}</p>
-                            <p className="font-medium text-hui-textMain">${(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                            <p className="font-medium text-hui-textMain">{formatCurrency(est.totalAmount)}</p>
                             {scheduleCount > 0 && (
                                 <p className="text-xs text-hui-textMuted mt-2 flex items-center gap-1">
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { updateRetainer, deleteRetainer } from "@/lib/actions";
 import Link from "next/link";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 interface RetainerData {
     id: string;
@@ -98,7 +99,7 @@ export default function RetainerEditor({ retainer, projectId }: { retainer: Reta
                     </div>
                     <p className="text-sm text-hui-textMuted mt-1">
                         Created {new Date(retainer.createdAt).toLocaleDateString()}
-                        {retainer.amountPaid > 0 && ` \u00b7 $${retainer.amountPaid.toLocaleString(undefined, { minimumFractionDigits: 2 })} paid`}
+                        {Number(retainer.amountPaid) > 0 && ` \u00b7 ${formatCurrency(retainer.amountPaid)} paid`}
                     </p>
                 </div>
                 <div className="flex items-center gap-3">
@@ -171,15 +172,15 @@ export default function RetainerEditor({ retainer, projectId }: { retainer: Reta
                         <div className="border-t border-hui-border pt-4 space-y-2 text-sm">
                             <div className="flex justify-between">
                                 <span className="text-hui-textMuted">Total Amount</span>
-                                <span className="font-medium">${Number(retainer.totalAmount).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                <span className="font-medium">{formatCurrency(retainer.totalAmount)}</span>
                             </div>
                             <div className="flex justify-between">
                                 <span className="text-hui-textMuted">Amount Paid</span>
-                                <span className="font-medium text-emerald-600">${retainer.amountPaid.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                <span className="font-medium text-emerald-600">{formatCurrency(retainer.amountPaid)}</span>
                             </div>
                             <div className="flex justify-between">
                                 <span className="text-hui-textMuted">Balance Due</span>
-                                <span className="font-bold">${retainer.balanceDue.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                <span className="font-bold">{formatCurrency(retainer.balanceDue)}</span>
                             </div>
                         </div>
                     )}

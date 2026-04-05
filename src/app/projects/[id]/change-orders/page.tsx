@@ -2,6 +2,7 @@ import { getCompanySettings, getProject } from "@/lib/actions";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { formatCurrency } from "@/lib/utils";
 
 export default async function ChangeOrdersPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -20,8 +21,8 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
 
     if (!project) notFound();
 
-    const totalInvoiced = invoices.reduce((sum: number, inv: any) => sum + inv.totalAmount, 0);
-    const totalCOs = changeOrders.reduce((sum: number, co: any) => sum + co.totalAmount, 0);
+    const totalInvoiced = invoices.reduce((sum: number, inv: any) => sum + Number(inv.totalAmount), 0);
+    const totalCOs = changeOrders.reduce((sum: number, co: any) => sum + Number(co.totalAmount), 0);
 
     return (
         <div className="flex-1 flex flex-col items-stretch h-full overflow-hidden">
@@ -43,7 +44,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                     <div className="hui-card p-4 border-l-4 border-l-blue-500">
                         <p className="text-xs font-semibold text-hui-textMuted uppercase">Total (All COs)</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
-                            ${totalCOs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {formatCurrency(totalCOs)}
                         </p>
                     </div>
                     <div className="hui-card p-4 border-l-4 border-l-orange-500">
@@ -53,13 +54,13 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                     <div className="hui-card p-4 border-l-4 border-l-green-500">
                         <p className="text-xs font-semibold text-hui-textMuted uppercase">Invoiced</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
-                            ${totalInvoiced.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {formatCurrency(totalInvoiced)}
                         </p>
                     </div>
                     <div className="hui-card p-4 border-l-4 border-l-amber-500">
                         <p className="text-xs font-semibold text-hui-textMuted uppercase">Balance</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
-                            ${totalCOs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {formatCurrency(totalCOs)}
                         </p>
                     </div>
                 </div>
@@ -110,7 +111,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                                             {co.createdAt.toLocaleDateString()}
                                         </td>
                                         <td className="px-4 py-4 text-right font-medium text-hui-textMain">
-                                            ${co.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                            {formatCurrency(co.totalAmount)}
                                         </td>
                                     </tr>
                                 ))

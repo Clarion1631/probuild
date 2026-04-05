@@ -4,6 +4,7 @@ import Avatar from "@/components/Avatar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import Link from "next/link";
 import NewEstimateButton from "./NewEstimateButton";
+import { formatCurrency } from "@/lib/utils";
 export default async function EstimatesPage() {
     const estimates = await getAllEstimates();
 
@@ -67,8 +68,8 @@ export default async function EstimatesPage() {
                                             <td className="px-4 py-4"><StatusBadge status={e.status as StatusType} /></td>
                                             <td className="px-4 py-4"><span className="bg-slate-100 px-2 py-1 rounded text-hui-textMuted text-xs border border-hui-border">{e.privacy}</span></td>
                                             <td className="px-4 py-4 text-hui-textMuted">{new Date(e.createdAt).toLocaleDateString()}</td>
-                                            <td className="px-4 py-4 text-hui-textMain font-medium text-right">${e.totalAmount?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                                            <td className={`px-4 py-4 font-medium text-right ${e.balanceDue > 0 ? "text-red-500" : "text-hui-textMain"}`}>${e.balanceDue?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                            <td className="px-4 py-4 text-hui-textMain font-medium text-right">{formatCurrency(e.totalAmount)}</td>
+                                            <td className={`px-4 py-4 font-medium text-right ${Number(e.balanceDue) > 0 ? "text-red-500" : "text-hui-textMain"}`}>{formatCurrency(e.balanceDue)}</td>
                                         </tr>
                                     );
                                 })}
