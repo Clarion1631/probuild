@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:e2e": "playwright test",
+    "test:qa": "npx playwright test e2e/quality-gate.spec.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {

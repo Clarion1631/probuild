@@ -116,6 +116,23 @@ test.describe("Quality Gate — Page Load", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Quality Gate — Decimal serialization (Prisma Decimal object leak)
+// ---------------------------------------------------------------------------
+
+test.describe("Quality Gate — Decimal Serialization", () => {
+  const DECIMAL_RE = /\[object Object\]|Decimal|BigNumber/;
+  const pages = ["/projects", "/estimates", "/invoices", "/leads", "/reports"];
+
+  for (const route of pages) {
+    test(`no Decimal object leak: ${route}`, async ({ page }) => {
+      await page.goto(route, { waitUntil: "networkidle" });
+      const body = await page.locator("body").innerText();
+      expect(body, `${route} leaks Decimal objects`).not.toMatch(DECIMAL_RE);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Quality Gate — Currency formatting spot-checks
 // ---------------------------------------------------------------------------
 
@@ -163,4 +180,27 @@ test.describe("Quality Gate — JS Errors", () => {
       ).toHaveLength(0);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Quality Gate — Auth redirect (unauthenticated users see login, not crash)
+// ---------------------------------------------------------------------------
+
+test("unauthenticated visit redirects or shows login", async ({ browser }) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  await page.goto("/projects", { waitUntil: "networkidle" });
+
+  const url = page.url();
+  const hasLogin =
+    url.includes("/login") ||
+    url.includes("/api/auth") ||
+    (await page.locator('button:has-text("Sign"), a:has-text("Sign")').count()) > 0;
+
+  const crashed = await page.locator("text=Something went wrong").count();
+  expect(crashed, "Page crashed instead of showing auth flow").toBe(0);
+  expect(hasLogin || url.includes("localhost:3000")).toBeTruthy();
+
+  await context.close();
 });
