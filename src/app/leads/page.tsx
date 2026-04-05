@@ -11,13 +11,14 @@ import { toast } from "sonner";
 
 type SortKey = "name" | "stage" | "client" | "source" | "projectType" | "targetRevenue" | "lastActivity";
 type SortDir = "asc" | "desc";
-type TabKey = "All" | "Hot" | "Qualified" | "Won" | "Lost";
+type TabKey = "All" | "New" | "Hot" | "Qualified" | "Won" | "Lost" | "Snoozed" | "Archived";
 
 // "Hot" = mid-funnel active stages
 const HOT_STAGES = ["Connected", "Estimate Sent"];
 const QUALIFIED_STAGES = ["Followed Up", "Connected"];
 const WON_STAGE = "Won";
 const LOST_STAGE = "Closed";
+const NEW_STAGE = "New";
 
 function TabButton({ active, onClick, count, children }: {
     active: boolean; onClick: () => void; count?: number; children: React.ReactNode;
@@ -110,23 +111,39 @@ export default function LeadsPage() {
     const sources = useMemo(() => [...new Set(leads.map(l => l.source).filter(Boolean))], [leads]);
     const types = useMemo(() => [...new Set(leads.map(l => l.projectType).filter(Boolean))], [leads]);
 
+    // Separate active leads from archived/snoozed for tab counting
+    const activeLeads = useMemo(() => leads.filter(l => !l.isArchived), [leads]);
+    const now = new Date();
+
     // Tab counts
     const tabCounts = useMemo(() => ({
-        All: leads.length,
-        Hot: leads.filter(l => HOT_STAGES.includes(l.stage)).length,
-        Qualified: leads.filter(l => QUALIFIED_STAGES.includes(l.stage)).length,
-        Won: leads.filter(l => l.stage === WON_STAGE).length,
-        Lost: leads.filter(l => l.stage === LOST_STAGE).length,
-    }), [leads]);
+        All: activeLeads.length,
+        New: activeLeads.filter(l => l.stage === NEW_STAGE).length,
+        Hot: activeLeads.filter(l => HOT_STAGES.includes(l.stage)).length,
+        Qualified: activeLeads.filter(l => QUALIFIED_STAGES.includes(l.stage)).length,
+        Won: activeLeads.filter(l => l.stage === WON_STAGE).length,
+        Lost: activeLeads.filter(l => l.stage === LOST_STAGE).length,
+        Snoozed: leads.filter(l => l.snoozedUntil && new Date(l.snoozedUntil) > now && !l.isArchived).length,
+        Archived: leads.filter(l => l.isArchived).length,
+    }), [leads, activeLeads]);
 
     const filtered = useMemo(() => {
         let list = leads;
 
         // Tab filter
-        if (activeTab === "Hot") list = list.filter(l => HOT_STAGES.includes(l.stage));
-        else if (activeTab === "Qualified") list = list.filter(l => QUALIFIED_STAGES.includes(l.stage));
-        else if (activeTab === "Won") list = list.filter(l => l.stage === WON_STAGE);
-        else if (activeTab === "Lost") list = list.filter(l => l.stage === LOST_STAGE);
+        if (activeTab === "Archived") {
+            list = list.filter(l => l.isArchived);
+        } else if (activeTab === "Snoozed") {
+            list = list.filter(l => l.snoozedUntil && new Date(l.snoozedUntil) > now && !l.isArchived);
+        } else {
+            // All active tabs exclude archived leads
+            list = list.filter(l => !l.isArchived);
+            if (activeTab === "New") list = list.filter(l => l.stage === NEW_STAGE);
+            else if (activeTab === "Hot") list = list.filter(l => HOT_STAGES.includes(l.stage));
+            else if (activeTab === "Qualified") list = list.filter(l => QUALIFIED_STAGES.includes(l.stage));
+            else if (activeTab === "Won") list = list.filter(l => l.stage === WON_STAGE);
+            else if (activeTab === "Lost") list = list.filter(l => l.stage === LOST_STAGE);
+        }
 
         // Search
         if (searchTerm) {
@@ -223,8 +240,19 @@ export default function LeadsPage() {
 
             {/* Tabs + Search */}
             <div className="flex items-end justify-between border-b border-hui-border mb-4">
-                <div className="flex gap-0">
-                    {(["All", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
+                <div className="flex gap-0 overflow-x-auto">
+                    {(["All", "New", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
+                        <TabButton
+                            key={tab}
+                            active={activeTab === tab}
+                            onClick={() => setActiveTab(tab)}
+                            count={tabCounts[tab]}
+                        >
+                            {tab}
+                        </TabButton>
+                    ))}
+                    <div className="w-px bg-slate-200 mx-1 my-2" />
+                    {(["Snoozed", "Archived"] as TabKey[]).map(tab => (
                         <TabButton
                             key={tab}
                             active={activeTab === tab}
