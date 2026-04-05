@@ -813,6 +813,8 @@ model PortalVisibility {
   showSelections   Boolean @default(true)
   showMoodBoards   Boolean @default(true)
 
+  paymentRemindersEnabled Boolean @default(false)
+
   isPortalEnabled      Boolean   @default(true)
   lastSharedAt         DateTime?
   lastShareEmailId     String?
