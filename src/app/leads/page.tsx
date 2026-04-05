@@ -8,6 +8,7 @@ import Link from "next/link";
 import AddLeadButton from "./AddLeadButton";
 import LeadStageDropdown from "./[id]/LeadStageDropdown";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 type SortKey = "name" | "stage" | "client" | "source" | "projectType" | "targetRevenue" | "lastActivity";
 type SortDir = "asc" | "desc";
@@ -229,7 +230,7 @@ export default function LeadsPage() {
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Won</p>
                     <p className="text-2xl font-bold text-hui-primary">{tabCounts.Won}</p>
-                    <p className="text-xs text-hui-textMuted mt-1">{wonRevenue > 0 ? `$${wonRevenue.toLocaleString()}` : "no revenue yet"}</p>
+                    <p className="text-xs text-hui-textMuted mt-1">{wonRevenue > 0 ? `${formatCurrency(wonRevenue)}` : "no revenue yet"}</p>
                 </div>
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Pipeline Value</p>
@@ -353,7 +354,7 @@ export default function LeadsPage() {
                                         </td>
                                         <td className="px-6 py-4 text-hui-textMuted">{l.projectType || "—"}</td>
                                         <td className="px-6 py-4 text-hui-textMuted">
-                                            {l.targetRevenue ? `$${Number(l.targetRevenue).toLocaleString()}` : "—"}
+                                            {l.targetRevenue ? `${formatCurrency(l.targetRevenue)}` : "—"}
                                         </td>
                                         <td className="px-6 py-4 text-hui-textMuted">{l.source || "—"}</td>
                                         <td className="px-6 py-4 text-hui-textMuted text-xs">

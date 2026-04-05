@@ -34,11 +34,11 @@ export async function POST(req: NextRequest) {
     if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
 
     const approvedEstimate = estimates.find(e => e.status === "Approved" || e.status === "Sent") || estimates[0];
-    const budget = approvedEstimate?.totalAmount || 0;
+    const budget = Number(approvedEstimate?.totalAmount || 0);
     const totalHours = timeEntries.reduce((s, e) => s + (e.durationHours || 0), 0);
-    const laborActual = timeEntries.reduce((s, e) => s + (e.laborCost || 0) + (e.burdenCost || 0), 0);
-    const expenseActual = expenses.reduce((s, e) => s + (e.amount || 0), 0);
-    const poCommitted = purchaseOrders.reduce((s, po) => s + (po.totalAmount || 0), 0);
+    const laborActual = timeEntries.reduce((s, e) => s + Number(e.laborCost || 0) + Number(e.burdenCost || 0), 0);
+    const expenseActual = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
+    const poCommitted = purchaseOrders.reduce((s, po) => s + Number(po.totalAmount || 0), 0);
     const totalActual = laborActual + expenseActual;
 
     const context = `
@@ -56,7 +56,7 @@ Remaining budget: $${(budget - totalActual - poCommitted).toLocaleString()}
 Budget consumed: ${budget > 0 ? Math.round(((totalActual + poCommitted) / budget) * 100) : 0}%
 
 Estimate line items:
-${(approvedEstimate?.items || []).map(i => `- ${i.name}: $${i.total.toLocaleString()} (${i.type})`).join("\n") || "None"}
+${(approvedEstimate?.items || []).map(i => `- ${i.name}: $${Number(i.total).toLocaleString()} (${i.type})`).join("\n") || "None"}
 `;
 
     const prompt = `You are an expert construction project cost analyst for a residential remodeling company in Vancouver, WA.

@@ -215,7 +215,7 @@ export default function JobCostingClient({
                         </div>
                         <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Total Budget</p>
                     </div>
-                    <p className="text-2xl font-bold text-hui-textMain">${totals.budget.toLocaleString('en-US', { minimumFractionDigits: 2 })}</p>
+                    <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(totals.budget)}</p>
                 </div>
 
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-hui-border">
@@ -225,7 +225,7 @@ export default function JobCostingClient({
                         </div>
                         <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Actual Costs</p>
                     </div>
-                    <p className="text-2xl font-bold text-hui-textMain">${totals.actual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</p>
+                    <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(totals.actual)}</p>
                 </div>
 
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-hui-border">
@@ -235,7 +235,7 @@ export default function JobCostingClient({
                         </div>
                         <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Committed POs</p>
                     </div>
-                    <p className="text-2xl font-bold text-amber-500">${totals.committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</p>
+                    <p className="text-2xl font-bold text-amber-500">{formatCurrency(totals.committed)}</p>
                 </div>
 
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-hui-border">
@@ -246,7 +246,7 @@ export default function JobCostingClient({
                         <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Variance</p>
                     </div>
                     <p className={`text-2xl font-bold ${totals.variance >= 0 ? "text-emerald-500" : "text-red-500"}`}>
-                        {totals.variance >= 0 ? "+" : ""}${totals.variance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        {totals.variance >= 0 ? "+" : ""}{formatCurrency(totals.variance)}
                     </p>
                 </div>
 
@@ -357,11 +357,11 @@ export default function JobCostingClient({
                                                 </div>
                                             </div>
                                         </td>
-                                        <td className="px-5 py-4 text-right font-medium tabular-nums">${totalBudget.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                        <td className="px-5 py-4 text-right font-semibold tabular-nums text-slate-500">${totalActual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                        <td className="px-5 py-4 text-right font-semibold tabular-nums text-amber-500">${committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-5 py-4 text-right font-medium tabular-nums">{formatCurrency(totalBudget)}</td>
+                                        <td className="px-5 py-4 text-right font-semibold tabular-nums text-slate-500">{formatCurrency(totalActual)}</td>
+                                        <td className="px-5 py-4 text-right font-semibold tabular-nums text-amber-500">{formatCurrency(committed)}</td>
                                         <td className={`px-5 py-4 text-right font-semibold tabular-nums ${variance >= 0 ? "text-emerald-500" : "text-red-500"}`}>
-                                            {variance >= 0 ? "+" : ""}${variance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                            {variance >= 0 ? "+" : ""}{formatCurrency(variance)}
                                         </td>
                                         <td className="px-5 py-4">
                                             <div className="flex items-center justify-end gap-3">
@@ -380,11 +380,11 @@ export default function JobCostingClient({
                         <tfoot className="bg-slate-50 border-t border-hui-border">
                             <tr className="text-sm font-bold text-hui-textMain">
                                 <td className="px-5 py-3.5">Totals</td>
-                                <td className="px-5 py-3.5 text-right tabular-nums">${totals.budget.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                <td className="px-5 py-3.5 text-right tabular-nums text-slate-500">${totals.actual.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                <td className="px-5 py-3.5 text-right tabular-nums text-amber-500">${totals.committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                <td className="px-5 py-3.5 text-right tabular-nums">{formatCurrency(totals.budget)}</td>
+                                <td className="px-5 py-3.5 text-right tabular-nums text-slate-500">{formatCurrency(totals.actual)}</td>
+                                <td className="px-5 py-3.5 text-right tabular-nums text-amber-500">{formatCurrency(totals.committed)}</td>
                                 <td className={`px-5 py-3.5 text-right tabular-nums ${totals.variance >= 0 ? "text-emerald-500" : "text-red-500"}`}>
-                                    {totals.variance >= 0 ? "+" : ""}${totals.variance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                    {totals.variance >= 0 ? "+" : ""}{formatCurrency(totals.variance)}
                                 </td>
                                 <td className="px-5 py-3.5 text-right tabular-nums">{budgetUsedPct.toFixed(1)}%</td>
                             </tr>

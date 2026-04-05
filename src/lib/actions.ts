@@ -1955,7 +1955,7 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
             data.client_phone = project.client.primaryPhone || "";
             data.client_address = [project.client.addressLine1, project.client.city, project.client.state, project.client.zipCode].filter(Boolean).join(", ");
             data.location = project.location || "";
-            data.estimate_total = project.estimates[0] ? `$${project.estimates[0].totalAmount.toLocaleString()}` : "$0.00";
+            data.estimate_total = project.estimates[0] ? `$${Number(project.estimates[0].totalAmount).toLocaleString()}` : "$0.00";
         }
     } else if (leadId) {
         const lead = await prisma.lead.findUnique({
@@ -1969,7 +1969,7 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
             data.client_phone = lead.client.primaryPhone || "";
             data.client_address = [lead.client.addressLine1, lead.client.city, lead.client.state, lead.client.zipCode].filter(Boolean).join(", ");
             data.location = lead.location || "";
-            data.estimate_total = lead.estimates[0] ? `$${lead.estimates[0].totalAmount.toLocaleString()}` : "$0.00";
+            data.estimate_total = lead.estimates[0] ? `$${Number(lead.estimates[0].totalAmount).toLocaleString()}` : "$0.00";
         }
     }
 

@@ -34,7 +34,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const daysSinceActivity = Math.floor(
         (Date.now() - new Date(lead.lastActivityAt).getTime()) / (1000 * 60 * 60 * 24)
     );
-    const estimateTotal = lead.estimates.reduce((sum, e) => sum + (e.totalAmount || 0), 0);
+    const estimateTotal = lead.estimates.reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
     const hasSignedEstimate = lead.estimates.some(e => e.status === "Approved");
     const meetingCount = lead.meetings.filter(m => m.status === "Completed").length;
     const recentNotes = lead.notes.map(n => n.content).join(" | ").slice(0, 500);
@@ -45,7 +45,7 @@ Lead data:
 - Name: ${lead.name}
 - Stage: ${lead.stage}
 - Project type: ${lead.projectType || "Unknown"}
-- Target revenue: ${lead.targetRevenue ? `$${lead.targetRevenue.toLocaleString()}` : "Not specified"}
+- Target revenue: ${lead.targetRevenue ? `$${Number(lead.targetRevenue).toLocaleString()}` : "Not specified"}
 - Days since last activity: ${daysSinceActivity}
 - Estimate total: ${estimateTotal > 0 ? `$${estimateTotal.toLocaleString()}` : "No estimates yet"}
 - Has approved estimate: ${hasSignedEstimate ? "Yes" : "No"}

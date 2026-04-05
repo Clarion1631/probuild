@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
 
     const scopeItems = (estimate?.items || [])
         .filter(i => i.type !== "Note")
-        .map(i => `- ${i.name}: $${i.total.toLocaleString()}`)
+        .map(i => `- ${i.name}: $${Number(i.total).toLocaleString()}`)
         .join("\n");
 
     const prompt = `You are an expert construction contract attorney and contractor for residential remodeling in Vancouver, WA (Clark County).
@@ -46,7 +46,7 @@ PROJECT: {{project_name}}
 LOCATION: ${project.location || "{{location}}"}
 DATE: {{date}}
 
-CONTRACT AMOUNT: $${(estimate?.totalAmount || 0).toLocaleString()}
+CONTRACT AMOUNT: $${Number(estimate?.totalAmount || 0).toLocaleString()}
 
 SCOPE OF WORK:
 ${scopeItems || "As detailed in the attached estimate"}

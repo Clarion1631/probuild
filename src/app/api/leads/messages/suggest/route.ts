@@ -77,7 +77,7 @@ export async function POST(request: Request) {
     ).join("\n");
 
     const estimatesSummary = lead.estimates.map((e: any) =>
-        `- ${e.title} (${e.code}): $${e.totalAmount?.toLocaleString() || "0"} — Status: ${e.status}`
+        `- ${e.title} (${e.code}): $${Number(e.totalAmount || 0).toLocaleString()} — Status: ${e.status}`
     ).join("\n");
 
     const meetingsSummary = lead.meetings.map((m: any) =>

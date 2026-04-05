@@ -25,7 +25,7 @@ Lead: ${lead.name}
 Stage: ${lead.stage}
 Source: ${lead.source || "Unknown"}
 Project Type: ${lead.projectType || "Unknown"}
-Target Revenue: ${lead.targetRevenue ? `$${lead.targetRevenue.toLocaleString()}` : "Not set"}
+Target Revenue: ${lead.targetRevenue ? `$${Number(lead.targetRevenue).toLocaleString()}` : "Not set"}
 Expected Start: ${lead.expectedStartDate ? new Date(lead.expectedStartDate).toLocaleDateString() : "Not set"}
 Created: ${new Date(lead.createdAt).toLocaleDateString()}
 Last Activity: ${new Date(lead.lastActivityAt).toLocaleDateString()}
@@ -34,7 +34,7 @@ Notes (${lead.notes.length}):
 ${lead.notes.map(n => `- ${n.content}`).join("\n") || "None"}
 
 Estimates (${lead.estimates.length}):
-${lead.estimates.map(e => `- ${e.status}: $${(e.totalAmount || 0).toLocaleString()}`).join("\n") || "None"}
+${lead.estimates.map(e => `- ${e.status}: $${Number(e.totalAmount || 0).toLocaleString()}`).join("\n") || "None"}
 
 Open Tasks: ${lead.tasks.filter(t => t.status !== "Done").length}
 `;

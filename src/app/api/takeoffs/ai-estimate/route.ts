@@ -45,7 +45,7 @@ export async function POST(req: NextRequest) {
                 const itemSummary = est.items.slice(0, 10).map(i =>
                     `  - ${i.name}: qty ${i.quantity} × $${i.unitCost} = $${i.total}`
                 ).join("\n");
-                return `Estimate "${est.title}" (${est.project?.type || "General"}, $${est.totalAmount.toLocaleString()}):\n${itemSummary}`;
+                return `Estimate "${est.title}" (${est.project?.type || "General"}, $${Number(est.totalAmount).toLocaleString()}):\n${itemSummary}`;
             }).join("\n\n");
             pastEstimateContext = `\n\nPAST ESTIMATES IN OUR SYSTEM (use these for pricing reference):\n${summaries}`;
         }
