@@ -4543,3 +4543,22 @@ export async function deleteDocumentComment(commentId: string) {
     await prisma.documentComment.delete({ where: { id: commentId } });
     return { success: true };
 }
+
+// ========== PER-ITEM APPROVAL ==========
+
+export async function updateItemApproval(itemId: string, status: "approved" | "rejected" | null, note?: string) {
+    const item = await prisma.estimateItem.update({
+        where: { id: itemId },
+        data: { approvalStatus: status, approvalNote: note || null },
+        select: { id: true, approvalStatus: true, estimateId: true },
+    });
+    return item;
+}
+
+export async function bulkUpdateItemApproval(itemIds: string[], status: "approved" | "rejected" | null) {
+    await prisma.estimateItem.updateMany({
+        where: { id: { in: itemIds } },
+        data: { approvalStatus: status, approvalNote: null },
+    });
+    return { success: true, count: itemIds.length }
+}
