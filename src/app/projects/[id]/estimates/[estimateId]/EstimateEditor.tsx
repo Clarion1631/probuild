@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -733,6 +733,15 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     <>
                         <span className="font-medium text-amber-800">{selectedItemIds.length} item{selectedItemIds.length > 1 ? 's' : ''} selected</span>
                         <div className="h-4 w-px bg-amber-300"></div>
+                        <button onClick={async () => { await bulkUpdateItemApproval(selectedItemIds, "approved"); setItems(items.map(i => selectedItemIds.includes(i.id) ? { ...i, approvalStatus: "approved" } : i)); toast.success(`${selectedItemIds.length} items approved`); }} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-green-300 text-green-800 hover:bg-green-100 flex items-center gap-1.5">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                            Approve All
+                        </button>
+                        <button onClick={async () => { await bulkUpdateItemApproval(selectedItemIds, "rejected"); setItems(items.map(i => selectedItemIds.includes(i.id) ? { ...i, approvalStatus: "rejected" } : i)); toast.success(`${selectedItemIds.length} items rejected`); }} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-red-300 text-red-800 hover:bg-red-100 flex items-center gap-1.5">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            Reject All
+                        </button>
+                        <div className="h-4 w-px bg-amber-300"></div>
                         <button onClick={handleCreateAssembly} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-amber-300 text-amber-800 hover:bg-amber-100 flex items-center gap-1.5">
                             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
                             Save as Assembly
@@ -861,7 +870,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 {viewMode === "internal" && <div className="w-20 text-right text-amber-500">Markup %</div>}
                                 <div className="w-32 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
                                 <div className="w-32 text-right">Total</div>
-                                <div className="w-10"></div>
+                                <div className="w-28 text-right">Approval</div>
                             </div>
 
                             <DragDropContext onDragEnd={onDragEnd}>
@@ -1000,11 +1009,31 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                     <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
                                                                         {formatCurrency(itemTotal)}
                                                                     </div>
-                                                                    <div className="w-10 pt-1.5 flex justify-end">
-                                                                    <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
-                                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                                    </button>
-                                                                </div>
+                                                                    <div className="w-28 pt-1 flex items-center justify-end gap-0.5">
+                                                                        {item.approvalStatus === "approved" ? (
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                                Approved
+                                                                            </span>
+                                                                        ) : item.approvalStatus === "rejected" ? (
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                                Rejected
+                                                                            </span>
+                                                                        ) : (
+                                                                            <span className="opacity-0 group-hover:opacity-100 transition flex gap-0.5">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-300 hover:text-green-600 transition" title="Approve">
+                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                                </button>
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-300 hover:text-red-500 transition" title="Reject">
+                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                                </button>
+                                                                            </span>
+                                                                        )}
+                                                                        <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
+                                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
                                                             </div>
                                                         )}
                                                     </Draggable>

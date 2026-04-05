@@ -287,6 +287,8 @@ model EstimateItem {
   costCode      CostCode?      @relation(fields: [costCodeId], references: [id])
   costTypeId    String?
   costType      CostType?      @relation(fields: [costTypeId], references: [id])
+  approvalStatus String?        // pending, approved, rejected
+  approvalNote   String?
   timeEntries    TimeEntry[]
   scheduleTasks  ScheduleTask[]
   createdAt      DateTime       @default(now())
