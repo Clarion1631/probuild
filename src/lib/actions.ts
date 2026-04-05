@@ -3,6 +3,7 @@
 import { prisma } from "./prisma";
 import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
+import { formatCurrency } from "./utils";
 
 // Safe estimate include that omits columns not yet migrated to the database.
 // Remove this wrapper once the DB Push workflow succeeds and the Estimate table
@@ -1087,7 +1088,7 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
                 <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${invoice.code}</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${invoice.client?.name || 'there'},</p>
                 <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you an invoice for <strong>$${(invoice.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</strong>.
+                    ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
                     Please click the button below to view the details and make a payment.
                 </p>
                 <div style="text-align: center; margin: 32px 0;">
@@ -1097,7 +1098,7 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
                 </div>
                 <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center;">
                     <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">$${(invoice.balanceDue || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(invoice.balanceDue)}</div>
                 </div>
                 <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
                     Or copy this link: ${portalUrl}

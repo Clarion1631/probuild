@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 interface Expense {
     id: string;
@@ -86,7 +87,7 @@ export default function ReceiptQueueClient({ expenses: initialExpenses, projects
                                 <span>
                                     <strong>Amount:</strong>{" "}
                                     <span className="text-hui-textMain font-semibold">
-                                        ${exp.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                        {formatCurrency(Number(exp.amount))}
                                     </span>
                                 </span>
                                 {exp.date && (

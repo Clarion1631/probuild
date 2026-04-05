@@ -223,7 +223,7 @@ export default function LeadDetailsCards({
                         </div>
                         <div className="flex justify-between">
                             <span className="text-hui-textMuted">Target Revenue</span>
-                            <span className="text-hui-textMain">{targetRevenue ? `$${targetRevenue.toLocaleString()}` : <span className="text-slate-400 italic">Not set</span>}</span>
+                            <span className="text-hui-textMain">{targetRevenue ? `$${Number(targetRevenue).toLocaleString()}` : <span className="text-slate-400 italic">Not set</span>}</span>
                         </div>
                     </div>
                 )}

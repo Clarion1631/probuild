@@ -12,7 +12,7 @@ const colors = {
 };
 
 function formatCurrency(amount: number): string {
-    return `$${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return `$${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {

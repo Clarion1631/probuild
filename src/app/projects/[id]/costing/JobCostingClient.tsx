@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import { formatCurrency } from "@/lib/utils";
 
 interface JobCostingClientProps {
     project: { id: string; name: string };
@@ -292,7 +293,7 @@ export default function JobCostingClient({
                                 tickFormatter={v => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v}`}
                             />
                             <Tooltip
-                                formatter={(value: number, name: string) => [`$${value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, name]}
+                                formatter={(value: number, name: string) => [formatCurrency(value), name]}
                                 labelFormatter={(label, payload) => payload?.[0]?.payload?.fullName ?? label}
                                 contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }}
                             />

@@ -9,6 +9,7 @@ import SendEstimateModal from "@/components/SendEstimateModal";
 import SelectVendorModal from "./SelectVendorModal";
 import LogPaymentModal from "./LogPaymentModal";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 import ReusableSignaturePad from "@/components/ReusableSignaturePad";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
@@ -408,7 +409,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 if (data.paymentMilestones && data.paymentMilestones.length > 0) {
                     setPaymentSchedules(newSchedules);
                 }
-                toast.success(`AI generated ${data.count} items (est. $${data.totalEstimate?.toLocaleString()})`);
+                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
                 setShowAiModal(false);
                 setAiPrompt("");
 
@@ -996,7 +997,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                          />
                                                                      </div>
                                                                     <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
-                                                                        ${itemTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                                        {formatCurrency(itemTotal)}
                                                                     </div>
                                                                     <div className="w-10 pt-1.5 flex justify-end">
                                                                     <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
@@ -1092,11 +1093,11 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 <div className="w-80 space-y-4 text-sm">
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>Subtotal</span>
-                                        <span className="text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>{taxName}</span>
-                                        <span className="text-slate-800">${tax.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-slate-800">{formatCurrency(tax)}</span>
                                     </div>
                                     {/* Processing Fee Markup — hidden from client view by default */}
                                     {(viewMode === "internal" || !hideProcessingFee) && (
@@ -1130,14 +1131,14 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     <span className="text-xs text-slate-400">%</span>
                                                 </div>
                                             ) : (
-                                                <span className="text-slate-800">${processingFee.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                                <span className="text-slate-800">{formatCurrency(processingFee)}</span>
                                             )}
                                         </div>
                                     )}
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
                                     <div className="flex justify-between text-xl font-extrabold text-slate-900">
                                         <span>Total</span>
-                                        <span className="text-indigo-600">${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-indigo-600">{formatCurrency(total)}</span>
                                     </div>
                                 </div>
                             </div>
@@ -1152,11 +1153,11 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     <div className="flex items-center gap-6 text-sm">
                                         <div className="text-center">
                                             <div className="text-[10px] text-amber-600 font-semibold uppercase">Base Cost</div>
-                                            <div className="font-bold text-amber-900">${totalBaseCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                            <div className="font-bold text-amber-900">{formatCurrency(totalBaseCost)}</div>
                                         </div>
                                         <div className="text-center">
                                             <div className="text-[10px] text-amber-600 font-semibold uppercase">Markup</div>
-                                            <div className="font-bold text-amber-900">${totalMarkup.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                            <div className="font-bold text-amber-900">{formatCurrency(totalMarkup)}</div>
                                         </div>
                                         <div className="text-center">
                                             <div className="text-[10px] text-amber-600 font-semibold uppercase">Margin</div>
@@ -1164,7 +1165,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         </div>
                                         <div className="text-center">
                                             <div className="text-[10px] text-amber-600 font-semibold uppercase">Sell Price</div>
-                                            <div className="font-bold text-amber-900">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                            <div className="font-bold text-amber-900">{formatCurrency(subtotal)}</div>
                                         </div>
                                     </div>
                                 </div>
@@ -1350,17 +1351,17 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 <div className="grid grid-cols-2 gap-3">
                                     <div className="bg-slate-50 rounded-lg p-3">
                                         <p className="text-[10px] text-slate-500 font-medium uppercase">Subtotal</p>
-                                        <p className="text-sm font-bold text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                        <p className="text-sm font-bold text-slate-800">{formatCurrency(subtotal)}</p>
                                     </div>
                                     <div className="bg-indigo-50 rounded-lg p-3">
                                         <p className="text-[10px] text-indigo-500 font-medium uppercase">Total</p>
-                                        <p className="text-sm font-bold text-indigo-700">${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                        <p className="text-sm font-bold text-indigo-700">{formatCurrency(total)}</p>
                                     </div>
                                 </div>
                                 {viewMode === "internal" && (
                                     <div className="bg-amber-50 rounded-lg p-3">
                                         <p className="text-[10px] text-amber-600 font-medium uppercase">Profit Margin</p>
-                                        <p className="text-sm font-bold text-amber-800">{profitMargin.toFixed(1)}% (${totalMarkup.toLocaleString(undefined, { minimumFractionDigits: 2 })})</p>
+                                        <p className="text-sm font-bold text-amber-800">{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</p>
                                     </div>
                                 )}
                             </div>

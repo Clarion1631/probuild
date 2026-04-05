@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
+import { formatCurrency } from "@/lib/utils";
 
 interface LogPaymentModalProps {
     estimateId: string;
@@ -69,7 +70,7 @@ export default function LogPaymentModal({ estimateId, balanceDue, onClose, onSav
                             />
                         </div>
                         {balanceDue > 0 && (
-                            <p className="text-xs text-slate-400 mt-1">Balance due: ${balanceDue.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-xs text-slate-400 mt-1">Balance due: {formatCurrency(balanceDue)}</p>
                         )}
                     </div>
 

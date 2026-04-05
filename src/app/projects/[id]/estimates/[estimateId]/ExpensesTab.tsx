@@ -247,16 +247,16 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                             </div>
                             <div className="w-1/6 text-right">
                                 <p className="text-xs text-slate-500 mb-1">Budget</p>
-                                <p className="text-sm font-medium">${item.budgetedCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                                <p className="text-sm font-medium">{formatCurrency(item.budgetedCost)}</p>
                             </div>
                             <div className="w-1/6 text-right">
                                 <p className="text-xs text-slate-500 mb-1">Actual</p>
-                                <p className="text-sm font-medium">${item.actualCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                                <p className="text-sm font-medium">{formatCurrency(item.actualCost)}</p>
                             </div>
                             <div className="w-1/6 text-right">
                                 <p className="text-xs text-slate-500 mb-1">Variance</p>
                                 <p className={`text-sm font-bold ${item.variance >= 0 ? "text-green-600" : "text-red-600"}`}>
-                                    ${item.variance.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                    {formatCurrency(item.variance)}
                                 </p>
                             </div>
                         </div>

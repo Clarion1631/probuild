@@ -374,7 +374,7 @@ export default function LeadDetailsSidebar({
                         <DetailRow label="Lead Source" value={leadSource} fieldKey="source" />
                         <DetailRow label="Tags" value={null} fieldKey="tags" />
                         <DetailRow label="Expected Start Date" value={expectedStartDate ? new Date(expectedStartDate).toLocaleDateString() : null} fieldKey="expectedStartDate" type="date" />
-                        <DetailRow label="Estimated Revenue" value={targetRevenue ? `$${targetRevenue.toLocaleString()}` : null} fieldKey="targetRevenue" type="number" />
+                        <DetailRow label="Estimated Revenue" value={targetRevenue ? `$${Number(targetRevenue).toLocaleString()}` : null} fieldKey="targetRevenue" type="number" />
                         <DetailRow label="Estimated Profit" value={null} fieldKey="estimatedProfit" />
                         <DetailRow label="Estimated Budget" value={null} fieldKey="estimatedBudget" />
                         <DetailRow label="Project Type" value={projectType} fieldKey="projectType" />

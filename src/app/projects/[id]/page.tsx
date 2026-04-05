@@ -25,7 +25,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         ]).then(([logs, cos, invs]) => [
             ...logs.map(l => ({ type: "dailylog" as const, id: l.id, label: `Daily log · ${new Date(l.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`, sub: l.workPerformed.slice(0, 60), date: new Date(l.createdAt), href: `/projects/${id}/dailylogs` })),
             ...cos.map(c => ({ type: "changeorder" as const, id: c.id, label: `Change order · ${c.title}`, sub: c.status, date: new Date(c.createdAt), href: `/projects/${id}/change-orders/${c.id}` })),
-            ...invs.map(i => ({ type: "invoice" as const, id: i.id, label: `Invoice ${i.code}`, sub: `${i.status} · $${Number(i.totalAmount).toLocaleString()}`, date: new Date(i.createdAt), href: `/projects/${id}/invoices/${i.id}` })),
+            ...invs.map(i => ({ type: "invoice" as const, id: i.id, label: `Invoice ${i.code}`, sub: `${i.status} · ${formatCurrency(i.totalAmount)}`, date: new Date(i.createdAt), href: `/projects/${id}/invoices/${i.id}` })),
         ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 8)),
     ]);
     const estimates = project.estimates || [];

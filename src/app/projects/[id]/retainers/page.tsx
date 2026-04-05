@@ -3,6 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getProject } from "@/lib/actions";
 import DocumentCode from "@/components/DocumentCode";
+import { formatCurrency } from "@/lib/utils";
 
 export default async function RetainersPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -51,19 +52,19 @@ export default async function RetainersPage({ params }: { params: Promise<{ id: 
                     <div className="hui-card p-4 border-l-4 border-l-emerald-500">
                         <p className="text-xs font-semibold text-hui-textMuted uppercase">Total Retainers</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
-                            ${totalRetainers.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {formatCurrency(totalRetainers)}
                         </p>
                     </div>
                     <div className="hui-card p-4 border-l-4 border-l-blue-500">
                         <p className="text-xs font-semibold text-hui-textMuted uppercase">Amount Paid</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
-                            ${totalPaid.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {formatCurrency(totalPaid)}
                         </p>
                     </div>
                     <div className="hui-card p-4 border-l-4 border-l-amber-500">
                         <p className="text-xs font-semibold text-hui-textMuted uppercase">Balance Due</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
-                            ${totalDue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {formatCurrency(totalDue)}
                         </p>
                     </div>
                 </div>
@@ -110,10 +111,10 @@ export default async function RetainersPage({ params }: { params: Promise<{ id: 
                                             {retainer.dueDate ? retainer.dueDate.toLocaleDateString() : '—'}
                                         </td>
                                         <td className="px-4 py-4 text-right font-medium text-hui-textMain">
-                                            ${Number(retainer.totalAmount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                            {formatCurrency(Number(retainer.totalAmount))}
                                         </td>
                                         <td className="px-4 py-4 text-right font-medium text-hui-textMain">
-                                            ${Number(retainer.balanceDue).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                            {formatCurrency(Number(retainer.balanceDue))}
                                         </td>
                                     </tr>
                                 ))

@@ -184,9 +184,9 @@ export default function LeadsPage() {
         return list;
     }, [leads, activeTab, searchTerm, sourceFilter, typeFilter, sortKey, sortDir]);
 
-    const totalRevenue = leads.reduce((sum, l) => sum + (l.targetRevenue || 0), 0);
+    const totalRevenue = leads.reduce((sum, l) => sum + Number(l.targetRevenue || 0), 0);
     const hotCount = tabCounts.Hot;
-    const wonRevenue = leads.filter(l => l.stage === WON_STAGE).reduce((sum, l) => sum + (l.targetRevenue || 0), 0);
+    const wonRevenue = leads.filter(l => l.stage === WON_STAGE).reduce((sum, l) => sum + Number(l.targetRevenue || 0), 0);
 
     const SORT_HEADER = ({ col, children }: { col: SortKey; children: React.ReactNode }) => (
         <th

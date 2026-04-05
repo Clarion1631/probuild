@@ -3,6 +3,7 @@ import { getProject, createDraftEstimate, duplicateEstimate, getEstimateTemplate
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import EstimatesListClient from "./EstimatesListClient";
+import { formatCurrency } from "@/lib/utils";
 
 export default async function EstimatesPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -65,13 +66,13 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-green-400 to-emerald-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Approved</p>
-                            <p className="text-2xl font-bold text-slate-900">${totalApproved.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-2xl font-bold text-slate-900">{formatCurrency(totalApproved)}</p>
                             <p className="text-[10px] text-slate-400 mt-1">{approvedEstimates.length} approved estimate{approvedEstimates.length !== 1 ? 's' : ''}</p>
                         </div>
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-400 to-indigo-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Value</p>
-                            <p className="text-2xl font-bold text-blue-600">${totalAll.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                            <p className="text-2xl font-bold text-blue-600">{formatCurrency(totalAll)}</p>
                             <p className="text-[10px] text-slate-400 mt-1">Across all estimates</p>
                         </div>
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group">
@@ -123,7 +124,7 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                             </Link>
                                         </td>
                                         <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
-                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">${Number(est.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">{formatCurrency(Number(est.totalAmount || 0))}</td>
                                         <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
                                         <td className="px-4 py-4 flex items-center gap-1 justify-end">
                                             <form action={handleDuplicate}>

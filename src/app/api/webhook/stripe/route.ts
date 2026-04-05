@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
+import { formatCurrency } from "@/lib/utils";
 
 export async function POST(req: Request) {
     const payload = await req.text();
@@ -89,9 +90,9 @@ export async function POST(req: Request) {
                         `Payment Received: ${updatedSchedule.name} - ${invoice.code}`,
                         `<div style="font-family: sans-serif; padding: 20px;">
                             <h2>Payment Received! 🎉</h2>
-                            <p>A payment of <strong>$${updatedSchedule.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code}.</p>
+                            <p>A payment of <strong>${formatCurrency(updatedSchedule.amount)}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code}.</p>
                             <p>Milestone: ${updatedSchedule.name}</p>
-                            <p>Remaining Invoice Balance: $${newBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                            <p>Remaining Invoice Balance: ${formatCurrency(newBalance)}</p>
                         </div>`
                     );
                 }
@@ -158,7 +159,7 @@ export async function POST(req: Request) {
                         `Refund Issued: Invoice ${schedule.invoice.code}`,
                         `<div style="font-family: sans-serif; padding: 20px;">
                             <h2>Refund Processed</h2>
-                            <p>A refund of <strong>$${refundedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong> was issued for Invoice #${schedule.invoice.code} (milestone: ${schedule.name}).</p>
+                            <p>A refund of <strong>${formatCurrency(refundedAmount)}</strong> was issued for Invoice #${schedule.invoice.code} (milestone: ${schedule.name}).</p>
                             <p>The payment schedule has been reset to Pending and the invoice balance restored.</p>
                         </div>`
                     );
@@ -174,7 +175,7 @@ export async function POST(req: Request) {
                         `🚨 Payment Dispute Filed`,
                         `<div style="font-family: sans-serif; padding: 20px;">
                             <h2>Payment Dispute Opened</h2>
-                            <p>A dispute has been filed for <strong>$${((dispute.amount ?? 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2 })}</strong>.</p>
+                            <p>A dispute has been filed for <strong>${formatCurrency((dispute.amount ?? 0) / 100)}</strong>.</p>
                             <p>Reason: ${dispute.reason ?? "Not specified"}</p>
                             <p>Dispute ID: ${dispute.id}</p>
                             <p>Please respond in your <a href="https://dashboard.stripe.com/disputes">Stripe dashboard</a> before the deadline.</p>
