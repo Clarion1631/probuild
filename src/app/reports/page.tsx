@@ -22,6 +22,16 @@ const REPORT_SECTIONS = [
         ],
     },
     {
+        heading: "Tax & Compliance",
+        reports: [
+            {
+                title: "Tax Liability",
+                description: "Sales tax collected vs owed by month. Shows total tax on invoiced and paid revenue.",
+                href: "/reports/tax-liability",
+            },
+        ],
+    },
+    {
         heading: "Project Financials",
         reports: [
             {
