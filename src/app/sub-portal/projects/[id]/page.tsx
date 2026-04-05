@@ -3,6 +3,7 @@ import { getSubPortalSession } from "@/lib/sub-portal-auth";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import ProjectViewTracker from "@/components/ProjectViewTracker";
+import SubTaskSummaryCard from "./SubTaskSummaryCard";
 
 export default async function SubPortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const sub = await getSubPortalSession();
@@ -139,6 +140,9 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
                     <p className="text-xs text-hui-textMuted font-medium mt-1">Not Started</p>
                 </div>
             </div>
+
+            {/* AI Task Summary */}
+            <SubTaskSummaryCard projectId={projectId} subcontractorId={sub.id} />
 
             {/* Task List */}
             <h2 className="text-lg font-bold text-hui-textMain mb-4 flex items-center gap-2">

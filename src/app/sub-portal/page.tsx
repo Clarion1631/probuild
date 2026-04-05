@@ -3,6 +3,7 @@ import { getSubPortalSession } from "@/lib/sub-portal-auth";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import SubPortalCoiCard from "./SubPortalCoiCard";
+import SubSafetyTipsCard from "./SubSafetyTipsCard";
 
 export default async function SubPortalDashboard() {
     const sub = await getSubPortalSession();
@@ -109,6 +110,9 @@ export default async function SubPortalDashboard() {
                     </div>
                 </div>
             </div>
+
+            {/* AI Safety Tips */}
+            <SubSafetyTipsCard subcontractorId={sub.id} />
 
             {/* Compliance COI Card */}
             <SubPortalCoiCard 
