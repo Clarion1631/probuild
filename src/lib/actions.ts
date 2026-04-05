@@ -4560,5 +4560,23 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
         where: { id: { in: itemIds } },
         data: { approvalStatus: status, approvalNote: null },
     });
-    return { success: true, count: itemIds.length }
+    return { success: true, count: itemIds.length };
+}
+
+// ========== WORKDAY EXCEPTIONS ==========
+
+export async function getWorkdayExceptions(): Promise<{ date: string; label: string; type: "holiday" | "workday" }[]> {
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { workdayExceptions: true } });
+    if (!settings?.workdayExceptions) return [];
+    try { return JSON.parse(settings.workdayExceptions); } catch { return []; }
+}
+
+export async function saveWorkdayExceptions(exceptions: { date: string; label: string; type: "holiday" | "workday" }[]) {
+    await prisma.companySettings.upsert({
+        where: { id: "singleton" },
+        update: { workdayExceptions: JSON.stringify(exceptions) },
+        create: { id: "singleton", workdayExceptions: JSON.stringify(exceptions) },
+    });
+    revalidatePath("/settings/calendar/exceptions");
+    return { success: true }
 }
