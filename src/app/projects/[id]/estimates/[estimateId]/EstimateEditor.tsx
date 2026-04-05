@@ -11,6 +11,7 @@ import LogPaymentModal from "./LogPaymentModal";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import ReusableSignaturePad from "@/components/ReusableSignaturePad";
+import DocumentComments from "@/components/DocumentComments";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
@@ -45,7 +46,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
     const [showSidebar, setShowSidebar] = useState(false);
-    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity">("overview");
+    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments">("overview");
     const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
     const [showTerms, setShowTerms] = useState(false);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
@@ -1327,6 +1328,10 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             onClick={() => setSidebarTab("activity")}
                             className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "activity" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Activity</button>
+                        <button
+                            onClick={() => setSidebarTab("comments")}
+                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "comments" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                        >Comments</button>
                     </div>
 
                     {sidebarTab === "overview" && (
@@ -1497,6 +1502,18 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     </div>
                                 </div>
                             </div>
+                        </div>
+                    )}
+
+                    {sidebarTab === "comments" && (
+                        <div className="flex-1 flex flex-col min-h-0">
+                            <DocumentComments
+                                documentType="estimate"
+                                documentId={initialEstimate.id}
+                                currentUserId={undefined}
+                                currentUserName={undefined}
+                                showClientTab={true}
+                            />
                         </div>
                     )}
                 </div>

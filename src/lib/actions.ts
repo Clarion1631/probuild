@@ -4513,3 +4513,33 @@ export async function deleteRetainer(id: string) {
     revalidatePath(`/projects/${retainer.projectId}/retainers`);
     return { success: true };
 }
+
+// ========== DOCUMENT COMMENTS ==========
+
+export async function getDocumentComments(documentType: string, documentId: string) {
+    return prisma.documentComment.findMany({
+        where: { documentType, documentId },
+        orderBy: { createdAt: "asc" },
+        include: { author: { select: { id: true, name: true, email: true } } },
+    });
+}
+
+export async function addDocumentComment(
+    documentType: string,
+    documentId: string,
+    text: string,
+    visibility: "team" | "client",
+    authorId?: string,
+    authorName?: string,
+) {
+    const comment = await prisma.documentComment.create({
+        data: { documentType, documentId, text, visibility, authorId: authorId || null, authorName: authorName || null },
+        include: { author: { select: { id: true, name: true, email: true } } },
+    });
+    return comment;
+}
+
+export async function deleteDocumentComment(commentId: string) {
+    await prisma.documentComment.delete({ where: { id: commentId } });
+    return { success: true };
+}
