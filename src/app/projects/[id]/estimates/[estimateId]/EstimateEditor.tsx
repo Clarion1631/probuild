@@ -42,6 +42,39 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
+    const [showSidebar, setShowSidebar] = useState(false);
+    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity">("overview");
+
+    function handleCreateAssembly() {
+        if (selectedItemIds.length < 2) {
+            toast.error("Select at least 2 items to create an assembly");
+            return;
+        }
+        const sectionId = generateId();
+        const sectionName = "Assembly";
+        const newItems = items.map(item =>
+            selectedItemIds.includes(item.id) ? { ...item, parentId: sectionId } : item
+        );
+        const insertAt = newItems.findIndex(item => item.parentId === sectionId);
+        newItems.splice(insertAt, 0, {
+            id: sectionId,
+            name: sectionName,
+            description: "",
+            type: "Section",
+            quantity: 1,
+            baseCost: 0,
+            markupPercent: 0,
+            unitCost: 0,
+            total: 0,
+            parentId: null,
+            costCodeId: null,
+            costTypeId: null,
+            isSection: true,
+        });
+        setItems(newItems);
+        setSelectedItemIds([]);
+        toast.success("Assembly created");
+    }
 
     async function handleCreateChangeOrder() {
         if (selectedItemIds.length === 0) return;
@@ -572,10 +605,32 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     >
                         {isSaving ? "Saving..." : "Save"}
                     </button>
+                    <button
+                        onClick={() => setShowSidebar(!showSidebar)}
+                        className={`hui-btn hui-btn-secondary px-2.5 ${showSidebar ? 'bg-slate-100' : ''}`}
+                        title="Toggle sidebar"
+                    >
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
+                    </button>
                 </div>
             </div>
 
+            {/* Selected Items Action Bar */}
+            {selectedItemIds.length > 0 && (
+                <div className="bg-amber-50 border-b border-amber-200 px-6 py-2 flex items-center gap-3 text-sm">
+                    <span className="font-medium text-amber-800">{selectedItemIds.length} item{selectedItemIds.length > 1 ? 's' : ''} selected</span>
+                    <div className="h-4 w-px bg-amber-300"></div>
+                    <button onClick={handleCreateAssembly} className="hui-btn hui-btn-secondary text-xs py-1 px-3 border-amber-300 text-amber-800 hover:bg-amber-100 flex items-center gap-1.5">
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                        Create Assembly
+                    </button>
+                    <button onClick={() => setSelectedItemIds([])} className="text-amber-600 hover:text-amber-800 text-xs font-medium ml-auto">
+                        Clear selection
+                    </button>
+                </div>
+            )}
 
+            <div className="flex-1 flex overflow-hidden">
             <div className="flex-1 p-8 flex justify-center pb-24 overflow-y-auto">
                 {activeTab === "builder" && (
                     <div className="w-full max-w-5xl">
@@ -963,6 +1018,55 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </button>
                             </div>
                         </div>
+
+                        {/* Terms & Conditions Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowTerms(!showTerms)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Terms & Conditions</span>
+                                        {termsAndConditions && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">Added</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showTerms ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showTerms && (
+                                    <div className="px-6 pb-5 border-t border-slate-100">
+                                        <p className="text-xs text-slate-500 mt-3 mb-2">These terms will be included on the estimate sent to the client.</p>
+                                        <textarea
+                                            value={termsAndConditions}
+                                            onChange={e => setTermsAndConditions(e.target.value)}
+                                            placeholder="Enter your terms and conditions here. For example: Payment is due within 30 days of invoice. A 50% deposit is required before work begins..."
+                                            className="hui-input w-full h-32 resize-y text-sm"
+                                        />
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Internal Memo Section (only in internal view) */}
+                        {viewMode === "internal" && (
+                            <div className="mt-6 mx-2">
+                                <div className="bg-amber-50/50 rounded-xl border border-amber-200 overflow-hidden">
+                                    <div className="flex items-center gap-2 px-6 py-3">
+                                        <svg className="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                                        <span className="text-sm font-semibold text-amber-800">Internal Memo</span>
+                                        <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">Not visible to client</span>
+                                    </div>
+                                    <div className="px-6 pb-4">
+                                        <textarea
+                                            value={memo}
+                                            onChange={e => setMemo(e.target.value)}
+                                            placeholder="Internal notes about this estimate..."
+                                            className="w-full h-20 resize-y text-sm bg-white border border-amber-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-amber-300 placeholder:text-amber-400"
+                                        />
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </div>
                 )}
                 {activeTab === "expenses" && (
@@ -971,6 +1075,195 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         <ExpensesTab estimateId={initialEstimate.id} projectId={context.type === "project" ? context.id : ""} items={items} />
                     </div>
                 )}
+            </div>
+
+            {/* Right Sidebar */}
+            {showSidebar && (
+                <div className="w-80 border-l border-slate-200 bg-white flex flex-col overflow-y-auto shrink-0">
+                    {/* Sidebar Tabs */}
+                    <div className="flex border-b border-slate-200 sticky top-0 bg-white z-10">
+                        <button
+                            onClick={() => setSidebarTab("overview")}
+                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "overview" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                        >Overview</button>
+                        <button
+                            onClick={() => setSidebarTab("activity")}
+                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "activity" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                        >Activity</button>
+                    </div>
+
+                    {sidebarTab === "overview" && (
+                        <div className="p-5 space-y-5">
+                            {/* Status */}
+                            <div>
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block">Status</label>
+                                <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold ${
+                                    status === "Draft" ? "bg-slate-100 text-slate-600" :
+                                    status === "Sent" ? "bg-amber-50 text-amber-700" :
+                                    status === "Viewed" ? "bg-blue-50 text-blue-700" :
+                                    status === "Approved" ? "bg-green-50 text-green-700" :
+                                    status === "Invoiced" ? "bg-teal-50 text-teal-700" :
+                                    status === "Paid" ? "bg-emerald-50 text-emerald-700" :
+                                    "bg-slate-100 text-slate-500"
+                                }`}>{status}</span>
+                            </div>
+
+                            {/* Amounts */}
+                            <div className="space-y-3">
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Financials</label>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="bg-slate-50 rounded-lg p-3">
+                                        <p className="text-[10px] text-slate-500 font-medium uppercase">Subtotal</p>
+                                        <p className="text-sm font-bold text-slate-800">${subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                    </div>
+                                    <div className="bg-indigo-50 rounded-lg p-3">
+                                        <p className="text-[10px] text-indigo-500 font-medium uppercase">Total</p>
+                                        <p className="text-sm font-bold text-indigo-700">${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                    </div>
+                                </div>
+                                {viewMode === "internal" && (
+                                    <div className="bg-amber-50 rounded-lg p-3">
+                                        <p className="text-[10px] text-amber-600 font-medium uppercase">Profit Margin</p>
+                                        <p className="text-sm font-bold text-amber-800">{profitMargin.toFixed(1)}% (${totalMarkup.toLocaleString(undefined, { minimumFractionDigits: 2 })})</p>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Key Dates */}
+                            <div className="space-y-2">
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Key Dates</label>
+                                <div className="space-y-2 text-sm">
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-500">Created</span>
+                                        <span className="text-slate-800 font-medium">{new Date(initialEstimate.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                    </div>
+                                    {initialEstimate.sentAt && (
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500">Sent</span>
+                                            <span className="text-slate-800 font-medium">{new Date(initialEstimate.sentAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                        </div>
+                                    )}
+                                    {initialEstimate.viewedAt && (
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500">Viewed</span>
+                                            <span className="text-slate-800 font-medium">{new Date(initialEstimate.viewedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                        </div>
+                                    )}
+                                    {initialEstimate.approvedAt && (
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500">Approved</span>
+                                            <span className="text-green-700 font-medium">{new Date(initialEstimate.approvedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                        </div>
+                                    )}
+                                    {expirationDate && (
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500">Expires</span>
+                                            <span className={`font-medium ${new Date(expirationDate) < new Date() ? 'text-red-600' : 'text-slate-800'}`}>{new Date(expirationDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Client Info */}
+                            <div className="space-y-2">
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Client</label>
+                                <div className="bg-slate-50 rounded-lg p-3 space-y-1">
+                                    <p className="text-sm font-semibold text-slate-800">{context.clientName}</p>
+                                    {context.clientEmail && <p className="text-xs text-slate-500">{context.clientEmail}</p>}
+                                    {context.location && <p className="text-xs text-slate-500">{context.location}</p>}
+                                </div>
+                            </div>
+
+                            {/* Signature */}
+                            {initialEstimate.signatureUrl && (
+                                <div className="space-y-2">
+                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Signature</label>
+                                    <div className="bg-green-50 rounded-lg p-3 border border-green-200">
+                                        <div className="flex items-center gap-2 mb-2">
+                                            <svg className="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                            <span className="text-xs font-semibold text-green-700">Signed by {initialEstimate.approvedBy || 'Client'}</span>
+                                        </div>
+                                        <img src={initialEstimate.signatureUrl} alt="Signature" className="max-h-16 rounded" />
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Items Summary */}
+                            <div>
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block">Items</label>
+                                <div className="text-sm text-slate-600">
+                                    <span className="font-semibold text-slate-800">{items.length}</span> line items
+                                    {paymentSchedules.length > 0 && (
+                                        <> &middot; <span className="font-semibold text-slate-800">{paymentSchedules.length}</span> payment milestones</>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {sidebarTab === "activity" && (
+                        <div className="p-5">
+                            <div className="space-y-4">
+                                {/* Activity Timeline */}
+                                <div className="relative">
+                                    <div className="absolute left-[11px] top-6 bottom-0 w-0.5 bg-slate-200"></div>
+                                    <div className="space-y-4">
+                                        <div className="flex items-start gap-3 relative">
+                                            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center shrink-0 z-10">
+                                                <svg className="w-3 h-3 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-medium text-slate-800">Estimate created</p>
+                                                <p className="text-xs text-slate-500">{new Date(initialEstimate.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                            </div>
+                                        </div>
+                                        {initialEstimate.sentAt && (
+                                            <div className="flex items-start gap-3 relative">
+                                                <div className="w-6 h-6 rounded-full bg-amber-100 flex items-center justify-center shrink-0 z-10">
+                                                    <svg className="w-3 h-3 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                                                </div>
+                                                <div>
+                                                    <p className="text-sm font-medium text-slate-800">Sent to client</p>
+                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.sentAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                </div>
+                                            </div>
+                                        )}
+                                        {initialEstimate.viewedAt && (
+                                            <div className="flex items-start gap-3 relative">
+                                                <div className="w-6 h-6 rounded-full bg-blue-100 flex items-center justify-center shrink-0 z-10">
+                                                    <svg className="w-3 h-3 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                </div>
+                                                <div>
+                                                    <p className="text-sm font-medium text-slate-800">Viewed by client</p>
+                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.viewedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                </div>
+                                            </div>
+                                        )}
+                                        {initialEstimate.approvedAt && (
+                                            <div className="flex items-start gap-3 relative">
+                                                <div className="w-6 h-6 rounded-full bg-green-100 flex items-center justify-center shrink-0 z-10">
+                                                    <svg className="w-3 h-3 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                </div>
+                                                <div>
+                                                    <p className="text-sm font-medium text-slate-800">Approved{initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ''}</p>
+                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.approvedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                </div>
+                                            </div>
+                                        )}
+                                        {!initialEstimate.sentAt && !initialEstimate.viewedAt && !initialEstimate.approvedAt && (
+                                            <div className="mt-4 text-center py-6">
+                                                <svg className="w-10 h-10 text-slate-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                                <p className="text-sm text-slate-500">No activity yet</p>
+                                                <p className="text-xs text-slate-400 mt-1">Send the estimate to start tracking</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
             </div>
             {showSendModal && (
                 <SendEstimateModal
