@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { toast } from "sonner";
-import { deleteExpense } from "@/lib/time-expense-actions";
+import { deleteExpense, getExpenses } from "@/lib/time-expense-actions";
 
 interface Expense {
     id: string;
@@ -36,9 +36,17 @@ function fmtMoney(v: number): string {
     return "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export default function ExpensesTab({ projectId, expenses, onAddNew, currentUser }: Props) {
+export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser }: Props) {
+    const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
     const [filter, setFilter] = useState("");
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
+
+    const refreshExpenses = useCallback(async () => {
+        try {
+            const fresh = await getExpenses(projectId);
+            setExpenses(fresh as Expense[]);
+        } catch { /* server revalidation will handle it */ }
+    }, [projectId]);
 
     const summary = useMemo(() => {
         let total = 0;
@@ -75,6 +83,7 @@ export default function ExpensesTab({ projectId, expenses, onAddNew, currentUser
         try {
             await deleteExpense(id, projectId);
             toast.success("Expense deleted");
+            await refreshExpenses();
         } catch (err: any) {
             toast.error(err.message || "Failed to delete");
         }

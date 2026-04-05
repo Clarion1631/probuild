@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { toast } from "sonner";
-import { deleteTimeEntry } from "@/lib/time-expense-actions";
+import { deleteTimeEntry, getTimeEntries } from "@/lib/time-expense-actions";
 
 interface TimeEntry {
     id: string;
@@ -34,9 +34,17 @@ function fmtMoney(v: number): string {
     return "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export default function TimeTab({ projectId, entries, onAddNew, currentUser }: Props) {
+export default function TimeTab({ projectId, entries: initialEntries, onAddNew, currentUser }: Props) {
+    const [entries, setEntries] = useState<TimeEntry[]>(initialEntries);
     const [filter, setFilter] = useState("");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+    const refreshEntries = useCallback(async () => {
+        try {
+            const fresh = await getTimeEntries(projectId);
+            setEntries(fresh as TimeEntry[]);
+        } catch { /* server revalidation will handle it */ }
+    }, [projectId]);
 
     const summary = useMemo(() => {
         let totalHours = 0;
@@ -77,6 +85,7 @@ export default function TimeTab({ projectId, entries, onAddNew, currentUser }: P
         try {
             await deleteTimeEntry(id);
             toast.success("Entry deleted");
+            await refreshEntries();
         } catch (err: any) {
             toast.error(err.message || "Failed to delete");
         }
