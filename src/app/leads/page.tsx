@@ -77,6 +77,8 @@ export default function LeadsPage() {
         getLeads().then(data => {
             setLeads(data);
             setLoading(false);
+        }).catch(() => {
+            setLoading(false);
         });
     }, []);
 
@@ -234,7 +236,7 @@ export default function LeadsPage() {
                 </div>
                 <div className="hui-card p-5">
                     <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1">Pipeline Value</p>
-                    <p className="text-2xl font-bold text-hui-textMain">${totalRevenue > 0 ? totalRevenue.toLocaleString() : "0"}</p>
+                    <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(totalRevenue)}</p>
                     <p className="text-xs text-hui-textMuted mt-1">estimated revenue</p>
                 </div>
             </div>

@@ -48,10 +48,10 @@ export async function getLeads() {
             }
         },
     });
-    return leads.map((l: any) => ({
+    return JSON.parse(JSON.stringify(leads.map((l: any) => ({
         ...l,
         client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
-    }));
+    }))));
 }
 
 export async function getLead(id: string) {
@@ -71,7 +71,7 @@ export async function getLead(id: string) {
     if (lead && !lead.client) {
         (lead as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
     }
-    return lead;
+    return lead ? JSON.parse(JSON.stringify(lead)) : null;
 }
 
 export async function updateLeadStage(id: string, stage: string) {
