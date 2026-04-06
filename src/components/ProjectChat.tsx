@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { toast } from "sonner";
 
 interface MessageData {
     id: string;
@@ -50,10 +51,11 @@ export default function ProjectChat({
                     m.senderType !== perspective && !m.readAt
             );
             for (const msg of unread) {
-                fetch(`/api/messages/${msg.id}/read`, { method: "PATCH" }).catch(() => {});
+                fetch(`/api/messages/${msg.id}/read`, { method: "PATCH" }).catch((err) => console.error("[Chat] Failed to mark as read:", err));
             }
-        } catch {
-            // silent
+        } catch (err) {
+            console.error("[Chat] Failed to fetch messages:", err);
+            toast.error("Failed to load messages");
         } finally {
             setLoading(false);
         }
@@ -96,8 +98,9 @@ export default function ProjectChat({
                 setMessages((prev) => [...prev, msg]);
                 setNewMessage("");
             }
-        } catch {
-            // silent
+        } catch (err) {
+            console.error("[Chat] Failed to send message:", err);
+            toast.error("Failed to send message");
         } finally {
             setSending(false);
         }

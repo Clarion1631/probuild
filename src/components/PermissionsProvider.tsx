@@ -29,7 +29,10 @@ export function PermissionsProvider({ children }: { children: ReactNode }) {
                 if (d) setData({ ...d, loaded: true });
                 else setData({ ...defaultPerms, loaded: true }); // Not logged in
             })
-            .catch(() => setData({ ...defaultPerms, loaded: true }));
+            .catch((err) => {
+                console.error("[Permissions] Failed to fetch permissions:", err);
+                setData({ ...defaultPerms, loaded: true });
+            });
     }, []);
 
     return (

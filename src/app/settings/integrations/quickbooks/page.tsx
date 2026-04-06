@@ -12,7 +12,7 @@ export default async function QuickBooksSettingsPage({
     const params = await searchParams;
     const [qbSettings, costCodes] = await Promise.all([
         getQBSettings(),
-        prisma.costCode.findMany({ where: { active: true }, orderBy: { code: "asc" }, select: { id: true, code: true, name: true } }),
+        prisma.costCode.findMany({ where: { isActive: true }, orderBy: { code: "asc" }, select: { id: true, code: true, name: true } }),
     ]);
 
     return (

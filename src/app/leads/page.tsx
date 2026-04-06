@@ -65,6 +65,7 @@ type ScoreResult = { score: number; rating: string; summary: string; topFactors:
 export default function LeadsPage() {
     const [leads, setLeads] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<TabKey>("All");
     const [searchTerm, setSearchTerm] = useState("");
     const [sortKey, setSortKey] = useState<SortKey>("lastActivity");
@@ -77,7 +78,9 @@ export default function LeadsPage() {
         getLeads().then(data => {
             setLeads(data);
             setLoading(false);
-        }).catch(() => {
+        }).catch((err) => {
+            console.error("[Leads] Failed to load:", err);
+            setLoadError("Failed to load leads. Please refresh the page.");
             setLoading(false);
         });
     }, []);
@@ -299,7 +302,18 @@ export default function LeadsPage() {
 
             {/* Table */}
             <div className="hui-card overflow-hidden">
-                {loading ? (
+                {loadError ? (
+                    <div className="p-12 text-center">
+                        <div className="w-14 h-14 bg-red-100 rounded-2xl flex items-center justify-center mx-auto mb-3">
+                            <svg className="w-7 h-7 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                            </svg>
+                        </div>
+                        <h3 className="text-base font-semibold text-hui-textMain mb-1">Error Loading Leads</h3>
+                        <p className="text-sm text-red-600 mb-4">{loadError}</p>
+                        <button onClick={() => window.location.reload()} className="hui-btn hui-btn-secondary">Retry</button>
+                    </div>
+                ) : loading ? (
                     <div className="p-12 text-center text-hui-textMuted">Loading leads...</div>
                 ) : filtered.length === 0 ? (
                     <div className="p-16 flex flex-col items-center">

@@ -11,7 +11,8 @@ export default async function VarianceReportPage() {
     const session = await getServerSession(authOptions);
     if (!session || !session.user) return redirect("/login");
 
-    const user = await prisma.user.findUnique({ where: { email: session.user.email! } });
+    if (!session.user.email) return redirect("/login");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email } });
     if (!user || (user.role !== 'MANAGER' && user.role !== 'ADMIN')) {
         return <div className="p-8 text-red-500">Access Denied. Managers Only.</div>;
     }
@@ -62,9 +63,9 @@ export default async function VarianceReportPage() {
                             }
                             const itemCategory = item.costType?.name || item.type || "";
                             if (itemCategory === 'Labor') {
-                                costCodeBudgets[ccId].laborBudget += item.total || 0;
+                                costCodeBudgets[ccId].laborBudget += Number(item.total) || 0;
                             } else {
-                                costCodeBudgets[ccId].materialBudget += item.total || 0;
+                                costCodeBudgets[ccId].materialBudget += Number(item.total) || 0;
                             }
                         }
                     }
@@ -81,7 +82,7 @@ export default async function VarianceReportPage() {
                                 actualLabor: 0,
                             };
                         }
-                        costCodeBudgets[ccId].actualLabor += (te.laborCost || 0) + (te.burdenCost || 0);
+                        costCodeBudgets[ccId].actualLabor += (Number(te.laborCost) || 0) + (Number(te.burdenCost) || 0);
                     }
 
                     const phases = Object.values(costCodeBudgets);

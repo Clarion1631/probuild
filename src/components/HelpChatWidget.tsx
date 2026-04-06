@@ -37,6 +37,7 @@ export default function HelpChatWidget({
   const [loading, setLoading] = useState(false);
   const [requests, setRequests] = useState<HelpRequest[]>([]);
   const [requestsLoading, setRequestsLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
 
@@ -55,8 +56,9 @@ export default function HelpChatWidget({
         const data = await res.json();
         setRequests(data.requests || []);
       }
-    } catch {
-      // silently fail
+    } catch (e) {
+      console.error("[HelpChat] Failed to load chat history:", e);
+      setHistoryError("Failed to load chat history");
     } finally {
       setRequestsLoading(false);
     }
@@ -102,12 +104,13 @@ export default function HelpChatWidget({
       }
 
       setMessages((prev) => [...prev, assistantMsg]);
-    } catch {
+    } catch (e: any) {
+      const errMsg = e?.message || "Unknown error";
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: "Sorry, I couldn't process your request. Please try again.",
+          content: `Error: ${errMsg}. Please try again.`,
         },
       ]);
     } finally {
@@ -137,10 +140,11 @@ export default function HelpChatWidget({
           },
         ]);
       }
-    } catch {
+    } catch (e: any) {
+      const reason = e?.message || "Unknown error";
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Failed to submit feature request." },
+        { role: "assistant", content: `Failed to submit feature request: ${reason}` },
       ]);
     }
   }
@@ -313,7 +317,11 @@ export default function HelpChatWidget({
           {/* Requests tab (admin only) */}
           {tab === "requests" && effectiveIsAdmin && (
             <div className="flex-1 overflow-y-auto px-4 py-3 bg-hui-background">
-              {requestsLoading ? (
+              {historyError ? (
+                <p className="text-sm text-red-500 text-center mt-8">
+                  {historyError}
+                </p>
+              ) : requestsLoading ? (
                 <p className="text-sm text-hui-textMuted text-center mt-8">
                   Loading...
                 </p>

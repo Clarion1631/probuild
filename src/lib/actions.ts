@@ -188,7 +188,7 @@ export async function updateLeadInfo(id: string, data: any) {
 }
 
 export async function getClients() {
-    return await prisma.client.findMany({
+    const clients = await prisma.client.findMany({
         orderBy: { name: "asc" },
         include: {
             projects: {
@@ -197,6 +197,7 @@ export async function getClients() {
             leads: true
         }
     });
+    return JSON.parse(JSON.stringify(clients));
 }
 
 export async function getClient(id: string) {
@@ -504,10 +505,10 @@ export async function getProjects() {
             estimates: safeEstimateInclude,
         },
     });
-    return projects.map((p: any) => ({
+    return JSON.parse(JSON.stringify(projects.map((p: any) => ({
         ...p,
         client: p.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
-    }));
+    }))));
 }
 
 export async function getProject(id: string) {
@@ -527,7 +528,7 @@ export async function getProject(id: string) {
     if (project && !project.client) {
         (project as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
     }
-    return project;
+    return project ? JSON.parse(JSON.stringify(project)) : null;
 }
 
 export async function getProjectLead(projectId: string) {
@@ -789,30 +790,35 @@ export async function getEstimateForPortal(id: string) {
                 paymentSchedules: { orderBy: { order: "asc" } },
             },
         });
-    } catch {
-        // Safe fallback — omit columns not yet migrated to DB
-        estimate = await prisma.estimate.findUnique({
-            where: { id },
-            select: {
-                id: true, number: true, title: true, projectId: true, leadId: true,
-                code: true, status: true, privacy: true, createdAt: true,
-                totalAmount: true, balanceDue: true,
-                approvedBy: true, approvedAt: true, approvalIp: true,
-                approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
-                project: { include: { client: true } },
-                lead: { include: { client: true } },
-                items: {
-                    orderBy: { order: "asc" },
-                    select: {
-                        id: true, estimateId: true, name: true, description: true, type: true,
-                        quantity: true, baseCost: true, markupPercent: true, unitCost: true,
-                        total: true, order: true, parentId: true,
-                        costCodeId: true, costTypeId: true, createdAt: true,
+    } catch (err) {
+        console.error("[getEstimateForPortal] Primary query failed:", err);
+        try {
+            estimate = await prisma.estimate.findUnique({
+                where: { id },
+                select: {
+                    id: true, number: true, title: true, projectId: true, leadId: true,
+                    code: true, status: true, privacy: true, createdAt: true,
+                    totalAmount: true, balanceDue: true,
+                    approvedBy: true, approvedAt: true, approvalIp: true,
+                    approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
+                    project: { include: { client: true } },
+                    lead: { include: { client: true } },
+                    items: {
+                        orderBy: { order: "asc" },
+                        select: {
+                            id: true, estimateId: true, name: true, description: true, type: true,
+                            quantity: true, baseCost: true, markupPercent: true, unitCost: true,
+                            total: true, order: true, parentId: true,
+                            costCodeId: true, costTypeId: true, createdAt: true,
+                        },
                     },
+                    paymentSchedules: { orderBy: { order: "asc" } },
                 },
-                paymentSchedules: { orderBy: { order: "asc" } },
-            },
-        });
+            });
+        } catch (fallbackErr) {
+            console.error("[getEstimateForPortal] Fallback query also failed:", fallbackErr);
+            return null;
+        }
     }
 
     if (!estimate) return null;
@@ -1168,21 +1174,26 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
 }
 
 export async function getInvoiceForPortal(id: string) {
-    const invoice = await prisma.invoice.findUnique({
-        where: { id },
-        include: {
-            project: { include: { client: true } },
-            client: true,
-            payments: { orderBy: { createdAt: "asc" } },
-        },
-    });
-    if (!invoice) return null;
-    return {
-        ...invoice,
-        projectName: invoice.project?.name || null,
-        clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
-        clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
-    };
+    try {
+        const invoice = await prisma.invoice.findUnique({
+            where: { id },
+            include: {
+                project: { include: { client: true } },
+                client: true,
+                payments: { orderBy: { createdAt: "asc" } },
+            },
+        });
+        if (!invoice) return null;
+        return {
+            ...invoice,
+            projectName: invoice.project?.name || null,
+            clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
+            clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
+        };
+    } catch (err) {
+        console.error("[getInvoiceForPortal] Query failed:", err);
+        return null;
+    }
 }
 
 export async function markInvoiceViewed(invoiceId: string) {
@@ -4608,6 +4619,9 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
             where: { id: { in: itemIds } },
             data: { approvalStatus: status, approvalNote: null },
         });
-    } catch { /* columns may not exist yet */ }
+    } catch (err) {
+        console.error("[bulkUpdateItemApproval] Failed — approvalStatus column may not exist:", err);
+        return { success: false, count: 0, error: "Update failed — database column may not be migrated yet" };
+    }
     return { success: true, count: itemIds.length }
 }
