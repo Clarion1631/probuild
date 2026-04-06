@@ -1,7 +1,7 @@
 "use server";
 
 import { prisma } from "./prisma";
-import { revalidatePath } from "next/cache";
+import { revalidatePath, unstable_cache } from "next/cache";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 
@@ -502,7 +502,7 @@ export async function getProjects() {
         orderBy: { viewedAt: "desc" },
         include: {
             client: true,
-            estimates: safeEstimateInclude,
+            estimates: { select: { totalAmount: true } },
         },
     });
     return JSON.parse(JSON.stringify(projects.map((p: any) => ({
@@ -1575,20 +1575,24 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
 }
 
 
-export async function getCompanySettings() {
-    let settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+export const getCompanySettings = unstable_cache(
+    async () => {
+        let settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
 
-    if (!settings) {
-        settings = await prisma.companySettings.create({
-            data: {
-                id: "singleton",
-                companyName: "My Construction Co.",
-            },
-        });
-    }
+        if (!settings) {
+            settings = await prisma.companySettings.create({
+                data: {
+                    id: "singleton",
+                    companyName: "My Construction Co.",
+                },
+            });
+        }
 
-    return settings;
-}
+        return JSON.parse(JSON.stringify(settings));
+    },
+    ["company-settings"],
+    { revalidate: 300 }
+);
 
 export async function saveCompanySettings(data: any) {
     await prisma.companySettings.update({
@@ -1614,6 +1618,7 @@ export async function saveCompanySettings(data: any) {
 
     revalidatePath("/settings/company");
     revalidatePath("/portal");
+    revalidatePath("/"); // bust company-settings cache
     return { success: true };
 }
 

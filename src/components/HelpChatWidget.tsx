@@ -132,11 +132,15 @@ export default function HelpChatWidget({
       });
 
       if (res.ok) {
+        const data = await res.json();
+        const ghLink = data.githubIssue
+          ? `\n\nGitHub Issue #${data.githubIssue.number} created — your team will be notified automatically.`
+          : "";
         setMessages((prev) => [
           ...prev,
           {
             role: "assistant",
-            content: `Feature request "${title}" has been submitted successfully.`,
+            content: `Feature request "${title}" has been submitted successfully.${ghLink}`,
           },
         ]);
       }
