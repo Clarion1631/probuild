@@ -21,7 +21,7 @@ export default async function LeadContractsPage({ params, searchParams }: {
             <LeadContractsClient
                 leadId={lead.id}
                 leadName={lead.name}
-                clientName={lead.client.name}
+                clientName={lead.client?.name || ""}
                 contracts={contracts.map(c => ({
                     ...c,
                     createdAt: c.createdAt.toISOString(),

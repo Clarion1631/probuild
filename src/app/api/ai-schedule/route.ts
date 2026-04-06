@@ -26,10 +26,13 @@ export async function POST(req: NextRequest) {
     if (estimateId) {
         const estimate = await prisma.estimate.findUnique({
             where: { id: estimateId },
-            include: {
+            select: {
+                id: true, code: true, title: true, status: true,
+                totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
                 items: {
                     where: { parentId: null },
                     orderBy: { order: "asc" },
+                    select: { name: true, type: true, total: true, quantity: true },
                 },
             },
         });
@@ -37,7 +40,7 @@ export async function POST(req: NextRequest) {
             estimateItems = estimate.items.map(i => ({
                 name: i.name,
                 type: i.type,
-                total: i.total,
+                total: Number(i.total),
                 quantity: i.quantity,
             }));
         }
@@ -45,10 +48,13 @@ export async function POST(req: NextRequest) {
         // Get all estimates for this project
         const estimates = await prisma.estimate.findMany({
             where: { projectId },
-            include: {
+            select: {
+                id: true, code: true, title: true, status: true,
+                totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
                 items: {
                     where: { parentId: null },
                     orderBy: { order: "asc" },
+                    select: { name: true, type: true, total: true, quantity: true },
                 },
             },
         });
@@ -56,7 +62,7 @@ export async function POST(req: NextRequest) {
             e.items.map(i => ({
                 name: i.name,
                 type: i.type,
-                total: i.total,
+                total: Number(i.total),
                 quantity: i.quantity,
             }))
         );

@@ -70,10 +70,10 @@ export async function GET(request: Request) {
                 let sentViaSms = false;
 
                 // Send email
-                if ((channel === "email" || channel === "both") && lead.client.email) {
+                if ((channel === "email" || channel === "both") && lead.client?.email) {
                     const emailSubject = subject || `Message from ${companyName} about your project`;
                     await sendNotification(
-                        lead.client.email,
+                        lead.client?.email,
                         emailSubject,
                         `<!DOCTYPE html>
                         <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
@@ -96,11 +96,11 @@ export async function GET(request: Request) {
                 }
 
                 // Send SMS
-                if ((channel === "sms" || channel === "both") && lead.client.primaryPhone) {
+                if ((channel === "sms" || channel === "both") && lead.client?.primaryPhone) {
                     const smsBody = parsedAttachments.length > 0
                         ? `${companyName}: ${messageBody}\n\nView your estimate: ${parsedAttachments[0]?.url || appUrl}`
                         : `${companyName}: ${messageBody}`;
-                    await sendSMS(lead.client.primaryPhone, smsBody);
+                    await sendSMS(lead.client?.primaryPhone, smsBody);
                     sentViaSms = true;
                 }
 

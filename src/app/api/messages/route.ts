@@ -177,7 +177,7 @@ export async function POST(request: Request) {
             } else if (senderType === "TEAM" && project?.client?.email) {
                 // Team sent a message → notify the client
                 await sendNotification(
-                    project.client.email,
+                    project.client?.email,
                     `${companyName} sent you a message — ${project.name}`,
                     `<!DOCTYPE html>
                     <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
@@ -210,7 +210,7 @@ export async function POST(request: Request) {
             } else if (senderType === "TEAM" && project?.client?.primaryPhone) {
                 // Team sent a message → text the client
                 await sendSMS(
-                    project.client.primaryPhone,
+                    project.client?.primaryPhone,
                     `${companyName}: New message about your ${project.name} project from ${resolvedName}: "${messageBody.substring(0, 100)}${messageBody.length > 100 ? '...' : ''}" — View at ${appUrl}/portal/projects/${projectId}`
                 );
             }

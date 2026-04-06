@@ -57,11 +57,11 @@ export default async function LeadMeetingsPage({ params }: { params: Promise<{ i
                 clientId={lead.client.id}
                 clientName={lead.client.name}
                 clientEmail={lead.client.email}
-                clientPhone={(lead.client as any).primaryPhone || null}
-                clientAddress={(lead.client as any).addressLine1 || null}
-                clientCity={(lead.client as any).city || null}
-                clientState={(lead.client as any).state || null}
-                clientZip={(lead.client as any).zipCode || null}
+                clientPhone={(lead.client as any)?.primaryPhone || null}
+                clientAddress={(lead.client as any)?.addressLine1 || null}
+                clientCity={(lead.client as any)?.city || null}
+                clientState={(lead.client as any)?.state || null}
+                clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={lead.message || null}
             />
         </div>

@@ -35,20 +35,20 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
             <LeadSidebar
                 leadId={lead.id}
                 leadName={lead.name}
-                clientName={lead.client.name}
+                clientName={lead.client?.name || ""}
                 onConvert={handleConvert}
             />
 
             {/* Center - Messaging */}
             <LeadMessaging
                 leadId={lead.id}
-                clientName={lead.client.name}
+                clientName={lead.client?.name || ""}
                 leadName={lead.name}
                 leadSource={lead.source}
                 createdAt={lead.createdAt.toISOString()}
                 location={lead.location}
-                clientEmail={lead.client.email}
-                clientPhone={(lead.client as any).primaryPhone || null}
+                clientEmail={lead.client?.email || null}
+                clientPhone={(lead.client as any)?.primaryPhone || null}
                 initialMessage={leadFull?.message || null}
                 estimates={estimates}
             />
@@ -63,14 +63,14 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 targetRevenue={lead.targetRevenue}
                 location={lead.location}
                 projectType={lead.projectType}
-                clientId={lead.client.id}
-                clientName={lead.client.name}
-                clientEmail={lead.client.email}
-                clientPhone={(lead.client as any).primaryPhone || null}
-                clientAddress={(lead.client as any).addressLine1 || null}
-                clientCity={(lead.client as any).city || null}
-                clientState={(lead.client as any).state || null}
-                clientZip={(lead.client as any).zipCode || null}
+                clientId={lead.client?.id || ""}
+                clientName={lead.client?.name || ""}
+                clientEmail={lead.client?.email || null}
+                clientPhone={(lead.client as any)?.primaryPhone || null}
+                clientAddress={(lead.client as any)?.addressLine1 || null}
+                clientCity={(lead.client as any)?.city || null}
+                clientState={(lead.client as any)?.state || null}
+                clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={leadFull?.message || null}
             />
         </div>

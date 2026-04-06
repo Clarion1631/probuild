@@ -15,7 +15,8 @@ export async function POST(req: NextRequest) {
             where: { parentId: null }, // top-level items only (skip sub-items to avoid double-counting)
             include: {
                 estimate: {
-                    include: {
+                    select: {
+                        id: true, code: true, title: true, status: true, totalAmount: true,
                         project: { select: { id: true, name: true, type: true, status: true } },
                     },
                 },
@@ -93,8 +94,10 @@ export async function POST(req: NextRequest) {
         if (estimateId) {
             const currentEstimate = await prisma.estimate.findUnique({
                 where: { id: estimateId },
-                include: {
-                    items: { orderBy: { order: "asc" } },
+                select: {
+                    id: true, code: true, title: true, status: true,
+                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                    items: { orderBy: { order: "asc" }, select: { name: true, type: true, quantity: true, unitCost: true, total: true, markupPercent: true } },
                     project: {
                         select: { name: true, type: true, location: true },
                     },

@@ -125,7 +125,7 @@ export async function GET(
     y -= 18;
 
     if (project.client?.name) {
-        page.drawText(`Client: ${project.client.name}`, {
+        page.drawText(`Client: ${project.client?.name || "Client"}`, {
             x: margin, y, size: 10, font: helvetica, color: colors.textMuted,
         });
         y -= 16;

@@ -114,9 +114,9 @@ Do NOT include greetings like "Dear" - use the client's first name casually.
 Do NOT include signatures — those are added automatically.`;
 
     const userPrompt = `CLIENT INFO:
-Name: ${lead.client.name}
-Email: ${lead.client.email || "Not provided"}
-Phone: ${lead.client.primaryPhone || "Not provided"}
+Name: ${lead.client?.name || "Client"}
+Email: ${lead.client?.email || "Not provided"}
+Phone: ${lead.client?.primaryPhone || "Not provided"}
 Project Location: ${lead.location || "Not specified"}
 Project Type: ${lead.projectType || "Not specified"}
 Lead Source: ${lead.source || "Unknown"}

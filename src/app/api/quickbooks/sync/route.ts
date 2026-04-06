@@ -38,8 +38,10 @@ export async function POST(req: NextRequest) {
         if (type === "estimate") {
             const estimate = await prisma.estimate.findUnique({
                 where: { id },
-                include: {
-                    items: true,
+                select: {
+                    id: true, code: true, title: true, status: true,
+                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                    items: { select: { name: true, quantity: true, unitCost: true, total: true, type: true } },
                     project: { include: { client: true } },
                 },
             });
