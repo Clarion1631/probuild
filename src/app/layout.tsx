@@ -45,11 +45,11 @@ export default async function RootLayout({
           <AppLayout logoUrl={settings?.logoUrl ?? undefined}>
             {children}
           </AppLayout>
+          <HelpChatWidget
+            userId={session?.user?.id}
+            userRole={session?.user?.role}
+          />
         </Providers>
-        <HelpChatWidget
-          userId={session?.user?.id}
-          userRole={session?.user?.role}
-        />
         <Toaster position="bottom-right" richColors />
       </body>
     </html>
