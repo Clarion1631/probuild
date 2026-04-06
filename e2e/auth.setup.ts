@@ -1,21 +1,26 @@
 import { test as setup, expect } from "@playwright/test";
 
-setup("authenticate", async ({ page }) => {
-  await page.goto("/api/auth/signin");
+setup("authenticate", async ({ page, request }) => {
+  const baseURL = page.context()._options?.baseURL || process.env.BASE_URL || "http://localhost:3000";
 
-  // Click the "Sign in with Test" button to get to the credentials form
-  await page.getByText("Sign in with Test").click();
+  // Get CSRF token from NextAuth
+  const csrfRes = await request.get(`${baseURL}/api/auth/csrf`);
+  const { csrfToken } = await csrfRes.json();
 
-  // Fill the credentials form
-  await page.locator('input[name="email"]').fill("jadkins@goldentouchremodeling.com");
-  await page.locator('input[name="secret"]').fill(process.env.PLAYWRIGHT_TEST_SECRET || "");
+  // POST directly to the credentials callback (bypasses custom login page)
+  const signInRes = await request.post(`${baseURL}/api/auth/callback/credentials`, {
+    form: {
+      csrfToken,
+      email: "jadkins@goldentouchremodeling.com",
+      secret: process.env.PLAYWRIGHT_TEST_SECRET || "",
+    },
+  });
 
-  // Submit the form
-  await page.locator('button[type="submit"]').click();
+  // Navigate to a protected page to verify the session is active
+  await page.goto("/projects", { waitUntil: "networkidle", timeout: 15_000 });
 
-  // Wait for redirect after successful login
-  await page.waitForURL("**/projects**", { timeout: 15_000 });
-  await expect(page).not.toHaveURL(/.*signin.*/);
+  // Should NOT be on the login page
+  await expect(page).not.toHaveURL(/.*login.*/);
 
   // Save signed-in state
   await page.context().storageState({ path: "e2e/.auth/user.json" });

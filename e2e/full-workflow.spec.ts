@@ -1,30 +1,13 @@
 import { test, expect } from "@playwright/test";
 
-const BASE = process.env.BASE_URL || "http://localhost:3000";
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
 const ESTIMATE_ID = "cmml6vtx7001dpwrh8n65xzy6";
-
-// Auth: sign in once, reuse across all tests
-test.use({
-  storageState: undefined,
-});
-
-test.beforeEach(async ({ page }) => {
-  // Navigate to login and authenticate
-  await page.goto(`${BASE}/login`);
-  // If already authenticated (e.g. via storageState), skip
-  if (page.url().includes("/login")) {
-    await page.fill('input[type="email"]', "jadkins@goldentouchremodeling.com");
-    await page.click('button[type="submit"]');
-    await page.waitForTimeout(2000);
-  }
-});
 
 const CRASH_REGEX = /Something went wrong|Internal Server Error|Application error/i;
 const DECIMAL_REGEX = /\[object Object\]|Decimal\{|BigNumber/;
 
 async function assertPageLoads(page: any, path: string, label: string) {
-  const response = await page.goto(`${BASE}${path}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+  const response = await page.goto(path, { waitUntil: "domcontentloaded", timeout: 30000 });
   const status = response?.status() ?? 0;
   expect(status, `${label} returned ${status}`).toBeLessThan(500);
 
