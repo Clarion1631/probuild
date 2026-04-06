@@ -27,7 +27,7 @@ export default async function BookkeeperReceiptsPage() {
     });
 
     const costCodes = await prisma.costCode.findMany({
-        where: { active: true },
+        where: { isActive: true },
         select: { id: true, code: true, name: true },
         orderBy: { code: "asc" },
     });

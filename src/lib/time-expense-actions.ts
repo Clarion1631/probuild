@@ -197,11 +197,11 @@ export async function getTimeExpenseData(projectId: string) {
     });
 
     const estimates = await prisma.estimate.findMany({
-        where: { projectId, isArchived: false },
+        where: { projectId, archivedAt: null },
         select: {
             id: true,
             title: true,
-            items: { select: { id: true, name: true }, where: { isSection: false } },
+            items: { select: { id: true, name: true } },
         },
     });
 

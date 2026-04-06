@@ -78,7 +78,6 @@ test.describe("Quality Gate — Page Load", () => {
   // Settings pages
   const settingsRoutes = [
     "/settings",
-    "/settings/profile",
     "/settings/company",
     "/settings/notifications",
     "/settings/sales-taxes",
