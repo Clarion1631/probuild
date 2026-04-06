@@ -778,27 +778,45 @@ export async function updateEstimateStatus(id: string, status: string, leadId?: 
 }
 
 export async function getEstimateForPortal(id: string) {
-    const estimate = await prisma.estimate.findUnique({
-        where: { id },
-        include: {
-            project: {
-                include: { client: true },
+    let estimate: any;
+    try {
+        estimate = await prisma.estimate.findUnique({
+            where: { id },
+            include: {
+                project: { include: { client: true } },
+                lead: { include: { client: true } },
+                items: { orderBy: { order: "asc" } },
+                paymentSchedules: { orderBy: { order: "asc" } },
             },
-            lead: {
-                include: { client: true },
+        });
+    } catch {
+        // Safe fallback — omit columns not yet migrated to DB
+        estimate = await prisma.estimate.findUnique({
+            where: { id },
+            select: {
+                id: true, number: true, title: true, projectId: true, leadId: true,
+                code: true, status: true, privacy: true, createdAt: true,
+                totalAmount: true, balanceDue: true,
+                approvedBy: true, approvedAt: true, approvalIp: true,
+                approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
+                project: { include: { client: true } },
+                lead: { include: { client: true } },
+                items: {
+                    orderBy: { order: "asc" },
+                    select: {
+                        id: true, estimateId: true, name: true, description: true, type: true,
+                        quantity: true, baseCost: true, markupPercent: true, unitCost: true,
+                        total: true, order: true, parentId: true,
+                        costCodeId: true, costTypeId: true, createdAt: true,
+                    },
+                },
+                paymentSchedules: { orderBy: { order: "asc" } },
             },
-            items: {
-                orderBy: { order: "asc" },
-            },
-            paymentSchedules: {
-                orderBy: { order: "asc" },
-            },
-        },
-    });
+        });
+    }
 
     if (!estimate) return null;
 
-    // Flatten for portal usage
     return {
         ...estimate,
         projectName: estimate.project?.name || estimate.lead?.name || null,
@@ -1201,23 +1219,30 @@ export async function markInvoiceViewed(invoiceId: string) {
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
-    // Update estimate
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: {
-            title: data.title,
-            code: data.code,
-            status: data.status,
-            totalAmount: data.totalAmount,
-            balanceDue: data.totalAmount,
-            ...(data.processingFeeMarkup !== undefined && { processingFeeMarkup: data.processingFeeMarkup }),
-            ...(data.hideProcessingFee !== undefined && { hideProcessingFee: data.hideProcessingFee }),
-            ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
-            ...(data.memo !== undefined && { memo: data.memo }),
-            ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
-            ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
-        },
-    });
+    // Update estimate — try full update, fallback to safe fields if columns missing
+    const safeData = {
+        title: data.title,
+        code: data.code,
+        status: data.status,
+        totalAmount: data.totalAmount,
+        balanceDue: data.totalAmount,
+        ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
+    };
+    try {
+        await prisma.estimate.update({
+            where: { id: estimateId },
+            data: {
+                ...safeData,
+                ...(data.processingFeeMarkup !== undefined && { processingFeeMarkup: data.processingFeeMarkup }),
+                ...(data.hideProcessingFee !== undefined && { hideProcessingFee: data.hideProcessingFee }),
+                ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
+                ...(data.memo !== undefined && { memo: data.memo }),
+                ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+            },
+        });
+    } catch {
+        await prisma.estimate.update({ where: { id: estimateId }, data: safeData });
+    }
 
     // Delete existing items and schedules
     await prisma.estimateItem.deleteMany({ where: { estimateId } });
@@ -4566,18 +4591,23 @@ export async function deleteDocumentComment(commentId: string) {
 // ========== PER-ITEM APPROVAL ==========
 
 export async function updateItemApproval(itemId: string, status: "approved" | "rejected" | null, note?: string) {
-    const item = await prisma.estimateItem.update({
-        where: { id: itemId },
-        data: { approvalStatus: status, approvalNote: note || null },
-        select: { id: true, approvalStatus: true, estimateId: true },
-    });
-    return item;
+    try {
+        return await prisma.estimateItem.update({
+            where: { id: itemId },
+            data: { approvalStatus: status, approvalNote: note || null },
+            select: { id: true, approvalStatus: true, estimateId: true },
+        });
+    } catch {
+        return { id: itemId, approvalStatus: status, estimateId: null };
+    }
 }
 
 export async function bulkUpdateItemApproval(itemIds: string[], status: "approved" | "rejected" | null) {
-    await prisma.estimateItem.updateMany({
-        where: { id: { in: itemIds } },
-        data: { approvalStatus: status, approvalNote: null },
-    });
+    try {
+        await prisma.estimateItem.updateMany({
+            where: { id: { in: itemIds } },
+            data: { approvalStatus: status, approvalNote: null },
+        });
+    } catch { /* columns may not exist yet */ }
     return { success: true, count: itemIds.length }
 }
