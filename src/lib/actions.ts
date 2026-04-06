@@ -188,7 +188,7 @@ export async function updateLeadInfo(id: string, data: any) {
 }
 
 export async function getClients() {
-    return await prisma.client.findMany({
+    const clients = await prisma.client.findMany({
         orderBy: { name: "asc" },
         include: {
             projects: {
@@ -197,6 +197,7 @@ export async function getClients() {
             leads: true
         }
     });
+    return JSON.parse(JSON.stringify(clients));
 }
 
 export async function getClient(id: string) {
@@ -504,10 +505,10 @@ export async function getProjects() {
             estimates: safeEstimateInclude,
         },
     });
-    return projects.map((p: any) => ({
+    return JSON.parse(JSON.stringify(projects.map((p: any) => ({
         ...p,
         client: p.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
-    }));
+    }))));
 }
 
 export async function getProject(id: string) {
@@ -527,7 +528,7 @@ export async function getProject(id: string) {
     if (project && !project.client) {
         (project as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
     }
-    return project;
+    return project ? JSON.parse(JSON.stringify(project)) : null;
 }
 
 export async function getProjectLead(projectId: string) {
