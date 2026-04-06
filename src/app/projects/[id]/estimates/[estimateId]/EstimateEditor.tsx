@@ -63,7 +63,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [isLoadingHistorical, setIsLoadingHistorical] = useState(false);
 
     useEffect(() => {
-        getEstimateTemplates().then(setAssemblies).catch(() => {});
+        getEstimateTemplates().then(setAssemblies).catch((err) => console.error("[EstimateEditor] Failed to load templates:", err));
     }, []);
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -276,11 +276,11 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         fetch('/api/cost-codes?active=true')
             .then(res => res.json())
             .then(data => { if (Array.isArray(data)) setCostCodes(data); })
-            .catch(() => {});
+            .catch((err) => console.error("[EstimateEditor] Failed to load cost codes:", err));
         fetch('/api/cost-types?active=true')
             .then(res => res.json())
             .then(data => { if (Array.isArray(data)) setCostTypes(data); })
-            .catch(() => {});
+            .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);

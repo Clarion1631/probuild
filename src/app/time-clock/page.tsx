@@ -17,6 +17,10 @@ export default function TimeClockPage() {
     const [budgetBuckets, setBudgetBuckets] = useState<any[]>([]);
     const [selectedBucket, setSelectedBucket] = useState<string>("");
 
+    const [projectsError, setProjectsError] = useState<string>("");
+    const [timeEntriesError, setTimeEntriesError] = useState<string>("");
+    const [bucketsError, setBucketsError] = useState<string>("");
+
     useEffect(() => {
         // Fetch only projects the current user is assigned to
         fetch('/api/projects?assigned=true')
@@ -26,7 +30,10 @@ export default function TimeClockPage() {
                     setProjects(data);
                 }
             })
-            .catch(e => console.error("Could not fetch projects", e));
+            .catch(e => {
+                console.error("Could not fetch projects", e);
+                setProjectsError("Failed to load projects");
+            });
 
         // Fetch active time entry
         fetch('/api/time-entries')
@@ -40,7 +47,10 @@ export default function TimeClockPage() {
                     setSelectedBucket(active.estimateItemId || "");
                 }
             })
-            .catch(e => console.error("Could not fetch time entries", e));
+            .catch(e => {
+                console.error("Could not fetch time entries", e);
+                setTimeEntriesError("Failed to load time entries");
+            });
     }, []);
 
     useEffect(() => {
@@ -57,7 +67,10 @@ export default function TimeClockPage() {
                     setBudgetBuckets(data);
                 }
             })
-            .catch(e => console.error("Could not fetch estimate items", e));
+            .catch(e => {
+                console.error("Could not fetch estimate items", e);
+                setBucketsError("Failed to load budget phases");
+            });
 
     }, [selectedProject]);
 
@@ -162,7 +175,10 @@ export default function TimeClockPage() {
                                     <option key={p.id} value={p.id}>{p.name}</option>
                                 ))}
                             </select>
-                            {projects.length === 0 && (
+                            {projectsError && (
+                                <p className="text-xs text-red-600 mt-1">{projectsError}</p>
+                            )}
+                            {!projectsError && projects.length === 0 && (
                                 <p className="text-xs text-amber-600 mt-1">No projects assigned to you. Ask your manager to assign you.</p>
                             )}
                         </div>
@@ -182,6 +198,9 @@ export default function TimeClockPage() {
                                         </option>
                                     ))}
                                 </select>
+                                {bucketsError && (
+                                    <p className="text-xs text-red-600 mt-1">{bucketsError}</p>
+                                )}
                             </div>
                         )}
                     </div>
@@ -199,6 +218,12 @@ export default function TimeClockPage() {
                                 </div>
                             )}
                         </div>
+                    </div>
+                )}
+
+                {timeEntriesError && (
+                    <div className="mb-6 p-4 bg-red-50 text-red-600 rounded-lg text-sm text-left">
+                        {timeEntriesError}
                     </div>
                 )}
 
