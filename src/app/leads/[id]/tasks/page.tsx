@@ -25,7 +25,7 @@ export default async function LeadTasksPage({ params }: { params: Promise<{ id: 
             <LeadSidebar
                 leadId={lead.id}
                 leadName={lead.name}
-                clientName={lead.client.name}
+                clientName={lead.client?.name || ""}
                 onConvert={handleConvert}
             />
 
@@ -49,14 +49,14 @@ export default async function LeadTasksPage({ params }: { params: Promise<{ id: 
                 targetRevenue={lead.targetRevenue ? Number(lead.targetRevenue) : null}
                 location={lead.location}
                 projectType={lead.projectType}
-                clientId={lead.client.id}
-                clientName={lead.client.name}
-                clientEmail={lead.client.email}
-                clientPhone={(lead.client as any).primaryPhone || null}
-                clientAddress={(lead.client as any).addressLine1 || null}
-                clientCity={(lead.client as any).city || null}
-                clientState={(lead.client as any).state || null}
-                clientZip={(lead.client as any).zipCode || null}
+                clientId={lead.client?.id || ""}
+                clientName={lead.client?.name || ""}
+                clientEmail={lead.client?.email || null}
+                clientPhone={(lead.client as any)?.primaryPhone || null}
+                clientAddress={(lead.client as any)?.addressLine1 || null}
+                clientCity={(lead.client as any)?.city || null}
+                clientState={(lead.client as any)?.state || null}
+                clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={lead.message || null}
             />
         </div>

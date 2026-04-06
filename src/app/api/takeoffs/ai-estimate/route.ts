@@ -34,8 +34,10 @@ export async function POST(req: NextRequest) {
         const pastEstimates = await prisma.estimate.findMany({
             take: 10,
             orderBy: { createdAt: "desc" },
-            include: {
-                items: { take: 20, orderBy: { order: "asc" } },
+            select: {
+                id: true, code: true, title: true, status: true,
+                totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                items: { take: 20, orderBy: { order: "asc" }, select: { name: true, quantity: true, unitCost: true, total: true } },
                 project: { select: { name: true, type: true } },
             },
         });
@@ -43,7 +45,7 @@ export async function POST(req: NextRequest) {
         if (pastEstimates.length > 0) {
             const summaries = pastEstimates.map(est => {
                 const itemSummary = est.items.slice(0, 10).map(i =>
-                    `  - ${i.name}: qty ${i.quantity} × $${i.unitCost} = $${i.total}`
+                    `  - ${i.name}: qty ${i.quantity} × $${Number(i.unitCost)} = $${Number(i.total)}`
                 ).join("\n");
                 return `Estimate "${est.title}" (${est.project?.type || "General"}, $${Number(est.totalAmount).toLocaleString()}):\n${itemSummary}`;
             }).join("\n\n");

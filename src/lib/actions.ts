@@ -48,10 +48,10 @@ export async function getLeads() {
             }
         },
     });
-    return leads.map((l: any) => ({
+    return JSON.parse(JSON.stringify(leads.map((l: any) => ({
         ...l,
         client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
-    }));
+    }))));
 }
 
 export async function getLead(id: string) {
@@ -71,7 +71,7 @@ export async function getLead(id: string) {
     if (lead && !lead.client) {
         (lead as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
     }
-    return lead;
+    return lead ? JSON.parse(JSON.stringify(lead)) : null;
 }
 
 export async function updateLeadStage(id: string, stage: string) {
@@ -3720,7 +3720,7 @@ export async function uploadEstimateFile(estimateId: string, formData: FormData)
 
 export async function deleteEstimateFile(fileId: string) {
     "use server";
-    const file = await prisma.estimateFile.findUnique({ where: { id: fileId }, include: { estimate: true } });
+    const file = await prisma.estimateFile.findUnique({ where: { id: fileId }, include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true, projectId: true, leadId: true } } } });
     if (!file) return;
 
     await prisma.estimateFile.delete({ where: { id: fileId } });
@@ -3928,7 +3928,7 @@ export async function sendSelectionBoardToClient(boardId: string) {
     });
 
     // Email the client
-    const clientEmail = board.project.client.email;
+    const clientEmail = board.project.client?.email;
     if (clientEmail) {
         const settings = await getCompanySettings();
         const portalUrl = `https://probuild.goldentouchremodeling.com/portal/projects/${board.projectId}/selections`;
@@ -3937,7 +3937,7 @@ export async function sendSelectionBoardToClient(boardId: string) {
             `Selection Board Ready: ${board.title}`,
             `<div style="font-family: sans-serif; color: #333;">
                 <h2>Your Selection Board is Ready</h2>
-                <p>Hi ${board.project.client.name},</p>
+                <p>Hi ${board.project.client?.name || "Client"},</p>
                 <p>Your project manager has prepared a selection board "<strong>${board.title}</strong>" for the project <strong>${board.project.name}</strong>.</p>
                 <p>Please review the options and make your selections:</p>
                 <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
@@ -3990,7 +3990,7 @@ export async function submitClientSelections(boardId: string, selections: Record
             `✅ Selections Made — ${board.title}`,
             `<div style="font-family: sans-serif; color: #333;">
                 <h3>Client Selections Submitted</h3>
-                <p><strong>${board.project.client.name}</strong> has made their selections for "<strong>${board.title}</strong>" on project <strong>${board.project.name}</strong>.</p>
+                <p><strong>${board.project.client?.name || "Client"}</strong> has made their selections for "<strong>${board.title}</strong>" on project <strong>${board.project.name}</strong>.</p>
                 <ul>${selectedSummary}</ul>
             </div>`
         );

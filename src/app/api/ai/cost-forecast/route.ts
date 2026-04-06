@@ -15,7 +15,11 @@ export async function POST(req: NextRequest) {
         }),
         prisma.estimate.findMany({
             where: { projectId },
-            include: { items: { where: { parentId: null } } },
+            select: {
+                id: true, code: true, title: true, status: true,
+                totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                items: { where: { parentId: null }, select: { name: true, type: true, total: true, unitCost: true, quantity: true } },
+            },
         }),
         prisma.timeEntry.findMany({
             where: { projectId },

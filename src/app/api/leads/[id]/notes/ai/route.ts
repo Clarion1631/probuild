@@ -43,7 +43,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         const prompt = `You are a professional AI assistant analyzing a CRM Lead. Please summarize the current state of this lead into a clear, concise bulleted internal memo.
 
 LEAD DETAILS:
-Name: ${lead.client.name}
+Name: ${lead.client?.name || "Client"}
 Project Type: ${lead.projectType || "Unknown"}
 Location: ${lead.location || "Unknown"}
 

@@ -22,5 +22,5 @@ export default async function BidPackagesPage({ params }: Props) {
 
     if (!project) return redirect("/projects");
 
-    return <BidPackagesClient projectId={id} projectName={project.name} initialPackages={packages} />;
+    return <BidPackagesClient projectId={id} projectName={project.name} initialPackages={JSON.parse(JSON.stringify(packages))} />;
 }

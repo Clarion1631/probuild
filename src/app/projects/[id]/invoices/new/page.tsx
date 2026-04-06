@@ -13,7 +13,11 @@ export default async function NewInvoicePage({ params }: { params: { id: string 
     const estimates = await prisma.estimate.findMany({
         where: { projectId: id },
         orderBy: { createdAt: "desc" },
-        include: { paymentSchedules: true },
+        select: {
+            id: true, number: true, title: true, code: true, status: true,
+            totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+            paymentSchedules: { orderBy: { order: "asc" } },
+        },
     });
 
     return (

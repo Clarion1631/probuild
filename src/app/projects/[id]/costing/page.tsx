@@ -40,14 +40,11 @@ export default async function JobCostingPage({
     // Fetch budget (from estimates) - find active or approved estimates
     const estimates = await prisma.estimate.findMany({
         where: { projectId },
-        include: {
-            items: {
-                include: {
-                    costCode: true,
-                    costType: true,
-                }
-            }
-        }
+        select: {
+            id: true, number: true, title: true, code: true, status: true,
+            totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+            items: { include: { costCode: true, costType: true } },
+        },
     });
 
     // Fetch Actuals: Time Entries and Expenses
@@ -77,12 +74,12 @@ export default async function JobCostingPage({
     // or aggregate here. We'll aggregate on the client for flexibility.
 
     return (
-        <JobCostingClient 
+        <JobCostingClient
             project={project}
-            estimates={estimates}
-            timeEntries={timeEntries}
-            expenses={expenses}
-            purchaseOrders={purchaseOrders}
+            estimates={JSON.parse(JSON.stringify(estimates))}
+            timeEntries={JSON.parse(JSON.stringify(timeEntries))}
+            expenses={JSON.parse(JSON.stringify(expenses))}
+            purchaseOrders={JSON.parse(JSON.stringify(purchaseOrders))}
         />
     );
 }

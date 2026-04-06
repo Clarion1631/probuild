@@ -16,11 +16,19 @@ export async function POST(req: NextRequest) {
         estimateId
             ? prisma.estimate.findUnique({
                 where: { id: estimateId },
-                include: { items: { where: { parentId: null }, orderBy: { order: "asc" } } },
+                select: {
+                    id: true, code: true, title: true, status: true,
+                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                    items: { where: { parentId: null }, orderBy: { order: "asc" }, select: { name: true, type: true, total: true } },
+                },
               })
             : prisma.estimate.findFirst({
                 where: { projectId, status: { in: ["Approved", "Sent"] } },
-                include: { items: { where: { parentId: null }, orderBy: { order: "asc" } } },
+                select: {
+                    id: true, code: true, title: true, status: true,
+                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                    items: { where: { parentId: null }, orderBy: { order: "asc" }, select: { name: true, type: true, total: true } },
+                },
               }),
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
     ]);

@@ -19,11 +19,13 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
         include: {
             client: true,
             estimates: {
-                where: {
-                    privacy: 'Shared',
-                    status: { not: 'Draft' }
+                where: { privacy: 'Shared', status: { not: 'Draft' } },
+                orderBy: { createdAt: 'desc' },
+                select: {
+                    id: true, number: true, title: true, code: true, status: true,
+                    privacy: true, totalAmount: true, balanceDue: true, createdAt: true,
+                    projectId: true, approvedBy: true, approvedAt: true, signatureUrl: true, viewedAt: true,
                 },
-                orderBy: { createdAt: 'desc' }
             },
             invoices: {
                 where: { status: { not: 'Draft' } },
@@ -37,7 +39,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
             changeOrders: {
                 where: { status: { not: 'Draft' } },
                 orderBy: { createdAt: 'desc' },
-                include: { estimate: true }
+                include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true } } }
             },
             floorPlans: {
                 orderBy: { createdAt: 'desc' }

@@ -39,6 +39,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
     const estimates = await prisma.estimate.findMany({
         where: { projectId, status: { in: validEstimateStatuses } },
+        select: { id: true, status: true, totalAmount: true, balanceDue: true },
     });
 
     const retainers = await prisma.retainer.findMany({
@@ -54,12 +55,12 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     for (const inv of invoices) {
         for (const payment of inv.payments) {
             if (payment.status === "Paid") {
-                currentIncoming += payment.amount;
+                currentIncoming += Number(payment.amount);
             } else {
                 if (payment.dueDate && payment.dueDate < now) {
-                    overdueIncoming += payment.amount;
+                    overdueIncoming += Number(payment.amount);
                 } else {
-                    scheduledIncoming += payment.amount;
+                    scheduledIncoming += Number(payment.amount);
                 }
             }
         }
@@ -67,8 +68,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
     // Retainers
     for (const ret of retainers) {
-        currentIncoming += ret.amountPaid;
-        const balance = ret.balanceDue;
+        currentIncoming += Number(ret.amountPaid);
+        const balance = Number(ret.balanceDue);
         if (balance > 0) {
             if (ret.dueDate && ret.dueDate < now) {
                 overdueIncoming += balance;
@@ -82,7 +83,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // Avoid double counting if estimate is already invoiced, we can roughly exclude status "Invoiced" and "Partially Paid"
     for (const est of estimates) {
         if (est.status !== "Invoiced" && est.status !== "Partially Paid") {
-            forecastedIncomingFromEstimates += est.totalAmount;
+            forecastedIncomingFromEstimates += Number(est.totalAmount);
         }
     }
 
@@ -92,7 +93,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // ------------------------------------
     // 2. OUTGOING PAYMENTS (Expenses + POs)
     // ------------------------------------
-    const expenses: any[] = [];
+    const expenses = await prisma.expense.findMany({
+        where: { estimate: { projectId } }
+    });
 
     let validPoStatuses = ["Sent", "Received", "Draft"]; // Include draft always in query, filter below
     const pos = await prisma.purchaseOrder.findMany({
@@ -101,7 +104,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
     let totalExpenses = 0;
     for (const exp of expenses) {
-        totalExpenses += exp.amount;
+        totalExpenses += Number(exp.amount);
     }
 
     let plannedExpenses = 0;
@@ -112,8 +115,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         if (!includeUnissued && po.status === "Draft") continue;
         // Mock logic for PO due dates since they don't have a due date in schema (using sentAt if needed)
         // We'll treat all PO totalAmounts as forecasted
-        forecastedPoAmount += po.totalAmount;
-        plannedExpenses += po.totalAmount; // simplistic handling since no due dates on POs in schema
+        forecastedPoAmount += Number(po.totalAmount);
+        plannedExpenses += Number(po.totalAmount);
     }
 
     const currentOutgoing = totalExpenses;
@@ -135,8 +138,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     let totalTimeHours = 0;
     let totalTimeCost = 0;
     for (const te of timeEntries) {
-        if (te.durationHours) totalTimeHours += te.durationHours;
-        const rateToUse = te.burdenCost || te.laborCost || 0;
+        if (te.durationHours) totalTimeHours += Number(te.durationHours);
+        const rateToUse = Number(te.burdenCost) || Number(te.laborCost) || 0;
         totalTimeCost += rateToUse; 
     }
 
@@ -147,10 +150,10 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     for (const est of estimates) {
         if (est.status === "Sent" || est.status === "Viewed") {
             estimateStatus.pendingApproval.count++;
-            estimateStatus.pendingApproval.totalAmount += est.totalAmount;
+            estimateStatus.pendingApproval.totalAmount += Number(est.totalAmount);
         } else if (est.status === "Approved") {
             estimateStatus.uninvoiced.count++;
-            estimateStatus.uninvoiced.totalAmount += est.totalAmount;
+            estimateStatus.uninvoiced.totalAmount += Number(est.totalAmount);
         }
     }
 
