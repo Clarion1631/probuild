@@ -37,9 +37,9 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
         assignments: (t.assignments || []).map((a: any) => ({ id: a.id, userId: a.userId, user: a.user })),
         subAssignments: (t.subAssignments || []).map((a: any) => ({ id: a.id, subcontractorId: a.subcontractorId, subcontractor: a.subcontractor })),
         estimateItemId: t.estimateItemId ?? null,
-        estimateItem: t.estimateItem ?? null,
-        baselineStartDate: t.baselineStartDate?.toISOString().split("T")[0] ?? null,
-        baselineEndDate: t.baselineEndDate?.toISOString().split("T")[0] ?? null,
+        estimateItem: t.estimateItem ? { ...t.estimateItem, total: Number(t.estimateItem.total) } : null,
+        baselineStartDate: null,
+        baselineEndDate: null,
     }));
 
     const estimates = (project.estimates || []).map((e: any) => ({ id: e.id, title: e.title, status: e.status }));

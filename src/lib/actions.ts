@@ -5,9 +5,8 @@ import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 
-// Safe estimate include that omits columns not yet migrated to the database.
-// Remove this wrapper once the DB Push workflow succeeds and the Estimate table
-// has: processingFeeMarkup, hideProcessingFee, expirationDate, archivedAt.
+// Lean estimate include for list views (leads, project overview).
+// Only select scalar fields needed for display — skip heavy relations.
 const safeEstimateInclude = {
     select: {
         id: true,
@@ -21,13 +20,8 @@ const safeEstimateInclude = {
         createdAt: true,
         totalAmount: true,
         balanceDue: true,
-        items: true,
-        expenses: true,
-        paymentSchedules: true,
         approvedBy: true,
         approvedAt: true,
-        approvalIp: true,
-        approvalUserAgent: true,
         signatureUrl: true,
         contractId: true,
         viewedAt: true,
