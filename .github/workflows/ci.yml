@@ -112,12 +112,6 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Verify secrets
-        run: |
-          echo "NEXTAUTH_SECRET length: ${#NEXTAUTH_SECRET}"
-          echo "PLAYWRIGHT_TEST_SECRET length: ${#PLAYWRIGHT_TEST_SECRET}"
-          echo "DATABASE_URL length: ${#DATABASE_URL}"
-
       - name: Build application
         run: npm run build
         env:
