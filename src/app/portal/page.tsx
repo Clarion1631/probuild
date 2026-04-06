@@ -61,7 +61,7 @@ export default async function PortalDashboard() {
             ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {projects.map(p => {
-                        const activeInvoices = p.invoices.reduce((sum, inv) => sum + inv.balanceDue, 0);
+                        const activeInvoices = p.invoices.reduce((sum, inv) => sum + Number(inv.balanceDue), 0);
 
                         return (
                             <Link href={`/portal/projects/${p.id}`} key={p.id} className="hui-card group overflow-hidden hover:shadow-md transition flex flex-col">

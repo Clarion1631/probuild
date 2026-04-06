@@ -83,6 +83,8 @@ test.describe("Quality Gate — Page Load", () => {
     "/settings/sales-taxes",
     "/settings/payment-methods",
     "/settings/integrations",
+    "/settings/integrations/gusto",
+    "/settings/integrations/quickbooks",
     "/settings/contacts",
     "/settings/cost-codes",
     "/settings/calendar",
@@ -135,6 +137,8 @@ test.describe("Quality Gate — Page Load", () => {
     "/reports/payments",
     "/reports/tax-liability",
     "/reports/global-tracker",
+    "/reports/payouts",
+    "/reports/transactions",
   ];
 
   for (const route of reportRoutes) {

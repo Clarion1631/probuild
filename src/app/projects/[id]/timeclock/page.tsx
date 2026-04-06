@@ -54,11 +54,15 @@ export default async function TimeClockPage({
         orderBy: { code: 'asc' }
     });
     
-    const teamMembers = await prisma.user.findMany({
+    const teamMembersRaw = await prisma.user.findMany({
         where: { status: { not: "DISABLED" } },
         select: { id: true, name: true, email: true, hourlyRate: true },
         orderBy: { name: 'asc' }
     });
+    const teamMembers = teamMembersRaw.map(u => ({
+        ...u,
+        hourlyRate: Number(u.hourlyRate),
+    }));
 
     return (
         <TimeClockClient

@@ -1646,7 +1646,7 @@ export async function deleteEstimate(estimateId: string) {
     } else if (estimate.leadId) {
         revalidatePath(`/leads/${estimate.leadId}`);
     } else {
-        revalidatePath("/projects/all/estimates");
+        revalidatePath("/estimates");
     }
     return { success: true };
 }
@@ -1990,7 +1990,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     // Revalidate paths
     if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
     if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
-    revalidatePath("/projects/all/estimates");
+    revalidatePath("/estimates");
 
     return { success: true, sentTo: recipientEmail };
 }

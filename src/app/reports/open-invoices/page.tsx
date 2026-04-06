@@ -28,7 +28,7 @@ export default async function OpenInvoicesPage() {
         orderBy: { issueDate: "asc" },
     });
 
-    const totalOutstanding = invoices.reduce((sum, inv) => sum + inv.balanceDue, 0);
+    const totalOutstanding = invoices.reduce((sum, inv) => sum + Number(inv.balanceDue), 0);
     const overdueCount = invoices.filter(i => i.status === "Overdue").length;
 
     const byBucket: Record<string, typeof invoices> = { "0–30": [], "31–60": [], "61–90": [], "90+": [] };
@@ -40,7 +40,7 @@ export default async function OpenInvoicesPage() {
     const bucketTotals = BUCKET_ORDER.map(b => ({
         label: b,
         count: byBucket[b].length,
-        total: byBucket[b].reduce((s, i) => s + i.balanceDue, 0),
+        total: byBucket[b].reduce((s, i) => s + Number(i.balanceDue), 0),
     }));
 
     const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
@@ -87,7 +87,7 @@ export default async function OpenInvoicesPage() {
                     <div key={bucket} className="hui-card overflow-hidden">
                         <div className="px-4 py-3 border-b border-hui-border bg-hui-surface">
                             <span className="text-sm font-semibold text-hui-textMain">{bucket} days</span>
-                            <span className="ml-2 text-sm text-hui-textMuted">({byBucket[bucket].length} invoices · {fmt(byBucket[bucket].reduce((s, i) => s + i.balanceDue, 0))})</span>
+                            <span className="ml-2 text-sm text-hui-textMuted">({byBucket[bucket].length} invoices · {fmt(byBucket[bucket].reduce((s, i) => s + Number(i.balanceDue), 0))})</span>
                         </div>
                         <table className="w-full text-sm">
                             <thead>
@@ -116,8 +116,8 @@ export default async function OpenInvoicesPage() {
                                         <td className="px-4 py-3 text-hui-textMuted">
                                             {inv.issueDate ? new Date(inv.issueDate).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—"}
                                         </td>
-                                        <td className="px-4 py-3 text-right text-hui-textMain">{fmt(inv.totalAmount)}</td>
-                                        <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(inv.balanceDue)}</td>
+                                        <td className="px-4 py-3 text-right text-hui-textMain">{fmt(Number(inv.totalAmount))}</td>
+                                        <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(Number(inv.balanceDue))}</td>
                                         <td className="px-4 py-3">
                                             <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${inv.status === "Overdue" ? "bg-red-100 text-red-700" : "bg-yellow-100 text-yellow-700"}`}>
                                                 {inv.status}

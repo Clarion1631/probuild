@@ -36,9 +36,9 @@ export default async function GlobalTrackerPage() {
     };
 
     const rows: Row[] = projects.map(p => {
-        const budget = p.estimates.reduce((s, e) => s + e.totalAmount, 0);
-        const invoiced = p.invoices.reduce((s, i) => s + i.totalAmount, 0);
-        const balance = p.invoices.reduce((s, i) => s + i.balanceDue, 0);
+        const budget = p.estimates.reduce((s, e) => s + Number(e.totalAmount), 0);
+        const invoiced = p.invoices.reduce((s, i) => s + Number(i.totalAmount), 0);
+        const balance = p.invoices.reduce((s, i) => s + Number(i.balanceDue), 0);
         const paid = invoiced - balance;
 
         const tasks = p.scheduleTasks;
