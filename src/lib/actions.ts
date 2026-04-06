@@ -724,27 +724,46 @@ export async function saveFloorPlanData(id: string, relatedId: string, data: str
 }
 
 export async function getEstimate(id: string) {
-    const estimate = await prisma.estimate.findUnique({
-        where: { id },
-        include: {
-            items: {
-                orderBy: { order: "asc" },
-                include: {
-                    expenses: true,
-                    costCode: true,
-                    costType: true,
+    try {
+        // Full query — works when all schema columns exist in DB
+        return await prisma.estimate.findUnique({
+            where: { id },
+            include: {
+                items: {
+                    orderBy: { order: "asc" },
+                    include: { expenses: true, costCode: true, costType: true },
                 },
+                paymentSchedules: { orderBy: { order: "asc" } },
+                expenses: true,
+                files: { orderBy: { createdAt: "desc" } },
             },
-            paymentSchedules: {
-                orderBy: { order: "asc" },
+        });
+    } catch {
+        // Safe fallback — omit columns not yet migrated to DB
+        // TODO: remove after running: gh workflow run db-push.yml --repo Clarion1631/probuild
+        return await prisma.estimate.findUnique({
+            where: { id },
+            select: {
+                id: true, number: true, title: true, projectId: true, leadId: true,
+                code: true, status: true, privacy: true, createdAt: true,
+                totalAmount: true, balanceDue: true,
+                approvedBy: true, approvedAt: true, approvalIp: true,
+                approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
+                items: {
+                    orderBy: { order: "asc" },
+                    select: {
+                        id: true, estimateId: true, name: true, description: true, type: true,
+                        quantity: true, baseCost: true, markupPercent: true, unitCost: true,
+                        total: true, order: true, parentId: true,
+                        costCodeId: true, costTypeId: true, createdAt: true,
+                        expenses: true, costCode: true, costType: true,
+                    },
+                },
+                paymentSchedules: { orderBy: { order: "asc" } },
+                expenses: true,
             },
-            expenses: true,
-            files: {
-                orderBy: { createdAt: "desc" },
-            },
-        },
-    });
-    return estimate;
+        });
+    }
 }
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
