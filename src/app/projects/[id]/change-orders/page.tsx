@@ -12,7 +12,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
         prisma.changeOrder.findMany({
             where: { projectId: resolvedParams.id },
             orderBy: { createdAt: "desc" },
-            include: { estimate: true }
+            include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true } } }
         }),
         prisma.invoice.findMany({
             where: { projectId: resolvedParams.id, status: { not: "Draft" } }

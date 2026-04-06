@@ -88,7 +88,7 @@ export default async function PurchaseOrdersPage({
                                             {new Date(po.createdAt).toLocaleDateString()}
                                         </td>
                                         <td className="px-5 py-4 text-right font-medium tabular-nums">
-                                            ${total.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                            ${Number(total).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                                         </td>
                                     </tr>
                                 );

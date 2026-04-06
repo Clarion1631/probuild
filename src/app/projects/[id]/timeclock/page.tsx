@@ -61,11 +61,11 @@ export default async function TimeClockPage({
     });
 
     return (
-        <TimeClockClient 
-            project={project} 
-            initialEntries={timeEntries} 
-            costCodes={costCodes}
-            teamMembers={teamMembers}
+        <TimeClockClient
+            project={project}
+            initialEntries={JSON.parse(JSON.stringify(timeEntries))}
+            costCodes={JSON.parse(JSON.stringify(costCodes))}
+            teamMembers={JSON.parse(JSON.stringify(teamMembers))}
             currentUser={{id: user.id, role: user.role, name: user.name || user.email}}
         />
     );

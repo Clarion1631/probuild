@@ -45,7 +45,7 @@ export default async function TimeExpensesPage({
                 <div className="max-w-7xl mx-auto space-y-6">
                     <TimeExpensesClient
                         project={project}
-                        data={data}
+                        data={JSON.parse(JSON.stringify(data))}
                         currentUser={{ id: user.id, role: user.role, name: user.name || user.email }}
                     />
                 </div>
