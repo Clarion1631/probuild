@@ -50,6 +50,8 @@ export async function getLeads() {
     });
     return JSON.parse(JSON.stringify(leads.map((l: any) => ({
         ...l,
+        targetRevenue: l.targetRevenue != null ? Number(l.targetRevenue) : null,
+        expectedProfit: l.expectedProfit != null ? Number(l.expectedProfit) : null,
         client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
     }))));
 }
@@ -70,6 +72,10 @@ export async function getLead(id: string) {
     });
     if (lead && !lead.client) {
         (lead as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
+    }
+    if (lead) {
+        (lead as any).targetRevenue = lead.targetRevenue != null ? Number(lead.targetRevenue) : null;
+        (lead as any).expectedProfit = lead.expectedProfit != null ? Number(lead.expectedProfit) : null;
     }
     return lead ? JSON.parse(JSON.stringify(lead)) : null;
 }
