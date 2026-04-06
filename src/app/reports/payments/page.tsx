@@ -23,7 +23,7 @@ export default async function PaymentsReportPage() {
         orderBy: { paidAt: "desc" },
     });
 
-    const totalCollected = payments.reduce((sum, p) => sum + p.amount, 0);
+    const totalCollected = payments.reduce((sum, p) => sum + Number(p.amount), 0);
 
     // Group by month
     const byMonth: Record<string, typeof payments> = {};
@@ -68,7 +68,7 @@ export default async function PaymentsReportPage() {
                     <div key={month} className="hui-card overflow-hidden">
                         <div className="px-4 py-3 border-b border-hui-border bg-hui-surface flex items-center justify-between">
                             <span className="text-sm font-semibold text-hui-textMain">{month}</span>
-                            <span className="text-sm text-hui-textMuted">{fmt(byMonth[month].reduce((s, p) => s + p.amount, 0))}</span>
+                            <span className="text-sm text-hui-textMuted">{fmt(byMonth[month].reduce((s, p) => s + Number(p.amount), 0))}</span>
                         </div>
                         <table className="w-full text-sm">
                             <thead>
@@ -101,7 +101,7 @@ export default async function PaymentsReportPage() {
                                                 {paidDate ? new Date(paidDate).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—"}
                                             </td>
                                             <td className="px-4 py-3 text-hui-textMuted capitalize">{p.paymentMethod ?? "—"}</td>
-                                            <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(p.amount)}</td>
+                                            <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(Number(p.amount))}</td>
                                         </tr>
                                     );
                                 })}
