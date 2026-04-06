@@ -1238,3 +1238,31 @@ model DocumentComment {
 
   @@index([documentType, documentId])
 }
+
+// ── Help Chat ────────────────────────────────────────────────────
+
+model ChatConversation {
+  id         String    @id @default(cuid())
+  userId     String
+  title      String?   // Auto-generated from first message
+  archivedAt DateTime? // Auto-archived after 7 days of inactivity
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  messages   ChatMessage[]
+
+  @@index([userId])
+  @@index([userId, archivedAt])
+}
+
+model ChatMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  role           String   // "user" or "assistant"
+  content        String
+  createdAt      DateTime @default(now())
+
+  conversation   ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+}
