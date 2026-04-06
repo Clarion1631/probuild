@@ -7,8 +7,14 @@ import { prisma } from "@/lib/prisma";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
-    const lead = await getLead(resolvedParams.id);
-    if (!lead) return <div className="p-6">Lead not found</div>;
+    const leadRaw = await getLead(resolvedParams.id);
+    if (!leadRaw) return <div className="p-6">Lead not found</div>;
+    // Normalize Decimal fields to plain numbers for client component serialization
+    const lead = {
+        ...leadRaw,
+        targetRevenue: leadRaw.targetRevenue != null ? Number(leadRaw.targetRevenue) : null,
+        expectedProfit: leadRaw.expectedProfit != null ? Number(leadRaw.expectedProfit) : null,
+    };
 
     // Fetch estimates for the attachment picker
     const estimates = await prisma.estimate.findMany({
