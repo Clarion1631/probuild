@@ -52,7 +52,7 @@ export async function GET(req: Request) {
         }
     });
 
-    return NextResponse.json(timeEntries);
+    return NextResponse.json(JSON.parse(JSON.stringify(timeEntries)));
 }
 
 export async function POST(req: Request) {
@@ -135,8 +135,8 @@ export async function PUT(req: Request) {
     let durationHours = durationMs / (1000 * 60 * 60);
     if (durationHours < 0) durationHours = 0;
 
-    const laborCost = durationHours * (user.hourlyRate || 0);
-    const burdenCost = durationHours * (user.burdenRate || 0);
+    const laborCost = durationHours * Number(user.hourlyRate || 0);
+    const burdenCost = durationHours * Number(user.burdenRate || 0);
 
     const updateData: any = {
         endTime: end,
@@ -160,5 +160,5 @@ export async function PUT(req: Request) {
         data: updateData
     });
 
-    return NextResponse.json(timeEntry);
+    return NextResponse.json(JSON.parse(JSON.stringify(timeEntry)));
 }

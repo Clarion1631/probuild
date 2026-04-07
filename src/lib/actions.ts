@@ -1,38 +1,10 @@
 "use server";
 
 import { prisma } from "./prisma";
+import { safeEstimateInclude } from "./prisma-helpers";
 import { revalidatePath, unstable_cache } from "next/cache";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-
-// Safe estimate include that omits columns not yet migrated to the database.
-// Remove this wrapper once the DB Push workflow succeeds and the Estimate table
-// has: processingFeeMarkup, hideProcessingFee, expirationDate, archivedAt.
-const safeEstimateInclude = {
-    select: {
-        id: true,
-        number: true,
-        title: true,
-        projectId: true,
-        leadId: true,
-        code: true,
-        status: true,
-        privacy: true,
-        createdAt: true,
-        totalAmount: true,
-        balanceDue: true,
-        items: true,
-        expenses: true,
-        paymentSchedules: true,
-        approvedBy: true,
-        approvedAt: true,
-        approvalIp: true,
-        approvalUserAgent: true,
-        signatureUrl: true,
-        contractId: true,
-        viewedAt: true,
-    },
-} as const;
 
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
@@ -52,6 +24,11 @@ export async function getLeads() {
         ...l,
         targetRevenue: l.targetRevenue != null ? Number(l.targetRevenue) : null,
         expectedProfit: l.expectedProfit != null ? Number(l.expectedProfit) : null,
+        estimates: (l.estimates || []).map((e: any) => ({
+            ...e,
+            totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+            balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+        })),
         client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
     }))));
 }
@@ -76,6 +53,11 @@ export async function getLead(id: string) {
     if (lead) {
         (lead as any).targetRevenue = lead.targetRevenue != null ? Number(lead.targetRevenue) : null;
         (lead as any).expectedProfit = lead.expectedProfit != null ? Number(lead.expectedProfit) : null;
+        (lead as any).estimates = ((lead as any).estimates || []).map((e: any) => ({
+            ...e,
+            totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+            balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+        }));
     }
     return lead ? JSON.parse(JSON.stringify(lead)) : null;
 }
