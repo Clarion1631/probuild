@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "probuild-dev",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeExecutable": "powershell",
+      "runtimeArgs": ["-Command", "npm run dev"],
       "port": 3000,
       "autoPort": false
     }
