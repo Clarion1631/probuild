@@ -15,7 +15,7 @@ export async function GET(request: Request) {
         }
 
         const now = new Date();
-        const scheduledMessages = await prisma.leadMessage.findMany({
+        const scheduledMessages = await prisma.clientMessage.findMany({
             where: {
                 status: "SCHEDULED",
                 scheduledFor: { lte: now }
@@ -104,7 +104,7 @@ export async function GET(request: Request) {
                     sentViaSms = true;
                 }
 
-                await prisma.leadMessage.update({
+                await prisma.clientMessage.update({
                     where: { id: msg.id },
                     data: {
                         status: "SENT",
@@ -116,7 +116,7 @@ export async function GET(request: Request) {
                 sentCount++;
             } catch (err) {
                 console.error(`[Cron] Error sending message ${msg.id}:`, err);
-                await prisma.leadMessage.update({
+                await prisma.clientMessage.update({
                     where: { id: msg.id },
                     data: { status: "FAILED" }
                 });

@@ -3,14 +3,27 @@
 ## What this project is
 **ProBuild** — a construction/contractor management platform (competitor to Houzz Pro). Built with Next.js, Prisma, Supabase, deployed on Vercel.
 
-## Key paths
-| Thing | Path |
+## Key paths & service IDs
+| Thing | Value |
 |---|---|
 | This project (Windows) | `C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site` |
 | GitHub | https://github.com/Clarion1631/probuild |
 | Production | https://probuild.goldentouchremodeling.com |
 | Vercel preview | https://probuild-amber.vercel.app |
-| Known prod project ID | `cmn7tlgiv0001phwqjzwk75or` |
+| Vercel project ID | `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL` |
+| Supabase project ref | `ghzdbzdnwjxazvmcefbh` |
+| Sentry org | `golden-touch-remodeling` (us.sentry.io) |
+| Known prod DB project ID | `cmn7tlgiv0001phwqjzwk75or` |
+
+## Vercel env vars (already configured)
+`STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `DATABASE_URL`,
+`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`,
+`RESEND_API_KEY`, `GEMINI_API_KEY`,
+`NEXTAUTH_SECRET`, `NEXTAUTH_URL`,
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`NEXT_PUBLIC_APP_URL`,
+`SENTRY_AUTH_TOKEN`, `SENTRY_ORG`
 
 ## Stack
 - Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
@@ -35,6 +48,17 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 4. git push origin main   # triggers Vercel deploy
 5. Click through affected pages on prod to verify
 6. Mark items done in ProbuildTodo.md
+```
+
+**Error diagnosis (Sentry)**
+```bash
+sentry-cli issues list --org golden-touch-remodeling --project <project> --output json
+```
+
+**Stripe webhook testing**
+```bash
+stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
+stripe trigger payment_intent.succeeded
 ```
 
 ## Dev server — clean start

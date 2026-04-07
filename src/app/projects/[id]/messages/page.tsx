@@ -2,7 +2,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
-import ProjectChat from "@/components/ProjectChat";
+import ClientMessaging from "@/components/ClientMessaging";
 
 export default async function ProjectMessagesPage({ params }: { params: Promise<{ id: string }> }) {
     const session = await getServerSession(authOptions);
@@ -12,7 +12,12 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
 
     const project = await prisma.project.findUnique({
         where: { id: projectId },
-        select: { id: true, name: true, client: { select: { name: true } } },
+        select: {
+            id: true,
+            name: true,
+            client: { select: { name: true, email: true, primaryPhone: true } },
+            estimates: { select: { id: true, code: true, title: true, status: true } },
+        },
     });
 
     if (!project) {
@@ -22,18 +27,23 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
     return (
         <div className="max-w-3xl mx-auto py-6 px-4">
             <div className="mb-6">
-                <h1 className="text-2xl font-bold text-hui-textMain">Messages</h1>
+                <h1 className="text-2xl font-bold text-hui-textMain">Client Messages</h1>
                 <p className="text-sm text-hui-textMuted mt-1">
                     Conversation with <span className="font-medium">{project.client.name}</span> for <span className="font-medium">{project.name}</span>
                 </p>
             </div>
 
-            <ProjectChat
-                projectId={projectId}
-                perspective="TEAM"
-                currentUserName={session.user.name || session.user.email || "Team"}
-                currentUserEmail={session.user.email || undefined}
-            />
+            <div className="bg-white border border-hui-border rounded-xl overflow-hidden" style={{ height: "calc(100vh - 240px)" }}>
+                <ClientMessaging
+                    entityId={projectId}
+                    entityType="project"
+                    clientName={project.client.name}
+                    clientEmail={project.client.email}
+                    clientPhone={project.client.primaryPhone}
+                    estimates={project.estimates}
+                    variant="full"
+                />
+            </div>
         </div>
     );
 }

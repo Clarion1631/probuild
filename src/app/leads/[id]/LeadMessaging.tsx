@@ -184,7 +184,7 @@ export default function LeadMessaging({
         setShowAiMenu(false);
         setAiSuggesting(true);
         try {
-            const res = await fetch("/api/leads/messages/suggest", {
+            const res = await fetch("/api/client-messages/suggest", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ leadId, context }),

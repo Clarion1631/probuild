@@ -51,6 +51,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             id: "management",
             title: "Management",
             items: [
+                { label: "Client Messages", href: `/projects/${projectId}/messages` },
                 { label: "Files & Photos", href: `/projects/${projectId}/files`, permission: "files" },
                 { label: "Schedule", href: `/projects/${projectId}/schedule`, permission: "schedules" },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
@@ -218,7 +219,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                                 <ul className="space-y-1">
                                     {visibleItems.map((item) => {
                                         const isActive = pathname?.includes(item.href);
-                                        const showBadge = item.label === "Messages" && unreadMessageCount > 0;
+                                        const showBadge = item.label === "Client Messages" && unreadMessageCount > 0;
                                         return (
                                             <li key={item.label}>
                                                 <Link

@@ -608,66 +608,39 @@ export async function convertLeadToProject(leadId: string) {
     const lead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!lead) throw new Error("Lead not found");
 
-    const project = await prisma.project.create({
-        data: {
-            name: lead.name,
-            clientId: lead.clientId,
-            location: lead.location,
-            status: "In Progress",
-            type: "Unknown",
-        },
-    });
+    // Idempotency: if this lead was already converted, return existing project
+    const existingProject = await prisma.project.findUnique({ where: { leadId } });
+    if (existingProject) return { id: existingProject.id };
 
-    // Relink all dual-FK child records to the new project
-    await prisma.estimate.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    await prisma.floorPlan.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    await prisma.contract.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    await prisma.projectFile.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    await prisma.fileFolder.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    await prisma.scheduleTask.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    await prisma.takeoff.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
-    // Relink client messages — keep leadId for history, add projectId
-    await prisma.clientMessage.updateMany({
-        where: { leadId },
-        data: { projectId: project.id },
-    });
+    // Wrap entire conversion in a transaction for atomicity
+    const project = await prisma.$transaction(async (tx) => {
+        const project = await tx.project.create({
+            data: {
+                name: lead.name,
+                clientId: lead.clientId,
+                location: lead.location,
+                status: "In Progress",
+                type: lead.projectType || "Unknown",
+                managerId: lead.managerId || null,
+                tags: lead.tags || null,
+                leadId,
+            },
+        });
 
-    // Set back-reference on project and copy lead metadata
-    await prisma.project.update({
-        where: { id: project.id },
-        data: {
-            leadId,
-            type: lead.projectType || "Unknown",
-            managerId: lead.managerId || null,
-            tags: lead.tags || null,
-        },
-    });
+        // Relink all dual-FK child records to the new project
+        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.floorPlan.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        // Relink client messages to project and clear leadId to prevent cascade-delete from lead
+        await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
 
-    // Update lead stage
-    await prisma.lead.update({
-        where: { id: leadId },
-        data: { stage: "Won" },
+        await tx.lead.update({ where: { id: leadId }, data: { stage: "Won" } });
+
+        return project;
     });
 
     revalidatePath("/leads");

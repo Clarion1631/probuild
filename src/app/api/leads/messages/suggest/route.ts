@@ -24,7 +24,7 @@ export async function POST(request: Request) {
                 select: { id: true, code: true, title: true, status: true, totalAmount: true, createdAt: true },
                 orderBy: { createdAt: "desc" },
             },
-            leadMessages: {
+            clientMessages: {
                 orderBy: { createdAt: "asc" },
                 take: 20,
             },
@@ -72,7 +72,7 @@ export async function POST(request: Request) {
     const companyName = settings?.companyName || "Our company";
 
     // Build conversation history for AI context
-    const messageHistory = lead.leadMessages.map((m: any) =>
+    const messageHistory = lead.clientMessages.map((m: any) =>
         `[${m.direction === "OUTBOUND" ? "TEAM" : "CLIENT"} - ${m.createdAt.toLocaleDateString()}]: ${m.body}`
     ).join("\n");
 
