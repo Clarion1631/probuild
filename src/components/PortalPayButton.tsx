@@ -22,15 +22,15 @@ export default function PortalPayButton({
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [selectedMethod, setSelectedMethod] = useState<string>("card");
 
-    // Fee calculations
+    // Fee calculations — coerce all Decimal-sourced values to Number to prevent string concatenation
     const passFee = settings?.passProcessingFee === true;
-    const rate = settings?.cardProcessingRate ?? 2.9;
-    const flat = settings?.cardProcessingFlat ?? 0.30;
-    
+    const rate = Number(settings?.cardProcessingRate ?? 2.9);
+    const flat = Number(settings?.cardProcessingFlat ?? 0.30);
+
     // Add processing fee if passFee is true and they select a method that adds fees (cards, affirm, klarna all act like cards here for fees)
     const isFeeMethod = selectedMethod !== 'us_bank_account';
-    const feeAmount = (passFee && isFeeMethod) ? ((amount * (rate / 100)) + flat) : 0;
-    const totalAmount = amount + feeAmount;
+    const feeAmount = (passFee && isFeeMethod) ? ((Number(amount) * (rate / 100)) + flat) : 0;
+    const totalAmount = Number(amount) + feeAmount;
 
     // Default to card initially, or whatever is enabled
     // Only one method might be enabled, handle that if necessary.
@@ -84,7 +84,7 @@ export default function PortalPayButton({
                 onClick={handleButtonClick}
                 className="flex-shrink-0 w-full sm:w-auto px-4 py-2 bg-hui-primary hover:bg-hui-primaryHover text-white text-sm font-medium rounded-md shadow-sm transition-colors flex items-center justify-center gap-2"
             >
-                {label} - ${(amount).toLocaleString()}
+                {label} - ${Number(amount).toLocaleString()}
             </button>
 
             {isModalOpen && (
