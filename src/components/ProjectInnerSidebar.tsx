@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { linkProjectToLead } from "@/lib/actions";
 import { toast } from "sonner";
@@ -25,6 +25,11 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const pathname = usePathname();
     const router = useRouter();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+    useEffect(() => {
+        const stored = localStorage.getItem("projectSidebarCollapsed");
+        if (stored === "true") setSidebarCollapsed(true);
+    }, []);
     const [showLinkModal, setShowLinkModal] = useState(false);
     const [linking, setLinking] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
@@ -32,6 +37,14 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const { permissions, loaded } = usePermissions();
 
     const can = (key?: string) => !key || !loaded || !!permissions[key];
+
+    const toggleSidebar = () => {
+        setSidebarCollapsed(prev => {
+            const next = !prev;
+            localStorage.setItem("projectSidebarCollapsed", String(next));
+            return next;
+        });
+    };
 
     const navSections: NavSection[] = [
         {
@@ -114,17 +127,51 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     );
 
     return (
-        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
-            {/* Back Button */}
-            <Link
-                href="/projects"
-                className="flex items-center gap-2 px-4 py-2.5 text-sm text-slate-500 hover:text-hui-primary hover:bg-slate-100 transition border-b border-hui-border group"
-            >
-                <svg className="w-4 h-4 transition group-hover:-translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                </svg>
-                <span className="font-medium">All Projects</span>
-            </Link>
+        <div className={`${sidebarCollapsed ? "w-12" : "w-56"} transition-all duration-200 bg-hui-background border-r border-hui-border flex flex-col min-h-full shrink-0`}>
+            {/* Toggle button */}
+            <div className={`flex items-center border-b border-hui-border ${sidebarCollapsed ? "justify-center py-2.5" : "justify-between px-2 py-2"}`}>
+                {!sidebarCollapsed && (
+                    <Link
+                        href="/projects"
+                        className="flex items-center gap-2 px-2 py-0.5 text-sm text-slate-500 hover:text-hui-primary hover:bg-slate-100 rounded transition group"
+                    >
+                        <svg className="w-4 h-4 transition group-hover:-translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                        </svg>
+                        <span className="font-medium">All Projects</span>
+                    </Link>
+                )}
+                <button
+                    onClick={toggleSidebar}
+                    title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition shrink-0"
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        {sidebarCollapsed
+                            ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
+                            : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
+                        }
+                    </svg>
+                </button>
+            </div>
+
+            {sidebarCollapsed && (
+                <Link
+                    href="/projects"
+                    title="All Projects"
+                    className="flex items-center justify-center py-2.5 text-slate-400 hover:text-hui-primary hover:bg-slate-100 transition border-b border-hui-border"
+                >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                    </svg>
+                </Link>
+            )}
+
+            {/* Collapsed: show nothing else */}
+            {sidebarCollapsed && <div className="flex-1" />}
+
+            {/* Expanded content */}
+            {!sidebarCollapsed && <>
 
             {/* Client Portal Link */}
             <div className="p-3 border-b border-hui-border bg-slate-50">
@@ -246,6 +293,8 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                     })}
                 </div>
             </div>
+
+            </>}
 
             {/* Link Lead Modal */}
             {showLinkModal && (

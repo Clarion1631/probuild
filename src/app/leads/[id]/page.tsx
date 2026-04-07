@@ -78,6 +78,8 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientState={(lead.client as any)?.state || null}
                 clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={leadFull?.message || null}
+                managerId={(lead as any).manager?.id || null}
+                managerName={(lead as any).manager?.name || null}
             />
         </div>
     );

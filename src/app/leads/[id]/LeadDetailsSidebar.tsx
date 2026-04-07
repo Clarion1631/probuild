@@ -9,6 +9,7 @@ import LeadStageDropdown from "./LeadStageDropdown";
 import EditLeadModal from "./EditLeadModal";
 import GoogleMapPreview from "@/components/GoogleMapPreview";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
+import ManagerAssignRow from "@/components/ManagerAssignRow";
 
 interface LeadDetailsSidebarProps {
     leadId: string;
@@ -28,12 +29,14 @@ interface LeadDetailsSidebarProps {
     clientState: string | null;
     clientZip: string | null;
     initialMessage: string | null;
+    managerId?: string | null;
+    managerName?: string | null;
 }
 
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
     clientId, clientName, clientEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
-    initialMessage,
+    initialMessage, managerId, managerName,
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
 
@@ -341,30 +344,13 @@ export default function LeadDetailsSidebar({
 
                 {showLeadDetails && (
                     <div className="px-5 pb-4 space-y-0">
-                        {/* Team avatars */}
-                        <div className="flex items-center justify-between py-2 border-b border-slate-50">
-                            <span className="text-sm text-slate-600">Team</span>
-                            <div className="flex -space-x-2">
-                                {["G", "WB", "R", "SB", "VB"].map((initials, i) => (
-                                    <div key={i} className={`w-7 h-7 rounded-full border-2 border-white flex items-center justify-center text-[9px] font-bold text-white ${
-                                        ["bg-amber-500", "bg-slate-600", "bg-red-500", "bg-blue-500", "bg-purple-500"][i]
-                                    }`}>
-                                        {initials}
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-
-                        {/* Managers */}
-                        <div className="flex items-center justify-between py-2 border-b border-slate-50">
-                            <span className="text-sm text-slate-600">Managers</span>
-                            <div className="flex items-center gap-1.5">
-                                <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center">
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                                </div>
-                                <span className="text-sm text-green-600 font-medium">Assign</span>
-                            </div>
-                        </div>
+                        {/* Manager */}
+                        <ManagerAssignRow
+                            entityType="lead"
+                            entityId={leadId}
+                            currentManagerId={managerId || null}
+                            currentManagerName={managerName || null}
+                        />
 
                         {/* Lead Stage */}
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">

@@ -27,6 +27,7 @@ model User {
   projectAccess    ProjectAccess[]
   leadTasks        LeadTask[]
   managedLeads     Lead[]           @relation("LeadManager")
+  managedProjects  Project[]        @relation("ProjectManager")
   dailyLogs        DailyLog[]
   documentComments DocumentComment[]
 }
@@ -160,6 +161,7 @@ model Project {
   tags                String?
   color               String?                      @default("#3b82f6") // Added color field
   managerId           String?
+  manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]
   invoices            Invoice[]
   budgets             Budget[]
@@ -380,6 +382,9 @@ model PaymentSchedule {
   paymentMethod         String?
   paidAt                DateTime?
   createdAt             DateTime  @default(now())
+
+  @@index([invoiceId])
+  @@index([stripePaymentIntentId])
 }
 
 model Budget {
@@ -722,6 +727,10 @@ model ProjectFile {
   uploadedById String?
   uploadedBy   User?       @relation(fields: [uploadedById], references: [id])
   createdAt    DateTime    @default(now())
+
+  @@index([projectId])
+  @@index([leadId])
+  @@index([folderId])
 }
 
 model UserPermission {
@@ -792,6 +801,9 @@ model Takeoff {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model TakeoffFile {
@@ -803,6 +815,8 @@ model TakeoffFile {
   mimeType  String   @default("application/octet-stream")
   size      Int      @default(0)
   createdAt DateTime @default(now())
+
+  @@index([takeoffId])
 }
 
 model EstimateTemplate {

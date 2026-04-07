@@ -5,6 +5,8 @@ import { safeEstimateInclude } from "./prisma-helpers";
 import { revalidatePath, unstable_cache } from "next/cache";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
+import { getServerSession } from "next-auth";
+import { authOptions } from "./auth";
 
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
@@ -141,12 +143,31 @@ export async function deleteLead(id: string) {
 }
 
 export async function updateLeadAssignment(id: string, managerId: string | null) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
     await prisma.lead.update({
         where: { id },
         data: { managerId }
     });
     revalidatePath(`/leads`);
     revalidatePath(`/leads/${id}`);
+}
+
+export async function updateProjectManager(projectId: string, managerId: string | null) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { managerId }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`, 'layout');
 }
 
 export async function updateLeadInfo(id: string, data: any) {
