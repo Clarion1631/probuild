@@ -50,6 +50,8 @@ export default function HelpChatWidget({
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [submittingRequest, setSubmittingRequest] = useState(false);
+  const [submittedRequests, setSubmittedRequests] = useState<Set<string>>(new Set());
 
   // Archive & search state
   const [archivedConvos, setArchivedConvos] = useState<ConversationSummary[]>([]);
@@ -264,6 +266,7 @@ export default function HelpChatWidget({
   }
 
   async function submitFeatureRequest(title: string, description: string) {
+    setSubmittingRequest(true);
     try {
       const res = await fetch("/api/help-chat/request", {
         method: "POST",
@@ -285,21 +288,33 @@ export default function HelpChatWidget({
           ...prev,
           {
             role: "assistant",
-            content: `✅ Feature request "${title}" submitted.${ghLink}\n\nCheck the Requests tab to track its status.`,
+            content: `Feature request "${title}" submitted.${ghLink}\n\nCheck the Requests tab to track its status.`,
           },
         ]);
+        setSubmittedRequests((prev) => new Set(prev).add(title));
         // Refresh the requests tab so it shows immediately
         loadHistory();
+      } else {
+        // API returned an error — show it to the user
+        const errData = await res.json().catch(() => ({ error: "Request failed" }));
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: `Failed to submit feature request: ${errData.error || `Server error (${res.status})`}`,
+          },
+        ]);
       }
     } catch (e: any) {
-      const reason = e?.message || "Unknown error";
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: `Failed to submit feature request: ${reason}`,
+          content: `Failed to submit feature request: ${e?.message || "Network error — please try again."}`,
         },
       ]);
+    } finally {
+      setSubmittingRequest(false);
     }
   }
 
@@ -443,13 +458,17 @@ export default function HelpChatWidget({
                       }
                     >
                       <p className="whitespace-pre-wrap">{msg.content}</p>
-                      {msg.featureRequest && effectiveIsAdmin && (
+                      {msg.featureRequest && effectiveIsAdmin && !submittedRequests.has(msg.featureRequest.title) && (
                         <button
                           onClick={() => submitFeatureRequest(msg.featureRequest!.title, msg.featureRequest!.description)}
-                          className="mt-2 text-xs font-medium bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded transition w-full text-center"
+                          disabled={submittingRequest}
+                          className="mt-2 text-xs font-medium bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded transition w-full text-center disabled:opacity-50 disabled:cursor-wait"
                         >
-                          ✓ Submit as feature request
+                          {submittingRequest ? "Submitting..." : "Submit as feature request"}
                         </button>
+                      )}
+                      {msg.featureRequest && submittedRequests.has(msg.featureRequest.title) && (
+                        <p className="mt-1.5 text-[10px] text-green-600 font-medium">Submitted</p>
                       )}
                     </div>
                   </div>
