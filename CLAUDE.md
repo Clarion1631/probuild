@@ -76,7 +76,7 @@ sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
 2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
-3. Regenerate: `"C:\Program Files\Git\bin\bash.exe" -c "cd '/c/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site' && ./node_modules/.bin/prisma generate"`
+3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site'; node_modules\.bin\prisma generate"`
 4. Update `prisma/schema.prisma` to match the SQL changes
 
 ## Critical database config
@@ -113,7 +113,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
-- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client with `./node_modules/.bin/prisma generate` from git bash
+- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library
