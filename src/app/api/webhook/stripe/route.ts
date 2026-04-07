@@ -112,14 +112,7 @@ export async function POST(req: Request) {
                     const projectId = estimate.projectId;
                     if (projectId) {
                         try {
-                            let thread = await prisma.messageThread.findFirst({
-                                where: { projectId, subcontractorId: null },
-                            });
-                            if (!thread) {
-                                thread = await prisma.messageThread.create({
-                                    data: { projectId, subcontractorId: null },
-                                });
-                            }
+                            const thread = await findOrCreateClientThread(projectId);
                             await prisma.message.create({
                                 data: {
                                     threadId: thread.id,
@@ -199,14 +192,7 @@ export async function POST(req: Request) {
                 // Post payment activity to message thread
                 if (invoice.projectId) {
                     try {
-                        let thread = await prisma.messageThread.findFirst({
-                            where: { projectId: invoice.projectId, subcontractorId: null },
-                        });
-                        if (!thread) {
-                            thread = await prisma.messageThread.create({
-                                data: { projectId: invoice.projectId, subcontractorId: null },
-                            });
-                        }
+                        const thread = await findOrCreateClientThread(invoice.projectId);
                         await prisma.message.create({
                             data: {
                                 threadId: thread.id,

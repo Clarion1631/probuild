@@ -862,6 +862,36 @@ export async function getAllEstimates() {
     });
 }
 
+// Race-safe find-or-create for the client MessageThread (subcontractorId IS NULL).
+// Exported for use in API route handlers that can't import server actions directly.
+// The partial unique index "MessageThread_projectId_client_unique" makes this safe under concurrency:
+// if two requests both see no thread and both call create, the second will get P2002 and re-read.
+export async function findOrCreateClientThread(projectId: string) {
+    let thread = await prisma.messageThread.findFirst({
+        where: { projectId, subcontractorId: null },
+        orderBy: { createdAt: "asc" },
+    });
+    if (!thread) {
+        try {
+            thread = await prisma.messageThread.create({
+                data: { projectId, subcontractorId: null },
+            });
+        } catch (e: any) {
+            if (e?.code === "P2002") {
+                // Race: another request created it — re-read
+                thread = await prisma.messageThread.findFirst({
+                    where: { projectId, subcontractorId: null },
+                    orderBy: { createdAt: "asc" },
+                });
+            } else {
+                throw e;
+            }
+        }
+    }
+    if (!thread) throw new Error(`Failed to find or create MessageThread for project ${projectId}`);
+    return thread;
+}
+
 async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
     try {
         if (leadId) {
@@ -876,14 +906,7 @@ async function postActivityToThread(leadId: string | null, projectId: string | n
                 },
             });
         } else if (projectId) {
-            let thread = await prisma.messageThread.findUnique({
-                where: { projectId_subcontractorId: { projectId, subcontractorId: null } },
-            });
-            if (!thread) {
-                thread = await prisma.messageThread.create({
-                    data: { projectId, subcontractorId: null },
-                });
-            }
+            const thread = await findOrCreateClientThread(projectId);
             await prisma.message.create({
                 data: {
                     threadId: thread.id,
@@ -1614,9 +1637,9 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
 
     for (const item of items) {
         if (item.type === "Labor") {
-            totalLaborBudget += item.total || 0;
+            totalLaborBudget += Number(item.total ?? 0);
         } else {
-            totalMaterialBudget += item.total || 0;
+            totalMaterialBudget += Number(item.total ?? 0);
         }
     }
 
@@ -1874,7 +1897,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
                 baseCost: item.baseCost,
                 markupPercent: item.markupPercent,
                 unitCost: item.unitCost,
-                total: (item.quantity || 0) * (item.unitCost || 0),
+                total: (Number(item.quantity) || 0) * (Number(item.unitCost) || 0),
                 order: item.order,
                 parentId: item.parentId,
                 costCodeId: item.costCodeId,
@@ -2090,14 +2113,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         });
         revalidatePath(`/leads/${estimate.leadId}/messages`);
     } else if (estimate.projectId) {
-        let thread = await prisma.messageThread.findUnique({
-            where: { projectId_subcontractorId: { projectId: estimate.projectId, subcontractorId: null } },
-        });
-        if (!thread) {
-            thread = await prisma.messageThread.create({
-                data: { projectId: estimate.projectId, subcontractorId: null },
-            });
-        }
+        const thread = await findOrCreateClientThread(estimate.projectId);
         await prisma.message.create({
             data: {
                 threadId: thread.id,
@@ -2740,8 +2756,8 @@ export async function aiGeneratePunchlist(taskId: string) {
     const prompt = `You are an expert construction project manager. Generate a detailed punch list for this construction task.
 
 TASK: "${task.name}"
-PROJECT: "${task.project.name}"
-PROJECT TYPE: ${task.project.type || "General Construction"}
+PROJECT: "${task.project?.name ?? "Unknown"}"
+PROJECT TYPE: ${task.project?.type ?? "General Construction"}
 
 Generate 5-10 specific, actionable punch list items that a foreman would check before marking this task complete. Be specific to the trade and scope of work.
 
