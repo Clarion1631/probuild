@@ -101,11 +101,11 @@ export async function POST(req: Request) {
                 if (invoice.projectId) {
                     try {
                         let thread = await prisma.messageThread.findUnique({
-                            where: { projectId_subcontractorId: { projectId: invoice.projectId, subcontractorId: "" } },
+                            where: { projectId_subcontractorId: { projectId: invoice.projectId, subcontractorId: null } },
                         });
                         if (!thread) {
                             thread = await prisma.messageThread.create({
-                                data: { projectId: invoice.projectId, subcontractorId: "" },
+                                data: { projectId: invoice.projectId, subcontractorId: null },
                             });
                         }
                         await prisma.message.create({

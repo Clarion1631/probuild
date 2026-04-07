@@ -3,6 +3,18 @@ import { prisma } from './prisma';
 
 async function fetchAndEmbedLogo(doc: PDFDocument, url: string): Promise<PDFImage | null> {
     try {
+        // SSRF guard: only allow HTTPS URLs from known safe hosts
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'https:') return null;
+        const allowedHosts = [
+            process.env.NEXT_PUBLIC_SUPABASE_URL ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).hostname : null,
+            'ghzdbzdnwjxazvmcefbh.supabase.co',
+        ].filter(Boolean);
+        const isAllowed = allowedHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`));
+        if (!isAllowed) {
+            console.warn('Logo URL blocked (not in allowlist):', parsed.hostname);
+            return null;
+        }
         const res = await fetch(url);
         if (!res.ok) return null;
         const buffer = Buffer.from(await res.arrayBuffer());

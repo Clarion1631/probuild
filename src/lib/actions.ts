@@ -850,7 +850,7 @@ async function postActivityToThread(leadId: string | null, projectId: string | n
             await prisma.leadMessage.create({
                 data: {
                     leadId,
-                    direction: "INBOUND",
+                    direction: "OUTBOUND",   // system events are team-side, not client-originating
                     senderName: "System",
                     body,
                     channel: "email",
@@ -859,17 +859,17 @@ async function postActivityToThread(leadId: string | null, projectId: string | n
             });
         } else if (projectId) {
             let thread = await prisma.messageThread.findUnique({
-                where: { projectId_subcontractorId: { projectId, subcontractorId: "" } },
+                where: { projectId_subcontractorId: { projectId, subcontractorId: null } },
             });
             if (!thread) {
                 thread = await prisma.messageThread.create({
-                    data: { projectId, subcontractorId: "" },
+                    data: { projectId, subcontractorId: null },
                 });
             }
             await prisma.message.create({
                 data: {
                     threadId: thread.id,
-                    senderType: "CLIENT",
+                    senderType: "TEAM",      // system events are team-side, not client-originating
                     senderName: "System",
                     body,
                 },
@@ -1976,14 +1976,10 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         if (defaultTemplate) termsHtml = defaultTemplate.body;
     }
 
-    // Update estimate with T&C snapshot and sent timestamp
+    // Snapshot T&C before sending (don't flip status yet)
     await prisma.estimate.update({
         where: { id: estimateId },
-        data: {
-            termsAndConditions: termsHtml,
-            sentAt: new Date(),
-            status: "Sent"
-        }
+        data: { termsAndConditions: termsHtml },
     });
 
     // Send email notification to client
@@ -1991,13 +1987,18 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
-    const personalNote = customMessage
+    // HTML-encode customMessage to prevent injection into email template
+    const safeMessage = customMessage
+        ? customMessage.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+        : '';
+
+    const personalNote = safeMessage
         ? `<div style="background: #f8fafc; border-left: 3px solid #4f46e5; padding: 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
-                <p style="color: #333; margin: 0; line-height: 1.6; white-space: pre-wrap;">${customMessage}</p>
+                <p style="color: #333; margin: 0; line-height: 1.6; white-space: pre-wrap;">${safeMessage}</p>
            </div>`
         : '';
 
-    await sendNotification(
+    const sendResult = await sendNotification(
         recipientEmail,
         `${companyName} sent you an estimate`,
         `<!DOCTYPE html>
@@ -2032,6 +2033,16 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails }
     );
 
+    if (!sendResult.success) {
+        throw new Error("Failed to send estimate email. Please check the recipient address and try again.");
+    }
+
+    // Mark as Sent only after confirmed delivery
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: { sentAt: new Date(), status: "Sent" },
+    });
+
     // Store as message in the appropriate thread
     const messageBody = customMessage
         ? `📄 Estimate sent: ${estimate.title || estimate.code}\n\n${customMessage}\n\n🔗 Portal link: ${portalUrl}`
@@ -2055,11 +2066,11 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         revalidatePath(`/leads/${estimate.leadId}/messages`);
     } else if (estimate.projectId) {
         let thread = await prisma.messageThread.findUnique({
-            where: { projectId_subcontractorId: { projectId: estimate.projectId, subcontractorId: "" } },
+            where: { projectId_subcontractorId: { projectId: estimate.projectId, subcontractorId: null } },
         });
         if (!thread) {
             thread = await prisma.messageThread.create({
-                data: { projectId: estimate.projectId, subcontractorId: "" },
+                data: { projectId: estimate.projectId, subcontractorId: null },
             });
         }
         await prisma.message.create({
