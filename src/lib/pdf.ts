@@ -419,23 +419,25 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         }
         if (tcLine) tcLines.push(tcLine);
 
-        // Draw background box
-        const boxHeight = tcLines.length * 14 + tcPadding * 2;
-        checkNewPage(boxHeight + 20);
-        page.drawRectangle({
-            x: margin, y: y - boxHeight, width: contentWidth, height: boxHeight,
-            color: colors.bgLight,
-            borderColor: colors.border,
-            borderWidth: 1,
-        });
+        if (tcLines.length > 0) {
+            // Draw background box
+            const boxHeight = tcLines.length * 14 + tcPadding * 2;
+            checkNewPage(boxHeight + 20);
+            page.drawRectangle({
+                x: margin, y: y - boxHeight, width: contentWidth, height: boxHeight,
+                color: colors.bgLight,
+                borderColor: colors.border,
+                borderWidth: 1,
+            });
 
-        // Draw text inside box
-        let tcY = y - tcPadding;
-        for (const ln of tcLines) {
-            page.drawText(ln, { x: margin + tcPadding, y: tcY, size: 9, font: helvetica, color: colors.textMuted });
-            tcY -= 14;
+            // Draw text inside box
+            let tcY = y - tcPadding;
+            for (const ln of tcLines) {
+                page.drawText(ln, { x: margin + tcPadding, y: tcY, size: 9, font: helvetica, color: colors.textMuted });
+                tcY -= 14;
+            }
+            y = tcY - tcPadding;
         }
-        y = tcY - tcPadding;
     }
 
     // --- Signature Section ---
