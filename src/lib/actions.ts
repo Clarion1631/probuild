@@ -1355,47 +1355,51 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         await prisma.estimate.update({ where: { id: estimateId }, data: safeData });
     }
 
-    // Delete existing items and schedules
+    // Delete existing items and schedules, then batch-insert replacements
     await prisma.estimateItem.deleteMany({ where: { estimateId } });
     await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
 
-    // Insert new items
-    let itemOrder = 0;
-    for (const item of items) {
-        await prisma.estimateItem.create({
-            data: {
-                id: item.id || undefined,
-                estimateId,
-                name: item.name,
-                description: item.description || "",
-                type: item.type,
-                quantity: parseFloat(item.quantity) || 0,
-                baseCost: item.baseCost != null ? parseFloat(item.baseCost) || 0 : null,
-                markupPercent: parseFloat(item.markupPercent) || 25,
-                unitCost: parseFloat(item.unitCost) || 0,
-                total: parseFloat(item.total) || 0,
-                order: item.order ?? itemOrder++,
-                parentId: item.parentId || null,
-                costCodeId: item.costCodeId || null,
-                costTypeId: item.costTypeId || null,
-            },
-        });
+    // Build item data — split parents/children so FK ordering is respected
+    const toItemData = (item: any, fallbackOrder: number) => ({
+        ...(item.id ? { id: item.id } : {}),
+        estimateId,
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: parseFloat(item.quantity) || 0,
+        baseCost: item.baseCost != null ? (parseFloat(item.baseCost) || 0) : null,
+        markupPercent: parseFloat(item.markupPercent) || 25,
+        unitCost: parseFloat(item.unitCost) || 0,
+        total: parseFloat(item.total) || 0,
+        order: item.order ?? fallbackOrder,
+        parentId: item.parentId || null,
+        costCodeId: item.costCodeId || null,
+        costTypeId: item.costTypeId || null,
+    });
+
+    const parentItems = items.filter((i: any) => !i.parentId);
+    const childItems  = items.filter((i: any) =>  i.parentId);
+
+    if (parentItems.length > 0) {
+        await prisma.estimateItem.createMany({ data: parentItems.map(toItemData) });
+    }
+    if (childItems.length > 0) {
+        await prisma.estimateItem.createMany({ data: childItems.map(toItemData) });
     }
 
-    // Insert new payment schedules
+    // Batch-insert payment schedules
     const schedules = data.paymentSchedules || [];
-    let scheduleOrder = 0;
-    for (const schedule of schedules) {
-        await prisma.estimatePaymentSchedule.create({
-            data: {
-                id: schedule.id || undefined,
+    if (schedules.length > 0) {
+        await prisma.estimatePaymentSchedule.createMany({
+            data: schedules.map((schedule: any, idx: number) => ({
+                ...(schedule.id ? { id: schedule.id } : {}),
                 estimateId,
                 name: schedule.name,
                 percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
                 amount: parseFloat(schedule.amount) || 0,
                 dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
-                order: schedule.order ?? scheduleOrder++,
-            },
+                order: schedule.order ?? idx,
+            })),
         });
     }
 
