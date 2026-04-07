@@ -558,7 +558,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 setAiPrompt("");
                 toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
 
-                // Auto-save in background — failures are non-fatal since items are already in state
+                // Auto-save in background — set isSaving to block concurrent blur-triggered save
+                setIsSaving(true);
                 try {
                     const mappedItems = newItems.map((item, index) => ({
                         ...item,
@@ -579,6 +580,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 } catch (saveErr) {
                     console.error("Auto-save after AI generate failed:", saveErr);
                     toast.error("Items added — but auto-save failed. Click Save to persist.");
+                } finally {
+                    setIsSaving(false);
                 }
             } else {
                 toast.error('AI returned no items');
@@ -643,7 +646,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu && !isSaving) {
                     handleSave();
                 }
             }}
