@@ -94,6 +94,17 @@ export async function createLead(data: { name: string; clientName: string; clien
         });
     }
 
+    // Dedup guard: if an identical lead for this client was created in the last 24h, return it
+    const existing = await prisma.lead.findFirst({
+        where: {
+            clientId: client.id,
+            name: data.name,
+            stage: "New",
+            createdAt: { gte: new Date(Date.now() - 86400000) },
+        },
+    });
+    if (existing) return { id: existing.id };
+
     const lead = await prisma.lead.create({
         data: {
             name: data.name,
@@ -607,19 +618,53 @@ export async function convertLeadToProject(leadId: string) {
         },
     });
 
-    // Relink estimates
+    // Relink all dual-FK child records to the new project
     await prisma.estimate.updateMany({
         where: { leadId },
         data: { projectId: project.id, leadId: null },
     });
-
-    // Relink floor plans
     await prisma.floorPlan.updateMany({
         where: { leadId },
         data: { projectId: project.id, leadId: null },
     });
+    await prisma.contract.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
+    await prisma.projectFile.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
+    await prisma.fileFolder.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
+    await prisma.scheduleTask.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
+    await prisma.takeoff.updateMany({
+        where: { leadId },
+        data: { projectId: project.id, leadId: null },
+    });
+    // Relink client messages — keep leadId for history, add projectId
+    await prisma.clientMessage.updateMany({
+        where: { leadId },
+        data: { projectId: project.id },
+    });
 
-    // Update lead
+    // Set back-reference on project and copy lead metadata
+    await prisma.project.update({
+        where: { id: project.id },
+        data: {
+            leadId,
+            type: lead.projectType || "Unknown",
+            managerId: lead.managerId || null,
+            tags: lead.tags || null,
+        },
+    });
+
+    // Update lead stage
     await prisma.lead.update({
         where: { id: leadId },
         data: { stage: "Won" },
@@ -847,7 +892,7 @@ export async function getAllEstimates() {
 async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
     try {
         if (leadId) {
-            await prisma.leadMessage.create({
+            await prisma.clientMessage.create({
                 data: {
                     leadId,
                     direction: "OUTBOUND",   // system events are team-side, not client-originating
@@ -1642,6 +1687,7 @@ export async function saveCompanySettings(data: any) {
             email: data.email,
             website: data.website,
             logoUrl: data.logoUrl,
+            licenseNumber: data.licenseNumber,
             notificationEmail: data.notificationEmail,
             stripeEnabled: data.stripeEnabled,
             enableCard: data.enableCard,
@@ -2049,7 +2095,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         : `📄 Estimate sent: ${estimate.title || estimate.code}\n\n🔗 Portal link: ${portalUrl}`;
 
     if (estimate.leadId) {
-        await prisma.leadMessage.create({
+        await prisma.clientMessage.create({
             data: {
                 leadId: estimate.leadId,
                 direction: "OUTBOUND",
@@ -2985,22 +3031,25 @@ export async function getProjectMessages(projectId: string) {
 }
 
 export async function getUnreadMessageCount(projectId: string, forSenderType: "CLIENT" | "TEAM") {
-    // Count messages sent by the OTHER party that haven't been read
-    const oppositeType = forSenderType === "TEAM" ? "CLIENT" : "TEAM";
+    // Count inbound ClientMessages from the client that haven't been read
+    const inboundDirection = forSenderType === "TEAM" ? "INBOUND" : "OUTBOUND";
 
-    const thread = await prisma.messageThread.findFirst({
-        where: { projectId, subcontractorId: null },
-    });
+    const [threadCount, clientMsgCount] = await Promise.all([
+        // Legacy project thread messages (senderType-based, with readAt)
+        prisma.messageThread.findFirst({ where: { projectId, subcontractorId: null } }).then(thread => {
+            if (!thread) return 0;
+            const oppositeType = forSenderType === "TEAM" ? "CLIENT" : "TEAM";
+            return prisma.message.count({
+                where: { threadId: thread.id, senderType: oppositeType, readAt: null },
+            });
+        }),
+        // New ClientMessage unread count (direction-based, no readAt field yet)
+        prisma.clientMessage.count({
+            where: { projectId, direction: inboundDirection },
+        }),
+    ]);
 
-    if (!thread) return 0;
-
-    return prisma.message.count({
-        where: {
-            threadId: thread.id,
-            senderType: oppositeType,
-            readAt: null,
-        },
-    });
+    return threadCount + clientMsgCount;
 }
 
 
