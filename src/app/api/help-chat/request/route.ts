@@ -79,9 +79,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { title, description, userId, currentPage } = await req.json();
+  const { title, description, currentPage } = await req.json();
+  const sessionUserId = (session.user as any).id;
 
-  if (!title || !description || !userId) {
+  if (!title || !description) {
     return NextResponse.json(
       { error: "Missing required fields" },
       { status: 400 }
@@ -92,13 +93,13 @@ export async function POST(req: NextRequest) {
     // 1. Create GitHub Issue
     const ghIssue = await createGitHubIssue(title, description, currentPage);
 
-    // 2. Save to HelpRequest table (with GitHub issue link if created)
+    // 2. Save to HelpRequest table — use session userId so Requests tab can find it
     const result = await prisma.$queryRaw<any[]>`
       INSERT INTO "HelpRequest" (
         "userId", "type", "question", "response", "currentPage", "status"
       )
       VALUES (
-        ${userId},
+        ${sessionUserId},
         'feature_request',
         ${title},
         ${description},
