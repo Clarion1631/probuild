@@ -62,7 +62,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
                     unit: form.unit,
                     costCodeId: cc?.id,
                 });
-                setItems(prev => [created as CatalogItem, ...prev]);
+                setItems(prev => [{ ...created, unitCost: Number(created.unitCost) } as CatalogItem, ...prev]);
                 setShowAdd(false);
                 setForm(EMPTY_FORM);
                 toast.success("Item added");
@@ -84,7 +84,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
                     unit: form.unit,
                     costCodeId: cc?.id || null,
                 });
-                setItems(prev => prev.map(i => i.id === editId ? updated as CatalogItem : i));
+                setItems(prev => prev.map(i => i.id === editId ? ({ ...updated, unitCost: Number(updated.unitCost) } as CatalogItem) : i));
                 setEditId(null);
                 toast.success("Item updated");
             } catch {
@@ -110,7 +110,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
         startTransition(async () => {
             try {
                 const updated = await updateCatalogItem(item.id, { isActive: !item.isActive });
-                setItems(prev => prev.map(i => i.id === item.id ? updated as CatalogItem : i));
+                setItems(prev => prev.map(i => i.id === item.id ? ({ ...updated, unitCost: Number(updated.unitCost) } as CatalogItem) : i));
             } catch {
                 toast.error("Failed to update");
             }

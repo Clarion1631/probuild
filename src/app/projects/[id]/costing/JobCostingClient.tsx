@@ -293,7 +293,7 @@ export default function JobCostingClient({
                                 tickFormatter={v => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v}`}
                             />
                             <Tooltip
-                                formatter={(value: number, name: string) => [formatCurrency(value), name]}
+                                formatter={(value: any, name: any) => [formatCurrency(Number(value ?? 0)), name]}
                                 labelFormatter={(label, payload) => payload?.[0]?.payload?.fullName ?? label}
                                 contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }}
                             />

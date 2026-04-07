@@ -170,7 +170,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // 5. TIMELINE (Cash Flow Tracker)
     // ------------------------------------
     // Build cash flow timeline from actual invoice payments bucketed by month
-    const allPayments = await prisma.payment.findMany({
+    const allPayments = await prisma.paymentSchedule.findMany({
         where: { invoice: { projectId } },
         select: { amount: true, paidAt: true, createdAt: true }
     });

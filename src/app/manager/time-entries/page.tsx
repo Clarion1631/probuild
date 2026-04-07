@@ -44,8 +44,8 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
     ]);
 
     const totalHours = entries.reduce((acc, e) => acc + (e.durationHours || 0), 0);
-    const totalCost = entries.reduce((acc, e) => acc + (e.laborCost || 0) + (e.burdenCost || 0), 0);
-    const totalBillable = entries.reduce((acc, e) => acc + (e.laborCost || 0), 0);
+    const totalCost = entries.reduce((acc, e) => acc + Number(e.laborCost || 0) + Number(e.burdenCost || 0), 0);
+    const totalBillable = entries.reduce((acc, e) => acc + Number(e.laborCost || 0), 0);
 
     // Group by project
     const grouped = entries.reduce((map, e) => {

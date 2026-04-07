@@ -51,7 +51,7 @@ export default async function SubPortalDashboard() {
 
     // Add task counts
     for (const a of assignments) {
-        const existing = projectMap.get(a.task.projectId);
+        const existing = a.task.projectId ? projectMap.get(a.task.projectId) : undefined;
         if (existing) {
             existing.taskCount += 1;
         }

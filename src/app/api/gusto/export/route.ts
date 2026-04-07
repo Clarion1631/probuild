@@ -45,7 +45,7 @@ export async function GET(req: NextRequest) {
             ? new Date(entry.startTime).toLocaleDateString("en-US")
             : "";
         const project = (entry.project?.name || "").replace(/,/g, " ");
-        const notes = (entry.notes || "").replace(/,/g, " ").replace(/\n/g, " ");
+        const notes = ((entry as any).notes || "").replace(/,/g, " ").replace(/\n/g, " ");
 
         rows.push(`"${name}","${gustoId}","${hours}","${date}","${project}","${notes}"`);
     }

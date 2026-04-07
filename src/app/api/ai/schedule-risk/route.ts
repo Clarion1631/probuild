@@ -83,7 +83,8 @@ Recommended completion adjustment: [date or "none needed"].`;
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const analysis = response.content[0].text.trim();
+    const textBlock = response.content.find(b => b.type === 'text');
+    const analysis = (textBlock && 'text' in textBlock ? (textBlock as any).text as string : '').trim();
 
     return NextResponse.json({ success: true, analysis });
 }

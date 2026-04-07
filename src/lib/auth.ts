@@ -21,7 +21,7 @@ if (process.env.PLAYWRIGHT_TEST_SECRET) {
             },
             async authorize(credentials) {
                 if (credentials?.secret !== process.env.PLAYWRIGHT_TEST_SECRET) return null;
-                if (!credentials.email) return null;
+                if (!credentials?.email) return null;
                 const user = await prisma.user.findUnique({
                     where: { email: credentials.email.toLowerCase() },
                 });

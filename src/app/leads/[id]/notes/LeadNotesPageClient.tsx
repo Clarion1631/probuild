@@ -6,7 +6,7 @@ import { toast } from "sonner";
 interface Note {
     id: string;
     content: string;
-    createdBy: string;
+    createdBy: string | null;
     createdAt: Date;
 }
 

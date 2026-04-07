@@ -54,12 +54,12 @@ export async function POST(req: NextRequest) {
                 id: estimate.id,
                 code: estimate.code,
                 title: estimate.title,
-                totalAmount: estimate.totalAmount,
+                totalAmount: Number(estimate.totalAmount),
                 items: estimate.items.map(i => ({
                     name: i.name,
-                    quantity: i.quantity,
-                    unitCost: i.unitCost,
-                    total: i.total,
+                    quantity: Number(i.quantity),
+                    unitCost: Number(i.unitCost),
+                    total: Number(i.total),
                     type: i.type,
                 })),
                 client: { name: client.name, email: client.email ?? null },
@@ -81,8 +81,8 @@ export async function POST(req: NextRequest) {
 
             const result = await syncInvoiceToQB(tokens, {
                 code: invoice.code,
-                totalAmount: invoice.totalAmount,
-                balanceDue: invoice.balanceDue,
+                totalAmount: Number(invoice.totalAmount),
+                balanceDue: Number(invoice.balanceDue),
                 client: { name: invoice.client.name, email: invoice.client.email ?? null },
                 project: invoice.project ? { name: invoice.project.name } : null,
             });

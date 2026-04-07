@@ -62,7 +62,7 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
         startTransition(async () => {
             try {
                 const created = await createScheduleTask(projectId, newTask);
-                setTasks(prev => [...prev, { ...created, punchItems: [] }]);
+                setTasks(prev => [...prev, { ...created, assignments: [], punchItems: [] }]);
                 setNewTask({ name: "", startDate: "", endDate: "", status: "Not Started" });
                 setShowAddTask(false);
                 toast.success("Task added");
@@ -117,6 +117,7 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
         startTransition(async () => {
             try {
                 const updated = await togglePunchItem(itemId);
+                if (!updated) return;
                 setTasks(prev => prev.map(t => t.id === taskId
                     ? { ...t, punchItems: t.punchItems?.map(p => p.id === itemId ? { ...p, completed: updated.completed } : p) }
                     : t

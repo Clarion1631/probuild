@@ -86,7 +86,8 @@ Write in a professional but accessible tone appropriate for Clark County, WA hom
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const contractHtml = response.content[0].text.trim()
+    const textBlock = response.content.find(b => b.type === 'text');
+    const contractHtml = (textBlock && 'text' in textBlock ? (textBlock as any).text as string : '').trim()
         .replace(/^```html\n?/, "")
         .replace(/\n?```$/, "");
 

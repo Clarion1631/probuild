@@ -15,7 +15,7 @@ export default async function TimeBillingPage({
 
     const { groupBy = "employee" } = await searchParams;
 
-    const entries = await prisma.timeEntry.findMany({
+    const rawEntries = await prisma.timeEntry.findMany({
         include: {
             user: { select: { id: true, name: true } },
             project: { select: { id: true, name: true } },
@@ -23,6 +23,8 @@ export default async function TimeBillingPage({
         },
         orderBy: { startTime: "desc" },
     });
+
+    const entries = rawEntries.map(e => ({ ...e, laborCost: e.laborCost !== null ? Number(e.laborCost) : null }));
 
     return <TimeBillingClient entries={entries} groupBy={groupBy} />;
 }

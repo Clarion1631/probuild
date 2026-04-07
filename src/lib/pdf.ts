@@ -276,14 +276,14 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucStr = formatCurrency(Number(item.unitCost ?? 0));
         const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(item.total || 0);
+        const totalStr = formatCurrency(Number(item.total ?? 0));
         const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
@@ -394,7 +394,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             }
 
             if (sched.amount) {
-                const amtStr = formatCurrency(sched.amount);
+                const amtStr = formatCurrency(Number(sched.amount));
                 const amtWidth = helveticaBold.widthOfTextAtSize(amtStr, 9);
                 page.drawText(amtStr, {
                     x: cols.total - amtWidth, y, size: 9, font: helveticaBold, color: colors.textMain,
@@ -689,14 +689,14 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucStr = formatCurrency(Number(item.unitCost ?? 0));
         const ucStrWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(item.total || 0);
+        const totalStr = formatCurrency(Number(item.total ?? 0));
         const totalStrWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalStrWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
@@ -715,7 +715,7 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     });
     y -= 25;
 
-    const total = po.totalAmount || 0;
+    const total = Number(po.totalAmount ?? 0);
 
     // Total line
     const labelX = cols.unitCost - 60;

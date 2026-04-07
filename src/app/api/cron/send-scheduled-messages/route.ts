@@ -42,6 +42,7 @@ export async function GET(request: Request) {
         for (const msg of scheduledMessages) {
             try {
                 const { lead, channel, body: messageBody, subject, senderName, attachments, ccEmails } = msg;
+                if (!lead) continue;
 
                 const parsedAttachments: { type: string, id: string, name: string, url?: string }[] = attachments ? JSON.parse(attachments) : [];
                 const parsedCcEmails: string[] = ccEmails ? JSON.parse(ccEmails) : [];
