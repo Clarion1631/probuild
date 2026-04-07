@@ -1697,6 +1697,10 @@ export async function saveCompanySettings(data: any) {
             passProcessingFee: data.passProcessingFee,
             cardProcessingRate: data.cardProcessingRate !== undefined ? parseFloat(data.cardProcessingRate) : undefined,
             cardProcessingFlat: data.cardProcessingFlat !== undefined ? parseFloat(data.cardProcessingFlat) : undefined,
+            workDays: data.workDays,
+            workdayStart: data.workdayStart,
+            workdayEnd: data.workdayEnd,
+            salesTaxes: data.salesTaxes,
         },
     });
 

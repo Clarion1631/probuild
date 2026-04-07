@@ -92,7 +92,7 @@ model Lead {
   notes          LeadNote[]
   meetings       LeadMeeting[]
   takeoffs       Takeoff[]
-  leadMessages   LeadMessage[]
+  clientMessages ClientMessage[]
   scheduleTasks  ScheduleTask[]
   message        String? // Initial inquiry message from the client
   project        Project? // reverse relation: the project created from this lead
@@ -175,6 +175,7 @@ model Project {
   takeoffs            Takeoff[]
   portalVisibility    PortalVisibility?
   messageThreads      MessageThread[]
+  clientMessages      ClientMessage[]
   changeOrders        ChangeOrder[]
   purchaseOrders      PurchaseOrder[]
   selectionBoards     SelectionBoard[]
@@ -518,6 +519,7 @@ model CompanySettings {
   email               String?
   website             String?
   logoUrl             String?
+  licenseNumber       String?
   notificationEmail   String? // Where to send View/Sign alerts
   projectStatuses     String? // JSON string array of custom statues [{label, value, color, dot}, ...]
   subcontractorTrades String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
@@ -868,16 +870,19 @@ model Message {
   createdAt   DateTime      @default(now())
 }
 
-model LeadMessage {
+model ClientMessage {
   id           String    @id @default(cuid())
-  leadId       String
-  lead         Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  // Belongs to either a Lead OR a Project (one must be set)
+  leadId       String?
+  lead         Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  projectId    String?
+  project      Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   direction    String // "INBOUND" (from client) or "OUTBOUND" (from team)
   senderName   String
   senderEmail  String?
   subject      String?
   body         String
-  channel      String    @default("email") // "email", "sms", "both"
+  channel      String    @default("email") // "email", "sms", "both", "app"
   attachments  String? // JSON array: [{ type, id, name, url }]
   sentViaEmail Boolean   @default(false)
   sentViaSms   Boolean   @default(false)
@@ -885,6 +890,10 @@ model LeadMessage {
   scheduledFor DateTime?
   ccEmails     String? // JSON array of emails
   createdAt    DateTime  @default(now())
+
+  @@index([leadId])
+  @@index([projectId])
+  @@index([createdAt])
 }
 
 model SubcontractorProjectAccess {
