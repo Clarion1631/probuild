@@ -7,6 +7,7 @@ import { usePermissions } from "@/components/PermissionsProvider";
 interface Message {
   role: "user" | "assistant";
   content: string;
+  featureRequest?: { title: string; description: string };
 }
 
 interface ConversationSummary {
@@ -243,12 +244,11 @@ export default function HelpChatWidget({
         content: data.answer,
       };
 
-      setMessages((prev) => [...prev, assistantMsg]);
-
-      // Auto-submit feature requests immediately — no manual button needed
       if (data.type === "feature_request" && data.title && data.description) {
-        submitFeatureRequest(data.title, data.description);
+        assistantMsg.featureRequest = { title: data.title, description: data.description };
       }
+
+      setMessages((prev) => [...prev, assistantMsg]);
     } catch (e: any) {
       const errMsg = e?.message || "Unknown error";
       setMessages((prev) => [
@@ -285,9 +285,11 @@ export default function HelpChatWidget({
           ...prev,
           {
             role: "assistant",
-            content: `Feature request "${title}" has been submitted successfully.${ghLink}`,
+            content: `✅ Feature request "${title}" submitted.${ghLink}\n\nCheck the Requests tab to track its status.`,
           },
         ]);
+        // Refresh the requests tab so it shows immediately
+        loadHistory();
       }
     } catch (e: any) {
       const reason = e?.message || "Unknown error";
@@ -387,14 +389,15 @@ export default function HelpChatWidget({
               {/* New Chat */}
               <button
                 onClick={startNewChat}
-                className="text-white/80 hover:text-white ml-1"
+                className="text-white/80 hover:text-white ml-1 text-xs font-medium flex items-center gap-0.5 bg-white/10 hover:bg-white/20 px-1.5 py-0.5 rounded transition"
                 aria-label="Start new chat"
-                title="New chat"
+                title="Start a new conversation"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M12 5v14" />
                   <path d="M5 12h14" />
                 </svg>
+                New
               </button>
               {/* Close */}
               <button
@@ -440,6 +443,14 @@ export default function HelpChatWidget({
                       }
                     >
                       <p className="whitespace-pre-wrap">{msg.content}</p>
+                      {msg.featureRequest && effectiveIsAdmin && (
+                        <button
+                          onClick={() => submitFeatureRequest(msg.featureRequest!.title, msg.featureRequest!.description)}
+                          className="mt-2 text-xs bg-white/20 hover:bg-white/30 border border-white/40 text-white px-2 py-1 rounded transition"
+                        >
+                          ✓ Submit as feature request
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -526,12 +537,12 @@ export default function HelpChatWidget({
                 ) : displayedConvos.length === 0 ? (
                   <div className="text-center text-sm text-hui-textMuted mt-8">
                     <p className="font-medium text-hui-textMain mb-1">
-                      {historyMode === "search" ? "No matches" : "No archived chats"}
+                      {historyMode === "search" ? "No matches" : "No conversations yet"}
                     </p>
                     <p>
                       {historyMode === "search"
                         ? "Try a different search term."
-                        : "Chats auto-archive after 7 days of inactivity."}
+                        : "Start a chat and it will appear here."}
                     </p>
                   </div>
                 ) : (
@@ -545,9 +556,14 @@ export default function HelpChatWidget({
                           <p className="text-sm font-medium text-hui-textMain truncate flex-1">
                             {c.title || "Untitled chat"}
                           </p>
-                          <span className="text-[10px] text-hui-textMuted whitespace-nowrap">
-                            {timeAgo(c.updatedAt)}
-                          </span>
+                          <div className="flex items-center gap-1 flex-shrink-0">
+                            {c.archived && (
+                              <span className="text-[10px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">archived</span>
+                            )}
+                            <span className="text-[10px] text-hui-textMuted whitespace-nowrap">
+                              {timeAgo(c.updatedAt)}
+                            </span>
+                          </div>
                         </div>
                         {c.matchPreview && (
                           <p className="text-xs text-hui-textMuted mt-1 truncate">
@@ -562,7 +578,7 @@ export default function HelpChatWidget({
                             onClick={() => restoreConversation(c.id)}
                             className="text-xs text-hui-primary hover:underline font-medium"
                           >
-                            Restore
+                            Open
                           </button>
                         </div>
                       </div>
