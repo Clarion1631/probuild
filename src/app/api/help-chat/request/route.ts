@@ -109,14 +109,18 @@ export async function POST(req: NextRequest) {
       RETURNING *
     `;
 
-    // 3. If GitHub issue was created, update the record with issue URL
+    // 3. If GitHub issue was created, try to store the link (best-effort — columns may not exist)
     if (ghIssue && result[0]) {
-      await prisma.$executeRaw`
-        UPDATE "HelpRequest"
-        SET "changeDescription" = ${`GitHub Issue #${ghIssue.number}`},
-            "changeLocation" = ${ghIssue.url}
-        WHERE "id" = ${result[0].id}::uuid
-      `;
+      try {
+        await prisma.$executeRaw`
+          UPDATE "HelpRequest"
+          SET "changeDescription" = ${`GitHub Issue #${ghIssue.number}`},
+              "changeLocation" = ${ghIssue.url}
+          WHERE "id" = ${result[0].id}::uuid
+        `;
+      } catch {
+        // Column doesn't exist — not fatal, issue link is still returned in the response
+      }
     }
 
     return NextResponse.json({
