@@ -128,21 +128,22 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
     return (
         <>
-        {/* Outer sizer: plain block div — flex item in layout, clips inner flex-col content */}
+        {/* Outer sizer: clips inner horizontally; overflowX:hidden makes overflowY:auto so inner scroll works */}
         <div
             style={{
                 flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
                 maxWidth: sidebarCollapsed ? "48px" : "224px",
                 minWidth: 0,
-                overflow: "hidden",
+                overflowX: "hidden",
             }}
             className="h-full"
         >
-        {/* Inner sidebar: always 224px wide, gets clipped by outer when collapsed */}
-        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
-            {/* Toggle row — button left-aligned so it stays within 48px clip */}
-            <div className={`flex items-center border-b border-hui-border ${sidebarCollapsed ? "justify-start py-2 pl-2" : "justify-between px-2 py-2"}`}>
-                {!sidebarCollapsed && (
+        {/* Inner sidebar: always 224px wide, clipped by outer when collapsed. h-full constrains flex so nav can scroll. */}
+        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
+
+            {/* Top bar — back link (hidden when collapsed) */}
+            {!sidebarCollapsed && (
+                <div className="flex items-center border-b border-hui-border px-2 py-2 shrink-0">
                     <Link
                         href="/projects"
                         className="flex items-center gap-2 px-2 py-0.5 text-sm text-slate-500 hover:text-hui-primary hover:bg-slate-100 rounded transition group"
@@ -152,27 +153,15 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                         </svg>
                         <span className="font-medium">All Projects</span>
                     </Link>
-                )}
-                <button
-                    onClick={toggleSidebar}
-                    title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                    className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition shrink-0"
-                >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        {sidebarCollapsed
-                            ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
-                            : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
-                        }
-                    </svg>
-                </button>
-            </div>
+                </div>
+            )}
 
             {/* Expanded content */}
             {!sidebarCollapsed && <>
 
             {/* Client Portal Link */}
-            <div className="p-3 border-b border-hui-border bg-slate-50">
-                <Link 
+            <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0">
+                <Link
                     href={`/portal/projects/${projectId}`}
                     target="_blank"
                     className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-md bg-white border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-100 transition shadow-sm"
@@ -182,12 +171,12 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 </Link>
             </div>
 
-            <div className="p-4 border-b border-hui-border bg-white">
+            <div className="p-4 border-b border-hui-border bg-white shrink-0">
                 <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Project Menu</h2>
             </div>
 
             {/* Lead Link - Prominent */}
-            <div className="px-3 pt-3 pb-1">
+            <div className="px-3 pt-3 pb-1 shrink-0">
                 {currentLead ? (
                     <div className="group/lead">
                         <Link
@@ -235,6 +224,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 )}
             </div>
 
+            {/* Scrollable nav */}
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
                     {navSections.map((section) => {
@@ -293,6 +283,31 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
             </>}
         </div>
+        </div>
+
+        {/* Toggle tab — zero-width flex item so it sits exactly at the sidebar's right edge */}
+        <div
+            className="relative shrink-0 self-stretch"
+            style={{ width: 0, zIndex: 10 }}
+        >
+            <button
+                onClick={toggleSidebar}
+                title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                style={{
+                    position: "absolute",
+                    left: 0,
+                    top: "50%",
+                    transform: "translateY(-50%)",
+                }}
+                className="w-5 h-10 bg-white border border-hui-border border-l-0 rounded-r-md shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition"
+            >
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    {sidebarCollapsed
+                        ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
+                        : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
+                    }
+                </svg>
+            </button>
         </div>
 
         {/* Link Lead Modal (fixed overlay, outside sizing divs) */}
