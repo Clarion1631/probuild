@@ -128,6 +128,34 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
     return (
         <>
+        {/* Toggle tab — rendered FIRST so it's the 1st focusable element (before all nav links) */}
+        <div
+            className="relative shrink-0 self-stretch"
+            style={{ width: 0, zIndex: 10 }}
+        >
+            <button
+                onClick={toggleSidebar}
+                aria-expanded={!sidebarCollapsed}
+                aria-controls="project-inner-sidebar"
+                aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                style={{
+                    position: "absolute",
+                    left: 0,
+                    top: "50%",
+                    transform: "translateY(-50%)",
+                }}
+                className="w-5 h-10 bg-white border border-hui-border border-l-0 rounded-r-md shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition"
+            >
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    {sidebarCollapsed
+                        ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
+                        : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
+                    }
+                </svg>
+            </button>
+        </div>
+
         {/* Outer sizer: clips inner horizontally; overflowX:hidden makes overflowY:auto so inner scroll works */}
         <div
             style={{
@@ -139,7 +167,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             className="h-full"
         >
         {/* Inner sidebar: always 224px wide, clipped by outer when collapsed. h-full constrains flex so nav can scroll. */}
-        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
+        <div id="project-inner-sidebar" className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
 
             {/* Top bar — back link (hidden when collapsed) */}
             {!sidebarCollapsed && (
@@ -283,31 +311,6 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
             </>}
         </div>
-        </div>
-
-        {/* Toggle tab — zero-width flex item so it sits exactly at the sidebar's right edge */}
-        <div
-            className="relative shrink-0 self-stretch"
-            style={{ width: 0, zIndex: 10 }}
-        >
-            <button
-                onClick={toggleSidebar}
-                title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                style={{
-                    position: "absolute",
-                    left: 0,
-                    top: "50%",
-                    transform: "translateY(-50%)",
-                }}
-                className="w-5 h-10 bg-white border border-hui-border border-l-0 rounded-r-md shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition"
-            >
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    {sidebarCollapsed
-                        ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
-                        : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
-                    }
-                </svg>
-            </button>
         </div>
 
         {/* Link Lead Modal (fixed overlay, outside sizing divs) */}
