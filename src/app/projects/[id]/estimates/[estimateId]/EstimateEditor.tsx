@@ -65,6 +65,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [aiSuggestingSubitems, setAiSuggestingSubitems] = useState<string | null>(null); // item ID
     const [aiSubitemSuggestions, setAiSubitemSuggestions] = useState<any[]>([]);
     const [showSubitemSuggestions, setShowSubitemSuggestions] = useState<string | null>(null);
+    const [selectedSuggestionIndices, setSelectedSuggestionIndices] = useState<Set<number>>(new Set());
 
     // Auto-expand textarea ref handler
     const autoExpand = useCallback((el: HTMLTextAreaElement | null) => {
@@ -127,6 +128,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 if (data.suggestions?.length) {
                     setAiSubitemSuggestions(data.suggestions);
                     setShowSubitemSuggestions(parent.id);
+                    // Pre-select all by default
+                    setSelectedSuggestionIndices(new Set(data.suggestions.map((_: any, i: number) => i)));
                 } else {
                     toast.info("No suggestions for this item");
                 }
@@ -137,6 +140,12 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         } finally {
             setAiSuggestingSubitems(null);
         }
+    }
+
+    function dismissSubitemSuggestions() {
+        setShowSubitemSuggestions(null);
+        setAiSubitemSuggestions([]);
+        setSelectedSuggestionIndices(new Set());
     }
 
     function acceptSubitemSuggestions(parentId: string, suggestions: any[]) {
@@ -159,7 +168,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         setItems([...items, ...newItems]);
         setShowSubitemSuggestions(null);
         setAiSubitemSuggestions([]);
-        toast.success(`Added ${newItems.length} sub-items`);
+        setSelectedSuggestionIndices(new Set());
+        toast.success(`Added ${newItems.length} sub-item${newItems.length !== 1 ? "s" : ""}`);
     }
 
     useEffect(() => {
@@ -1092,16 +1102,31 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                     {showSubitemSuggestions === item.id && aiSubitemSuggestions.length > 0 && (
                                                                         <div className="mt-2 bg-amber-50 border border-amber-200 rounded-lg p-3 shadow-sm">
                                                                             <div className="flex items-center justify-between mb-2">
-                                                                                <span className="text-xs font-semibold text-amber-800">AI Suggested Sub-items</span>
+                                                                                <div className="flex items-center gap-2">
+                                                                                    <span className="text-xs font-semibold text-amber-800">AI Suggested Sub-items</span>
+                                                                                    <button
+                                                                                        onClick={() => {
+                                                                                            if (selectedSuggestionIndices.size === aiSubitemSuggestions.length) {
+                                                                                                setSelectedSuggestionIndices(new Set());
+                                                                                            } else {
+                                                                                                setSelectedSuggestionIndices(new Set(aiSubitemSuggestions.map((_: any, i: number) => i)));
+                                                                                            }
+                                                                                        }}
+                                                                                        className="text-[10px] text-amber-600 hover:text-amber-800 underline"
+                                                                                    >
+                                                                                        {selectedSuggestionIndices.size === aiSubitemSuggestions.length ? "Deselect all" : "Select all"}
+                                                                                    </button>
+                                                                                </div>
                                                                                 <div className="flex gap-1">
                                                                                     <button
-                                                                                        onClick={() => acceptSubitemSuggestions(item.id, aiSubitemSuggestions)}
-                                                                                        className="text-[10px] font-medium bg-amber-500 text-white px-2 py-0.5 rounded hover:bg-amber-600 transition"
+                                                                                        onClick={() => acceptSubitemSuggestions(item.id, aiSubitemSuggestions.filter((_: any, i: number) => selectedSuggestionIndices.has(i)))}
+                                                                                        disabled={selectedSuggestionIndices.size === 0}
+                                                                                        className="text-[10px] font-medium bg-amber-500 text-white px-2 py-0.5 rounded hover:bg-amber-600 transition disabled:opacity-40"
                                                                                     >
-                                                                                        Add All
+                                                                                        Add {selectedSuggestionIndices.size > 0 && selectedSuggestionIndices.size < aiSubitemSuggestions.length ? `${selectedSuggestionIndices.size} Selected` : "All"}
                                                                                     </button>
                                                                                     <button
-                                                                                        onClick={() => { setShowSubitemSuggestions(null); setAiSubitemSuggestions([]); }}
+                                                                                        onClick={dismissSubitemSuggestions}
                                                                                         className="text-[10px] font-medium text-amber-600 hover:text-amber-800 px-1"
                                                                                     >
                                                                                         Dismiss
@@ -1110,12 +1135,30 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             </div>
                                                                             <div className="space-y-1">
                                                                                 {aiSubitemSuggestions.map((s: any, si: number) => (
-                                                                                    <div key={si} className="flex items-start justify-between text-xs bg-white rounded px-2 py-1.5 border border-amber-100">
+                                                                                    <div
+                                                                                        key={si}
+                                                                                        onClick={() => {
+                                                                                            const next = new Set(selectedSuggestionIndices);
+                                                                                            next.has(si) ? next.delete(si) : next.add(si);
+                                                                                            setSelectedSuggestionIndices(next);
+                                                                                        }}
+                                                                                        className={`flex items-start gap-2 text-xs rounded px-2 py-1.5 border cursor-pointer transition ${
+                                                                                            selectedSuggestionIndices.has(si)
+                                                                                                ? "bg-amber-100 border-amber-300"
+                                                                                                : "bg-white border-amber-100 opacity-60"
+                                                                                        }`}
+                                                                                    >
+                                                                                        <input
+                                                                                            type="checkbox"
+                                                                                            checked={selectedSuggestionIndices.has(si)}
+                                                                                            onChange={() => {}}
+                                                                                            className="mt-0.5 flex-shrink-0 accent-amber-500"
+                                                                                        />
                                                                                         <div className="flex-1 min-w-0">
                                                                                             <span className="font-medium text-slate-800">{s.name}</span>
-                                                                                            {s.description && <p className="text-slate-500 mt-0.5 truncate">{s.description}</p>}
+                                                                                            {s.description && <p className="text-slate-500 mt-0.5 line-clamp-2">{s.description}</p>}
                                                                                         </div>
-                                                                                        <span className="ml-2 text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded whitespace-nowrap">{s.costType}</span>
+                                                                                        <span className="ml-1 text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded whitespace-nowrap flex-shrink-0">{s.costType}</span>
                                                                                     </div>
                                                                                 ))}
                                                                             </div>
