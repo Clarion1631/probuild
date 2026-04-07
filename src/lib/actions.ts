@@ -2881,6 +2881,7 @@ export async function getPortalVisibility(projectId: string) {
             showChangeOrders: true,
             showSelections: true,
             showMoodBoards: true,
+            paymentRemindersEnabled: false,
             isPortalEnabled: true,
             lastSharedAt: null,
             lastShareEmailId: null,
