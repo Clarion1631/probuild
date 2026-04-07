@@ -13,6 +13,16 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     const { searchParams } = new URL(req.url);
     const includeUnissued = searchParams.get("includeUnissued") === "true";
 
+    // Verify caller has access to this project (admins/managers bypass; others must have ProjectAccess)
+    const callerUser = await prisma.user.findUnique({
+        where: { email: session.user.email },
+        select: { id: true, role: true, projectAccess: { where: { projectId }, select: { projectId: true } } }
+    });
+    const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
+    if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+
     const project = await prisma.project.findUnique({ where: { id: projectId } });
     if (!project) {
         return NextResponse.json({ error: "Project not found" }, { status: 404 });
@@ -139,8 +149,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     let totalTimeCost = 0;
     for (const te of timeEntries) {
         if (te.durationHours) totalTimeHours += Number(te.durationHours);
-        const rateToUse = Number(te.burdenCost) || Number(te.laborCost) || 0;
-        totalTimeCost += rateToUse; 
+        totalTimeCost += (Number(te.laborCost) || 0) + (Number(te.burdenCost) || 0);
     }
 
     const estimateStatus = {
@@ -160,20 +169,43 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // ------------------------------------
     // 5. TIMELINE (Cash Flow Tracker)
     // ------------------------------------
-    // Generating dummy past 4 months for now to satisfy chart UI
-    const cashFlowTimeline = [];
+    // Build cash flow timeline from actual invoice payments bucketed by month
+    const allPayments = await prisma.payment.findMany({
+        where: { invoice: { projectId } },
+        select: { amount: true, paidAt: true, createdAt: true }
+    });
+    const allExpenseRecords = await prisma.expense.findMany({
+        where: { estimate: { projectId } },
+        select: { amount: true, date: true, createdAt: true }
+    });
+
+    const monthlyData: Record<string, { incomingPayments: number; outgoingPayments: number }> = {};
     for (let i = 4; i >= 0; i--) {
-        const d = new Date();
+        const d = new Date(now);
         d.setMonth(now.getMonth() - i);
-        cashFlowTimeline.push({
-            date: d.toLocaleString('default', { month: 'short', year: '2-digit' }),
-            incomingPayments: Math.max(0, currentIncoming / 5 + (Math.random() * 1000 - 500)),
-            forecastedIncoming: totalForecastedIncoming / 5,
-            outgoingPayments: Math.max(0, currentOutgoing / 5 + (Math.random() * 1000 - 500)),
-            forecastedOutgoing: forecastedOutgoing / 5,
-            overdue: overdueIncoming / 5,
-        });
+        const key = d.toLocaleString('default', { month: 'short', year: '2-digit' });
+        monthlyData[key] = { incomingPayments: 0, outgoingPayments: 0 };
     }
+
+    for (const p of allPayments) {
+        const d = p.paidAt || p.createdAt;
+        const key = d.toLocaleString('default', { month: 'short', year: '2-digit' });
+        if (monthlyData[key]) monthlyData[key].incomingPayments += Number(p.amount) || 0;
+    }
+    for (const e of allExpenseRecords) {
+        const d = e.date || e.createdAt;
+        const key = d.toLocaleString('default', { month: 'short', year: '2-digit' });
+        if (monthlyData[key]) monthlyData[key].outgoingPayments += Number(e.amount) || 0;
+    }
+
+    const cashFlowTimeline = Object.entries(monthlyData).map(([date, vals]) => ({
+        date,
+        incomingPayments: vals.incomingPayments,
+        forecastedIncoming: totalForecastedIncoming / 5,
+        outgoingPayments: vals.outgoingPayments,
+        forecastedOutgoing: forecastedOutgoing / 5,
+        overdue: overdueIncoming / 5,
+    }));
 
     return NextResponse.json({
         cashFlow: {

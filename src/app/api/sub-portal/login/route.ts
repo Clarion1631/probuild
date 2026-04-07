@@ -3,9 +3,11 @@ import { prisma } from "@/lib/prisma";
 import { SignJWT } from "jose";
 import { sendNotification } from "@/lib/email";
 
-const JWT_SECRET = new TextEncoder().encode(
-    process.env.SUB_PORTAL_SECRET || "sub-portal-dev-secret-change-me"
-);
+function getJwtSecret(): Uint8Array {
+    const secret = process.env.SUB_PORTAL_SECRET;
+    if (!secret) throw new Error("SUB_PORTAL_SECRET environment variable is not configured");
+    return new TextEncoder().encode(secret);
+}
 
 export async function POST(req: NextRequest) {
     try {
@@ -33,7 +35,7 @@ export async function POST(req: NextRequest) {
             .setProtectedHeader({ alg: "HS256" })
             .setIssuedAt()
             .setExpirationTime("24h")
-            .sign(JWT_SECRET);
+            .sign(getJwtSecret());
 
         const appUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
         const loginLink = `${appUrl}/api/sub-portal/verify?token=${token}`;

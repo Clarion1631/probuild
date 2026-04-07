@@ -2,9 +2,14 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
     try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
         const { estimateId, itemId, amount, vendor, date, description, receiptUrl } = await req.json();
 
         if (!estimateId) {

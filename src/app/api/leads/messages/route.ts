@@ -7,6 +7,9 @@ import { sendNotification } from "@/lib/email";
 import { sendSMS } from "@/lib/sms";
 
 export async function GET(request: Request) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { searchParams } = new URL(request.url);
     const leadId = searchParams.get("leadId");
 
@@ -24,6 +27,8 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
     const session = await getServerSession(authOptions);
+    if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const body = await request.json();
     const {
         leadId,

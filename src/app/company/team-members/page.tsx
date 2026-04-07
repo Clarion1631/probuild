@@ -13,7 +13,7 @@ type User = {
     role: string;
     hourlyRate: number;
     burdenRate: number;
-    pinCode: string | null;
+    hasPin: boolean;
 };
 
 export default function TeamPage() {

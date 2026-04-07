@@ -16,6 +16,14 @@ export async function POST(
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
         }
 
+        const callerRole = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { role: true }
+        });
+        if (!callerRole || !["MANAGER", "ADMIN"].includes(callerRole.role)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+
         const params = await props.params;
         const clientId = params.id;
 

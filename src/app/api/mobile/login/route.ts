@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { SignJWT } from "jose";
+import bcrypt from "bcryptjs";
 
 export const dynamic = 'force-dynamic';
+
+const JWT_SECRET = new TextEncoder().encode(process.env.NEXTAUTH_SECRET);
+const TOKEN_EXPIRY = "24h";
 
 export async function POST(req: Request) {
     try {
@@ -12,23 +17,21 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: "Email and PIN are required" }, { status: 400 });
         }
 
-        // Find user by email and PIN
         const user = await prisma.user.findFirst({
-            where: {
-                email: email.toLowerCase(),
-                pinCode: pinCode
-            }
+            where: { email: email.toLowerCase() }
         });
 
-        if (!user) {
+        // Use bcrypt.compare for constant-time PIN verification
+        const pinValid = user?.pinCode ? await bcrypt.compare(pinCode, user.pinCode) : false;
+        if (!user || !pinValid) {
             return NextResponse.json({ error: "Invalid email or PIN" }, { status: 401 });
         }
 
-        // Since we are moving away from Supabase, we need a way to authenticate mobile
-        // requests. We will return a simple token/identifier for the mobile app to use.
-        // In a production app this should be a proper JWT, but for now we'll return 
-        // the user ID to be used in an 'Authorization' header as a simple bearer token.
-        // We will accept requests where the Authorization header is just the user ID.
+        const token = await new SignJWT({ sub: user.id, role: user.role })
+            .setProtectedHeader({ alg: "HS256" })
+            .setIssuedAt()
+            .setExpirationTime(TOKEN_EXPIRY)
+            .sign(JWT_SECRET);
 
         return NextResponse.json({
             user: {
@@ -37,7 +40,7 @@ export async function POST(req: Request) {
                 name: user.name,
                 role: user.role
             },
-            token: user.id // Simplistic token for Next.js API authorization
+            token
         });
     } catch (error: any) {
         console.error("Mobile login error:", error);

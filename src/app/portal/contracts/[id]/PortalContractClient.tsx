@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
+import DOMPurify from "dompurify";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
 import { toJpeg } from "html-to-image";
@@ -38,7 +39,8 @@ export default function PortalContractClient({ initialContract, companySettings 
 
     // Parse and Inject HTML Buttons
     const parsedBody = React.useMemo(() => {
-        let html = initialContract.body || "";
+        // Sanitize DB content before rendering; our own placeholder injections below are safe
+        let html = DOMPurify.sanitize(initialContract.body || "", { USE_PROFILES: { html: true } });
         
         let sigCount = 0;
         let initCount = 0;

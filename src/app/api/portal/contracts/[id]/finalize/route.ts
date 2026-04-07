@@ -35,6 +35,11 @@ export async function POST(
             return NextResponse.json({ error: "Contract not found" }, { status: 404 });
         }
 
+        // Only accept finalization for contracts that have been signed
+        if (contract.status !== "Signed") {
+            return NextResponse.json({ error: "Contract has not been signed" }, { status: 403 });
+        }
+
         let formData;
         try {
             formData = await req.formData();
@@ -74,6 +79,12 @@ export async function POST(
             .getPublicUrl(storagePath);
 
         const publicUrl = urlData?.publicUrl || storagePath;
+
+        // Mark contract as Finalized to prevent duplicate submissions
+        await prisma.contract.update({
+            where: { id },
+            data: { status: "Finalized" }
+        });
 
         // Archive as a Project File in the database
         const record = await prisma.projectFile.create({

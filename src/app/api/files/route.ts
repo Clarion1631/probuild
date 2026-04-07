@@ -24,6 +24,17 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
         }
 
+        if (projectId) {
+            const callerUser = await prisma.user.findUnique({
+                where: { email: session.user.email },
+                select: { role: true, projectAccess: { where: { projectId }, select: { projectId: true } } }
+            });
+            const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
+            if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
+                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
+        }
+
         const where: any = {};
         if (projectId) where.projectId = projectId;
         if (leadId) where.leadId = leadId;
@@ -79,6 +90,17 @@ export async function POST(req: NextRequest) {
 
         if (!projectId && !leadId) {
             return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
+        }
+
+        if (projectId) {
+            const callerUser = await prisma.user.findUnique({
+                where: { email: session.user.email },
+                select: { role: true, projectAccess: { where: { projectId }, select: { projectId: true } } }
+            });
+            const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
+            if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
+                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
         }
 
         if (!files || files.length === 0) {

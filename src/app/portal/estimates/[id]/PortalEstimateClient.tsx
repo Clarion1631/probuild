@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
+import DOMPurify from "dompurify";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import { formatCurrency } from "@/lib/utils";
@@ -253,7 +254,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                             <div className="bg-slate-50 rounded-md p-6 border border-slate-100">
                                 <div
                                     className="prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-sm"
-                                    dangerouslySetInnerHTML={{ __html: initialEstimate.termsAndConditions }}
+                                    dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(initialEstimate.termsAndConditions ?? "") }}
                                 />
                             </div>
                         </div>

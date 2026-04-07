@@ -11,15 +11,29 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { question, currentPage, userId, userRole, conversationId } =
-    await req.json();
+  const { question, currentPage, conversationId } = await req.json();
 
-  if (!question || !userId) {
+  if (!question) {
     return NextResponse.json(
       { error: "Missing required fields" },
       { status: 400 }
     );
   }
+
+  // Derive identity exclusively from the server session
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const sessionUser = await prisma.user.findUnique({
+    where: { email: session.user.email },
+    select: { id: true, role: true },
+  });
+  if (!sessionUser) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const userId = sessionUser.id;
+  const userRole = sessionUser.role;
 
   try {
     // Resolve or create conversation

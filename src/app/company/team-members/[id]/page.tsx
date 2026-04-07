@@ -13,7 +13,7 @@ interface User {
     role: string;
     hourlyRate: number;
     burdenRate: number;
-    pinCode: string | null;
+    hasPin: boolean;
 }
 
 export default function TeamMemberEditPage({ params }: { params: Promise<{ id: string }> }) {
@@ -50,7 +50,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                     setRole(found.role);
                     setHourlyRate(found.hourlyRate);
                     setBurdenRate(found.burdenRate);
-                    setPinCode(found.pinCode || "");
+                    // PIN is hashed server-side; don't pre-populate — leave blank so admin can set a new PIN
                 } else {
                     toast.error("User not found");
                     router.push("/company/team-members");
