@@ -649,8 +649,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             }}
         >
             {/* Top Navigation / Action Bar */}
-            <div className="bg-white border-b border-hui-border px-6 py-4 flex items-center justify-between shadow-sm z-10 sticky top-0">
-                <div className="flex items-center gap-4">
+            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-10 sticky top-0">
+                <div className="flex items-center gap-3">
                     <button onClick={() => {
                         if (context.type === "project") {
                             router.push(`/projects/${context.id}/estimates`);
@@ -715,7 +715,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     {/* More dropdown for secondary actions */}
                     <div className="relative">
                         <button
-                            onClick={() => setShowMoreMenu(!showMoreMenu)}
+                            onClick={() => setShowMoreMenu(v => !v)}
                             className="hui-btn hui-btn-secondary px-2.5"
                             title="More actions"
                         >
@@ -725,6 +725,31 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             <>
                                 <div className="fixed inset-0 z-40" onClick={() => setShowMoreMenu(false)} />
                                 <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
+                                    {/* AI Tools section */}
+                                    <div className="px-4 py-1 text-[10px] font-semibold text-hui-textMuted uppercase tracking-wider">AI Tools</div>
+                                    <button
+                                        onClick={() => { setShowAiModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700"
+                                    >
+                                        <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                                        AI Generate
+                                    </button>
+                                    <button
+                                        onClick={() => { handleHistoricalPricing(); setShowMoreMenu(false); }}
+                                        disabled={isLoadingHistorical}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-teal-50 flex items-center gap-2.5 text-teal-700 disabled:opacity-50"
+                                    >
+                                        <svg className="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                                        {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowSidebar(v => !v); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
+                                    >
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
+                                        {showSidebar ? "Hide Sidebar" : "Show Sidebar"}
+                                    </button>
+                                    <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={() => { window.open(`/portal/estimates/${initialEstimate.id}`, '_blank'); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
@@ -846,21 +871,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                     {/* Primary Actions */}
                     <button
-                        onClick={handleHistoricalPricing}
-                        disabled={isLoadingHistorical}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-teal-50 to-cyan-50 border-teal-200 text-teal-700 hover:from-teal-100 hover:to-cyan-100 flex items-center gap-2 disabled:opacity-50"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                        {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
-                    </button>
-                    <button
-                        onClick={() => setShowAiModal(true)}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
-                        AI Generate
-                    </button>
-                    <button
                         onClick={() => setShowSendModal(true)}
                         className="hui-btn hui-btn-green flex items-center gap-2"
                     >
@@ -873,13 +883,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         className="hui-btn hui-btn-primary disabled:opacity-50"
                     >
                         {isSaving ? "Saving..." : "Save"}
-                    </button>
-                    <button
-                        onClick={() => setShowSidebar(!showSidebar)}
-                        className={`hui-btn hui-btn-secondary px-2.5 ${showSidebar ? 'bg-slate-100' : ''}`}
-                        title="Toggle sidebar"
-                    >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
                     </button>
                 </div>
             </div>
