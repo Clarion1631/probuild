@@ -1,5 +1,8 @@
 "use client";
 
+/** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
+const rm = (n: number) => Math.round(n * 100) / 100;
+
 import { useState, useEffect, useRef, useCallback } from "react";
 import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval } from "@/lib/actions";
 import { useRouter } from "next/navigation";
@@ -393,12 +396,12 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
-    const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+    const subtotal = items.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
     const taxRate = defaultTax ? defaultTax.rate / 100 : 0.088;
     const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
-    const processingFee = processingFeeMarkup > 0 ? subtotal * (processingFeeMarkup / 100) : 0;
-    const tax = subtotal * taxRate;
-    const total = subtotal + tax + processingFee;
+    const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
+    const tax = rm(subtotal * taxRate);
+    const total = rm(subtotal + tax + processingFee);
 
     // Internal margin calculations
     const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
@@ -563,8 +566,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     ...schedule,
                     order: index
                 }));
-                const newSubtotal = newItems.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-                const newTotal = newSubtotal + newSubtotal * taxRate;
+                const newSubtotal = newItems.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+                const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
                 await saveEstimate(initialEstimate.id, context.id, context.type, {
                     title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
                 }, mappedItems);
@@ -608,7 +611,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (field === "percentage") {
             const pct = parseFloat(value) || 0;
             newSchedules[index].percentage = value;
-            newSchedules[index].amount = (total * (pct / 100)).toFixed(2);
+            newSchedules[index].amount = String(rm(total * (pct / 100)));
         } else {
             newSchedules[index][field] = value;
         }

@@ -1390,8 +1390,8 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
         },
     });
 
-    // Update balance
-    const newBalance = Math.max(0, Number(estimate.balanceDue) - data.amount);
+    // Update balance — round to 2 decimal places to avoid floating-point drift
+    const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
     await prisma.estimate.update({
         where: { id: estimateId },
         data: {
@@ -1559,7 +1559,7 @@ export async function recordPayment(paymentId: string, invoiceId: string, timest
     });
 
     const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    const newBalance = Math.max(0, (invoice!.balanceDue || 0) - (payment.amount || 0));
+    const newBalance = Math.max(0, Math.round((Number(invoice!.balanceDue || 0) - Number(payment.amount || 0)) * 100) / 100);
     const newStatus = newBalance <= 0 ? "Paid" : "Partially Paid";
 
     await prisma.invoice.update({

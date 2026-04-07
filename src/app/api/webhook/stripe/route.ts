@@ -56,31 +56,45 @@ export async function POST(req: Request) {
                     }
                 }
 
-                // Update PaymentSchedule to Paid
-                const updatedSchedule = await prisma.paymentSchedule.update({
+                // Idempotency: skip if already paid (duplicate webhook delivery)
+                const existingSchedule = await prisma.paymentSchedule.findUnique({
                     where: { id: metadata.paymentScheduleId },
-                    data: {
-                        status: "Paid",
-                        stripePaymentIntentId: session.payment_intent as string | null,
-                        paymentMethod: paymentMethod,
-                        paymentDate: new Date(),
-                        paidAt: new Date(),
-                    },
-                    include: { invoice: true }
+                    select: { status: true, stripePaymentIntentId: true }
+                });
+                if (existingSchedule?.status === "Paid") {
+                    console.log(`[webhook] PaymentSchedule ${metadata.paymentScheduleId} already paid — skipping duplicate event ${event.id}`);
+                    break;
+                }
+
+                // Atomic: update schedule and invoice together
+                const [updatedSchedule] = await prisma.$transaction(async (tx) => {
+                    const schedule = await tx.paymentSchedule.update({
+                        where: { id: metadata.paymentScheduleId },
+                        data: {
+                            status: "Paid",
+                            stripePaymentIntentId: session.payment_intent as string | null,
+                            paymentMethod: paymentMethod,
+                            paymentDate: new Date(),
+                            paidAt: new Date(),
+                        },
+                        include: { invoice: true }
+                    });
+
+                    const invoice = schedule.invoice;
+                    const newBalance = Math.max(0, Number(invoice.balanceDue || 0) - Number(schedule.amount));
+                    const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
+
+                    await tx.invoice.update({
+                        where: { id: invoice.id },
+                        data: { balanceDue: newBalance, status: newStatus }
+                    });
+
+                    return [schedule];
                 });
 
-                // Update Invoice balance and status
                 const invoice = updatedSchedule.invoice;
-                const newBalance = Math.max(0, (invoice.balanceDue || 0) - updatedSchedule.amount);
+                const newBalance = Math.max(0, Number(invoice.balanceDue || 0) - Number(updatedSchedule.amount));
                 const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
-
-                await prisma.invoice.update({
-                    where: { id: invoice.id },
-                    data: {
-                        balanceDue: newBalance,
-                        status: newStatus
-                    }
-                });
 
                 // Send notification email
                 const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -160,20 +174,28 @@ export async function POST(req: Request) {
                 });
                 if (!schedule) break;
 
+                // Idempotency: skip if already reversed
+                if (schedule.status === "Pending" || schedule.status === "Refunded") {
+                    console.log(`[webhook] Schedule ${schedule.id} already reversed — skipping duplicate refund event ${event.id}`);
+                    break;
+                }
+
                 const refundedAmount = (charge.amount_refunded ?? 0) / 100; // Stripe amounts are in cents
 
-                await prisma.paymentSchedule.update({
-                    where: { id: schedule.id },
-                    data: { status: "Pending", paidAt: null },
-                });
+                // Atomic: reverse schedule and restore invoice together
+                await prisma.$transaction(async (tx) => {
+                    await tx.paymentSchedule.update({
+                        where: { id: schedule.id },
+                        data: { status: "Pending", paidAt: null },
+                    });
 
-                // Restore invoice balance
-                await prisma.invoice.update({
-                    where: { id: schedule.invoice.id },
-                    data: {
-                        balanceDue: (schedule.invoice.balanceDue || 0) + refundedAmount,
-                        status: "Sent",
-                    },
+                    await tx.invoice.update({
+                        where: { id: schedule.invoice.id },
+                        data: {
+                            balanceDue: Number(schedule.invoice.balanceDue || 0) + refundedAmount,
+                            status: "Sent",
+                        },
+                    });
                 });
 
                 const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
