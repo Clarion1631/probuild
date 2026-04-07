@@ -548,31 +548,38 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
                     ? [...paymentSchedules, ...data.paymentMilestones]
                     : paymentSchedules;
+
+                // Close modal and update UI immediately — don't wait for save
                 setItems(newItems);
                 if (data.paymentMilestones && data.paymentMilestones.length > 0) {
                     setPaymentSchedules(newSchedules);
                 }
-                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
                 setShowAiModal(false);
                 setAiPrompt("");
+                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
 
-                // Auto-save with the newly merged items
-                const mappedItems = newItems.map((item, index) => ({
-                    ...item,
-                    order: index,
-                    total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-                }));
-                const mappedSchedules = newSchedules.map((schedule, index) => ({
-                    ...schedule,
-                    order: index
-                }));
-                const newSubtotal = newItems.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-                const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
-                await saveEstimate(initialEstimate.id, context.id, context.type, {
-                    title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
-                }, mappedItems);
-                toast.success("Estimate auto-saved");
-                router.refresh();
+                // Auto-save in background — failures are non-fatal since items are already in state
+                try {
+                    const mappedItems = newItems.map((item, index) => ({
+                        ...item,
+                        order: index,
+                        total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
+                    }));
+                    const mappedSchedules = newSchedules.map((schedule, index) => ({
+                        ...schedule,
+                        order: index
+                    }));
+                    const newSubtotal = newItems.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+                    const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
+                    await saveEstimate(initialEstimate.id, context.id, context.type, {
+                        title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
+                    }, mappedItems);
+                    toast.success("Estimate auto-saved");
+                    router.refresh();
+                } catch (saveErr) {
+                    console.error("Auto-save after AI generate failed:", saveErr);
+                    toast.error("Items added — but auto-save failed. Click Save to persist.");
+                }
             } else {
                 toast.error('AI returned no items');
             }
@@ -1812,7 +1819,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </div>
                                 <div>
                                     <h2 className="text-lg font-bold text-hui-textMain">AI Estimate Generator</h2>
-                                    <p className="text-xs text-purple-600">Powered by Gemini • Vancouver, WA pricing</p>
+                                    <p className="text-xs text-purple-600">Powered by Claude • Vancouver, WA pricing</p>
                                 </div>
                             </div>
                             <button onClick={() => setShowAiModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">

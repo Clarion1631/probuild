@@ -16,6 +16,8 @@ type AiItem = {
 type AiMilestone = { name?: string; percentage?: number };
 type AiData = { items: AiItem[]; paymentMilestones: AiMilestone[] };
 
+export const maxDuration = 300; // 5 min — Claude needs time for large estimates
+
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) {
         return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
