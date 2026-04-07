@@ -8,6 +8,7 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   featureRequest?: { title: string; description: string };
+  bugReport?: { title: string; description: string; steps: string };
 }
 
 interface ConversationSummary {
@@ -30,7 +31,6 @@ interface HelpRequest {
 }
 
 export default function HelpChatWidget({
-  userId,
   userRole,
 }: {
   userId?: string;
@@ -50,25 +50,30 @@ export default function HelpChatWidget({
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [submittingBugFix, setSubmittingBugFix] = useState(false);
+  const [submittedBugFixes, setSubmittedBugFixes] = useState<Set<string>>(
+    new Set()
+  );
 
-  // Archive & search state
-  const [archivedConvos, setArchivedConvos] = useState<ConversationSummary[]>([]);
+  const [archivedConvos, setArchivedConvos] = useState<ConversationSummary[]>(
+    []
+  );
   const [searchResults, setSearchResults] = useState<ConversationSummary[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [archiveLoading, setArchiveLoading] = useState(false);
-  const [historyMode, setHistoryMode] = useState<"archived" | "search">("archived");
+  const [historyMode, setHistoryMode] = useState<"archived" | "search">(
+    "archived"
+  );
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
 
-  // Scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Load conversation history when widget opens
   const loadConversation = useCallback(async () => {
-    if (historyLoaded || !userId) return;
+    if (historyLoaded) return;
     try {
       const res = await fetch("/api/help-chat/conversations");
       if (res.ok) {
@@ -88,13 +93,12 @@ export default function HelpChatWidget({
     } finally {
       setHistoryLoaded(true);
     }
-  }, [historyLoaded, userId]);
+  }, [historyLoaded]);
 
   useEffect(() => {
     if (open && tab === "chat") loadConversation();
   }, [open, tab, loadConversation]);
 
-  // Load request history when admin opens requests tab
   const loadHistory = useCallback(async () => {
     if (!effectiveIsAdmin) return;
     setRequestsLoading(true);
@@ -116,7 +120,6 @@ export default function HelpChatWidget({
     if (tab === "requests" && open) loadHistory();
   }, [tab, open, loadHistory]);
 
-  // Load archived conversations
   const loadArchived = useCallback(async () => {
     setArchiveLoading(true);
     try {
@@ -163,11 +166,9 @@ export default function HelpChatWidget({
         body: JSON.stringify({ conversationId: convoId, action: "restore" }),
       });
       if (res.ok) {
-        // Load the restored conversation into chat
         setConversationId(convoId);
         setHistoryLoaded(false);
         setTab("chat");
-        // Reload conversation
         const convoRes = await fetch("/api/help-chat/conversations");
         if (convoRes.ok) {
           const data = await convoRes.json();
@@ -225,7 +226,6 @@ export default function HelpChatWidget({
         body: JSON.stringify({
           question: userMsg.content,
           currentPage: pathname,
-          userId: userId || "anonymous",
           userRole: effectiveRole,
           conversationId,
         }),
@@ -244,10 +244,18 @@ export default function HelpChatWidget({
         content: data.answer,
       };
 
-      if (data.type === "feature_request") {
+      if (data.type === "feature_request" && data.title) {
         assistantMsg.featureRequest = {
           title: data.title,
           description: data.description,
+        };
+      }
+
+      if (data.type === "bug_report" && data.title) {
+        assistantMsg.bugReport = {
+          title: data.title,
+          description: data.description,
+          steps: data.steps || "",
         };
       }
 
@@ -274,15 +282,15 @@ export default function HelpChatWidget({
         body: JSON.stringify({
           title,
           description,
-          userId: userId || "anonymous",
           currentPage: pathname,
+          conversationId,
         }),
       });
 
       if (res.ok) {
         const data = await res.json();
         const ghLink = data.githubIssue
-          ? `\n\nGitHub Issue #${data.githubIssue.number} created — your team will be notified automatically.`
+          ? `\n\nGitHub Issue #${data.githubIssue.number} created - your team will be notified automatically.`
           : "";
         setMessages((prev) => [
           ...prev,
@@ -304,14 +312,81 @@ export default function HelpChatWidget({
     }
   }
 
+  async function submitBugFix(
+    title: string,
+    description: string,
+    steps: string
+  ) {
+    if (!conversationId || submittingBugFix) return;
+
+    setSubmittingBugFix(true);
+    try {
+      const res = await fetch("/api/help-chat/bug-fix", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          description,
+          steps,
+          currentPage: pathname,
+          conversationId,
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => null);
+        throw new Error(errorData?.error || "Failed to submit bug fix");
+      }
+
+      const data = await res.json();
+      setSubmittedBugFixes((prev) => new Set(prev).add(title));
+      const issueDetails = data.issueNumber
+        ? `\n\nGitHub Issue #${data.issueNumber} created and queued for Phantom.`
+        : "\n\nThe bug fix request was saved, but no GitHub issue was created.";
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `Bug fix "${title}" has been submitted successfully.${issueDetails}`,
+        },
+      ]);
+    } catch (e: any) {
+      const reason = e?.message || "Unknown error";
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `Failed to submit bug fix: ${reason}`,
+        },
+      ]);
+    } finally {
+      setSubmittingBugFix(false);
+    }
+  }
+
   function getStatusBadge(status: string) {
     const styles: Record<string, string> = {
       open: "bg-slate-100 text-slate-700",
+      submitted: "bg-amber-100 text-amber-800",
       in_progress: "bg-blue-100 text-blue-700",
+      deployed: "bg-violet-100 text-violet-700",
       completed: "bg-green-100 text-green-700",
       verified: "bg-green-100 text-green-700",
     };
     return styles[status] || styles.open;
+  }
+
+  function getRequestTypeLabel(type: string) {
+    if (type === "bug_fix") return "Bug Fix";
+    if (type === "feature_request") return "Feature Request";
+    return type.replace(/_/g, " ");
+  }
+
+  function getRequestTypeChip(type: string) {
+    if (type === "bug_fix") return "bg-red-100 text-red-700";
+    if (type === "feature_request") return "bg-emerald-100 text-emerald-700";
+    return "bg-slate-100 text-slate-700";
   }
 
   function timeAgo(dateStr: string) {
@@ -326,11 +401,11 @@ export default function HelpChatWidget({
 
   if (!loaded) return null;
 
-  const displayedConvos = historyMode === "search" ? searchResults : archivedConvos;
+  const displayedConvos =
+    historyMode === "search" ? searchResults : archivedConvos;
 
   return (
     <>
-      {/* Floating chat bubble */}
       {!open && (
         <button
           onClick={() => setOpen(true)}
@@ -354,17 +429,14 @@ export default function HelpChatWidget({
         </button>
       )}
 
-      {/* Chat panel */}
       {open && (
         <div className="fixed bottom-6 right-6 z-50 w-[370px] h-[520px] flex flex-col hui-card shadow-xl rounded-xl overflow-hidden border border-hui-border">
-          {/* Header */}
           <div
             className="flex items-center justify-between px-4 py-3 text-white"
             style={{ backgroundColor: "#4c9a2a" }}
           >
             <span className="text-sm font-semibold">ProBuild Help</span>
             <div className="flex items-center gap-1.5">
-              {/* Tab buttons */}
               <div className="flex bg-white/20 rounded text-xs">
                 <button
                   onClick={() => setTab("chat")}
@@ -373,7 +445,10 @@ export default function HelpChatWidget({
                   Chat
                 </button>
                 <button
-                  onClick={() => { setTab("history"); setHistoryMode("archived"); }}
+                  onClick={() => {
+                    setTab("history");
+                    setHistoryMode("archived");
+                  }}
                   className={`px-2 py-1 rounded ${tab === "history" ? "bg-white/30 font-medium" : ""}`}
                 >
                   History
@@ -387,25 +462,43 @@ export default function HelpChatWidget({
                   </button>
                 )}
               </div>
-              {/* New Chat */}
               <button
                 onClick={startNewChat}
                 className="text-white/80 hover:text-white ml-1"
                 aria-label="New conversation"
                 title="New conversation"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
                   <path d="M12 20h9" />
                   <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
                 </svg>
               </button>
-              {/* Close */}
               <button
                 onClick={() => setOpen(false)}
                 className="text-white/80 hover:text-white"
                 aria-label="Close help chat"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="17"
+                  height="17"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
                   <line x1="18" y1="6" x2="6" y2="18" />
                   <line x1="6" y1="6" x2="18" y2="18" />
                 </svg>
@@ -413,7 +506,6 @@ export default function HelpChatWidget({
             </div>
           </div>
 
-          {/* ── Chat tab ────────────────────────────────────────── */}
           {tab === "chat" && (
             <>
               <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 bg-hui-background">
@@ -456,6 +548,23 @@ export default function HelpChatWidget({
                           Submit as feature request?
                         </button>
                       )}
+                      {msg.bugReport &&
+                        effectiveIsAdmin &&
+                        !submittedBugFixes.has(msg.bugReport.title) && (
+                          <button
+                            onClick={() =>
+                              submitBugFix(
+                                msg.bugReport!.title,
+                                msg.bugReport!.description,
+                                msg.bugReport!.steps
+                              )
+                            }
+                            disabled={submittingBugFix || !conversationId}
+                            className="mt-2 text-xs px-2 py-1 rounded bg-red-600 text-white disabled:opacity-50"
+                          >
+                            Submit as Bug Fix
+                          </button>
+                        )}
                     </div>
                   </div>
                 ))}
@@ -469,7 +578,6 @@ export default function HelpChatWidget({
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* Input + archive button */}
               <div className="border-t border-hui-border px-3 py-2 bg-white">
                 {conversationId && messages.length > 0 && (
                   <div className="flex justify-end mb-1">
@@ -503,10 +611,8 @@ export default function HelpChatWidget({
             </>
           )}
 
-          {/* ── History tab (archived + search) ──────────────────── */}
           {tab === "history" && (
             <div className="flex-1 overflow-y-auto bg-hui-background flex flex-col">
-              {/* Search bar */}
               <div className="px-3 py-2 border-b border-hui-border bg-white">
                 <div className="flex gap-2">
                   <input
@@ -527,7 +633,11 @@ export default function HelpChatWidget({
                 </div>
                 {historyMode === "search" && (
                   <button
-                    onClick={() => { setHistoryMode("archived"); setSearchResults([]); setSearchQuery(""); }}
+                    onClick={() => {
+                      setHistoryMode("archived");
+                      setSearchResults([]);
+                      setSearchQuery("");
+                    }}
                     className="text-xs text-hui-primary mt-1.5 hover:underline"
                   >
                     Back to archived
@@ -535,14 +645,17 @@ export default function HelpChatWidget({
                 )}
               </div>
 
-              {/* List */}
               <div className="flex-1 overflow-y-auto px-3 py-2">
                 {archiveLoading ? (
-                  <p className="text-sm text-hui-textMuted text-center mt-8">Loading...</p>
+                  <p className="text-sm text-hui-textMuted text-center mt-8">
+                    Loading...
+                  </p>
                 ) : displayedConvos.length === 0 ? (
                   <div className="text-center text-sm text-hui-textMuted mt-8">
                     <p className="font-medium text-hui-textMain mb-1">
-                      {historyMode === "search" ? "No matches" : "No archived chats"}
+                      {historyMode === "search"
+                        ? "No matches"
+                        : "No archived chats"}
                     </p>
                     <p>
                       {historyMode === "search"
@@ -589,7 +702,6 @@ export default function HelpChatWidget({
             </div>
           )}
 
-          {/* ── Requests tab (admin only) ────────────────────────── */}
           {tab === "requests" && effectiveIsAdmin && (
             <div className="flex-1 overflow-y-auto px-4 py-3 bg-hui-background">
               {historyError ? (
@@ -605,7 +717,7 @@ export default function HelpChatWidget({
                   <p className="font-medium text-hui-textMain mb-1">
                     No requests yet
                   </p>
-                  <p>Feature requests you submit will appear here.</p>
+                  <p>Requests you submit will appear here.</p>
                 </div>
               ) : (
                 <div className="space-y-2">
@@ -615,9 +727,16 @@ export default function HelpChatWidget({
                       className="bg-white border border-hui-border rounded-lg p-3"
                     >
                       <div className="flex items-start justify-between gap-2">
-                        <p className="text-sm font-medium text-hui-textMain">
-                          {r.question}
-                        </p>
+                        <div className="min-w-0 flex-1">
+                          <span
+                            className={`inline-flex text-[10px] px-2 py-0.5 rounded-full mb-1 ${getRequestTypeChip(r.type)}`}
+                          >
+                            {getRequestTypeLabel(r.type)}
+                          </span>
+                          <p className="text-sm font-medium text-hui-textMain">
+                            {r.question}
+                          </p>
+                        </div>
                         <span
                           className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${getStatusBadge(r.status)}`}
                         >
