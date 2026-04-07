@@ -1,9 +1,11 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
+import { useSearchParams } from "next/navigation";
 import DOMPurify from "dompurify";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
+import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
 
 export default function PortalEstimateClient({ initialEstimate, companySettings }: { initialEstimate: any, companySettings?: any }) {
@@ -13,6 +15,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
     const viewedRef = useRef(false);
+    const searchParams = useSearchParams();
+    const paymentStatus = searchParams.get("payment");
 
     useEffect(() => {
         if (viewedRef.current) return;
@@ -61,6 +65,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const tax = subtotal * 0.088;
     const total = subtotal + tax;
     const isApproved = initialEstimate.status === "Approved";
+    const stripeEnabled = companySettings?.stripeEnabled !== false;
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
@@ -82,6 +87,24 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Approved & Signed</span>
                 )}
             </header>
+
+            {/* Payment status banners */}
+            {paymentStatus === "success" && (
+                <div className="max-w-4xl mx-auto px-4 pt-4 print:hidden">
+                    <div className="bg-green-50 border border-green-200 rounded-lg px-5 py-3 flex items-center gap-3">
+                        <svg className="w-5 h-5 text-green-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                        <p className="text-sm font-medium text-green-800">Payment successful! Your milestone has been marked as paid.</p>
+                    </div>
+                </div>
+            )}
+            {paymentStatus === "cancelled" && (
+                <div className="max-w-4xl mx-auto px-4 pt-4 print:hidden">
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg px-5 py-3 flex items-center gap-3">
+                        <svg className="w-5 h-5 text-amber-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                        <p className="text-sm font-medium text-amber-800">Payment was cancelled. You can try again anytime.</p>
+                    </div>
+                </div>
+            )}
 
             {/* Document Container */}
             <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
@@ -231,18 +254,40 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         <div className="px-10 pb-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment Schedule</h2>
                             <div className="border border-slate-200 rounded-md overflow-hidden">
-                                {initialEstimate.paymentSchedules.map((p: any) => (
-                                    <div key={p.id} className="flex justify-between items-center px-5 py-3 text-sm border-b last:border-b-0 border-slate-100">
-                                        <div>
-                                            <span className="font-medium text-slate-700">{p.name}</span>
-                                            {p.percentage && <span className="text-slate-400 ml-1">({p.percentage}%)</span>}
+                                {initialEstimate.paymentSchedules.map((p: any) => {
+                                    const isPaid = p.status === "Paid";
+                                    return (
+                                        <div key={p.id} className={`flex flex-wrap justify-between items-center px-5 py-3 text-sm border-b last:border-b-0 border-slate-100 gap-3 ${isPaid ? "bg-green-50" : ""}`}>
+                                            <div>
+                                                <div className="flex items-center gap-2">
+                                                    <span className="font-medium text-slate-700">{p.name}</span>
+                                                    {p.percentage && <span className="text-slate-400">({p.percentage}%)</span>}
+                                                    {isPaid && (
+                                                        <span className="text-[10px] font-bold uppercase text-green-700 bg-green-100 px-1.5 py-0.5 rounded">Paid</span>
+                                                    )}
+                                                </div>
+                                                {isPaid && p.paymentDate && (
+                                                    <p className="text-xs text-slate-400 mt-0.5">Paid {new Date(p.paymentDate).toLocaleDateString()}</p>
+                                                )}
+                                                {!isPaid && p.dueDate && (
+                                                    <p className="text-xs text-slate-400 mt-0.5">Due {new Date(p.dueDate).toLocaleDateString()}</p>
+                                                )}
+                                            </div>
+                                            <div className="flex gap-4 items-center">
+                                                <span className="font-semibold text-slate-800">{formatCurrency(p.amount)}</span>
+                                                {isApproved && !isPaid && stripeEnabled && (
+                                                    <PortalPayButton
+                                                        paymentScheduleId={p.id}
+                                                        estimateId={initialEstimate.id}
+                                                        amount={Number(p.amount)}
+                                                        label="Pay Now"
+                                                        settings={companySettings}
+                                                    />
+                                                )}
+                                            </div>
                                         </div>
-                                        <div className="flex gap-6 items-center">
-                                            <span className="text-slate-500 text-xs">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : "TBD"}</span>
-                                            <span className="font-semibold text-slate-800 w-24 text-right">{formatCurrency(p.amount)}</span>
-                                        </div>
-                                    </div>
-                                ))}
+                                    );
+                                })}
                             </div>
                         </div>
                     )}

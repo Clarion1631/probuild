@@ -271,15 +271,21 @@ model EstimateFile {
 }
 
 model EstimatePaymentSchedule {
-  id         String    @id @default(cuid())
-  estimateId String
-  estimate   Estimate  @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  name       String
-  percentage Float? // Optional: represent this payment as a % of the total
-  amount     Decimal
-  dueDate    DateTime?
-  order      Int       @default(0)
-  createdAt  DateTime  @default(now())
+  id                    String    @id @default(cuid())
+  estimateId            String
+  estimate              Estimate  @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  name                  String
+  percentage            Float? // Optional: represent this payment as a % of the total
+  amount                Decimal
+  dueDate               DateTime?
+  order                 Int       @default(0)
+  createdAt             DateTime  @default(now())
+  status                String    @default("Pending")
+  stripeSessionId       String?
+  stripePaymentIntentId String?
+  paymentMethod         String?
+  paidAt                DateTime?
+  paymentDate           DateTime?
 }
 
 model EstimateItem {

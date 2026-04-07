@@ -3,16 +3,18 @@
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
 
-export default function PortalPayButton({ 
-    paymentScheduleId, 
-    invoiceId, 
-    amount, 
+export default function PortalPayButton({
+    paymentScheduleId,
+    invoiceId,
+    estimateId,
+    amount,
     label,
-    settings 
-}: { 
-    paymentScheduleId: string, 
-    invoiceId: string, 
-    amount: number, 
+    settings
+}: {
+    paymentScheduleId: string,
+    invoiceId?: string,
+    estimateId?: string,
+    amount: number,
     label: string,
     settings?: any
 }) {
@@ -39,9 +41,10 @@ export default function PortalPayButton({
             const res = await fetch("/api/payments/create-session", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ 
-                    paymentScheduleId, 
+                body: JSON.stringify({
+                    paymentScheduleId,
                     invoiceId,
+                    estimateId,
                     selectedMethod: method
                 }),
             });
