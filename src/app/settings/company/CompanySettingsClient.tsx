@@ -11,6 +11,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
         email: initialData?.email || "",
         website: initialData?.website || "",
         logoUrl: initialData?.logoUrl || "",
+        licenseNumber: initialData?.licenseNumber || "",
         notificationEmail: initialData?.notificationEmail || "",
         stripeEnabled: initialData?.stripeEnabled || false,
         enableCard: initialData?.enableCard ?? true,
@@ -185,6 +186,9 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                             <input
                                 id="licenseNumber"
                                 type="text"
+                                name="licenseNumber"
+                                value={formData.licenseNumber}
+                                onChange={handleChange}
                                 placeholder="License Number"
                                 className="hui-input peer w-full placeholder-transparent bg-white border border-hui-border rounded-md px-3 pb-2 pt-5 focus:outline-none focus:ring-1 focus:ring-hui-primary focus:border-hui-primary"
                             />
