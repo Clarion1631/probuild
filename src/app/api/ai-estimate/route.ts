@@ -107,7 +107,7 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
             model: "claude-sonnet-4-6",
-            max_tokens: 4096,
+            max_tokens: 16000,
             messages: [{ role: "user", content: prompt }],
         });
 
@@ -116,6 +116,11 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
 
         if (!rawText) {
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
+        }
+
+        if (response.stop_reason === 'max_tokens') {
+            console.error(`[ai-estimate] Response truncated — increase max_tokens. Length: ${rawText.length}`);
+            return NextResponse.json({ error: "AI response was too long and got cut off. Try a shorter description or fewer phases." }, { status: 502 });
         }
 
         let aiData: AiData;
