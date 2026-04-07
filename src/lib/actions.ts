@@ -1660,7 +1660,9 @@ export async function saveCompanySettings(data: any) {
             email: data.email,
             website: data.website,
             logoUrl: data.logoUrl,
-            licenseNumber: data.licenseNumber,
+            licenseNumber: typeof data.licenseNumber === "string"
+                ? data.licenseNumber.replace(/[\r\n\t]/g, "").trim().slice(0, 50)
+                : undefined,
             notificationEmail: data.notificationEmail,
             stripeEnabled: data.stripeEnabled,
             enableCard: data.enableCard,
