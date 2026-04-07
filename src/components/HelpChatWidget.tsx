@@ -446,7 +446,7 @@ export default function HelpChatWidget({
                       {msg.featureRequest && effectiveIsAdmin && (
                         <button
                           onClick={() => submitFeatureRequest(msg.featureRequest!.title, msg.featureRequest!.description)}
-                          className="mt-2 text-xs bg-white/20 hover:bg-white/30 border border-white/40 text-white px-2 py-1 rounded transition"
+                          className="mt-2 text-xs font-medium bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded transition w-full text-center"
                         >
                           ✓ Submit as feature request
                         </button>
