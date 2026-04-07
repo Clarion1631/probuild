@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Wait for Vercel deployment
         uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
