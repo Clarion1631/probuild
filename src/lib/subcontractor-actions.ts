@@ -133,7 +133,7 @@ export async function inviteNewSubcontractor(projectId: string, data: {
     if (data.sendText && data.phone) {
         await sendSMS(
             data.phone,
-            `You've been invited to a project by Golden Touch Remodeling. Access your portal at ${process.env.NEXT_PUBLIC_APP_URL || 'https://probuild-amber.vercel.app'}/sub-portal`
+            `You've been invited to a project by Golden Touch Remodeling. Access your portal at ${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/sub-portal`
         );
     }
 

@@ -83,7 +83,7 @@ export async function POST(req: Request) {
         }
 
         // Send invite email
-        const appUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+        const appUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
         const loginUrl = `${appUrl}/login`;
 
         if (process.env.RESEND_API_KEY) {

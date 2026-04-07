@@ -57,7 +57,7 @@ export async function POST(request: Request) {
     const senderEmail = session?.user?.email || null;
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://probuild-amber.vercel.app";
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
     const emailAttachments: { filename: string; content: Buffer }[] = [];
     const resolvedAttachments: { type: string; id: string; name: string; url?: string }[] = [];

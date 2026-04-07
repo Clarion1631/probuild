@@ -8,7 +8,7 @@ export async function GET(req: NextRequest) {
     const realmId = searchParams.get("realmId");
     const state = searchParams.get("state");
     const error = searchParams.get("error");
-    const baseUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+    const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
 
     if (error) {
         return NextResponse.redirect(`${baseUrl}/settings/integrations/quickbooks?error=${encodeURIComponent(error)}`);
@@ -25,7 +25,7 @@ export async function GET(req: NextRequest) {
     }
 
     try {
-        const baseUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+        const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
         const redirectUri = `${baseUrl}/api/quickbooks/callback`;
 
         const tokens = await exchangeQBCode(code, redirectUri);
@@ -43,7 +43,7 @@ export async function GET(req: NextRequest) {
         return successResponse;
     } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
-        const baseUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+        const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
         return NextResponse.redirect(`${baseUrl}/settings/integrations/quickbooks?error=${encodeURIComponent(msg)}`);
     }
 }

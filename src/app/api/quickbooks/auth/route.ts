@@ -9,7 +9,7 @@ export async function GET() {
         return NextResponse.json({ error: "QB_CLIENT_ID not configured in Vercel" }, { status: 500 });
     }
 
-    const baseUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+    const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
     const redirectUri = `${baseUrl}/api/quickbooks/callback`;
 
     // Cryptographically random state to prevent CSRF

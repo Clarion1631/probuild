@@ -6,7 +6,7 @@ export async function GET(req: NextRequest) {
     const code = searchParams.get("code");
     const state = searchParams.get("state");
     const error = searchParams.get("error");
-    const baseUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+    const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
 
     if (error) {
         return NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?error=${encodeURIComponent(error)}`);

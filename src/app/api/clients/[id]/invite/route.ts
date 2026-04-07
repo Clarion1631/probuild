@@ -57,7 +57,7 @@ export async function POST(
             });
         }
 
-        const appUrl = process.env.NEXTAUTH_URL || 'https://probuild-amber.vercel.app';
+        const appUrl = process.env.NEXTAUTH_URL || 'http://localhost:3000';
         const loginUrl = `${appUrl}/login`;
 
         // Try to send email

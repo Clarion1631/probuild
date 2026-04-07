@@ -37,7 +37,7 @@ export async function POST(req: NextRequest) {
             .setExpirationTime("24h")
             .sign(getJwtSecret());
 
-        const appUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+        const appUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
         const loginLink = `${appUrl}/api/sub-portal/verify?token=${token}`;
 
         // Send magic link email
