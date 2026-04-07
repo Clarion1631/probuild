@@ -16,6 +16,8 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
         notFound();
     }
 
+    const serializedEstimate = JSON.parse(JSON.stringify(estimate));
+
     let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
     try {
         salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
@@ -34,7 +36,7 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
                         clientEmail: lead.client.email || undefined,
                         location: lead.location || undefined
                     }}
-                    initialEstimate={estimate}
+                    initialEstimate={serializedEstimate}
                     defaultTax={defaultTax}
                 />
             </div>

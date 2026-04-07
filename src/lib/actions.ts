@@ -811,12 +811,12 @@ export async function getEstimateForPortal(id: string) {
 
     if (!estimate) return null;
 
-    return {
+    return JSON.parse(JSON.stringify({
         ...estimate,
         projectName: estimate.project?.name || estimate.lead?.name || null,
         clientName: estimate.project?.client?.name || estimate.lead?.client?.name || "Unknown Client",
         clientEmail: estimate.project?.client?.email || estimate.lead?.client?.email || null,
-    };
+    }));
 }
 
 export async function getAllEstimates() {

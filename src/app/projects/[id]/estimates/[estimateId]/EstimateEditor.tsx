@@ -394,8 +394,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     }, []);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.087;
-    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.7%)";
+    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.088;
+    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
     const processingFee = processingFeeMarkup > 0 ? subtotal * (processingFeeMarkup / 100) : 0;
     const tax = subtotal * taxRate;
     const total = subtotal + tax + processingFee;

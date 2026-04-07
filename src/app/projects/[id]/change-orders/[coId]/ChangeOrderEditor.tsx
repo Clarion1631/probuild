@@ -22,7 +22,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSigning, setIsSigning] = useState(false);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const tax = subtotal * 0.087;
+    const tax = subtotal * 0.088;
     const total = subtotal + tax;
 
     async function handleSign() {
@@ -291,7 +291,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>Estimated Tax (8.7%)</span>
+                                        <span>Estimated Tax (8.8%)</span>
                                         <span className="text-slate-800">{formatCurrency(tax)}</span>
                                     </div>
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>

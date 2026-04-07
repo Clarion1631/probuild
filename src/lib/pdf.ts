@@ -216,8 +216,8 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((sum, item) => sum + (item.total || 0), 0);
-    const tax = subtotal * 0.087;
+    const subtotal = estimate.items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+    const tax = subtotal * 0.088;
     const total = subtotal + tax;
 
     // Subtotal
@@ -233,7 +233,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     y -= 18;
 
     // Tax
-    page.drawText('Estimated Tax (8.7%)', {
+    page.drawText('Estimated Tax (8.8%)', {
         x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
     });
     const taxStr = formatCurrency(tax);
@@ -293,6 +293,42 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
                 });
             }
             y -= 18;
+        }
+    }
+
+    // --- Terms & Conditions ---
+    if ((estimate as any).termsAndConditions) {
+        y -= 40;
+        checkNewPage(100);
+
+        page.drawText('Terms & Conditions', {
+            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
+        });
+        y -= 18;
+
+        // Strip HTML tags
+        const rawTerms: string = (estimate as any).termsAndConditions;
+        const plainTerms = rawTerms.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+        // Word-wrap within content width
+        const words = plainTerms.split(' ');
+        let line = '';
+        for (const word of words) {
+            const testLine = line ? `${line} ${word}` : word;
+            const testWidth = helvetica.widthOfTextAtSize(testLine, 9);
+            if (testWidth > contentWidth && line) {
+                checkNewPage(20);
+                page.drawText(line, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+                y -= 14;
+                line = word;
+            } else {
+                line = testLine;
+            }
+        }
+        if (line) {
+            checkNewPage(20);
+            page.drawText(line, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+            y -= 14;
         }
     }
 

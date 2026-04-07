@@ -57,7 +57,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     });
 
     const subtotal = items.reduce((sum: number, item: any) => sum + calculateTotal(item), 0);
-    const tax = subtotal * 0.087;
+    const tax = subtotal * 0.088;
     const total = subtotal + tax;
     const isApproved = initialEstimate.status === "Approved";
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
@@ -214,7 +214,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                     <span>{formatCurrency(subtotal)}</span>
                                 </div>
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
-                                    <span>Tax (8.7%)</span>
+                                    <span>Tax (8.8%)</span>
                                     <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-slate-800">
