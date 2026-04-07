@@ -127,9 +127,21 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     );
 
     return (
-        <div className={`${sidebarCollapsed ? "w-12" : "w-56"} transition-all duration-200 bg-hui-background border-r border-hui-border flex flex-col min-h-full shrink-0`}>
-            {/* Toggle button */}
-            <div className={`flex items-center border-b border-hui-border ${sidebarCollapsed ? "justify-center py-2.5" : "justify-between px-2 py-2"}`}>
+        <>
+        {/* Outer sizer: plain block div — flex item in layout, clips inner flex-col content */}
+        <div
+            style={{
+                flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
+                maxWidth: sidebarCollapsed ? "48px" : "224px",
+                minWidth: 0,
+                overflow: "hidden",
+            }}
+            className="h-full"
+        >
+        {/* Inner sidebar: always 224px wide, gets clipped by outer when collapsed */}
+        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
+            {/* Toggle row — button left-aligned so it stays within 48px clip */}
+            <div className={`flex items-center border-b border-hui-border ${sidebarCollapsed ? "justify-start py-2 pl-2" : "justify-between px-2 py-2"}`}>
                 {!sidebarCollapsed && (
                     <Link
                         href="/projects"
@@ -154,21 +166,6 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                     </svg>
                 </button>
             </div>
-
-            {sidebarCollapsed && (
-                <Link
-                    href="/projects"
-                    title="All Projects"
-                    className="flex items-center justify-center py-2.5 text-slate-400 hover:text-hui-primary hover:bg-slate-100 transition border-b border-hui-border"
-                >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                    </svg>
-                </Link>
-            )}
-
-            {/* Collapsed: show nothing else */}
-            {sidebarCollapsed && <div className="flex-1" />}
 
             {/* Expanded content */}
             {!sidebarCollapsed && <>
@@ -295,50 +292,52 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             </div>
 
             </>}
+        </div>
+        </div>
 
-            {/* Link Lead Modal */}
-            {showLinkModal && (
-                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-5 max-h-[70vh] flex flex-col">
-                        <div className="flex items-center justify-between mb-3">
-                            <h3 className="text-base font-bold text-hui-textMain">Link Lead to Project</h3>
-                            <button onClick={() => setShowLinkModal(false)} className="text-slate-400 hover:text-slate-600 text-lg">&times;</button>
-                        </div>
+        {/* Link Lead Modal (fixed overlay, outside sizing divs) */}
+        {showLinkModal && (
+            <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-5 max-h-[70vh] flex flex-col">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-base font-bold text-hui-textMain">Link Lead to Project</h3>
+                        <button onClick={() => setShowLinkModal(false)} className="text-slate-400 hover:text-slate-600 text-lg">&times;</button>
+                    </div>
 
-                        <input
-                            type="text"
-                            placeholder="Search leads..."
-                            value={searchTerm}
-                            onChange={e => setSearchTerm(e.target.value)}
-                            className="hui-input w-full mb-3 text-sm"
-                            autoFocus
-                        />
+                    <input
+                        type="text"
+                        placeholder="Search leads..."
+                        value={searchTerm}
+                        onChange={e => setSearchTerm(e.target.value)}
+                        className="hui-input w-full mb-3 text-sm"
+                        autoFocus
+                    />
 
-                        <div className="flex-1 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-                            {filtered.length === 0 ? (
-                                <div className="p-4 text-center text-sm text-slate-400">No leads found</div>
-                            ) : (
-                                filtered.map(l => (
-                                    <button
-                                        key={l.id}
-                                        onClick={() => handleLinkLead(l.id)}
-                                        disabled={linking}
-                                        className="w-full text-left px-4 py-3 hover:bg-amber-50 transition flex items-center justify-between group disabled:opacity-50"
-                                    >
-                                        <div className="min-w-0">
-                                            <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
-                                            <p className="text-xs text-slate-400">{l.client?.name || "No client"} · {l.stage}</p>
-                                        </div>
-                                        <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
-                                            Link →
-                                        </span>
-                                    </button>
-                                ))
-                            )}
-                        </div>
+                    <div className="flex-1 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                        {filtered.length === 0 ? (
+                            <div className="p-4 text-center text-sm text-slate-400">No leads found</div>
+                        ) : (
+                            filtered.map(l => (
+                                <button
+                                    key={l.id}
+                                    onClick={() => handleLinkLead(l.id)}
+                                    disabled={linking}
+                                    className="w-full text-left px-4 py-3 hover:bg-amber-50 transition flex items-center justify-between group disabled:opacity-50"
+                                >
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
+                                        <p className="text-xs text-slate-400">{l.client?.name || "No client"} · {l.stage}</p>
+                                    </div>
+                                    <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
+                                        Link →
+                                    </span>
+                                </button>
+                            ))
+                        )}
                     </div>
                 </div>
-            )}
-        </div>
+            </div>
+        )}
+        </>
     );
 }
