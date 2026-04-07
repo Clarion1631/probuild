@@ -1,5 +1,21 @@
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts, PDFImage } from 'pdf-lib';
 import { prisma } from './prisma';
+
+async function fetchAndEmbedLogo(doc: PDFDocument, url: string): Promise<PDFImage | null> {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const buffer = Buffer.from(await res.arrayBuffer());
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('png') || url.toLowerCase().endsWith('.png')) {
+            return await doc.embedPng(buffer);
+        }
+        return await doc.embedJpg(buffer);
+    } catch (err) {
+        console.warn('Could not embed logo in PDF:', err);
+        return null;
+    }
+}
 
 // Color helpers
 const colors = {
@@ -60,15 +76,47 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y = pageHeight - 40;
 
-    // --- Company Name ---
+    // --- Logo + Company Name + Contact Info ---
+    let logoImage: PDFImage | null = null;
+    if (company?.logoUrl) {
+        logoImage = await fetchAndEmbedLogo(doc, company.logoUrl);
+    }
+
+    let textX = margin;
+    if (logoImage) {
+        const maxLogoH = 40;
+        const maxLogoW = 120;
+        const scale = Math.min(maxLogoW / logoImage.width, maxLogoH / logoImage.height, 1);
+        const logoW = logoImage.width * scale;
+        const logoH = logoImage.height * scale;
+        page.drawImage(logoImage, {
+            x: margin, y: y - logoH + 12, width: logoW, height: logoH,
+        });
+        textX = margin + logoW + 12;
+    }
+
     if (company?.companyName) {
         page.drawText(company.companyName.toUpperCase(), {
-            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
+            x: textX, y, size: 11, font: helveticaBold, color: colors.textMain,
         });
     }
 
-    // --- Title ---
-    y -= 30;
+    // Contact info
+    const contactLines: string[] = [];
+    if (company?.address) contactLines.push(company.address);
+    if (company?.phone) contactLines.push(company.phone);
+    if (company?.email) contactLines.push(company.email);
+    if (company?.website) contactLines.push(company.website);
+
+    let contactY = y;
+    for (const line of contactLines) {
+        contactY -= 12;
+        page.drawText(line, {
+            x: textX, y: contactY, size: 8, font: helvetica, color: colors.textMuted,
+        });
+    }
+
+    y = Math.min(contactY, y) - 20;
     page.drawText(estimate.title || 'Estimate', {
         x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
     });
@@ -203,7 +251,30 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
         });
 
-        y -= 20;
+        // Description (below name, word-wrapped in muted text)
+        if (item.description) {
+            y -= 14;
+            const descWords = item.description.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().split(' ');
+            let descLine = '';
+            for (const word of descWords) {
+                const testLine = descLine ? `${descLine} ${word}` : word;
+                if (helvetica.widthOfTextAtSize(testLine, 8) > maxNameWidth && descLine) {
+                    checkNewPage(14);
+                    page.drawText(descLine, { x: nameX, y, size: 8, font: helvetica, color: colors.textMuted });
+                    y -= 11;
+                    descLine = word;
+                } else {
+                    descLine = testLine;
+                }
+            }
+            if (descLine) {
+                checkNewPage(14);
+                page.drawText(descLine, { x: nameX, y, size: 8, font: helvetica, color: colors.textMuted });
+            }
+            y -= 14;
+        } else {
+            y -= 20;
+        }
     }
 
     // --- Totals Section ---
