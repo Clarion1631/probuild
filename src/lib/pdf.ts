@@ -118,6 +118,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     if (company?.address) contactLines.push(company.address);
     if (company?.phone) contactLines.push(company.phone);
     if (company?.email) contactLines.push(company.email);
+    if ((company as any)?.licenseNumber) contactLines.push(`Lic# ${(company as any).licenseNumber}`);
 
     let contactY = y;
     for (const line of contactLines) {
