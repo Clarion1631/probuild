@@ -288,6 +288,8 @@ model EstimatePaymentSchedule {
   paymentMethod         String?
   paidAt                DateTime?
   paymentDate           DateTime?
+
+  @@index([estimateId])
 }
 
 model EstimateItem {

@@ -858,6 +858,52 @@ export async function getEstimateForPortal(id: string) {
     }));
 }
 
+/** Returns the id of the "Payment in Full" schedule for an estimate, creating one if none exist.
+ *  Amount is always derived server-side from balanceDue to prevent client-side manipulation.
+ *  Race-safe: catches P2002 on concurrent creates and re-reads the winner. */
+export async function ensureEstimatePayInFullSchedule(estimateId: string): Promise<string> {
+    "use server";
+    // Derive amount from canonical server data — never accept it from the client
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { balanceDue: true, totalAmount: true },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+    const amount = Number(estimate.balanceDue ?? estimate.totalAmount ?? 0);
+    if (amount <= 0) throw new Error("Estimate has no balance due");
+
+    // Return existing schedule if one exists (handles abandoned Stripe sessions too)
+    const existing = await prisma.estimatePaymentSchedule.findFirst({
+        where: { estimateId, name: "Payment in Full" },
+        select: { id: true },
+    });
+    if (existing) return existing.id;
+
+    try {
+        const created = await prisma.estimatePaymentSchedule.create({
+            data: {
+                estimateId,
+                name: "Payment in Full",
+                amount,
+                order: 0,
+                status: "Pending",
+            },
+            select: { id: true },
+        });
+        return created.id;
+    } catch (e: any) {
+        // Race: concurrent request already created it — read the winner
+        if (e.code === "P2002") {
+            const winner = await prisma.estimatePaymentSchedule.findFirst({
+                where: { estimateId, name: "Payment in Full" },
+                select: { id: true },
+            });
+            if (winner) return winner.id;
+        }
+        throw e;
+    }
+}
+
 export async function getAllEstimates() {
     return await prisma.estimate.findMany({
         orderBy: { createdAt: "desc" },

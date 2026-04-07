@@ -6,6 +6,7 @@ import DOMPurify from "dompurify";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";
+import PortalPayInFullButton from "@/components/PortalPayInFullButton";
 import { formatCurrency } from "@/lib/utils";
 
 export default function PortalEstimateClient({ initialEstimate, companySettings }: { initialEstimate: any, companySettings?: any }) {
@@ -66,6 +67,12 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const total = subtotal + tax;
     const isApproved = initialEstimate.status === "Approved";
     const stripeEnabled = companySettings?.stripeEnabled !== false;
+    const schedules: any[] = initialEstimate.paymentSchedules || [];
+    // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
+    const showPayInFull = isApproved && stripeEnabled && (
+        schedules.length === 0 ||
+        schedules.some(s => s.name === "Payment in Full" && s.status !== "Paid" && !s.stripeSessionId)
+    );
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
@@ -249,12 +256,21 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </div>
                     </div>
 
-                    {/* Payment Schedule */}
-                    {initialEstimate.paymentSchedules && initialEstimate.paymentSchedules.length > 0 && (
+                    {/* Pay in Full — shown when no milestones, OR when the auto-created pay-in-full schedule is pending (handles abandoned checkouts) */}
+                    {showPayInFull && (
+                        <PortalPayInFullButton
+                            estimateId={initialEstimate.id}
+                            displayAmount={total}
+                            settings={companySettings}
+                        />
+                    )}
+
+                    {/* Payment Schedule — hide auto-created "Payment in Full" rows from milestone list */}
+                    {schedules.filter((s: any) => s.name !== "Payment in Full").length > 0 && (
                         <div className="px-10 pb-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment Schedule</h2>
                             <div className="border border-slate-200 rounded-md overflow-hidden">
-                                {initialEstimate.paymentSchedules.map((p: any) => {
+                                {schedules.filter((s: any) => s.name !== "Payment in Full").map((p: any) => {
                                     const isPaid = p.status === "Paid";
                                     return (
                                         <div key={p.id} className={`flex flex-wrap justify-between items-center px-5 py-3 text-sm border-b last:border-b-0 border-slate-100 gap-3 ${isPaid ? "bg-green-50" : ""}`}>
