@@ -51,7 +51,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientName={lead.client?.name || ""}
                 leadName={lead.name}
                 leadSource={lead.source}
-                createdAt={lead.createdAt.toISOString()}
+                createdAt={typeof lead.createdAt === 'string' ? lead.createdAt : lead.createdAt.toISOString()}
                 location={lead.location}
                 clientEmail={lead.client?.email || null}
                 clientPhone={(lead.client as any)?.primaryPhone || null}
@@ -65,7 +65,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 leadName={lead.name}
                 leadSource={lead.source}
                 leadStage={lead.stage}
-                expectedStartDate={lead.expectedStartDate?.toISOString().split("T")[0] || null}
+                expectedStartDate={lead.expectedStartDate ? (typeof lead.expectedStartDate === 'string' ? lead.expectedStartDate.split("T")[0] : lead.expectedStartDate.toISOString().split("T")[0]) : null}
                 targetRevenue={lead.targetRevenue}
                 location={lead.location}
                 projectType={lead.projectType}
