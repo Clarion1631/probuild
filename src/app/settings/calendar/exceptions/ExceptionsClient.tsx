@@ -34,8 +34,11 @@ export default function ExceptionsClient({ initialExceptions }: { initialExcepti
         finally { setIsSaving(false); }
     }
 
-    const upcoming = exceptions.filter(e => new Date(e.date) >= new Date(new Date().toISOString().split("T")[0]));
-    const past = exceptions.filter(e => new Date(e.date) < new Date(new Date().toISOString().split("T")[0]));
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const upcoming = exceptions.filter(e => new Date(`${e.date}T00:00:00`) >= today);
+    const past = exceptions.filter(e => new Date(`${e.date}T00:00:00`) < today);
 
     return (
         <div className="max-w-3xl mx-auto p-6 space-y-6">
