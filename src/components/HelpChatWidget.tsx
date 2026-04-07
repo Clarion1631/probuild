@@ -7,7 +7,6 @@ import { usePermissions } from "@/components/PermissionsProvider";
 interface Message {
   role: "user" | "assistant";
   content: string;
-  featureRequest?: { title: string; description: string };
 }
 
 interface ConversationSummary {
@@ -244,14 +243,12 @@ export default function HelpChatWidget({
         content: data.answer,
       };
 
-      if (data.type === "feature_request") {
-        assistantMsg.featureRequest = {
-          title: data.title,
-          description: data.description,
-        };
-      }
-
       setMessages((prev) => [...prev, assistantMsg]);
+
+      // Auto-submit feature requests immediately — no manual button needed
+      if (data.type === "feature_request" && data.title && data.description) {
+        submitFeatureRequest(data.title, data.description);
+      }
     } catch (e: any) {
       const errMsg = e?.message || "Unknown error";
       setMessages((prev) => [
@@ -391,12 +388,12 @@ export default function HelpChatWidget({
               <button
                 onClick={startNewChat}
                 className="text-white/80 hover:text-white ml-1"
-                aria-label="New conversation"
-                title="New conversation"
+                aria-label="Start new chat"
+                title="New chat"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 20h9" />
-                  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 5v14" />
+                  <path d="M5 12h14" />
                 </svg>
               </button>
               {/* Close */}
@@ -443,19 +440,6 @@ export default function HelpChatWidget({
                       }
                     >
                       <p className="whitespace-pre-wrap">{msg.content}</p>
-                      {msg.featureRequest && effectiveIsAdmin && (
-                        <button
-                          onClick={() =>
-                            submitFeatureRequest(
-                              msg.featureRequest!.title,
-                              msg.featureRequest!.description
-                            )
-                          }
-                          className="mt-2 text-xs hui-btn-green px-2 py-1 rounded"
-                        >
-                          Submit as feature request?
-                        </button>
-                      )}
                     </div>
                   </div>
                 ))}
