@@ -115,9 +115,16 @@ export default function ClientMessaging({
     useEffect(() => {
         fetchMessages();
         fetchTeamMembers();
+        // Mark inbound messages as read when the conversation is opened
+        const entityKey = entityType === "lead" ? "leadId" : "projectId";
+        fetch("/api/client-messages/mark-read", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ [entityKey]: entityId }),
+        }).catch(() => {}); // non-critical, ignore errors
         pollRef.current = setInterval(fetchMessages, 10000);
         return () => { if (pollRef.current) clearInterval(pollRef.current); };
-    }, [fetchMessages]);
+    }, [fetchMessages, entityId, entityType]);
 
     useEffect(() => {
         if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;

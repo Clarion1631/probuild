@@ -3008,25 +3008,23 @@ export async function getProjectMessages(projectId: string) {
 }
 
 export async function getUnreadMessageCount(projectId: string, forSenderType: "CLIENT" | "TEAM") {
-    // Count inbound ClientMessages from the client that haven't been read
+    // Count unread inbound ClientMessages for this project.
+    // "Inbound" from the team's perspective = messages sent by the CLIENT.
+    // Uses readAt to determine unread status — badge clears when markClientMessagesRead is called.
     const inboundDirection = forSenderType === "TEAM" ? "INBOUND" : "OUTBOUND";
+    return prisma.clientMessage.count({
+        where: { projectId, direction: inboundDirection, readAt: null },
+    });
+}
 
-    const [threadCount, clientMsgCount] = await Promise.all([
-        // Legacy project thread messages (senderType-based, with readAt)
-        prisma.messageThread.findFirst({ where: { projectId, subcontractorId: null } }).then(thread => {
-            if (!thread) return 0;
-            const oppositeType = forSenderType === "TEAM" ? "CLIENT" : "TEAM";
-            return prisma.message.count({
-                where: { threadId: thread.id, senderType: oppositeType, readAt: null },
-            });
-        }),
-        // New ClientMessage unread count (direction-based, no readAt field yet)
-        prisma.clientMessage.count({
-            where: { projectId, direction: inboundDirection },
-        }),
-    ]);
-
-    return threadCount + clientMsgCount;
+export async function markClientMessagesRead(entityId: string, entityType: "lead" | "project") {
+    const where = entityType === "lead"
+        ? { leadId: entityId, direction: "INBOUND", readAt: null }
+        : { projectId: entityId, direction: "INBOUND", readAt: null };
+    await prisma.clientMessage.updateMany({
+        where,
+        data: { readAt: new Date() },
+    });
 }
 
 

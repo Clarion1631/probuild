@@ -890,10 +890,12 @@ model ClientMessage {
   scheduledFor DateTime?
   ccEmails     String? // JSON array of emails
   createdAt    DateTime  @default(now())
+  readAt       DateTime? // Set when the recipient (team or client) reads the message
 
   @@index([leadId])
   @@index([projectId])
   @@index([createdAt])
+  @@index([readAt])
 }
 
 model SubcontractorProjectAccess {
