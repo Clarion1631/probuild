@@ -35,6 +35,6 @@ export const config = {
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          */
-        "/((?!api/auth|api/cron|api/webhook|api/payments|api/portal|api/sub-portal|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/webhook|api/payments|api/portal|api/pdf|api/sub-portal|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
     ],
 };

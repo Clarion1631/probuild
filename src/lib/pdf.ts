@@ -115,48 +115,15 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
     }
 
-    y = Math.min(contactY, y) - 20;
-    page.drawText(estimate.title || 'Estimate', {
-        x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
-    });
+    const headerTopY = Math.min(contactY, y) - 20;
 
-    // --- Estimate Info ---
-    y -= 30;
-
-    // Left: Client info
-    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
-    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
-
-    page.drawText('ESTIMATE TO', {
-        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
-    });
-
-    if (clientName) {
-        y -= 16;
-        page.drawText(clientName, {
-            x: margin, y, size: 11, font: helvetica, color: colors.textMain,
-        });
-    }
-    if (clientEmail) {
-        y -= 14;
-        page.drawText(clientEmail, {
-            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    // Client address
-    const client = estimate.project?.client || estimate.lead?.client;
-    const clientAddress = client ? [client.addressLine1, client.city, client.state, client.zipCode].filter(Boolean).join(', ') : '';
-    if (clientAddress) {
-        y -= 14;
-        page.drawText(clientAddress, {
-            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    // Right side: Estimate # / Date / Status
+    // Right side header: "ESTIMATE" label (portal style, top-right)
     const rightX = pageWidth - margin;
-    let ry = y + (clientEmail ? 30 : 16);
+    const estimateHeadLabel = 'ESTIMATE';
+    const estimateHeadWidth = helveticaBold.widthOfTextAtSize(estimateHeadLabel, 22);
+    page.drawText(estimateHeadLabel, {
+        x: rightX - estimateHeadWidth, y: headerTopY, size: 22, font: helveticaBold, color: colors.primary,
+    });
 
     const drawRightLabel = (label: string, value: string, yPos: number) => {
         page.drawText(label, {
@@ -168,14 +135,63 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
     };
 
+    let ry = headerTopY - 24;
     drawRightLabel('Estimate No.', estimate.code || '', ry);
     ry -= 16;
     drawRightLabel('Date', new Date(estimate.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
     ry -= 16;
     drawRightLabel('Status', estimate.status || 'Draft', ry);
 
+    // --- Client + Project section ---
+    y = headerTopY - 70;
+
+    // Left: "PREPARED FOR" + client info
+    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
+    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
+    const client = estimate.project?.client || estimate.lead?.client;
+    const clientAddress = client ? [client.addressLine1, client.city, client.state, client.zipCode].filter(Boolean).join(', ') : '';
+
+    page.drawText('PREPARED FOR', {
+        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
+    });
+
+    let leftY = y;
+    if (clientName) {
+        leftY -= 16;
+        page.drawText(clientName, {
+            x: margin, y: leftY, size: 11, font: helvetica, color: colors.textMain,
+        });
+    }
+    if (clientAddress) {
+        leftY -= 14;
+        page.drawText(clientAddress, {
+            x: margin, y: leftY, size: 9, font: helvetica, color: colors.textMuted,
+        });
+    }
+    if (clientEmail) {
+        leftY -= 14;
+        page.drawText(clientEmail, {
+            x: margin, y: leftY, size: 9, font: helvetica, color: colors.textMuted,
+        });
+    }
+
+    // Right: "PROJECT" section
+    const halfX = margin + contentWidth * 0.5;
+    page.drawText('PROJECT', {
+        x: halfX, y, size: 9, font: helveticaBold, color: colors.textMuted,
+    });
+    const projectTitle = estimate.title || '';
+    let rightY = y;
+    if (projectTitle) {
+        rightY -= 16;
+        page.drawText(projectTitle, {
+            x: halfX, y: rightY, size: 11, font: helvetica, color: colors.textMain,
+        });
+    }
+
+    y = Math.min(leftY, rightY) - 24;
+
     // --- Separator ---
-    y -= 20;
     page.drawLine({
         start: { x: margin, y }, end: { x: pageWidth - margin, y },
         thickness: 0.5, color: colors.border,
@@ -191,7 +207,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     };
 
     function drawTableHeader() {
-        page.drawText('ITEM DESCRIPTION', {
+        page.drawText('DESCRIPTION', {
             x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
         const qtyLabel = 'QTY';
@@ -199,12 +215,12 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         page.drawText(qtyLabel, {
             x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
-        const ucLabel = 'UNIT COST';
+        const ucLabel = 'UNIT PRICE';
         const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
         page.drawText(ucLabel, {
             x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
-        const totalLabel = 'TOTAL';
+        const totalLabel = 'AMOUNT';
         const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
         page.drawText(totalLabel, {
             x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
@@ -313,7 +329,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     y -= 18;
 
     // Tax
-    page.drawText('Estimated Tax (8.8%)', {
+    page.drawText('Tax (8.8%)', {
         x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
     });
     const taxStr = formatCurrency(tax);
@@ -352,24 +368,23 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         for (const sched of estimate.paymentSchedules) {
             checkNewPage(60);
 
-            page.drawText(sched.name || '', {
+            const schedName = sched.percentage ? `${sched.name || ''} (${sched.percentage}%)` : (sched.name || '');
+            page.drawText(schedName, {
                 x: margin, y, size: 9, font: helveticaBold, color: colors.textMain,
             });
 
-            const schedInfo: string[] = [];
-            if (sched.percentage) schedInfo.push(`${sched.percentage}%`);
-            if (sched.amount) schedInfo.push(formatCurrency(sched.amount));
-            const schedText = schedInfo.join('  ');
-
-            page.drawText(schedText, {
-                x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
-            });
-
             if (sched.dueDate) {
-                const dateStr = new Date(sched.dueDate).toLocaleDateString();
-                const dateWidth = helvetica.widthOfTextAtSize(dateStr, 9);
+                const dateStr = new Date(sched.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
                 page.drawText(dateStr, {
-                    x: cols.total - dateWidth, y, size: 9, font: helvetica, color: colors.textMuted,
+                    x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
+                });
+            }
+
+            if (sched.amount) {
+                const amtStr = formatCurrency(sched.amount);
+                const amtWidth = helveticaBold.widthOfTextAtSize(amtStr, 9);
+                page.drawText(amtStr, {
+                    x: cols.total - amtWidth, y, size: 9, font: helveticaBold, color: colors.textMain,
                 });
             }
             y -= 18;
@@ -379,37 +394,48 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     // --- Terms & Conditions ---
     if ((estimate as any).termsAndConditions) {
         y -= 40;
-        checkNewPage(100);
+        checkNewPage(120);
 
         page.drawText('Terms & Conditions', {
             x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
         });
         y -= 18;
 
-        // Strip HTML tags
+        // Strip HTML tags and pre-compute wrapped lines
         const rawTerms: string = (estimate as any).termsAndConditions;
         const plainTerms = rawTerms.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-
-        // Word-wrap within content width
-        const words = plainTerms.split(' ');
-        let line = '';
-        for (const word of words) {
-            const testLine = line ? `${line} ${word}` : word;
-            const testWidth = helvetica.widthOfTextAtSize(testLine, 9);
-            if (testWidth > contentWidth && line) {
-                checkNewPage(20);
-                page.drawText(line, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
-                y -= 14;
-                line = word;
+        const tcPadding = 12;
+        const tcWidth = contentWidth - tcPadding * 2;
+        const tcLines: string[] = [];
+        let tcLine = '';
+        for (const word of plainTerms.split(' ')) {
+            const testLine = tcLine ? `${tcLine} ${word}` : word;
+            if (helvetica.widthOfTextAtSize(testLine, 9) > tcWidth && tcLine) {
+                tcLines.push(tcLine);
+                tcLine = word;
             } else {
-                line = testLine;
+                tcLine = testLine;
             }
         }
-        if (line) {
-            checkNewPage(20);
-            page.drawText(line, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
-            y -= 14;
+        if (tcLine) tcLines.push(tcLine);
+
+        // Draw background box
+        const boxHeight = tcLines.length * 14 + tcPadding * 2;
+        checkNewPage(boxHeight + 20);
+        page.drawRectangle({
+            x: margin, y: y - boxHeight, width: contentWidth, height: boxHeight,
+            color: colors.bgLight,
+            borderColor: colors.border,
+            borderWidth: 1,
+        });
+
+        // Draw text inside box
+        let tcY = y - tcPadding;
+        for (const ln of tcLines) {
+            page.drawText(ln, { x: margin + tcPadding, y: tcY, size: 9, font: helvetica, color: colors.textMuted });
+            tcY -= 14;
         }
+        y = tcY - tcPadding;
     }
 
     // --- Signature Section ---
