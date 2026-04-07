@@ -1371,7 +1371,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 type: item.type,
                 quantity: parseFloat(item.quantity) || 0,
                 baseCost: item.baseCost != null ? parseFloat(item.baseCost) || 0 : null,
-                markupPercent: parseFloat(item.markupPercent) ?? 25,
+                markupPercent: parseFloat(item.markupPercent) || 25,
                 unitCost: parseFloat(item.unitCost) || 0,
                 total: parseFloat(item.total) || 0,
                 order: item.order ?? itemOrder++,

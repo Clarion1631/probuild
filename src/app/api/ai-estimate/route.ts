@@ -167,6 +167,8 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             quantity: item.quantity || 1,
             unitCost: item.unitCost || 0,
             total: item.total || (item.quantity || 1) * (item.unitCost || 0),
+            markupPercent: 25,
+            baseCost: null,
             parentId: null,
             costCodeId: item.costCode ? (codeMap[item.costCode] || null) : null,
             costTypeId: item.costType ? (typeMap[item.costType] || null) : null,
