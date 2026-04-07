@@ -15,7 +15,7 @@ const DOC_PREFIXES: Record<string, string> = {
   PAYMENT: "PM",
 };
 
-async function getNextDocumentNumber(type: string): Promise<string> {
+export async function getNextDocumentNumber(type: string): Promise<string> {
   const prefix = DOC_PREFIXES[type];
   if (!prefix) throw new Error(`Unknown document type: ${type}`);
 
