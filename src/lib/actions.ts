@@ -844,10 +844,46 @@ export async function getAllEstimates() {
     });
 }
 
+async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
+    try {
+        if (leadId) {
+            await prisma.leadMessage.create({
+                data: {
+                    leadId,
+                    direction: "INBOUND",
+                    senderName: "System",
+                    body,
+                    channel: "email",
+                    status: "SENT",
+                },
+            });
+        } else if (projectId) {
+            let thread = await prisma.messageThread.findUnique({
+                where: { projectId_subcontractorId: { projectId, subcontractorId: "" } },
+            });
+            if (!thread) {
+                thread = await prisma.messageThread.create({
+                    data: { projectId, subcontractorId: "" },
+                });
+            }
+            await prisma.message.create({
+                data: {
+                    threadId: thread.id,
+                    senderType: "CLIENT",
+                    senderName: "System",
+                    body,
+                },
+            });
+        }
+    } catch (err) {
+        console.error("[postActivityToThread] Failed:", err);
+    }
+}
+
 export async function markEstimateViewed(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        select: { viewedAt: true, title: true, code: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
+        select: { viewedAt: true, title: true, code: true, projectId: true, leadId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
     if (estimate && !estimate.viewedAt) {
@@ -872,6 +908,12 @@ export async function markEstimateViewed(estimateId: string) {
                 </div>`
             );
         }
+
+        // Post activity to message thread
+        await postActivityToThread(
+            estimate.leadId, estimate.projectId,
+            `👁️ ${clientName} viewed estimate ${estimate.title || estimate.code}`
+        );
     }
 }
 
@@ -1050,6 +1092,14 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             // Non-critical — don't block the approval if filing fails
             console.error("[approveEstimate] Failed to file signed PDF:", fileErr);
         }
+    }
+
+    // Post activity to message thread
+    if (estimate) {
+        await postActivityToThread(
+            estimate.leadId, estimate.projectId,
+            `✅ ${signatureName} signed and approved estimate ${estimate.code || estimate.title}`
+        );
     }
 
     if (estimate?.projectId) {
@@ -1898,7 +1948,7 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string) {
+export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -1941,6 +1991,12 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
+    const personalNote = customMessage
+        ? `<div style="background: #f8fafc; border-left: 3px solid #4f46e5; padding: 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
+                <p style="color: #333; margin: 0; line-height: 1.6; white-space: pre-wrap;">${customMessage}</p>
+           </div>`
+        : '';
+
     await sendNotification(
         recipientEmail,
         `${companyName} sent you an estimate`,
@@ -1953,6 +2009,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
                 <h2 style="font-size: 20px; margin: 0 0 8px;">New Estimate for You</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
+                ${personalNote}
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you an estimate for review and approval.
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
@@ -1972,8 +2029,50 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         </body>
         </html>`,
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails }
     );
+
+    // Store as message in the appropriate thread
+    const messageBody = customMessage
+        ? `📄 Estimate sent: ${estimate.title || estimate.code}\n\n${customMessage}\n\n🔗 Portal link: ${portalUrl}`
+        : `📄 Estimate sent: ${estimate.title || estimate.code}\n\n🔗 Portal link: ${portalUrl}`;
+
+    if (estimate.leadId) {
+        await prisma.leadMessage.create({
+            data: {
+                leadId: estimate.leadId,
+                direction: "OUTBOUND",
+                senderName: companyName,
+                senderEmail: settings?.email || null,
+                subject: `Estimate sent: ${estimate.title || estimate.code}`,
+                body: messageBody,
+                channel: "email",
+                sentViaEmail: true,
+                status: "SENT",
+                ccEmails: ccEmails && ccEmails.length > 0 ? JSON.stringify(ccEmails) : null,
+            },
+        });
+        revalidatePath(`/leads/${estimate.leadId}/messages`);
+    } else if (estimate.projectId) {
+        let thread = await prisma.messageThread.findUnique({
+            where: { projectId_subcontractorId: { projectId: estimate.projectId, subcontractorId: "" } },
+        });
+        if (!thread) {
+            thread = await prisma.messageThread.create({
+                data: { projectId: estimate.projectId, subcontractorId: "" },
+            });
+        }
+        await prisma.message.create({
+            data: {
+                threadId: thread.id,
+                senderType: "TEAM",
+                senderName: companyName,
+                senderEmail: settings?.email || null,
+                body: messageBody,
+            },
+        });
+        revalidatePath(`/projects/${estimate.projectId}/messages`);
+    }
 
     // Revalidate paths
     if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);

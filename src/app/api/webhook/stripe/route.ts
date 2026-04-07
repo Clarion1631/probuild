@@ -96,6 +96,30 @@ export async function POST(req: Request) {
                         </div>`
                     );
                 }
+
+                // Post payment activity to message thread
+                if (invoice.projectId) {
+                    try {
+                        let thread = await prisma.messageThread.findUnique({
+                            where: { projectId_subcontractorId: { projectId: invoice.projectId, subcontractorId: "" } },
+                        });
+                        if (!thread) {
+                            thread = await prisma.messageThread.create({
+                                data: { projectId: invoice.projectId, subcontractorId: "" },
+                            });
+                        }
+                        await prisma.message.create({
+                            data: {
+                                threadId: thread.id,
+                                senderType: "CLIENT",
+                                senderName: "System",
+                                body: `💰 Payment received: ${formatCurrency(updatedSchedule.amount)} via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code} — ${updatedSchedule.name}`,
+                            },
+                        });
+                    } catch (e) {
+                        console.error("[webhook] Failed to post payment activity:", e);
+                    }
+                }
                 break;
             }
             case "checkout.session.async_payment_failed": {

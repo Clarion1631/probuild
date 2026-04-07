@@ -12,6 +12,8 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
     const [isSending, setIsSending] = useState(false);
     const [previewBody, setPreviewBody] = useState("");
     const [sendToEmail, setSendToEmail] = useState(clientEmail || "");
+    const [ccEmails, setCcEmails] = useState("");
+    const [customMessage, setCustomMessage] = useState("");
 
     useEffect(() => {
         getDocumentTemplates().then((data: any[]) => {
@@ -37,7 +39,14 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
         }
         setIsSending(true);
         try {
-            const result = await sendEstimateToClient(estimateId, selectedTemplateId || undefined, sendToEmail.trim());
+            const ccList = ccEmails.split(",").map(e => e.trim()).filter(Boolean);
+            const result = await sendEstimateToClient(
+                estimateId,
+                selectedTemplateId || undefined,
+                sendToEmail.trim(),
+                ccList.length > 0 ? ccList : undefined,
+                customMessage.trim() || undefined
+            );
             toast.success(`Estimate sent to ${result.sentTo}`);
             onClose();
         } catch (e: any) {
@@ -74,6 +83,33 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                                 className="flex-1 text-sm font-medium text-hui-textMain bg-transparent focus:outline-none"
                             />
                         </div>
+                    </div>
+
+                    {/* CC */}
+                    <div>
+                        <label className="block text-sm font-medium text-hui-textMain mb-1">CC <span className="text-hui-textMuted font-normal">(optional)</span></label>
+                        <div className="flex items-center gap-2 bg-slate-50 px-4 py-3 rounded-lg border border-hui-border">
+                            <svg className="w-4 h-4 text-slate-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                            <input
+                                type="text"
+                                value={ccEmails}
+                                onChange={e => setCcEmails(e.target.value)}
+                                placeholder="email1@example.com, email2@example.com"
+                                className="flex-1 text-sm text-hui-textMain bg-transparent focus:outline-none"
+                            />
+                        </div>
+                    </div>
+
+                    {/* Custom Message */}
+                    <div>
+                        <label className="block text-sm font-medium text-hui-textMain mb-1">Personal Message <span className="text-hui-textMuted font-normal">(optional)</span></label>
+                        <textarea
+                            value={customMessage}
+                            onChange={e => setCustomMessage(e.target.value)}
+                            placeholder="Add a personal note to include in the email..."
+                            rows={3}
+                            className="hui-input w-full resize-none"
+                        />
                     </div>
 
                     {/* Template Picker */}
