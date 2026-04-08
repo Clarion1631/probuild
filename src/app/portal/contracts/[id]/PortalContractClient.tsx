@@ -344,20 +344,20 @@ export default function PortalContractClient({ initialContract, companySettings 
                         {/* We add a style tag to apply CSS to the dynamically generated buttons so Tailwind works smoothly on them */}
                         <style dangerouslySetInnerHTML={{__html: `
                             .doc-block-btn {
-                                display: inline-flex;
-                                flex-direction: column;
-                                align-items: stretch;
+                                display: block;
                                 cursor: pointer;
                                 transition: all 0.2s;
                                 background: transparent;
                                 border: none;
                                 padding: 0;
-                                min-width: 160px;
-                                vertical-align: bottom;
-                                margin: 4px 2px;
+                                min-width: 200px;
+                                max-width: 280px;
+                                margin: 12px 0 4px;
+                                text-align: left;
                             }
                             .doc-block-btn.init-block {
-                                min-width: 100px;
+                                min-width: 120px;
+                                max-width: 180px;
                             }
                             .signing-line {
                                 display: block;
