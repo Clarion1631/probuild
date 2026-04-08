@@ -103,13 +103,29 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
     const [editBody, setEditBody] = useState("");
     const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
     const [saving, setSaving] = useState(false);
+    const [editUndoStack, setEditUndoStack] = useState<string[]>([]);
+    const [editRedoStack, setEditRedoStack] = useState<string[]>([]);
+    const [blankUndoStack, setBlankUndoStack] = useState<string[]>([]);
+    const [blankRedoStack, setBlankRedoStack] = useState<string[]>([]);
+    const [openDropdown, setOpenDropdown] = useState<string | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const toolbarRef = useRef<HTMLDivElement>(null);
+    const editTypingDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const editPreTypingBodyRef = useRef("");
+    const editIsTypingRef = useRef(false);
+    const blankTypingDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const blankPreTypingBodyRef = useRef("");
+    const blankIsTypingRef = useRef(false);
+    const editBodyRef = useRef("");
+    useEffect(() => { editBodyRef.current = editBody; }, [editBody]);
 
     // ─── NEW BLANK CONTRACT STATE ───
     const [creatingBlank, setCreatingBlank] = useState(false);
     const [blankTitle, setBlankTitle] = useState("");
     const [blankBody, setBlankBody] = useState("");
     const blankTextareaRef = useRef<HTMLTextAreaElement>(null);
+    const blankBodyRef = useRef("");
+    useEffect(() => { blankBodyRef.current = blankBody; }, [blankBody]);
 
     const contractTemplates = templates.filter(t => t.type === "contract" || t.type === "lien_release");
 
@@ -121,30 +137,103 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
     }, [autoCreate]);
 
     // ─── EDITOR HELPERS ───
-    const insertMergeField = (key: string, ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void) => {
+    const insertMergeField = (key: string, ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void, pushUndo: (v: string) => void) => {
         const ta = ref.current;
         if (!ta) return;
         const start = ta.selectionStart;
         const end = ta.selectionEnd;
         const tag = `{{${key}}}`;
+        pushUndo(body);
         const newBody = body.substring(0, start) + tag + body.substring(end);
         setBody(newBody);
         setTimeout(() => { ta.focus(); ta.selectionStart = ta.selectionEnd = start + tag.length; }, 0);
     };
 
-    const insertHtmlTag = (tag: string, ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void, placeholder?: string) => {
+    const insertHtmlTag = (tag: string, ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void, pushUndo: (v: string) => void, placeholder?: string) => {
         const ta = ref.current;
         if (!ta) return;
         const start = ta.selectionStart;
+        const end = ta.selectionEnd;
+        const selected = body.substring(start, end);
+        pushUndo(body);
         const selfClosing = ["hr", "br"].includes(tag);
         let snippet: string;
         if (selfClosing) { snippet = `<${tag}/>`; }
         else if (tag === "ul") { snippet = `<ul>\n  <li>Item 1</li>\n  <li>Item 2</li>\n</ul>`; }
+        else if (selected) { snippet = `<${tag}>${selected}</${tag}>`; }
         else { snippet = `<${tag}>${placeholder || ""}</${tag}>`; }
-        const newBody = body.substring(0, start) + snippet + body.substring(ta.selectionEnd);
+        const newBody = body.substring(0, start) + snippet + body.substring(end);
         setBody(newBody);
         setTimeout(() => { ta.focus(); }, 0);
     };
+
+    const makeUndoHelpers = (
+        undoStack: string[], setUndoStack: React.Dispatch<React.SetStateAction<string[]>>,
+        redoStack: string[], setRedoStack: React.Dispatch<React.SetStateAction<string[]>>,
+        bodyRef: React.MutableRefObject<string>, setBody: (v: string) => void
+    ) => {
+        const pushUndo = (value: string) => {
+            setUndoStack(prev => [...prev, value].slice(-50));
+            setRedoStack([]);
+        };
+        const handleUndo = () => {
+            if (undoStack.length === 0) return;
+            const newStack = [...undoStack];
+            const prev = newStack.pop()!;
+            setRedoStack(r => [bodyRef.current, ...r].slice(0, 50));
+            setUndoStack(newStack);
+            setBody(prev);
+        };
+        const handleRedo = () => {
+            if (redoStack.length === 0) return;
+            const newStack = [...redoStack];
+            const next = newStack.shift()!;
+            setUndoStack(u => [...u, bodyRef.current].slice(-50));
+            setRedoStack(newStack);
+            setBody(next);
+        };
+        return { pushUndo, handleUndo, handleRedo };
+    };
+
+    const editHelpers = makeUndoHelpers(editUndoStack, setEditUndoStack, editRedoStack, setEditRedoStack, editBodyRef, setEditBody);
+    const blankHelpers = makeUndoHelpers(blankUndoStack, setBlankUndoStack, blankRedoStack, setBlankRedoStack, blankBodyRef, setBlankBody);
+
+    const makeTypingHandler = (
+        preTypingRef: React.MutableRefObject<string>,
+        isTypingRef: React.MutableRefObject<boolean>,
+        debounceRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>,
+        setUndoStack: React.Dispatch<React.SetStateAction<string[]>>,
+        setRedoStack: React.Dispatch<React.SetStateAction<string[]>>,
+        latestBodyRef: React.MutableRefObject<string>,
+        setBody: (v: string) => void
+    ) => (newBody: string) => {
+        if (!isTypingRef.current) {
+            preTypingRef.current = latestBodyRef.current;
+            isTypingRef.current = true;
+            setRedoStack([]); // clear redo at burst start, not debounce end
+        }
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => {
+            setUndoStack(prev => [...prev, preTypingRef.current].slice(-50));
+            isTypingRef.current = false;
+            debounceRef.current = null;
+        }, 500);
+        setBody(newBody);
+    };
+
+    const handleEditBodyChange = makeTypingHandler(editPreTypingBodyRef, editIsTypingRef, editTypingDebounceRef, setEditUndoStack, setEditRedoStack, editBodyRef, setEditBody);
+    const handleBlankBodyChange = makeTypingHandler(blankPreTypingBodyRef, blankIsTypingRef, blankTypingDebounceRef, setBlankUndoStack, setBlankRedoStack, blankBodyRef, setBlankBody);
+
+    useEffect(() => {
+        if ((!editingContract && !creatingBlank) || !openDropdown) return;
+        const handleClickOutside = (e: MouseEvent) => {
+            if (toolbarRef.current && !toolbarRef.current.contains(e.target as Node)) {
+                setOpenDropdown(null);
+            }
+        };
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, [editingContract, creatingBlank, openDropdown]);
 
     const openEditor = (contract: any) => {
         setEditingContract(contract);
@@ -242,47 +331,84 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
     );
 
     // ─── RENDER EDITOR TOOLBAR ───
-    const renderToolbar = (ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void) => (
-        <>
-            {/* Merge Field Toolbar */}
-            <div className="bg-slate-50 border-b border-slate-200 px-6 py-3 shrink-0">
-                <div className="flex items-start gap-4 flex-wrap">
-                    <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider pt-1.5 shrink-0">Smart Text:</span>
-                    {MERGE_FIELDS.map(cat => (
-                        <div key={cat.category} className="flex items-center gap-1.5">
-                            <span className="text-xs font-semibold text-slate-500">{cat.icon} {cat.category}:</span>
-                            <div className="flex gap-1 flex-wrap">
-                                {cat.fields.map(f => (
-                                    <button
-                                        key={f.key}
-                                        onClick={() => insertMergeField(f.key, ref, body, setBody)}
-                                        className={`px-2 py-0.5 rounded-full text-xs font-medium transition cursor-pointer ${categoryColors[cat.color].pill}`}
-                                        title={`Inserts {{${f.key}}} → "${f.example}"`}
-                                    >{f.label}</button>
-                                ))}
+    const renderToolbar = (
+        ref: React.RefObject<HTMLTextAreaElement | null>,
+        body: string,
+        setBody: (v: string) => void,
+        undoStack: string[],
+        redoStack: string[],
+        helpers: { pushUndo: (v: string) => void; handleUndo: () => void; handleRedo: () => void }
+    ) => {
+        const dataCategories = MERGE_FIELDS.filter(c => c.category !== "Signing");
+        const signingCategory = MERGE_FIELDS.find(c => c.category === "Signing")!;
+        return (
+            <>
+                {/* Merge Field Toolbar */}
+                <div ref={toolbarRef} className="bg-slate-50 border-b border-slate-200 px-6 py-2.5 shrink-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider shrink-0">Insert:</span>
+                        {dataCategories.map(cat => (
+                            <div key={cat.category} className="relative">
+                                <button
+                                    onClick={() => setOpenDropdown(openDropdown === cat.category ? null : cat.category)}
+                                    className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 transition"
+                                >
+                                    <span>{cat.icon}</span>
+                                    <span>{cat.category}</span>
+                                    <svg className="w-3 h-3 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {openDropdown === cat.category && (
+                                    <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-20 min-w-[190px]">
+                                        {cat.fields.map(f => (
+                                            <button
+                                                key={f.key}
+                                                onClick={() => { insertMergeField(f.key, ref, body, setBody, helpers.pushUndo); setOpenDropdown(null); }}
+                                                className="w-full text-left px-3 py-2 text-xs hover:bg-slate-50 flex items-center justify-between gap-4 group first:rounded-t-lg last:rounded-b-lg"
+                                            >
+                                                <span className="font-medium text-slate-700">{f.label}</span>
+                                                <span className="text-slate-400 text-[10px] truncate max-w-[100px]">"{f.example}"</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
+                        ))}
+                        <div className="w-px h-5 bg-slate-300 mx-1 shrink-0" />
+                        <div className="flex items-center gap-1.5 border border-rose-200 rounded-md px-2.5 py-1 bg-rose-50">
+                            <span className="text-xs font-semibold text-rose-600 shrink-0">Signing:</span>
+                            {signingCategory.fields.map(f => (
+                                <button
+                                    key={f.key}
+                                    onClick={() => insertMergeField(f.key, ref, body, setBody, helpers.pushUndo)}
+                                    className="px-2 py-0.5 text-xs font-medium rounded bg-rose-100 text-rose-700 hover:bg-rose-200 transition"
+                                    title={`Inserts {{${f.key}}}`}
+                                >{f.label}</button>
+                            ))}
                         </div>
-                    ))}
+                    </div>
                 </div>
-            </div>
 
-            {/* HTML Format Toolbar */}
-            <div className="bg-white border-b border-slate-200 px-6 py-2 shrink-0 flex items-center gap-1">
-                <span className="text-xs font-semibold text-slate-500 mr-2">Format:</span>
-                <button onClick={() => insertHtmlTag("h2", ref, body, setBody, "Heading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition">H2</button>
-                <button onClick={() => insertHtmlTag("h3", ref, body, setBody, "Subheading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-semibold transition">H3</button>
-                <button onClick={() => insertHtmlTag("strong", ref, body, setBody, "bold text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition"><b>B</b></button>
-                <button onClick={() => insertHtmlTag("em", ref, body, setBody, "italic text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 italic transition"><em>I</em></button>
-                <button onClick={() => insertHtmlTag("u", ref, body, setBody, "underlined text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 underline transition">U</button>
-                <button onClick={() => insertHtmlTag("p", ref, body, setBody, "Paragraph text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">¶</button>
-                <button onClick={() => insertHtmlTag("ul", ref, body, setBody)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">• List</button>
-                <button onClick={() => insertHtmlTag("li", ref, body, setBody, "List item")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">— Item</button>
-                <div className="w-px h-5 bg-slate-200 mx-1"></div>
-                <button onClick={() => insertHtmlTag("hr", ref, body, setBody)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">― Line</button>
-                <button onClick={() => insertHtmlTag("br", ref, body, setBody)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">↵ Break</button>
-            </div>
-        </>
-    );
+                {/* HTML Format Toolbar */}
+                <div className="bg-white border-b border-slate-200 px-6 py-2 shrink-0 flex items-center gap-1 flex-wrap">
+                    <span className="text-xs font-semibold text-slate-500 mr-2">Format:</span>
+                    <button onClick={() => insertHtmlTag("h2", ref, body, setBody, helpers.pushUndo, "Heading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition">H2</button>
+                    <button onClick={() => insertHtmlTag("h3", ref, body, setBody, helpers.pushUndo, "Subheading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-semibold transition">H3</button>
+                    <button onClick={() => insertHtmlTag("strong", ref, body, setBody, helpers.pushUndo, "bold text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition"><b>B</b></button>
+                    <button onClick={() => insertHtmlTag("em", ref, body, setBody, helpers.pushUndo, "italic text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 italic transition"><em>I</em></button>
+                    <button onClick={() => insertHtmlTag("u", ref, body, setBody, helpers.pushUndo, "underlined text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 underline transition">U</button>
+                    <button onClick={() => insertHtmlTag("p", ref, body, setBody, helpers.pushUndo, "Paragraph text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">¶</button>
+                    <button onClick={() => insertHtmlTag("ul", ref, body, setBody, helpers.pushUndo)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">• List</button>
+                    <button onClick={() => insertHtmlTag("li", ref, body, setBody, helpers.pushUndo, "List item")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">— Item</button>
+                    <div className="w-px h-5 bg-slate-200 mx-1"></div>
+                    <button onClick={() => insertHtmlTag("hr", ref, body, setBody, helpers.pushUndo)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">― Line</button>
+                    <button onClick={() => insertHtmlTag("br", ref, body, setBody, helpers.pushUndo)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">↵ Break</button>
+                    <div className="w-px h-5 bg-slate-200 mx-1"></div>
+                    <button onClick={helpers.handleUndo} disabled={undoStack.length === 0} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition disabled:opacity-30" title="Undo (Ctrl+Z)">↩ Undo</button>
+                    <button onClick={helpers.handleRedo} disabled={redoStack.length === 0} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition disabled:opacity-30" title="Redo (Ctrl+Shift+Z)">↪ Redo</button>
+                </div>
+            </>
+        );
+    };
 
     // ─── RENDER PREVIEW ───
     const renderPreview = (body: string) => (
@@ -362,7 +488,7 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                     </div>
                 </header>
 
-                {renderToolbar(blankTextareaRef, blankBody, setBlankBody)}
+                {renderToolbar(blankTextareaRef, blankBody, setBlankBody, blankUndoStack, blankRedoStack, blankHelpers)}
 
                 <div className="flex-1 flex flex-col overflow-hidden">
                     <div className="lg:hidden flex border-b border-slate-200 shrink-0">
@@ -377,9 +503,15 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                             <textarea
                                 ref={blankTextareaRef}
                                 className="flex-1 w-full p-4 font-mono text-sm text-slate-800 bg-white resize-none outline-none border-none leading-relaxed"
-                                placeholder={"Start typing or copy-paste your contract text...\n\nUse Smart Text buttons above to insert {{client_name}} etc.\nUse format buttons to add HTML tags."}
+                                placeholder={"Start typing or copy-paste your contract text...\n\nUse Insert dropdowns above to add merge fields.\nCtrl+Z to undo, Ctrl+Shift+Z to redo."}
                                 value={blankBody}
-                                onChange={e => setBlankBody(e.target.value)}
+                                onChange={e => handleBlankBodyChange(e.target.value)}
+                                onKeyDown={e => {
+                                    if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+                                        e.preventDefault();
+                                        if (e.shiftKey) blankHelpers.handleRedo(); else blankHelpers.handleUndo();
+                                    }
+                                }}
                                 spellCheck={false}
                             />
                         </div>
@@ -442,7 +574,7 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                     </div>
                 </header>
 
-                {renderToolbar(textareaRef, editBody, setEditBody)}
+                {renderToolbar(textareaRef, editBody, setEditBody, editUndoStack, editRedoStack, editHelpers)}
 
                 <div className="flex-1 flex flex-col overflow-hidden">
                     <div className="lg:hidden flex border-b border-slate-200 shrink-0">
@@ -457,9 +589,15 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                             <textarea
                                 ref={textareaRef}
                                 className="flex-1 w-full p-4 font-mono text-sm text-slate-800 bg-white resize-none outline-none border-none leading-relaxed"
-                                placeholder={"Edit your contract content here...\n\nUse Smart Text buttons above to insert {{client_name}} etc.\nUse format buttons to add HTML tags."}
+                                placeholder={"Edit your contract content here...\n\nUse Insert dropdowns above to add merge fields.\nCtrl+Z to undo, Ctrl+Shift+Z to redo."}
                                 value={editBody}
-                                onChange={e => setEditBody(e.target.value)}
+                                onChange={e => handleEditBodyChange(e.target.value)}
+                                onKeyDown={e => {
+                                    if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+                                        e.preventDefault();
+                                        if (e.shiftKey) editHelpers.handleRedo(); else editHelpers.handleUndo();
+                                    }
+                                }}
                                 spellCheck={false}
                             />
                         </div>

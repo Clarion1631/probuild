@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from "react";
 import DOMPurify from "dompurify";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
+import { toast } from "sonner";
 import { toJpeg } from "html-to-image";
 import { jsPDF } from "jspdf";
 
@@ -25,8 +26,7 @@ export default function PortalContractClient({ initialContract, companySettings 
     const [signatures, setSignatures] = useState<Record<string, { image: string, name: string }>>({});
     const [initials, setInitials] = useState<Record<string, { image: string, name: string }>>({});
 
-    // Blocks Tracking
-    const [totalRequiredBlocks, setTotalRequiredBlocks] = useState(0);
+    // Blocks Tracking (derived from parsedBody memo — not state)
 
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
@@ -37,35 +37,34 @@ export default function PortalContractClient({ initialContract, companySettings 
         markContractViewed(initialContract.id).catch(console.error);
     }, [initialContract.id]);
 
-    // Parse and Inject HTML Buttons
-    const parsedBody = React.useMemo(() => {
+    // Parse and Inject HTML Buttons — returns derived block counts alongside HTML
+    const { parsedBody, totalRequiredBlocks, totalSigBlocks } = React.useMemo(() => {
         // Sanitize DB content before rendering; our own placeholder injections below are safe
         let html = DOMPurify.sanitize(initialContract.body || "", { USE_PROFILES: { html: true } });
-        
+
         let sigCount = 0;
         let initCount = 0;
 
         // Replace Signature Blocks
         html = html.replace(/\{\{SIGNATURE_BLOCK\}\}/g, () => {
             const id = `sig-${sigCount++}`;
-            return `<button type="button" class="doc-block-btn sig-block" data-id="${id}">[ Click to Sign ]</button>`;
+            return `<button type="button" class="doc-block-btn sig-block" data-id="${id}" aria-label="Click to sign"><span class="signing-line"></span><span class="signing-cta"><svg class="signing-pen" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" width="13" height="13"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>Tap to sign</span><span class="signing-type">Client Signature</span></button>`;
         });
 
         // Replace Initial Blocks
         html = html.replace(/\{\{INITIAL_BLOCK\}\}/g, () => {
             const id = `init-${initCount++}`;
-            return `<button type="button" class="doc-block-btn init-block" data-id="${id}">[ Click to Initial ]</button>`;
+            return `<button type="button" class="doc-block-btn init-block" data-id="${id}" aria-label="Click to initial"><span class="signing-line"></span><span class="signing-cta"><svg class="signing-pen" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" width="13" height="13"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>Tap to initial</span><span class="signing-type">Initials</span></button>`;
         });
 
         // Replace Date Blocks with current date (if not signed) or approved date
-        const dateStr = isSigned && initialContract.approvedAt 
+        const dateStr = isSigned && initialContract.approvedAt
             ? new Date(initialContract.approvedAt).toLocaleDateString()
             : new Date().toLocaleDateString();
-            
+
         html = html.replace(/\{\{DATE_BLOCK\}\}/g, `<strong>${dateStr}</strong>`);
 
-        setTotalRequiredBlocks(sigCount + initCount);
-        return html;
+        return { parsedBody: html, totalRequiredBlocks: sigCount + initCount, totalSigBlocks: sigCount };
     }, [initialContract.body, isSigned, initialContract.approvedAt]);
 
     // Attach Delegated Listeners
@@ -104,32 +103,34 @@ export default function PortalContractClient({ initialContract, companySettings 
         const initBtns = contractBodyRef.current.querySelectorAll('.init-block');
 
         // Helper to sync
-        const syncBtn = (btn: Element, stateMap: Record<string, any>, defaultText: string) => {
+        const sigDefaultHtml = `<span class="signing-line"></span><span class="signing-cta"><svg class="signing-pen" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" width="13" height="13"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>Tap to sign</span><span class="signing-type">Client Signature</span>`;
+        const initDefaultHtml = `<span class="signing-line"></span><span class="signing-cta"><svg class="signing-pen" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" width="13" height="13"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>Tap to initial</span><span class="signing-type">Initials</span>`;
+
+        const syncBtn = (btn: Element, stateMap: Record<string, any>, defaultHtml: string) => {
             const id = (btn as HTMLElement).dataset.id;
             if (!id) return;
-            
+
             if (stateMap[id]) {
-                // It is signed
-                btn.innerHTML = `<img src="${stateMap[id].image}" class="h-10 object-contain mix-blend-multiply" alt="Signed" />`;
-                btn.classList.add('bg-transparent', 'border-none', 'p-0', 'ring-0', 'shadow-none');
-                btn.classList.remove('bg-blue-50', 'border-blue-300', 'text-blue-700', 'animate-pulse', 'ring-2', 'ring-red-400');
+                // It is signed — show ink-on-paper image
+                btn.innerHTML = `<img src="${stateMap[id].image}" class="h-12 object-contain mix-blend-multiply" alt="Signed" />`;
+                btn.classList.add('signed-block');
+                btn.classList.remove('unsigned-block', 'error-block');
             } else {
-                // It is missing
-                btn.innerHTML = defaultText;
-                btn.classList.remove('bg-transparent', 'border-none', 'p-0', 'ring-0', 'shadow-none');
-                btn.classList.add('bg-blue-50', 'border-blue-300', 'text-blue-700');
-                
-                // If they tried to submit and failed, or just naturally highlight
+                // Unsigned — show signature line design
+                btn.innerHTML = defaultHtml;
+                btn.classList.remove('signed-block');
                 if (error) {
-                    btn.classList.add('ring-2', 'ring-red-400', 'animate-pulse');
+                    btn.classList.add('error-block');
+                    btn.classList.remove('unsigned-block');
                 } else {
-                    btn.classList.add('ring-2', 'ring-blue-400', 'animate-bounce-subtle');
+                    btn.classList.add('unsigned-block');
+                    btn.classList.remove('error-block');
                 }
             }
         };
 
-        sigBtns.forEach(btn => syncBtn(btn, signatures, "[ Click to Sign ]"));
-        initBtns.forEach(btn => syncBtn(btn, initials, "[ Click to Initial ]"));
+        sigBtns.forEach(btn => syncBtn(btn, signatures, sigDefaultHtml));
+        initBtns.forEach(btn => syncBtn(btn, initials, initDefaultHtml));
     }, [signatures, initials, error, isSigned]);
 
     // Handle Modal Finish
@@ -137,7 +138,26 @@ export default function PortalContractClient({ initialContract, companySettings 
         if (!activeBlockId) return;
 
         if (modalMode === "signature") {
-            setSignatures(prev => ({ ...prev, [activeBlockId]: { image: dataUrl, name: typedName } }));
+            const isFirstSig = Object.keys(signatures).length === 0;
+            const newSigs = { ...signatures, [activeBlockId]: { image: dataUrl, name: typedName } };
+            setSignatures(newSigs);
+
+            const remainingCount = totalSigBlocks - Object.keys(newSigs).length;
+            if (isFirstSig && remainingCount > 0) {
+                toast(`Apply this signature to all ${remainingCount} remaining block${remainingCount !== 1 ? "s" : ""}?`, {
+                    action: {
+                        label: "Apply to all",
+                        onClick: () => {
+                            const allSigs: Record<string, { image: string; name: string }> = {};
+                            for (let i = 0; i < totalSigBlocks; i++) {
+                                allSigs[`sig-${i}`] = { image: dataUrl, name: typedName };
+                            }
+                            setSignatures(allSigs);
+                        },
+                    },
+                    duration: 8000,
+                });
+            }
         } else {
             setInitials(prev => ({ ...prev, [activeBlockId]: { image: dataUrl, name: typedName } }));
         }
@@ -325,29 +345,73 @@ export default function PortalContractClient({ initialContract, companySettings 
                         <style dangerouslySetInnerHTML={{__html: `
                             .doc-block-btn {
                                 display: inline-flex;
-                                align-items: center;
-                                justify-content: center;
-                                background-color: #eff6ff;
-                                color: #2563eb;
-                                padding: 6px 12px;
-                                border: 1px dashed #93c5fd;
-                                border-radius: 4px;
-                                font-weight: 600;
-                                font-size: 0.875rem;
+                                flex-direction: column;
+                                align-items: stretch;
                                 cursor: pointer;
                                 transition: all 0.2s;
-                                min-width: 120px;
-                            }
-                            .doc-block-btn:hover {
-                                background-color: #dbeafe;
-                                border-color: #3b82f6;
+                                background: transparent;
+                                border: none;
+                                padding: 0;
+                                min-width: 160px;
+                                vertical-align: bottom;
+                                margin: 4px 2px;
                             }
                             .doc-block-btn.init-block {
-                                min-width: 80px;
-                                padding: 4px 8px;
+                                min-width: 100px;
+                            }
+                            .signing-line {
+                                display: block;
+                                border-bottom: 1.5px solid #64748b;
+                                margin-bottom: 4px;
+                                height: 32px;
+                            }
+                            .signing-cta {
+                                display: flex;
+                                align-items: center;
+                                gap: 4px;
+                                font-size: 11px;
+                                font-weight: 500;
+                                color: #2563eb;
+                                padding: 2px 0;
+                            }
+                            .signing-pen {
+                                flex-shrink: 0;
+                                stroke: #2563eb;
+                            }
+                            .signing-type {
+                                display: block;
+                                font-size: 10px;
+                                color: #94a3b8;
+                                margin-top: 1px;
+                            }
+                            .doc-block-btn.unsigned-block .signing-line {
+                                border-color: #3b82f6;
+                                animation: signing-pulse 2s ease-in-out infinite;
+                            }
+                            .doc-block-btn.error-block .signing-line {
+                                border-color: #ef4444;
+                                animation: signing-pulse 0.8s ease-in-out infinite;
+                            }
+                            .doc-block-btn.error-block .signing-cta {
+                                color: #dc2626;
+                            }
+                            .doc-block-btn.error-block .signing-pen {
+                                stroke: #dc2626;
+                            }
+                            .doc-block-btn.signed-block {
+                                min-width: auto;
+                            }
+                            .doc-block-btn:hover .signing-line {
+                                border-color: #1d4ed8;
+                                box-shadow: 0 1px 0 #1d4ed8;
+                            }
+                            @keyframes signing-pulse {
+                                0%, 100% { opacity: 1; }
+                                50% { opacity: 0.5; }
                             }
                             .prose .doc-block-btn img {
                                 margin: 0;
+                                display: inline;
                             }
                         `}} />
                         <div
@@ -398,6 +462,40 @@ export default function PortalContractClient({ initialContract, companySettings 
                     </div>
                 </div>
             </div>
+
+            {/* Signing Progress Bar — fixed at bottom, outside overflow-hidden wrapper */}
+            {!isSigned && totalRequiredBlocks > 0 && (
+                <div className="fixed bottom-0 inset-x-0 z-20 flex justify-center px-4 pb-4 pointer-events-none print:hidden">
+                    <div className="pointer-events-auto bg-white border border-slate-200 rounded-xl shadow-lg px-5 py-3 flex items-center gap-4 max-w-md w-full">
+                        <div className="flex-1">
+                            {(() => {
+                                const completed = Object.keys(signatures).length + Object.keys(initials).length;
+                                const pct = Math.round((completed / totalRequiredBlocks) * 100);
+                                return (
+                                    <>
+                                        <div className="flex items-center justify-between mb-1.5">
+                                            <span className="text-xs font-semibold text-slate-700">
+                                                {completed === totalRequiredBlocks
+                                                    ? "All blocks signed — ready to submit"
+                                                    : `${completed} of ${totalRequiredBlocks} signature${totalRequiredBlocks !== 1 ? "s" : ""} completed`}
+                                            </span>
+                                            <span className="text-xs text-slate-400">{pct}%</span>
+                                        </div>
+                                        <div className="w-full bg-slate-100 rounded-full h-1.5">
+                                            <div className="bg-blue-500 h-1.5 rounded-full transition-all duration-300" style={{ width: `${pct}%` }} />
+                                        </div>
+                                    </>
+                                );
+                            })()}
+                        </div>
+                        {Object.keys(signatures).length + Object.keys(initials).length === totalRequiredBlocks && (
+                            <span className="w-6 h-6 bg-green-100 text-green-600 rounded-full flex items-center justify-center shrink-0">
+                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                            </span>
+                        )}
+                    </div>
+                </div>
+            )}
 
             <DocumentSignModal
                 isOpen={modalOpen}
