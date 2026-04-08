@@ -16,8 +16,6 @@ interface ProjectMessagingPanelProps {
     clientEmail?: string | null;
     clientPhone?: string | null;
     estimates: EstimateOption[];
-    currentUserName?: string;
-    currentUserEmail?: string;
 }
 
 export default function ProjectMessagingPanel({

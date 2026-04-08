@@ -103,8 +103,6 @@ export default function ProjectMessagingToggle({
                     clientEmail={clientEmail}
                     clientPhone={clientPhone}
                     estimates={estimates}
-                    currentUserName={currentUserName}
-                    currentUserEmail={currentUserEmail}
                 />
             </div>
         </>
