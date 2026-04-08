@@ -24,7 +24,12 @@ export default function GoogleMapsAutocomplete({ value, onChange, onPlaceDetails
             if (!window.google) {
                 const script = document.createElement("script");
                 (window as any).initGooglePlaces = initAutocomplete;
-                script.src = `https://maps.googleapis.com/maps/api/js?key=${process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "AIzaSyALTSGHtNgwQNOaK2NL5FgJXzvfmNcu5Xw"}&libraries=places&callback=initGooglePlaces`;
+                const mapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+                if (!mapsApiKey) {
+                    console.error("NEXT_PUBLIC_GOOGLE_MAPS_API_KEY is not set");
+                    return;
+                }
+                script.src = `https://maps.googleapis.com/maps/api/js?key=${mapsApiKey}&libraries=places&callback=initGooglePlaces`;
                 script.async = true;
                 script.defer = true;
                 document.head.appendChild(script);
