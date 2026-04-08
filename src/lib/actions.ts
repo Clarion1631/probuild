@@ -2176,18 +2176,57 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
 
     if (!estimate) return { success: false, error: "Estimate not found" };
 
-    const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+    const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
     const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
     if (unpaidSchedules.length > 0) {
         const estimateTotal = estimate.totalAmount?.toNumber() || 0;
+        // Half-cent-safe currency rounding
+        const rc = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
         const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+        const balanceDue = rc(estimateTotal - paidSum);
+
+        // Recalculate percentage-based unpaid milestones so stale DB values (from edits
+        // made without clicking Save) don't block sending. The LAST percentage milestone
+        // (by order) absorbs any rounding residual, guaranteeing the total sums exactly to
+        // balanceDue. If the computed lastAmount would be negative (inconsistent user data)
+        // we skip auto-correction and let the manual validation error fire instead.
+        const pctUnpaid = unpaidSchedules.filter(s => (s.percentage != null ? Number(s.percentage) : 0) > 0);
+        if (pctUnpaid.length > 0) {
+            const allButLast = pctUnpaid.slice(0, -1);
+            const allButLastAmounts = allButLast.map(s => rc(estimateTotal * (Number(s.percentage!) / 100)));
+            const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
+            const fixedUnpaidSum = unpaidSchedules
+                .filter(s => (s.percentage != null ? Number(s.percentage) : 0) <= 0)
+                .reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+            const lastMilestone = pctUnpaid[pctUnpaid.length - 1];
+            const lastAmount = rc(balanceDue - fixedUnpaidSum - allButLastSum);
+
+            if (lastAmount >= 0) {
+                const updates: { id: string; amount: number }[] = [];
+                allButLast.forEach((s, i) => {
+                    if (Math.abs(allButLastAmounts[i] - (s.amount?.toNumber() || 0)) > 0.001)
+                        updates.push({ id: s.id, amount: allButLastAmounts[i] });
+                });
+                if (Math.abs(lastAmount - (lastMilestone.amount?.toNumber() || 0)) > 0.001)
+                    updates.push({ id: lastMilestone.id, amount: lastAmount });
+
+                if (updates.length > 0) {
+                    await Promise.all(updates.map(u =>
+                        prisma.estimatePaymentSchedule.update({ where: { id: u.id }, data: { amount: u.amount } })
+                    ));
+                    const refreshed = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
+                    schedules.splice(0, schedules.length, ...refreshed);
+                }
+            }
+        }
+
         const unpaidSum = schedules.reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0) - paidSum;
-        const remaining = Math.round((estimateTotal - paidSum) * 100) / 100;
-        const unpaidRounded = Math.round(unpaidSum * 100) / 100;
-        if (Math.abs(unpaidRounded - remaining) > 0.01) {
+        const unpaidRounded = rc(unpaidSum);
+        if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
             const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
-            const diff = Math.abs(unpaidRounded - remaining);
-            return { success: false, error: `Milestone total (${fmt(unpaidRounded)}) doesn't match the estimate balance due (${fmt(remaining)}). Difference: ${fmt(diff)}. Please adjust your milestones before sending.` };
+            const diff = Math.abs(unpaidRounded - balanceDue);
+            return { success: false, error: `Milestone total (${fmt(unpaidRounded)}) doesn't match the estimate balance due (${fmt(balanceDue)}). Difference: ${fmt(diff)}. Please adjust your milestones before sending.` };
         }
     }
 
