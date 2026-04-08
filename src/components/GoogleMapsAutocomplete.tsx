@@ -3,6 +3,7 @@
 declare global {
     interface Window {
         google: any;
+        initGooglePlaces: () => void;
     }
 }
 
@@ -16,28 +17,32 @@ interface GoogleMapsAutocompleteProps {
     placeholder?: string;
 }
 
+// Singleton loader — prevents duplicate script tags and race conditions when
+// multiple autocomplete instances mount concurrently.
+let googleMapsPromise: Promise<void> | null = null;
+
+function loadGoogleMapsScript(): Promise<void> {
+    if (typeof window === "undefined") return Promise.resolve();
+    if (window.google?.maps) return Promise.resolve();
+    if (googleMapsPromise) return googleMapsPromise;
+
+    googleMapsPromise = new Promise((resolve) => {
+        window.initGooglePlaces = resolve;
+        const script = document.createElement("script");
+        const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim();
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=places&callback=initGooglePlaces`;
+        script.async = true;
+        script.defer = true;
+        document.head.appendChild(script);
+    });
+
+    return googleMapsPromise;
+}
+
 export default function GoogleMapsAutocomplete({ value, onChange, onPlaceDetails, className, placeholder }: GoogleMapsAutocompleteProps) {
     const inputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
-        const loadGoogleMaps = () => {
-            if (!window.google) {
-                const script = document.createElement("script");
-                (window as any).initGooglePlaces = initAutocomplete;
-                const mapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
-                if (!mapsApiKey) {
-                    console.error("NEXT_PUBLIC_GOOGLE_MAPS_API_KEY is not set");
-                    return;
-                }
-                script.src = `https://maps.googleapis.com/maps/api/js?key=${mapsApiKey}&libraries=places&callback=initGooglePlaces`;
-                script.async = true;
-                script.defer = true;
-                document.head.appendChild(script);
-            } else {
-                initAutocomplete();
-            }
-        };
-
         const initAutocomplete = () => {
             if (!inputRef.current || !window.google) return;
             const autocomplete = new window.google.maps.places.Autocomplete(inputRef.current, {
@@ -54,7 +59,7 @@ export default function GoogleMapsAutocomplete({ value, onChange, onPlaceDetails
                         let city = "";
                         let state = "";
                         let zip = "";
-                        
+
                         for (const component of place.address_components) {
                             const componentType = component.types[0];
                             if (componentType === "street_number") street_number = component.long_name;
@@ -75,7 +80,7 @@ export default function GoogleMapsAutocomplete({ value, onChange, onPlaceDetails
             });
         };
 
-        loadGoogleMaps();
+        loadGoogleMapsScript().then(initAutocomplete);
     }, [onChange]);
 
     return (
