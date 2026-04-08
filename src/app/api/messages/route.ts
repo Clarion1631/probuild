@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
 import { sendSMS } from "@/lib/sms";
+import { logActivity } from "@/lib/actions";
 
 // GET /api/messages?projectId=X&subcontractorId=Y — list messages for a project thread
 export async function GET(request: Request) {
@@ -80,6 +81,18 @@ export async function POST(request: Request) {
             body: messageBody,
         },
     });
+
+    // Log client message to activity feed
+    if (senderType === "CLIENT" && !subcontractorId) {
+        await logActivity({
+            projectId,
+            actorType: "CLIENT",
+            actorName: resolvedName,
+            action: "sent_message",
+            entityType: "message",
+            entityId: message.id,
+        });
+    }
 
     // Send email notification
     try {

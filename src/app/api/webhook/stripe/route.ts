@@ -3,7 +3,7 @@ import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
-import { findOrCreateClientThread } from "@/lib/actions";
+import { findOrCreateClientThread, logActivity } from "@/lib/actions";
 
 export async function POST(req: Request) {
     const payload = await req.text();
@@ -124,6 +124,16 @@ export async function POST(req: Request) {
                         } catch (e) {
                             console.error("[webhook] Failed to post estimate payment activity:", e);
                         }
+                        await logActivity({
+                            projectId,
+                            actorType: "CLIENT",
+                            actorName: "Client",
+                            action: "paid_invoice",
+                            entityType: "estimate",
+                            entityId: estimate.id,
+                            entityName: `Estimate #${estimate.code} — ${updatedEstSchedule.name}`,
+                            metadata: { amount: Number(updatedEstSchedule.amount), paymentMethod },
+                        });
                     }
                     break;
                 }
@@ -204,6 +214,16 @@ export async function POST(req: Request) {
                     } catch (e) {
                         console.error("[webhook] Failed to post payment activity:", e);
                     }
+                    await logActivity({
+                        projectId: invoice.projectId,
+                        actorType: "CLIENT",
+                        actorName: "Client",
+                        action: "paid_invoice",
+                        entityType: "invoice",
+                        entityId: invoice.id,
+                        entityName: `Invoice #${invoice.code} — ${updatedSchedule.name}`,
+                        metadata: { amount: Number(updatedSchedule.amount), paymentMethod },
+                    });
                 }
                 break;
             }

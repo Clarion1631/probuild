@@ -959,6 +959,64 @@ export async function findOrCreateClientThread(projectId: string) {
     return thread;
 }
 
+export async function logActivity({
+    projectId,
+    actorType,
+    actorName,
+    action,
+    entityType,
+    entityId,
+    entityName,
+    metadata,
+}: {
+    projectId: string;
+    actorType: string;
+    actorName: string;
+    action: string;
+    entityType?: string;
+    entityId?: string;
+    entityName?: string;
+    metadata?: Record<string, unknown>;
+}) {
+    try {
+        await prisma.activityLog.create({
+            data: {
+                projectId,
+                actorType,
+                actorName,
+                action,
+                entityType: entityType ?? null,
+                entityId: entityId ?? null,
+                entityName: entityName ?? null,
+                metadata: metadata ? JSON.stringify(metadata) : null,
+            },
+        });
+    } catch (err) {
+        console.error("[logActivity] Failed:", err);
+    }
+}
+
+export async function logPortalVisit(projectId: string, clientName: string) {
+    // Dedup: skip if a portal visit was logged in the last 30 minutes
+    const recent = await prisma.activityLog.findFirst({
+        where: {
+            projectId,
+            action: "viewed_portal",
+            createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+        },
+    });
+    if (!recent) {
+        await logActivity({
+            projectId,
+            actorType: "CLIENT",
+            actorName: clientName,
+            action: "viewed_portal",
+            entityType: "project",
+            entityId: projectId,
+        });
+    }
+}
+
 async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
     try {
         if (leadId) {
@@ -1022,13 +1080,26 @@ export async function markEstimateViewed(estimateId: string) {
             estimate.leadId, estimate.projectId,
             `👁️ ${clientName} viewed estimate ${estimate.title || estimate.code}`
         );
+
+        // Log to activity feed
+        if (estimate.projectId) {
+            await logActivity({
+                projectId: estimate.projectId,
+                actorType: "CLIENT",
+                actorName: clientName,
+                action: "viewed_estimate",
+                entityType: "estimate",
+                entityId: estimateId,
+                entityName: `Estimate ${estimate.code || estimate.title}`,
+            });
+        }
     }
 }
 
 export async function markContractViewed(contractId: string) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
-        select: { viewedAt: true, title: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
+        select: { viewedAt: true, title: true, projectId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
     if (contract && !contract.viewedAt) {
@@ -1052,6 +1123,20 @@ export async function markContractViewed(contractId: string) {
                     </div>
                 </div>`
             );
+        }
+
+        // Log to activity feed
+        if (contract.projectId) {
+            const projectId = contract.projectId;
+            await logActivity({
+                projectId,
+                actorType: "CLIENT",
+                actorName: clientName,
+                action: "viewed_contract",
+                entityType: "contract",
+                entityId: contractId,
+                entityName: `Contract "${contract.title}"`,
+            });
         }
     }
 }
@@ -1206,6 +1291,19 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             estimate.leadId, estimate.projectId,
             `✅ ${signatureName} signed and approved estimate ${estimate.code || estimate.title}`
         );
+    }
+
+    // Log to activity feed
+    if (estimate?.projectId) {
+        await logActivity({
+            projectId: estimate.projectId,
+            actorType: "CLIENT",
+            actorName: signatureName,
+            action: "signed_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+        });
     }
 
     if (estimate?.projectId) {
@@ -2518,6 +2616,19 @@ export async function approveContract(contractId: string, signatureName: string,
             `<p>The contract "<strong>${contract.title}</strong>" has been electronically signed by <strong>${signatureName}</strong> on ${now.toLocaleString()}.</p>
             ${isRecurring ? `<p style="color: #666; font-size: 0.9em;">This is a recurring document (every ${contract.recurringDays} days). The next signing will be due on <strong>${new Date(now.getTime() + contract.recurringDays! * 86400000).toLocaleDateString()}</strong>.</p>` : ""}`
         );
+    }
+
+    // Log to activity feed
+    if (contract.projectId) {
+        await logActivity({
+            projectId: contract.projectId,
+            actorType: "CLIENT",
+            actorName: signatureName,
+            action: "signed_contract",
+            entityType: "contract",
+            entityId: contractId,
+            entityName: `Contract "${contract.title}"`,
+        });
     }
 
     revalidatePath("/");
