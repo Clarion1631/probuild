@@ -174,6 +174,44 @@ export function ContractWysiwygEditor({ value, onChange }: ContractWysiwygEditor
         setOpenDropdown(null);
     };
 
+    const insertSignatureSection = () => {
+        if (!editor) return;
+        editor.chain().focus()
+            .insertContent([
+                { type: "horizontalRule" },
+                { type: "paragraph", content: [
+                    { type: "text", marks: [{ type: "bold" }], text: "CLIENT SIGNATURE" },
+                ]},
+                { type: "paragraph", content: [
+                    { type: "mergeField", attrs: { key: "SIGNATURE_BLOCK" } },
+                ]},
+                { type: "paragraph", content: [
+                    { type: "text", text: "Printed Name:\u00a0" },
+                    { type: "mergeField", attrs: { key: "client_name" } },
+                ]},
+                { type: "paragraph", content: [
+                    { type: "text", text: "Date:\u00a0" },
+                    { type: "mergeField", attrs: { key: "DATE_BLOCK" } },
+                ]},
+                { type: "paragraph" },
+                { type: "horizontalRule" },
+                { type: "paragraph", content: [
+                    { type: "text", marks: [{ type: "bold" }], text: "CONTRACTOR SIGNATURE" },
+                ]},
+                { type: "paragraph", content: [
+                    { type: "text", text: "Company:\u00a0" },
+                    { type: "mergeField", attrs: { key: "company_name" } },
+                ]},
+                { type: "paragraph", content: [
+                    { type: "text", text: "Signature:\u00a0___________________________________" },
+                ]},
+                { type: "paragraph", content: [
+                    { type: "text", text: "Date:\u00a0___________________________________" },
+                ]},
+            ])
+            .run();
+    };
+
     const dataCategories = MERGE_FIELDS.filter(c => c.category !== "Signing");
     const signingCategory = MERGE_FIELDS.find(c => c.category === "Signing")!;
 
@@ -216,6 +254,16 @@ export function ContractWysiwygEditor({ value, onChange }: ContractWysiwygEditor
                     <div className="w-px h-5 bg-slate-300 mx-1 shrink-0" />
                     <div className="flex items-center gap-1.5 border border-rose-200 rounded-md px-2.5 py-1 bg-rose-50">
                         <span className="text-xs font-semibold text-rose-600 shrink-0">Signing:</span>
+                        <button
+                            type="button"
+                            onClick={insertSignatureSection}
+                            className="px-2.5 py-0.5 text-xs font-semibold rounded bg-rose-600 text-white hover:bg-rose-700 transition flex items-center gap-1"
+                            title="Insert a complete client + contractor signature section"
+                        >
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                            Signature Section
+                        </button>
+                        <div className="w-px h-4 bg-rose-200 shrink-0" />
                         {signingCategory.fields.map(f => (
                             <button
                                 key={f.key}
