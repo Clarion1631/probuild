@@ -128,7 +128,10 @@ Sort phases in logical construction order. Make the estimate thorough and profes
         let aiData: AiData;
         try {
             const parsed = JSON.parse(rawText);
-            aiData = Array.isArray(parsed) ? { phases: [], paymentMilestones: [] } : parsed;
+            if (Array.isArray(parsed)) {
+                return NextResponse.json({ error: "AI returned wrong format — please retry" }, { status: 502 });
+            }
+            aiData = parsed;
         } catch {
             const objMatch = rawText.match(/\{[\s\S]*\}/);
             if (objMatch) {
@@ -163,13 +166,15 @@ Sort phases in logical construction order. Make the estimate thorough and profes
             const phaseTotal = phaseItems.reduce((s, it) => s + (it.quantity || 1) * (it.unitCost || 0), 0);
 
             // Parent row — phase header
+            // unitCost = phaseTotal so that qty(1) * unitCost = total survives the
+            // save-path recomputation in EstimateEditor (which does qty * unitCost for all rows)
             estimateItems.push(makeItem({
                 id: parentId,
                 name: phase.phaseName || `Phase ${pi + 1}`,
                 description: "",
                 type: "Material",
                 quantity: 1,
-                unitCost: 0,
+                unitCost: phaseTotal,
                 total: phaseTotal,
                 parentId: null,
                 costCodeId: phase.phaseCode ? (codeMap[phase.phaseCode] ?? null) : null,
