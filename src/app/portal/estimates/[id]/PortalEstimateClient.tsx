@@ -291,7 +291,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                             </div>
                                             <div className="flex gap-4 items-center">
                                                 <span className="font-semibold text-slate-800">{formatCurrency(p.amount)}</span>
-                                                {isApproved && !isPaid && stripeEnabled && (
+                                                {isApproved && !isPaid && stripeEnabled && Number(p.amount) > 0 && (
                                                     <PortalPayButton
                                                         paymentScheduleId={p.id}
                                                         estimateId={initialEstimate.id}

@@ -49,6 +49,9 @@ export async function POST(req: Request) {
             if (schedule.status === "Paid") {
                 return new NextResponse("This milestone has already been paid", { status: 400 });
             }
+            if (Number(schedule.amount) <= 0) {
+                return new NextResponse("Payment schedule has no amount — please update the milestone in the estimate editor.", { status: 400 });
+            }
 
             const estimate = schedule.estimate;
             const clientName =

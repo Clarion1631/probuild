@@ -1401,9 +1401,10 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         await prisma.estimate.update({ where: { id: estimateId }, data: safeData });
     }
 
-    // Delete existing items and schedules, then batch-insert replacements
+    // Delete existing items and NON-PAID schedules, then batch-insert replacements
+    // Preserve Paid schedules so payment history survives estimate edits
     await prisma.estimateItem.deleteMany({ where: { estimateId } });
-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId, status: { not: "Paid" } } });
 
     // Build item data — split parents/children so FK ordering is respected
     const toItemData = (item: any, fallbackOrder: number) => ({
@@ -1433,8 +1434,8 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         await prisma.estimateItem.createMany({ data: childItems.map(toItemData) });
     }
 
-    // Batch-insert payment schedules
-    const schedules = data.paymentSchedules || [];
+    // Batch-insert payment schedules (skip Paid ones — they were preserved above)
+    const schedules = (data.paymentSchedules || []).filter((s: any) => s.status !== "Paid");
     if (schedules.length > 0) {
         await prisma.estimatePaymentSchedule.createMany({
             data: schedules.map((schedule: any, idx: number) => ({
