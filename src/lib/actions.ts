@@ -1409,8 +1409,23 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
         { fromName: companyName, replyTo: settings?.email || undefined }
     );
 
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    // Log to activity feed (project-scoped only)
+    if (invoice.projectId) {
+        await logActivity({
+            projectId: invoice.projectId,
+            actorType: "TEAM",
+            actorName: companyName,
+            action: "sent_invoice",
+            entityType: "invoice",
+            entityId: invoiceId,
+            entityName: `Invoice ${invoice.code}`,
+        });
+    }
+
+    if (invoice.projectId) {
+        revalidatePath(`/projects/${invoice.projectId}/invoices`);
+        revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    }
     revalidatePath(`/invoices`);
     return { success: true, sentTo: recipientEmail };
 }
@@ -2349,6 +2364,19 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         revalidatePath(`/projects/${estimate.projectId}/messages`);
     }
 
+    // Log to activity feed (project-scoped only)
+    if (estimate.projectId) {
+        await logActivity({
+            projectId: estimate.projectId,
+            actorType: "TEAM",
+            actorName: companyName,
+            action: "sent_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+        });
+    }
+
     // Revalidate paths
     if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
     if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
@@ -2558,6 +2586,19 @@ export async function sendContractToClient(contractId: string) {
         </body>
         </html>`
     );
+
+    // Log to activity feed (project-scoped only)
+    if (contract.projectId) {
+        await logActivity({
+            projectId: contract.projectId,
+            actorType: "TEAM",
+            actorName: companyName,
+            action: "sent_contract",
+            entityType: "contract",
+            entityId: contractId,
+            entityName: contract.title,
+        });
+    }
 
     if (contract.projectId) revalidatePath(`/projects/${contract.projectId}`);
     if (contract.leadId) revalidatePath(`/leads/${contract.leadId}`);
