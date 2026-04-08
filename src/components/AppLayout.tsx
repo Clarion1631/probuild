@@ -65,7 +65,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     }
 
     return (
-        <div className="flex min-h-screen h-full bg-hui-background">
+        <div className="flex h-screen bg-hui-background overflow-hidden">
             <Sidebar />
             <div className="flex-1 flex flex-col overflow-hidden">
                 <Header />

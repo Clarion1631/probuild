@@ -14,6 +14,7 @@ interface TeamChatProps {
     projectId: string;
     currentUserName?: string;
     onNewMessages?: (count: number) => void;
+    onParticipantsChange?: (names: string[]) => void;
     isActive?: boolean;
 }
 
@@ -21,6 +22,7 @@ export default function TeamChat({
     projectId,
     currentUserName = "Team Member",
     onNewMessages,
+    onParticipantsChange,
     isActive = true,
 }: TeamChatProps) {
     const [messages, setMessages] = useState<TeamMessageData[]>([]);
@@ -30,10 +32,11 @@ export default function TeamChat({
     const scrollRef = useRef<HTMLDivElement>(null);
     const pollRef = useRef<NodeJS.Timeout | null>(null);
     const prevCountRef = useRef(0);
+    const prevParticipantsRef = useRef("");
 
-    const fetchMessages = useCallback(async () => {
+    const fetchMessages = useCallback(async (signal?: AbortSignal) => {
         try {
-            const res = await fetch(`/api/team-messages?projectId=${projectId}`);
+            const res = await fetch(`/api/team-messages?projectId=${projectId}`, { signal });
             if (!res.ok) return;
             const data = await res.json();
             const msgs: TeamMessageData[] = data.messages || [];
@@ -44,18 +47,33 @@ export default function TeamChat({
                 onNewMessages(msgs.length - prevCountRef.current);
             }
             prevCountRef.current = msgs.length;
+
+            // Derive unique participants (excluding current user) and notify parent
+            if (onParticipantsChange) {
+                const others = Array.from(
+                    new Set(msgs.map((m) => m.authorName).filter((n) => n !== currentUserName))
+                );
+                const serialized = JSON.stringify([...others].sort());
+                if (serialized !== prevParticipantsRef.current) {
+                    prevParticipantsRef.current = serialized;
+                    onParticipantsChange(others);
+                }
+            }
         } catch (err) {
+            if (err instanceof Error && err.name === "AbortError") return;
             console.error("[TeamChat] Failed to fetch:", err);
         } finally {
             setLoading(false);
         }
-    }, [projectId, isActive, onNewMessages]);
+    }, [projectId, isActive, onNewMessages, onParticipantsChange, currentUserName]);
 
     useEffect(() => {
-        fetchMessages();
-        pollRef.current = setInterval(fetchMessages, 5000);
+        const controller = new AbortController();
+        fetchMessages(controller.signal);
+        pollRef.current = setInterval(() => fetchMessages(controller.signal), 5000);
         return () => {
             if (pollRef.current) clearInterval(pollRef.current);
+            controller.abort();
         };
     }, [fetchMessages]);
 
@@ -144,7 +162,7 @@ export default function TeamChat({
     return (
         <div className="h-full flex flex-col bg-white">
             {/* Messages */}
-            <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3 bg-slate-50/50">
+            <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-3 bg-slate-50/50">
                 {messages.length === 0 ? (
                     <div className="flex flex-col items-center justify-center h-full text-center py-12">
                         <div className="w-14 h-14 bg-slate-100 rounded-2xl flex items-center justify-center mb-4">
@@ -206,8 +224,8 @@ export default function TeamChat({
                 )}
             </div>
 
-            {/* Input */}
-            <div className="px-3 py-2.5 border-t border-hui-border bg-white">
+            {/* Input — pinned to bottom */}
+            <div className="shrink-0 px-3 py-2.5 border-t border-hui-border bg-white">
                 <div className="flex items-end gap-2">
                     <div className="flex-1">
                         <textarea
