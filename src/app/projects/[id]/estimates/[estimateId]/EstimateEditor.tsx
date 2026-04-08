@@ -3,7 +3,7 @@
 /** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
 const rm = (n: number) => Math.round(n * 100) / 100;
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
@@ -69,6 +69,21 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [aiSubitemSuggestions, setAiSubitemSuggestions] = useState<any[]>([]);
     const [showSubitemSuggestions, setShowSubitemSuggestions] = useState<string | null>(null);
     const [selectedSuggestionIndices, setSelectedSuggestionIndices] = useState<Set<number>>(new Set());
+    const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+
+    // Derived: sum of children totals per section header
+    const sectionTotals = useMemo(() => {
+        const map = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                map.set(item.parentId, (map.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        return map;
+    }, [items]);
+
+    // A row is a section header if it has no parentId and at least one child references it
+    const sectionIds = useMemo(() => new Set(items.filter(i => i.parentId).map((i: any) => i.parentId)), [items]);
 
     // Auto-expand textarea ref handler
     const autoExpand = useCallback((el: HTMLTextAreaElement | null) => {
@@ -403,6 +418,22 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
 
+    // Auto-recalculate percentage-based milestones when total changes
+    useEffect(() => {
+        setPaymentSchedules(prev => {
+            if (prev.length === 0) return prev;
+            const updated = prev.map(s => {
+                const pct = parseFloat(s.percentage) || 0;
+                if (pct > 0 && s.status !== "Paid") {
+                    return { ...s, amount: String(rm(total * (pct / 100))) };
+                }
+                return s;
+            });
+            const changed = updated.some((s, i) => s.amount !== prev[i].amount);
+            return changed ? updated : prev;
+        });
+    }, [total]);
+
     // Internal margin calculations
     const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
     const totalMarkup = subtotal - totalBaseCost;
@@ -410,11 +441,20 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
     async function handleSave() {
         setIsSaving(true);
-        const mappedItems = items.map((item, index) => ({
-            ...item,
-            order: index,
-            total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-        }));
+        // Recompute section header totals from children before saving
+        const childTotals = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        const mappedItems = items.map((item, index) => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            const computedTotal = isSection
+                ? (childTotals.get(item.id) || 0)
+                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+            return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
+        });
         const mappedSchedules = paymentSchedules.map((schedule, index) => ({
             ...schedule,
             order: index
@@ -561,16 +601,28 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 // Auto-save in background — set isSaving to block concurrent blur-triggered save
                 setIsSaving(true);
                 try {
-                    const mappedItems = newItems.map((item, index) => ({
-                        ...item,
-                        order: index,
-                        total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-                    }));
+                    // Recompute section header totals from children before saving
+                    const aiChildTotals = new Map<string, number>();
+                    for (const item of newItems) {
+                        if (item.parentId) {
+                            aiChildTotals.set(item.parentId, (aiChildTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                        }
+                    }
+                    const mappedItems = newItems.map((item: any, index: number) => {
+                        const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
+                        const ct = isSect ? (aiChildTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                        return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
+                    });
                     const mappedSchedules = newSchedules.map((schedule, index) => ({
                         ...schedule,
                         order: index
                     }));
-                    const newSubtotal = newItems.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+                    // Subtotal from leaf items only (sections would double-count)
+                    const newSubtotal = newItems.reduce((acc: number, item: any) => {
+                        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                        if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                        return acc;
+                    }, 0);
                     const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
                     await saveEstimate(initialEstimate.id, context.id, context.type, {
                         title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
@@ -874,7 +926,20 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                     {/* Primary Actions */}
                     <button
-                        onClick={() => setShowSendModal(true)}
+                        onClick={() => {
+                            const unpaidSchedules = paymentSchedules.filter(s => s.status !== "Paid");
+                            if (unpaidSchedules.length > 0) {
+                                const paidSum = paymentSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+                                const milestoneSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+                                const remaining = rm(total - paidSum);
+                                const unpaidSum = rm(milestoneSum - paidSum);
+                                if (Math.abs(unpaidSum - remaining) > 0.01) {
+                                    toast.error(`Payment milestones total $${milestoneSum.toFixed(2)} but estimate total is $${total.toFixed(2)}. Please adjust milestones.`);
+                                    return;
+                                }
+                            }
+                            setShowSendModal(true);
+                        }}
                         className="hui-btn hui-btn-green flex items-center gap-2"
                     >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
@@ -975,7 +1040,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         {/* Premium Document Wrapper */}
                         <div className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
                             {/* Subtle Gradient Accent Top Line */}
-                            <div className="h-1.5 w-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500"></div>
+                            <div className="h-1.5 w-full bg-slate-800"></div>
                             {/* Document Header */}
                             <div className="p-10 pb-12 space-y-10 border-b border-slate-100">
                                 <input
@@ -1041,8 +1106,56 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     {(provided) => (
                                         <div {...provided.droppableProps} ref={provided.innerRef} className="divide-y divide-slate-100">
                                             {items.map((item, index) => {
-                                                const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
                                                 const isSubItem = !!item.parentId;
+                                                const isSection = !item.parentId && sectionIds.has(item.id);
+                                                // Hide children of collapsed sections
+                                                if (isSubItem && collapsedSections.has(item.parentId)) return null;
+                                                const sectionTotal = isSection ? (sectionTotals.get(item.id) || 0) : 0;
+                                                const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
+                                                const isCollapsed = isSection && collapsedSections.has(item.id);
+
+                                                // ── Section header row ──────────────────────────────────────
+                                                if (isSection) {
+                                                    return (
+                                                        <Draggable key={item.id} draggableId={item.id} index={index}>
+                                                            {(provided, snapshot) => (
+                                                                <div ref={provided.innerRef} {...provided.draggableProps}
+                                                                    className={`flex items-center px-4 py-2.5 bg-slate-100 border-l-4 border-hui-primary group transition ${snapshot.isDragging ? "shadow-lg z-50" : ""}`}
+                                                                >
+                                                                    <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-400 hover:text-slate-600 cursor-grab opacity-0 group-hover:opacity-100">
+                                                                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
+                                                                    </div>
+                                                                    <button onClick={() => setCollapsedSections(prev => { const n = new Set(prev); n.has(item.id) ? n.delete(item.id) : n.add(item.id); return n; })}
+                                                                        className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-200 transition mr-1 text-slate-500 flex-shrink-0"
+                                                                    >
+                                                                        <svg className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "-rotate-90" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                                                        </svg>
+                                                                    </button>
+                                                                    <div className="w-6 mr-1">
+                                                                        <input type="checkbox" checked={selectedItemIds.includes(item.id)}
+                                                                            onChange={e => { if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]); else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id)); }}
+                                                                            className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                                                        />
+                                                                    </div>
+                                                                    <input type="text" value={item.name} onChange={e => updateItem(index, "name", e.target.value)}
+                                                                        placeholder="Section name"
+                                                                        className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
+                                                                    />
+                                                                    <div className="flex items-center gap-3 ml-auto">
+                                                                        {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
+                                                                        <span className="text-sm font-semibold text-slate-700 w-32 text-right">{formatCurrency(sectionTotal)}</span>
+                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-0 group-hover:opacity-100">
+                                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </Draggable>
+                                                    );
+                                                }
+
+                                                // ── Regular item row ────────────────────────────────────────
                                                 return (
                                                     <Draggable key={item.id} draggableId={item.id} index={index}>
                                                         {(provided, snapshot) => (

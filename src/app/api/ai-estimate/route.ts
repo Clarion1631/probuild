@@ -165,14 +165,14 @@ Sort phases in logical construction order. Make the estimate thorough and profes
             const phaseItems = phase.items || [];
             const phaseTotal = phaseItems.reduce((s, it) => s + (it.quantity || 1) * (it.unitCost || 0), 0);
 
-            // Parent row — phase header
+            // Parent row — phase header (type "Section" so editor renders it as a collapsible group)
             // unitCost = phaseTotal so that qty(1) * unitCost = total survives the
             // save-path recomputation in EstimateEditor (which does qty * unitCost for all rows)
             estimateItems.push(makeItem({
                 id: parentId,
                 name: phase.phaseName || `Phase ${pi + 1}`,
                 description: "",
-                type: "Material",
+                type: "Section",
                 quantity: 1,
                 unitCost: phaseTotal,
                 total: phaseTotal,
