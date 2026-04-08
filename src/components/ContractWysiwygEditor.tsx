@@ -187,8 +187,7 @@ export function ContractWysiwygEditor({ value, onChange }: ContractWysiwygEditor
                     { type: "mergeField", attrs: { key: "SIGNATURE_BLOCK" } },
                 ]},
                 { type: "paragraph", content: [
-                    { type: "text", text: "Printed Name:\u00a0" },
-                    { type: "mergeField", attrs: { key: "client_name" } },
+                    { type: "text", text: "Printed Name:\u00a0___________________________________" },
                 ]},
                 { type: "paragraph", content: [
                     { type: "text", text: "Date:\u00a0" },
@@ -203,8 +202,7 @@ export function ContractWysiwygEditor({ value, onChange }: ContractWysiwygEditor
                     { type: "mergeField", attrs: { key: "CONTRACTOR_SIGNATURE_BLOCK" } },
                 ]},
                 { type: "paragraph", content: [
-                    { type: "text", text: "Company:\u00a0" },
-                    { type: "mergeField", attrs: { key: "company_name" } },
+                    { type: "text", text: "Company:\u00a0___________________________________" },
                 ]},
                 { type: "paragraph", content: [
                     { type: "text", text: "Date:\u00a0___________________________________" },

@@ -68,7 +68,7 @@ export default function PortalContractClient({ initialContract, companySettings 
         // contractorSignedBy is HTML-escaped before injection to prevent XSS (injected after DOMPurify runs)
         const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
         if (initialContract.contractorSignatureUrl && /^data:image\/(png|jpeg|webp);base64,/.test(initialContract.contractorSignatureUrl)) {
-            const safeUrl = initialContract.contractorSignatureUrl;
+            const safeUrl = escapeHtml(initialContract.contractorSignatureUrl);
             const safeName = escapeHtml(initialContract.contractorSignedBy || "Signed");
             html = html.replace(/\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}/g,
                 `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Contractor Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor — ${safeName}</span></span>`

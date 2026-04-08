@@ -2434,19 +2434,21 @@ export async function signContractAsContractor(contractId: string, signerName: s
         throw new Error("Invalid signature format");
     }
 
-    // Idempotency — don't silently overwrite an existing contractor signature
-    const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+    // Verify contract exists first (gives a clear 404-style error if not found)
+    const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { id: true } });
     if (!existing) throw new Error("Contract not found");
-    if (existing.contractorSignedAt) throw new Error("Contract already signed by contractor");
 
-    await prisma.contract.update({
-        where: { id: contractId },
+    // Atomic idempotency guard — updateMany only matches rows where contractorSignedAt IS NULL,
+    // so two concurrent requests can't both succeed (eliminates TOCTOU race)
+    const result = await prisma.contract.updateMany({
+        where: { id: contractId, contractorSignedAt: null },
         data: {
             contractorSignedBy: signerName,
             contractorSignedAt: new Date(),
             contractorSignatureUrl: signatureDataUrl,
         },
     });
+    if (result.count === 0) throw new Error("Contract already signed by contractor");
 
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
