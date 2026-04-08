@@ -2185,7 +2185,9 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         const remaining = Math.round((estimateTotal - paidSum) * 100) / 100;
         const unpaidRounded = Math.round(unpaidSum * 100) / 100;
         if (Math.abs(unpaidRounded - remaining) > 0.01) {
-            return { success: false, error: "Payment schedule amounts do not match the estimate total. Please update milestones before sending." };
+            const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+            const diff = Math.abs(unpaidRounded - remaining);
+            return { success: false, error: `Milestone total (${fmt(unpaidRounded)}) doesn't match the estimate balance due (${fmt(remaining)}). Difference: ${fmt(diff)}. Please adjust your milestones before sending.` };
         }
     }
 
