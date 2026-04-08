@@ -2181,6 +2181,27 @@ export async function deleteDocumentTemplate(id: string) {
 
 export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     try {
+    // --- Server-side CC validation ---
+    const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const CC_MAX = 20;
+    if (ccEmails && ccEmails.length > 0) {
+        if (ccEmails.length > CC_MAX) {
+            return { success: false, error: `Too many CC recipients (max ${CC_MAX}).` };
+        }
+        const invalid = ccEmails.filter(e => !EMAIL_REGEX.test(e));
+        if (invalid.length > 0) {
+            return { success: false, error: `Invalid CC email address${invalid.length > 1 ? "es" : ""}: ${invalid.join(", ")}` };
+        }
+        // Dedupe case-insensitively
+        const seen = new Set<string>();
+        ccEmails = ccEmails.filter(e => {
+            const key = e.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -2248,6 +2269,13 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const client = estimate.project?.client || estimate.lead?.client;
     const recipientEmail = overrideEmail || client?.email;
     if (!recipientEmail) return { success: false, error: "No email address found for this client. Please add an email address before sending." };
+
+    // Remove the primary recipient from CC to avoid Resend duplicate-recipient errors
+    if (ccEmails && ccEmails.length > 0) {
+        const recipientLower = recipientEmail.toLowerCase();
+        ccEmails = ccEmails.filter(e => e.toLowerCase() !== recipientLower);
+        if (ccEmails.length === 0) ccEmails = undefined;
+    }
 
     // Snapshot T&C if a template is selected
     let termsHtml: string | null = null;
@@ -2352,13 +2380,16 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         revalidatePath(`/leads/${estimate.leadId}/messages`);
     } else if (estimate.projectId) {
         const thread = await findOrCreateClientThread(estimate.projectId);
+        const projectMessageBody = ccEmails && ccEmails.length > 0
+            ? `${messageBody}\n\nCC: ${ccEmails.join(", ")}`
+            : messageBody;
         await prisma.message.create({
             data: {
                 threadId: thread.id,
                 senderType: "TEAM",
                 senderName: companyName,
                 senderEmail: settings?.email || null,
-                body: messageBody,
+                body: projectMessageBody,
             },
         });
         revalidatePath(`/projects/${estimate.projectId}/messages`);

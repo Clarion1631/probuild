@@ -13,6 +13,7 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
     const [previewBody, setPreviewBody] = useState("");
     const [sendToEmail, setSendToEmail] = useState(clientEmail || "");
     const [ccEmails, setCcEmails] = useState("");
+    const [ccError, setCcError] = useState("");
     const [customMessage, setCustomMessage] = useState("");
 
     useEffect(() => {
@@ -32,9 +33,24 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
         setPreviewBody(t?.body || "");
     }, [selectedTemplateId, templates]);
 
+    function validateCc(raw: string): string {
+        if (!raw.trim()) return "";
+        const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        const parts = raw.split(",").map(e => e.trim()).filter(Boolean);
+        if (parts.length > 20) return "Too many CC recipients (max 20).";
+        const invalid = parts.filter(e => !EMAIL_REGEX.test(e));
+        if (invalid.length > 0) return `Invalid: ${invalid.join(", ")}`;
+        return "";
+    }
+
     async function handleSend() {
         if (!sendToEmail.trim()) {
             toast.error("Please enter an email address.");
+            return;
+        }
+        const ccValidation = validateCc(ccEmails);
+        if (ccValidation) {
+            toast.error(ccValidation);
             return;
         }
         setIsSending(true);
@@ -97,11 +113,13 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                             <input
                                 type="text"
                                 value={ccEmails}
-                                onChange={e => setCcEmails(e.target.value)}
+                                onChange={e => { setCcEmails(e.target.value); setCcError(validateCc(e.target.value)); }}
+                                onBlur={e => setCcError(validateCc(e.target.value))}
                                 placeholder="email1@example.com, email2@example.com"
                                 className="flex-1 text-sm text-hui-textMain bg-transparent focus:outline-none"
                             />
                         </div>
+                        {ccError && <p className="text-xs text-red-500 mt-1">{ccError}</p>}
                     </div>
 
                     {/* Custom Message */}
@@ -145,7 +163,7 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
 
                 <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 shrink-0 bg-slate-50">
                     <button onClick={onClose} className="hui-btn hui-btn-secondary" disabled={isSending}>Cancel</button>
-                    <button onClick={handleSend} disabled={isSending || !sendToEmail.trim()} className="hui-btn hui-btn-green flex items-center gap-2">
+                    <button onClick={handleSend} disabled={isSending || !sendToEmail.trim() || !!ccError} className="hui-btn hui-btn-green flex items-center gap-2">
                         {isSending ? (
                             <>
                                 <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
