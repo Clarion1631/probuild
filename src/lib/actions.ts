@@ -2164,7 +2164,8 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string) {
+export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+    try {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -2173,7 +2174,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         }
     });
 
-    if (!estimate) throw new Error("Estimate not found");
+    if (!estimate) return { success: false, error: "Estimate not found" };
 
     const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
     const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
@@ -2184,13 +2185,13 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         const remaining = Math.round((estimateTotal - paidSum) * 100) / 100;
         const unpaidRounded = Math.round(unpaidSum * 100) / 100;
         if (Math.abs(unpaidRounded - remaining) > 0.01) {
-            throw new Error("Payment schedule amounts do not match the estimate total. Please update milestones before sending.");
+            return { success: false, error: "Payment schedule amounts do not match the estimate total. Please update milestones before sending." };
         }
     }
 
     const client = estimate.project?.client || estimate.lead?.client;
     const recipientEmail = overrideEmail || client?.email;
-    if (!recipientEmail) throw new Error("No email address provided");
+    if (!recipientEmail) return { success: false, error: "No email address found for this client. Please add an email address before sending." };
 
     // Snapshot T&C if a template is selected
     let termsHtml: string | null = null;
@@ -2263,7 +2264,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     );
 
     if (!sendResult.success) {
-        throw new Error("Failed to send estimate email. Please check the recipient address and try again.");
+        return { success: false, error: "Failed to send estimate email. Please check the recipient address and try again." };
     }
 
     // Mark as Sent only after confirmed delivery
@@ -2313,6 +2314,10 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     revalidatePath("/estimates");
 
     return { success: true, sentTo: recipientEmail };
+    } catch (err) {
+        console.error("[sendEstimateToClient] unexpected error:", err);
+        return { success: false, error: "An unexpected error occurred. Please try again." };
+    }
 }
 
 // ────────────────────────────────────────────────

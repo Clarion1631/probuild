@@ -47,10 +47,14 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                 ccList.length > 0 ? ccList : undefined,
                 customMessage.trim() || undefined
             );
+            if (!result.success) {
+                toast.error(result.error || "Failed to send estimate");
+                return;
+            }
             toast.success(`Estimate sent to ${result.sentTo}`);
             onClose();
         } catch (e: any) {
-            toast.error(e.message || "Failed to send estimate");
+            toast.error("An unexpected error occurred. Please try again.");
         } finally {
             setIsSending(false);
         }
