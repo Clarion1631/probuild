@@ -128,44 +128,40 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
     return (
         <>
-        {/* Toggle tab — rendered FIRST so it's the 1st focusable element (before all nav links) */}
-        <div
-            className="relative shrink-0 self-stretch"
-            style={{ width: 0, zIndex: 10 }}
-        >
-            <button
-                onClick={toggleSidebar}
-                aria-expanded={!sidebarCollapsed}
-                aria-controls="project-inner-sidebar"
-                aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                style={{
-                    position: "absolute",
-                    left: 0,
-                    top: "50%",
-                    transform: "translateY(-50%)",
-                }}
-                className="w-5 h-10 bg-white border border-hui-border border-l-0 rounded-r-md shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition"
-            >
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    {sidebarCollapsed
-                        ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
-                        : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
-                    }
-                </svg>
-            </button>
-        </div>
-
-        {/* Outer sizer: clips inner horizontally; overflowX:hidden makes overflowY:auto so inner scroll works */}
+        {/* Outer sizer: relative so toggle button can be positioned outside; clips inner horizontally */}
         <div
             style={{
                 flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
                 maxWidth: sidebarCollapsed ? "48px" : "224px",
                 minWidth: 0,
                 overflowX: "hidden",
+                position: "relative",
             }}
             className="h-full"
         >
+        {/* Toggle tab — first in DOM for keyboard focus order, positioned on outside (right) edge via CSS */}
+        <button
+            onClick={toggleSidebar}
+            aria-expanded={!sidebarCollapsed}
+            aria-controls="project-inner-sidebar"
+            aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            style={{
+                position: "absolute",
+                right: -20,
+                top: "50%",
+                transform: "translateY(-50%)",
+                zIndex: 10,
+            }}
+            className="w-5 h-10 bg-white border border-hui-border border-l-0 rounded-r-md shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition"
+        >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                {sidebarCollapsed
+                    ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
+                    : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
+                }
+            </svg>
+        </button>
         {/* Inner sidebar: always 224px wide, clipped by outer when collapsed. h-full constrains flex so nav can scroll. */}
         <div id="project-inner-sidebar" className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
 
