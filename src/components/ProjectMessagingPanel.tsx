@@ -29,7 +29,7 @@ export default function ProjectMessagingPanel({
     const [activeTab, setActiveTab] = useState<"client" | "team">("client");
 
     return (
-        <div className="h-full w-full flex flex-col border-l border-slate-200 bg-white">
+        <div className="h-full flex flex-col border-l border-slate-200 bg-white">
             {/* Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 bg-white shrink-0">
                 <div className="flex items-center gap-1 bg-slate-100 rounded-lg p-1">
@@ -56,7 +56,8 @@ export default function ProjectMessagingPanel({
                 </div>
                 <button
                     onClick={onClose}
-                    title="Close messages"
+                    aria-label="Collapse messages"
+                    title="Collapse messages"
                     className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition"
                 >
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
