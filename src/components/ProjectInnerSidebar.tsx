@@ -128,13 +128,12 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
     return (
         <>
-        {/* Outer sizer: relative so toggle button can be positioned outside; clips inner horizontally */}
+        {/* Outer sizer: position:relative for toggle button; NO overflow here so button isn't clipped */}
         <div
             style={{
                 flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
                 maxWidth: sidebarCollapsed ? "48px" : "224px",
                 minWidth: 0,
-                overflowX: "hidden",
                 position: "relative",
             }}
             className="h-full"
@@ -162,7 +161,9 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 }
             </svg>
         </button>
-        {/* Inner sidebar: always 224px wide, clipped by outer when collapsed. h-full constrains flex so nav can scroll. */}
+        {/* Inner clip wrapper: overflow:hidden here so sidebar content clips but toggle button does not */}
+        <div style={{ overflowX: "hidden", width: "100%", height: "100%" }}>
+        {/* Inner sidebar: always 224px wide, clipped by inner wrapper when collapsed. */}
         <div id="project-inner-sidebar" className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
 
             {/* Top bar — back link (hidden when collapsed) */}
@@ -307,7 +308,8 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
             </>}
         </div>
-        </div>
+        </div>{/* end inner clip wrapper */}
+        </div>{/* end outer sizer */}
 
         {/* Link Lead Modal (fixed overlay, outside sizing divs) */}
         {showLinkModal && (
