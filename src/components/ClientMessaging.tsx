@@ -79,6 +79,7 @@ export default function ClientMessaging({
             }),
         ],
         content: messageText || "",
+        immediatelyRender: false,
         onUpdate: ({ editor }) => { setMessageText(editor.getHTML()); },
         editorProps: {
             attributes: {

@@ -80,6 +80,7 @@ export default function LeadMessaging({
             }),
         ],
         content: messageText || "",
+        immediatelyRender: false,
         onUpdate: ({ editor }) => {
             setMessageText(editor.getHTML());
         },
