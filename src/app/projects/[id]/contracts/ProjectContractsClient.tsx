@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
-import { createContractFromTemplate, sendContractToClient, deleteContract, getContractSigningHistory, updateContract } from "@/lib/actions";
+import { useState } from "react";
+import { createContractFromTemplate, sendContractToClient, deleteContract, getContractSigningHistory, updateContract, signContractAsContractor } from "@/lib/actions";
 import { toast } from "sonner";
 import { ContractWysiwygEditor } from "@/components/ContractWysiwygEditor";
+import DocumentSignModal from "@/components/DocumentSignModal";
 
 interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
@@ -12,58 +13,6 @@ interface SigningRecord {
     signatureUrl?: string | null;
 }
 
-// ─── MERGE FIELDS ───
-const MERGE_FIELDS = [
-    {
-        category: "Client", icon: "👤", color: "blue",
-        fields: [
-            { key: "client_name", label: "Name", example: "John Doe" },
-            { key: "client_email", label: "Email", example: "john@example.com" },
-            { key: "client_phone", label: "Phone", example: "(555) 123-4567" },
-            { key: "client_address", label: "Address", example: "123 Main St, Los Angeles, CA 90001" },
-        ]
-    },
-    {
-        category: "Company", icon: "🏢", color: "purple",
-        fields: [
-            { key: "company_name", label: "Name", example: "Golden Touch Remodeling" },
-            { key: "company_address", label: "Address", example: "456 Business Ave" },
-            { key: "company_phone", label: "Phone", example: "(555) 987-6543" },
-            { key: "company_email", label: "Email", example: "info@company.com" },
-        ]
-    },
-    {
-        category: "Project", icon: "📋", color: "green",
-        fields: [
-            { key: "project_name", label: "Name", example: "Kitchen Remodel" },
-            { key: "location", label: "Location", example: "123 Main St, Los Angeles" },
-            { key: "estimate_total", label: "Estimate Total", example: "$45,000" },
-        ]
-    },
-    {
-        category: "Date", icon: "📅", color: "amber",
-        fields: [
-            { key: "date", label: "Today's Date", example: "March 10, 2026" },
-            { key: "year", label: "Year", example: "2026" },
-        ]
-    },
-    {
-        category: "Signing", icon: "✍️", color: "rose",
-        fields: [
-            { key: "SIGNATURE_BLOCK", label: "Signature", example: "[ Click to Sign ]" },
-            { key: "INITIAL_BLOCK", label: "Initials", example: "[ Click to Initial ]" },
-            { key: "DATE_BLOCK", label: "Signed Date", example: "3/27/2026" },
-        ]
-    }
-];
-
-const categoryColors: Record<string, { pill: string }> = {
-    blue: { pill: "bg-blue-100 text-blue-700 hover:bg-blue-200" },
-    purple: { pill: "bg-purple-100 text-purple-700 hover:bg-purple-200" },
-    green: { pill: "bg-green-100 text-green-700 hover:bg-green-200" },
-    amber: { pill: "bg-amber-100 text-amber-700 hover:bg-amber-200" },
-    rose: { pill: "bg-rose-100 text-rose-700 hover:bg-rose-200" },
-};
 
 export default function ProjectContractsClient({ projectId, projectName, clientName, contracts: initialContracts, templates }: {
     projectId: string;
@@ -89,28 +38,27 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
     const [editTitle, setEditTitle] = useState("");
     const [editBody, setEditBody] = useState("");
     const [saving, setSaving] = useState(false);
-    const [undoStack, setUndoStack] = useState<string[]>([]);
-    const [redoStack, setRedoStack] = useState<string[]>([]);
-    const [openDropdown, setOpenDropdown] = useState<string | null>(null);
-    const toolbarRef = useRef<HTMLDivElement>(null);
 
-    const handleUndo = useCallback(() => {
-        if (undoStack.length === 0) return;
-        const prev = undoStack[undoStack.length - 1];
-        setRedoStack(r => [editBody, ...r]);
-        setUndoStack(s => s.slice(0, -1));
-        setEditBody(prev);
-    }, [undoStack, editBody]);
-
-    const handleRedo = useCallback(() => {
-        if (redoStack.length === 0) return;
-        const next = redoStack[0];
-        setUndoStack(s => [...s, editBody]);
-        setRedoStack(r => r.slice(1));
-        setEditBody(next);
-    }, [redoStack, editBody]);
+    // ─── CONTRACTOR SIGNING ───
+    const [contractorSignModal, setContractorSignModal] = useState<any>(null);
+    const [signingAsContractor, setSigningAsContractor] = useState(false);
 
     const contractTemplates = templates.filter(t => t.type === "contract" || t.type === "lien_release");
+
+    const handleContractorSign = async (dataUrl: string, name: string) => {
+        if (!contractorSignModal) return;
+        setSigningAsContractor(true);
+        try {
+            await signContractAsContractor(contractorSignModal.id, name, dataUrl);
+            toast.success("Contractor signature saved!");
+            setContractorSignModal(null);
+            window.location.reload();
+        } catch (e: any) {
+            toast.error(e.message || "Failed to save signature");
+        } finally {
+            setSigningAsContractor(false);
+        }
+    };
 
     const openEditor = (contract: any) => {
         setEditingContract(contract);
@@ -316,10 +264,16 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                                             <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-600 border border-indigo-200">🔄 Every {c.recurringDays}d</span>
                                         )}
                                     </div>
-                                    <div className="flex items-center gap-3 text-xs text-slate-500">
+                                    <div className="flex items-center gap-3 text-xs text-slate-500 flex-wrap">
                                         <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
                                         {c.sentAt && <span>· Sent {new Date(c.sentAt).toLocaleDateString()}</span>}
-                                        {c.approvedBy && <span className="text-green-600 font-medium">· Signed by {c.approvedBy}</span>}
+                                        {c.approvedBy && <span className="text-green-600 font-medium">· Client: {c.approvedBy}</span>}
+                                        {c.contractorSignedBy && (
+                                            <span className="text-violet-600 font-medium flex items-center gap-1">
+                                                · Contractor: {c.contractorSignedBy}
+                                                {c.contractorSignatureUrl && <img src={c.contractorSignatureUrl} alt="sig" className="h-5 object-contain ml-1 opacity-80" />}
+                                            </span>
+                                        )}
                                         {c.nextDueDate && <span className="text-indigo-600">· Next due {new Date(c.nextDueDate).toLocaleDateString()}</span>}
                                     </div>
                                     {c.signingRecords?.length > 0 && (
@@ -333,6 +287,19 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                                     {c.recurringDays && (
                                         <button onClick={() => handleViewHistory(c.id)} className="px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition border border-indigo-200">
                                             📋 History
+                                        </button>
+                                    )}
+                                    {c.contractorSignedBy ? (
+                                        <span className="px-3 py-1.5 text-xs font-medium rounded-lg border text-violet-700 bg-violet-50 border-violet-200 flex items-center gap-1">
+                                            ✓ Contractor Signed
+                                        </span>
+                                    ) : (
+                                        <button
+                                            onClick={() => setContractorSignModal(c)}
+                                            className="px-3 py-1.5 text-xs font-medium rounded-lg transition border text-violet-700 bg-violet-50 border-violet-200 hover:bg-violet-100"
+                                            title="Sign as contractor"
+                                        >
+                                            ✍ Sign as Contractor
                                         </button>
                                     )}
                                     {(c.status === "Draft" || c.status === "Sent") && (
@@ -441,6 +408,13 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                     </div>
                 </div>
             )}
+            {/* Contractor Sign Modal */}
+            <DocumentSignModal
+                isOpen={!!contractorSignModal}
+                onClose={() => setContractorSignModal(null)}
+                mode="signature"
+                onSign={handleContractorSign}
+            />
         </div>
     );
 }

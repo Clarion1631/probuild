@@ -200,7 +200,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             </div>
 
             <div className="p-4 border-b border-hui-border bg-white shrink-0">
-                <Link href={`/projects/${projectId}`} className="text-sm font-bold text-hui-textMain uppercase tracking-wider hover:text-hui-accent transition-colors">Project Overview</Link>
+                <h2 className="text-sm font-bold uppercase tracking-wider"><Link href={`/projects/${projectId}`} className="text-hui-textMain hover:text-hui-accent transition-colors">Project Overview</Link></h2>
             </div>
 
             {/* Lead Link - Prominent */}

@@ -24,7 +24,6 @@ export const safeEstimateSelect = {
     balanceDue: true,
     approvedBy: true,
     approvedAt: true,
-    approvalIp: true,
     approvalUserAgent: true,
     signatureUrl: true,
     contractId: true,

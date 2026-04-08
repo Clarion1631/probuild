@@ -55,7 +55,6 @@ export async function GET(req: Request) {
                         signedBy: contract.approvedBy,
                         signedAt: contract.approvedAt || now,
                         signatureUrl: contract.signatureUrl,
-                        ipAddress: contract.approvalIp,
                         userAgent: contract.approvalUserAgent,
                         notes: `Archived automatically for period ending ${now.toLocaleDateString()}`
                     }
@@ -69,7 +68,6 @@ export async function GET(req: Request) {
                     status: "Sent",
                     approvedBy: null,
                     approvedAt: null,
-                    approvalIp: null,
                     signatureUrl: null,
                     nextDueDate: periodEnd
                 }

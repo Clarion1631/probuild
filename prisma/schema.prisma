@@ -492,6 +492,11 @@ model Contract {
   approvalUserAgent String?
   signatureUrl      String? // PNG data URL of drawn signature
 
+  // Contractor signing fields
+  contractorSignedBy       String?
+  contractorSignedAt       DateTime?
+  contractorSignatureUrl   String? // PNG data URL of contractor's drawn signature
+
   // Sending
   sentAt   DateTime?
   viewedAt DateTime?

@@ -64,6 +64,21 @@ export default function PortalContractClient({ initialContract, companySettings 
 
         html = html.replace(/\{\{DATE_BLOCK\}\}/g, `<strong>${dateStr}</strong>`);
 
+        // Replace Contractor Signature Block — show stored sig image or pending placeholder (read-only for client)
+        // contractorSignedBy is HTML-escaped before injection to prevent XSS (injected after DOMPurify runs)
+        const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        if (initialContract.contractorSignatureUrl && /^data:image\/(png|jpeg|webp);base64,/.test(initialContract.contractorSignatureUrl)) {
+            const safeUrl = initialContract.contractorSignatureUrl;
+            const safeName = escapeHtml(initialContract.contractorSignedBy || "Signed");
+            html = html.replace(/\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}/g,
+                `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Contractor Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor — ${safeName}</span></span>`
+            );
+        } else {
+            html = html.replace(/\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}/g,
+                `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:200px;height:40px;margin:4px 0;padding-bottom:4px;"><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor Signature — Pending</span></span>`
+            );
+        }
+
         return { parsedBody: html, totalRequiredBlocks: sigCount + initCount, totalSigBlocks: sigCount };
     }, [initialContract.body, isSigned, initialContract.approvedAt]);
 
@@ -185,7 +200,7 @@ export default function PortalContractClient({ initialContract, companySettings 
             const primarySigName = primarySigData?.name || "Accepted Digitally";
             const userAgent = window.navigator.userAgent;
             
-            await approveContract(initialContract.id, primarySigName, "Client IP", userAgent, primarySigUrl || undefined);
+            await approveContract(initialContract.id, primarySigName, userAgent, primarySigUrl || undefined);
             
             // Stage 2: Capture crisp DOM Snapshot
             const element = document.getElementById("contract-document-wrapper");

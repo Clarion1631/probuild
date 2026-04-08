@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
-import { useSearchParams } from "next/navigation";
+import { useSearchParams, useRouter } from "next/navigation";
 import DOMPurify from "dompurify";
 import { approveEstimate, markEstimateViewed } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
@@ -18,12 +18,19 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const viewedRef = useRef(false);
     const searchParams = useSearchParams();
     const paymentStatus = searchParams.get("payment");
+    const router = useRouter();
 
     useEffect(() => {
         if (viewedRef.current) return;
         viewedRef.current = true;
         markEstimateViewed(initialEstimate.id).catch(console.error);
     }, [initialEstimate.id]);
+
+    useEffect(() => {
+        if (paymentStatus !== "success") return;
+        const timer = setTimeout(() => router.refresh(), 3000);
+        return () => clearTimeout(timer);
+    }, [paymentStatus, router]);
 
     const handleApprove = async () => {
         if (!signature.trim()) {
@@ -39,7 +46,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveEstimate(initialEstimate.id, signature.trim(), "Client IP", userAgent, signatureDataUrl);
+            await approveEstimate(initialEstimate.id, signature.trim(), userAgent, signatureDataUrl);
             window.location.reload();
         } catch (e) {
             setError("Something went wrong processing your approval.");
@@ -69,7 +76,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const stripeEnabled = companySettings?.stripeEnabled !== false;
     const schedules: any[] = initialEstimate.paymentSchedules || [];
     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
-    const showPayInFull = isApproved && stripeEnabled && (
+    // Suppress immediately after a successful payment redirect — webhook may not have updated status yet
+    const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && (
         schedules.length === 0 ||
         schedules.some(s => s.name === "Payment in Full" && s.status !== "Paid" && !s.stripeSessionId)
     );
@@ -291,14 +299,18 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                             </div>
                                             <div className="flex gap-4 items-center">
                                                 <span className="font-semibold text-slate-800">{formatCurrency(p.amount)}</span>
-                                                {isApproved && !isPaid && stripeEnabled && Number(p.amount) > 0 && (
-                                                    <PortalPayButton
-                                                        paymentScheduleId={p.id}
-                                                        estimateId={initialEstimate.id}
-                                                        amount={Number(p.amount)}
-                                                        label="Pay Now"
-                                                        settings={companySettings}
-                                                    />
+                                                {paymentStatus === "success" && !isPaid && p.stripeSessionId ? (
+                                                    <span className="text-xs text-slate-500 italic">Payment processing…</span>
+                                                ) : (
+                                                    isApproved && !isPaid && stripeEnabled && Number(p.amount) > 0 && (
+                                                        <PortalPayButton
+                                                            paymentScheduleId={p.id}
+                                                            estimateId={initialEstimate.id}
+                                                            amount={Number(p.amount)}
+                                                            label="Pay Now"
+                                                            settings={companySettings}
+                                                        />
+                                                    )
                                                 )}
                                             </div>
                                         </div>

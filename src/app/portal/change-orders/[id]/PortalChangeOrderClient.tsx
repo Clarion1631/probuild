@@ -28,7 +28,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveChangeOrder(initialData.id, signature.trim(), "Client IP", userAgent, signatureDataUrl);
+            await approveChangeOrder(initialData.id, signature.trim(), userAgent, signatureDataUrl);
             toast.success("Change Order Approved!");
             window.location.reload();
         } catch (e: any) {

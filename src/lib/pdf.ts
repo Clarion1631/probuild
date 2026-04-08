@@ -31,7 +31,7 @@ async function fetchAndEmbedLogo(doc: PDFDocument, url: string): Promise<PDFImag
 
 // Color helpers
 const colors = {
-    primary: rgb(79 / 255, 70 / 255, 229 / 255),     // indigo-600
+    primary: rgb(15 / 255, 23 / 255, 42 / 255),       // slate-900 (matches portal)
     textMain: rgb(15 / 255, 23 / 255, 42 / 255),      // slate-900
     textMuted: rgb(100 / 255, 116 / 255, 139 / 255),   // slate-500
     border: rgb(226 / 255, 232 / 255, 240 / 255),      // slate-200
@@ -477,13 +477,6 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         page.drawText(`Date:          ${estimate.approvedAt ? new Date(estimate.approvedAt).toLocaleString() : new Date().toLocaleString()}`, {
             x: margin, y, size: 10, font: helvetica, color: colors.textMain,
         });
-        if (estimate.approvalIp) {
-            y -= 15;
-            page.drawText(`IP Address:  ${estimate.approvalIp}`, {
-                x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
-            });
-        }
-
         // Signature Image
         if (estimate.signatureUrl && estimate.signatureUrl.startsWith('data:image/png;base64,')) {
             try {

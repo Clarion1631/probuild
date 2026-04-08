@@ -44,9 +44,10 @@ export const MERGE_FIELDS = [
     {
         category: "Signing", icon: "✍️",
         fields: [
-            { key: "SIGNATURE_BLOCK", label: "Signature", example: "[ Click to Sign ]" },
-            { key: "INITIAL_BLOCK", label: "Initials", example: "[ Click to Initial ]" },
+            { key: "SIGNATURE_BLOCK", label: "Client Signature", example: "[ Click to Sign ]" },
+            { key: "INITIAL_BLOCK", label: "Client Initials", example: "[ Click to Initial ]" },
             { key: "DATE_BLOCK", label: "Signed Date", example: "3/27/2026" },
+            { key: "CONTRACTOR_SIGNATURE_BLOCK", label: "Contractor Signature", example: "[ Company Signs Here ]" },
         ]
     },
 ];
@@ -54,7 +55,7 @@ export const MERGE_FIELDS = [
 const FIELD_LABEL_MAP: Record<string, string> = {};
 MERGE_FIELDS.forEach(cat => cat.fields.forEach(f => { FIELD_LABEL_MAP[f.key] = f.label; }));
 
-const SIGNING_KEYS = new Set(["SIGNATURE_BLOCK", "INITIAL_BLOCK", "DATE_BLOCK"]);
+const SIGNING_KEYS = new Set(["SIGNATURE_BLOCK", "INITIAL_BLOCK", "DATE_BLOCK", "CONTRACTOR_SIGNATURE_BLOCK"]);
 
 // ─── HTML CONVERSION ───
 // Before loading into Tiptap: wrap {{key}} in data-merge-field span so Tiptap can parse them
@@ -199,11 +200,11 @@ export function ContractWysiwygEditor({ value, onChange }: ContractWysiwygEditor
                     { type: "text", marks: [{ type: "bold" }], text: "CONTRACTOR SIGNATURE" },
                 ]},
                 { type: "paragraph", content: [
-                    { type: "text", text: "Company:\u00a0" },
-                    { type: "mergeField", attrs: { key: "company_name" } },
+                    { type: "mergeField", attrs: { key: "CONTRACTOR_SIGNATURE_BLOCK" } },
                 ]},
                 { type: "paragraph", content: [
-                    { type: "text", text: "Signature:\u00a0___________________________________" },
+                    { type: "text", text: "Company:\u00a0" },
+                    { type: "mergeField", attrs: { key: "company_name" } },
                 ]},
                 { type: "paragraph", content: [
                     { type: "text", text: "Date:\u00a0___________________________________" },

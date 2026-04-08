@@ -775,7 +775,7 @@ export async function getEstimate(id: string) {
                 id: true, number: true, title: true, projectId: true, leadId: true,
                 code: true, status: true, privacy: true, createdAt: true,
                 totalAmount: true, balanceDue: true,
-                approvedBy: true, approvedAt: true, approvalIp: true,
+                approvedBy: true, approvedAt: true,
                 approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                 items: {
                     orderBy: { order: "asc" },
@@ -826,7 +826,7 @@ export async function getEstimateForPortal(id: string) {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
                     totalAmount: true, balanceDue: true,
-                    approvedBy: true, approvedAt: true, approvalIp: true,
+                    approvedBy: true, approvedAt: true,
                     approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                     project: { include: { client: true } },
                     lead: { include: { client: true } },
@@ -1056,7 +1056,7 @@ export async function markContractViewed(contractId: string) {
     }
 }
 
-export async function approveEstimate(estimateId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     const approvedAt = new Date();
 
     await prisma.estimate.update({
@@ -1065,7 +1065,6 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             status: "Approved",
             approvedBy: signatureName,
             approvedAt,
-            approvalIp: ipAddress,
             approvalUserAgent: userAgent,
             signatureUrl: signatureDataUrl || null,
         },
@@ -1143,7 +1142,6 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <table style="width: 100%; font-size: 13px; color: #555;">
                         <tr><td style="padding: 4px 0;">Client</td><td style="text-align: right; font-weight: 600;">${clientName}</td></tr>
                         <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${approvedAt.toLocaleString()}</td></tr>
-                        <tr><td style="padding: 4px 0;">IP Address</td><td style="text-align: right; font-family: monospace; font-size: 12px;">${ipAddress}</td></tr>
                     </table>
                 </div>
                 ${clientEmail ? `<p style="margin: 12px 0 0; font-size: 12px; color: #888;">A copy was also sent to the client at ${clientEmail}.</p>` : ""}
@@ -2079,6 +2077,19 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
 
     if (!estimate) throw new Error("Estimate not found");
 
+    const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+    const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
+    if (unpaidSchedules.length > 0) {
+        const estimateTotal = estimate.totalAmount?.toNumber() || 0;
+        const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+        const unpaidSum = schedules.reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0) - paidSum;
+        const remaining = Math.round((estimateTotal - paidSum) * 100) / 100;
+        const unpaidRounded = Math.round(unpaidSum * 100) / 100;
+        if (Math.abs(unpaidRounded - remaining) > 0.01) {
+            throw new Error("Payment schedule amounts do not match the estimate total. Please update milestones before sending.");
+        }
+    }
+
     const client = estimate.project?.client || estimate.lead?.client;
     const recipientEmail = overrideEmail || client?.email;
     if (!recipientEmail) throw new Error("No email address provided");
@@ -2410,7 +2421,39 @@ export async function sendContractToClient(contractId: string) {
     return { success: true, sentTo: client.email };
 }
 
-export async function approveContract(contractId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    // Role gate — only ADMIN/MANAGER can sign as contractor
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    // Validate data URL is a safe image type before storing
+    if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format");
+    }
+
+    // Idempotency — don't silently overwrite an existing contractor signature
+    const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+    if (!existing) throw new Error("Contract not found");
+    if (existing.contractorSignedAt) throw new Error("Contract already signed by contractor");
+
+    await prisma.contract.update({
+        where: { id: contractId },
+        data: {
+            contractorSignedBy: signerName,
+            contractorSignedAt: new Date(),
+            contractorSignatureUrl: signatureDataUrl,
+        },
+    });
+
+    revalidatePath(`/projects/[id]/contracts`, "page");
+    revalidatePath(`/leads/[id]/contracts`, "page");
+    return { success: true };
+}
+
+export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     // Fetch the contract first to get recurring info
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
@@ -2427,7 +2470,6 @@ export async function approveContract(contractId: string, signatureName: string,
             signedBy: signatureName,
             signedAt: now,
             signatureUrl: signatureDataUrl || null,
-            ipAddress,
             userAgent,
             periodStart: contract.nextDueDate
                 ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
@@ -2444,7 +2486,6 @@ export async function approveContract(contractId: string, signatureName: string,
             data: {
                 approvedBy: signatureName,
                 approvedAt: now,
-                approvalIp: ipAddress,
                 approvalUserAgent: userAgent,
                 signatureUrl: signatureDataUrl || null,
                 status: "Sent", // Reset to Sent so it can be signed again next cycle
@@ -2460,7 +2501,6 @@ export async function approveContract(contractId: string, signatureName: string,
                 status: "Signed",
                 approvedBy: signatureName,
                 approvedAt: now,
-                approvalIp: ipAddress,
                 approvalUserAgent: userAgent,
                 signatureUrl: signatureDataUrl || null,
             }
@@ -3422,7 +3462,7 @@ export async function updateChangeOrderStatus(id: string, status: string, projec
     revalidatePath(`/projects/${projectId}/change-orders`);
 }
 
-export async function approveChangeOrder(id: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     "use server";
     const approvedAt = new Date();
     const co = await prisma.changeOrder.update({
