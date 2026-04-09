@@ -2152,6 +2152,7 @@ export async function createDocumentTemplate(data: { name: string; type: string;
     }
     const template = await prisma.documentTemplate.create({ data });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return template;
 }
 
