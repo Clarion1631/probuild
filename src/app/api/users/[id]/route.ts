@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import bcrypt from "bcryptjs";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -53,16 +54,19 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         const { id } = await params;
         const body = await req.json();
-        const { permissions, projectIds, userInfo } = body;
+        const { permissions, projectIds, userInfo, pinCode } = body;
 
         // Update user info if provided
-        if (userInfo) {
+        if (userInfo || pinCode !== undefined) {
             const data: any = {};
-            if (userInfo.name !== undefined) data.name = userInfo.name;
-            if (userInfo.role !== undefined) data.role = userInfo.role;
-            if (userInfo.status !== undefined) data.status = userInfo.status;
-            if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
-            if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+            if (userInfo) {
+                if (userInfo.name !== undefined) data.name = userInfo.name;
+                if (userInfo.role !== undefined) data.role = userInfo.role;
+                if (userInfo.status !== undefined) data.status = userInfo.status;
+                if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
+                if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+            }
+            if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
             if (Object.keys(data).length > 0) {
                 await prisma.user.update({ where: { id }, data });
             }

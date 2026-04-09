@@ -11,6 +11,7 @@ type User = {
     name: string | null;
     email: string;
     role: string;
+    status: string;
     hourlyRate: number;
     burdenRate: number;
     hasPin: boolean;
@@ -20,7 +21,7 @@ export default function TeamPage() {
     const [users, setUsers] = useState<User[]>([]);
     const [loading, setLoading] = useState(true);
     const [isAddingUser, setIsAddingUser] = useState(false);
-    const [addForm, setAddForm] = useState<Partial<User>>({ role: 'EMPLOYEE' });
+    const [addForm, setAddForm] = useState<Partial<User>>({ role: 'FIELD_CREW' });
     const [searchQuery, setSearchQuery] = useState("");
     const [statusFilter, setStatusFilter] = useState("All");
 
@@ -50,7 +51,7 @@ export default function TeamPage() {
         if (res.ok) {
             const data = await res.json();
             setIsAddingUser(false);
-            setAddForm({ role: 'EMPLOYEE', email: '' });
+            setAddForm({ role: 'FIELD_CREW', email: '' });
 
             if (data.warning) {
                 toast.warning(data.warning);
@@ -67,6 +68,7 @@ export default function TeamPage() {
     };
 
     const getStatus = (user: User) => {
+        if (user.status === "DISABLED") return "Disabled";
         if (!user.name) return "Pending";
         return "Activated";
     };
@@ -177,7 +179,7 @@ export default function TeamPage() {
                                                 {user.email}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
-                                                {user.role === 'EMPLOYEE' ? 'Field Crew' :
+                                                {(user.role === 'FIELD_CREW' || user.role === 'EMPLOYEE') ? 'Field Crew' :
                                                     user.role === 'MANAGER' ? 'Manager' :
                                                         user.role === 'FINANCE' ? 'Finance' :
                                                             'Admin'}
@@ -232,7 +234,7 @@ export default function TeamPage() {
                             <div>
                                 <label className="block font-medium text-hui-textMain mb-1">Role</label>
                                 <select className="hui-input w-full" value={addForm.role} onChange={e => setAddForm({ ...addForm, role: e.target.value })}>
-                                    <option value="EMPLOYEE">Field Crew</option>
+                                    <option value="FIELD_CREW">Field Crew</option>
                                     <option value="MANAGER">Manager</option>
                                     <option value="FINANCE">Finance</option>
                                     <option value="ADMIN">Admin</option>

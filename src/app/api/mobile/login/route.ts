@@ -23,7 +23,7 @@ export async function POST(req: Request) {
 
         // Use bcrypt.compare for constant-time PIN verification
         const pinValid = user?.pinCode ? await bcrypt.compare(pinCode, user.pinCode) : false;
-        if (!user || !pinValid) {
+        if (!user || !pinValid || user.status === "DISABLED") {
             return NextResponse.json({ error: "Invalid email or PIN" }, { status: 401 });
         }
 

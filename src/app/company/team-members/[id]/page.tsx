@@ -72,10 +72,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    name: fullName,
-                    role,
-                    hourlyRate,
-                    burdenRate,
+                    userInfo: { name: fullName, role, hourlyRate, burdenRate },
                     pinCode
                 })
             });
@@ -92,6 +89,26 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
             toast.error("An error occurred while saving");
         } finally {
             setSaving(false);
+        }
+    };
+
+    const handleDisable = async () => {
+        if (!confirm(`Disable ${user?.email}? They will lose access until re-enabled.`)) return;
+        try {
+            const res = await fetch(`/api/users/${id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ userInfo: { status: "DISABLED" } })
+            });
+            if (res.ok) {
+                toast.success("Team member disabled");
+                router.push("/company/team-members");
+            } else {
+                const data = await res.json();
+                toast.error(data.error || "Failed to disable member");
+            }
+        } catch {
+            toast.error("An error occurred");
         }
     };
 
@@ -193,7 +210,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                             <option value="ADMIN">Admin</option>
                             <option value="MANAGER">Manager</option>
                             <option value="FINANCE">Finance</option>
-                            <option value="EMPLOYEE">Field Crew</option>
+                            <option value="FIELD_CREW">Field Crew</option>
                         </select>
                     </div>
                 </div>
@@ -279,6 +296,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                     <div className="flex gap-4">
                         <button
                             type="button"
+                            onClick={handleDisable}
                             className="hui-btn hui-btn-secondary"
                         >
                             Disable Team Member
