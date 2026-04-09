@@ -2131,8 +2131,9 @@ export async function deleteAssembly(templateId: string) {
 // Document Templates CRUD
 // =============================================
 
-export async function getDocumentTemplates() {
+export async function getDocumentTemplates(type?: string) {
     return await prisma.documentTemplate.findMany({
+        where: type ? { type } : undefined,
         orderBy: { updatedAt: "desc" },
     });
 }
