@@ -2168,6 +2168,7 @@ export async function updateDocumentTemplate(id: string, data: { name?: string; 
     }
     const template = await prisma.documentTemplate.update({ where: { id }, data });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return template;
 }
 
