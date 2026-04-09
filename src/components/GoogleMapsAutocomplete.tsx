@@ -85,7 +85,8 @@ export default function GoogleMapsAutocomplete({
     useEffect(() => { onPlaceDetailsRef.current = onPlaceDetails; }, [onPlaceDetails]);
 
     useEffect(() => {
-        let listener: google.maps.MapsEventListener | null = null;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let listener: any = null;
         let cancelled = false;
 
         loadGoogleMapsScript()
