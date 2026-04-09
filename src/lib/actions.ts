@@ -2175,6 +2175,7 @@ export async function updateDocumentTemplate(id: string, data: { name?: string; 
 export async function deleteDocumentTemplate(id: string) {
     await prisma.documentTemplate.delete({ where: { id } });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return { success: true };
 }
 
