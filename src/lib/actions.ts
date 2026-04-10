@@ -2131,8 +2131,9 @@ export async function deleteAssembly(templateId: string) {
 // Document Templates CRUD
 // =============================================
 
-export async function getDocumentTemplates() {
+export async function getDocumentTemplates(type?: string) {
     return await prisma.documentTemplate.findMany({
+        where: type ? { type } : undefined,
         orderBy: { updatedAt: "desc" },
     });
 }
@@ -2151,6 +2152,7 @@ export async function createDocumentTemplate(data: { name: string; type: string;
     }
     const template = await prisma.documentTemplate.create({ data });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return template;
 }
 
@@ -2166,12 +2168,14 @@ export async function updateDocumentTemplate(id: string, data: { name?: string; 
     }
     const template = await prisma.documentTemplate.update({ where: { id }, data });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return template;
 }
 
 export async function deleteDocumentTemplate(id: string) {
     await prisma.documentTemplate.delete({ where: { id } });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return { success: true };
 }
 
