@@ -1,7 +1,7 @@
 "use server";
 
 import { prisma } from "./prisma";
-import { safeEstimateInclude } from "./prisma-helpers";
+import { safeEstimateInclude, safeEstimateSelect } from "./prisma-helpers";
 import { revalidatePath, unstable_cache } from "next/cache";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
@@ -136,6 +136,12 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
 }
 
 export async function deleteLead(id: string) {
+    // Prevent deletion of Won/converted leads — their records have been relinked to a project
+    // and deleting the lead would cascade-delete anything still pointing at it.
+    const lead = await prisma.lead.findUnique({ where: { id }, select: { stage: true } });
+    if (lead?.stage === "Won") {
+        throw new Error("Cannot delete a converted lead. Archive it instead.");
+    }
     await prisma.lead.delete({
         where: { id }
     });
@@ -648,15 +654,18 @@ export async function convertLeadToProject(leadId: string) {
             },
         });
 
-        // Relink all dual-FK child records to the new project
-        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.floorPlan.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        // Relink child records to the new project.
+        // Estimate and FloorPlan have no onDelete:Cascade on their lead FK — keep leadId so they
+        // remain visible from both the lead view and the project view.
+        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        await tx.floorPlan.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        // The remaining models have onDelete:Cascade on their lead FK — clear leadId to prevent
+        // cascade-deletion of project records if the lead is ever deleted post-conversion.
         await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        // Relink client messages to project and clear leadId to prevent cascade-delete from lead
         await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
 
         await tx.lead.update({ where: { id: leadId }, data: { stage: "Won" } });
@@ -1614,23 +1623,41 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
 
 export async function archiveEstimate(estimateId: string) {
     "use server";
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: safeEstimateSelect,
+    });
     if (!estimate) throw new Error("Estimate not found");
 
-    const isArchived = !!estimate.archivedAt;
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: { archivedAt: isArchived ? null : new Date() },
-    });
+    let archived: boolean;
+    try {
+        // Try archivedAt column (may not exist in DB yet)
+        const full = await prisma.estimate.findUnique({ where: { id: estimateId }, select: { archivedAt: true } });
+        const isArchived = !!full?.archivedAt;
+        await prisma.estimate.update({
+            where: { id: estimateId },
+            data: { archivedAt: isArchived ? null : new Date() },
+        });
+        archived = !isArchived;
+    } catch {
+        // Fallback: use status field as proxy for archival
+        const isArchived = estimate.status === "Archived";
+        await prisma.estimate.update({
+            where: { id: estimateId },
+            data: { status: isArchived ? "Draft" : "Archived" },
+        });
+        archived = !isArchived;
+    }
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
         revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
     }
     if (estimate.leadId) {
-        revalidatePath(`/leads`);
+        revalidatePath(`/leads/${estimate.leadId}`);
+        revalidatePath(`/leads/${estimate.leadId}/estimates`);
     }
-    return { success: true, archived: !isArchived };
+    return { success: true, archived };
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
@@ -2208,10 +2235,14 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
 
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
-        }
+        select: {
+            ...safeEstimateSelect,
+            sentAt: true,
+            memo: true,
+            termsAndConditions: true,
+            project: { select: { id: true, name: true, client: true } },
+            lead: { select: { id: true, name: true, client: true } },
+        },
     });
 
     if (!estimate) return { success: false, error: "Estimate not found" };
@@ -2413,8 +2444,14 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     }
 
     // Revalidate paths
-    if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
-    if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
+    if (estimate.projectId) {
+        revalidatePath(`/projects/${estimate.projectId}/estimates`);
+        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+    }
+    if (estimate.leadId) {
+        revalidatePath(`/leads/${estimate.leadId}`);
+        revalidatePath(`/leads/${estimate.leadId}/estimates`);
+    }
     revalidatePath("/estimates");
 
     return { success: true, sentTo: recipientEmail };
