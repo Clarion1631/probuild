@@ -1,8 +1,9 @@
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
-import { getProject, createDraftEstimate, duplicateEstimate, getEstimateTemplates, createEstimateFromTemplate } from "@/lib/actions";
+import { getProject, createDraftEstimate, duplicateEstimate, getEstimateTemplates, createEstimateFromTemplate, getProjects } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import EstimatesListClient from "./EstimatesListClient";
+import CopyToProjectButton from "@/components/CopyToProjectButton";
 import { formatCurrency } from "@/lib/utils";
 
 export default async function EstimatesPage({ params }: { params: Promise<{ id: string }> }) {
@@ -14,6 +15,15 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
     const estimates = project.estimates || [];
     let templates: any[] = [];
     try { templates = await getEstimateTemplates(); } catch {}
+
+    // Active projects for "Copy to another project" feature — exclude Archived
+    let allActiveProjects: { id: string; name: string }[] = [];
+    try {
+        const allProjs = await getProjects();
+        allActiveProjects = allProjs
+            .filter((p: any) => p.status !== "Archived")
+            .map((p: any) => ({ id: p.id, name: p.name }));
+    } catch {}
 
     // Calculate real stats
     const approvedEstimates = estimates.filter((e: any) => e.status === 'Approved' || e.status === 'Sent');
@@ -131,12 +141,17 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                                 <input type="hidden" name="estimateId" value={est.id} />
                                                 <button
                                                     type="submit"
-                                                    title="Duplicate estimate"
+                                                    title="Duplicate estimate (same project)"
                                                     className="text-slate-300 hover:text-slate-600 hover:bg-slate-100 rounded p-1.5 transition opacity-0 group-hover:opacity-100"
                                                 >
                                                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
                                                 </button>
                                             </form>
+                                            <CopyToProjectButton
+                                                estimateId={est.id}
+                                                currentProjectId={resolvedParams.id}
+                                                allProjects={allActiveProjects}
+                                            />
                                             <Link href={`/projects/${project.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
                                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
                                             </Link>

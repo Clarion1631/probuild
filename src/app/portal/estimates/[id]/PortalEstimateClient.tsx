@@ -15,16 +15,83 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
+    const [isDownloading, setIsDownloading] = useState(false);
     const viewedRef = useRef(false);
+    const documentRef = useRef<HTMLDivElement>(null);
     const searchParams = useSearchParams();
     const paymentStatus = searchParams.get("payment");
+    const isCapture = searchParams.get("capture") === "1";
     const router = useRouter();
 
     useEffect(() => {
         if (viewedRef.current) return;
         viewedRef.current = true;
-        markEstimateViewed(initialEstimate.id).catch(console.error);
-    }, [initialEstimate.id]);
+        if (!isCapture) {
+            markEstimateViewed(initialEstimate.id).catch(console.error);
+        }
+    }, [initialEstimate.id, isCapture]);
+
+    // Shared helper: build a paginated jsPDF from an element
+    async function buildPdf(element: HTMLElement): Promise<import("jspdf").jsPDF> {
+        const { toJpeg } = await import("html-to-image");
+        const { jsPDF } = await import("jspdf");
+        const imgData = await toJpeg(element, { quality: 0.85, pixelRatio: 1.5 });
+        const pdf = new jsPDF("p", "mm", "a4");
+        const pdfWidth = pdf.internal.pageSize.getWidth();
+        const pdfPageHeight = pdf.internal.pageSize.getHeight();
+        const imgRenderedHeight = (element.offsetHeight * pdfWidth) / element.offsetWidth;
+        let heightLeft = imgRenderedHeight;
+        let position = 0;
+        pdf.addImage(imgData, "JPEG", 0, position, pdfWidth, imgRenderedHeight);
+        heightLeft -= pdfPageHeight;
+        while (heightLeft > 0) {
+            position -= pdfPageHeight;
+            pdf.addPage();
+            pdf.addImage(imgData, "JPEG", 0, position, pdfWidth, imgRenderedHeight);
+            heightLeft -= pdfPageHeight;
+        }
+        return pdf;
+    }
+
+    // Capture mode: auto-capture DOM and postMessage PDF to parent
+    useEffect(() => {
+        if (!isCapture) return;
+        const timer = setTimeout(async () => {
+            const element = document.getElementById("estimate-document-wrapper");
+            if (!element) {
+                window.parent.postMessage({ type: "estimate-capture-done", error: "no-element" }, window.location.origin);
+                return;
+            }
+            try {
+                const pdf = await buildPdf(element);
+                const dataUrl = pdf.output("datauristring");
+                window.parent.postMessage({ type: "estimate-capture-done", dataUrl }, window.location.origin);
+            } catch (err) {
+                window.parent.postMessage({ type: "estimate-capture-done", error: String(err) }, window.location.origin);
+            }
+        }, 2000);
+        return () => clearTimeout(timer);
+    }, [isCapture]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    async function handleDownload() {
+        const element = document.getElementById("estimate-document-wrapper");
+        if (!element) return;
+        setIsDownloading(true);
+        try {
+            const prevShadow = element.style.boxShadow;
+            const prevBorder = element.style.border;
+            element.style.boxShadow = "none";
+            element.style.border = "none";
+            const pdf = await buildPdf(element);
+            element.style.boxShadow = prevShadow;
+            element.style.border = prevBorder;
+            pdf.save(`Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);
+        } catch (err) {
+            console.error("Download failed:", err);
+        } finally {
+            setIsDownloading(false);
+        }
+    }
 
     useEffect(() => {
         if (paymentStatus !== "success") return;
@@ -88,8 +155,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
-            {/* Minimal Top Bar */}
-            <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden">
+            {/* Minimal Top Bar — hidden in capture mode */}
+            <header className={`bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden${isCapture ? " hidden" : ""}`}>
                 <div className="flex items-center gap-3">
                     {companySettings?.logoUrl ? (
                         <img src={companySettings.logoUrl} alt={companyName} className="h-8 w-auto object-contain" />
@@ -98,13 +165,25 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     )}
                     <span className="text-sm text-slate-500">Estimate Portal</span>
                 </div>
+                <button
+                    onClick={handleDownload}
+                    disabled={isDownloading}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition disabled:opacity-50"
+                >
+                    {isDownloading ? (
+                        <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                    ) : (
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                    )}
+                    {isDownloading ? "Generating..." : "Download PDF"}
+                </button>
                 {isApproved && (
                     <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Approved & Signed</span>
                 )}
             </header>
 
-            {/* Payment status banners */}
-            {paymentStatus === "success" && (
+            {/* Payment status banners — hidden in capture mode */}
+            {paymentStatus === "success" && !isCapture && (
                 <div className="max-w-4xl mx-auto px-4 pt-4 print:hidden">
                     <div className="bg-green-50 border border-green-200 rounded-lg px-5 py-3 flex items-center gap-3">
                         <svg className="w-5 h-5 text-green-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
@@ -112,7 +191,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     </div>
                 </div>
             )}
-            {paymentStatus === "cancelled" && (
+            {paymentStatus === "cancelled" && !isCapture && (
                 <div className="max-w-4xl mx-auto px-4 pt-4 print:hidden">
                     <div className="bg-amber-50 border border-amber-200 rounded-lg px-5 py-3 flex items-center gap-3">
                         <svg className="w-5 h-5 text-amber-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -122,8 +201,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             )}
 
             {/* Document Container */}
-            <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
-                <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+            <div className={`max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
+                <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
                     <div className="px-10 pt-10 pb-8 border-b border-slate-200">
@@ -264,8 +343,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </div>
                     </div>
 
-                    {/* Pay in Full — shown when no milestones, OR when the auto-created pay-in-full schedule is pending (handles abandoned checkouts) */}
-                    {showPayInFull && (
+                    {/* Pay in Full — hidden in capture mode */}
+                    {showPayInFull && !isCapture && (
                         <PortalPayInFullButton
                             estimateId={initialEstimate.id}
                             displayAmount={total}
@@ -333,8 +412,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </div>
                     )}
 
-                    {/* Signature / Approval Area */}
-                    {!isApproved && (
+                    {/* Signature / Approval Area — hidden in capture mode */}
+                    {!isApproved && !isCapture && (
                         <div className="px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">

@@ -1951,7 +1951,7 @@ export async function deleteEstimate(estimateId: string) {
 // Duplicate Estimate
 // =============================================
 
-export async function duplicateEstimate(estimateId: string) {
+export async function duplicateEstimate(estimateId: string, targetProjectId?: string) {
     const original = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -1961,13 +1961,18 @@ export async function duplicateEstimate(estimateId: string) {
     });
     if (!original) throw new Error("Estimate not found");
 
+    if (targetProjectId) {
+        const target = await prisma.project.findUnique({ where: { id: targetProjectId } });
+        if (!target) throw new Error("Target project not found");
+    }
+
     const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
 
     const newEstimate = await prisma.estimate.create({
         data: {
             title: `Copy of ${original.title}`,
-            projectId: original.projectId,
-            leadId: original.leadId,
+            projectId: targetProjectId ?? original.projectId,
+            leadId: targetProjectId ? null : original.leadId,
             code,
             status: "Draft",
             totalAmount: original.totalAmount,
@@ -2023,14 +2028,23 @@ export async function duplicateEstimate(estimateId: string) {
         });
     }
 
-    if (original.projectId) {
+    if (targetProjectId) {
+        revalidatePath(`/projects/${targetProjectId}/estimates`);
+        if (original.projectId && original.projectId !== targetProjectId) {
+            revalidatePath(`/projects/${original.projectId}/estimates`);
+        }
+    } else if (original.projectId) {
         revalidatePath(`/projects/${original.projectId}/estimates`);
     } else if (original.leadId) {
         revalidatePath(`/leads/${original.leadId}`);
     }
     revalidatePath("/estimates");
 
-    return { id: newEstimate.id, projectId: original.projectId, leadId: original.leadId };
+    return {
+        id: newEstimate.id,
+        projectId: targetProjectId ?? original.projectId,
+        leadId: targetProjectId ? null : original.leadId,
+    };
 }
 
 // =============================================
@@ -2210,7 +2224,7 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string, capturedPdfUrl?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     try {
     // --- Server-side CC validation ---
     const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -2331,6 +2345,34 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         data: { termsAndConditions: termsHtml },
     });
 
+    // Generate PDF for email attachment
+    let emailAttachments: { filename: string; content: Buffer }[] | undefined = undefined;
+    let pdfAttached = false;
+    try {
+        let pdfBuffer: Buffer | undefined;
+        if (capturedPdfUrl) {
+            // Use the pre-captured portal PDF (high-quality, matches what client sees)
+            const res = await fetch(capturedPdfUrl);
+            if (res.ok) {
+                const ab = await res.arrayBuffer();
+                pdfBuffer = Buffer.from(ab);
+            }
+        }
+        if (!pdfBuffer) {
+            // Fall back to server-side PDF generation
+            const { generateEstimatePdf } = await import("./pdf");
+            pdfBuffer = await generateEstimatePdf(estimateId);
+        }
+        if (pdfBuffer) {
+            const filename = `Estimate_${estimate.code || estimateId}.pdf`;
+            emailAttachments = [{ filename, content: pdfBuffer }];
+            pdfAttached = true;
+        }
+    } catch (e) {
+        console.error("Failed to generate estimate PDF for send:", e);
+        // Do not block the email send — matches approveEstimate() pattern
+    }
+
     // Send email notification to client
     const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/estimates/${estimateId}`;
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -2347,6 +2389,12 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
            </div>`
         : '';
 
+    const pdfNote = pdfAttached
+        ? `<div style="background: #f0fdf4; border-left: 3px solid #16a34a; padding: 12px 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
+               <p style="color: #15803d; margin: 0; font-size: 13px; font-weight: 600;">✓ A copy of your estimate is attached to this email for your records.</p>
+           </div>`
+        : '';
+
     const sendResult = await sendNotification(
         recipientEmail,
         `${companyName} sent you an estimate`,
@@ -2360,6 +2408,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
                 <h2 style="font-size: 20px; margin: 0 0 8px;">New Estimate for You</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
                 ${personalNote}
+                ${pdfNote}
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you an estimate for review and approval.
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
@@ -2378,7 +2427,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             </p>
         </body>
         </html>`,
-        undefined,
+        emailAttachments,
         { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails }
     );
 
