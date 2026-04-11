@@ -319,13 +319,13 @@ export async function updateLeadInfo(id: string, data: any) {
             where: { id: lead.clientId },
             data: {
                 name: data.clientName,
-                // Truthy-only: blank values from unrelated edits must not wipe a saved address.
-                // No "clear address" intent in current UX — revisit if/when one is added.
-                // TODO: switch to `data.field !== undefined` checks once a "clear address" UX is added to EditLeadModal.
-                ...(data.addressLine1 ? { addressLine1: data.addressLine1 } : {}),
-                ...(data.city ? { city: data.city } : {}),
-                ...(data.state ? { state: data.state } : {}),
-                ...(data.zipCode ? { zipCode: data.zipCode } : {}),
+                // undefined-check: EditLeadModal always sends all address fields (initialized from
+                // DB values), so these guards fire every save. Empty string → null clears the field.
+                // Callers that omit a field entirely (pass undefined) preserve the existing DB value.
+                ...(data.addressLine1 !== undefined ? { addressLine1: data.addressLine1 || null } : {}),
+                ...(data.city !== undefined ? { city: data.city || null } : {}),
+                ...(data.state !== undefined ? { state: data.state || null } : {}),
+                ...(data.zipCode !== undefined ? { zipCode: data.zipCode || null } : {}),
             }
         });
     }
@@ -2029,7 +2029,8 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
         select: { projectId: true, leadId: true, status: true },
     });
     if (!estimate) return { success: false, error: "Estimate not found" };
-    if (estimate.status === "Approved") return { success: false, error: "Approved estimates cannot be deleted" };
+    const PROTECTED_STATUSES = new Set(["Approved", "Invoiced", "Partially Paid"]);
+    if (PROTECTED_STATUSES.has(estimate.status)) return { success: false, error: `${estimate.status} estimates cannot be deleted` };
 
     // Delete related Budget
     const budget = await prisma.budget.findUnique({ where: { estimateId } });

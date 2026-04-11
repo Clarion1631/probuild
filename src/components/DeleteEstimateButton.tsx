@@ -10,7 +10,7 @@ export default function DeleteEstimateButton({ estimateId, estimateTitle, status
     const [isDeleting, setIsDeleting] = useState(false);
     const router = useRouter();
 
-    const isApproved = status === "Approved";
+    const isProtected = ["Approved", "Invoiced", "Partially Paid"].includes(status);
 
     async function handleDelete() {
         setIsDeleting(true);
@@ -30,7 +30,7 @@ export default function DeleteEstimateButton({ estimateId, estimateTitle, status
         }
     }
 
-    if (isApproved) return null;
+    if (isProtected) return null;
 
     return (
         <>

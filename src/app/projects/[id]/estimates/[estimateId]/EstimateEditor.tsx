@@ -493,7 +493,11 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (!confirm("Are you sure you want to delete this estimate? This action cannot be undone.")) return;
         setIsDeleting(true);
         try {
-            await deleteEstimate(initialEstimate.id);
+            const result = await deleteEstimate(initialEstimate.id);
+            if (!result.success) {
+                toast.error(result.error || "Failed to delete estimate");
+                return;
+            }
             toast.success("Estimate deleted");
             if (context.type === "project") {
                 router.push(`/projects/${context.id}/estimates`);
