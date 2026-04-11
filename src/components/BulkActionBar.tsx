@@ -19,51 +19,49 @@ type Props = {
 export default function BulkActionBar({ count, actions, onClear }: Props) {
     if (count === 0) return null;
 
-    const hasDanger = actions.some(a => a.variant === "danger");
-
-    // Outer pill style: red if any danger action, slate otherwise
-    const pillClass = hasDanger
-        ? "bg-red-50 text-red-700 border-red-200"
-        : "bg-slate-50 text-slate-700 border-slate-200";
-
-    const separatorClass = hasDanger ? "bg-red-200" : "bg-slate-200";
-
     return (
-        <div
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg border animate-in fade-in slide-in-from-bottom-2 ${pillClass}`}
-        >
-            <span className="text-sm font-semibold">{count} selected</span>
-            {actions.map((action, i) => (
-                <React.Fragment key={i}>
-                    <div className={`h-4 w-px ${separatorClass}`}></div>
-                    <button
-                        onClick={action.onClick}
-                        disabled={action.disabled}
-                        className={`text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50 ${
-                            action.variant === "danger"
-                                ? "hover:text-red-800"
-                                : "hover:text-slate-900"
-                        }`}
-                    >
-                        {action.icon}
-                        {action.label}
-                    </button>
-                </React.Fragment>
-            ))}
-            {onClear && (
-                <>
-                    <div className={`h-4 w-px ${separatorClass}`}></div>
-                    <button
-                        onClick={onClear}
-                        className="text-sm opacity-60 hover:opacity-100"
-                        aria-label="Clear selection"
-                    >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M18 6L6 18M6 6l12 12" />
-                        </svg>
-                    </button>
-                </>
-            )}
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-bottom-3 duration-200">
+            <div className="flex items-center gap-1 bg-slate-900 text-white rounded-xl shadow-2xl border border-slate-700 px-3 py-2">
+                {/* Count badge */}
+                <span className="text-xs font-semibold bg-slate-700 rounded-md px-2 py-1 mr-1 tabular-nums">
+                    {count} selected
+                </span>
+
+                <div className="h-4 w-px bg-slate-700 mx-1" />
+
+                {actions.map((action, i) => (
+                    <React.Fragment key={i}>
+                        {i > 0 && <div className="h-4 w-px bg-slate-700 mx-0.5" />}
+                        <button
+                            onClick={action.onClick}
+                            disabled={action.disabled}
+                            className={`flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg transition disabled:opacity-40 ${
+                                action.variant === "danger"
+                                    ? "hover:bg-red-600 hover:text-white text-red-400"
+                                    : "hover:bg-slate-700 text-slate-200"
+                            }`}
+                        >
+                            {action.icon}
+                            {action.label}
+                        </button>
+                    </React.Fragment>
+                ))}
+
+                {onClear && (
+                    <>
+                        <div className="h-4 w-px bg-slate-700 mx-1" />
+                        <button
+                            onClick={onClear}
+                            className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-white transition"
+                            aria-label="Clear selection"
+                        >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                <path d="M18 6L6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </>
+                )}
+            </div>
         </div>
     );
 }

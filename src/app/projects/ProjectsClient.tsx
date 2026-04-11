@@ -151,6 +151,21 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
 
     return (
         <div className="max-w-screen-2xl mx-auto px-4 md:px-8 pb-10">
+            {viewMode === "list" && (
+                <BulkActionBar
+                    count={selectedIds.length}
+                    onClear={() => setSelectedIds([])}
+                    actions={[
+                        {
+                            label: "Delete",
+                            icon: DeleteIcon,
+                            onClick: handleDeleteSelected,
+                            variant: "danger",
+                            disabled: isDeleting,
+                        },
+                    ]}
+                />
+            )}
             {/* Stat Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-6 mb-6">
                 <div className="hui-card p-4">
@@ -227,21 +242,6 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                     </select>
                 </div>
 
-                {/* Bulk Actions Toolbar for List View */}
-                {viewMode === "list" && (
-                    <BulkActionBar
-                        count={selectedIds.length}
-                        actions={[
-                            {
-                                label: "Delete",
-                                icon: DeleteIcon,
-                                onClick: handleDeleteSelected,
-                                variant: "danger",
-                                disabled: isDeleting,
-                            },
-                        ]}
-                    />
-                )}
             </div>
 
             {/* Kanban View */}

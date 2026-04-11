@@ -258,6 +258,25 @@ export default function LeadsPage() {
 
     return (
         <div className="max-w-7xl mx-auto py-8 px-6">
+            <BulkActionBar
+                count={selectedIds.length}
+                onClear={() => setSelectedIds([])}
+                actions={[
+                    {
+                        label: "Copy",
+                        icon: CopyIcon,
+                        onClick: handleBulkCopy,
+                        disabled: isBulking,
+                    },
+                    {
+                        label: "Delete",
+                        icon: DeleteIcon,
+                        onClick: handleBulkDelete,
+                        variant: "danger",
+                        disabled: isBulking,
+                    },
+                ]}
+            />
             {/* Header */}
             <div className="flex justify-between items-center mb-6">
                 <div>
@@ -321,24 +340,6 @@ export default function LeadsPage() {
                     ))}
                 </div>
                 <div className="flex items-center gap-2 pb-2">
-                    <BulkActionBar
-                        count={selectedIds.length}
-                        actions={[
-                            {
-                                label: "Copy",
-                                icon: CopyIcon,
-                                onClick: handleBulkCopy,
-                                disabled: isBulking,
-                            },
-                            {
-                                label: "Delete",
-                                icon: DeleteIcon,
-                                onClick: handleBulkDelete,
-                                variant: "danger",
-                                disabled: isBulking,
-                            },
-                        ]}
-                    />
                     <input
                         type="text"
                         placeholder="Search leads..."
