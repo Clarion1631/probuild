@@ -699,6 +699,11 @@ export async function getProjectLead(projectId: string) {
 export async function linkProjectToLead(projectId: string, leadId: string) {
     "use server";
     if (!leadId) throw new Error("leadId is required — unlinking a project from its lead is no longer supported");
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
     const project = await prisma.project.update({
         where: { id: projectId },
         data: { leadId },

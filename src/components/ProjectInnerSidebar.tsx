@@ -34,7 +34,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const [linking, setLinking] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [currentLead, setCurrentLead] = useState(lead || null);
-    const { permissions, loaded } = usePermissions();
+    const { permissions, isAdmin, loaded } = usePermissions();
 
     const can = (key?: string) => !key || !loaded || !!permissions[key];
 
@@ -105,19 +105,6 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             router.refresh();
         } catch (e: any) {
             toast.error(e.message || "Failed to link lead");
-        } finally { setLinking(false); }
-    };
-
-    const handleUnlinkLead = async () => {
-        if (!confirm("Unlink this lead from the project?")) return;
-        setLinking(true);
-        try {
-            await linkProjectToLead(projectId, null);
-            setCurrentLead(null);
-            toast.success("Lead unlinked");
-            router.refresh();
-        } catch (e: any) {
-            toast.error(e.message || "Failed to unlink lead");
         } finally { setLinking(false); }
     };
 
@@ -201,9 +188,9 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             </div>
 
             {/* Lead Link - Prominent */}
-            <div className="px-3 pt-3 pb-1 shrink-0">
-                {currentLead ? (
-                    <div className="group/lead">
+            {(currentLead || isAdmin) && (
+                <div className="px-3 pt-3 pb-1 shrink-0">
+                    {currentLead ? (
                         <Link
                             href={`/leads/${currentLead.id}`}
                             className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 hover:from-amber-100 hover:to-orange-100 transition"
@@ -224,30 +211,24 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                             </svg>
                         </Link>
+                    ) : (
                         <button
-                            onClick={handleUnlinkLead}
-                            className="w-full text-center text-[10px] text-slate-400 hover:text-red-500 mt-1 transition opacity-0 group-hover/lead:opacity-100"
+                            onClick={() => setShowLinkModal(true)}
+                            className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-slate-50 border border-dashed border-slate-300 hover:border-amber-300 hover:bg-amber-50 transition text-slate-400 hover:text-amber-600 group"
                         >
-                            Unlink lead
+                            <div className="w-7 h-7 bg-slate-100 group-hover:bg-amber-100 rounded-lg flex items-center justify-center shrink-0 transition">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                                    <path d="M12 5v14M5 12h14" />
+                                </svg>
+                            </div>
+                            <div className="text-left">
+                                <p className="text-[10px] font-semibold uppercase tracking-wider">Link Lead</p>
+                                <p className="text-[10px]">Connect to a lead</p>
+                            </div>
                         </button>
-                    </div>
-                ) : (
-                    <button
-                        onClick={() => setShowLinkModal(true)}
-                        className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-slate-50 border border-dashed border-slate-300 hover:border-amber-300 hover:bg-amber-50 transition text-slate-400 hover:text-amber-600 group"
-                    >
-                        <div className="w-7 h-7 bg-slate-100 group-hover:bg-amber-100 rounded-lg flex items-center justify-center shrink-0 transition">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                                <path d="M12 5v14M5 12h14" />
-                            </svg>
-                        </div>
-                        <div className="text-left">
-                            <p className="text-[10px] font-semibold uppercase tracking-wider">Link Lead</p>
-                            <p className="text-[10px]">Connect to a lead</p>
-                        </div>
-                    </button>
-                )}
-            </div>
+                    )}
+                </div>
+            )}
 
             {/* Scrollable nav */}
             <div className="flex-1 overflow-y-auto w-full">
