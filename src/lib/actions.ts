@@ -8,6 +8,7 @@ import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
+import { resolveSessionClientId } from "./portal-auth";
 
 // Safe estimate include that omits columns not yet migrated to the database.
 // Remove this wrapper once the DB Push workflow succeeds and the Estimate table
@@ -92,6 +93,7 @@ export async function getLeads() {
             client: true,
             estimates: safeEstimateInclude,
             manager: true,
+            project: { select: { id: true } },
             tasks: {
                 where: { status: { not: "Done" } },
                 orderBy: { dueDate: "asc" },
@@ -1197,10 +1199,24 @@ export async function markEstimateViewed(estimateId: string) {
     }
 }
 
-export async function markContractViewed(contractId: string) {
-    const contract = await prisma.contract.findUnique({
-        where: { id: contractId },
-        select: { viewedAt: true, title: true, projectId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
+export async function markContractViewed(contractId: string, accessToken?: string) {
+    // Ownership gate — same shape as approveContract. Either the caller presents a
+    // matching accessToken (magic-link path, no session) or the logged-in portal session
+    // resolves to the exact client that owns the lead/project. Unknown callers get a
+    // silent no-op (idempotent) to avoid leaking existence via a thrown error.
+    const sessionClientId = await resolveSessionClientId();
+
+    const ownershipClauses: any[] = [];
+    if (accessToken) ownershipClauses.push({ accessToken });
+    if (sessionClientId) {
+        ownershipClauses.push({ lead: { clientId: sessionClientId } });
+        ownershipClauses.push({ project: { clientId: sessionClientId } });
+    }
+    if (ownershipClauses.length === 0) return;
+
+    const contract = await prisma.contract.findFirst({
+        where: { id: contractId, OR: ownershipClauses },
+        select: { viewedAt: true, title: true, projectId: true, leadId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
     if (contract && !contract.viewedAt) {
@@ -1226,7 +1242,14 @@ export async function markContractViewed(contractId: string) {
             );
         }
 
-        // Log to activity feed
+        // Post activity to lead/project thread so it surfaces in Recent Activity
+        await postActivityToThread(
+            contract.leadId ?? null,
+            contract.projectId ?? null,
+            `👁️ ${clientName} viewed contract "${contract.title}"`
+        );
+
+        // Log to project activity feed
         if (contract.projectId) {
             const projectId = contract.projectId;
             await logActivity({
@@ -2689,6 +2712,95 @@ export async function getContract(id: string) {
     });
 }
 
+/**
+ * Ownership-scoped contract fetch for the client portal.
+ *
+ * Returns the contract only if the caller can prove access in one of two ways:
+ *   1. A matching `accessToken` (the magic-link the contractor emailed)
+ *   2. A portal session whose email resolves to exactly one Client row, and
+ *      that client is the owner of the lead/project the contract belongs to.
+ *
+ * Returns `null` on not-found OR not-authorized — never leak existence with a 403.
+ *
+ * This is the only path `/portal/contracts/[id]/page.tsx` and related portal mutations
+ * should use. Plain `getContract` has no ownership check and is admin-only.
+ */
+export async function getContractForPortal(id: string, token?: string | null) {
+    // Try token first — it's the path the email link uses and needs no session.
+    if (token) {
+        const byToken = await prisma.contract.findFirst({
+            where: { id, accessToken: token },
+            include: {
+                project: { include: { client: true } },
+                lead: { include: { client: true } },
+            },
+        });
+        if (byToken) return byToken;
+    }
+
+    // Fall back to session-based access for logged-in clients browsing /portal.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return null;
+
+    return prisma.contract.findFirst({
+        where: {
+            id,
+            OR: [
+                { lead: { clientId: sessionClientId } },
+                { project: { clientId: sessionClientId } },
+            ],
+        },
+        include: {
+            project: { include: { client: true } },
+            lead: { include: { client: true } },
+        },
+    });
+}
+
+/**
+ * Returns the executed PDF ProjectFile for a specific contract.
+ *
+ * Files written by the finalize route use a contractId-embedded filename of the
+ * form `{timestamp}_Executed_Contract_{contractId}.pdf`, so we match on
+ * `contains: "_Executed_Contract_" + contractId + "."` which is unambiguous.
+ *
+ * Legacy fallback: files written before the contractId naming convention used
+ * `Executed_Contract_{safeTitle}.pdf`. If the new query finds nothing AND the
+ * contract has a title, we retry with the title-based prefix as a courtesy
+ * for old data. Same-title collisions on legacy data are accepted as a known
+ * limitation — new data is unambiguous.
+ */
+export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
+    const where: any = contract.projectId
+        ? { projectId: contract.projectId }
+        : contract.leadId
+            ? { leadId: contract.leadId }
+            : null;
+    if (!where) return null;
+
+    // Preferred: match the contract-id-embedded filename.
+    const byContractId = await prisma.projectFile.findFirst({
+        where: {
+            ...where,
+            name: { contains: `_Executed_Contract_${contract.id}.` },
+            mimeType: "application/pdf",
+        },
+        orderBy: { createdAt: "desc" },
+    });
+    if (byContractId) return byContractId;
+
+    // Legacy fallback — title-prefixed files from before the contractId naming change.
+    const legacyPrefix = `Executed_Contract_${contract.title.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+    return prisma.projectFile.findFirst({
+        where: {
+            ...where,
+            name: { startsWith: legacyPrefix },
+            mimeType: "application/pdf",
+        },
+        orderBy: { createdAt: "desc" },
+    });
+}
+
 export async function createContractFromTemplate(
     templateId: string,
     context: { type: "project" | "lead"; id: string },
@@ -2775,14 +2887,37 @@ export async function sendContractToClient(contractId: string) {
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
+    // Generate a stable access token on first send. Preserve on resend so previously emailed
+    // links remain valid. crypto.randomUUID() is cryptographically strong and unique.
+    const accessToken = contract.accessToken || crypto.randomUUID();
+
     await prisma.contract.update({
         where: { id: contractId },
-        data: { status: "Sent", sentAt: new Date() }
+        data: {
+            status: "Sent",
+            sentAt: new Date(),
+            accessToken,
+        }
     });
 
-    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/contracts/${contractId}`;
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+    const portalUrl = `${appUrl}/portal/contracts/${contractId}?token=${accessToken}`;
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
+    const companyLogo = settings?.logoUrl || "";
+    const companyLicense = settings?.licenseNumber || "";
+
+    // Brand header — logo if present, else just company name. License displayed under name.
+    const brandHeader = `
+        <div style="text-align: center; margin-bottom: 32px;">
+            ${companyLogo
+                ? `<img src="${companyLogo}" alt="${companyName}" style="max-height: 64px; width: auto; margin: 0 auto 12px; display: block;" />`
+                : ""}
+            <h1 style="font-size: 22px; font-weight: 700; margin: 0; color: #0f172a;">${companyName}</h1>
+            ${companyLicense
+                ? `<p style="font-size: 12px; color: #64748b; margin: 4px 0 0;">Lic# ${companyLicense}</p>`
+                : ""}
+        </div>`;
 
     await sendNotification(
         client.email,
@@ -2790,19 +2925,17 @@ export async function sendContractToClient(contractId: string) {
         `<!DOCTYPE html>
         <html>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            <div style="text-align: center; margin-bottom: 32px;">
-                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
-            </div>
+            ${brandHeader}
             <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
                 <h2 style="font-size: 20px; margin: 0 0 8px;">Contract Ready for Your Signature</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you a contract titled "<strong>${contract.title}</strong>" for your review and signature.
-                    Please click the button below to read the agreement and sign electronically.
+                    Click the button below to open your document portal, read the agreement, and sign electronically.
                 </p>
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        Review & Sign Contract
+                        View in Portal
                     </a>
                 </div>
                 <p style="color: #999; font-size: 13px; margin: 0;">If you have any questions, reply to this email or contact us directly.</p>
@@ -2811,7 +2944,7 @@ export async function sendContractToClient(contractId: string) {
         </html>`
     );
 
-    // Log to activity feed (project-scoped only)
+    // Log to activity feed — project side uses ActivityLog, lead side uses the client message thread.
     if (contract.projectId) {
         await logActivity({
             projectId: contract.projectId,
@@ -2823,11 +2956,16 @@ export async function sendContractToClient(contractId: string) {
             entityName: contract.title,
         });
     }
+    await postActivityToThread(
+        contract.leadId,
+        contract.projectId,
+        `📄 Contract "${contract.title}" sent to ${client.name} (${client.email}) for review and signature.`
+    );
 
     if (contract.projectId) revalidatePath(`/projects/${contract.projectId}`);
     if (contract.leadId) revalidatePath(`/leads/${contract.leadId}`);
 
-    return { success: true, sentTo: client.email };
+    return { success: true, sentTo: client.email, clientName: client.name };
 }
 
 export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
@@ -2864,10 +3002,24 @@ export async function signContractAsContractor(contractId: string, signerName: s
     return { success: true };
 }
 
-export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
-    // Fetch the contract first to get recurring info
-    const contract = await prisma.contract.findUnique({
-        where: { id: contractId },
+export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, accessToken?: string) {
+    // Ownership gate — caller must have either an access-token match (magic-link path) or
+    // a portal session whose email resolves to exactly one Client row that owns the
+    // lead/project. Duplicate emails collapse to null (see resolveSessionClientId).
+    // Unknown callers get "Contract not found" so we don't leak existence.
+    const sessionClientId = await resolveSessionClientId();
+
+    const ownershipClauses: any[] = [];
+    if (accessToken) ownershipClauses.push({ accessToken });
+    if (sessionClientId) {
+        ownershipClauses.push({ lead: { clientId: sessionClientId } });
+        ownershipClauses.push({ project: { clientId: sessionClientId } });
+    }
+    if (ownershipClauses.length === 0) throw new Error("Contract not found");
+
+    // Fetch the contract, verifying ownership in the same query
+    const contract = await prisma.contract.findFirst({
+        where: { id: contractId, OR: ownershipClauses },
         include: { project: true, lead: true }
     });
     if (!contract) throw new Error("Contract not found");
@@ -2929,7 +3081,7 @@ export async function approveContract(contractId: string, signatureName: string,
         );
     }
 
-    // Log to activity feed
+    // Log to project activity feed
     if (contract.projectId) {
         await logActivity({
             projectId: contract.projectId,
@@ -2941,6 +3093,13 @@ export async function approveContract(contractId: string, signatureName: string,
             entityName: `Contract "${contract.title}"`,
         });
     }
+
+    // Post to lead/project thread (Recent Activity panel)
+    await postActivityToThread(
+        contract.leadId ?? null,
+        contract.projectId ?? null,
+        `✅ ${signatureName} signed contract "${contract.title}" on ${now.toLocaleDateString()}`
+    );
 
     revalidatePath("/");
     return { success: true };

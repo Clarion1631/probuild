@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { useState, useMemo, useEffect } from "react";
 import Avatar from "@/components/Avatar";
-import { getLeads } from "@/lib/actions";
+import { getLeads, deleteLead } from "@/lib/actions";
 import Link from "next/link";
 import AddLeadButton from "./AddLeadButton";
 import LeadStageDropdown from "./[id]/LeadStageDropdown";
@@ -60,8 +60,6 @@ function SortIcon({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; s
     );
 }
 
-type ScoreResult = { score: number; rating: string; summary: string; topFactors: string[] };
-
 export default function LeadsPage() {
     const [leads, setLeads] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
@@ -72,7 +70,7 @@ export default function LeadsPage() {
     const [sortDir, setSortDir] = useState<SortDir>("desc");
     const [sourceFilter, setSourceFilter] = useState("");
     const [typeFilter, setTypeFilter] = useState("");
-    const [scores, setScores] = useState<Record<string, ScoreResult | "loading">>({});
+    const [deletingId, setDeletingId] = useState<string | null>(null);
 
     useEffect(() => {
         getLeads().then(data => {
@@ -94,22 +92,22 @@ export default function LeadsPage() {
         }
     }
 
-    async function scoreLead(leadId: string, e: React.MouseEvent) {
+    async function handleDelete(lead: any, e: React.MouseEvent) {
         e.stopPropagation();
-        setScores(prev => ({ ...prev, [leadId]: "loading" }));
+        if (lead.project) {
+            toast.error("This lead has a linked project. Delete the project first before deleting the lead.");
+            return;
+        }
+        if (!confirm(`Delete "${lead.name}"? This cannot be undone.`)) return;
+        setDeletingId(lead.id);
         try {
-            const res = await fetch(`/api/leads/${leadId}/score`, { method: "POST" });
-            if (!res.ok) throw new Error("Score failed");
-            const data: ScoreResult = await res.json();
-            setScores(prev => ({ ...prev, [leadId]: data }));
-            toast.success(`Lead scored: ${data.score}/100 (${data.rating})`);
-        } catch {
-            setScores(prev => {
-                const next = { ...prev };
-                delete next[leadId];
-                return next;
-            });
-            toast.error("Scoring failed. Try again.");
+            await deleteLead(lead.id);
+            setLeads(prev => prev.filter(l => l.id !== lead.id));
+            toast.success("Lead deleted");
+        } catch (err: any) {
+            toast.error(err?.message || "Failed to delete lead");
+        } finally {
+            setDeletingId(null);
         }
     }
 
@@ -341,15 +339,11 @@ export default function LeadsPage() {
                                 <SORT_HEADER col="targetRevenue">Revenue</SORT_HEADER>
                                 <SORT_HEADER col="source">Source</SORT_HEADER>
                                 <SORT_HEADER col="lastActivity">Last Activity</SORT_HEADER>
-                                <th scope="col" className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider text-center">AI Score</th>
+                                <th scope="col" className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider text-center"></th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                             {filtered.map((l: any) => {
-                                const scoreResult = scores[l.id];
-                                const isScoring = scoreResult === "loading";
-                                const scored = scoreResult && scoreResult !== "loading" ? scoreResult as ScoreResult : null;
-
                                 return (
                                     <tr
                                         key={l.id}
@@ -376,36 +370,21 @@ export default function LeadsPage() {
                                         <td className="px-6 py-4 text-hui-textMuted text-xs">
                                             {new Date(l.lastActivityAt || l.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
                                         </td>
-                                        <td className="px-6 py-4 text-center" onClick={e => e.stopPropagation()}>
-                                            {scored ? (
-                                                <div className="flex flex-col items-center gap-1" title={scored.summary}>
-                                                    <span className={`text-sm font-bold ${scored.score >= 70 ? "text-green-600" : scored.score >= 40 ? "text-amber-600" : "text-slate-500"}`}>
-                                                        {scored.score}
-                                                    </span>
-                                                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                                                        scored.rating === "Hot" ? "bg-red-100 text-red-700"
-                                                        : scored.rating === "Warm" ? "bg-amber-100 text-amber-700"
-                                                        : "bg-slate-100 text-slate-600"
-                                                    }`}>
-                                                        {scored.rating}
-                                                    </span>
-                                                </div>
-                                            ) : (
-                                                <button
-                                                    onClick={e => scoreLead(l.id, e)}
-                                                    disabled={isScoring}
-                                                    className="text-xs font-semibold text-purple-600 bg-purple-50 hover:bg-purple-100 px-2.5 py-1 rounded-md transition disabled:opacity-50 flex items-center gap-1 mx-auto"
-                                                >
-                                                    {isScoring ? (
-                                                        <span className="w-3 h-3 border-2 border-purple-200 border-t-purple-600 rounded-full animate-spin" />
-                                                    ) : (
-                                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                                        </svg>
-                                                    )}
-                                                    {isScoring ? "Scoring..." : "AI Score"}
-                                                </button>
-                                            )}
+                                        <td className="px-3 py-4 text-center" onClick={e => e.stopPropagation()}>
+                                            <button
+                                                onClick={e => handleDelete(l, e)}
+                                                disabled={deletingId === l.id}
+                                                title={l.project ? "Delete project first" : "Delete lead"}
+                                                className={`opacity-0 group-hover:opacity-100 transition p-1.5 rounded hover:bg-red-50 disabled:opacity-40 ${l.project ? "text-slate-300 cursor-not-allowed" : "text-slate-400 hover:text-red-600"}`}
+                                            >
+                                                {deletingId === l.id ? (
+                                                    <span className="w-4 h-4 border-2 border-slate-300 border-t-red-500 rounded-full animate-spin block" />
+                                                ) : (
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                                    </svg>
+                                                )}
+                                            </button>
                                         </td>
                                     </tr>
                                 );
