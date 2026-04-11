@@ -22,7 +22,7 @@ export default function DeleteEstimateButton({ estimateId, estimateTitle, status
             }
             toast.success("Estimate deleted");
             setShowConfirm(false);
-            router.refresh();
+            window.location.reload();
         } catch {
             toast.error("Failed to delete estimate");
         } finally {
