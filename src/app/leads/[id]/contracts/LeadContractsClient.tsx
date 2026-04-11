@@ -111,7 +111,12 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
     const handleSend = async (contractId: string) => {
         try {
             const result = await sendContractToClient(contractId);
-            toast.success(`Sent to ${result.sentTo}`);
+            // Rich confirmation: who we sent to + their email, so the user can immediately
+            // verify that the right recipient was notified.
+            toast.success(
+                `Contract sent to ${result.clientName || clientName} at ${result.sentTo}`,
+                { description: `Lead: ${leadName}` }
+            );
             window.location.reload();
         } catch (e: any) { toast.error(e.message || "Failed to send"); }
     };
@@ -320,10 +325,14 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                                                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-600 border border-indigo-200">🔄 Every {c.recurringDays}d</span>
                                             )}
                                         </div>
-                                        <div className="flex items-center gap-3 text-xs text-slate-500">
+                                        <div className="flex items-center flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
                                             <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
                                             {c.sentAt && <span>· Sent {new Date(c.sentAt).toLocaleDateString()}</span>}
-                                            {c.approvedBy && <span className="text-green-600 font-medium">· Signed by {c.approvedBy}</span>}
+                                            {c.approvedBy && c.approvedAt && (
+                                                <span className="text-green-600 font-medium">
+                                                    · Signed by {c.approvedBy} on {new Date(c.approvedAt).toLocaleDateString()}
+                                                </span>
+                                            )}
                                             {c.nextDueDate && <span className="text-indigo-600">· Next due {new Date(c.nextDueDate).toLocaleDateString()}</span>}
                                         </div>
                                     </div>
@@ -335,6 +344,18 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                                             <button onClick={() => handleViewHistory(c.id)} className="px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition border border-indigo-200">
                                                 📋 History
                                             </button>
+                                        )}
+                                        {c.executedPdfUrl && (
+                                            <a
+                                                href={c.executedPdfUrl}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                onClick={e => e.stopPropagation()}
+                                                className="px-3 py-1.5 text-xs font-medium text-green-700 bg-green-50 rounded-lg hover:bg-green-100 transition border border-green-200"
+                                                title="Download signed PDF"
+                                            >
+                                                ⬇ PDF
+                                            </a>
                                         )}
                                         {(c.status === "Draft" || c.status === "Sent") && (
                                             <button onClick={() => handleSend(c.id)} className="px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition shadow-sm">

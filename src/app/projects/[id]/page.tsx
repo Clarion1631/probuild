@@ -56,11 +56,19 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     const inProgressTasks = tasks.filter((t: any) => t.status === "In Progress").length;
     const taskProgress = tasks.length > 0 ? Math.round((completedTasks / tasks.length) * 100) : 0;
 
-    // Upcoming tasks (not completed, sorted by end date)
+    // Upcoming tasks: overdue first, then by end date ascending
     const upcoming = tasks
         .filter((t: any) => t.status !== "Complete")
-        .sort((a: any, b: any) => new Date(a.endDate).getTime() - new Date(b.endDate).getTime())
-        .slice(0, 5);
+        .sort((a: any, b: any) => {
+            const aDate = new Date(a.endDate).getTime();
+            const bDate = new Date(b.endDate).getTime();
+            const aOverdue = aDate < today.getTime();
+            const bOverdue = bDate < today.getTime();
+            if (aOverdue && !bOverdue) return -1;
+            if (!aOverdue && bOverdue) return 1;
+            return aDate - bDate;
+        })
+        .slice(0, 8);
 
     const today = new Date();
     const now = Date.now();
@@ -122,7 +130,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                             <span className="text-[10px] text-slate-400 font-medium bg-slate-100 px-2 py-0.5 rounded-full">{recentActivity.length}</span>
                         </div>
                     </div>
-                    <div className="divide-y divide-slate-100">
+                    <div className="overflow-y-auto max-h-[420px] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-300 divide-y divide-slate-100">
                         {recentActivity.length === 0 && (
                             <div className="px-6 py-10 text-center">
                                 <p className="text-sm text-slate-400">No activity yet</p>
@@ -167,7 +175,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                                 View →
                             </Link>
                         </div>
-                        <div className="divide-y divide-slate-100">
+                        <div className="overflow-y-auto max-h-[240px] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-300 divide-y divide-slate-100">
                             {upcoming.length === 0 && (
                                 <div className="px-4 py-6 text-center">
                                     <p className="text-xs text-slate-400">No upcoming tasks</p>

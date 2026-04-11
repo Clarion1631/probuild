@@ -61,7 +61,29 @@ export async function GET(req: Request) {
                 });
             }
 
-            // Reset Contract for next signature period
+            // Atomic first-mint of accessToken — the read-then-update pattern is racy
+            // with `sendContractToClient`. `updateMany` gated on `accessToken IS NULL`
+            // ensures only the first writer mints; subsequent writers re-read the
+            // canonical value. See matching logic in `sendContractToClient`.
+            if (!contract.accessToken) {
+                const candidate = crypto.randomUUID();
+                await prisma.contract.updateMany({
+                    where: { id: contract.id, accessToken: null },
+                    data: { accessToken: candidate },
+                });
+            }
+            const minted = await prisma.contract.findUnique({
+                where: { id: contract.id },
+                select: { accessToken: true },
+            });
+            const cycleToken = minted?.accessToken;
+            if (!cycleToken) {
+                console.error(`[recurring-docs] Failed to mint access token for contract ${contract.id}`);
+                continue;
+            }
+
+            // Reset Contract for next signature period (does NOT touch accessToken —
+            // the atomic mint above handles that so no writer can clobber another).
             await prisma.contract.update({
                 where: { id: contract.id },
                 data: {
@@ -69,24 +91,36 @@ export async function GET(req: Request) {
                     approvedBy: null,
                     approvedAt: null,
                     signatureUrl: null,
-                    nextDueDate: periodEnd
+                    nextDueDate: periodEnd,
                 }
             });
 
             // Dispatch Notification Email only if we have an email
             if (clientEmail) {
-                const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/contracts/${contract.id}`;
+                const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/contracts/${contract.id}?token=${cycleToken}`;
                 const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                
+                const companyLogo = settings?.logoUrl || "";
+                const companyLicense = settings?.licenseNumber || "";
+                const companyName = settings?.companyName || 'ProBuild';
+
+                const brandHeader = `
+                    <div style="text-align: center; margin-bottom: 32px;">
+                        ${companyLogo
+                            ? `<img src="${companyLogo}" alt="${companyName}" style="max-height: 64px; width: auto; margin: 0 auto 12px; display: block;" />`
+                            : ""}
+                        <h1 style="font-size: 22px; font-weight: 700; margin: 0; color: #0f172a;">${companyName}</h1>
+                        ${companyLicense
+                            ? `<p style="font-size: 12px; color: #64748b; margin: 4px 0 0;">Lic# ${companyLicense}</p>`
+                            : ""}
+                    </div>`;
+
                 await sendNotification(
                     clientEmail,
                     `Action Required: Monthly Document Ready to Sign - ${contract.title}`,
                     `<!DOCTYPE html>
                     <html>
                     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-                        <div style="text-align: center; margin-bottom: 32px;">
-                            <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${settings?.companyName || 'ProBuild'}</h1>
-                        </div>
+                        ${brandHeader}
                         <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
                             <h2 style="font-size: 20px; margin: 0 0 8px;">Action Required: Signature Needed</h2>
                             <p style="color: #666; margin: 0 0 24px;">Hi ${clientName},</p>
@@ -95,7 +129,7 @@ export async function GET(req: Request) {
                             </p>
                             <div style="text-align: center; margin: 32px 0;">
                                 <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                                    Review & Sign Securely
+                                    View in Portal
                                 </a>
                             </div>
                             <p style="color: #999; font-size: 13px; text-align: center;">
@@ -105,7 +139,7 @@ export async function GET(req: Request) {
                     </body>
                     </html>`,
                     undefined,
-                    { fromName: settings?.companyName || 'ProBuild', replyTo: settings?.email || undefined }
+                    { fromName: companyName, replyTo: settings?.email || undefined }
                 );
             }
 

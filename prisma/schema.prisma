@@ -504,6 +504,10 @@ model Contract {
   sentAt   DateTime?
   viewedAt DateTime?
 
+  // Portal access token — stable magic-link for client to view/sign the contract without a login.
+  // Generated on first send, preserved on resend so old email links keep working.
+  accessToken String? @unique
+
   // Recurring (e.g. lien release every 30 days)
   recurringDays  Int? // null = one-time, 30 = every 30 days
   nextDueDate    DateTime? // When the next signing is due

@@ -1,18 +1,29 @@
-import { getContract, getCompanySettings, getPortalVisibility } from "@/lib/actions";
+import { getContractForPortal, getCompanySettings, getPortalVisibility, getExecutedContractPdf } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import PortalContractClient from "./PortalContractClient";
 import Link from "next/link";
 
 export const dynamic = "force-dynamic";
 
-export default async function PortalContractPage({ params }: { params: Promise<{ id: string }> }) {
+export default async function PortalContractPage({
+    params,
+    searchParams,
+}: {
+    params: Promise<{ id: string }>;
+    searchParams: Promise<{ token?: string }>;
+}) {
     const resolvedParams = await params;
-    const contract = await getContract(resolvedParams.id);
-    const settings = await getCompanySettings();
+    const resolvedSearch = await searchParams;
 
+    // Ownership gate: either a valid access token (from email magic link) or a portal
+    // session whose email matches the lead/project client. Returns null on both miss — never
+    // leak existence with a 403.
+    const contract = await getContractForPortal(resolvedParams.id, resolvedSearch.token);
     if (!contract) {
         notFound();
     }
+
+    const settings = await getCompanySettings();
 
     // Check portal visibility if contract belongs to a project
     if (contract!.projectId) {
@@ -33,5 +44,21 @@ export default async function PortalContractPage({ params }: { params: Promise<{
         }
     }
 
-    return <PortalContractClient initialContract={contract} companySettings={settings} />;
+    // Fetch the executed PDF file (if this contract has been signed & archived) so the client
+    // can download it from the portal page instead of hunting through email.
+    const archivedFile = await getExecutedContractPdf({
+        id: contract.id,
+        title: contract.title,
+        projectId: contract.projectId,
+        leadId: contract.leadId,
+    });
+
+    return (
+        <PortalContractClient
+            initialContract={contract}
+            companySettings={settings}
+            archivedPdfUrl={archivedFile?.url || null}
+            accessToken={resolvedSearch.token || null}
+        />
+    );
 }

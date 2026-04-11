@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { sendNotification } from "@/lib/email";
+import { resolveSessionClientId } from "@/lib/portal-auth";
 
 // Allow larger uploads (50MB) and longer processing times for PDF Generation
 export const maxDuration = 60;
@@ -23,8 +24,29 @@ export async function POST(
             return NextResponse.json({ error: "Storage not configured." }, { status: 500 });
         }
 
-        const contract = await prisma.contract.findUnique({
-            where: { id },
+        // Ownership gate — caller must present either a matching accessToken (magic-link
+        // path, no session required) or a portal session whose email resolves to exactly
+        // one Client row that owns the lead/project. Missing/mismatched auth collapses
+        // into 404 so we don't leak existence. Duplicate-email collisions are refused
+        // by resolveSessionClientId returning null.
+        const tokenFromQuery = req.nextUrl.searchParams.get("token");
+        const sessionClientId = await resolveSessionClientId();
+
+        const ownershipClauses: any[] = [];
+        if (tokenFromQuery) ownershipClauses.push({ accessToken: tokenFromQuery });
+        if (sessionClientId) {
+            ownershipClauses.push({ lead: { clientId: sessionClientId } });
+            ownershipClauses.push({ project: { clientId: sessionClientId } });
+        }
+        if (ownershipClauses.length === 0) {
+            return NextResponse.json({ error: "Contract not found" }, { status: 404 });
+        }
+
+        const contract = await prisma.contract.findFirst({
+            where: {
+                id,
+                OR: ownershipClauses,
+            },
             include: {
                 project: { select: { id: true, name: true, client: { select: { name: true, email: true } } } },
                 lead: { select: { id: true, name: true, client: { select: { name: true, email: true } } } }
@@ -56,9 +78,12 @@ export async function POST(
         const bytes = await pdfBlob.arrayBuffer();
         const buffer = Buffer.from(bytes);
 
-        // Upload to Supabase Bucket
+        // Upload to Supabase Bucket.
+        // Filename embeds the contractId so lookups can unambiguously map a PDF back
+        // to its contract even when titles collide. `getExecutedContractPdf` matches
+        // on `contains: "_Executed_Contract_{id}."`.
         const prefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
-        const safeName = `Executed_Contract_${contract.title.replace(/[^a-zA-Z0-9._-]/g, "_")}.pdf`;
+        const safeName = `Executed_Contract_${contract.id}.pdf`;
         const storagePath = `${prefix}/${Date.now()}_${safeName}`;
 
         const { data: uploadData, error: uploadError } = await supabase.storage

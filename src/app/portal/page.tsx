@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { resolveSessionClientId } from "@/lib/portal-auth";
 import Link from 'next/link';
 import Avatar from "@/components/Avatar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
@@ -14,8 +15,25 @@ export default async function PortalDashboard() {
         return <div className="p-8 text-center">Please log in to access your portal.</div>;
     }
 
-    const client = await prisma.client.findFirst({
-        where: { email },
+    // Resolve the session to exactly one Client row. If the email maps to zero or
+    // more-than-one client records, refuse the listing entirely rather than
+    // cross-authorizing. Client.email is nullable + non-unique in the schema.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) {
+        return (
+            <div className="max-w-4xl mx-auto py-16 px-4 text-center">
+                <div className="w-16 h-16 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                    <svg className="w-8 h-8 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
+                </div>
+                <h1 className="text-2xl font-bold text-hui-textMain mb-2">Welcome to your Portal!</h1>
+                <p className="text-hui-textMuted mb-6">We couldn't find any projects currently linked to <strong>{email}</strong>.</p>
+                <p className="text-hui-textMuted text-sm">If you believe this is an error, please double-check with your project manager that this is the email address they added to your file.</p>
+            </div>
+        );
+    }
+
+    const client = await prisma.client.findUnique({
+        where: { id: sessionClientId },
         include: {
             projects: {
                 orderBy: { createdAt: 'desc' },
@@ -27,6 +45,30 @@ export default async function PortalDashboard() {
                 }
             }
         }
+    });
+
+    // Fetch contracts visible to this client — both lead-side and project-side,
+    // scoped by the resolved clientId (safer than raw email). Draft contracts
+    // are excluded (they haven't been sent yet).
+    const clientContracts = await prisma.contract.findMany({
+        where: {
+            status: { in: ["Sent", "Viewed", "Signed", "Finalized"] },
+            OR: [
+                { lead: { clientId: sessionClientId } },
+                { project: { clientId: sessionClientId } },
+            ],
+        },
+        select: {
+            id: true,
+            title: true,
+            status: true,
+            sentAt: true,
+            approvedAt: true,
+            accessToken: true,
+            lead: { select: { name: true } },
+            project: { select: { name: true } },
+        },
+        orderBy: { sentAt: "desc" },
     });
 
     if (!client) {
@@ -54,11 +96,11 @@ export default async function PortalDashboard() {
                 </div>
             </div>
 
-            {projects.length === 0 ? (
+            {projects.length === 0 && clientContracts.length === 0 ? (
                 <div className="hui-card p-8 text-center flex flex-col items-center">
                     <p className="text-hui-textMuted">You don't have any projects yet. They will appear here once created by your team.</p>
                 </div>
-            ) : (
+            ) : projects.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {projects.map(p => {
                         const activeInvoices = p.invoices.reduce((sum, inv) => sum + Number(inv.balanceDue), 0);
@@ -100,6 +142,64 @@ export default async function PortalDashboard() {
                             </Link>
                         )
                     })}
+                </div>
+            )}
+
+            {clientContracts.length > 0 && (
+                <div className="mt-12">
+                    <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-lg font-semibold text-hui-textMain">Documents</h2>
+                        <span className="text-xs text-hui-textMuted">{clientContracts.length} total</span>
+                    </div>
+                    <div className="hui-card divide-y divide-hui-border overflow-hidden">
+                        {clientContracts.map(c => {
+                            const context = c.project?.name || c.lead?.name || "";
+                            const href = c.accessToken
+                                ? `/portal/contracts/${c.id}?token=${c.accessToken}`
+                                : `/portal/contracts/${c.id}`;
+                            const isSigned = c.status === "Signed" || c.status === "Finalized";
+                            return (
+                                <Link
+                                    key={c.id}
+                                    href={href}
+                                    className="flex items-center justify-between px-5 py-4 hover:bg-slate-50 transition group"
+                                >
+                                    <div className="flex items-center gap-4 min-w-0 flex-1">
+                                        <div className="w-10 h-10 rounded-lg bg-blue-50 flex items-center justify-center flex-shrink-0">
+                                            <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                            </svg>
+                                        </div>
+                                        <div className="min-w-0 flex-1">
+                                            <div className="flex items-center gap-2 mb-1">
+                                                <h3 className="font-medium text-hui-textMain truncate group-hover:text-blue-600 transition">
+                                                    {c.title}
+                                                </h3>
+                                                <StatusBadge status={c.status as StatusType} />
+                                            </div>
+                                            <div className="flex items-center gap-3 text-xs text-hui-textMuted">
+                                                {context && <span className="truncate">{context}</span>}
+                                                {c.sentAt && (
+                                                    <span>· Sent {new Date(c.sentAt).toLocaleDateString()}</span>
+                                                )}
+                                                {isSigned && c.approvedAt && (
+                                                    <span className="text-green-600 font-medium">
+                                                        · Signed {new Date(c.approvedAt).toLocaleDateString()}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-2 text-sm text-blue-600 font-medium flex-shrink-0 ml-4">
+                                        {isSigned ? "View & Download" : "Review"}
+                                        <svg className="w-4 h-4 transform group-hover:translate-x-1 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                        </svg>
+                                    </div>
+                                </Link>
+                            );
+                        })}
+                    </div>
                 </div>
             )}
         </div>

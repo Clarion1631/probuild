@@ -2760,15 +2760,16 @@ export async function getContractForPortal(id: string, token?: string | null) {
 /**
  * Returns the executed PDF ProjectFile for a specific contract.
  *
- * Files written by the finalize route use a contractId-embedded filename of the
- * form `{timestamp}_Executed_Contract_{contractId}.pdf`, so we match on
- * `contains: "_Executed_Contract_" + contractId + "."` which is unambiguous.
+ * Files written by the finalize route set `ProjectFile.name` to the exact string
+ * `Executed_Contract_{contractId}.pdf` (no timestamp prefix — the timestamp only
+ * appears in the storage path, not the DB `name` column). We use exact equality
+ * for airtight lookup.
  *
  * Legacy fallback: files written before the contractId naming convention used
- * `Executed_Contract_{safeTitle}.pdf`. If the new query finds nothing AND the
- * contract has a title, we retry with the title-based prefix as a courtesy
- * for old data. Same-title collisions on legacy data are accepted as a known
- * limitation — new data is unambiguous.
+ * `Executed_Contract_{safeTitle}.pdf`. If exact-match returns nothing we retry
+ * with the title-based prefix as a best-effort courtesy for old data. Same-title
+ * collisions on legacy data are accepted as a known limitation — new data is
+ * unambiguous.
  */
 export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
     const where: any = contract.projectId
@@ -2778,11 +2779,12 @@ export async function getExecutedContractPdf(contract: { id: string; title: stri
             : null;
     if (!where) return null;
 
-    // Preferred: match the contract-id-embedded filename.
+    // Preferred: exact-match on the contract-id-embedded filename.
+    const exactName = `Executed_Contract_${contract.id}.pdf`;
     const byContractId = await prisma.projectFile.findFirst({
         where: {
             ...where,
-            name: { contains: `_Executed_Contract_${contract.id}.` },
+            name: exactName,
             mimeType: "application/pdf",
         },
         orderBy: { createdAt: "desc" },
@@ -2887,16 +2889,33 @@ export async function sendContractToClient(contractId: string) {
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
-    // Generate a stable access token on first send. Preserve on resend so previously emailed
-    // links remain valid. crypto.randomUUID() is cryptographically strong and unique.
-    const accessToken = contract.accessToken || crypto.randomUUID();
+    // Atomic first-mint of accessToken. We cannot read-then-update because two
+    // concurrent senders (e.g. a human resend racing with the recurring-docs cron)
+    // could both read `null`, mint different UUIDs, and the later write would
+    // invalidate the earlier emailed link. Instead, we race with `updateMany`
+    // gated on `accessToken IS NULL` — only the first writer wins. Then we
+    // re-read to learn the canonical value (ours or a concurrent writer's).
+    if (!contract.accessToken) {
+        const candidate = crypto.randomUUID();
+        await prisma.contract.updateMany({
+            where: { id: contractId, accessToken: null },
+            data: { accessToken: candidate },
+        });
+    }
+    const minted = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { accessToken: true },
+    });
+    const accessToken = minted?.accessToken;
+    if (!accessToken) throw new Error("Failed to mint contract access token");
 
+    // Status/sentAt update is now separate — it does NOT touch accessToken, so it
+    // can never clobber a token another writer has already set.
     await prisma.contract.update({
         where: { id: contractId },
         data: {
             status: "Sent",
             sentAt: new Date(),
-            accessToken,
         }
     });
 

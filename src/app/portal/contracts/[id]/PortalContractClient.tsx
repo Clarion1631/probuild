@@ -8,12 +8,26 @@ import { toast } from "sonner";
 import { toJpeg } from "html-to-image";
 import { jsPDF } from "jspdf";
 
-export default function PortalContractClient({ initialContract, companySettings }: { initialContract: any; companySettings?: any }) {
-    const isSigned = initialContract.status === "Signed" || initialContract.status === "Approved";
+export default function PortalContractClient({
+    initialContract,
+    companySettings,
+    archivedPdfUrl,
+    accessToken,
+}: {
+    initialContract: any;
+    companySettings?: any;
+    archivedPdfUrl?: string | null;
+    accessToken?: string | null;
+}) {
+    const isSigned =
+        initialContract.status === "Signed" ||
+        initialContract.status === "Approved" ||
+        initialContract.status === "Finalized";
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
+    const companyLicense = companySettings?.licenseNumber || "";
 
     const contractBodyRef = useRef<HTMLDivElement>(null);
 
@@ -32,10 +46,11 @@ export default function PortalContractClient({ initialContract, companySettings 
     const [error, setError] = useState("");
     const [isSuccess, setIsSuccess] = useState(false);
 
-    // Detect View
+    // Detect View. Pass the accessToken through so the server-side ownership
+    // check accepts the magic-link path (no portal session required).
     useEffect(() => {
-        markContractViewed(initialContract.id).catch(console.error);
-    }, [initialContract.id]);
+        markContractViewed(initialContract.id, accessToken || undefined).catch(console.error);
+    }, [initialContract.id, accessToken]);
 
     // Parse and Inject HTML Buttons — returns derived block counts alongside HTML
     const { parsedBody, totalRequiredBlocks, totalSigBlocks } = React.useMemo(() => {
@@ -200,37 +215,80 @@ export default function PortalContractClient({ initialContract, companySettings 
             const primarySigName = primarySigData?.name || "Accepted Digitally";
             const userAgent = window.navigator.userAgent;
             
-            await approveContract(initialContract.id, primarySigName, userAgent, primarySigUrl || undefined);
+            await approveContract(initialContract.id, primarySigName, userAgent, primarySigUrl || undefined, accessToken || undefined);
             
             // Stage 2: Capture crisp DOM Snapshot
             const element = document.getElementById("contract-document-wrapper");
             if (element) {
-                // Remove box shadows or borders that mess up standard A4 sizing
+                // Strip decoration that breaks A4 sizing, and temporarily ensure nothing clips
+                // the full document height before we capture it.
+                const prevShadow = element.style.boxShadow;
+                const prevBorder = element.style.border;
+                const prevOverflow = element.style.overflow;
                 element.style.boxShadow = "none";
                 element.style.border = "none";
-                
-                // Capture crisp DOM Snapshot natively
-                // Using JPEG with quality 0.85 instead of uncompressed PNG drops file size from ~8MB to ~300KB
-                // This prevents Vercel's 4.5MB FUNCTION_PAYLOAD_TOO_LARGE fatal error natively.
-                const imgData = await toJpeg(element, { quality: 0.85, pixelRatio: 1.5 });
-                
-                // Scale perfectly onto standard A4 PDF to prevent 96dpi vs 72dpi zooming
-                const pdf = new jsPDF("p", "mm", "a4");
-                const pdfWidth = pdf.internal.pageSize.getWidth();
-                const pdfHeight = (element.offsetHeight * pdfWidth) / element.offsetWidth;
+                element.style.overflow = "visible";
 
-                pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
-                
-                // Stage 3: Send blob to finalize server action
+                // Sanity-check: warn if anything is still clipping. If scrollHeight > offsetHeight
+                // the captured image will be short — we need to hunt down the ancestor and fix.
+                if (element.scrollHeight > element.offsetHeight + 1) {
+                    console.debug(
+                        "[contract-pdf] wrapper is shorter than its content",
+                        { offsetHeight: element.offsetHeight, scrollHeight: element.scrollHeight }
+                    );
+                }
+
+                // Capture crisp DOM snapshot. JPEG (quality 0.92) drops file size vs PNG and
+                // stays well under Vercel's 4.5MB function payload cap.
+                // pixelRatio: 1.5 is a deliberate trade-off — crisp enough on retina but
+                // keeps the rasterised canvas well under browser memory limits for tall
+                // multi-page contracts (a 10-page contract at pixelRatio 2 can exceed
+                // Chrome's canvas byte cap).
+                const imgData = await toJpeg(element, { quality: 0.92, pixelRatio: 1.5 });
+
+                // Restore inline styles so the live page keeps looking right
+                element.style.boxShadow = prevShadow;
+                element.style.border = prevBorder;
+                element.style.overflow = prevOverflow;
+
+                // Build a multi-page A4 PDF. Rather than cropping the image to the page height
+                // (which requires canvas slicing and re-encoding), we draw the full image onto
+                // each page at a negative Y offset. jsPDF clips image draws to the page MediaBox
+                // so each page shows the correct slice without double-exposure.
+                const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
+                const pageW = pdf.internal.pageSize.getWidth();
+                const pageH = pdf.internal.pageSize.getHeight();
+                const imgProps = pdf.getImageProperties(imgData);
+                // Unit note: pageW is in pt; imgProps.width/.height are in px. The ratio
+                // pageW/imgProps.width gives pt-per-px — applied to imgProps.height this yields
+                // the full image height in pt (unit-consistent).
+                const scaledTotalH = (imgProps.height * pageW) / imgProps.width;
+
+                let rendered = 0;
+                let pageIdx = 0;
+                // Safety cap: refuse to render more than 30 pages (signals something weird,
+                // prevents an infinite loop if pageH is ever misread as zero).
+                while (rendered < scaledTotalH && pageIdx < 30) {
+                    if (pageIdx > 0) pdf.addPage();
+                    pdf.addImage(imgData, "JPEG", 0, -rendered, pageW, scaledTotalH);
+                    rendered += pageH;
+                    pageIdx++;
+                }
+
+                // Stage 3: Send blob to finalize server action (include token so the finalize
+                // route can verify ownership for lead-owned contracts with no portal session)
                 const blob = pdf.output('blob');
                 const formData = new FormData();
                 formData.append("pdf", blob);
 
-                const response = await fetch(`/api/portal/contracts/${initialContract.id}/finalize`, {
+                const finalizeUrl = accessToken
+                    ? `/api/portal/contracts/${initialContract.id}/finalize?token=${encodeURIComponent(accessToken)}`
+                    : `/api/portal/contracts/${initialContract.id}/finalize`;
+                const response = await fetch(finalizeUrl, {
                     method: 'POST',
                     body: formData
                 });
-                
+
                 if (!response.ok) {
                     const errText = await response.text();
                     throw new Error(`Failed to upload PDF: ${errText}`);
@@ -277,20 +335,56 @@ export default function PortalContractClient({ initialContract, companySettings 
             <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden">
                 <div className="flex items-center gap-3">
                     {companySettings?.logoUrl ? (
-                        <img src={companySettings.logoUrl} alt={companyName} className="h-8 w-auto object-contain" />
+                        <img src={companySettings.logoUrl} alt={companyName} className="h-10 w-auto object-contain" />
                     ) : (
-                        <img src="/logo.png" alt={companyName} className="h-8 w-auto object-contain" />
+                        <img src="/logo.png" alt={companyName} className="h-10 w-auto object-contain" />
                     )}
-                    <span className="text-sm border-l border-slate-300 pl-3 font-medium text-slate-500">Document Portal</span>
+                    <div className="border-l border-slate-300 pl-3">
+                        <div className="text-sm font-semibold text-slate-700 leading-tight">{companyName}</div>
+                        {companyLicense && (
+                            <div className="text-[11px] text-slate-500 leading-tight">Lic# {companyLicense}</div>
+                        )}
+                    </div>
                 </div>
-                {isSigned && (
-                    <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Executed</span>
-                )}
+                <div className="flex items-center gap-3">
+                    {isSigned && (
+                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Executed</span>
+                    )}
+                    <a
+                        href="/portal"
+                        className="text-xs font-medium text-slate-500 hover:text-slate-800 transition"
+                    >
+                        ← Back to My Portal
+                    </a>
+                </div>
             </header>
+
+            {/* Executed PDF Download Banner — shown once the document has been signed & archived */}
+            {isSigned && archivedPdfUrl && (
+                <div className="max-w-4xl mx-auto mt-6 px-4 print:hidden">
+                    <div className="bg-white border border-green-200 rounded-xl p-5 flex items-center justify-between shadow-sm">
+                        <div>
+                            <h3 className="text-sm font-semibold text-slate-800">Your executed document is ready</h3>
+                            <p className="text-xs text-slate-500 mt-1">A permanent PDF copy has been archived for your records.</p>
+                        </div>
+                        <a
+                            href={archivedPdfUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white text-sm font-semibold rounded-lg transition shadow-sm"
+                        >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V4" />
+                            </svg>
+                            Download Executed PDF
+                        </a>
+                    </div>
+                </div>
+            )}
 
             {/* Document Container */}
             <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
-                <div id="contract-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="contract-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
                     <div className="px-10 pt-10 pb-8 border-b border-slate-200">
@@ -302,6 +396,7 @@ export default function PortalContractClient({ initialContract, companySettings 
                                     <img src="/logo.png" alt={companyName} className="h-14 w-auto object-contain mb-3" />
                                 )}
                                 <h2 className="text-lg font-bold text-slate-800">{companyName}</h2>
+                                {companyLicense && <p className="text-sm text-slate-500">Lic# {companyLicense}</p>}
                                 {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
                                 {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
                                 {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
