@@ -55,9 +55,11 @@ export default function CopyToProjectButton({
         try {
             const result = await duplicateEstimate(estimateId, selectedProjectId, newTitle);
             const targetName = otherProjects.find((p) => p.id === selectedProjectId)?.name || "target project";
-            toast.success(`Copied to ${targetName}`);
             setShowModal(false);
+            // Refresh the current list so it reflects any same-project copies, then navigate
+            router.refresh();
             router.push(`/projects/${selectedProjectId}/estimates/${result.id}`);
+            toast.success(`Copied to ${targetName}`);
         } catch (e: any) {
             toast.error(e?.message || "Failed to copy estimate");
         } finally {
