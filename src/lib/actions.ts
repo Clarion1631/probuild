@@ -1150,7 +1150,7 @@ export async function markContractViewed(contractId: string) {
     }
 }
 
-export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
+export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, capturedPdfUrl?: string) {
     const approvedAt = new Date();
 
     await prisma.estimate.update({
@@ -1182,13 +1182,24 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     const clientEmail = estimate?.project?.client?.email || estimate?.lead?.client?.email || null;
     const pdfFilename = `Signed_Estimate_${estimateCode}.pdf`;
 
-    // Generate PDF once — reused for customer email, company email, and project filing
+    // Generate PDF — prefer the portal-captured version (pixel-perfect), fall back to pdf-lib
     let pdfBuffer: Buffer | null = null;
     let attachments: any = undefined;
     try {
-        const { generateEstimatePdf } = await import("./pdf");
-        pdfBuffer = await generateEstimatePdf(estimateId);
-        attachments = [{ filename: pdfFilename, content: pdfBuffer }];
+        if (capturedPdfUrl) {
+            const res = await fetch(capturedPdfUrl);
+            if (res.ok) {
+                const ab = await res.arrayBuffer();
+                pdfBuffer = Buffer.from(ab);
+            }
+        }
+        if (!pdfBuffer) {
+            const { generateEstimatePdf } = await import("./pdf");
+            pdfBuffer = await generateEstimatePdf(estimateId);
+        }
+        if (pdfBuffer) {
+            attachments = [{ filename: pdfFilename, content: pdfBuffer }];
+        }
     } catch (e) {
         console.error("Failed to generate PDF snapshot for signed estimate:", e);
     }

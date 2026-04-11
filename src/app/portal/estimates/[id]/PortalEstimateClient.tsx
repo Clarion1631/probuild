@@ -113,7 +113,32 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveEstimate(initialEstimate.id, signature.trim(), userAgent, signatureDataUrl);
+
+            // Step 1: Capture the portal view (signature is drawn on-screen, estimate still "Pending")
+            // This gives the confirmation email a portal-quality PDF matching what the client sees.
+            let capturedPdfUrl: string | undefined;
+            const element = document.getElementById("estimate-document-wrapper");
+            if (element) {
+                try {
+                    const pdf = await buildPdf(element);
+                    const blob = pdf.output("blob");
+                    const fd = new FormData();
+                    fd.append("pdf", blob, `Signed_Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);
+                    const res = await fetch(`/api/portal/estimates/${initialEstimate.id}/pdf-upload`, {
+                        method: "POST",
+                        body: fd,
+                    });
+                    if (res.ok) {
+                        const json = await res.json();
+                        capturedPdfUrl = json.url;
+                    }
+                } catch (captureErr) {
+                    console.error("PDF capture failed, falling back to server-side generation:", captureErr);
+                }
+            }
+
+            // Step 2: Approve — passes captured URL so the confirmation email gets the portal-quality PDF
+            await approveEstimate(initialEstimate.id, signature.trim(), userAgent, signatureDataUrl, capturedPdfUrl);
             window.location.reload();
         } catch (e) {
             setError("Something went wrong processing your approval.");

@@ -249,8 +249,9 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
 
     drawTableHeader();
 
-    // --- Table Rows ---
+    // --- Table Rows --- skip blank placeholder rows (no name and zero total)
     for (const item of estimate.items) {
+        if (!item.name?.trim() && Number(item.total ?? 0) === 0) continue;
         checkNewPage(100);
 
         const isSubItem = !!item.parentId;
