@@ -246,7 +246,7 @@ export default function LeadsPage() {
 
             {/* Tabs + Search */}
             <div className="flex items-end justify-between border-b border-hui-border mb-4">
-                <div className="flex gap-0 overflow-x-auto">
+                <div className="flex gap-0 overflow-x-auto scrollbar-none" style={{ scrollbarWidth: "none" }}>
                     {(["All", "New", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
                         <TabButton
                             key={tab}
