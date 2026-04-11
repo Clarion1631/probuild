@@ -10,31 +10,48 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [clientEmail, setClientEmail] = useState("");
     const [clientPhone, setClientPhone] = useState("");
-    // Address state — cLocation holds the canonical formatted_address from Google Places
-    // (or raw typed text), cAddr/cCity/cState/cZip hold the structured breakdown.
-    // GoogleMapsAutocomplete fires onChange first with formatted_address, then onPlaceDetails
-    // with the per-component breakdown — we keep them in non-overlapping state slots.
-    const [cLocation, setCLocation] = useState("");
-    const [cAddr, setCAddr] = useState("");
-    const [cCity, setCCity] = useState("");
-    const [cState, setCState] = useState("");
-    const [cZip, setCZip] = useState("");
+
+    // Job site address — writes to lead.location
+    const [jobSiteLocation, setJobSiteLocation] = useState("");
+    const [jobSiteAddr, setJobSiteAddr] = useState("");
+    const [jobSiteCity, setJobSiteCity] = useState("");
+    const [jobSiteState, setJobSiteState] = useState("");
+    const [jobSiteZip, setJobSiteZip] = useState("");
+
+    // "Client lives at a different address" — unchecked by default (homeowner case)
+    const [clientAddressDiffers, setClientAddressDiffers] = useState(false);
+
+    // Client contact address — only used when checkbox is checked
+    const [clientAddr, setClientAddr] = useState("");
+    const [clientCity, setClientCity] = useState("");
+    const [clientState, setClientState] = useState("");
+    const [clientZip, setClientZip] = useState("");
+    const [clientLocation, setClientLocation] = useState("");
+
     const router = useRouter();
 
     async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
         e.preventDefault();
         setIsSubmitting(true);
         const formData = new FormData(e.currentTarget);
+
+        // When checkbox unchecked: client address = job site structured breakdown
+        // (only for new clients — returning-client guard in createLead preserves existing addresses)
+        const resolvedAddr = clientAddressDiffers ? clientAddr : jobSiteAddr;
+        const resolvedCity = clientAddressDiffers ? clientCity : jobSiteCity;
+        const resolvedState = clientAddressDiffers ? clientState : jobSiteState;
+        const resolvedZip = clientAddressDiffers ? clientZip : jobSiteZip;
+
         const data = {
             name: formData.get("name") as string,
             clientName: formData.get("clientName") as string,
             clientEmail: formData.get("clientEmail") as string,
             clientPhone: formData.get("clientPhone") as string,
-            location: cLocation || undefined,
-            addressLine1: cAddr || undefined,
-            city: cCity || undefined,
-            state: cState || undefined,
-            zipCode: cZip || undefined,
+            location: jobSiteLocation || undefined,
+            addressLine1: resolvedAddr || undefined,
+            city: resolvedCity || undefined,
+            state: resolvedState || undefined,
+            zipCode: resolvedZip || undefined,
             source: formData.get("source") as string,
             projectType: formData.get("projectType") as string,
         };
@@ -59,12 +76,12 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
                     <div className="grid grid-cols-2 gap-4">
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Client Name</label>
-                            <ClientCombobox 
-                                name="clientName" 
+                            <ClientCombobox
+                                name="clientName"
                                 onSelect={(client) => {
                                     if (client.email) setClientEmail(client.email);
                                     if (client.primaryPhone) setClientPhone(client.primaryPhone);
-                                }} 
+                                }}
                             />
                         </div>
                         <div>
@@ -76,16 +93,22 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
                         <label className="block text-sm text-hui-textMuted mb-1">Client Phone</label>
                         <input name="clientPhone" type="text" value={clientPhone} onChange={e => setClientPhone(e.target.value)} className="hui-input w-full" placeholder="Optional" />
                     </div>
+
+                    {/* Job Site Address */}
                     <div>
-                        <label className="block text-sm text-hui-textMuted mb-1">Project Address</label>
+                        <label className="block text-sm text-hui-textMuted mb-1">Job Site Address</label>
                         <GoogleMapsAutocomplete
-                            value={cLocation}
-                            onChange={setCLocation}
+                            value={jobSiteLocation}
+                            onChange={(val) => {
+                                setJobSiteLocation(val);
+                                // Clear structured fields when user types (prevent stale mix)
+                                setJobSiteAddr(""); setJobSiteCity(""); setJobSiteState(""); setJobSiteZip("");
+                            }}
                             onPlaceDetails={(d) => {
-                                setCAddr(d.address || "");
-                                setCCity(d.city || "");
-                                setCState(d.state || "");
-                                setCZip(d.zip || "");
+                                setJobSiteAddr(d.address || "");
+                                setJobSiteCity(d.city || "");
+                                setJobSiteState(d.state || "");
+                                setJobSiteZip(d.zip || "");
                             }}
                             className="hui-input w-full"
                         />
@@ -93,17 +116,64 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
                     <div className="grid grid-cols-3 gap-2">
                         <div>
                             <label className="text-xs text-slate-500 block mb-1">City</label>
-                            <input type="text" value={cCity} onChange={e => setCCity(e.target.value)} className="hui-input w-full text-sm" />
+                            <input type="text" value={jobSiteCity} onChange={e => setJobSiteCity(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                         <div>
                             <label className="text-xs text-slate-500 block mb-1">State</label>
-                            <input type="text" value={cState} onChange={e => setCState(e.target.value)} className="hui-input w-full text-sm" />
+                            <input type="text" value={jobSiteState} onChange={e => setJobSiteState(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                         <div>
                             <label className="text-xs text-slate-500 block mb-1">Zip</label>
-                            <input type="text" value={cZip} onChange={e => setCZip(e.target.value)} className="hui-input w-full text-sm" />
+                            <input type="text" value={jobSiteZip} onChange={e => setJobSiteZip(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                     </div>
+
+                    {/* Different client address toggle */}
+                    <label className="flex items-center gap-2 text-sm text-hui-textMuted cursor-pointer select-none">
+                        <input
+                            type="checkbox"
+                            checked={clientAddressDiffers}
+                            onChange={e => setClientAddressDiffers(e.target.checked)}
+                            className="rounded border-slate-300"
+                        />
+                        Client contact address differs from job site
+                    </label>
+
+                    {/* Client Contact Address — only shown when checkbox is checked */}
+                    {clientAddressDiffers && (
+                        <div className="space-y-2 border-l-2 border-slate-200 pl-3">
+                            <label className="block text-sm text-hui-textMuted mb-1">Client Contact Address</label>
+                            <GoogleMapsAutocomplete
+                                value={clientLocation}
+                                onChange={(val) => {
+                                    setClientLocation(val);
+                                    setClientAddr(""); setClientCity(""); setClientState(""); setClientZip("");
+                                }}
+                                onPlaceDetails={(d) => {
+                                    setClientAddr(d.address || "");
+                                    setClientCity(d.city || "");
+                                    setClientState(d.state || "");
+                                    setClientZip(d.zip || "");
+                                }}
+                                className="hui-input w-full"
+                            />
+                            <div className="grid grid-cols-3 gap-2">
+                                <div>
+                                    <label className="text-xs text-slate-500 block mb-1">City</label>
+                                    <input type="text" value={clientCity} onChange={e => setClientCity(e.target.value)} className="hui-input w-full text-sm" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-slate-500 block mb-1">State</label>
+                                    <input type="text" value={clientState} onChange={e => setClientState(e.target.value)} className="hui-input w-full text-sm" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-slate-500 block mb-1">Zip</label>
+                                    <input type="text" value={clientZip} onChange={e => setClientZip(e.target.value)} className="hui-input w-full text-sm" />
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     <div className="grid grid-cols-2 gap-4">
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Lead Source</label>

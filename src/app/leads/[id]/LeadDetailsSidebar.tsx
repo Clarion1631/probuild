@@ -159,6 +159,14 @@ export default function LeadDetailsSidebar({
         return parts.length > 0 ? parts.join(", ") : null;
     };
 
+    // Normalize a Google formatted_address to strip country suffix before comparing
+    const normalizeAddress = (addr: string) =>
+        addr.replace(/,\s*(USA|United States|US)$/i, "").trim();
+
+    // True when job site and client contact address are the same (suppress duplicate map)
+    const addressesMatch = !!formatAddress() && !!location &&
+        normalizeAddress(location) === normalizeAddress(formatAddress()!);
+
     const maskEmail = (email: string) => {
         const [user, domain] = email.split("@");
         if (!domain) return email;
@@ -303,7 +311,7 @@ export default function LeadDetailsSidebar({
                         </div>
                         <div className="flex flex-col py-2">
                             <div className="flex items-start justify-between mb-2">
-                                <span className="text-sm text-slate-600 shrink-0 mr-3">Client Address</span>
+                                <span className="text-sm text-slate-600 shrink-0 mr-3">Client Contact Address</span>
                                 <span className="text-sm text-hui-textMain flex items-start gap-1.5 min-w-0">
                                     {formatAddress() ? (
                                         <>
@@ -315,7 +323,7 @@ export default function LeadDetailsSidebar({
                                     ) : <span className="text-slate-400 italic">Not set</span>}
                                 </span>
                             </div>
-                            {formatAddress() && (
+                            {formatAddress() && !addressesMatch && (
                                 <div className="mt-1 w-[280px]">
                                     <GoogleMapPreview address={formatAddress()!} />
                                 </div>
@@ -390,7 +398,7 @@ export default function LeadDetailsSidebar({
                             <p className="text-green-600 font-medium">{clientName}</p>
                         </div>
                         <div>
-                            <p className="text-slate-500 text-xs font-medium mb-0.5">Project Location</p>
+                            <p className="text-slate-500 text-xs font-medium mb-0.5">Job Site</p>
                             <p className="text-hui-textMain mb-2">{location || "Not specified"}</p>
                             {location && <GoogleMapPreview address={location} />}
                         </div>

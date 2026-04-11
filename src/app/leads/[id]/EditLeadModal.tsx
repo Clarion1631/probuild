@@ -8,13 +8,11 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
     const router = useRouter();
     const [saving, setSaving] = useState(false);
 
-    // Initial state based on lead and client props
     const [formData, setFormData] = useState({
         clientName: client?.name || "",
+        // Job site address — lead.location (formatted string)
         location: lead.location || "",
-        // Structured address fields seeded from client — onPlaceDetails will overwrite
-        // these when the user picks a Google Places suggestion. onChange only writes
-        // `location` so the two callbacks never collide.
+        // Client contact address — client structured fields (independent of job site)
         addressLine1: client?.addressLine1 || "",
         city: client?.city || "",
         state: client?.state || "",
@@ -27,7 +25,6 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
         projectType: lead.projectType || "",
         expectedStartDate: lead.expectedStartDate ? new Date(lead.expectedStartDate).toISOString().split('T')[0] : "",
         message: lead.message || "",
-        // Adding dummy payment fields to mimic the UI screenshot functionality
         acceptCreditCard: true,
         acceptBankTransfer: true,
         acceptBNPL: false
@@ -57,6 +54,8 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
         }
     };
 
+    const clientAddressEmpty = !formData.addressLine1 && !formData.city && !formData.state && !formData.zipCode;
+
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
             <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
@@ -68,7 +67,7 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                 </div>
 
                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                    {/* Top Section */}
+                    {/* Client Name */}
                     <div className="space-y-4">
                         <div className="relative">
                             <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500">Client Name</label>
@@ -76,7 +75,7 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                         </div>
                     </div>
 
-                    {/* Read-only Client Details Box (contact info only — address now lives in the editable Project Address field below) */}
+                    {/* Client Details — read-only contact info */}
                     <div className="bg-[#f9f8f6] rounded-lg p-5">
                         <h3 className="text-sm font-bold text-slate-800 mb-4">Client Details</h3>
                         <div className="grid grid-cols-2 gap-4">
@@ -91,13 +90,34 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                         </div>
                     </div>
 
-                    {/* Middle Section */}
-                    <div className="space-y-4">
+                    {/* Job Site Address — writes to lead.location */}
+                    <div className="space-y-2">
+                        <h3 className="text-sm font-semibold text-slate-700">Job Site Address</h3>
+                        <p className="text-xs text-slate-400">Where the work takes place.</p>
                         <div className="relative">
-                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500 z-10">Project Address</label>
                             <GoogleMapsAutocomplete
                                 value={formData.location}
                                 onChange={(val) => setFormData(p => ({ ...p, location: val }))}
+                                className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition"
+                            />
+                        </div>
+                    </div>
+
+                    {/* Client Contact Address — writes to client.addressLine1/city/state/zipCode */}
+                    <div className="space-y-2">
+                        <h3 className="text-sm font-semibold text-slate-700">Client Contact Address</h3>
+                        <p className="text-xs text-slate-400">Where to send invoices and correspondence.</p>
+                        <div className="relative">
+                            <GoogleMapsAutocomplete
+                                value={formData.addressLine1}
+                                onChange={(val) => setFormData(p => ({
+                                    ...p,
+                                    addressLine1: val,
+                                    // Clear structured fields when typing to prevent stale mix
+                                    city: "",
+                                    state: "",
+                                    zipCode: "",
+                                }))}
                                 onPlaceDetails={(d) => setFormData(p => ({
                                     ...p,
                                     addressLine1: d.address || "",
@@ -108,6 +128,9 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                                 className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition"
                             />
                         </div>
+                        {clientAddressEmpty && (
+                            <p className="text-xs text-slate-400 italic">No client address on file.</p>
+                        )}
                         <div className="grid grid-cols-3 gap-2">
                             <div>
                                 <label className="text-xs text-slate-500 block mb-1">City</label>
@@ -122,7 +145,10 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                                 <input type="text" value={formData.zipCode} onChange={e => setFormData(p => ({ ...p, zipCode: e.target.value }))} className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-slate-800 transition" />
                             </div>
                         </div>
+                    </div>
 
+                    {/* Lead fields */}
+                    <div className="space-y-4">
                         <div className="grid grid-cols-2 gap-4 pt-2">
                             <div className="relative">
                                 <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500">Lead Source</label>
@@ -177,13 +203,12 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                         </div>
                     </div>
 
-                    {/* Payment Settings Simulator */}
+                    {/* Payment Settings */}
                     <div className="pt-4 border-t border-slate-100">
                         <button className="flex items-center justify-between w-full pb-4 shrink-0 text-slate-800 font-bold">
                             Payment Methods
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6"/></svg>
                         </button>
-                        
                         <div className="space-y-4">
                             <div className="flex items-center justify-between p-4 border border-slate-200 rounded-lg">
                                 <div className="flex gap-4 items-center">
@@ -202,7 +227,6 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6"/></svg>
                                 </div>
                             </div>
-                            
                             <div className="flex items-center justify-between p-4 border border-slate-200 rounded-lg">
                                 <div className="flex gap-4 items-center">
                                     <div className="w-10 h-10 bg-[#f4ebd0] text-[#8e815b] rounded flex items-center justify-center shrink-0">
@@ -220,7 +244,6 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6"/></svg>
                                 </div>
                             </div>
-
                         </div>
                     </div>
                 </div>
