@@ -128,21 +128,31 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
                         </div>
                     </div>
 
-                    {/* Different client address toggle */}
-                    <label className="flex items-center gap-2 text-sm text-hui-textMuted cursor-pointer select-none">
-                        <input
-                            type="checkbox"
-                            checked={clientAddressDiffers}
-                            onChange={e => setClientAddressDiffers(e.target.checked)}
-                            className="rounded border-slate-300"
-                        />
-                        Client contact address differs from job site
-                    </label>
+                    {/* Text link to reveal client contact address — hidden by default (90% homeowner case) */}
+                    {!clientAddressDiffers && (
+                        <button
+                            type="button"
+                            onClick={() => setClientAddressDiffers(true)}
+                            className="text-xs text-slate-400 hover:text-hui-primary transition flex items-center gap-1"
+                        >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+                            Client lives at a different address
+                        </button>
+                    )}
 
-                    {/* Client Contact Address — only shown when checkbox is checked */}
+                    {/* Client Contact Address — only shown when link is clicked */}
                     {clientAddressDiffers && (
                         <div className="space-y-2 border-l-2 border-slate-200 pl-3">
-                            <label className="block text-sm text-hui-textMuted mb-1">Client Contact Address</label>
+                            <div className="flex items-center justify-between">
+                                <label className="block text-sm text-hui-textMuted">Client Contact Address</label>
+                                <button
+                                    type="button"
+                                    onClick={() => setClientAddressDiffers(false)}
+                                    className="text-xs text-slate-400 hover:text-slate-600 transition"
+                                >
+                                    Remove
+                                </button>
+                            </div>
                             <GoogleMapsAutocomplete
                                 value={clientLocation}
                                 onChange={(val) => {
