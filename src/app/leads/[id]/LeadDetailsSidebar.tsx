@@ -115,6 +115,7 @@ export default function LeadDetailsSidebar({
         addressLine1: clientAddress,
         city: clientCity,
         state: clientState,
+        zipCode: clientZip,
     };
 
     const handleSaveClient = async () => {

@@ -4,11 +4,21 @@ import { useState } from "react";
 import { createLead } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import ClientCombobox from "@/components/ClientCombobox";
+import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
 
 export default function AddLeadModal({ onClose }: { onClose: () => void }) {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [clientEmail, setClientEmail] = useState("");
     const [clientPhone, setClientPhone] = useState("");
+    // Address state — cLocation holds the canonical formatted_address from Google Places
+    // (or raw typed text), cAddr/cCity/cState/cZip hold the structured breakdown.
+    // GoogleMapsAutocomplete fires onChange first with formatted_address, then onPlaceDetails
+    // with the per-component breakdown — we keep them in non-overlapping state slots.
+    const [cLocation, setCLocation] = useState("");
+    const [cAddr, setCAddr] = useState("");
+    const [cCity, setCCity] = useState("");
+    const [cState, setCState] = useState("");
+    const [cZip, setCZip] = useState("");
     const router = useRouter();
 
     async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -20,7 +30,11 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
             clientName: formData.get("clientName") as string,
             clientEmail: formData.get("clientEmail") as string,
             clientPhone: formData.get("clientPhone") as string,
-            location: formData.get("location") as string,
+            location: cLocation || undefined,
+            addressLine1: cAddr || undefined,
+            city: cCity || undefined,
+            state: cState || undefined,
+            zipCode: cZip || undefined,
             source: formData.get("source") as string,
             projectType: formData.get("projectType") as string,
         };
@@ -58,14 +72,36 @@ export default function AddLeadModal({ onClose }: { onClose: () => void }) {
                             <input name="clientEmail" type="email" value={clientEmail} onChange={e => setClientEmail(e.target.value)} className="hui-input w-full" placeholder="Optional" />
                         </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-4">
+                    <div>
+                        <label className="block text-sm text-hui-textMuted mb-1">Client Phone</label>
+                        <input name="clientPhone" type="text" value={clientPhone} onChange={e => setClientPhone(e.target.value)} className="hui-input w-full" placeholder="Optional" />
+                    </div>
+                    <div>
+                        <label className="block text-sm text-hui-textMuted mb-1">Project Address</label>
+                        <GoogleMapsAutocomplete
+                            value={cLocation}
+                            onChange={setCLocation}
+                            onPlaceDetails={(d) => {
+                                setCAddr(d.address || "");
+                                setCCity(d.city || "");
+                                setCState(d.state || "");
+                                setCZip(d.zip || "");
+                            }}
+                            className="hui-input w-full"
+                        />
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
                         <div>
-                            <label className="block text-sm text-hui-textMuted mb-1">Client Phone</label>
-                            <input name="clientPhone" type="text" value={clientPhone} onChange={e => setClientPhone(e.target.value)} className="hui-input w-full" placeholder="Optional" />
+                            <label className="text-xs text-slate-500 block mb-1">City</label>
+                            <input type="text" value={cCity} onChange={e => setCCity(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                         <div>
-                            <label className="block text-sm text-hui-textMuted mb-1">Project Location</label>
-                            <input name="location" type="text" className="hui-input w-full" />
+                            <label className="text-xs text-slate-500 block mb-1">State</label>
+                            <input type="text" value={cState} onChange={e => setCState(e.target.value)} className="hui-input w-full text-sm" />
+                        </div>
+                        <div>
+                            <label className="text-xs text-slate-500 block mb-1">Zip</label>
+                            <input type="text" value={cZip} onChange={e => setCZip(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                     </div>
                     <div className="grid grid-cols-2 gap-4">

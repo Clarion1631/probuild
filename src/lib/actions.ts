@@ -175,8 +175,8 @@ export async function createLead(data: { name: string; clientName: string; clien
                 zipCode: data.zipCode || null,
             },
         });
-    } else if (data.addressLine1 && !client.addressLine1) {
-        // Returning client: only fill if their primary address is empty.
+    } else if (data.addressLine1 && !client.addressLine1 && !client.city && !client.state && !client.zipCode) {
+        // Returning client: only fill if the entire address slot is empty.
         // A returning client may already have a billing/home address on file
         // and we must not silently overwrite it with a new lead's site address.
         client = await prisma.client.update({
@@ -299,6 +299,7 @@ export async function updateLeadInfo(id: string, data: any) {
                 name: data.clientName,
                 // Truthy-only: blank values from unrelated edits must not wipe a saved address.
                 // No "clear address" intent in current UX — revisit if/when one is added.
+                // TODO: switch to `data.field !== undefined` checks once a "clear address" UX is added to EditLeadModal.
                 ...(data.addressLine1 ? { addressLine1: data.addressLine1 } : {}),
                 ...(data.city ? { city: data.city } : {}),
                 ...(data.state ? { state: data.state } : {}),
