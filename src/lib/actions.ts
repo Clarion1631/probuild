@@ -398,6 +398,7 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
     }
 
     revalidatePath(`/leads/${leadId}`);
+    revalidatePath(`/leads`);
     return lead;
 }
 
