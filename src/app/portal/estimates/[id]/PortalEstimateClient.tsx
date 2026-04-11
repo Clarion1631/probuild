@@ -220,6 +220,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
+    const companyLicense = companySettings?.licenseNumber || "";
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -285,6 +286,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
                                 {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
                                 {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
+                                {companyLicense && <p className="text-sm text-slate-500">Lic# {companyLicense}</p>}
                             </div>
                             <div className="text-right">
                                 <h1 className="text-2xl font-bold text-slate-800 tracking-tight">ESTIMATE</h1>
@@ -553,7 +555,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     {/* Footer */}
                     <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
-                            This estimate was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
+                            This estimate was prepared by {companyName}.{companyLicense && ` Lic# ${companyLicense}.`} {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
                         </p>
                     </div>
                 </div>
