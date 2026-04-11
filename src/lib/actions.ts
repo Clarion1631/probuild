@@ -7,6 +7,7 @@ import { authOptions } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
+import { createHmac, timingSafeEqual } from "crypto";
 
 // Safe estimate include that omits columns not yet migrated to the database.
 // Remove this wrapper once the DB Push workflow succeeds and the Estimate table
@@ -36,6 +37,53 @@ const safeEstimateInclude = {
         viewedAt: true,
     },
 } as const;
+
+/**
+ * Validates a capturedPdfUrl before the server fetches it.
+ * Prevents SSRF — only Supabase Storage URLs for our own project are allowed.
+ */
+function isAllowedCapturedPdfUrl(url: string): boolean {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:") return false;
+        // Must be a Supabase storage hostname
+        if (!parsed.hostname.endsWith(".supabase.co") && !parsed.hostname.endsWith(".supabase.in")) return false;
+        // Must be a storage path (object endpoint) containing our known prefixes
+        const path = parsed.pathname;
+        const allowedPrefixes = ["/storage/v1/object/public/", "/storage/v1/object/sign/"];
+        if (!allowedPrefixes.some(p => path.startsWith(p))) return false;
+        // Must be one of our upload directories
+        if (!path.includes("estimate-pdfs/") && !path.includes("/signed/")) return false;
+        // Must belong to our own Supabase project
+        const supabaseUrl = process.env.SUPABASE_URL || "";
+        if (supabaseUrl) {
+            const projectHost = new URL(supabaseUrl).hostname;
+            if (parsed.hostname !== projectHost && !parsed.hostname.endsWith(`.${projectHost.split(".").slice(1).join(".")}`)) {
+                // Allow the pooler subdomain variations — just verify same project ref prefix
+                const ourProjectRef = projectHost.split(".")[0];
+                if (!parsed.hostname.startsWith(ourProjectRef)) return false;
+            }
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Generates a short-lived HMAC token that authorises a single PDF upload for
+ * the given estimateId.  Valid for 5 minutes.
+ *
+ * The token format is: `<estimateId>:<expiry>:<sig>`
+ * where <expiry> is a Unix timestamp (seconds) and <sig> is HMAC-SHA256.
+ */
+export async function generatePdfUploadToken(estimateId: string): Promise<string> {
+    const secret = process.env.NEXTAUTH_SECRET || "probuild-pdf-token-secret";
+    const expiry = Math.floor(Date.now() / 1000) + 300; // 5 min
+    const payload = `${estimateId}:${expiry}`;
+    const sig = createHmac("sha256", secret).update(payload).digest("hex");
+    return `${payload}:${sig}`;
+}
 
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
@@ -1215,12 +1263,14 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     let pdfBuffer: Buffer | null = null;
     let attachments: any = undefined;
     try {
-        if (capturedPdfUrl) {
+        if (capturedPdfUrl && isAllowedCapturedPdfUrl(capturedPdfUrl)) {
             const res = await fetch(capturedPdfUrl);
             if (res.ok) {
                 const ab = await res.arrayBuffer();
                 pdfBuffer = Buffer.from(ab);
             }
+        } else if (capturedPdfUrl) {
+            console.warn("[approveEstimate] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
         if (!pdfBuffer) {
             const { generateEstimatePdf } = await import("./pdf");
@@ -2390,13 +2440,15 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     let pdfAttached = false;
     try {
         let pdfBuffer: Buffer | undefined;
-        if (capturedPdfUrl) {
+        if (capturedPdfUrl && isAllowedCapturedPdfUrl(capturedPdfUrl)) {
             // Use the pre-captured portal PDF (high-quality, matches what client sees)
             const res = await fetch(capturedPdfUrl);
             if (res.ok) {
                 const ab = await res.arrayBuffer();
                 pdfBuffer = Buffer.from(ab);
             }
+        } else if (capturedPdfUrl) {
+            console.warn("[sendEstimateToClient] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
         if (!pdfBuffer) {
             // Fall back to server-side PDF generation

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import DOMPurify from "dompurify";
-import { sendEstimateToClient, getDocumentTemplates } from "@/lib/actions";
+import { sendEstimateToClient, getDocumentTemplates, generatePdfUploadToken } from "@/lib/actions";
 import { toast } from "sonner";
 
 type Template = { id: string; name: string; type: string; body: string; isDefault: boolean };
@@ -20,9 +20,12 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
     // P1.5 — capture state
     const [capturedPdfUrl, setCapturedPdfUrl] = useState<string | null>(null);
     const [captureReady, setCaptureReady] = useState(false);
+    const [uploadToken, setUploadToken] = useState<string>("");
     const iframeRef = useRef<HTMLIFrameElement>(null);
+    const captureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {
+        // Load templates
         getDocumentTemplates().then((data: any[]) => {
             const termsTemplates = data.filter(t => t.type === "terms");
             setTemplates(termsTemplates);
@@ -32,7 +35,19 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                 setPreviewBody(defaultT.body);
             }
         });
-    }, []);
+        // Generate upload token for the capture iframe
+        generatePdfUploadToken(estimateId).then(setUploadToken).catch(console.warn);
+        // C4 — 15 second fallback: if capture hasn't reported back, unblock the Send button
+        captureTimeoutRef.current = setTimeout(() => {
+            setCaptureReady(prev => {
+                if (!prev) console.warn("PDF capture timed out — falling back to server-side generation");
+                return true;
+            });
+        }, 15_000);
+        return () => {
+            if (captureTimeoutRef.current) clearTimeout(captureTimeoutRef.current);
+        };
+    }, [estimateId]);
 
     useEffect(() => {
         const t = templates.find(t => t.id === selectedTemplateId);
@@ -44,6 +59,12 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
         async function handleMessage(e: MessageEvent) {
             if (e.origin !== window.location.origin) return;
             if (e.data?.type !== "estimate-capture-done") return;
+
+            // Cancel the 15s timeout — we got a response
+            if (captureTimeoutRef.current) {
+                clearTimeout(captureTimeoutRef.current);
+                captureTimeoutRef.current = null;
+            }
 
             if (e.data.error || !e.data.dataUrl) {
                 console.warn("PDF capture failed:", e.data.error);
@@ -59,8 +80,11 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                 const formData = new FormData();
                 formData.append("pdf", blob, `Estimate_${estimateId}.pdf`);
 
+                // Include the HMAC upload token from e.data or fall back to the one we generated
+                const token = e.data.uploadToken || uploadToken;
                 const uploadRes = await fetch(`/api/portal/estimates/${estimateId}/pdf-upload`, {
                     method: "POST",
+                    headers: token ? { "x-upload-token": token } : {},
                     body: formData,
                 });
 
@@ -79,7 +103,7 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
 
         window.addEventListener("message", handleMessage);
         return () => window.removeEventListener("message", handleMessage);
-    }, [estimateId]);
+    }, [estimateId, uploadToken]);
 
     function validateCc(raw: string): string {
         if (!raw.trim()) return "";
@@ -132,7 +156,7 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
             {/* Hidden capture iframe — loads portal estimate in capture mode */}
             <iframe
                 ref={iframeRef}
-                src={`/portal/estimates/${estimateId}?capture=1`}
+                src={uploadToken ? `/portal/estimates/${estimateId}?capture=1&upload_token=${encodeURIComponent(uploadToken)}` : undefined}
                 title="pdf-capture"
                 style={{ position: "fixed", top: -9999, left: -9999, width: 960, height: 1400, opacity: 0, pointerEvents: "none" }}
                 aria-hidden="true"

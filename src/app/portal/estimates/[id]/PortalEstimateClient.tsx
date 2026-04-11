@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import DOMPurify from "dompurify";
-import { approveEstimate, markEstimateViewed } from "@/lib/actions";
+import { approveEstimate, markEstimateViewed, generatePdfUploadToken } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalPayInFullButton from "@/components/PortalPayInFullButton";
@@ -16,11 +16,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
     const [isDownloading, setIsDownloading] = useState(false);
+    // C5 — temporarily override approved state to show "Approved" badge during pre-approval capture
+    const [approvedOverride, setApprovedOverride] = useState<boolean | null>(null);
     const viewedRef = useRef(false);
     const documentRef = useRef<HTMLDivElement>(null);
     const searchParams = useSearchParams();
     const paymentStatus = searchParams.get("payment");
     const isCapture = searchParams.get("capture") === "1";
+    // C1 — upload token passed from admin iframe via query param
+    const uploadTokenParam = searchParams.get("upload_token") || "";
     const router = useRouter();
 
     useEffect(() => {
@@ -54,9 +58,31 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     }
 
     // Capture mode: auto-capture DOM and postMessage PDF to parent
+    // C6 — use document.fonts.ready + requestAnimationFrame instead of a hardcoded delay
     useEffect(() => {
         if (!isCapture) return;
-        const timer = setTimeout(async () => {
+        let cancelled = false;
+
+        async function waitAndCapture() {
+            // Wait for all web fonts to finish loading
+            await document.fonts.ready;
+            // Wait for any in-flight images to decode
+            const imgs = Array.from(document.images);
+            await Promise.all(
+                imgs
+                    .filter(img => !img.complete)
+                    .map(img => new Promise<void>(resolve => {
+                        img.onload = () => resolve();
+                        img.onerror = () => resolve();
+                    }))
+            );
+            // One animation frame ensures the DOM has painted at least once
+            await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+            // Small extra buffer for CSS transitions / layout
+            await new Promise<void>(resolve => setTimeout(resolve, 200));
+
+            if (cancelled) return;
+
             const element = document.getElementById("estimate-document-wrapper");
             if (!element) {
                 window.parent.postMessage({ type: "estimate-capture-done", error: "no-element" }, window.location.origin);
@@ -65,13 +91,16 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             try {
                 const pdf = await buildPdf(element);
                 const dataUrl = pdf.output("datauristring");
-                window.parent.postMessage({ type: "estimate-capture-done", dataUrl }, window.location.origin);
+                // Include the upload token so the parent can authenticate the storage upload
+                window.parent.postMessage({ type: "estimate-capture-done", dataUrl, uploadToken: uploadTokenParam }, window.location.origin);
             } catch (err) {
                 window.parent.postMessage({ type: "estimate-capture-done", error: String(err) }, window.location.origin);
             }
-        }, 2000);
-        return () => clearTimeout(timer);
-    }, [isCapture]); // eslint-disable-line react-hooks/exhaustive-deps
+        }
+
+        waitAndCapture();
+        return () => { cancelled = true; };
+    }, [isCapture, uploadTokenParam]); // eslint-disable-line react-hooks/exhaustive-deps
 
     async function handleDownload() {
         const element = document.getElementById("estimate-document-wrapper");
@@ -114,8 +143,13 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         try {
             const userAgent = window.navigator.userAgent;
 
-            // Step 1: Capture the portal view (signature is drawn on-screen, estimate still "Pending")
-            // This gives the confirmation email a portal-quality PDF matching what the client sees.
+            // Step 1: Temporarily show "Approved" badge in the DOM so the captured PDF
+            // reflects the final approved state rather than "Pending Approval" (C5)
+            setApprovedOverride(true);
+            // Give React one frame to re-render the badge before capturing
+            await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+
+            // Step 2: Capture the portal view with the signature drawn and "Approved" badge
             let capturedPdfUrl: string | undefined;
             const element = document.getElementById("estimate-document-wrapper");
             if (element) {
@@ -124,8 +158,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     const blob = pdf.output("blob");
                     const fd = new FormData();
                     fd.append("pdf", blob, `Signed_Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);
+
+                    // Generate a fresh upload token for this request (C1)
+                    let token = "";
+                    try { token = await generatePdfUploadToken(initialEstimate.id); } catch { /* fallback: no token */ }
+
                     const res = await fetch(`/api/portal/estimates/${initialEstimate.id}/pdf-upload`, {
                         method: "POST",
+                        headers: token ? { "x-upload-token": token } : {},
                         body: fd,
                     });
                     if (res.ok) {
@@ -137,10 +177,12 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 }
             }
 
-            // Step 2: Approve — passes captured URL so the confirmation email gets the portal-quality PDF
+            // Step 3: Approve — passes captured URL so the confirmation email gets the portal-quality PDF
             await approveEstimate(initialEstimate.id, signature.trim(), userAgent, signatureDataUrl, capturedPdfUrl);
             window.location.reload();
         } catch (e) {
+            // Restore the badge to real status on error
+            setApprovedOverride(null);
             setError("Something went wrong processing your approval.");
         } finally {
             setIsSubmitting(false);
@@ -164,7 +206,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const subtotal = items.reduce((sum: number, item: any) => sum + calculateTotal(item), 0);
     const tax = subtotal * 0.088;
     const total = subtotal + tax;
-    const isApproved = initialEstimate.status === "Approved";
+    // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update
+    const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");
     const stripeEnabled = companySettings?.stripeEnabled !== false;
     const schedules: any[] = initialEstimate.paymentSchedules || [];
     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
