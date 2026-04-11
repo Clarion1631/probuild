@@ -302,15 +302,15 @@ export default function LeadDetailsSidebar({
                             </span>
                         </div>
                         <div className="flex flex-col py-2">
-                            <div className="flex items-center justify-between mb-2">
-                                <span className="text-sm text-slate-600">Client Address</span>
-                                <span className="text-sm text-hui-textMain flex items-center justify-end gap-1.5 text-right w-2/3">
+                            <div className="flex items-start justify-between mb-2">
+                                <span className="text-sm text-slate-600 shrink-0 mr-3">Client Address</span>
+                                <span className="text-sm text-hui-textMain flex items-start gap-1.5 min-w-0">
                                     {formatAddress() ? (
                                         <>
-                                            <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition" title="Directions">
+                                            <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition shrink-0 mt-0.5" title="Directions">
                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
                                             </a>
-                                            <span className="truncate">{formatAddress()}</span>
+                                            <span className="break-words">{formatAddress()}</span>
                                         </>
                                     ) : <span className="text-slate-400 italic">Not set</span>}
                                 </span>
