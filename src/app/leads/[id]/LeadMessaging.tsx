@@ -316,7 +316,11 @@ export default function LeadMessaging({
                                 <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
                             </svg>
                         </div>
-                        <p className="text-xs text-hui-textMuted px-1 -ml-1">{clientName}</p>
+                        <p className="text-xs px-1 -ml-1 flex items-center gap-1">
+                            <span className="font-semibold text-amber-600 uppercase tracking-wider">Lead</span>
+                            <span className="text-hui-textMuted">·</span>
+                            <span className="text-hui-textMuted">{clientName}</span>
+                        </p>
                     </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
