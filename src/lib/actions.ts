@@ -123,7 +123,16 @@ export async function getLead(id: string) {
             tasks: {
                 orderBy: { createdAt: "desc" }
             },
-            floorPlans: true
+            floorPlans: true,
+            // Pull the linked project + its estimates so the lead estimates page
+            // can surface project estimates alongside lead-direct ones.
+            project: {
+                select: {
+                    id: true,
+                    name: true,
+                    estimates: safeEstimateInclude,
+                }
+            }
         },
     });
     if (lead && !lead.client) {
@@ -137,6 +146,13 @@ export async function getLead(id: string) {
             totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
             balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
         }));
+        if ((lead as any).project?.estimates) {
+            (lead as any).project.estimates = ((lead as any).project.estimates || []).map((e: any) => ({
+                ...e,
+                totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+                balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+            }));
+        }
     }
     return lead ? JSON.parse(JSON.stringify(lead)) : null;
 }
@@ -230,8 +246,14 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
 }
 
 export async function deleteLead(id: string) {
-    // Prevent deletion of Won/converted leads — their records have been relinked to a project
-    // and deleting the lead would cascade-delete anything still pointing at it.
+    // Prevent deletion of leads that have a linked project — checking the FK directly is
+    // authoritative. Previously this only checked stage === "Won", but any stage can be
+    // linked to a project, and with unlink removed there is no recovery path from a
+    // Postgres FK constraint violation.
+    const linked = await prisma.project.findUnique({ where: { leadId: id }, select: { id: true } });
+    if (linked) {
+        throw new Error("Cannot delete a lead that has a linked project. Archive it instead.");
+    }
     const lead = await prisma.lead.findUnique({ where: { id }, select: { stage: true } });
     if (lead?.stage === "Won") {
         throw new Error("Cannot delete a converted lead. Archive it instead.");
@@ -674,8 +696,9 @@ export async function getProjectLead(projectId: string) {
     return lead;
 }
 
-export async function linkProjectToLead(projectId: string, leadId: string | null) {
+export async function linkProjectToLead(projectId: string, leadId: string) {
     "use server";
+    if (!leadId) throw new Error("leadId is required — unlinking a project from its lead is no longer supported");
     const project = await prisma.project.update({
         where: { id: projectId },
         data: { leadId },
@@ -693,42 +716,6 @@ export async function getLeadsForLinking() {
         take: 50,
     });
     return leads;
-}
-
-export async function createProject(data: { name: string; clientName: string; clientEmail?: string; location?: string; type?: string }) {
-    // Find or create client
-    let client = await prisma.client.findFirst({
-        where: { name: data.clientName },
-    });
-
-    if (!client) {
-        const initials = data.clientName
-            .split(" ")
-            .map((n) => n[0])
-            .join("")
-            .toUpperCase()
-            .slice(0, 2);
-        client = await prisma.client.create({
-            data: {
-                name: data.clientName,
-                initials,
-                email: data.clientEmail || null,
-            },
-        });
-    }
-
-    const project = await prisma.project.create({
-        data: {
-            name: data.name,
-            clientId: client.id,
-            location: data.location || null,
-            type: data.type || null,
-            status: "In Progress",
-        },
-    });
-
-    revalidatePath("/");
-    return { id: project.id };
 }
 
 export async function convertLeadToProject(leadId: string) {

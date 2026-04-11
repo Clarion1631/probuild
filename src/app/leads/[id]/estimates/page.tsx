@@ -12,11 +12,24 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
 
     if (!lead) return <div className="p-6">Lead not found</div>;
 
-    const estimates = lead.estimates || [];
+    // Direct lead estimates (no project)
+    const leadEstimates: any[] = (lead.estimates || []).map((e: any) => ({ ...e, _source: "lead" }));
 
-    const approvedEstimates = estimates.filter((e: any) => e.status === "Approved" || e.status === "Sent");
+    // Project estimates (from the linked project, if any)
+    const linkedProject = lead.project as { id: string; name: string; estimates: any[] } | null;
+    const projectEstimates: any[] = (linkedProject?.estimates || []).map((e: any) => ({ ...e, _source: "project" }));
+
+    // Combined for stats — deduplicate by id (shouldn't overlap, but guard anyway)
+    const seenIds = new Set<string>();
+    const allEstimates = [...leadEstimates, ...projectEstimates].filter(e => {
+        if (seenIds.has(e.id)) return false;
+        seenIds.add(e.id);
+        return true;
+    });
+
+    const approvedEstimates = allEstimates.filter((e: any) => e.status === "Approved" || e.status === "Sent");
     const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
-    const totalAll = estimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
+    const totalAll = allEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
 
     async function handleNewEstimate() {
         "use server";
@@ -37,7 +50,7 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                                 </Link>
                             </div>
                             <h1 className="text-2xl font-bold text-hui-textMain">Estimates</h1>
-                            <p className="text-sm text-hui-textMuted mt-1">{estimates.length} estimate{estimates.length !== 1 ? "s" : ""} for {lead.name}</p>
+                            <p className="text-sm text-hui-textMuted mt-1">{allEstimates.length} estimate{allEstimates.length !== 1 ? "s" : ""} for {lead.name}</p>
                         </div>
                         <form action={handleNewEstimate}>
                             <button type="submit" className="px-5 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg transition shadow-sm flex items-center gap-2">
@@ -64,62 +77,120 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm relative overflow-hidden">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-purple-400 to-violet-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Estimates</p>
-                            <p className="text-2xl font-bold text-purple-600">{estimates.length}</p>
+                            <p className="text-2xl font-bold text-purple-600">{allEstimates.length}</p>
                             <p className="text-[10px] text-slate-400 mt-1">Total created</p>
                         </div>
                     </div>
 
-                    {/* Table */}
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
-                        <table className="w-full text-sm text-left">
-                            <thead>
-                                <tr className="bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-slate-200">
-                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Estimate</th>
-                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Status</th>
-                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Amount</th>
-                                    <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Date</th>
-                                    <th className="w-12"></th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-100">
-                                {estimates.length === 0 && (
-                                    <tr>
-                                        <td colSpan={5} className="px-6 py-16 text-center">
-                                            <div className="flex flex-col items-center gap-3">
-                                                <div className="w-14 h-14 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center">
-                                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
-                                                </div>
-                                                <p className="text-sm font-medium text-slate-500">No estimates yet</p>
-                                                <p className="text-xs text-slate-400 max-w-xs">Create your first estimate to start sending proposals to this lead.</p>
-                                            </div>
-                                        </td>
+                    {/* Project estimates section */}
+                    {projectEstimates.length > 0 && (
+                        <div className="mb-8">
+                            <div className="flex items-center gap-3 mb-3">
+                                <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">Project Estimates</h2>
+                                <span className="text-xs text-slate-400">·</span>
+                                <Link href={`/projects/${linkedProject!.id}/estimates`} className="text-xs text-indigo-500 hover:text-indigo-700 font-medium transition">
+                                    {linkedProject!.name} →
+                                </Link>
+                            </div>
+                            <div className="bg-white rounded-xl shadow-sm border border-indigo-100 overflow-hidden">
+                                <table className="w-full text-sm text-left">
+                                    <thead>
+                                        <tr className="bg-indigo-50/60 border-b border-indigo-100">
+                                            <th className="px-6 py-3 font-semibold text-xs text-indigo-400 uppercase tracking-wider">Estimate</th>
+                                            <th className="px-6 py-3 font-semibold text-xs text-indigo-400 uppercase tracking-wider">Status</th>
+                                            <th className="px-6 py-3 font-semibold text-xs text-indigo-400 uppercase tracking-wider text-right">Amount</th>
+                                            <th className="px-6 py-3 font-semibold text-xs text-indigo-400 uppercase tracking-wider text-right">Date</th>
+                                            <th className="w-12"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100">
+                                        {projectEstimates.map((est: any) => (
+                                            <tr key={est.id} className="hover:bg-slate-50/80 transition group">
+                                                <td className="px-6 py-4">
+                                                    <Link href={`/projects/${linkedProject!.id}/estimates/${est.id}`} className="font-medium text-hui-textMain hover:text-hui-primary transition-colors flex items-center gap-2">
+                                                        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-50 to-violet-50 flex items-center justify-center shrink-0 border border-indigo-100/50">
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-xs text-slate-400 font-mono">{est.code}</span>
+                                                            <span className="ml-2">{est.title}</span>
+                                                        </div>
+                                                    </Link>
+                                                </td>
+                                                <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
+                                                <td className="px-6 py-4 text-right font-semibold text-slate-700">{formatCurrency(est.totalAmount)}</td>
+                                                <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
+                                                <td className="px-4 py-4">
+                                                    <Link href={`/projects/${linkedProject!.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
+                                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
+                                                    </Link>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Lead estimates section */}
+                    <div>
+                        {projectEstimates.length > 0 && (
+                            <div className="flex items-center gap-2 mb-3">
+                                <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">Lead Estimates</h2>
+                            </div>
+                        )}
+                        <div className="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
+                            <table className="w-full text-sm text-left">
+                                <thead>
+                                    <tr className="bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-slate-200">
+                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Estimate</th>
+                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Status</th>
+                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Amount</th>
+                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Date</th>
+                                        <th className="w-12"></th>
                                     </tr>
-                                )}
-                                {estimates.map((est: any) => (
-                                    <tr key={est.id} className="hover:bg-slate-50/80 transition group">
-                                        <td className="px-6 py-4">
-                                            <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="font-medium text-hui-textMain hover:text-hui-primary transition-colors flex items-center gap-2">
-                                                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center shrink-0 border border-indigo-100/50">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                    {leadEstimates.length === 0 && (
+                                        <tr>
+                                            <td colSpan={5} className="px-6 py-16 text-center">
+                                                <div className="flex flex-col items-center gap-3">
+                                                    <div className="w-14 h-14 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center">
+                                                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+                                                    </div>
+                                                    <p className="text-sm font-medium text-slate-500">No lead estimates yet</p>
+                                                    <p className="text-xs text-slate-400 max-w-xs">Create your first estimate to start sending proposals to this lead.</p>
                                                 </div>
-                                                <div>
-                                                    <span className="text-xs text-slate-400 font-mono">{est.code}</span>
-                                                    <span className="ml-2">{est.title}</span>
-                                                </div>
-                                            </Link>
-                                        </td>
-                                        <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
-                                        <td className="px-6 py-4 text-right font-semibold text-slate-700">{formatCurrency(est.totalAmount)}</td>
-                                        <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
-                                        <td className="px-4 py-4">
-                                            <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
-                                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
-                                            </Link>
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
+                                            </td>
+                                        </tr>
+                                    )}
+                                    {leadEstimates.map((est: any) => (
+                                        <tr key={est.id} className="hover:bg-slate-50/80 transition group">
+                                            <td className="px-6 py-4">
+                                                <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="font-medium text-hui-textMain hover:text-hui-primary transition-colors flex items-center gap-2">
+                                                    <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center shrink-0 border border-indigo-100/50">
+                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+                                                    </div>
+                                                    <div>
+                                                        <span className="text-xs text-slate-400 font-mono">{est.code}</span>
+                                                        <span className="ml-2">{est.title}</span>
+                                                    </div>
+                                                </Link>
+                                            </td>
+                                            <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
+                                            <td className="px-6 py-4 text-right font-semibold text-slate-700">{formatCurrency(est.totalAmount)}</td>
+                                            <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
+                                            <td className="px-4 py-4">
+                                                <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
+                                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
+                                                </Link>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
