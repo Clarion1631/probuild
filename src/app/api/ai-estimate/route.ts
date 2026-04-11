@@ -20,6 +20,7 @@ type AiPhase = {
 };
 type AiMilestone = { name?: string; percentage?: number };
 type AiData = { phases: AiPhase[]; paymentMilestones: AiMilestone[] };
+type EstimateItem = ReturnType<typeof makeItem>;
 
 export const maxDuration = 300; // 5 min — Claude needs time for large estimates
 
@@ -155,20 +156,10 @@ Sort phases in logical construction order. Make the estimate thorough and profes
             if (ct.name) typeMap[ct.name] = ct.id;
         }
 
-        // Transform AI items into estimate items structure
-        const estimateItems = aiItems.map((item: AiItem, idx: number) => ({
-            id: `ai_${Date.now()}_${idx}`,
-            name: item.name || "Unnamed Item",
-            description: item.description || "",
-            type: item.costType || "Material",
-            quantity: item.quantity || 1,
-            unitCost: item.unitCost || 0,
-            total: item.total || (item.quantity || 1) * (item.unitCost || 0),
-            parentId: null,
-            costCodeId: item.costCode ? codeMap[item.costCode] || null : null,
-            costTypeId: item.costType ? typeMap[item.costType] || null : null,
-            order: idx,
-        }));
+        // Transform AI phases into the grouped estimate-item structure the editor expects.
+        const ts = Date.now();
+        let order = 0;
+        const estimateItems: EstimateItem[] = [];
 
         for (let pi = 0; pi < aiPhases.length; pi++) {
             const phase = aiPhases[pi];

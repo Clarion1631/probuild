@@ -27,7 +27,7 @@ export default async function TimeBillingPage({
 
     return (
         <TimeBillingClient
-            entries={entries.map((entry) => ({
+            entries={rawEntries.map((entry) => ({
                 ...entry,
                 laborCost: entry.laborCost === null ? null : toNum(entry.laborCost),
             }))}

@@ -16,7 +16,7 @@ export default async function MyItemsPage() {
 
     return (
         <MyItemsClient
-            items={items.map((item) => ({ ...item, unitCost: toNum(item.unitCost) }))}
+            items={rawItems.map((item) => ({ ...item, unitCost: toNum(item.unitCost) }))}
             costCodes={costCodes}
         />
     );

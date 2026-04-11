@@ -1331,3 +1331,32 @@ model ChatMessage {
 
   @@index([conversationId])
 }
+
+model TeamMessage {
+  id         String   @id @default(cuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  authorId   String?
+  author     User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  authorName String
+  body       String
+  createdAt  DateTime @default(now())
+
+  @@index([projectId, createdAt])
+}
+
+model ActivityLog {
+  id         String   @id @default(cuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  actorType  String   // "CLIENT", "TEAM", "SUBCONTRACTOR", "SYSTEM"
+  actorName  String
+  action     String   // "viewed_estimate", "signed_contract", "paid_invoice", "sent_message", "viewed_portal"
+  entityType String?  // "estimate", "invoice", "contract", "change_order", "message"
+  entityId   String?
+  entityName String?  // e.g. "Estimate #E-001"
+  metadata   String?  // JSON for extra data
+  createdAt  DateTime @default(now())
+
+  @@index([projectId, createdAt])
+}

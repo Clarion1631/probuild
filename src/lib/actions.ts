@@ -1,9 +1,11 @@
 "use server";
 
+import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
 import { revalidatePath, unstable_cache } from "next/cache";
+import { authOptions } from "./auth";
 import { sendNotification } from "./email";
-import { toNum } from "./prisma-helpers";
+import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 
 // Safe estimate include that omits columns not yet migrated to the database.
@@ -2302,11 +2304,11 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
     const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
     if (unpaidSchedules.length > 0) {
-        const estimateTotal = estimate.totalAmount?.toNumber() || 0;
+        const estimateTotal = toNum(estimate.totalAmount);
         // Half-cent-safe currency rounding
         const rc = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-        const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+        const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
         const balanceDue = rc(estimateTotal - paidSum);
 
         // Recalculate percentage-based unpaid milestones so stale DB values (from edits
@@ -2321,17 +2323,17 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
             const fixedUnpaidSum = unpaidSchedules
                 .filter(s => (s.percentage != null ? Number(s.percentage) : 0) <= 0)
-                .reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+                .reduce((sum, s) => sum + toNum(s.amount), 0);
             const lastMilestone = pctUnpaid[pctUnpaid.length - 1];
             const lastAmount = rc(balanceDue - fixedUnpaidSum - allButLastSum);
 
             if (lastAmount >= 0) {
                 const updates: { id: string; amount: number }[] = [];
                 allButLast.forEach((s, i) => {
-                    if (Math.abs(allButLastAmounts[i] - (s.amount?.toNumber() || 0)) > 0.001)
+                    if (Math.abs(allButLastAmounts[i] - toNum(s.amount)) > 0.001)
                         updates.push({ id: s.id, amount: allButLastAmounts[i] });
                 });
-                if (Math.abs(lastAmount - (lastMilestone.amount?.toNumber() || 0)) > 0.001)
+                if (Math.abs(lastAmount - toNum(lastMilestone.amount)) > 0.001)
                     updates.push({ id: lastMilestone.id, amount: lastAmount });
 
                 if (updates.length > 0) {
@@ -2344,7 +2346,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             }
         }
 
-        const unpaidSum = schedules.reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0) - paidSum;
+        const unpaidSum = schedules.reduce((sum, s) => sum + toNum(s.amount), 0) - paidSum;
         const unpaidRounded = rc(unpaidSum);
         if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
             const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
