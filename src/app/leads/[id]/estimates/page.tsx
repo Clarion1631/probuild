@@ -12,20 +12,19 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
 
     if (!lead) return <div className="p-6">Lead not found</div>;
 
-    // Direct lead estimates (no project)
-    const leadEstimates: any[] = (lead.estimates || []).map((e: any) => ({ ...e, _source: "lead" }));
-
     // Project estimates (from the linked project, if any)
     const linkedProject = lead.project as { id: string; name: string; estimates: any[] } | null;
     const projectEstimates: any[] = (linkedProject?.estimates || []).map((e: any) => ({ ...e, _source: "project" }));
 
-    // Combined for stats — deduplicate by id (shouldn't overlap, but guard anyway)
-    const seenIds = new Set<string>();
-    const allEstimates = [...leadEstimates, ...projectEstimates].filter(e => {
-        if (seenIds.has(e.id)) return false;
-        seenIds.add(e.id);
-        return true;
-    });
+    // Converted estimates carry both leadId and projectId — exclude them from the
+    // lead section so they only appear once, in the "Project Estimates" section.
+    const projectEstimateIds = new Set<string>(projectEstimates.map((e: any) => e.id));
+    const leadEstimates: any[] = (lead.estimates || [])
+        .filter((e: any) => !projectEstimateIds.has(e.id))
+        .map((e: any) => ({ ...e, _source: "lead" }));
+
+    // Combined for stats (already deduplicated by construction above)
+    const allEstimates = [...leadEstimates, ...projectEstimates];
 
     const approvedEstimates = allEstimates.filter((e: any) => e.status === "Approved" || e.status === "Sent");
     const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
