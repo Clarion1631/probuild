@@ -51,6 +51,9 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     const estimates = project.estimates || [];
 
     // Real stats
+    const today = new Date();
+    const now = Date.now();
+
     const totalBudget = estimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const completedTasks = tasks.filter((t: any) => t.status === "Complete").length;
     const inProgressTasks = tasks.filter((t: any) => t.status === "In Progress").length;
@@ -69,9 +72,6 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
             return aDate - bDate;
         })
         .slice(0, 8);
-
-    const today = new Date();
-    const now = Date.now();
 
     return (
         <div className="max-w-7xl mx-auto">
@@ -118,7 +118,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                 </div>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
                 {/* Recent Activity — prominent left column */}
                 <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
                     <div className="px-6 py-4 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white flex items-center justify-between">
@@ -132,9 +132,22 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                     </div>
                     <div className="overflow-y-auto max-h-[420px] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-300 divide-y divide-slate-100">
                         {recentActivity.length === 0 && (
-                            <div className="px-6 py-10 text-center">
-                                <p className="text-sm text-slate-400">No activity yet</p>
-                                <p className="text-xs text-slate-400 mt-1">Daily logs, change orders, and invoices will appear here.</p>
+                            <div className="px-6 py-5">
+                                <p className="text-xs text-slate-400 mb-3">No activity yet — get started:</p>
+                                <div className="grid grid-cols-3 gap-2">
+                                    <Link href={`/projects/${id}/dailylogs`} className="flex flex-col items-center gap-1.5 p-3 rounded-lg border border-slate-100 hover:border-green-200 hover:bg-green-50 transition group">
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                                        <span className="text-[11px] font-medium text-slate-500 group-hover:text-green-700">Daily Log</span>
+                                    </Link>
+                                    <Link href={`/projects/${id}/change-orders`} className="flex flex-col items-center gap-1.5 p-3 rounded-lg border border-slate-100 hover:border-amber-200 hover:bg-amber-50 transition group">
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+                                        <span className="text-[11px] font-medium text-slate-500 group-hover:text-amber-700">Change Order</span>
+                                    </Link>
+                                    <Link href={`/projects/${id}/invoices`} className="flex flex-col items-center gap-1.5 p-3 rounded-lg border border-slate-100 hover:border-indigo-200 hover:bg-indigo-50 transition group">
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+                                        <span className="text-[11px] font-medium text-slate-500 group-hover:text-indigo-700">Invoice</span>
+                                    </Link>
+                                </div>
                             </div>
                         )}
                         {recentActivity.map(event => {
@@ -211,66 +224,62 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                         initialPortalVisibility={portalVisibility}
                         initialSubcontractors={subList}
                     />
-                </div>
-            </div>
 
-            {/* Recent Files & Photos — full-width horizontal strip */}
-            <div className="mt-6 bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                        <div className="w-7 h-7 bg-gradient-to-br from-sky-100 to-blue-100 rounded-lg flex items-center justify-center">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0ea5e9" strokeWidth="1.5"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="M21 15l-5-5L5 21" /></svg>
+                    {/* Recent Files & Photos — compact right-rail card */}
+                    <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
+                        <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Recent Files</h3>
+                                <span className="text-[10px] text-slate-400 font-medium bg-slate-100 px-1.5 py-0.5 rounded-full">{recentFiles.length}</span>
+                            </div>
+                            <Link href={`/projects/${id}/files`} className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 transition">
+                                View all →
+                            </Link>
                         </div>
-                        <h2 className="text-sm font-bold text-hui-textMain">Recent Files & Photos</h2>
-                        <span className="text-[10px] text-slate-400 font-medium bg-slate-100 px-2 py-0.5 rounded-full">{recentFiles.length}</span>
+                        {recentFiles.length === 0 ? (
+                            <div className="px-4 py-5 text-center">
+                                <p className="text-xs text-slate-400">No files yet</p>
+                                <Link href={`/projects/${id}/files`} className="text-[11px] text-indigo-600 font-medium mt-1 inline-block">Upload files →</Link>
+                            </div>
+                        ) : (
+                            <div className="px-3 py-3 overflow-x-auto [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+                                <div className="flex gap-2">
+                                    {recentFiles.map(file => {
+                                        const isImage = file.mimeType?.startsWith("image/");
+                                        return (
+                                            <Link
+                                                key={file.id}
+                                                href={`/projects/${id}/files`}
+                                                className="shrink-0 w-20 group"
+                                                title={file.name}
+                                            >
+                                                {isImage ? (
+                                                    <img
+                                                        src={file.url}
+                                                        alt={file.name}
+                                                        loading="lazy"
+                                                        width={80}
+                                                        height={80}
+                                                        className="w-20 h-20 object-cover rounded-lg border border-slate-200 group-hover:border-indigo-300 group-hover:shadow-md transition"
+                                                    />
+                                                ) : (
+                                                    <div className="w-20 h-20 rounded-lg border border-slate-200 bg-gradient-to-br from-slate-50 to-slate-100 flex flex-col items-center justify-center gap-1.5 group-hover:border-indigo-300 group-hover:shadow-md transition">
+                                                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="1.5">
+                                                            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+                                                            <path d="M14 2v6h6" />
+                                                        </svg>
+                                                        <span className="text-[9px] font-bold text-slate-500">{fileExt(file.name)}</span>
+                                                    </div>
+                                                )}
+                                                <p className="text-[10px] text-slate-500 mt-1 truncate">{file.name}</p>
+                                            </Link>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
                     </div>
-                    <Link href={`/projects/${id}/files`} className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition">
-                        View all →
-                    </Link>
                 </div>
-                {recentFiles.length === 0 ? (
-                    <div className="px-6 py-10 text-center">
-                        <p className="text-sm text-slate-400">No files uploaded yet</p>
-                        <Link href={`/projects/${id}/files`} className="text-xs text-indigo-600 font-medium mt-1 inline-block">Upload files →</Link>
-                    </div>
-                ) : (
-                    <div className="px-6 py-5">
-                        <div className="flex gap-3 overflow-x-auto pb-1">
-                            {recentFiles.map(file => {
-                                const isImage = file.mimeType?.startsWith("image/");
-                                return (
-                                    <Link
-                                        key={file.id}
-                                        href={`/projects/${id}/files`}
-                                        className="shrink-0 w-28 group"
-                                        title={file.name}
-                                    >
-                                        {isImage ? (
-                                            <img
-                                                src={file.url}
-                                                alt={file.name}
-                                                loading="lazy"
-                                                width={112}
-                                                height={112}
-                                                className="w-28 h-28 object-cover rounded-lg border border-slate-200 group-hover:border-indigo-300 group-hover:shadow-md transition"
-                                            />
-                                        ) : (
-                                            <div className="w-28 h-28 rounded-lg border border-slate-200 bg-gradient-to-br from-slate-50 to-slate-100 flex flex-col items-center justify-center gap-2 group-hover:border-indigo-300 group-hover:shadow-md transition">
-                                                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="1.5">
-                                                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-                                                    <path d="M14 2v6h6" />
-                                                </svg>
-                                                <span className="text-[10px] font-bold text-slate-500">{fileExt(file.name)}</span>
-                                            </div>
-                                        )}
-                                        <p className="text-[11px] text-slate-500 mt-1.5 truncate">{file.name}</p>
-                                        <p className="text-[10px] text-slate-400">{timeAgo(new Date(file.createdAt), now)}</p>
-                                    </Link>
-                                );
-                            })}
-                        </div>
-                    </div>
-                )}
             </div>
         </div>
     );
