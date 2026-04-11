@@ -1,6 +1,7 @@
 "use client";
 import { useState, useTransition } from "react";
 import { createCatalogItem, updateCatalogItem, deleteCatalogItem } from "@/lib/actions";
+import { toNum } from "@/lib/prisma-helpers";
 import { toast } from "sonner";
 
 interface CatalogItem {
@@ -26,8 +27,15 @@ interface Props {
 
 const EMPTY_FORM = { name: "", description: "", unitCost: "", unit: "each", costCodeId: "" };
 
+function normalizeCatalogItem(item: any): CatalogItem {
+    return {
+        ...item,
+        unitCost: toNum(item.unitCost),
+    };
+}
+
 export default function MyItemsClient({ items: initialItems, costCodes }: Props) {
-    const [items, setItems] = useState<CatalogItem[]>(initialItems);
+    const [items, setItems] = useState<CatalogItem[]>(initialItems.map(normalizeCatalogItem));
     const [showAdd, setShowAdd] = useState(false);
     const [editId, setEditId] = useState<string | null>(null);
     const [form, setForm] = useState(EMPTY_FORM);
@@ -62,7 +70,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
                     unit: form.unit,
                     costCodeId: cc?.id,
                 });
-                setItems(prev => [created as CatalogItem, ...prev]);
+                setItems(prev => [normalizeCatalogItem(created), ...prev]);
                 setShowAdd(false);
                 setForm(EMPTY_FORM);
                 toast.success("Item added");
@@ -84,7 +92,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
                     unit: form.unit,
                     costCodeId: cc?.id || null,
                 });
-                setItems(prev => prev.map(i => i.id === editId ? updated as CatalogItem : i));
+                setItems(prev => prev.map(i => i.id === editId ? normalizeCatalogItem(updated) : i));
                 setEditId(null);
                 toast.success("Item updated");
             } catch {
@@ -110,7 +118,7 @@ export default function MyItemsClient({ items: initialItems, costCodes }: Props)
         startTransition(async () => {
             try {
                 const updated = await updateCatalogItem(item.id, { isActive: !item.isActive });
-                setItems(prev => prev.map(i => i.id === item.id ? updated as CatalogItem : i));
+                setItems(prev => prev.map(i => i.id === item.id ? normalizeCatalogItem(updated) : i));
             } catch {
                 toast.error("Failed to update");
             }

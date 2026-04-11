@@ -3,6 +3,7 @@
 import { prisma } from "./prisma";
 import { revalidatePath, unstable_cache } from "next/cache";
 import { sendNotification } from "./email";
+import { toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 
 // Safe estimate include that omits columns not yet migrated to the database.
@@ -1503,7 +1504,7 @@ export async function recordPayment(paymentId: string, invoiceId: string, timest
     });
 
     const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    const newBalance = Math.max(0, (invoice!.balanceDue || 0) - (payment.amount || 0));
+    const newBalance = Math.max(0, toNum(invoice!.balanceDue) - toNum(payment.amount));
     const newStatus = newBalance <= 0 ? "Paid" : "Partially Paid";
 
     await prisma.invoice.update({
@@ -1558,9 +1559,9 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
 
     for (const item of items) {
         if (item.type === "Labor") {
-            totalLaborBudget += item.total || 0;
+            totalLaborBudget += toNum(item.total);
         } else {
-            totalMaterialBudget += item.total || 0;
+            totalMaterialBudget += toNum(item.total);
         }
     }
 
@@ -1811,7 +1812,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
                 baseCost: item.baseCost,
                 markupPercent: item.markupPercent,
                 unitCost: item.unitCost,
-                total: (item.quantity || 0) * (item.unitCost || 0),
+                total: toNum(item.quantity) * toNum(item.unitCost),
                 order: item.order,
                 parentId: item.parentId,
                 costCodeId: item.costCodeId,
@@ -2617,8 +2618,8 @@ export async function aiGeneratePunchlist(taskId: string) {
     const prompt = `You are an expert construction project manager. Generate a detailed punch list for this construction task.
 
 TASK: "${task.name}"
-PROJECT: "${task.project.name}"
-PROJECT TYPE: ${task.project.type || "General Construction"}
+PROJECT: "${task.project?.name || "Unknown Project"}"
+PROJECT TYPE: ${task.project?.type || "General Construction"}
 
 Generate 5-10 specific, actionable punch list items that a foreman would check before marking this task complete. Be specific to the trade and scope of work.
 
@@ -4402,7 +4403,7 @@ export async function getProjectBidPackages(projectId: string) {
 }
 
 export async function getBidPackage(id: string) {
-    return prisma.bidPackage.findUnique({
+    const pkg = await prisma.bidPackage.findUnique({
         where: { id },
         include: {
             scopes: { orderBy: { order: "asc" } },
@@ -4410,6 +4411,21 @@ export async function getBidPackage(id: string) {
             project: { select: { id: true, name: true } },
         },
     });
+
+    if (!pkg) return null;
+
+    return {
+        ...pkg,
+        totalBudget: pkg.totalBudget === null ? null : toNum(pkg.totalBudget),
+        scopes: pkg.scopes.map((scope) => ({
+            ...scope,
+            budgetAmount: scope.budgetAmount === null ? null : toNum(scope.budgetAmount),
+        })),
+        invitations: pkg.invitations.map((invitation) => ({
+            ...invitation,
+            bidAmount: invitation.bidAmount === null ? null : toNum(invitation.bidAmount),
+        })),
+    };
 }
 
 export async function createBidPackage(projectId: string, data: {

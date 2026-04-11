@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
 import { authOptions, getSessionOrDev } from "@/lib/auth";
+import { toNum } from "@/lib/prisma-helpers";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
@@ -44,8 +45,8 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
     ]);
 
     const totalHours = entries.reduce((acc, e) => acc + (e.durationHours || 0), 0);
-    const totalCost = entries.reduce((acc, e) => acc + (e.laborCost || 0) + (e.burdenCost || 0), 0);
-    const totalBillable = entries.reduce((acc, e) => acc + (e.laborCost || 0), 0);
+    const totalCost = entries.reduce((acc, e) => acc + toNum(e.laborCost) + toNum(e.burdenCost), 0);
+    const totalBillable = entries.reduce((acc, e) => acc + toNum(e.laborCost), 0);
 
     // Group by project
     const grouped = entries.reduce((map, e) => {
@@ -173,7 +174,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
             ) : (
                 Array.from(grouped.values()).map(({ project, entries: pEntries }) => {
                     const pHours = pEntries.reduce((a, e) => a + (e.durationHours || 0), 0);
-                    const pCost = pEntries.reduce((a, e) => a + (e.laborCost || 0) + (e.burdenCost || 0), 0);
+                    const pCost = pEntries.reduce((a, e) => a + toNum(e.laborCost) + toNum(e.burdenCost), 0);
                     return (
                         <div key={project.id} className="hui-card overflow-hidden">
                             <div className="flex justify-between items-center px-6 py-3 bg-slate-50 border-b border-hui-border">
@@ -197,9 +198,9 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                 <tbody className="divide-y divide-hui-border">
                                     {pEntries.map((e: any) => {
                                         const rate = e.durationHours && e.laborCost
-                                            ? (e.laborCost / e.durationHours)
-                                            : (e.user.hourlyRate || 0);
-                                        const total = (e.laborCost || 0) + (e.burdenCost || 0);
+                                            ? (toNum(e.laborCost) / e.durationHours)
+                                            : toNum(e.user.hourlyRate);
+                                        const total = toNum(e.laborCost) + toNum(e.burdenCost);
                                         return (
                                             <tr key={e.id} className="hover:bg-slate-50">
                                                 <td className="px-5 py-3 font-medium text-hui-textMain">

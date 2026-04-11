@@ -1,5 +1,6 @@
 export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
+import { toNum } from "@/lib/prisma-helpers";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
@@ -24,5 +25,13 @@ export default async function TimeBillingPage({
         orderBy: { startTime: "desc" },
     });
 
-    return <TimeBillingClient entries={entries} groupBy={groupBy} />;
+    return (
+        <TimeBillingClient
+            entries={entries.map((entry) => ({
+                ...entry,
+                laborCost: entry.laborCost === null ? null : toNum(entry.laborCost),
+            }))}
+            groupBy={groupBy}
+        />
+    );
 }

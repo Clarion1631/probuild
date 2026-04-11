@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 type CostCode = { id: string; code: string; name: string };
@@ -109,7 +110,7 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             messages: [{ role: "user", content: prompt }],
         });
 
-        const rawText = response.content[0].text;
+        const rawText = getAnthropicText(response.content);
 
         if (!rawText) {
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
@@ -160,8 +161,8 @@ Sort items by phase code, then by cost type within each phase. Make the estimate
             unitCost: item.unitCost || 0,
             total: item.total || (item.quantity || 1) * (item.unitCost || 0),
             parentId: null,
-            costCodeId: codeMap[item.costCode] || null,
-            costTypeId: typeMap[item.costType] || null,
+            costCodeId: item.costCode ? codeMap[item.costCode] || null : null,
+            costTypeId: item.costType ? typeMap[item.costType] || null : null,
             order: idx,
         }));
 

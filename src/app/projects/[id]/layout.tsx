@@ -34,7 +34,7 @@ export default async function ProjectLayout({
         if (!access) {
             // Also check crew assignment as fallback
             const crewAccess = await prisma.project.findFirst({
-                where: { id, crew: { some: { id: user.id } } },
+                where: { id, crew: { some: { id: effectiveUser.id } } },
                 select: { id: true },
             });
             if (!crewAccess) redirect("/projects");

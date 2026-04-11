@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -17,13 +18,18 @@ export async function POST(req: NextRequest) {
             select: { totalAmount: true, status: true, createdAt: true },
         }),
         prisma.invoice.findMany({
-            select: { totalAmount: true, status: true, paidAmount: true, createdAt: true },
+            select: {
+                totalAmount: true,
+                status: true,
+                createdAt: true,
+                payments: { select: { amount: true, status: true } },
+            },
         }),
         prisma.lead.findMany({
-            select: { stage: true, estimatedRevenue: true, createdAt: true },
+            select: { stage: true, targetRevenue: true, createdAt: true },
         }),
         prisma.timeEntry.findMany({
-            where: { date: { gte: thirtyDaysAgo } },
+            where: { startTime: { gte: thirtyDaysAgo } },
             select: { durationHours: true, laborCost: true, burdenCost: true },
         }),
         prisma.expense.findMany({
@@ -33,10 +39,16 @@ export async function POST(req: NextRequest) {
     ]);
 
     const activeProjects = projects.filter(p => p.status === "Active" || p.status === "In Progress");
-    const totalPipeline = leads.reduce((s, l) => s + Number(l.estimatedRevenue || 0), 0);
+    const totalPipeline = leads.reduce((s, l) => s + Number(l.targetRevenue || 0), 0);
     const wonLeads = leads.filter(l => l.stage === "Won");
     const totalRevenue = invoices.reduce((s, i) => s + Number(i.totalAmount || 0), 0);
-    const totalPaid = invoices.reduce((s, i) => s + Number(i.paidAmount || 0), 0);
+    const totalPaid = invoices.reduce(
+        (sum, invoice) =>
+            sum + invoice.payments.reduce((invoiceSum, payment) => {
+                return payment.status === "Paid" ? invoiceSum + Number(payment.amount || 0) : invoiceSum;
+            }, 0),
+        0
+    );
     const outstandingAR = totalRevenue - totalPaid;
     const recentEstimatesTotal = estimates.reduce((s, e) => s + Number(e.totalAmount || 0), 0);
     const laborCost30d = timeEntries.reduce((s, e) => s + Number(e.laborCost || 0) + Number(e.burdenCost || 0), 0);
@@ -118,7 +130,7 @@ TOP RISKS
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const summary = response.content[0].text.trim();
+    const summary = getAnthropicText(response.content);
 
     return NextResponse.json({
         success: true,

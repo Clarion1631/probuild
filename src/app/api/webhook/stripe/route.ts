@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
+import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
 
 export async function POST(req: Request) {
@@ -71,7 +72,7 @@ export async function POST(req: Request) {
 
                 // Update Invoice balance and status
                 const invoice = updatedSchedule.invoice;
-                const newBalance = Math.max(0, (invoice.balanceDue || 0) - updatedSchedule.amount);
+                const newBalance = Math.max(0, toNum(invoice.balanceDue) - toNum(updatedSchedule.amount));
                 const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
 
                 await prisma.invoice.update({
@@ -147,7 +148,7 @@ export async function POST(req: Request) {
                 await prisma.invoice.update({
                     where: { id: schedule.invoice.id },
                     data: {
-                        balanceDue: (schedule.invoice.balanceDue || 0) + refundedAmount,
+                        balanceDue: toNum(schedule.invoice.balanceDue) + refundedAmount,
                         status: "Sent",
                     },
                 });

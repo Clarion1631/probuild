@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -26,7 +27,7 @@ export async function POST(req: NextRequest) {
             select: { durationHours: true, laborCost: true, burdenCost: true },
         }),
         prisma.expense.findMany({
-            where: { estimate: { projectId } },
+            where: { estimate: { is: { projectId } } },
             select: { amount: true, vendor: true, status: true },
         }),
         prisma.purchaseOrder.findMany({
@@ -99,7 +100,7 @@ RECOMMENDED ACTIONS:
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const analysis = response.content[0].text.trim();
+    const analysis = getAnthropicText(response.content);
 
     return NextResponse.json({ success: true, analysis, budget, actualToDate: totalActual, committed: poCommitted });
 }

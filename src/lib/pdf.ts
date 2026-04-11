@@ -1,5 +1,6 @@
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
+import { toNum } from './prisma-helpers';
 
 // Color helpers
 const colors = {
@@ -190,14 +191,14 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucStr = formatCurrency(toNum(item.unitCost));
         const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(item.total || 0);
+        const totalStr = formatCurrency(toNum(item.total));
         const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
@@ -216,7 +217,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((sum, item) => sum + (item.total || 0), 0);
+    const subtotal = estimate.items.reduce((sum, item) => sum + toNum(item.total), 0);
     const tax = subtotal * 0.087;
     const total = subtotal + tax;
 
@@ -278,7 +279,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
 
             const schedInfo: string[] = [];
             if (sched.percentage) schedInfo.push(`${sched.percentage}%`);
-            if (sched.amount) schedInfo.push(formatCurrency(sched.amount));
+            if (sched.amount) schedInfo.push(formatCurrency(toNum(sched.amount)));
             const schedText = schedInfo.join('  ');
 
             page.drawText(schedText, {
@@ -532,14 +533,14 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucStr = formatCurrency(toNum(item.unitCost));
         const ucStrWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(item.total || 0);
+        const totalStr = formatCurrency(toNum(item.total));
         const totalStrWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalStrWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
@@ -558,7 +559,7 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     });
     y -= 25;
 
-    const total = po.totalAmount || 0;
+    const total = toNum(po.totalAmount);
 
     // Total line
     const labelX = cols.unitCost - 60;

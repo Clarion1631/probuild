@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -86,7 +87,7 @@ Write in a professional but accessible tone appropriate for Clark County, WA hom
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const contractHtml = response.content[0].text.trim()
+    const contractHtml = getAnthropicText(response.content)
         .replace(/^```html\n?/, "")
         .replace(/\n?```$/, "");
 

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getQBSettings, saveQBSettings } from "@/lib/integration-store";
 import { syncEstimateToQB, syncInvoiceToQB, refreshQBToken } from "@/lib/quickbooks";
 import { prisma } from "@/lib/prisma";
+import { toNum } from "@/lib/prisma-helpers";
 
 async function getTokens() {
     const qb = await getQBSettings();
@@ -54,12 +55,12 @@ export async function POST(req: NextRequest) {
                 id: estimate.id,
                 code: estimate.code,
                 title: estimate.title,
-                totalAmount: estimate.totalAmount,
+                totalAmount: toNum(estimate.totalAmount),
                 items: estimate.items.map(i => ({
                     name: i.name,
                     quantity: i.quantity,
-                    unitCost: i.unitCost,
-                    total: i.total,
+                    unitCost: toNum(i.unitCost),
+                    total: toNum(i.total),
                     type: i.type,
                 })),
                 client: { name: client.name, email: client.email ?? null },
@@ -79,13 +80,13 @@ export async function POST(req: NextRequest) {
             });
             if (!invoice) return NextResponse.json({ error: "Invoice not found" }, { status: 404 });
 
-            const result = await syncInvoiceToQB(tokens, {
-                code: invoice.code,
-                totalAmount: invoice.totalAmount,
-                balanceDue: invoice.balanceDue,
-                client: { name: invoice.client.name, email: invoice.client.email ?? null },
-                project: invoice.project ? { name: invoice.project.name } : null,
-            });
+                const result = await syncInvoiceToQB(tokens, {
+                    code: invoice.code,
+                    totalAmount: toNum(invoice.totalAmount),
+                    balanceDue: toNum(invoice.balanceDue),
+                    client: { name: invoice.client.name, email: invoice.client.email ?? null },
+                    project: invoice.project ? { name: invoice.project.name } : null,
+                });
 
             return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
         }
