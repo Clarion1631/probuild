@@ -312,7 +312,8 @@ export default function LeadMessaging({
                                 }}
                                 aria-label="Lead name"
                                 title="Click to rename"
-                                className="text-lg font-bold text-hui-textMain bg-transparent border-none outline-none min-w-0 flex-1 max-w-full hover:bg-slate-50 focus:bg-slate-50 rounded px-1 -ml-1 transition cursor-text"
+                                size={Math.max(8, nameValue.length + 1)}
+                                className="text-lg font-bold text-hui-textMain bg-transparent border-none outline-none min-w-0 max-w-xs hover:bg-slate-50 focus:bg-slate-50 rounded px-1 -ml-1 transition cursor-text"
                             />
                             <svg
                                 className="w-3.5 h-3.5 text-hui-textMuted opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition shrink-0"
