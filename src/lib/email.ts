@@ -49,6 +49,10 @@ export async function sendNotification(
             attachments: attachments,
             cc: options?.cc
         });
+        if (data.error) {
+            console.error("Resend API returned error:", data.error);
+            return { success: false };
+        }
         return { success: true, id: data.data?.id };
     } catch (error) {
         console.error("Failed to send Resend email:", error);

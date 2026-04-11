@@ -53,6 +53,10 @@ export const authOptions: NextAuthOptions = {
                     return "/login?error=AccessDenied";
                 }
 
+                if (existingUser.status === "DISABLED") {
+                    return "/login?error=AccessDenied";
+                }
+
                 // Activate user on first sign-in
                 if (existingUser.status === "PENDING") {
                     await prisma.user.update({

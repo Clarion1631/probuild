@@ -1,15 +1,40 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
+
+const ALLOWED_IMAGE_HOSTS = [
+    process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL).hostname : null,
+    "images.unsplash.com",
+    "source.unsplash.com",
+].filter(Boolean) as string[];
+
+function isAllowedImageUrl(url: string): boolean {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:") return false;
+        return ALLOWED_IMAGE_HOSTS.some(host => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`));
+    } catch {
+        return false;
+    }
+}
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "" });
 
 export async function POST(request: Request) {
     try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
         const { projectId, prompt, baseImageUrl } = await request.json();
 
         if (!projectId || !prompt) {
             return NextResponse.json({ error: "projectId and prompt are required" }, { status: 400 });
+        }
+
+        if (baseImageUrl && !isAllowedImageUrl(baseImageUrl)) {
+            return NextResponse.json({ error: "Invalid image URL" }, { status: 400 });
         }
 
         if (!process.env.ANTHROPIC_API_KEY) {

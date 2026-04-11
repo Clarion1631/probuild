@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { linkProjectToLead } from "@/lib/actions";
 import { toast } from "sonner";
@@ -25,6 +25,11 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const pathname = usePathname();
     const router = useRouter();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+    useEffect(() => {
+        const stored = localStorage.getItem("projectSidebarCollapsed");
+        if (stored === "true") setSidebarCollapsed(true);
+    }, []);
     const [showLinkModal, setShowLinkModal] = useState(false);
     const [linking, setLinking] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
@@ -32,6 +37,14 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const { permissions, loaded } = usePermissions();
 
     const can = (key?: string) => !key || !loaded || !!permissions[key];
+
+    const toggleSidebar = () => {
+        setSidebarCollapsed(prev => {
+            const next = !prev;
+            localStorage.setItem("projectSidebarCollapsed", String(next));
+            return next;
+        });
+    };
 
     const navSections: NavSection[] = [
         {
@@ -51,6 +64,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             id: "management",
             title: "Management",
             items: [
+                { label: "Client Messages", href: `/projects/${projectId}/messages` },
                 { label: "Files & Photos", href: `/projects/${projectId}/files`, permission: "files" },
                 { label: "Schedule", href: `/projects/${projectId}/schedule`, permission: "schedules" },
                 { label: "Tasks & Punchlist", href: `/projects/${projectId}/tasks` },
@@ -113,21 +127,66 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     );
 
     return (
-        <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col min-h-full">
-            {/* Back Button */}
-            <Link
-                href="/projects"
-                className="flex items-center gap-2 px-4 py-2.5 text-sm text-slate-500 hover:text-hui-primary hover:bg-slate-100 transition border-b border-hui-border group"
-            >
-                <svg className="w-4 h-4 transition group-hover:-translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                </svg>
-                <span className="font-medium">All Projects</span>
-            </Link>
+        <>
+        {/* Outer sizer: position:relative for toggle button; NO overflow here so button isn't clipped */}
+        <div
+            style={{
+                flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
+                maxWidth: sidebarCollapsed ? "48px" : "224px",
+                minWidth: 0,
+                position: "relative",
+            }}
+            className="h-full"
+        >
+        {/* Toggle tab — first in DOM for keyboard focus order, positioned on outside (right) edge via CSS */}
+        <button
+            onClick={toggleSidebar}
+            aria-expanded={!sidebarCollapsed}
+            aria-controls="project-inner-sidebar"
+            aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            style={{
+                position: "absolute",
+                right: -20,
+                top: "50%",
+                transform: "translateY(-50%)",
+                zIndex: 10,
+            }}
+            className="w-5 h-10 bg-white border border-hui-border border-l-0 rounded-r-md shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition"
+        >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                {sidebarCollapsed
+                    ? <path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6"/>
+                    : <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6"/>
+                }
+            </svg>
+        </button>
+        {/* Inner clip wrapper: overflow:hidden here so sidebar content clips but toggle button does not */}
+        <div style={{ overflowX: "hidden", width: "100%", height: "100%" }}>
+        {/* Inner sidebar: always 224px wide, clipped by inner wrapper when collapsed. */}
+        <div id="project-inner-sidebar" className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
+
+            {/* Top bar — back link (hidden when collapsed) */}
+            {!sidebarCollapsed && (
+                <div className="flex items-center border-b border-hui-border px-2 py-2 shrink-0">
+                    <Link
+                        href="/projects"
+                        className="flex items-center gap-2 px-2 py-0.5 text-sm text-slate-500 hover:text-hui-primary hover:bg-slate-100 rounded transition group"
+                    >
+                        <svg className="w-4 h-4 transition group-hover:-translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                        </svg>
+                        <span className="font-medium">All Projects</span>
+                    </Link>
+                </div>
+            )}
+
+            {/* Expanded content */}
+            {!sidebarCollapsed && <>
 
             {/* Client Portal Link */}
-            <div className="p-3 border-b border-hui-border bg-slate-50">
-                <Link 
+            <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0">
+                <Link
                     href={`/portal/projects/${projectId}`}
                     target="_blank"
                     className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-md bg-white border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-100 transition shadow-sm"
@@ -137,12 +196,12 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 </Link>
             </div>
 
-            <div className="p-4 border-b border-hui-border bg-white">
-                <h2 className="text-sm font-bold text-hui-textMain uppercase tracking-wider">Project Menu</h2>
+            <div className="p-4 border-b border-hui-border bg-white shrink-0">
+                <h2 className="text-sm font-bold uppercase tracking-wider"><Link href={`/projects/${projectId}`} className="text-hui-textMain hover:text-hui-accent transition-colors">Project Overview</Link></h2>
             </div>
 
             {/* Lead Link - Prominent */}
-            <div className="px-3 pt-3 pb-1">
+            <div className="px-3 pt-3 pb-1 shrink-0">
                 {currentLead ? (
                     <div className="group/lead">
                         <Link
@@ -190,6 +249,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 )}
             </div>
 
+            {/* Scrollable nav */}
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
                     {navSections.map((section) => {
@@ -218,7 +278,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                                 <ul className="space-y-1">
                                     {visibleItems.map((item) => {
                                         const isActive = pathname?.includes(item.href);
-                                        const showBadge = item.label === "Messages" && unreadMessageCount > 0;
+                                        const showBadge = item.label === "Client Messages" && unreadMessageCount > 0;
                                         return (
                                             <li key={item.label}>
                                                 <Link
@@ -246,49 +306,54 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
                 </div>
             </div>
 
-            {/* Link Lead Modal */}
-            {showLinkModal && (
-                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-5 max-h-[70vh] flex flex-col">
-                        <div className="flex items-center justify-between mb-3">
-                            <h3 className="text-base font-bold text-hui-textMain">Link Lead to Project</h3>
-                            <button onClick={() => setShowLinkModal(false)} className="text-slate-400 hover:text-slate-600 text-lg">&times;</button>
-                        </div>
+            </>}
+        </div>
+        </div>{/* end inner clip wrapper */}
+        </div>{/* end outer sizer */}
 
-                        <input
-                            type="text"
-                            placeholder="Search leads..."
-                            value={searchTerm}
-                            onChange={e => setSearchTerm(e.target.value)}
-                            className="hui-input w-full mb-3 text-sm"
-                            autoFocus
-                        />
+        {/* Link Lead Modal (fixed overlay, outside sizing divs) */}
+        {showLinkModal && (
+            <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-5 max-h-[70vh] flex flex-col">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-base font-bold text-hui-textMain">Link Lead to Project</h3>
+                        <button onClick={() => setShowLinkModal(false)} className="text-slate-400 hover:text-slate-600 text-lg">&times;</button>
+                    </div>
 
-                        <div className="flex-1 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-                            {filtered.length === 0 ? (
-                                <div className="p-4 text-center text-sm text-slate-400">No leads found</div>
-                            ) : (
-                                filtered.map(l => (
-                                    <button
-                                        key={l.id}
-                                        onClick={() => handleLinkLead(l.id)}
-                                        disabled={linking}
-                                        className="w-full text-left px-4 py-3 hover:bg-amber-50 transition flex items-center justify-between group disabled:opacity-50"
-                                    >
-                                        <div className="min-w-0">
-                                            <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
-                                            <p className="text-xs text-slate-400">{l.client?.name || "No client"} · {l.stage}</p>
-                                        </div>
-                                        <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
-                                            Link →
-                                        </span>
-                                    </button>
-                                ))
-                            )}
-                        </div>
+                    <input
+                        type="text"
+                        placeholder="Search leads..."
+                        value={searchTerm}
+                        onChange={e => setSearchTerm(e.target.value)}
+                        className="hui-input w-full mb-3 text-sm"
+                        autoFocus
+                    />
+
+                    <div className="flex-1 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                        {filtered.length === 0 ? (
+                            <div className="p-4 text-center text-sm text-slate-400">No leads found</div>
+                        ) : (
+                            filtered.map(l => (
+                                <button
+                                    key={l.id}
+                                    onClick={() => handleLinkLead(l.id)}
+                                    disabled={linking}
+                                    className="w-full text-left px-4 py-3 hover:bg-amber-50 transition flex items-center justify-between group disabled:opacity-50"
+                                >
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
+                                        <p className="text-xs text-slate-400">{l.client?.name || "No client"} · {l.stage}</p>
+                                    </div>
+                                    <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
+                                        Link →
+                                    </span>
+                                </button>
+                            ))
+                        )}
                     </div>
                 </div>
-            )}
-        </div>
+            </div>
+        )}
+        </>
     );
 }

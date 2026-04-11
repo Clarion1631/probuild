@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createContractFromTemplate, createContractBlank, sendContractToClient, deleteContract, getContractSigningHistory, updateContract } from "@/lib/actions";
 import { toast } from "sonner";
+import { ContractWysiwygEditor } from "@/components/ContractWysiwygEditor";
 
 interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
@@ -12,70 +13,6 @@ interface SigningRecord {
     signatureUrl?: string | null;
 }
 
-// ─── MERGE FIELDS ───
-const MERGE_FIELDS = [
-    {
-        category: "Client", icon: "👤", color: "blue",
-        fields: [
-            { key: "client_name", label: "Name", example: "John Doe" },
-            { key: "client_email", label: "Email", example: "john@example.com" },
-            { key: "client_phone", label: "Phone", example: "(555) 123-4567" },
-            { key: "client_address", label: "Address", example: "123 Main St, Los Angeles, CA 90001" },
-        ]
-    },
-    {
-        category: "Company", icon: "🏢", color: "purple",
-        fields: [
-            { key: "company_name", label: "Name", example: "Golden Touch Remodeling" },
-            { key: "company_address", label: "Address", example: "456 Business Ave" },
-            { key: "company_phone", label: "Phone", example: "(555) 987-6543" },
-            { key: "company_email", label: "Email", example: "info@company.com" },
-        ]
-    },
-    {
-        category: "Project", icon: "📋", color: "green",
-        fields: [
-            { key: "project_name", label: "Name", example: "Kitchen Remodel" },
-            { key: "location", label: "Location", example: "123 Main St, Los Angeles" },
-            { key: "estimate_total", label: "Estimate Total", example: "$45,000" },
-        ]
-    },
-    {
-        category: "Date", icon: "📅", color: "amber",
-        fields: [
-            { key: "date", label: "Today's Date", example: "March 10, 2026" },
-            { key: "year", label: "Year", example: "2026" },
-        ]
-    },
-    {
-        category: "Signing", icon: "✍️", color: "rose",
-        fields: [
-            { key: "SIGNATURE_BLOCK", label: "Signature", example: "[ Click to Sign ]" },
-            { key: "INITIAL_BLOCK", label: "Initials", example: "[ Click to Initial ]" },
-            { key: "DATE_BLOCK", label: "Signed Date", example: "3/27/2026" },
-        ]
-    }
-];
-
-const categoryColors: Record<string, { pill: string }> = {
-    blue: { pill: "bg-blue-100 text-blue-700 hover:bg-blue-200" },
-    purple: { pill: "bg-purple-100 text-purple-700 hover:bg-purple-200" },
-    green: { pill: "bg-green-100 text-green-700 hover:bg-green-200" },
-    amber: { pill: "bg-amber-100 text-amber-700 hover:bg-amber-200" },
-    rose: { pill: "bg-rose-100 text-rose-700 hover:bg-rose-200" },
-};
-
-function resolvePreview(html: string): string {
-    const data: Record<string, string> = {};
-    MERGE_FIELDS.forEach(cat => cat.fields.forEach(f => { data[f.key] = f.example; }));
-    data.date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
-    data.year = new Date().getFullYear().toString();
-    return html.replace(/\{\{(\w+)\}\}/g, (match, key) => {
-        const value = data[key];
-        if (value) return `<span style="background: #dbeafe; padding: 1px 4px; border-radius: 4px; font-weight: 600;">${value}</span>`;
-        return `<span style="background: #fef3c7; padding: 1px 4px; border-radius: 4px; color: #92400e;">${match}</span>`;
-    });
-}
 
 export default function LeadContractsClient({ leadId, leadName, clientName, contracts: initialContracts, templates, autoCreate }: {
     leadId: string;
@@ -101,15 +38,12 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
     const [editingContract, setEditingContract] = useState<any>(null);
     const [editTitle, setEditTitle] = useState("");
     const [editBody, setEditBody] = useState("");
-    const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
     const [saving, setSaving] = useState(false);
-    const textareaRef = useRef<HTMLTextAreaElement>(null);
 
     // ─── NEW BLANK CONTRACT STATE ───
     const [creatingBlank, setCreatingBlank] = useState(false);
     const [blankTitle, setBlankTitle] = useState("");
     const [blankBody, setBlankBody] = useState("");
-    const blankTextareaRef = useRef<HTMLTextAreaElement>(null);
 
     const contractTemplates = templates.filter(t => t.type === "contract" || t.type === "lien_release");
 
@@ -120,37 +54,10 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
         }
     }, [autoCreate]);
 
-    // ─── EDITOR HELPERS ───
-    const insertMergeField = (key: string, ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void) => {
-        const ta = ref.current;
-        if (!ta) return;
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const tag = `{{${key}}}`;
-        const newBody = body.substring(0, start) + tag + body.substring(end);
-        setBody(newBody);
-        setTimeout(() => { ta.focus(); ta.selectionStart = ta.selectionEnd = start + tag.length; }, 0);
-    };
-
-    const insertHtmlTag = (tag: string, ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void, placeholder?: string) => {
-        const ta = ref.current;
-        if (!ta) return;
-        const start = ta.selectionStart;
-        const selfClosing = ["hr", "br"].includes(tag);
-        let snippet: string;
-        if (selfClosing) { snippet = `<${tag}/>`; }
-        else if (tag === "ul") { snippet = `<ul>\n  <li>Item 1</li>\n  <li>Item 2</li>\n</ul>`; }
-        else { snippet = `<${tag}>${placeholder || ""}</${tag}>`; }
-        const newBody = body.substring(0, start) + snippet + body.substring(ta.selectionEnd);
-        setBody(newBody);
-        setTimeout(() => { ta.focus(); }, 0);
-    };
-
     const openEditor = (contract: any) => {
         setEditingContract(contract);
         setEditTitle(contract.title);
         setEditBody(contract.body);
-        setActiveTab("edit");
     };
 
     const handleSaveEdit = async () => {
@@ -241,95 +148,6 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
         t.name.toLowerCase().includes(templateSearch.toLowerCase())
     );
 
-    // ─── RENDER EDITOR TOOLBAR ───
-    const renderToolbar = (ref: React.RefObject<HTMLTextAreaElement | null>, body: string, setBody: (v: string) => void) => (
-        <>
-            {/* Merge Field Toolbar */}
-            <div className="bg-slate-50 border-b border-slate-200 px-6 py-3 shrink-0">
-                <div className="flex items-start gap-4 flex-wrap">
-                    <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider pt-1.5 shrink-0">Smart Text:</span>
-                    {MERGE_FIELDS.map(cat => (
-                        <div key={cat.category} className="flex items-center gap-1.5">
-                            <span className="text-xs font-semibold text-slate-500">{cat.icon} {cat.category}:</span>
-                            <div className="flex gap-1 flex-wrap">
-                                {cat.fields.map(f => (
-                                    <button
-                                        key={f.key}
-                                        onClick={() => insertMergeField(f.key, ref, body, setBody)}
-                                        className={`px-2 py-0.5 rounded-full text-xs font-medium transition cursor-pointer ${categoryColors[cat.color].pill}`}
-                                        title={`Inserts {{${f.key}}} → "${f.example}"`}
-                                    >{f.label}</button>
-                                ))}
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            </div>
-
-            {/* HTML Format Toolbar */}
-            <div className="bg-white border-b border-slate-200 px-6 py-2 shrink-0 flex items-center gap-1">
-                <span className="text-xs font-semibold text-slate-500 mr-2">Format:</span>
-                <button onClick={() => insertHtmlTag("h2", ref, body, setBody, "Heading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition">H2</button>
-                <button onClick={() => insertHtmlTag("h3", ref, body, setBody, "Subheading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-semibold transition">H3</button>
-                <button onClick={() => insertHtmlTag("strong", ref, body, setBody, "bold text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition"><b>B</b></button>
-                <button onClick={() => insertHtmlTag("em", ref, body, setBody, "italic text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 italic transition"><em>I</em></button>
-                <button onClick={() => insertHtmlTag("u", ref, body, setBody, "underlined text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 underline transition">U</button>
-                <button onClick={() => insertHtmlTag("p", ref, body, setBody, "Paragraph text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">¶</button>
-                <button onClick={() => insertHtmlTag("ul", ref, body, setBody)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">• List</button>
-                <button onClick={() => insertHtmlTag("li", ref, body, setBody, "List item")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">— Item</button>
-                <div className="w-px h-5 bg-slate-200 mx-1"></div>
-                <button onClick={() => insertHtmlTag("hr", ref, body, setBody)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">― Line</button>
-                <button onClick={() => insertHtmlTag("br", ref, body, setBody)} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition">↵ Break</button>
-            </div>
-        </>
-    );
-
-    // ─── RENDER PREVIEW ───
-    const renderPreview = (body: string) => (
-        <div className="flex-1 overflow-auto p-6">
-            <div className="bg-white rounded-xl shadow-lg border border-slate-200 max-w-2xl mx-auto overflow-hidden">
-                {/* Document Header */}
-                <div className="bg-gradient-to-r from-slate-800 to-slate-700 px-8 py-6 text-white">
-                    <div className="flex items-center gap-4">
-                        <img src="/logo.png" alt="Logo" className="h-12 w-auto object-contain rounded bg-white p-1" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-                        <div>
-                            <h1 className="text-lg font-bold">Golden Touch Remodeling</h1>
-                            <p className="text-sm text-slate-300">{leadName}</p>
-                        </div>
-                    </div>
-                </div>
-                {/* Document Body */}
-                <div className="p-8">
-                    {body ? (
-                        <div
-                            className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-headings:font-semibold prose-p:text-slate-600 prose-p:leading-relaxed prose-strong:text-slate-800 prose-li:text-slate-600"
-                            dangerouslySetInnerHTML={{ __html: resolvePreview(body) }}
-                        />
-                    ) : (
-                        <div className="text-center py-16 text-slate-400">
-                            <p className="text-sm">Start editing to see a live preview</p>
-                        </div>
-                    )}
-                </div>
-                {/* Signature Placeholder */}
-                <div className="px-8 pb-8">
-                    <div className="border-t-2 border-dotted border-slate-300 pt-6 mt-4">
-                        <div className="grid grid-cols-2 gap-8">
-                            <div>
-                                <div className="border-b border-slate-300 pb-8 mb-2"></div>
-                                <p className="text-xs text-slate-400">Client Signature</p>
-                            </div>
-                            <div>
-                                <div className="border-b border-slate-300 pb-8 mb-2"></div>
-                                <p className="text-xs text-slate-400">Date</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-
     // ═══════════════════════════════════════
     // BLANK CONTRACT EDITOR (full-screen)
     // ═══════════════════════════════════════
@@ -362,36 +180,7 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                     </div>
                 </header>
 
-                {renderToolbar(blankTextareaRef, blankBody, setBlankBody)}
-
-                <div className="flex-1 flex flex-col overflow-hidden">
-                    <div className="lg:hidden flex border-b border-slate-200 shrink-0">
-                        <button onClick={() => setActiveTab("edit")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "edit" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-slate-500"}`}>✏️ Editor</button>
-                        <button onClick={() => setActiveTab("preview")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "preview" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-slate-500"}`}>👁️ Preview</button>
-                    </div>
-                    <div className="flex-1 flex overflow-hidden">
-                        <div className={`flex-1 flex flex-col border-r border-slate-200 ${activeTab === "preview" ? "hidden lg:flex" : ""}`}>
-                            <div className="px-4 py-2 bg-slate-50 text-xs font-semibold text-slate-500 uppercase tracking-wider border-b border-slate-200 shrink-0">
-                                HTML Source
-                            </div>
-                            <textarea
-                                ref={blankTextareaRef}
-                                className="flex-1 w-full p-4 font-mono text-sm text-slate-800 bg-white resize-none outline-none border-none leading-relaxed"
-                                placeholder={"Start typing or copy-paste your contract text...\n\nUse Smart Text buttons above to insert {{client_name}} etc.\nUse format buttons to add HTML tags."}
-                                value={blankBody}
-                                onChange={e => setBlankBody(e.target.value)}
-                                spellCheck={false}
-                            />
-                        </div>
-                        <div className={`flex-1 flex flex-col bg-slate-100 ${activeTab === "edit" ? "hidden lg:flex" : ""}`}>
-                            <div className="px-4 py-2 bg-slate-50 text-xs font-semibold text-slate-500 uppercase tracking-wider border-b border-slate-200 shrink-0 flex items-center justify-between">
-                                <span>Live Preview</span>
-                                <span className="text-[10px] font-normal normal-case">Shows resolved merge fields</span>
-                            </div>
-                            {renderPreview(blankBody)}
-                        </div>
-                    </div>
-                </div>
+                <ContractWysiwygEditor value={blankBody} onChange={setBlankBody} />
             </div>
         );
     }
@@ -442,36 +231,7 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                     </div>
                 </header>
 
-                {renderToolbar(textareaRef, editBody, setEditBody)}
-
-                <div className="flex-1 flex flex-col overflow-hidden">
-                    <div className="lg:hidden flex border-b border-slate-200 shrink-0">
-                        <button onClick={() => setActiveTab("edit")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "edit" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-slate-500"}`}>✏️ Editor</button>
-                        <button onClick={() => setActiveTab("preview")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "preview" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-slate-500"}`}>👁️ Preview</button>
-                    </div>
-                    <div className="flex-1 flex overflow-hidden">
-                        <div className={`flex-1 flex flex-col border-r border-slate-200 ${activeTab === "preview" ? "hidden lg:flex" : ""}`}>
-                            <div className="px-4 py-2 bg-slate-50 text-xs font-semibold text-slate-500 uppercase tracking-wider border-b border-slate-200 shrink-0">
-                                HTML Source
-                            </div>
-                            <textarea
-                                ref={textareaRef}
-                                className="flex-1 w-full p-4 font-mono text-sm text-slate-800 bg-white resize-none outline-none border-none leading-relaxed"
-                                placeholder={"Edit your contract content here...\n\nUse Smart Text buttons above to insert {{client_name}} etc.\nUse format buttons to add HTML tags."}
-                                value={editBody}
-                                onChange={e => setEditBody(e.target.value)}
-                                spellCheck={false}
-                            />
-                        </div>
-                        <div className={`flex-1 flex flex-col bg-slate-100 ${activeTab === "edit" ? "hidden lg:flex" : ""}`}>
-                            <div className="px-4 py-2 bg-slate-50 text-xs font-semibold text-slate-500 uppercase tracking-wider border-b border-slate-200 shrink-0 flex items-center justify-between">
-                                <span>Live Preview</span>
-                                <span className="text-[10px] font-normal normal-case">Shows resolved merge fields</span>
-                            </div>
-                            {renderPreview(editBody)}
-                        </div>
-                    </div>
-                </div>
+                <ContractWysiwygEditor value={editBody} onChange={setEditBody} />
             </div>
         );
     }

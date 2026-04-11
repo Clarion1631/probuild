@@ -27,7 +27,7 @@ export default async function ClientPortalPage({ params }: Props) {
 
     if (!project) return <div className="p-8 text-red-500">Project not found.</div>;
 
-    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild-amber.vercel.app"}/portal/projects/${id}`;
+    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"}/portal/projects/${id}`;
     const clientEmail = project.client?.email ?? null;
 
     const initialState = {

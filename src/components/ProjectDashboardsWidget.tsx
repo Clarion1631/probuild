@@ -50,7 +50,7 @@ export default function ProjectDashboardsWidget({
                     {/* Client Dashboard */}
                     <button 
                         onClick={() => setShowClientModal(true)}
-                        className="w-full text-left p-4 hover:bg-slate-50 transition-colors group rounded-md"
+                        className="w-full text-left p-4 hover:bg-slate-50 transition-colors group rounded-md cursor-pointer"
                     >
                         <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
@@ -72,7 +72,7 @@ export default function ProjectDashboardsWidget({
                     {/* Subcontractor Dashboard */}
                     <button 
                         onClick={() => setShowSubModal(true)}
-                        className="w-full text-left p-4 hover:bg-slate-50 transition-colors group rounded-md"
+                        className="w-full text-left p-4 hover:bg-slate-50 transition-colors group rounded-md cursor-pointer"
                     >
                         <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">

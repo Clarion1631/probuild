@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import DOMPurify from "dompurify";
 import Avatar from "@/components/Avatar";
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
@@ -79,6 +80,7 @@ export default function LeadMessaging({
             }),
         ],
         content: messageText || "",
+        immediatelyRender: false,
         onUpdate: ({ editor }) => {
             setMessageText(editor.getHTML());
         },
@@ -184,7 +186,7 @@ export default function LeadMessaging({
         setShowAiMenu(false);
         setAiSuggesting(true);
         try {
-            const res = await fetch("/api/leads/messages/suggest", {
+            const res = await fetch("/api/client-messages/suggest", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ leadId, context }),
@@ -335,7 +337,7 @@ export default function LeadMessaging({
                                                 ? "bg-green-600 text-white rounded-br-md prose-invert prose-a:text-green-200"
                                                 : "bg-white text-hui-textMain border border-slate-200 rounded-bl-md"
                                         }`}>
-                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: msg.body }} />
+                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.body ?? "") }} />
 
                                             {/* Attachment chips */}
                                             {atts.length > 0 && (
@@ -763,7 +765,7 @@ export default function LeadMessaging({
                                         <div className="bg-slate-50 rounded-lg p-4 my-4">
                                             <div 
                                                 className="m-0 leading-relaxed text-slate-800 prose prose-sm max-w-none prose-a:text-green-600"
-                                                dangerouslySetInnerHTML={{ __html: messageText || "Your message will appear here..." }}
+                                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(messageText || "Your message will appear here...") }}
                                             />
                                         </div>
                                         

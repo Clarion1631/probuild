@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { toast } from "sonner";
 
 type FileRecord = {
@@ -71,8 +71,8 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
         setLoaded(true);
     }, [projectId, leadId, currentFolder]);
 
-    // Load on mount
-    useState(() => { fetchFiles(null); });
+    // Load on mount (useEffect ensures this only runs client-side, not during SSR)
+    useEffect(() => { fetchFiles(null); }, []);
 
     async function handleUpload(fileList: FileList | null) {
         if (!fileList || fileList.length === 0) return;

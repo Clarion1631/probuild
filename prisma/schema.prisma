@@ -27,8 +27,10 @@ model User {
   projectAccess    ProjectAccess[]
   leadTasks        LeadTask[]
   managedLeads     Lead[]           @relation("LeadManager")
+  managedProjects  Project[]        @relation("ProjectManager")
   dailyLogs        DailyLog[]
   documentComments DocumentComment[]
+  teamMessages     TeamMessage[]
 }
 
 model Client {
@@ -92,10 +94,14 @@ model Lead {
   notes          LeadNote[]
   meetings       LeadMeeting[]
   takeoffs       Takeoff[]
-  leadMessages   LeadMessage[]
+  clientMessages ClientMessage[]
   scheduleTasks  ScheduleTask[]
   message        String? // Initial inquiry message from the client
   project        Project? // reverse relation: the project created from this lead
+
+  @@index([createdAt])
+  @@index([clientId])
+  @@index([stage])
 }
 
 model LeadNote {
@@ -156,6 +162,7 @@ model Project {
   tags                String?
   color               String?                      @default("#3b82f6") // Added color field
   managerId           String?
+  manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]
   invoices            Invoice[]
   budgets             Budget[]
@@ -171,6 +178,7 @@ model Project {
   takeoffs            Takeoff[]
   portalVisibility    PortalVisibility?
   messageThreads      MessageThread[]
+  clientMessages      ClientMessage[]
   changeOrders        ChangeOrder[]
   purchaseOrders      PurchaseOrder[]
   selectionBoards     SelectionBoard[]
@@ -178,6 +186,13 @@ model Project {
   moodBoards          MoodBoard[]
   retainers           Retainer[]
   bidPackages         BidPackage[]
+  teamMessages        TeamMessage[]
+  activityLogs        ActivityLog[]
+
+  @@index([viewedAt])
+  @@index([clientId])
+  @@index([status])
+  @@index([createdAt])
 }
 
 model FloorPlan {
@@ -242,6 +257,11 @@ model Estimate {
   sentAt             DateTime? // When the estimate was emailed to the client
   changeOrders       ChangeOrder[]
   files              EstimateFile[]
+
+  @@index([createdAt])
+  @@index([projectId])
+  @@index([leadId])
+  @@index([status])
 }
 
 model EstimateFile {
@@ -256,15 +276,23 @@ model EstimateFile {
 }
 
 model EstimatePaymentSchedule {
-  id         String    @id @default(cuid())
-  estimateId String
-  estimate   Estimate  @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  name       String
-  percentage Float? // Optional: represent this payment as a % of the total
-  amount     Decimal
-  dueDate    DateTime?
-  order      Int       @default(0)
-  createdAt  DateTime  @default(now())
+  id                    String    @id @default(cuid())
+  estimateId            String
+  estimate              Estimate  @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  name                  String
+  percentage            Float? // Optional: represent this payment as a % of the total
+  amount                Decimal
+  dueDate               DateTime?
+  order                 Int       @default(0)
+  createdAt             DateTime  @default(now())
+  status                String    @default("Pending")
+  stripeSessionId       String?
+  stripePaymentIntentId String?
+  paymentMethod         String?
+  paidAt                DateTime?
+  paymentDate           DateTime?
+
+  @@index([estimateId])
 }
 
 model EstimateItem {
@@ -293,6 +321,8 @@ model EstimateItem {
   timeEntries    TimeEntry[]
   scheduleTasks  ScheduleTask[]
   createdAt      DateTime       @default(now())
+
+  @@index([estimateId])
 }
 
 model Expense {
@@ -316,6 +346,8 @@ model Expense {
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
   createdAt DateTime @default(now())
+
+  @@index([estimateId])
 }
 
 model Invoice {
@@ -336,6 +368,9 @@ model Invoice {
   createdAt   DateTime  @default(now())
 
   payments PaymentSchedule[]
+
+  @@index([projectId])
+  @@index([createdAt])
 }
 
 model PaymentSchedule {
@@ -352,6 +387,9 @@ model PaymentSchedule {
   paymentMethod         String?
   paidAt                DateTime?
   createdAt             DateTime  @default(now())
+
+  @@index([invoiceId])
+  @@index([stripePaymentIntentId])
 }
 
 model Budget {
@@ -431,6 +469,9 @@ model TimeEntry {
   // Audit history
   editedByManagerId String?
   editedAt          DateTime?
+
+  @@index([projectId])
+  @@index([userId])
 }
 
 model Contract {
@@ -453,6 +494,11 @@ model Contract {
   approvalIp        String?
   approvalUserAgent String?
   signatureUrl      String? // PNG data URL of drawn signature
+
+  // Contractor signing fields
+  contractorSignedBy       String?
+  contractorSignedAt       DateTime?
+  contractorSignatureUrl   String? // PNG data URL of contractor's drawn signature
 
   // Sending
   sentAt   DateTime?
@@ -494,6 +540,7 @@ model CompanySettings {
   email               String?
   website             String?
   logoUrl             String?
+  licenseNumber       String?
   notificationEmail   String? // Where to send View/Sign alerts
   projectStatuses     String? // JSON string array of custom statues [{label, value, color, dot}, ...]
   subcontractorTrades String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
@@ -690,6 +737,10 @@ model ProjectFile {
   uploadedById String?
   uploadedBy   User?       @relation(fields: [uploadedById], references: [id])
   createdAt    DateTime    @default(now())
+
+  @@index([projectId])
+  @@index([leadId])
+  @@index([folderId])
 }
 
 model UserPermission {
@@ -760,6 +811,9 @@ model Takeoff {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model TakeoffFile {
@@ -771,6 +825,8 @@ model TakeoffFile {
   mimeType  String   @default("application/octet-stream")
   size      Int      @default(0)
   createdAt DateTime @default(now())
+
+  @@index([takeoffId])
 }
 
 model EstimateTemplate {
@@ -844,16 +900,19 @@ model Message {
   createdAt   DateTime      @default(now())
 }
 
-model LeadMessage {
+model ClientMessage {
   id           String    @id @default(cuid())
-  leadId       String
-  lead         Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  // Belongs to either a Lead OR a Project (one must be set)
+  leadId       String?
+  lead         Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  projectId    String?
+  project      Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   direction    String // "INBOUND" (from client) or "OUTBOUND" (from team)
   senderName   String
   senderEmail  String?
   subject      String?
   body         String
-  channel      String    @default("email") // "email", "sms", "both"
+  channel      String    @default("email") // "email", "sms", "both", "app"
   attachments  String? // JSON array: [{ type, id, name, url }]
   sentViaEmail Boolean   @default(false)
   sentViaSms   Boolean   @default(false)
@@ -861,6 +920,12 @@ model LeadMessage {
   scheduledFor DateTime?
   ccEmails     String? // JSON array of emails
   createdAt    DateTime  @default(now())
+  readAt       DateTime? // Set when the recipient (team or client) reads the message
+
+  @@index([leadId])
+  @@index([projectId])
+  @@index([createdAt])
+  @@index([readAt])
 }
 
 model SubcontractorProjectAccess {

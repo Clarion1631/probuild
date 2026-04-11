@@ -53,7 +53,7 @@ export async function GET(req: Request) {
         }
     });
 
-    return NextResponse.json(timeEntries);
+    return NextResponse.json(JSON.parse(JSON.stringify(timeEntries)));
 }
 
 export async function POST(req: Request) {
@@ -161,5 +161,5 @@ export async function PUT(req: Request) {
         data: updateData
     });
 
-    return NextResponse.json(timeEntry);
+    return NextResponse.json(JSON.parse(JSON.stringify(timeEntry)));
 }

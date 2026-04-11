@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { Resend } from "resend";
+import bcrypt from "bcryptjs";
 
 const resend = new Resend(process.env.RESEND_API_KEY || "re_dummy");
 
@@ -28,7 +29,9 @@ export async function GET(req: NextRequest) {
             },
         });
 
-        return NextResponse.json(users);
+        // Never expose PIN hash to clients; replace with a boolean indicator
+        const safeUsers = users.map(({ pinCode, ...u }) => ({ ...u, hasPin: !!pinCode }));
+        return NextResponse.json(safeUsers);
     } catch (error: any) {
         console.error("GET /api/users error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
@@ -62,7 +65,7 @@ export async function POST(req: Request) {
                 status: "PENDING",
                 hourlyRate: Number(hourlyRate) || 0,
                 burdenRate: Number(burdenRate) || 0,
-                pinCode: pinCode || null,
+                pinCode: pinCode ? await bcrypt.hash(pinCode, 10) : null,
                 invitedAt: new Date(),
             },
         });
@@ -80,7 +83,7 @@ export async function POST(req: Request) {
         }
 
         // Send invite email
-        const appUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+        const appUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
         const loginUrl = `${appUrl}/login`;
 
         if (process.env.RESEND_API_KEY) {
@@ -138,15 +141,15 @@ export async function PATCH(req: Request) {
         if (status !== undefined) data.status = status;
         if (hourlyRate !== undefined) data.hourlyRate = Number(hourlyRate);
         if (burdenRate !== undefined) data.burdenRate = Number(burdenRate);
-        if (pinCode !== undefined) data.pinCode = pinCode || null;
+        if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
 
-        const user = await prisma.user.update({
+        const { pinCode: _pin, ...user } = await prisma.user.update({
             where: { id },
             data,
             include: { permissions: true, projectAccess: { select: { projectId: true } } },
         });
 
-        return NextResponse.json(user);
+        return NextResponse.json({ ...user, hasPin: !!_pin });
     } catch (error: any) {
         console.error("PATCH /api/users error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });

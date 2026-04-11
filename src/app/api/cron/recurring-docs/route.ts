@@ -2,20 +2,16 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { sendNotification } from '@/lib/email';
 
-// Protect cron route against unauthorized access outside Vercel Cron
-const cronSecret = process.env.CRON_SECRET || "local-cron-secret-123";
-
 export async function GET(req: Request) {
     try {
+        const cronSecret = process.env.CRON_SECRET;
+        if (!cronSecret) {
+            console.error("CRON_SECRET is not configured");
+            return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+        }
+
         const authHeader = req.headers.get('authorization');
-        const isTesting = req.url.includes('test');
-        
-        // Ensure local development, test query, or valid Vercel Cron Secret
-        if (
-            process.env.NODE_ENV !== 'development' && 
-            !isTesting &&
-            authHeader !== `Bearer ${cronSecret}`
-        ) {
+        if (authHeader !== `Bearer ${cronSecret}`) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
 
@@ -59,7 +55,6 @@ export async function GET(req: Request) {
                         signedBy: contract.approvedBy,
                         signedAt: contract.approvedAt || now,
                         signatureUrl: contract.signatureUrl,
-                        ipAddress: contract.approvalIp,
                         userAgent: contract.approvalUserAgent,
                         notes: `Archived automatically for period ending ${now.toLocaleDateString()}`
                     }
@@ -73,7 +68,6 @@ export async function GET(req: Request) {
                     status: "Sent",
                     approvedBy: null,
                     approvedAt: null,
-                    approvalIp: null,
                     signatureUrl: null,
                     nextDueDate: periodEnd
                 }
@@ -114,8 +108,6 @@ export async function GET(req: Request) {
                     { fromName: settings?.companyName || 'ProBuild', replyTo: settings?.email || undefined }
                 );
             }
-
-            createdRecords.push(contract.id);
 
             createdRecords.push(contract.id);
         }

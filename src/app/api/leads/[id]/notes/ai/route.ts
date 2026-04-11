@@ -21,14 +21,14 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
                 client: true,
                 estimates: { select: { title: true, totalAmount: true, status: true } },
                 meetings: { select: { title: true, scheduledAt: true, status: true } },
-                leadMessages: { select: { direction: true, body: true, createdAt: true }, orderBy: { createdAt: "asc" } },
+                clientMessages: { select: { direction: true, body: true, createdAt: true }, orderBy: { createdAt: "asc" } },
                 notes: { select: { content: true, createdAt: true }, orderBy: { createdAt: "asc" } }
             }
         });
 
         if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
 
-        const messageHistory = lead.leadMessages.map((m: any) =>
+        const messageHistory = lead.clientMessages.map((m: any) =>
             `[${m.direction}] - ${m.body}`
         ).join("\n");
 

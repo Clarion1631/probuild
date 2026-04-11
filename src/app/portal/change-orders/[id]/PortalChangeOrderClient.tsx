@@ -28,7 +28,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveChangeOrder(initialData.id, signature.trim(), "Client IP", userAgent, signatureDataUrl);
+            await approveChangeOrder(initialData.id, signature.trim(), userAgent, signatureDataUrl);
             toast.success("Change Order Approved!");
             window.location.reload();
         } catch (e: any) {
@@ -47,7 +47,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
     const items = initialData.items || [];
     const subtotal = items.reduce((acc: number, item: any) => acc + (Number(item.quantity || 0) * Number(item.unitCost || 0)), 0);
-    const tax = subtotal * 0.087;
+    const tax = subtotal * 0.088;
     const total = subtotal + tax;
 
     return (
@@ -200,7 +200,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <span>{formatCurrency(subtotal)}</span>
                                 </div>
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
-                                    <span>Tax (8.7%)</span>
+                                    <span>Tax (8.8%)</span>
                                     <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-amber-600">

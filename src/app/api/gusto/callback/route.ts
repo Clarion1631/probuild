@@ -4,14 +4,21 @@ import { saveGustoSettings } from "@/lib/integration-store";
 export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const code = searchParams.get("code");
+    const state = searchParams.get("state");
     const error = searchParams.get("error");
-    const baseUrl = process.env.NEXTAUTH_URL || "https://probuild-amber.vercel.app";
+    const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
 
     if (error) {
         return NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?error=${encodeURIComponent(error)}`);
     }
     if (!code) {
         return NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?error=missing_code`);
+    }
+
+    // Validate CSRF state
+    const expectedState = req.cookies.get("gusto_oauth_state")?.value;
+    if (!state || !expectedState || state !== expectedState) {
+        return NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?error=invalid_state`);
     }
 
     try {
@@ -49,7 +56,9 @@ export async function GET(req: NextRequest) {
             connectedAt: new Date().toISOString(),
         });
 
-        return NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?success=1`);
+        const successResponse = NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?success=1`);
+        successResponse.cookies.delete("gusto_oauth_state");
+        return successResponse;
     } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         return NextResponse.redirect(`${baseUrl}/settings/integrations/gusto?error=${encodeURIComponent(msg)}`);

@@ -3,14 +3,27 @@
 ## What this project is
 **ProBuild** — a construction/contractor management platform (competitor to Houzz Pro). Built with Next.js, Prisma, Supabase, deployed on Vercel.
 
-## Key paths
-| Thing | Path |
+## Key paths & service IDs
+| Thing | Value |
 |---|---|
 | This project (Windows) | `C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site` |
 | GitHub | https://github.com/Clarion1631/probuild |
 | Production | https://probuild.goldentouchremodeling.com |
 | Vercel preview | https://probuild-amber.vercel.app |
-| Known prod project ID | `cmn7tlgiv0001phwqjzwk75or` |
+| Vercel project ID | `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL` |
+| Supabase project ref | `ghzdbzdnwjxazvmcefbh` |
+| Sentry org | `golden-touch-remodeling` (us.sentry.io) |
+| Known prod DB project ID | `cmn7tlgiv0001phwqjzwk75or` |
+
+## Vercel env vars (already configured)
+`STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `DATABASE_URL`,
+`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`,
+`RESEND_API_KEY`, `GEMINI_API_KEY`,
+`NEXTAUTH_SECRET`, `NEXTAUTH_URL`,
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`NEXT_PUBLIC_APP_URL`,
+`SENTRY_AUTH_TOKEN`, `SENTRY_ORG`
 
 ## Stack
 - Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
@@ -37,6 +50,17 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 6. Mark items done in ProbuildTodo.md
 ```
 
+**Error diagnosis (Sentry)**
+```bash
+sentry-cli issues list --org golden-touch-remodeling --project <project> --output json
+```
+
+**Stripe webhook testing**
+```bash
+stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
+stripe trigger payment_intent.succeeded
+```
+
 ## Dev server — clean start
 ```bash
 kill -9 $(lsof -ti tcp:3000,3001,3002) 2>/dev/null; rm -f .next/dev/lock; sleep 2
@@ -52,7 +76,7 @@ sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
 2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
-3. Regenerate: `"C:\Program Files\Git\bin\bash.exe" -c "cd '/c/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site' && ./node_modules/.bin/prisma generate"`
+3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site'; node_modules\.bin\prisma generate"`
 4. Update `prisma/schema.prisma` to match the SQL changes
 
 ## Critical database config
@@ -89,7 +113,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
-- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client with `./node_modules/.bin/prisma generate` from git bash
+- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library

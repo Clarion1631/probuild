@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
 
-const JWT_SECRET = new TextEncoder().encode(
-    process.env.SUB_PORTAL_SECRET || "sub-portal-dev-secret-change-me"
-);
+function getJwtSecret(): Uint8Array {
+    const secret = process.env.SUB_PORTAL_SECRET;
+    if (!secret) throw new Error("SUB_PORTAL_SECRET environment variable is not configured");
+    return new TextEncoder().encode(secret);
+}
 
 export async function GET(req: NextRequest) {
     try {
@@ -13,7 +15,7 @@ export async function GET(req: NextRequest) {
             return NextResponse.redirect(new URL("/sub-portal/login?error=missing_token", req.url));
         }
 
-        const { payload } = await jwtVerify(token, JWT_SECRET);
+        const { payload } = await jwtVerify(token, getJwtSecret());
 
         if (!payload.subId || !payload.email) {
             return NextResponse.redirect(new URL("/sub-portal/login?error=invalid_token", req.url));

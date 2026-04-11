@@ -4,7 +4,7 @@ import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 
-const TAX_RATE = 0.087; // 8.7% Washington state sales tax
+const TAX_RATE = 0.088; // 8.8% Washington state sales tax
 
 export default async function TaxLiabilityPage() {
     const session = await getSessionOrDev();

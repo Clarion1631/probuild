@@ -1,12 +1,25 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
 export const dynamic = 'force-dynamic';
+
+async function requireManagerSession() {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) return null;
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || !["MANAGER", "ADMIN"].includes(user.role)) return null;
+    return user;
+}
 
 export async function PUT(
     req: Request,
     { params }: { params: Promise<{ id: string }> }
 ) {
     try {
+        const authUser = await requireManagerSession();
+        if (!authUser) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+
         const id = (await params).id;
         if (!id) {
             return NextResponse.json({ error: "Client ID is required" }, { status: 400 });
@@ -47,6 +60,9 @@ export async function DELETE(
     { params }: { params: Promise<{ id: string }> }
 ) {
     try {
+        const authUser = await requireManagerSession();
+        if (!authUser) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+
         const id = (await params).id;
         if (!id) {
             return NextResponse.json({ error: "Client ID is required" }, { status: 400 });

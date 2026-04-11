@@ -17,13 +17,16 @@ export async function GET(req: NextRequest) {
         // Save tokens locally
         saveToken(tokens);
         
+        // Log token server-side only — never expose to browser
+        if (tokens.refresh_token) {
+            console.log("[Gmail OAuth] Refresh token received — store as GMAIL_REFRESH_TOKEN in Vercel env vars");
+        }
+
         return new NextResponse(`
             <html>
                 <body>
                     <h2>Gmail Authorization Successful!</h2>
-                    <p>The server has successfully received the tokens.</p>
-                    <p>Refresh Token: <b>${tokens.refresh_token}</b></p>
-                    <p style="color: red;">Copy the Refresh Token above and paste it securely into your Vercel Environment Variables as <code>GMAIL_REFRESH_TOKEN</code>.</p>
+                    <p>The refresh token has been saved server-side. Copy it from the server logs and set it as <code>GMAIL_REFRESH_TOKEN</code> in your Vercel environment variables.</p>
                     <p>You may now close this tab.</p>
                 </body>
             </html>

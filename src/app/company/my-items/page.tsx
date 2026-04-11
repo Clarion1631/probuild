@@ -9,7 +9,7 @@ export default async function MyItemsPage() {
     const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
 
-    const [items, costCodes] = await Promise.all([
+    const [rawItems, costCodes] = await Promise.all([
         prisma.catalogItem.findMany({ orderBy: { name: "asc" }, include: { costCode: { select: { code: true, name: true } } } }),
         prisma.costCode.findMany({ where: { isActive: true }, orderBy: { code: "asc" }, select: { id: true, code: true, name: true } }),
     ]);

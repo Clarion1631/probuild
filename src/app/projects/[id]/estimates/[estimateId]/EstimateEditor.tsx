@@ -1,6 +1,9 @@
 "use client";
 
-import { useState, useEffect } from "react";
+/** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
+const rm = (n: number) => Math.round(n * 100) / 100;
+
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
@@ -61,6 +64,131 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showHistoricalPricing, setShowHistoricalPricing] = useState(false);
     const [historicalAnalysis, setHistoricalAnalysis] = useState("");
     const [isLoadingHistorical, setIsLoadingHistorical] = useState(false);
+    const [aiSuggestingDesc, setAiSuggestingDesc] = useState<string | null>(null); // item ID currently suggesting for
+    const [aiSuggestingSubitems, setAiSuggestingSubitems] = useState<string | null>(null); // item ID
+    const [aiSubitemSuggestions, setAiSubitemSuggestions] = useState<any[]>([]);
+    const [showSubitemSuggestions, setShowSubitemSuggestions] = useState<string | null>(null);
+    const [selectedSuggestionIndices, setSelectedSuggestionIndices] = useState<Set<number>>(new Set());
+    const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+
+    // Derived: sum of children totals per section header
+    const sectionTotals = useMemo(() => {
+        const map = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                map.set(item.parentId, (map.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        return map;
+    }, [items]);
+
+    // A row is a section header if it has no parentId and at least one child references it
+    const sectionIds = useMemo(() => new Set(items.filter(i => i.parentId).map((i: any) => i.parentId)), [items]);
+
+    // Auto-expand textarea ref handler
+    const autoExpand = useCallback((el: HTMLTextAreaElement | null) => {
+        if (!el) return;
+        el.style.height = "auto";
+        el.style.height = el.scrollHeight + "px";
+    }, []);
+
+    // AI description suggestion
+    async function suggestDescription(itemIndex: number) {
+        const item = items[itemIndex];
+        if (!item?.name?.trim() || aiSuggestingDesc === item.id) return;
+        setAiSuggestingDesc(item.id);
+        try {
+            const parent = item.parentId ? items.find((i: any) => i.id === item.parentId) : null;
+            const costType = costTypes.find((ct: any) => ct.id === item.costTypeId);
+            const res = await fetch("/api/ai-estimate/suggest", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    mode: "description",
+                    itemName: item.name,
+                    parentName: parent?.name,
+                    projectName: context.name,
+                    costType: costType?.name || item.type,
+                }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.description) {
+                    updateItem(itemIndex, "description", data.description);
+                    toast.success("AI description added");
+                }
+            }
+        } catch (err) {
+            console.error("[AI Suggest] Description error:", err);
+        } finally {
+            setAiSuggestingDesc(null);
+        }
+    }
+
+    // AI sub-item suggestions
+    async function suggestSubitems(parentIndex: number) {
+        const parent = items[parentIndex];
+        if (!parent?.name?.trim() || aiSuggestingSubitems === parent.id) return;
+        setAiSuggestingSubitems(parent.id);
+        try {
+            const res = await fetch("/api/ai-estimate/suggest", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    mode: "subitems",
+                    itemName: parent.name,
+                    projectName: context.name,
+                    existingItems: items.filter((i: any) => i.parentId === parent.id),
+                }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.suggestions?.length) {
+                    setAiSubitemSuggestions(data.suggestions);
+                    setShowSubitemSuggestions(parent.id);
+                    // Pre-select all by default
+                    setSelectedSuggestionIndices(new Set(data.suggestions.map((_: any, i: number) => i)));
+                } else {
+                    toast.info("No suggestions for this item");
+                }
+            }
+        } catch (err) {
+            console.error("[AI Suggest] Sub-items error:", err);
+            toast.error("Failed to get AI suggestions");
+        } finally {
+            setAiSuggestingSubitems(null);
+        }
+    }
+
+    function dismissSubitemSuggestions() {
+        setShowSubitemSuggestions(null);
+        setAiSubitemSuggestions([]);
+        setSelectedSuggestionIndices(new Set());
+    }
+
+    function acceptSubitemSuggestions(parentId: string, suggestions: any[]) {
+        const typeMap: Record<string, string> = {};
+        for (const ct of costTypes) typeMap[ct.name] = ct.id;
+        const newItems = suggestions.map((s: any) => ({
+            id: generateId(),
+            name: s.name,
+            description: s.description || "",
+            type: s.costType || "Material",
+            quantity: 1,
+            baseCost: 0,
+            markupPercent: 25,
+            unitCost: 0,
+            total: 0,
+            parentId,
+            costCodeId: null,
+            costTypeId: typeMap[s.costType] || null,
+        }));
+        setItems([...items, ...newItems]);
+        setShowSubitemSuggestions(null);
+        setAiSubitemSuggestions([]);
+        setSelectedSuggestionIndices(new Set());
+        toast.success(`Added ${newItems.length} sub-item${newItems.length !== 1 ? "s" : ""}`);
+    }
 
     useEffect(() => {
         getEstimateTemplates().then(setAssemblies).catch((err) => console.error("[EstimateEditor] Failed to load templates:", err));
@@ -283,12 +411,28 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
-    const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.087;
-    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.7%)";
-    const processingFee = processingFeeMarkup > 0 ? subtotal * (processingFeeMarkup / 100) : 0;
-    const tax = subtotal * taxRate;
-    const total = subtotal + tax + processingFee;
+    const subtotal = items.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.088;
+    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
+    const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
+    const tax = rm(subtotal * taxRate);
+    const total = rm(subtotal + tax + processingFee);
+
+    // Auto-recalculate percentage-based milestones when total changes
+    useEffect(() => {
+        setPaymentSchedules(prev => {
+            if (prev.length === 0) return prev;
+            const updated = prev.map(s => {
+                const pct = parseFloat(s.percentage) || 0;
+                if (pct > 0 && s.status !== "Paid") {
+                    return { ...s, amount: String(rm(total * (pct / 100))) };
+                }
+                return s;
+            });
+            const changed = updated.some((s, i) => s.amount !== prev[i].amount);
+            return changed ? updated : prev;
+        });
+    }, [total]);
 
     // Internal margin calculations
     const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
@@ -297,11 +441,20 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
     async function handleSave() {
         setIsSaving(true);
-        const mappedItems = items.map((item, index) => ({
-            ...item,
-            order: index,
-            total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-        }));
+        // Recompute section header totals from children before saving
+        const childTotals = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        const mappedItems = items.map((item, index) => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            const computedTotal = isSection
+                ? (childTotals.get(item.id) || 0)
+                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+            return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
+        });
         const mappedSchedules = paymentSchedules.map((schedule, index) => ({
             ...schedule,
             order: index
@@ -435,31 +588,53 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
                     ? [...paymentSchedules, ...data.paymentMilestones]
                     : paymentSchedules;
+
+                // Close modal and update UI immediately — don't wait for save
                 setItems(newItems);
                 if (data.paymentMilestones && data.paymentMilestones.length > 0) {
                     setPaymentSchedules(newSchedules);
                 }
-                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
                 setShowAiModal(false);
                 setAiPrompt("");
+                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
 
-                // Auto-save with the newly merged items
-                const mappedItems = newItems.map((item, index) => ({
-                    ...item,
-                    order: index,
-                    total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-                }));
-                const mappedSchedules = newSchedules.map((schedule, index) => ({
-                    ...schedule,
-                    order: index
-                }));
-                const newSubtotal = newItems.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-                const newTotal = newSubtotal + newSubtotal * taxRate;
-                await saveEstimate(initialEstimate.id, context.id, context.type, {
-                    title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
-                }, mappedItems);
-                toast.success("Estimate auto-saved");
-                router.refresh();
+                // Auto-save in background — set isSaving to block concurrent blur-triggered save
+                setIsSaving(true);
+                try {
+                    // Recompute section header totals from children before saving
+                    const aiChildTotals = new Map<string, number>();
+                    for (const item of newItems) {
+                        if (item.parentId) {
+                            aiChildTotals.set(item.parentId, (aiChildTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                        }
+                    }
+                    const mappedItems = newItems.map((item: any, index: number) => {
+                        const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
+                        const ct = isSect ? (aiChildTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                        return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
+                    });
+                    const mappedSchedules = newSchedules.map((schedule, index) => ({
+                        ...schedule,
+                        order: index
+                    }));
+                    // Subtotal from leaf items only (sections would double-count)
+                    const newSubtotal = newItems.reduce((acc: number, item: any) => {
+                        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                        if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                        return acc;
+                    }, 0);
+                    const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
+                    await saveEstimate(initialEstimate.id, context.id, context.type, {
+                        title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
+                    }, mappedItems);
+                    toast.success("Estimate auto-saved");
+                    router.refresh();
+                } catch (saveErr) {
+                    console.error("Auto-save after AI generate failed:", saveErr);
+                    toast.error("Items added — but auto-save failed. Click Save to persist.");
+                } finally {
+                    setIsSaving(false);
+                }
             } else {
                 toast.error('AI returned no items');
             }
@@ -498,7 +673,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (field === "percentage") {
             const pct = parseFloat(value) || 0;
             newSchedules[index].percentage = value;
-            newSchedules[index].amount = (total * (pct / 100)).toFixed(2);
+            newSchedules[index].amount = String(rm(total * (pct / 100)));
         } else {
             newSchedules[index][field] = value;
         }
@@ -523,14 +698,14 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu && !isSaving) {
                     handleSave();
                 }
             }}
         >
             {/* Top Navigation / Action Bar */}
-            <div className="bg-white border-b border-hui-border px-6 py-4 flex items-center justify-between shadow-sm z-10 sticky top-0">
-                <div className="flex items-center gap-4">
+            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-10 sticky top-0">
+                <div className="flex items-center gap-3">
                     <button onClick={() => {
                         if (context.type === "project") {
                             router.push(`/projects/${context.id}/estimates`);
@@ -595,7 +770,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     {/* More dropdown for secondary actions */}
                     <div className="relative">
                         <button
-                            onClick={() => setShowMoreMenu(!showMoreMenu)}
+                            onClick={() => setShowMoreMenu(v => !v)}
                             className="hui-btn hui-btn-secondary px-2.5"
                             title="More actions"
                         >
@@ -605,6 +780,31 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             <>
                                 <div className="fixed inset-0 z-40" onClick={() => setShowMoreMenu(false)} />
                                 <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
+                                    {/* AI Tools section */}
+                                    <div className="px-4 py-1 text-[10px] font-semibold text-hui-textMuted uppercase tracking-wider">AI Tools</div>
+                                    <button
+                                        onClick={() => { setShowAiModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700"
+                                    >
+                                        <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                                        AI Generate
+                                    </button>
+                                    <button
+                                        onClick={() => { handleHistoricalPricing(); setShowMoreMenu(false); }}
+                                        disabled={isLoadingHistorical}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-teal-50 flex items-center gap-2.5 text-teal-700 disabled:opacity-50"
+                                    >
+                                        <svg className="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                                        {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowSidebar(v => !v); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
+                                    >
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
+                                        {showSidebar ? "Hide Sidebar" : "Show Sidebar"}
+                                    </button>
+                                    <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={() => { window.open(`/portal/estimates/${initialEstimate.id}`, '_blank'); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
@@ -726,26 +926,24 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                     {/* Primary Actions */}
                     <button
-                        onClick={handleHistoricalPricing}
-                        disabled={isLoadingHistorical}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-teal-50 to-cyan-50 border-teal-200 text-teal-700 hover:from-teal-100 hover:to-cyan-100 flex items-center gap-2 disabled:opacity-50"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                        {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
-                    </button>
-                    <button
-                        onClick={() => setShowAiModal(true)}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
-                        AI Generate
-                    </button>
-                    <button
-                        onClick={() => setShowSendModal(true)}
+                        onClick={() => {
+                            const unpaidSchedules = paymentSchedules.filter(s => s.status !== "Paid");
+                            if (unpaidSchedules.length > 0) {
+                                const paidSum = paymentSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+                                const milestoneSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+                                const remaining = rm(total - paidSum);
+                                const unpaidSum = rm(milestoneSum - paidSum);
+                                if (Math.abs(unpaidSum - remaining) > 0.01) {
+                                    toast.error(`Payment milestones total $${milestoneSum.toFixed(2)} but estimate total is $${total.toFixed(2)}. Please adjust milestones.`);
+                                    return;
+                                }
+                            }
+                            setShowSendModal(true);
+                        }}
                         className="hui-btn hui-btn-green flex items-center gap-2"
                     >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
-                        Send
+                        {initialEstimate.sentAt ? "Resend" : "Send"}
                     </button>
                     <button
                         onClick={handleSave}
@@ -753,13 +951,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         className="hui-btn hui-btn-primary disabled:opacity-50"
                     >
                         {isSaving ? "Saving..." : "Save"}
-                    </button>
-                    <button
-                        onClick={() => setShowSidebar(!showSidebar)}
-                        className={`hui-btn hui-btn-secondary px-2.5 ${showSidebar ? 'bg-slate-100' : ''}`}
-                        title="Toggle sidebar"
-                    >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
                     </button>
                 </div>
             </div>
@@ -849,7 +1040,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         {/* Premium Document Wrapper */}
                         <div className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
                             {/* Subtle Gradient Accent Top Line */}
-                            <div className="h-1.5 w-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500"></div>
+                            <div className="h-1.5 w-full bg-slate-800"></div>
                             {/* Document Header */}
                             <div className="p-10 pb-12 space-y-10 border-b border-slate-100">
                                 <input
@@ -915,8 +1106,56 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     {(provided) => (
                                         <div {...provided.droppableProps} ref={provided.innerRef} className="divide-y divide-slate-100">
                                             {items.map((item, index) => {
-                                                const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
                                                 const isSubItem = !!item.parentId;
+                                                const isSection = !item.parentId && sectionIds.has(item.id);
+                                                // Hide children of collapsed sections
+                                                if (isSubItem && collapsedSections.has(item.parentId)) return null;
+                                                const sectionTotal = isSection ? (sectionTotals.get(item.id) || 0) : 0;
+                                                const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
+                                                const isCollapsed = isSection && collapsedSections.has(item.id);
+
+                                                // ── Section header row ──────────────────────────────────────
+                                                if (isSection) {
+                                                    return (
+                                                        <Draggable key={item.id} draggableId={item.id} index={index}>
+                                                            {(provided, snapshot) => (
+                                                                <div ref={provided.innerRef} {...provided.draggableProps}
+                                                                    className={`flex items-center px-4 py-2.5 bg-slate-100 border-l-4 border-hui-primary group transition ${snapshot.isDragging ? "shadow-lg z-50" : ""}`}
+                                                                >
+                                                                    <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-400 hover:text-slate-600 cursor-grab opacity-0 group-hover:opacity-100">
+                                                                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
+                                                                    </div>
+                                                                    <button onClick={() => setCollapsedSections(prev => { const n = new Set(prev); n.has(item.id) ? n.delete(item.id) : n.add(item.id); return n; })}
+                                                                        className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-200 transition mr-1 text-slate-500 flex-shrink-0"
+                                                                    >
+                                                                        <svg className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "-rotate-90" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                                                        </svg>
+                                                                    </button>
+                                                                    <div className="w-6 mr-1">
+                                                                        <input type="checkbox" checked={selectedItemIds.includes(item.id)}
+                                                                            onChange={e => { if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]); else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id)); }}
+                                                                            className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                                                        />
+                                                                    </div>
+                                                                    <input type="text" value={item.name} onChange={e => updateItem(index, "name", e.target.value)}
+                                                                        placeholder="Section name"
+                                                                        className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
+                                                                    />
+                                                                    <div className="flex items-center gap-3 ml-auto">
+                                                                        {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
+                                                                        <span className="text-sm font-semibold text-slate-700 w-32 text-right">{formatCurrency(sectionTotal)}</span>
+                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-0 group-hover:opacity-100">
+                                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </Draggable>
+                                                    );
+                                                }
+
+                                                // ── Regular item row ────────────────────────────────────────
                                                 return (
                                                     <Draggable key={item.id} draggableId={item.id} index={index}>
                                                         {(provided, snapshot) => (
@@ -947,17 +1186,112 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                         placeholder="Item name"
                                                                         className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
                                                                     />
-                                                                    <textarea
-                                                                        value={item.description || ""}
-                                                                        onChange={e => updateItem(index, "description", e.target.value)}
-                                                                        placeholder="Description (optional)"
-                                                                        rows={1}
-                                                                        className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 -ml-2 transition text-xs text-hui-textMuted resize-none mt-0.5"
-                                                                    />
+                                                                    <div className="flex items-start gap-1 mt-0.5">
+                                                                        <textarea
+                                                                            ref={el => autoExpand(el)}
+                                                                            value={item.description || ""}
+                                                                            onChange={e => {
+                                                                                updateItem(index, "description", e.target.value);
+                                                                                autoExpand(e.target);
+                                                                            }}
+                                                                            onInput={e => autoExpand(e.target as HTMLTextAreaElement)}
+                                                                            placeholder="Description — click sparkle to auto-fill with AI"
+                                                                            rows={1}
+                                                                            className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 -ml-2 transition text-xs text-hui-textMuted resize-none overflow-hidden"
+                                                                        />
+                                                                        {item.name?.trim() && (
+                                                                            <button
+                                                                                onClick={() => suggestDescription(index)}
+                                                                                disabled={aiSuggestingDesc === item.id}
+                                                                                title="AI: suggest description"
+                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition opacity-0 group-hover:opacity-100 disabled:opacity-50 disabled:animate-pulse"
+                                                                            >
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
                                                                     {!isSubItem && (
-                                                                        <button onClick={() => addItem(item.id)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit mt-1 opacity-0 group-hover:opacity-100 transition">
-                                                                            + Add Sub-item
-                                                                        </button>
+                                                                        <div className="flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition">
+                                                                            <button onClick={() => addItem(item.id)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
+                                                                                + Add Sub-item
+                                                                            </button>
+                                                                            {item.name?.trim() && (
+                                                                                <button
+                                                                                    onClick={() => suggestSubitems(index)}
+                                                                                    disabled={aiSuggestingSubitems === item.id}
+                                                                                    className="text-[10px] text-amber-500 hover:text-amber-700 font-medium flex items-center gap-0.5 disabled:opacity-50 disabled:animate-pulse"
+                                                                                >
+                                                                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
+                                                                                    {aiSuggestingSubitems === item.id ? "Thinking..." : "AI Sub-items"}
+                                                                                </button>
+                                                                            )}
+                                                                        </div>
+                                                                    )}
+                                                                    {/* AI sub-item suggestions popover */}
+                                                                    {showSubitemSuggestions === item.id && aiSubitemSuggestions.length > 0 && (
+                                                                        <div className="mt-2 bg-amber-50 border border-amber-200 rounded-lg p-3 shadow-sm">
+                                                                            <div className="flex items-center justify-between mb-2">
+                                                                                <div className="flex items-center gap-2">
+                                                                                    <span className="text-xs font-semibold text-amber-800">AI Suggested Sub-items</span>
+                                                                                    <button
+                                                                                        onClick={() => {
+                                                                                            if (selectedSuggestionIndices.size === aiSubitemSuggestions.length) {
+                                                                                                setSelectedSuggestionIndices(new Set());
+                                                                                            } else {
+                                                                                                setSelectedSuggestionIndices(new Set(aiSubitemSuggestions.map((_: any, i: number) => i)));
+                                                                                            }
+                                                                                        }}
+                                                                                        className="text-[10px] text-amber-600 hover:text-amber-800 underline"
+                                                                                    >
+                                                                                        {selectedSuggestionIndices.size === aiSubitemSuggestions.length ? "Deselect all" : "Select all"}
+                                                                                    </button>
+                                                                                </div>
+                                                                                <div className="flex gap-1">
+                                                                                    <button
+                                                                                        onClick={() => acceptSubitemSuggestions(item.id, aiSubitemSuggestions.filter((_: any, i: number) => selectedSuggestionIndices.has(i)))}
+                                                                                        disabled={selectedSuggestionIndices.size === 0}
+                                                                                        className="text-[10px] font-medium bg-amber-500 text-white px-2 py-0.5 rounded hover:bg-amber-600 transition disabled:opacity-40"
+                                                                                    >
+                                                                                        Add {selectedSuggestionIndices.size > 0 && selectedSuggestionIndices.size < aiSubitemSuggestions.length ? `${selectedSuggestionIndices.size} Selected` : "All"}
+                                                                                    </button>
+                                                                                    <button
+                                                                                        onClick={dismissSubitemSuggestions}
+                                                                                        className="text-[10px] font-medium text-amber-600 hover:text-amber-800 px-1"
+                                                                                    >
+                                                                                        Dismiss
+                                                                                    </button>
+                                                                                </div>
+                                                                            </div>
+                                                                            <div className="space-y-1">
+                                                                                {aiSubitemSuggestions.map((s: any, si: number) => (
+                                                                                    <div
+                                                                                        key={si}
+                                                                                        onClick={() => {
+                                                                                            const next = new Set(selectedSuggestionIndices);
+                                                                                            next.has(si) ? next.delete(si) : next.add(si);
+                                                                                            setSelectedSuggestionIndices(next);
+                                                                                        }}
+                                                                                        className={`flex items-start gap-2 text-xs rounded px-2 py-1.5 border cursor-pointer transition ${
+                                                                                            selectedSuggestionIndices.has(si)
+                                                                                                ? "bg-amber-100 border-amber-300"
+                                                                                                : "bg-white border-amber-100 opacity-60"
+                                                                                        }`}
+                                                                                    >
+                                                                                        <input
+                                                                                            type="checkbox"
+                                                                                            checked={selectedSuggestionIndices.has(si)}
+                                                                                            onChange={() => {}}
+                                                                                            className="mt-0.5 flex-shrink-0 accent-amber-500"
+                                                                                        />
+                                                                                        <div className="flex-1 min-w-0">
+                                                                                            <span className="font-medium text-slate-800">{s.name}</span>
+                                                                                            {s.description && <p className="text-slate-500 mt-0.5 line-clamp-2">{s.description}</p>}
+                                                                                        </div>
+                                                                                        <span className="ml-1 text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded whitespace-nowrap flex-shrink-0">{s.costType}</span>
+                                                                                    </div>
+                                                                                ))}
+                                                                            </div>
+                                                                        </div>
                                                                     )}
                                                                 </div>
                                                                 <div className="w-32 px-2">
@@ -1604,7 +1938,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </div>
                                 <div>
                                     <h2 className="text-lg font-bold text-hui-textMain">AI Estimate Generator</h2>
-                                    <p className="text-xs text-purple-600">Powered by Gemini • Vancouver, WA pricing</p>
+                                    <p className="text-xs text-purple-600">Powered by Claude • Vancouver, WA pricing</p>
                                 </div>
                             </div>
                             <button onClick={() => setShowAiModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">

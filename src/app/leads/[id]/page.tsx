@@ -7,8 +7,14 @@ import { prisma } from "@/lib/prisma";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
-    const lead = await getLead(resolvedParams.id);
-    if (!lead) return <div className="p-6">Lead not found</div>;
+    const leadRaw = await getLead(resolvedParams.id);
+    if (!leadRaw) return <div className="p-6">Lead not found</div>;
+    // Normalize Decimal fields to plain numbers for client component serialization
+    const lead = {
+        ...leadRaw,
+        targetRevenue: leadRaw.targetRevenue != null ? Number(leadRaw.targetRevenue) : null,
+        expectedProfit: leadRaw.expectedProfit != null ? Number(leadRaw.expectedProfit) : null,
+    };
 
     // Fetch estimates for the attachment picker
     const estimates = await prisma.estimate.findMany({
@@ -45,7 +51,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientName={lead.client?.name || ""}
                 leadName={lead.name}
                 leadSource={lead.source}
-                createdAt={lead.createdAt.toISOString()}
+                createdAt={typeof lead.createdAt === 'string' ? lead.createdAt : lead.createdAt.toISOString()}
                 location={lead.location}
                 clientEmail={lead.client?.email || null}
                 clientPhone={(lead.client as any)?.primaryPhone || null}
@@ -59,7 +65,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 leadName={lead.name}
                 leadSource={lead.source}
                 leadStage={lead.stage}
-                expectedStartDate={lead.expectedStartDate?.toISOString().split("T")[0] || null}
+                expectedStartDate={lead.expectedStartDate ? (typeof lead.expectedStartDate === 'string' ? lead.expectedStartDate.split("T")[0] : lead.expectedStartDate.toISOString().split("T")[0]) : null}
                 targetRevenue={lead.targetRevenue}
                 location={lead.location}
                 projectType={lead.projectType}
@@ -72,6 +78,8 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientState={(lead.client as any)?.state || null}
                 clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={leadFull?.message || null}
+                managerId={(lead as any).manager?.id || null}
+                managerName={(lead as any).manager?.name || null}
             />
         </div>
     );

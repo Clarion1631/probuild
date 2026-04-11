@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
 Analyze this receipt image and extract the following information as JSON:
@@ -23,6 +25,9 @@ Return ONLY valid JSON, no markdown, no explanation.`;
 
 export async function POST(req: NextRequest) {
     try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
         const contentType = req.headers.get("content-type") || "";
 
         let imageBase64: string;
@@ -79,6 +84,16 @@ export async function POST(req: NextRequest) {
 
         // Auto-create a pending expense if projectId provided
         if (projectId && parsed.vendor && typeof parsed.total === "number") {
+            // Verify caller has access to the project before creating the expense
+            const callerUser = await prisma.user.findUnique({
+                where: { email: session.user.email },
+                select: { role: true, projectAccess: { where: { projectId }, select: { projectId: true } } }
+            });
+            const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
+            if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
+                return NextResponse.json({ success: true, parsed }); // silently skip expense creation
+            }
+
             const estimate = await prisma.estimate.findFirst({
                 where: { projectId },
                 select: { id: true },

@@ -155,7 +155,7 @@ export default function ProjectChat({
                 </div>
                 <div>
                     <h3 className="text-sm font-semibold text-hui-textMain">
-                        {perspective === "TEAM" ? "Client Messages" : "Project Messages"}
+                        {perspective === "TEAM" ? "Team Chat" : "Project Messages"}
                     </h3>
                     <p className="text-xs text-hui-textMuted">
                         {messages.length} message{messages.length !== 1 ? "s" : ""}
@@ -173,7 +173,9 @@ export default function ProjectChat({
                             </svg>
                         </div>
                         <p className="text-sm font-medium text-hui-textMuted mb-1">No messages yet</p>
-                        <p className="text-xs text-slate-400">Send a message to start the conversation</p>
+                        <p className="text-xs text-slate-400">
+                            {perspective === "TEAM" ? "Send a message to the team" : "Start the conversation"}
+                        </p>
                     </div>
                 ) : (
                     messages.map((msg, idx) => {

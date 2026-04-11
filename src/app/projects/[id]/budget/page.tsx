@@ -43,7 +43,7 @@ export default async function BudgetPage({
         <div className="flex h-full bg-hui-background">
             <div className="flex-1 overflow-auto p-8">
                 <div className="max-w-7xl mx-auto space-y-6">
-                    <BudgetClient project={project} data={budgetData} />
+                    <BudgetClient project={project} data={budgetData as any} />
                 </div>
             </div>
         </div>

@@ -26,7 +26,7 @@ export async function GET(request: Request) {
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyName = settings?.companyName || "Your Contractor";
         const companyEmail = settings?.notificationEmail;
-        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://probuild-amber.vercel.app";
+        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
         let sentCount = 0;
         const today = startOfDay(new Date());

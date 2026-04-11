@@ -15,7 +15,7 @@ export async function GET(request: Request) {
         }
 
         const now = new Date();
-        const scheduledMessages = await prisma.leadMessage.findMany({
+        const scheduledMessages = await prisma.clientMessage.findMany({
             where: {
                 status: "SCHEDULED",
                 scheduledFor: { lte: now }
@@ -34,7 +34,7 @@ export async function GET(request: Request) {
 
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyName = settings?.companyName || "Your Contractor";
-        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://probuild-amber.vercel.app";
+        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
         let sentCount = 0;
         let failCount = 0;
@@ -42,6 +42,7 @@ export async function GET(request: Request) {
         for (const msg of scheduledMessages) {
             try {
                 const { lead, channel, body: messageBody, subject, senderName, attachments, ccEmails } = msg;
+                if (!lead) continue;
 
                 const parsedAttachments: { type: string, id: string, name: string, url?: string }[] = attachments ? JSON.parse(attachments) : [];
                 const parsedCcEmails: string[] = ccEmails ? JSON.parse(ccEmails) : [];
@@ -104,7 +105,7 @@ export async function GET(request: Request) {
                     sentViaSms = true;
                 }
 
-                await prisma.leadMessage.update({
+                await prisma.clientMessage.update({
                     where: { id: msg.id },
                     data: {
                         status: "SENT",
@@ -116,7 +117,7 @@ export async function GET(request: Request) {
                 sentCount++;
             } catch (err) {
                 console.error(`[Cron] Error sending message ${msg.id}:`, err);
-                await prisma.leadMessage.update({
+                await prisma.clientMessage.update({
                     where: { id: msg.id },
                     data: { status: "FAILED" }
                 });

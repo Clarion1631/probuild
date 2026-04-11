@@ -1,0 +1,2645 @@
+{
+  "config": {
+    "configFile": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\playwright.config.prod.ts",
+    "rootDir": "C:/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site/e2e",
+    "forbidOnly": false,
+    "fullyParallel": false,
+    "globalSetup": null,
+    "globalTeardown": null,
+    "globalTimeout": 0,
+    "grep": {},
+    "grepInvert": null,
+    "maxFailures": 0,
+    "metadata": {
+      "actualWorkers": 1
+    },
+    "preserveOutput": "always",
+    "projects": [
+      {
+        "outputDir": "C:/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site/test-results",
+        "repeatEach": 1,
+        "retries": 0,
+        "metadata": {
+          "actualWorkers": 1
+        },
+        "id": "prod-setup",
+        "name": "prod-setup",
+        "testDir": "C:/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site/e2e",
+        "testIgnore": [],
+        "testMatch": [
+          "/prod-auth\\.setup\\.ts/"
+        ],
+        "timeout": 90000
+      },
+      {
+        "outputDir": "C:/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site/test-results",
+        "repeatEach": 1,
+        "retries": 0,
+        "metadata": {
+          "actualWorkers": 1
+        },
+        "id": "qa-chromium",
+        "name": "qa-chromium",
+        "testDir": "C:/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site/e2e",
+        "testIgnore": [],
+        "testMatch": [
+          "/qa-.*\\.spec\\.ts/"
+        ],
+        "timeout": 90000
+      }
+    ],
+    "quiet": false,
+    "reporter": [
+      [
+        "list",
+        null
+      ],
+      [
+        "html",
+        {
+          "outputFolder": "qa-report",
+          "open": "never"
+        }
+      ],
+      [
+        "json",
+        {
+          "outputFile": "qa-report/results.json"
+        }
+      ]
+    ],
+    "reportSlowTests": {
+      "max": 5,
+      "threshold": 300000
+    },
+    "shard": null,
+    "tags": [],
+    "updateSnapshots": "missing",
+    "updateSourceMethod": "patch",
+    "version": "1.59.1",
+    "workers": 1,
+    "webServer": null
+  },
+  "suites": [
+    {
+      "title": "prod-auth.setup.ts",
+      "file": "prod-auth.setup.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [
+        {
+          "title": "authenticate against production",
+          "ok": true,
+          "tags": [],
+          "tests": [
+            {
+              "timeout": 90000,
+              "annotations": [],
+              "expectedStatus": "passed",
+              "projectId": "prod-setup",
+              "projectName": "prod-setup",
+              "results": [
+                {
+                  "workerIndex": 0,
+                  "parallelIndex": 0,
+                  "status": "passed",
+                  "duration": 7302,
+                  "errors": [],
+                  "stdout": [
+                    {
+                      "text": "[auth] CSRF token: aed97e55...\n"
+                    },
+                    {
+                      "text": "[auth] Secret length: 44\n"
+                    },
+                    {
+                      "text": "[auth] POST status: 200\n"
+                    },
+                    {
+                      "text": "[auth] POST URL: https://probuild-amber.vercel.app/\n"
+                    },
+                    {
+                      "text": "[auth] POST headers: {\n  age: \u001b[32m'0'\u001b[39m,\n  \u001b[32m'cache-control'\u001b[39m: \u001b[32m'private, no-cache, no-store, max-age=0, must-revalidate'\u001b[39m,\n  \u001b[32m'content-encoding'\u001b[39m: \u001b[32m'br'\u001b[39m,\n  \u001b[32m'content-type'\u001b[39m: \u001b[32m'text/html; charset=utf-8'\u001b[39m,\n  date: \u001b[32m'Tue, 07 Apr 2026 05:52:34 GMT'\u001b[39m,\n  link: \u001b[32m'</_next/static/media/797e433ab948586e-s.p.dbea232f.woff2>; rel=preload; as=\"font\"; crossorigin=\"\"; type=\"font/woff2\", </_next/static/media/caa3a2e1cccd8315-s.p.853070df.woff2>; rel=preload; as=\"font\"; crossorigin=\"\"; type=\"font/woff2\", </_next/static/chunks/2473c16c0c2f6b5f.css?dpl=dpl_4vrr1kswQ3PPztLyL2CG2WmXv5U4>; rel=preload; as=\"style\", </_next/static/chunks/e16d43dfbb489510.css?dpl=dpl_4vrr1kswQ3PPztLyL2CG2WmXv5U4>; rel=preload; as=\"style\"'\u001b[39m,\n  server: \u001b[32m'Vercel'\u001b[39m,\n  \u001b[32m'strict-transport-security'\u001b[39m: \u001b[32m'max-age=63072000; includeSubDomains; preload'\u001b[39m,\n  vary: \u001b[32m'rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch'\u001b[39m,\n  \u001b[32m'x-matched-path'\u001b[39m: \u001b[32m'/'\u001b[39m,\n  \u001b[32m'x-powered-by'\u001b[39m: \u001b[32m'Next.js'\u001b[39m,\n  \u001b[32m'x-vercel-cache'\u001b[39m: \u001b[32m'MISS'\u001b[39m,\n  \u001b[32m'x-vercel-id'\u001b[39m: \u001b[32m'pdx1::iad1::8ct6q-1775541153094-cff7796de753'\u001b[39m,\n  \u001b[32m'transfer-encoding'\u001b[39m: \u001b[32m'chunked'\u001b[39m\n}\n"
+                    },
+                    {
+                      "text": "[auth] Final URL: https://probuild-amber.vercel.app/projects\n"
+                    }
+                  ],
+                  "stderr": [],
+                  "retry": 0,
+                  "startTime": "2026-04-07T05:52:31.391Z",
+                  "annotations": [],
+                  "attachments": [
+                    {
+                      "name": "screenshot",
+                      "contentType": "image/png",
+                      "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\prod-auth.setup.ts-authenticate-against-production-prod-setup\\test-finished-1.png"
+                    },
+                    {
+                      "name": "trace",
+                      "contentType": "application/zip",
+                      "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\prod-auth.setup.ts-authenticate-against-production-prod-setup\\trace.zip"
+                    }
+                  ]
+                }
+              ],
+              "status": "expected"
+            }
+          ],
+          "id": "92513ebb8b0b70c25f76-29f0141d140d5358bfcf",
+          "file": "prod-auth.setup.ts",
+          "line": 10,
+          "column": 6
+        }
+      ]
+    },
+    {
+      "title": "qa-client-portal.spec.ts",
+      "file": "qa-client-portal.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 7: Client Portal",
+          "file": "qa-client-portal.spec.ts",
+          "line": 12,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W7.1: Navigate to /portal — no crash",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3708,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:52:39.949Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w7_s1_portal-home",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--82436-vigate-to-portal-—-no-crash-qa-chromium\\attachments\\w7-s1-portal-home-1196bbd9edac9a05547eb9e09c3a12a1654cf3a3.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--82436-vigate-to-portal-—-no-crash-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--82436-vigate-to-portal-—-no-crash-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "84a16a499e5c6eaec147-cd46ee2eae60260f5a50",
+              "file": "qa-client-portal.spec.ts",
+              "line": 17,
+              "column": 7
+            },
+            {
+              "title": "W7.2: Click into a project from portal",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 7987,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:52:43.867Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w7_s2_no-portal-projects",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--de8c3--into-a-project-from-portal-qa-chromium\\attachments\\w7-s2-no-portal-projects-090ede13cc26a644d70f2823e3f63ae6b5c98555.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--de8c3--into-a-project-from-portal-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--de8c3--into-a-project-from-portal-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "84a16a499e5c6eaec147-80f33929f3ddcc64b979",
+              "file": "qa-client-portal.spec.ts",
+              "line": 25,
+              "column": 7
+            },
+            {
+              "title": "W7.3: Check portal estimate view",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3255,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:52:51.895Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w7_s3_no-portal-estimates",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--3f042--Check-portal-estimate-view-qa-chromium\\attachments\\w7-s3-no-portal-estimates-d7e6a716488f4a29333f6b853591319658e0f83d.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--3f042--Check-portal-estimate-view-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--3f042--Check-portal-estimate-view-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "84a16a499e5c6eaec147-984064b3ea06fb22373b",
+              "file": "qa-client-portal.spec.ts",
+              "line": 42,
+              "column": 7
+            },
+            {
+              "title": "W7.4: Check portal invoice view",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 2974,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:52:55.189Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--cbb07-4-Check-portal-invoice-view-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--cbb07-4-Check-portal-invoice-view-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "84a16a499e5c6eaec147-7386f8f15fafd283a2f5",
+              "file": "qa-client-portal.spec.ts",
+              "line": 67,
+              "column": 7
+            },
+            {
+              "title": "W7.5: Check sub-portal",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3093,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:52:58.200Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w7_s5_sub-portal",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--a7ab3-ortal-W7-5-Check-sub-portal-qa-chromium\\attachments\\w7-s5-sub-portal-5113667b87eb12a40ead66337edfc7f060a18a3c.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--a7ab3-ortal-W7-5-Check-sub-portal-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-client-portal-Workflow--a7ab3-ortal-W7-5-Check-sub-portal-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "84a16a499e5c6eaec147-9e975dc0c089914bb0bd",
+              "file": "qa-client-portal.spec.ts",
+              "line": 90,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-help-chat.spec.ts",
+      "file": "qa-help-chat.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 10: Help Chat Widget",
+          "file": "qa-help-chat.spec.ts",
+          "line": 10,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W10.1: Chat bubble visible on page",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 5171,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:01.338Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w10_s1_chat-bubble-check",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-41e3c-Chat-bubble-visible-on-page-qa-chromium\\attachments\\w10-s1-chat-bubble-check-85e00c2966b889794b8e93661d3cb247f6dd6970.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-41e3c-Chat-bubble-visible-on-page-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-41e3c-Chat-bubble-visible-on-page-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "f970f7380337c81fc047-9df5979a17666f2d4609",
+              "file": "qa-help-chat.spec.ts",
+              "line": 15,
+              "column": 7
+            },
+            {
+              "title": "W10.2: Open chat, send message, get AI response",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 22381,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:06.574Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w10_s2_chat-panel-opened",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-581c0-end-message-get-AI-response-qa-chromium\\attachments\\w10-s2-chat-panel-opened-ee40bc949b782c55b811470aca7076254bc0490e.png"
+                        },
+                        {
+                          "name": "w10_s2_message-typed",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-581c0-end-message-get-AI-response-qa-chromium\\attachments\\w10-s2-message-typed-8ca9e58308b2ecfa81a5837539dfbd327f569f23.png"
+                        },
+                        {
+                          "name": "w10_s2_waiting-for-response",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-581c0-end-message-get-AI-response-qa-chromium\\attachments\\w10-s2-waiting-for-response-af1db5c3b32a4b3ea44104d21b0bb2a654b976a2.png"
+                        },
+                        {
+                          "name": "w10_s2_after-ai-response",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-581c0-end-message-get-AI-response-qa-chromium\\attachments\\w10-s2-after-ai-response-6a793dacf51f08104a31c6c7fc96ab04121b714d.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-581c0-end-message-get-AI-response-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-581c0-end-message-get-AI-response-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "f970f7380337c81fc047-0a859e114df32708cd4f",
+              "file": "qa-help-chat.spec.ts",
+              "line": 35,
+              "column": 7
+            },
+            {
+              "title": "W10.3: Close and reopen chat — verify persistence",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 8135,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:29.120Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w10_s3_chat-opened",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-ef8f9-n-chat-—-verify-persistence-qa-chromium\\attachments\\w10-s3-chat-opened-a59488e16f203f8eff7ebf5e4d341f59abb834a3.png"
+                        },
+                        {
+                          "name": "w10_s3_chat-closed",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-ef8f9-n-chat-—-verify-persistence-qa-chromium\\attachments\\w10-s3-chat-closed-e2a5f472a82c07240981acf64631702f04279c1a.png"
+                        },
+                        {
+                          "name": "w10_s3_chat-reopened",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-ef8f9-n-chat-—-verify-persistence-qa-chromium\\attachments\\w10-s3-chat-reopened-f5e0eb3ff6df44f3c036e6692863b192ebb16ad4.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-ef8f9-n-chat-—-verify-persistence-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-help-chat-Workflow-10-H-ef8f9-n-chat-—-verify-persistence-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "f970f7380337c81fc047-a0aed0672995f5c0fe8e",
+              "file": "qa-help-chat.spec.ts",
+              "line": 95,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-lead-estimate-invoice.spec.ts",
+      "file": "qa-lead-estimate-invoice.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflows 1-3: Lead → Estimate → Invoice",
+          "file": "qa-lead-estimate-invoice.spec.ts",
+          "line": 17,
+          "column": 15,
+          "specs": [
+            {
+              "title": "W1.1: Navigate to /leads and verify page loads",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 2728,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:37.359Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w1_s1_leads-page",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-25515-leads-and-verify-page-loads-qa-chromium\\attachments\\w1-s1-leads-page-a0479a2412ff2ba5dbcdef0ea2985cea1fbbc1bd.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-25515-leads-and-verify-page-loads-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-25515-leads-and-verify-page-loads-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-c068abfe8985276cfc1c",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 26,
+              "column": 7
+            },
+            {
+              "title": "W1.2: Create a new lead with full details",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 10320,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W1.2: Create a new lead with full details] 1 console error(s): [\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:40.154Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w1_s2_before-add-lead",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-fb04d--new-lead-with-full-details-qa-chromium\\attachments\\w1-s2-before-add-lead-3647b133bd0674d9aac8f4a8386f5ddcb6bb489d.png"
+                        },
+                        {
+                          "name": "w1_s2_add-lead-modal",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-fb04d--new-lead-with-full-details-qa-chromium\\attachments\\w1-s2-add-lead-modal-143732393cc36221cd2f50dd27db487835630115.png"
+                        },
+                        {
+                          "name": "w1_s2_form-filled",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-fb04d--new-lead-with-full-details-qa-chromium\\attachments\\w1-s2-form-filled-cf98dd479e3e6336607fb541ae849db531284b46.png"
+                        },
+                        {
+                          "name": "w1_s2_lead-created",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-fb04d--new-lead-with-full-details-qa-chromium\\attachments\\w1-s2-lead-created-4a9b434b02c491673957004d36593085ef88772f.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-fb04d--new-lead-with-full-details-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-fb04d--new-lead-with-full-details-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-8b4def3a3d87fa39fc0a",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 34,
+              "column": 7
+            },
+            {
+              "title": "W1.3: Verify lead detail page renders correctly",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 4933,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W1.3: Verify lead detail page renders correctly] 3 console error(s): [\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m,\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m,\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:50.638Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w1_s3_lead-detail-page",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-8c19d-tail-page-renders-correctly-qa-chromium\\attachments\\w1-s3-lead-detail-page-7966e5a4707b603a0033963fae7431f2a99c4dab.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-8c19d-tail-page-renders-correctly-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-8c19d-tail-page-renders-correctly-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-243fafaa21ba87772909",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 105,
+              "column": 7
+            },
+            {
+              "title": "W1.4: Change lead stage and verify persistence",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 10855,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W1.4: Change lead stage and verify persistence] 6 console error(s): [\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m,\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m,\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m,\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m,\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m,\n  \u001b[32m'Failed to load resource: the server responded with a status of 403 ()'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:53:55.635Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w1_s4_stage-changed",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-5ff1e-tage-and-verify-persistence-qa-chromium\\attachments\\w1-s4-stage-changed-602ee31cdb468a2c458d1ab22b00f8a36db0a083.png"
+                        },
+                        {
+                          "name": "w1_s4_stage-after-reload",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-5ff1e-tage-and-verify-persistence-qa-chromium\\attachments\\w1-s4-stage-after-reload-511be031cfc2d51ff9c5091d1dc3b7c6db44690a.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-5ff1e-tage-and-verify-persistence-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-5ff1e-tage-and-verify-persistence-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-4f5e851ccac5907043e3",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 126,
+              "column": 7
+            },
+            {
+              "title": "W1.5: Navigate to lead estimates and create one",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 6772,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:06.593Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w1_s5_lead-estimates-page",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-06d76-ad-estimates-and-create-one-qa-chromium\\attachments\\w1-s5-lead-estimates-page-8385b2506801c2e6f42c67a6fd5e72e135e57aa4.png"
+                        },
+                        {
+                          "name": "w1_s5_estimate-created",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-06d76-ad-estimates-and-create-one-qa-chromium\\attachments\\w1-s5-estimate-created-05ef5d662f956a2ba003abd946291a41d2626002.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-06d76-ad-estimates-and-create-one-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-06d76-ad-estimates-and-create-one-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-4999b26c2ab0afdad1e6",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 161,
+              "column": 7
+            },
+            {
+              "title": "W2.1: Add first line item — Demolition",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 5379,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W2.1: Add first line item — Demolition] 1 console error(s): [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:13.446Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w2_s1_estimate-before-items",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-493ad-irst-line-item-—-Demolition-qa-chromium\\attachments\\w2-s1-estimate-before-items-1bc0c21ad0e082eb73368625f077b4c4a678d62d.png"
+                        },
+                        {
+                          "name": "w2_s1_first-item-added",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-493ad-irst-line-item-—-Demolition-qa-chromium\\attachments\\w2-s1-first-item-added-cc977b2a14550bf9222e5bc501418d185b3177b9.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-493ad-irst-line-item-—-Demolition-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-493ad-irst-line-item-—-Demolition-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-2d36b21a426f0a18b99b",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 199,
+              "column": 7
+            },
+            {
+              "title": "W2.2: Verify estimate math and grand total",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 8144,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W2.2: Verify estimate math and grand total] 1 console error(s): [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:18.914Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w2_s2_estimate-math-page",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-7e24b-timate-math-and-grand-total-qa-chromium\\attachments\\w2-s2-estimate-math-page-2d5ae34eec969355ac8a6d611993e72500c0214a.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-7e24b-timate-math-and-grand-total-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-7e24b-timate-math-and-grand-total-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-62827850f6bc048fad1f",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 258,
+              "column": 7
+            },
+            {
+              "title": "W2.3: Save estimate, reload, verify persistence",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 14811,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W2.3: Save estimate, reload, verify persistence] 2 console error(s): [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m,\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:27.129Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w2_s3_before-reload",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-9d6af-e-reload-verify-persistence-qa-chromium\\attachments\\w2-s3-before-reload-8803f41a13177522d6c6270b39e664db813fc2e3.png"
+                        },
+                        {
+                          "name": "w2_s3_after-reload",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-9d6af-e-reload-verify-persistence-qa-chromium\\attachments\\w2-s3-after-reload-a2b8d74b18cf6aae61ed8633474457b7dd73083e.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-9d6af-e-reload-verify-persistence-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-9d6af-e-reload-verify-persistence-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-156cb7c977a05a31ea42",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 288,
+              "column": 7
+            },
+            {
+              "title": "W3.1: Navigate to invoices list",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 2966,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:42.035Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w3_s1_invoices-list",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-ccdac-1-Navigate-to-invoices-list-qa-chromium\\attachments\\w3-s1-invoices-list-a6b1532068065f879f79a8eb6cb92856c0681f63.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-ccdac-1-Navigate-to-invoices-list-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-ccdac-1-Navigate-to-invoices-list-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-0002968aa9be12418ecc",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 316,
+              "column": 7
+            },
+            {
+              "title": "W3.2: Verify invoice detail page",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 6959,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:45.049Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w3_s2_project-invoices",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-572a6--Verify-invoice-detail-page-qa-chromium\\attachments\\w3-s2-project-invoices-1d7fd182bcb7c4209e87d7a49c7a8b1e68c831c1.png"
+                        },
+                        {
+                          "name": "w3_s2_invoice-detail",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-572a6--Verify-invoice-detail-page-qa-chromium\\attachments\\w3-s2-invoice-detail-f174bddee7ddc756efb962294bb1aa34c928ce11.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-572a6--Verify-invoice-detail-page-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-572a6--Verify-invoice-detail-page-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-c30f282cab7683c67925",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 322,
+              "column": 7
+            },
+            {
+              "title": "W3.3: Verify reports/payments page",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 4436,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:52.080Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w3_s3_reports-payments",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-3a951-erify-reports-payments-page-qa-chromium\\attachments\\w3-s3-reports-payments-afc1564e31b62562323ee83795be2829dc8557d3.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-3a951-erify-reports-payments-page-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-3a951-erify-reports-payments-page-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-cb16b3a3060070d518bf",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 348,
+              "column": 7
+            },
+            {
+              "title": "W3.4: Verify reports pages load cleanly",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 14471,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W3.4: Verify reports pages load cleanly] 1 console error(s): [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:54:56.572Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w3_s4_all-reports-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-57c80--reports-pages-load-cleanly-qa-chromium\\attachments\\w3-s4-all-reports-clean-94ae7a1ddcff72d340218856586e6575f9e888ca.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-57c80--reports-pages-load-cleanly-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-estimate-invoice-W-57c80--reports-pages-load-cleanly-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "1e95dba1aeac954cc9bb-f36de33dad1a0177be07",
+              "file": "qa-lead-estimate-invoice.spec.ts",
+              "line": 354,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-lead-messaging.spec.ts",
+      "file": "qa-lead-messaging.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 6: Lead Messaging",
+          "file": "qa-lead-messaging.spec.ts",
+          "line": 11,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W6.1: Navigate to a lead and verify messaging panel",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3309,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:55:11.145Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w6_s1_no-leads-in-list",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-messaging-Workflow-9d4c2--and-verify-messaging-panel-qa-chromium\\attachments\\w6-s1-no-leads-in-list-4249943d809dfcad30c7bb31cdbb22e85c8cc14f.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-messaging-Workflow-9d4c2--and-verify-messaging-panel-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-messaging-Workflow-9d4c2--and-verify-messaging-panel-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "85d2ffa3701e523b625a-7416442fa237237f8e22",
+              "file": "qa-lead-messaging.spec.ts",
+              "line": 16,
+              "column": 7
+            },
+            {
+              "title": "W6.2: Send a message",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [
+                    {
+                      "type": "skip",
+                      "description": "No leads available",
+                      "location": {
+                        "file": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\e2e\\qa-lead-messaging.spec.ts",
+                        "line": 50,
+                        "column": 12
+                      }
+                    }
+                  ],
+                  "expectedStatus": "skipped",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "skipped",
+                      "duration": 2469,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:55:14.517Z",
+                      "annotations": [
+                        {
+                          "type": "skip",
+                          "description": "No leads available",
+                          "location": {
+                            "file": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\e2e\\qa-lead-messaging.spec.ts",
+                            "line": 50,
+                            "column": 12
+                          }
+                        }
+                      ],
+                      "attachments": [
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-messaging-Workflow-87420-ssaging-W6-2-Send-a-message-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-lead-messaging-Workflow-87420-ssaging-W6-2-Send-a-message-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "skipped"
+                }
+              ],
+              "id": "85d2ffa3701e523b625a-9ddf2d80c112cd1197e1",
+              "file": "qa-lead-messaging.spec.ts",
+              "line": 45,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-navigation-audit.spec.ts",
+      "file": "qa-navigation-audit.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 9: Navigation Audit",
+          "file": "qa-navigation-audit.spec.ts",
+          "line": 12,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W9.1: All top-level sidebar pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 15726,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:55:17.036Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s1_sidebar-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-e1925-op-level-sidebar-pages-load-qa-chromium\\attachments\\w9-s1-sidebar-pages-clean-948c81c1f1f11868461617c8607f2d1b727b093a.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-e1925-op-level-sidebar-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-e1925-op-level-sidebar-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-752d0acf582d53cd8dc1",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 21,
+              "column": 7
+            },
+            {
+              "title": "W9.2: Company section pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 15948,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W9.2: Company section pages load] console errors: [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:55:32.875Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s2_company-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-d6387--Company-section-pages-load-qa-chromium\\attachments\\w9-s2-company-pages-clean-fc21dd7004838278b2682182446ece0e40397a71.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-d6387--Company-section-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-d6387--Company-section-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-d2dbd39b396fea8a9152",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 39,
+              "column": 7
+            },
+            {
+              "title": "W9.3: Settings section pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 24049,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:55:48.935Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s3_settings-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-66e78-Settings-section-pages-load-qa-chromium\\attachments\\w9-s3-settings-pages-clean-c2ba9ca4331e735885cffb9ff1b45384fc1145e1.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-66e78-Settings-section-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-66e78-Settings-section-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-d856e69ff74952a6ed05",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 55,
+              "column": 7
+            },
+            {
+              "title": "W9.4: Manager section pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 13916,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:56:13.160Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s4_manager-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-42716--Manager-section-pages-load-qa-chromium\\attachments\\w9-s4-manager-pages-clean-db57e665c4dd3ba0d7ef8bb0209fd2c2667666e2.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-42716--Manager-section-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-42716--Manager-section-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-29b70a9b02ae4d8b4731",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 75,
+              "column": 7
+            },
+            {
+              "title": "W9.5: Reports section pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 27948,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W9.5: Reports section pages load] console errors: [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m,\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:56:27.162Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s5_reports-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-ba75a--Reports-section-pages-load-qa-chromium\\attachments\\w9-s5-reports-pages-clean-8bb16c8695382d52f2262bf59e92403267eed4ed.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-ba75a--Reports-section-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-ba75a--Reports-section-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-d67ce3fc893226d39a2b",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 89,
+              "column": 7
+            },
+            {
+              "title": "W9.6: Template section pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 9590,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:56:55.273Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s6_template-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-1d282-Template-section-pages-load-qa-chromium\\attachments\\w9-s6-template-pages-clean-568d55cf2ec3587f230feda1168817a7070ec5e3.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-1d282-Template-section-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-1d282-Template-section-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-1646838c2df23cc2a879",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 107,
+              "column": 7
+            },
+            {
+              "title": "W9.7: All project sub-pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 180000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 164751,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W9.7: All project sub-pages load] console errors: [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:57:04.934Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s7_project-subpages-done",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-3a3ea--All-project-sub-pages-load-qa-chromium\\attachments\\w9-s7-project-subpages-done-8bf0569e13012ad6e726ab71c5d7cb7cedae51c1.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-3a3ea--All-project-sub-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-3a3ea--All-project-sub-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-eaa392696511420292c0",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 125,
+              "column": 7
+            },
+            {
+              "title": "W9.8: Portal and sub-portal pages load",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 5921,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:59:50.171Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w9_s8_portal-pages-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-b193b-l-and-sub-portal-pages-load-qa-chromium\\attachments\\w9-s8-portal-pages-clean-a24fb52552b1f7c60232026ad17de5e97bf05be8.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-b193b-l-and-sub-portal-pages-load-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-navigation-audit-Workfl-b193b-l-and-sub-portal-pages-load-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "18c9b8f6314ef54e5e40-e9dc5a7412d4386f8cb1",
+              "file": "qa-navigation-audit.spec.ts",
+              "line": 187,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-schedule-tasks.spec.ts",
+      "file": "qa-schedule-tasks.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 5: Schedule & Task Management",
+          "file": "qa-schedule-tasks.spec.ts",
+          "line": 11,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W5.1: Navigate to /manager/schedule",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3425,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:59:56.134Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w5_s1_manager-schedule",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-11d16-avigate-to-manager-schedule-qa-chromium\\attachments\\w5-s1-manager-schedule-f5432a43cb5dfb8fcd60d56a4ab8d457f1bfc524.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-11d16-avigate-to-manager-schedule-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-11d16-avigate-to-manager-schedule-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "719a54be7ce84c32300d-354ff7df49653820fb0a",
+              "file": "qa-schedule-tasks.spec.ts",
+              "line": 16,
+              "column": 7
+            },
+            {
+              "title": "W5.2: Verify project schedule (Gantt)",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 9356,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T05:59:59.605Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w5_s2_project-gantt",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-37826-ify-project-schedule-Gantt--qa-chromium\\attachments\\w5-s2-project-gantt-7ccd6cd8aa09dbd7527ed588bee594c3235a4d80.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-37826-ify-project-schedule-Gantt--qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-37826-ify-project-schedule-Gantt--qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "719a54be7ce84c32300d-0b01753199a3a72578f4",
+              "file": "qa-schedule-tasks.spec.ts",
+              "line": 21,
+              "column": 7
+            },
+            {
+              "title": "W5.3: Verify project tasks page",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 7450,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W5.3: Verify project tasks page] console errors: [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:09.027Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w5_s3_project-tasks",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-85a9d-3-Verify-project-tasks-page-qa-chromium\\attachments\\w5-s3-project-tasks-bcb6fd46b904bbe6c6bfa70aba309141d77b58bd.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-85a9d-3-Verify-project-tasks-page-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-schedule-tasks-Workflow-85a9d-3-Verify-project-tasks-page-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "719a54be7ce84c32300d-10244a0937623ff8d120",
+              "file": "qa-schedule-tasks.spec.ts",
+              "line": 34,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-settings-company.spec.ts",
+      "file": "qa-settings-company.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 8: Settings & Company",
+          "file": "qa-settings-company.spec.ts",
+          "line": 11,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W8.1: /settings/company loads and is editable",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3199,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:16.544Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s1_settings-company",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-f52df-mpany-loads-and-is-editable-qa-chromium\\attachments\\w8-s1-settings-company-091f96e82bacb961be6eab5a133ad3cc8fe3bdd3.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-f52df-mpany-loads-and-is-editable-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-f52df-mpany-loads-and-is-editable-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-046fcb4eaabfab07268c",
+              "file": "qa-settings-company.spec.ts",
+              "line": 16,
+              "column": 7
+            },
+            {
+              "title": "W8.2: Edit phone → save → reload → verify persistence",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 10719,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:19.795Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s2_phone-edited",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cd331-reload-→-verify-persistence-qa-chromium\\attachments\\w8-s2-phone-edited-ef3cae2b21a3584b0b5e186a911162e4c89610ac.png"
+                        },
+                        {
+                          "name": "w8_s2_after-save",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cd331-reload-→-verify-persistence-qa-chromium\\attachments\\w8-s2-after-save-191a0a633ebf70b4824e50aa0580e0542cfc1a1d.png"
+                        },
+                        {
+                          "name": "w8_s2_after-reload",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cd331-reload-→-verify-persistence-qa-chromium\\attachments\\w8-s2-after-reload-814fbaf1bc822289834e0d95363f62a010e4ed2e.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cd331-reload-→-verify-persistence-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cd331-reload-→-verify-persistence-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-aa3e3f053afcc9b02206",
+              "file": "qa-settings-company.spec.ts",
+              "line": 28,
+              "column": 7
+            },
+            {
+              "title": "W8.3: /company/team-members loads",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3289,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:30.622Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s3_team-members",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-d9917--company-team-members-loads-qa-chromium\\attachments\\w8-s3-team-members-3a5b31e8f300c3dd9cb64d98042aab7bacdbfeda.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-d9917--company-team-members-loads-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-d9917--company-team-members-loads-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-2539ac033a5ae3959f79",
+              "file": "qa-settings-company.spec.ts",
+              "line": 74,
+              "column": 7
+            },
+            {
+              "title": "W8.4: /settings/sales-taxes loads",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 2985,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:33.968Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s4_sales-taxes",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-a1c17--settings-sales-taxes-loads-qa-chromium\\attachments\\w8-s4-sales-taxes-c41d03096862827c5321b0cc757f35d7c65398c9.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-a1c17--settings-sales-taxes-loads-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-a1c17--settings-sales-taxes-loads-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-5190e33dd06626e642bf",
+              "file": "qa-settings-company.spec.ts",
+              "line": 83,
+              "column": 7
+            },
+            {
+              "title": "W8.5: /settings/cost-codes loads",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3521,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:37.002Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s5_cost-codes",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-17b56-5-settings-cost-codes-loads-qa-chromium\\attachments\\w8-s5-cost-codes-d46037781f28c5888759a30af02232ad499676a6.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-17b56-5-settings-cost-codes-loads-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-17b56-5-settings-cost-codes-loads-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-c02e77d8f886d3a9b64d",
+              "file": "qa-settings-company.spec.ts",
+              "line": 92,
+              "column": 7
+            },
+            {
+              "title": "W8.6: /settings/payment-methods loads",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 7896,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:40.600Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s6_payment-methods",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cb107-tings-payment-methods-loads-qa-chromium\\attachments\\w8-s6-payment-methods-bb6167c9bb0cfef0b6d55256b75b9f2e716de98d.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cb107-tings-payment-methods-loads-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-cb107-tings-payment-methods-loads-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-09fd84fb2a85b2ecce4d",
+              "file": "qa-settings-company.spec.ts",
+              "line": 101,
+              "column": 7
+            },
+            {
+              "title": "W8.7: Additional settings pages",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 20719,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [
+                        {
+                          "text": "[W8.7: Additional settings pages] console errors: [\n  \u001b[32m'PAGE_ERROR: Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'\u001b[39m\n]\n"
+                        }
+                      ],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:00:48.552Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w8_s7_all-settings-clean",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-a16b0-7-Additional-settings-pages-qa-chromium\\attachments\\w8-s7-all-settings-clean-fc37a737ec415296079bb2e7ad1aa8fdcd691e74.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-a16b0-7-Additional-settings-pages-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-settings-company-Workfl-a16b0-7-Additional-settings-pages-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "79736dd581126a2dec18-456a7cb321c31dba5871",
+              "file": "qa-settings-company.spec.ts",
+              "line": 112,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "qa-timeclock-expenses.spec.ts",
+      "file": "qa-timeclock-expenses.spec.ts",
+      "column": 0,
+      "line": 0,
+      "specs": [],
+      "suites": [
+        {
+          "title": "Workflow 4: Time Clock & Expenses",
+          "file": "qa-timeclock-expenses.spec.ts",
+          "line": 12,
+          "column": 6,
+          "specs": [
+            {
+              "title": "W4.1: Navigate to /time-clock — page loads cleanly",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 3199,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:01:09.412Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w4_s1_time-clock-page",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-9f10c--clock-—-page-loads-cleanly-qa-chromium\\attachments\\w4-s1-time-clock-page-8201a028be9537df35abdd256ae45a1621e1ae38.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-9f10c--clock-—-page-loads-cleanly-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-9f10c--clock-—-page-loads-cleanly-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "3cfb7acdc6ea21b75b5e-11c57ca1aba52939c6b4",
+              "file": "qa-timeclock-expenses.spec.ts",
+              "line": 17,
+              "column": 7
+            },
+            {
+              "title": "W4.2: Clock in, wait, clock out",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 10160,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:01:12.648Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w4_s2_before-clock-in",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-76385-4-2-Clock-in-wait-clock-out-qa-chromium\\attachments\\w4-s2-before-clock-in-3509a36d01422599cf75ad9267b8c9dd7532f214.png"
+                        },
+                        {
+                          "name": "w4_s2_clocked-in",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-76385-4-2-Clock-in-wait-clock-out-qa-chromium\\attachments\\w4-s2-clocked-in-e79962a771b7130dfe7434bff6daec84d9fbc560.png"
+                        },
+                        {
+                          "name": "w4_s2_clocked-out",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-76385-4-2-Clock-in-wait-clock-out-qa-chromium\\attachments\\w4-s2-clocked-out-4f65548db4f84bfdfa02ba970711d649d776c365.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-76385-4-2-Clock-in-wait-clock-out-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-76385-4-2-Clock-in-wait-clock-out-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "3cfb7acdc6ea21b75b5e-63148bad6e9d220bd3d5",
+              "file": "qa-timeclock-expenses.spec.ts",
+              "line": 24,
+              "column": 7
+            },
+            {
+              "title": "W4.3: Verify project timeclock tab",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 7516,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:01:22.873Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w4_s3_project-timeclock",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-4e1bb-erify-project-timeclock-tab-qa-chromium\\attachments\\w4-s3-project-timeclock-08bc7f882ee3dbd256977d0e1644cad98132fb7b.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-4e1bb-erify-project-timeclock-tab-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-4e1bb-erify-project-timeclock-tab-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "3cfb7acdc6ea21b75b5e-d1ef6196a2f9caf681b0",
+              "file": "qa-timeclock-expenses.spec.ts",
+              "line": 77,
+              "column": 7
+            },
+            {
+              "title": "W4.4: Verify time-expenses page",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 90000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "qa-chromium",
+                  "projectName": "qa-chromium",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 8484,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-04-07T06:01:30.446Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "w4_s4_time-expenses",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-5fc77-4-Verify-time-expenses-page-qa-chromium\\attachments\\w4-s4-time-expenses-6463f57359f75458cf47e92597ae6a337fdce3a8.png"
+                        },
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-5fc77-4-Verify-time-expenses-page-qa-chromium\\test-finished-1.png"
+                        },
+                        {
+                          "name": "trace",
+                          "contentType": "application/zip",
+                          "path": "C:\\Users\\jat00\\.gemini\\antigravity\\workspaces\\gtr-probuild-site\\test-results\\qa-timeclock-expenses-Work-5fc77-4-Verify-time-expenses-page-qa-chromium\\trace.zip"
+                        }
+                      ]
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "3cfb7acdc6ea21b75b5e-d84dc562f4d893079166",
+              "file": "qa-timeclock-expenses.spec.ts",
+              "line": 87,
+              "column": 7
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "stats": {
+    "startTime": "2026-04-07T05:52:30.477Z",
+    "duration": 548853.8219999999,
+    "expected": 44,
+    "skipped": 1,
+    "unexpected": 0,
+    "flaky": 0
+  }
+}

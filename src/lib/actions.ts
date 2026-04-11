@@ -51,6 +51,13 @@ export async function getLeads() {
     });
     return JSON.parse(JSON.stringify(leads.map((l: any) => ({
         ...l,
+        targetRevenue: l.targetRevenue != null ? Number(l.targetRevenue) : null,
+        expectedProfit: l.expectedProfit != null ? Number(l.expectedProfit) : null,
+        estimates: (l.estimates || []).map((e: any) => ({
+            ...e,
+            totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+            balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+        })),
         client: l.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
     }))));
 }
@@ -71,6 +78,15 @@ export async function getLead(id: string) {
     });
     if (lead && !lead.client) {
         (lead as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
+    }
+    if (lead) {
+        (lead as any).targetRevenue = lead.targetRevenue != null ? Number(lead.targetRevenue) : null;
+        (lead as any).expectedProfit = lead.expectedProfit != null ? Number(lead.expectedProfit) : null;
+        (lead as any).estimates = ((lead as any).estimates || []).map((e: any) => ({
+            ...e,
+            totalAmount: e.totalAmount != null ? Number(e.totalAmount) : 0,
+            balanceDue: e.balanceDue != null ? Number(e.balanceDue) : 0,
+        }));
     }
     return lead ? JSON.parse(JSON.stringify(lead)) : null;
 }
@@ -107,6 +123,17 @@ export async function createLead(data: { name: string; clientName: string; clien
         });
     }
 
+    // Dedup guard: if an identical lead for this client was created in the last 24h, return it
+    const existing = await prisma.lead.findFirst({
+        where: {
+            clientId: client.id,
+            name: data.name,
+            stage: "New",
+            createdAt: { gte: new Date(Date.now() - 86400000) },
+        },
+    });
+    if (existing) return { id: existing.id };
+
     const lead = await prisma.lead.create({
         data: {
             name: data.name,
@@ -136,6 +163,12 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
 }
 
 export async function deleteLead(id: string) {
+    // Prevent deletion of Won/converted leads — their records have been relinked to a project
+    // and deleting the lead would cascade-delete anything still pointing at it.
+    const lead = await prisma.lead.findUnique({ where: { id }, select: { stage: true } });
+    if (lead?.stage === "Won") {
+        throw new Error("Cannot delete a converted lead. Archive it instead.");
+    }
     await prisma.lead.delete({
         where: { id }
     });
@@ -143,12 +176,31 @@ export async function deleteLead(id: string) {
 }
 
 export async function updateLeadAssignment(id: string, managerId: string | null) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
     await prisma.lead.update({
         where: { id },
         data: { managerId }
     });
     revalidatePath(`/leads`);
     revalidatePath(`/leads/${id}`);
+}
+
+export async function updateProjectManager(projectId: string, managerId: string | null) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { managerId }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`, 'layout');
 }
 
 export async function updateLeadInfo(id: string, data: any) {
@@ -610,32 +662,42 @@ export async function convertLeadToProject(leadId: string) {
     const lead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!lead) throw new Error("Lead not found");
 
-    const project = await prisma.project.create({
-        data: {
-            name: lead.name,
-            clientId: lead.clientId,
-            location: lead.location,
-            status: "In Progress",
-            type: "Unknown",
-        },
-    });
+    // Idempotency: if this lead was already converted, return existing project
+    const existingProject = await prisma.project.findUnique({ where: { leadId } });
+    if (existingProject) return { id: existingProject.id };
 
-    // Relink estimates
-    await prisma.estimate.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
+    // Wrap entire conversion in a transaction for atomicity
+    const project = await prisma.$transaction(async (tx) => {
+        const project = await tx.project.create({
+            data: {
+                name: lead.name,
+                clientId: lead.clientId,
+                location: lead.location,
+                status: "In Progress",
+                type: lead.projectType || "Unknown",
+                managerId: lead.managerId || null,
+                tags: lead.tags || null,
+                leadId,
+            },
+        });
 
-    // Relink floor plans
-    await prisma.floorPlan.updateMany({
-        where: { leadId },
-        data: { projectId: project.id, leadId: null },
-    });
+        // Relink child records to the new project.
+        // Estimate and FloorPlan have no onDelete:Cascade on their lead FK — keep leadId so they
+        // remain visible from both the lead view and the project view.
+        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        await tx.floorPlan.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        // The remaining models have onDelete:Cascade on their lead FK — clear leadId to prevent
+        // cascade-deletion of project records if the lead is ever deleted post-conversion.
+        await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
 
-    // Update lead
-    await prisma.lead.update({
-        where: { id: leadId },
-        data: { stage: "Won" },
+        await tx.lead.update({ where: { id: leadId }, data: { stage: "Won" } });
+
+        return project;
     });
 
     revalidatePath("/leads");
@@ -749,7 +811,7 @@ export async function getEstimate(id: string) {
                 id: true, number: true, title: true, projectId: true, leadId: true,
                 code: true, status: true, privacy: true, createdAt: true,
                 totalAmount: true, balanceDue: true,
-                approvedBy: true, approvedAt: true, approvalIp: true,
+                approvedBy: true, approvedAt: true,
                 approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                 items: {
                     orderBy: { order: "asc" },
@@ -800,7 +862,7 @@ export async function getEstimateForPortal(id: string) {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
                     totalAmount: true, balanceDue: true,
-                    approvedBy: true, approvedAt: true, approvalIp: true,
+                    approvedBy: true, approvedAt: true,
                     approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                     project: { include: { client: true } },
                     lead: { include: { client: true } },
@@ -824,12 +886,58 @@ export async function getEstimateForPortal(id: string) {
 
     if (!estimate) return null;
 
-    return {
+    return JSON.parse(JSON.stringify({
         ...estimate,
         projectName: estimate.project?.name || estimate.lead?.name || null,
         clientName: estimate.project?.client?.name || estimate.lead?.client?.name || "Unknown Client",
         clientEmail: estimate.project?.client?.email || estimate.lead?.client?.email || null,
-    };
+    }));
+}
+
+/** Returns the id of the "Payment in Full" schedule for an estimate, creating one if none exist.
+ *  Amount is always derived server-side from balanceDue to prevent client-side manipulation.
+ *  Race-safe: catches P2002 on concurrent creates and re-reads the winner. */
+export async function ensureEstimatePayInFullSchedule(estimateId: string): Promise<string> {
+    "use server";
+    // Derive amount from canonical server data — never accept it from the client
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { balanceDue: true, totalAmount: true },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+    const amount = Number(estimate.balanceDue ?? estimate.totalAmount ?? 0);
+    if (amount <= 0) throw new Error("Estimate has no balance due");
+
+    // Return existing schedule if one exists (handles abandoned Stripe sessions too)
+    const existing = await prisma.estimatePaymentSchedule.findFirst({
+        where: { estimateId, name: "Payment in Full" },
+        select: { id: true },
+    });
+    if (existing) return existing.id;
+
+    try {
+        const created = await prisma.estimatePaymentSchedule.create({
+            data: {
+                estimateId,
+                name: "Payment in Full",
+                amount,
+                order: 0,
+                status: "Pending",
+            },
+            select: { id: true },
+        });
+        return created.id;
+    } catch (e: any) {
+        // Race: concurrent request already created it — read the winner
+        if (e.code === "P2002") {
+            const winner = await prisma.estimatePaymentSchedule.findFirst({
+                where: { estimateId, name: "Payment in Full" },
+                select: { id: true },
+            });
+            if (winner) return winner.id;
+        }
+        throw e;
+    }
 }
 
 export async function getAllEstimates() {
@@ -857,10 +965,127 @@ export async function getAllEstimates() {
     });
 }
 
+// Race-safe find-or-create for the client MessageThread (subcontractorId IS NULL).
+// Exported for use in API route handlers that can't import server actions directly.
+// The partial unique index "MessageThread_projectId_client_unique" makes this safe under concurrency:
+// if two requests both see no thread and both call create, the second will get P2002 and re-read.
+export async function findOrCreateClientThread(projectId: string) {
+    let thread = await prisma.messageThread.findFirst({
+        where: { projectId, subcontractorId: null },
+        orderBy: { createdAt: "asc" },
+    });
+    if (!thread) {
+        try {
+            thread = await prisma.messageThread.create({
+                data: { projectId, subcontractorId: null },
+            });
+        } catch (e: any) {
+            if (e?.code === "P2002") {
+                // Race: another request created it — re-read
+                thread = await prisma.messageThread.findFirst({
+                    where: { projectId, subcontractorId: null },
+                    orderBy: { createdAt: "asc" },
+                });
+            } else {
+                throw e;
+            }
+        }
+    }
+    if (!thread) throw new Error(`Failed to find or create MessageThread for project ${projectId}`);
+    return thread;
+}
+
+export async function logActivity({
+    projectId,
+    actorType,
+    actorName,
+    action,
+    entityType,
+    entityId,
+    entityName,
+    metadata,
+}: {
+    projectId: string;
+    actorType: string;
+    actorName: string;
+    action: string;
+    entityType?: string;
+    entityId?: string;
+    entityName?: string;
+    metadata?: Record<string, unknown>;
+}) {
+    try {
+        await prisma.activityLog.create({
+            data: {
+                projectId,
+                actorType,
+                actorName,
+                action,
+                entityType: entityType ?? null,
+                entityId: entityId ?? null,
+                entityName: entityName ?? null,
+                metadata: metadata ? JSON.stringify(metadata) : null,
+            },
+        });
+    } catch (err) {
+        console.error("[logActivity] Failed:", err);
+    }
+}
+
+export async function logPortalVisit(projectId: string, clientName: string) {
+    // Dedup: skip if a portal visit was logged in the last 30 minutes
+    const recent = await prisma.activityLog.findFirst({
+        where: {
+            projectId,
+            action: "viewed_portal",
+            createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+        },
+    });
+    if (!recent) {
+        await logActivity({
+            projectId,
+            actorType: "CLIENT",
+            actorName: clientName,
+            action: "viewed_portal",
+            entityType: "project",
+            entityId: projectId,
+        });
+    }
+}
+
+async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
+    try {
+        if (leadId) {
+            await prisma.clientMessage.create({
+                data: {
+                    leadId,
+                    direction: "OUTBOUND",   // system events are team-side, not client-originating
+                    senderName: "System",
+                    body,
+                    channel: "email",
+                    status: "SENT",
+                },
+            });
+        } else if (projectId) {
+            const thread = await findOrCreateClientThread(projectId);
+            await prisma.message.create({
+                data: {
+                    threadId: thread.id,
+                    senderType: "TEAM",      // system events are team-side, not client-originating
+                    senderName: "System",
+                    body,
+                },
+            });
+        }
+    } catch (err) {
+        console.error("[postActivityToThread] Failed:", err);
+    }
+}
+
 export async function markEstimateViewed(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        select: { viewedAt: true, title: true, code: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
+        select: { viewedAt: true, title: true, code: true, projectId: true, leadId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
     if (estimate && !estimate.viewedAt) {
@@ -885,13 +1110,32 @@ export async function markEstimateViewed(estimateId: string) {
                 </div>`
             );
         }
+
+        // Post activity to message thread
+        await postActivityToThread(
+            estimate.leadId, estimate.projectId,
+            `👁️ ${clientName} viewed estimate ${estimate.title || estimate.code}`
+        );
+
+        // Log to activity feed
+        if (estimate.projectId) {
+            await logActivity({
+                projectId: estimate.projectId,
+                actorType: "CLIENT",
+                actorName: clientName,
+                action: "viewed_estimate",
+                entityType: "estimate",
+                entityId: estimateId,
+                entityName: `Estimate ${estimate.code || estimate.title}`,
+            });
+        }
     }
 }
 
 export async function markContractViewed(contractId: string) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
-        select: { viewedAt: true, title: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
+        select: { viewedAt: true, title: true, projectId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
     if (contract && !contract.viewedAt) {
@@ -916,10 +1160,24 @@ export async function markContractViewed(contractId: string) {
                 </div>`
             );
         }
+
+        // Log to activity feed
+        if (contract.projectId) {
+            const projectId = contract.projectId;
+            await logActivity({
+                projectId,
+                actorType: "CLIENT",
+                actorName: clientName,
+                action: "viewed_contract",
+                entityType: "contract",
+                entityId: contractId,
+                entityName: `Contract "${contract.title}"`,
+            });
+        }
     }
 }
 
-export async function approveEstimate(estimateId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, capturedPdfUrl?: string) {
     const approvedAt = new Date();
 
     await prisma.estimate.update({
@@ -928,7 +1186,6 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             status: "Approved",
             approvedBy: signatureName,
             approvedAt,
-            approvalIp: ipAddress,
             approvalUserAgent: userAgent,
             signatureUrl: signatureDataUrl || null,
         },
@@ -952,13 +1209,24 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     const clientEmail = estimate?.project?.client?.email || estimate?.lead?.client?.email || null;
     const pdfFilename = `Signed_Estimate_${estimateCode}.pdf`;
 
-    // Generate PDF once — reused for customer email, company email, and project filing
+    // Generate PDF — prefer the portal-captured version (pixel-perfect), fall back to pdf-lib
     let pdfBuffer: Buffer | null = null;
     let attachments: any = undefined;
     try {
-        const { generateEstimatePdf } = await import("./pdf");
-        pdfBuffer = await generateEstimatePdf(estimateId);
-        attachments = [{ filename: pdfFilename, content: pdfBuffer }];
+        if (capturedPdfUrl) {
+            const res = await fetch(capturedPdfUrl);
+            if (res.ok) {
+                const ab = await res.arrayBuffer();
+                pdfBuffer = Buffer.from(ab);
+            }
+        }
+        if (!pdfBuffer) {
+            const { generateEstimatePdf } = await import("./pdf");
+            pdfBuffer = await generateEstimatePdf(estimateId);
+        }
+        if (pdfBuffer) {
+            attachments = [{ filename: pdfFilename, content: pdfBuffer }];
+        }
     } catch (e) {
         console.error("Failed to generate PDF snapshot for signed estimate:", e);
     }
@@ -1006,7 +1274,6 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <table style="width: 100%; font-size: 13px; color: #555;">
                         <tr><td style="padding: 4px 0;">Client</td><td style="text-align: right; font-weight: 600;">${clientName}</td></tr>
                         <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${approvedAt.toLocaleString()}</td></tr>
-                        <tr><td style="padding: 4px 0;">IP Address</td><td style="text-align: right; font-family: monospace; font-size: 12px;">${ipAddress}</td></tr>
                     </table>
                 </div>
                 ${clientEmail ? `<p style="margin: 12px 0 0; font-size: 12px; color: #888;">A copy was also sent to the client at ${clientEmail}.</p>` : ""}
@@ -1063,6 +1330,27 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             // Non-critical — don't block the approval if filing fails
             console.error("[approveEstimate] Failed to file signed PDF:", fileErr);
         }
+    }
+
+    // Post activity to message thread
+    if (estimate) {
+        await postActivityToThread(
+            estimate.leadId, estimate.projectId,
+            `✅ ${signatureName} signed and approved estimate ${estimate.code || estimate.title}`
+        );
+    }
+
+    // Log to activity feed
+    if (estimate?.projectId) {
+        await logActivity({
+            projectId: estimate.projectId,
+            actorType: "CLIENT",
+            actorName: signatureName,
+            action: "signed_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+        });
     }
 
     if (estimate?.projectId) {
@@ -1168,8 +1456,23 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
         { fromName: companyName, replyTo: settings?.email || undefined }
     );
 
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    // Log to activity feed (project-scoped only)
+    if (invoice.projectId) {
+        await logActivity({
+            projectId: invoice.projectId,
+            actorType: "TEAM",
+            actorName: companyName,
+            action: "sent_invoice",
+            entityType: "invoice",
+            entityId: invoiceId,
+            entityName: `Invoice ${invoice.code}`,
+        });
+    }
+
+    if (invoice.projectId) {
+        revalidatePath(`/projects/${invoice.projectId}/invoices`);
+        revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    }
     revalidatePath(`/invoices`);
     return { success: true, sentTo: recipientEmail };
 }
@@ -1256,47 +1559,52 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         await prisma.estimate.update({ where: { id: estimateId }, data: safeData });
     }
 
-    // Delete existing items and schedules
+    // Delete existing items and NON-PAID schedules, then batch-insert replacements
+    // Preserve Paid schedules so payment history survives estimate edits
     await prisma.estimateItem.deleteMany({ where: { estimateId } });
-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId, status: { not: "Paid" } } });
 
-    // Insert new items
-    let itemOrder = 0;
-    for (const item of items) {
-        await prisma.estimateItem.create({
-            data: {
-                id: item.id || undefined,
-                estimateId,
-                name: item.name,
-                description: item.description || "",
-                type: item.type,
-                quantity: parseFloat(item.quantity) || 0,
-                baseCost: item.baseCost != null ? parseFloat(item.baseCost) || 0 : null,
-                markupPercent: parseFloat(item.markupPercent) ?? 25,
-                unitCost: parseFloat(item.unitCost) || 0,
-                total: parseFloat(item.total) || 0,
-                order: item.order ?? itemOrder++,
-                parentId: item.parentId || null,
-                costCodeId: item.costCodeId || null,
-                costTypeId: item.costTypeId || null,
-            },
-        });
+    // Build item data — split parents/children so FK ordering is respected
+    const toItemData = (item: any, fallbackOrder: number) => ({
+        ...(item.id ? { id: item.id } : {}),
+        estimateId,
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: parseFloat(item.quantity) || 0,
+        baseCost: item.baseCost != null ? (parseFloat(item.baseCost) || 0) : null,
+        markupPercent: parseFloat(item.markupPercent) || 25,
+        unitCost: parseFloat(item.unitCost) || 0,
+        total: parseFloat(item.total) || 0,
+        order: item.order ?? fallbackOrder,
+        parentId: item.parentId || null,
+        costCodeId: item.costCodeId || null,
+        costTypeId: item.costTypeId || null,
+    });
+
+    const parentItems = items.filter((i: any) => !i.parentId);
+    const childItems  = items.filter((i: any) =>  i.parentId);
+
+    if (parentItems.length > 0) {
+        await prisma.estimateItem.createMany({ data: parentItems.map(toItemData) });
+    }
+    if (childItems.length > 0) {
+        await prisma.estimateItem.createMany({ data: childItems.map(toItemData) });
     }
 
-    // Insert new payment schedules
-    const schedules = data.paymentSchedules || [];
-    let scheduleOrder = 0;
-    for (const schedule of schedules) {
-        await prisma.estimatePaymentSchedule.create({
-            data: {
-                id: schedule.id || undefined,
+    // Batch-insert payment schedules (skip Paid ones — they were preserved above)
+    const schedules = (data.paymentSchedules || []).filter((s: any) => s.status !== "Paid");
+    if (schedules.length > 0) {
+        await prisma.estimatePaymentSchedule.createMany({
+            data: schedules.map((schedule: any, idx: number) => ({
+                ...(schedule.id ? { id: schedule.id } : {}),
                 estimateId,
                 name: schedule.name,
                 percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
                 amount: parseFloat(schedule.amount) || 0,
                 dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
-                order: schedule.order ?? scheduleOrder++,
-            },
+                order: schedule.order ?? idx,
+            })),
         });
     }
 
@@ -1335,8 +1643,8 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
         },
     });
 
-    // Update balance
-    const newBalance = Math.max(0, Number(estimate.balanceDue) - data.amount);
+    // Update balance — round to 2 decimal places to avoid floating-point drift
+    const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
     await prisma.estimate.update({
         where: { id: estimateId },
         data: {
@@ -1353,23 +1661,41 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
 
 export async function archiveEstimate(estimateId: string) {
     "use server";
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: safeEstimateSelect,
+    });
     if (!estimate) throw new Error("Estimate not found");
 
-    const isArchived = !!estimate.archivedAt;
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: { archivedAt: isArchived ? null : new Date() },
-    });
+    let archived: boolean;
+    try {
+        // Try archivedAt column (may not exist in DB yet)
+        const full = await prisma.estimate.findUnique({ where: { id: estimateId }, select: { archivedAt: true } });
+        const isArchived = !!full?.archivedAt;
+        await prisma.estimate.update({
+            where: { id: estimateId },
+            data: { archivedAt: isArchived ? null : new Date() },
+        });
+        archived = !isArchived;
+    } catch {
+        // Fallback: use status field as proxy for archival
+        const isArchived = estimate.status === "Archived";
+        await prisma.estimate.update({
+            where: { id: estimateId },
+            data: { status: isArchived ? "Draft" : "Archived" },
+        });
+        archived = !isArchived;
+    }
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
         revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
     }
     if (estimate.leadId) {
-        revalidatePath(`/leads`);
+        revalidatePath(`/leads/${estimate.leadId}`);
+        revalidatePath(`/leads/${estimate.leadId}/estimates`);
     }
-    return { success: true, archived: !isArchived };
+    return { success: true, archived };
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
@@ -1605,6 +1931,9 @@ export async function saveCompanySettings(data: any) {
             email: data.email,
             website: data.website,
             logoUrl: data.logoUrl,
+            licenseNumber: typeof data.licenseNumber === "string"
+                ? data.licenseNumber.replace(/[\r\n\t]/g, "").trim().slice(0, 50)
+                : undefined,
             notificationEmail: data.notificationEmail,
             stripeEnabled: data.stripeEnabled,
             enableCard: data.enableCard,
@@ -1614,6 +1943,10 @@ export async function saveCompanySettings(data: any) {
             passProcessingFee: data.passProcessingFee,
             cardProcessingRate: data.cardProcessingRate !== undefined ? parseFloat(data.cardProcessingRate) : undefined,
             cardProcessingFlat: data.cardProcessingFlat !== undefined ? parseFloat(data.cardProcessingFlat) : undefined,
+            workDays: data.workDays,
+            workdayStart: data.workdayStart,
+            workdayEnd: data.workdayEnd,
+            salesTaxes: data.salesTaxes,
         },
     });
 
@@ -1656,7 +1989,7 @@ export async function deleteEstimate(estimateId: string) {
 // Duplicate Estimate
 // =============================================
 
-export async function duplicateEstimate(estimateId: string) {
+export async function duplicateEstimate(estimateId: string, targetProjectId?: string) {
     const original = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -1666,13 +1999,18 @@ export async function duplicateEstimate(estimateId: string) {
     });
     if (!original) throw new Error("Estimate not found");
 
+    if (targetProjectId) {
+        const target = await prisma.project.findUnique({ where: { id: targetProjectId } });
+        if (!target) throw new Error("Target project not found");
+    }
+
     const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
 
     const newEstimate = await prisma.estimate.create({
         data: {
             title: `Copy of ${original.title}`,
-            projectId: original.projectId,
-            leadId: original.leadId,
+            projectId: targetProjectId ?? original.projectId,
+            leadId: targetProjectId ? null : original.leadId,
             code,
             status: "Draft",
             totalAmount: original.totalAmount,
@@ -1728,14 +2066,23 @@ export async function duplicateEstimate(estimateId: string) {
         });
     }
 
-    if (original.projectId) {
+    if (targetProjectId) {
+        revalidatePath(`/projects/${targetProjectId}/estimates`);
+        if (original.projectId && original.projectId !== targetProjectId) {
+            revalidatePath(`/projects/${original.projectId}/estimates`);
+        }
+    } else if (original.projectId) {
         revalidatePath(`/projects/${original.projectId}/estimates`);
     } else if (original.leadId) {
         revalidatePath(`/leads/${original.leadId}`);
     }
     revalidatePath("/estimates");
 
-    return { id: newEstimate.id, projectId: original.projectId, leadId: original.leadId };
+    return {
+        id: newEstimate.id,
+        projectId: targetProjectId ?? original.projectId,
+        leadId: targetProjectId ? null : original.leadId,
+    };
 }
 
 // =============================================
@@ -1863,8 +2210,9 @@ export async function deleteAssembly(templateId: string) {
 // Document Templates CRUD
 // =============================================
 
-export async function getDocumentTemplates() {
+export async function getDocumentTemplates(type?: string) {
     return await prisma.documentTemplate.findMany({
+        where: type ? { type } : undefined,
         orderBy: { updatedAt: "desc" },
     });
 }
@@ -1883,6 +2231,7 @@ export async function createDocumentTemplate(data: { name: string; type: string;
     }
     const template = await prisma.documentTemplate.create({ data });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return template;
 }
 
@@ -1898,12 +2247,14 @@ export async function updateDocumentTemplate(id: string, data: { name?: string; 
     }
     const template = await prisma.documentTemplate.update({ where: { id }, data });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return template;
 }
 
 export async function deleteDocumentTemplate(id: string) {
     await prisma.documentTemplate.delete({ where: { id } });
     revalidatePath("/company/templates");
+    revalidatePath("/estimates");
     return { success: true };
 }
 
@@ -1911,20 +2262,107 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string) {
+export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string, capturedPdfUrl?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+    try {
+    // --- Server-side CC validation ---
+    const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const CC_MAX = 20;
+    if (ccEmails && ccEmails.length > 0) {
+        if (ccEmails.length > CC_MAX) {
+            return { success: false, error: `Too many CC recipients (max ${CC_MAX}).` };
+        }
+        const invalid = ccEmails.filter(e => !EMAIL_REGEX.test(e));
+        if (invalid.length > 0) {
+            return { success: false, error: `Invalid CC email address${invalid.length > 1 ? "es" : ""}: ${invalid.join(", ")}` };
+        }
+        // Dedupe case-insensitively
+        const seen = new Set<string>();
+        ccEmails = ccEmails.filter(e => {
+            const key = e.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
-        }
+        select: {
+            ...safeEstimateSelect,
+            sentAt: true,
+            memo: true,
+            termsAndConditions: true,
+            project: { select: { id: true, name: true, client: true } },
+            lead: { select: { id: true, name: true, client: true } },
+        },
     });
 
-    if (!estimate) throw new Error("Estimate not found");
+    if (!estimate) return { success: false, error: "Estimate not found" };
+
+    const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
+    const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
+    if (unpaidSchedules.length > 0) {
+        const estimateTotal = estimate.totalAmount?.toNumber() || 0;
+        // Half-cent-safe currency rounding
+        const rc = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+        const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+        const balanceDue = rc(estimateTotal - paidSum);
+
+        // Recalculate percentage-based unpaid milestones so stale DB values (from edits
+        // made without clicking Save) don't block sending. The LAST percentage milestone
+        // (by order) absorbs any rounding residual, guaranteeing the total sums exactly to
+        // balanceDue. If the computed lastAmount would be negative (inconsistent user data)
+        // we skip auto-correction and let the manual validation error fire instead.
+        const pctUnpaid = unpaidSchedules.filter(s => (s.percentage != null ? Number(s.percentage) : 0) > 0);
+        if (pctUnpaid.length > 0) {
+            const allButLast = pctUnpaid.slice(0, -1);
+            const allButLastAmounts = allButLast.map(s => rc(estimateTotal * (Number(s.percentage!) / 100)));
+            const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
+            const fixedUnpaidSum = unpaidSchedules
+                .filter(s => (s.percentage != null ? Number(s.percentage) : 0) <= 0)
+                .reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+            const lastMilestone = pctUnpaid[pctUnpaid.length - 1];
+            const lastAmount = rc(balanceDue - fixedUnpaidSum - allButLastSum);
+
+            if (lastAmount >= 0) {
+                const updates: { id: string; amount: number }[] = [];
+                allButLast.forEach((s, i) => {
+                    if (Math.abs(allButLastAmounts[i] - (s.amount?.toNumber() || 0)) > 0.001)
+                        updates.push({ id: s.id, amount: allButLastAmounts[i] });
+                });
+                if (Math.abs(lastAmount - (lastMilestone.amount?.toNumber() || 0)) > 0.001)
+                    updates.push({ id: lastMilestone.id, amount: lastAmount });
+
+                if (updates.length > 0) {
+                    await Promise.all(updates.map(u =>
+                        prisma.estimatePaymentSchedule.update({ where: { id: u.id }, data: { amount: u.amount } })
+                    ));
+                    const refreshed = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
+                    schedules.splice(0, schedules.length, ...refreshed);
+                }
+            }
+        }
+
+        const unpaidSum = schedules.reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0) - paidSum;
+        const unpaidRounded = rc(unpaidSum);
+        if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
+            const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+            const diff = Math.abs(unpaidRounded - balanceDue);
+            return { success: false, error: `Milestone total (${fmt(unpaidRounded)}) doesn't match the estimate balance due (${fmt(balanceDue)}). Difference: ${fmt(diff)}. Please adjust your milestones before sending.` };
+        }
+    }
 
     const client = estimate.project?.client || estimate.lead?.client;
     const recipientEmail = overrideEmail || client?.email;
-    if (!recipientEmail) throw new Error("No email address provided");
+    if (!recipientEmail) return { success: false, error: "No email address found for this client. Please add an email address before sending." };
+
+    // Remove the primary recipient from CC to avoid Resend duplicate-recipient errors
+    if (ccEmails && ccEmails.length > 0) {
+        const recipientLower = recipientEmail.toLowerCase();
+        ccEmails = ccEmails.filter(e => e.toLowerCase() !== recipientLower);
+        if (ccEmails.length === 0) ccEmails = undefined;
+    }
 
     // Snapshot T&C if a template is selected
     let termsHtml: string | null = null;
@@ -1939,22 +2377,63 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         if (defaultTemplate) termsHtml = defaultTemplate.body;
     }
 
-    // Update estimate with T&C snapshot and sent timestamp
+    // Snapshot T&C before sending (don't flip status yet)
     await prisma.estimate.update({
         where: { id: estimateId },
-        data: {
-            termsAndConditions: termsHtml,
-            sentAt: new Date(),
-            status: "Sent"
-        }
+        data: { termsAndConditions: termsHtml },
     });
+
+    // Generate PDF for email attachment
+    let emailAttachments: { filename: string; content: Buffer }[] | undefined = undefined;
+    let pdfAttached = false;
+    try {
+        let pdfBuffer: Buffer | undefined;
+        if (capturedPdfUrl) {
+            // Use the pre-captured portal PDF (high-quality, matches what client sees)
+            const res = await fetch(capturedPdfUrl);
+            if (res.ok) {
+                const ab = await res.arrayBuffer();
+                pdfBuffer = Buffer.from(ab);
+            }
+        }
+        if (!pdfBuffer) {
+            // Fall back to server-side PDF generation
+            const { generateEstimatePdf } = await import("./pdf");
+            pdfBuffer = await generateEstimatePdf(estimateId);
+        }
+        if (pdfBuffer) {
+            const filename = `Estimate_${estimate.code || estimateId}.pdf`;
+            emailAttachments = [{ filename, content: pdfBuffer }];
+            pdfAttached = true;
+        }
+    } catch (e) {
+        console.error("Failed to generate estimate PDF for send:", e);
+        // Do not block the email send — matches approveEstimate() pattern
+    }
 
     // Send email notification to client
     const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/estimates/${estimateId}`;
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
-    await sendNotification(
+    // HTML-encode customMessage to prevent injection into email template
+    const safeMessage = customMessage
+        ? customMessage.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+        : '';
+
+    const personalNote = safeMessage
+        ? `<div style="background: #f8fafc; border-left: 3px solid #4f46e5; padding: 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
+                <p style="color: #333; margin: 0; line-height: 1.6; white-space: pre-wrap;">${safeMessage}</p>
+           </div>`
+        : '';
+
+    const pdfNote = pdfAttached
+        ? `<div style="background: #f0fdf4; border-left: 3px solid #16a34a; padding: 12px 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
+               <p style="color: #15803d; margin: 0; font-size: 13px; font-weight: 600;">✓ A copy of your estimate is attached to this email for your records.</p>
+           </div>`
+        : '';
+
+    const sendResult = await sendNotification(
         recipientEmail,
         `${companyName} sent you an estimate`,
         `<!DOCTYPE html>
@@ -1966,6 +2445,8 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
                 <h2 style="font-size: 20px; margin: 0 0 8px;">New Estimate for You</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
+                ${personalNote}
+                ${pdfNote}
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you an estimate for review and approval.
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
@@ -1984,9 +2465,70 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             </p>
         </body>
         </html>`,
-        undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined }
+        emailAttachments,
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails }
     );
+
+    if (!sendResult.success) {
+        return { success: false, error: "Failed to send estimate email. Please check the recipient address and try again." };
+    }
+
+    // Mark as Sent only after confirmed delivery
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: { sentAt: new Date(), status: "Sent" },
+    });
+
+    // Store as message in the appropriate thread
+    const messageBody = customMessage
+        ? `📄 Estimate sent: ${estimate.title || estimate.code}\n\n${customMessage}\n\n🔗 Portal link: ${portalUrl}`
+        : `📄 Estimate sent: ${estimate.title || estimate.code}\n\n🔗 Portal link: ${portalUrl}`;
+
+    if (estimate.leadId) {
+        await prisma.clientMessage.create({
+            data: {
+                leadId: estimate.leadId,
+                direction: "OUTBOUND",
+                senderName: companyName,
+                senderEmail: settings?.email || null,
+                subject: `Estimate sent: ${estimate.title || estimate.code}`,
+                body: messageBody,
+                channel: "email",
+                sentViaEmail: true,
+                status: "SENT",
+                ccEmails: ccEmails && ccEmails.length > 0 ? JSON.stringify(ccEmails) : null,
+            },
+        });
+        revalidatePath(`/leads/${estimate.leadId}/messages`);
+    } else if (estimate.projectId) {
+        const thread = await findOrCreateClientThread(estimate.projectId);
+        const projectMessageBody = ccEmails && ccEmails.length > 0
+            ? `${messageBody}\n\nCC: ${ccEmails.join(", ")}`
+            : messageBody;
+        await prisma.message.create({
+            data: {
+                threadId: thread.id,
+                senderType: "TEAM",
+                senderName: companyName,
+                senderEmail: settings?.email || null,
+                body: projectMessageBody,
+            },
+        });
+        revalidatePath(`/projects/${estimate.projectId}/messages`);
+    }
+
+    // Log to activity feed (project-scoped only)
+    if (estimate.projectId) {
+        await logActivity({
+            projectId: estimate.projectId,
+            actorType: "TEAM",
+            actorName: companyName,
+            action: "sent_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+        });
+    }
 
     // Revalidate paths
     if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
@@ -1994,6 +2536,10 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     revalidatePath("/estimates");
 
     return { success: true, sentTo: recipientEmail };
+    } catch (err) {
+        console.error("[sendEstimateToClient] unexpected error:", err);
+        return { success: false, error: "An unexpected error occurred. Please try again." };
+    }
 }
 
 // ────────────────────────────────────────────────
@@ -2194,13 +2740,60 @@ export async function sendContractToClient(contractId: string) {
         </html>`
     );
 
+    // Log to activity feed (project-scoped only)
+    if (contract.projectId) {
+        await logActivity({
+            projectId: contract.projectId,
+            actorType: "TEAM",
+            actorName: companyName,
+            action: "sent_contract",
+            entityType: "contract",
+            entityId: contractId,
+            entityName: contract.title,
+        });
+    }
+
     if (contract.projectId) revalidatePath(`/projects/${contract.projectId}`);
     if (contract.leadId) revalidatePath(`/leads/${contract.leadId}`);
 
     return { success: true, sentTo: client.email };
 }
 
-export async function approveContract(contractId: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    // Role gate — only ADMIN/MANAGER can sign as contractor
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    // Validate data URL is a safe image type before storing
+    if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format");
+    }
+
+    // Verify contract exists first (gives a clear 404-style error if not found)
+    const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { id: true } });
+    if (!existing) throw new Error("Contract not found");
+
+    // Atomic idempotency guard — updateMany only matches rows where contractorSignedAt IS NULL,
+    // so two concurrent requests can't both succeed (eliminates TOCTOU race)
+    const result = await prisma.contract.updateMany({
+        where: { id: contractId, contractorSignedAt: null },
+        data: {
+            contractorSignedBy: signerName,
+            contractorSignedAt: new Date(),
+            contractorSignatureUrl: signatureDataUrl,
+        },
+    });
+    if (result.count === 0) throw new Error("Contract already signed by contractor");
+
+    revalidatePath(`/projects/[id]/contracts`, "page");
+    revalidatePath(`/leads/[id]/contracts`, "page");
+    return { success: true };
+}
+
+export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     // Fetch the contract first to get recurring info
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
@@ -2217,7 +2810,6 @@ export async function approveContract(contractId: string, signatureName: string,
             signedBy: signatureName,
             signedAt: now,
             signatureUrl: signatureDataUrl || null,
-            ipAddress,
             userAgent,
             periodStart: contract.nextDueDate
                 ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
@@ -2234,7 +2826,6 @@ export async function approveContract(contractId: string, signatureName: string,
             data: {
                 approvedBy: signatureName,
                 approvedAt: now,
-                approvalIp: ipAddress,
                 approvalUserAgent: userAgent,
                 signatureUrl: signatureDataUrl || null,
                 status: "Sent", // Reset to Sent so it can be signed again next cycle
@@ -2250,7 +2841,6 @@ export async function approveContract(contractId: string, signatureName: string,
                 status: "Signed",
                 approvedBy: signatureName,
                 approvedAt: now,
-                approvalIp: ipAddress,
                 approvalUserAgent: userAgent,
                 signatureUrl: signatureDataUrl || null,
             }
@@ -2266,6 +2856,19 @@ export async function approveContract(contractId: string, signatureName: string,
             `<p>The contract "<strong>${contract.title}</strong>" has been electronically signed by <strong>${signatureName}</strong> on ${now.toLocaleString()}.</p>
             ${isRecurring ? `<p style="color: #666; font-size: 0.9em;">This is a recurring document (every ${contract.recurringDays} days). The next signing will be due on <strong>${new Date(now.getTime() + contract.recurringDays! * 86400000).toLocaleDateString()}</strong>.</p>` : ""}`
         );
+    }
+
+    // Log to activity feed
+    if (contract.projectId) {
+        await logActivity({
+            projectId: contract.projectId,
+            actorType: "CLIENT",
+            actorName: signatureName,
+            action: "signed_contract",
+            entityType: "contract",
+            entityId: contractId,
+            entityName: `Contract "${contract.title}"`,
+        });
     }
 
     revalidatePath("/");
@@ -2888,21 +3491,22 @@ export async function getProjectMessages(projectId: string) {
 }
 
 export async function getUnreadMessageCount(projectId: string, forSenderType: "CLIENT" | "TEAM") {
-    // Count messages sent by the OTHER party that haven't been read
-    const oppositeType = forSenderType === "TEAM" ? "CLIENT" : "TEAM";
-
-    const thread = await prisma.messageThread.findFirst({
-        where: { projectId, subcontractorId: null },
+    // Count unread inbound ClientMessages for this project.
+    // "Inbound" from the team's perspective = messages sent by the CLIENT.
+    // Uses readAt to determine unread status — badge clears when markClientMessagesRead is called.
+    const inboundDirection = forSenderType === "TEAM" ? "INBOUND" : "OUTBOUND";
+    return prisma.clientMessage.count({
+        where: { projectId, direction: inboundDirection, readAt: null },
     });
+}
 
-    if (!thread) return 0;
-
-    return prisma.message.count({
-        where: {
-            threadId: thread.id,
-            senderType: oppositeType,
-            readAt: null,
-        },
+export async function markClientMessagesRead(entityId: string, entityType: "lead" | "project") {
+    const where = entityType === "lead"
+        ? { leadId: entityId, direction: "INBOUND", readAt: null }
+        : { projectId: entityId, direction: "INBOUND", readAt: null };
+    await prisma.clientMessage.updateMany({
+        where,
+        data: { readAt: new Date() },
     });
 }
 
@@ -3211,7 +3815,7 @@ export async function updateChangeOrderStatus(id: string, status: string, projec
     revalidatePath(`/projects/${projectId}/change-orders`);
 }
 
-export async function approveChangeOrder(id: string, signatureName: string, ipAddress: string, userAgent: string, signatureDataUrl?: string) {
+export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     "use server";
     const approvedAt = new Date();
     const co = await prisma.changeOrder.update({
