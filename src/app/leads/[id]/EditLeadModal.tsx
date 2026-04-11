@@ -10,9 +10,15 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
 
     // Initial state based on lead and client props
     const [formData, setFormData] = useState({
-        name: lead.name || "",
         clientName: client?.name || "",
         location: lead.location || "",
+        // Structured address fields seeded from client — onPlaceDetails will overwrite
+        // these when the user picks a Google Places suggestion. onChange only writes
+        // `location` so the two callbacks never collide.
+        addressLine1: client?.addressLine1 || "",
+        city: client?.city || "",
+        state: client?.state || "",
+        zipCode: client?.zipCode || "",
         source: lead.source || "Manually created lead",
         stage: lead.stage || "New",
         tags: lead.tags || "",
@@ -65,19 +71,15 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                     {/* Top Section */}
                     <div className="space-y-4">
                         <div className="relative">
-                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500">Lead Name *</label>
-                            <input name="name" value={formData.name} onChange={handleChange} className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition" />
-                        </div>
-                        <div className="relative mt-4">
-                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500">Client Name *</label>
+                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500">Client Name</label>
                             <input name="clientName" value={formData.clientName} onChange={handleChange} className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition" />
                         </div>
                     </div>
 
-                    {/* Read-only Client Details Box */}
+                    {/* Read-only Client Details Box (contact info only — address now lives in the editable Project Address field below) */}
                     <div className="bg-[#f9f8f6] rounded-lg p-5">
                         <h3 className="text-sm font-bold text-slate-800 mb-4">Client Details</h3>
-                        <div className="grid grid-cols-2 gap-4 mb-4">
+                        <div className="grid grid-cols-2 gap-4">
                             <div>
                                 <label className="text-xs text-slate-500 block mb-1">Email Address</label>
                                 <div className="text-sm text-slate-800">{client?.email || "-"}</div>
@@ -87,21 +89,38 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                                 <div className="text-sm text-slate-800">{client?.primaryPhone || "-"}</div>
                             </div>
                         </div>
-                        <div>
-                            <label className="text-xs text-slate-500 block mb-1">Address</label>
-                            <div className="text-sm text-slate-800">{client?.addressLine1 ? `${client.addressLine1}, ${client.city || ''}, ${client.state || ''}` : "-"}</div>
-                        </div>
                     </div>
 
                     {/* Middle Section */}
                     <div className="space-y-4">
                         <div className="relative">
-                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500 z-10">Lead Address</label>
-                            <GoogleMapsAutocomplete 
-                                value={formData.location} 
+                            <label className="absolute -top-2 left-3 bg-white px-1 text-[11px] font-semibold text-slate-500 z-10">Project Address</label>
+                            <GoogleMapsAutocomplete
+                                value={formData.location}
                                 onChange={(val) => setFormData(p => ({ ...p, location: val }))}
-                                className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition" 
+                                onPlaceDetails={(d) => setFormData(p => ({
+                                    ...p,
+                                    addressLine1: d.address || "",
+                                    city: d.city || "",
+                                    state: d.state || "",
+                                    zipCode: d.zip || "",
+                                }))}
+                                className="w-full border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-slate-800 transition"
                             />
+                        </div>
+                        <div className="grid grid-cols-3 gap-2">
+                            <div>
+                                <label className="text-xs text-slate-500 block mb-1">City</label>
+                                <input type="text" value={formData.city} onChange={e => setFormData(p => ({ ...p, city: e.target.value }))} className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-slate-800 transition" />
+                            </div>
+                            <div>
+                                <label className="text-xs text-slate-500 block mb-1">State</label>
+                                <input type="text" value={formData.state} onChange={e => setFormData(p => ({ ...p, state: e.target.value }))} className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-slate-800 transition" />
+                            </div>
+                            <div>
+                                <label className="text-xs text-slate-500 block mb-1">Zip</label>
+                                <input type="text" value={formData.zipCode} onChange={e => setFormData(p => ({ ...p, zipCode: e.target.value }))} className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-slate-800 transition" />
+                            </div>
                         </div>
 
                         <div className="grid grid-cols-2 gap-4 pt-2">

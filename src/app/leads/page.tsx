@@ -1,9 +1,9 @@
 "use client";
 export const dynamic = "force-dynamic";
 
-import { useState, useMemo, useEffect, useRef } from "react";
+import { useState, useMemo, useEffect } from "react";
 import Avatar from "@/components/Avatar";
-import { getLeads, updateLead } from "@/lib/actions";
+import { getLeads } from "@/lib/actions";
 import Link from "next/link";
 import AddLeadButton from "./AddLeadButton";
 import LeadStageDropdown from "./[id]/LeadStageDropdown";
@@ -73,32 +73,6 @@ export default function LeadsPage() {
     const [sourceFilter, setSourceFilter] = useState("");
     const [typeFilter, setTypeFilter] = useState("");
     const [scores, setScores] = useState<Record<string, ScoreResult | "loading">>({});
-    const [editingNameId, setEditingNameId] = useState<string | null>(null);
-    const [editingNameValue, setEditingNameValue] = useState("");
-    const [leadNames, setLeadNames] = useState<Record<string, string>>({});
-    // savingRef: set synchronously on first save-attempt; prevents Enter→blur() from firing
-    // saveLeadName twice before React re-renders. Keyed by leadId.
-    const savingRef = useRef<Set<string>>(new Set());
-
-    async function saveLeadName(leadId: string, originalName: string) {
-        if (savingRef.current.has(leadId)) return;
-        savingRef.current.add(leadId);
-        const newName = editingNameValue.trim();
-        setEditingNameId(null);
-        if (!newName || newName === originalName) {
-            savingRef.current.delete(leadId);
-            return;
-        }
-        try {
-            await updateLead(leadId, { name: newName });
-            setLeadNames(prev => ({ ...prev, [leadId]: newName }));
-            toast.success("Lead renamed");
-        } catch (e: any) {
-            toast.error(e?.message || "Failed to rename lead");
-        } finally {
-            savingRef.current.delete(leadId);
-        }
-    }
 
     useEffect(() => {
         getLeads().then(data => {
@@ -160,7 +134,6 @@ export default function LeadsPage() {
     }), [leads, activeLeads]);
 
     const filtered = useMemo(() => {
-        const nameOf = (lead: any) => leadNames[lead.id] ?? lead.name;
         let list = leads;
 
         // Tab filter
@@ -182,7 +155,7 @@ export default function LeadsPage() {
         if (searchTerm) {
             const q = searchTerm.toLowerCase();
             list = list.filter(l =>
-                nameOf(l).toLowerCase().includes(q) ||
+                l.name.toLowerCase().includes(q) ||
                 (l.client?.name || "").toLowerCase().includes(q) ||
                 (l.location || "").toLowerCase().includes(q) ||
                 (l.source || "").toLowerCase().includes(q)
@@ -199,7 +172,7 @@ export default function LeadsPage() {
         list = [...list].sort((a, b) => {
             let aVal: any, bVal: any;
             switch (sortKey) {
-                case "name": aVal = nameOf(a); bVal = nameOf(b); break;
+                case "name": aVal = a.name; bVal = b.name; break;
                 case "stage": aVal = a.stage; bVal = b.stage; break;
                 case "client": aVal = a.client?.name || ""; bVal = b.client?.name || ""; break;
                 case "source": aVal = a.source || ""; bVal = b.source || ""; break;
@@ -215,7 +188,7 @@ export default function LeadsPage() {
         });
 
         return list;
-    }, [leads, leadNames, activeTab, searchTerm, sourceFilter, typeFilter, sortKey, sortDir]);
+    }, [leads, activeTab, searchTerm, sourceFilter, typeFilter, sortKey, sortDir]);
 
     const totalRevenue = leads.reduce((sum, l) => sum + Number(l.targetRevenue || 0), 0);
     const hotCount = tabCounts.Hot;
@@ -380,38 +353,11 @@ export default function LeadsPage() {
                                 return (
                                     <tr
                                         key={l.id}
-                                        className={`hover:bg-slate-50 transition group ${editingNameId ? "" : "cursor-pointer"}`}
-                                        onClick={editingNameId ? undefined : () => window.location.href = `/leads/${l.id}`}
+                                        className="hover:bg-slate-50 cursor-pointer transition group"
+                                        onClick={() => window.location.href = `/leads/${l.id}`}
                                     >
-                                        <td
-                                            className="px-6 py-4 font-medium text-hui-textMain group-hover:text-hui-primary transition"
-                                            onClick={e => e.stopPropagation()}
-                                        >
-                                            {editingNameId === l.id ? (
-                                                <input
-                                                    autoFocus
-                                                    value={editingNameValue}
-                                                    onChange={e => setEditingNameValue(e.target.value)}
-                                                    onBlur={() => saveLeadName(l.id, leadNames[l.id] ?? l.name)}
-                                                    onKeyDown={e => {
-                                                        if (e.key === "Enter") { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
-                                                        if (e.key === "Escape") { e.preventDefault(); setEditingNameId(null); }
-                                                    }}
-                                                    className="w-full border border-slate-300 rounded-md px-2 py-1 text-sm outline-none focus:border-hui-primary focus:ring-2 focus:ring-hui-primary/20"
-                                                />
-                                            ) : (
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        setEditingNameValue(leadNames[l.id] ?? l.name);
-                                                        setEditingNameId(l.id);
-                                                    }}
-                                                    className="text-left w-full hover:underline decoration-dotted underline-offset-4"
-                                                    title="Click to rename"
-                                                >
-                                                    {leadNames[l.id] ?? l.name}
-                                                </button>
-                                            )}
+                                        <td className="px-6 py-4 font-medium text-hui-textMain group-hover:text-hui-primary transition">
+                                            {l.name}
                                         </td>
                                         <td className="px-6 py-4" onClick={e => e.stopPropagation()}>
                                             <LeadStageDropdown leadId={l.id} currentStage={l.stage} variant="pill" />

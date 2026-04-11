@@ -150,7 +150,7 @@ export async function updateLeadStage(id: string, stage: string) {
     revalidatePath(`/leads`);
 }
 
-export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; source?: string; projectType?: string; message?: string }) {
+export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; source?: string; projectType?: string; message?: string }) {
     // Find or create client
     let client = await prisma.client.findFirst({
         where: { name: data.clientName },
@@ -169,6 +169,23 @@ export async function createLead(data: { name: string; clientName: string; clien
                 initials,
                 email: data.clientEmail || null,
                 primaryPhone: data.clientPhone || null,
+                addressLine1: data.addressLine1 || null,
+                city: data.city || null,
+                state: data.state || null,
+                zipCode: data.zipCode || null,
+            },
+        });
+    } else if (data.addressLine1 && !client.addressLine1) {
+        // Returning client: only fill if their primary address is empty.
+        // A returning client may already have a billing/home address on file
+        // and we must not silently overwrite it with a new lead's site address.
+        client = await prisma.client.update({
+            where: { id: client.id },
+            data: {
+                addressLine1: data.addressLine1,
+                city: data.city || null,
+                state: data.state || null,
+                zipCode: data.zipCode || null,
             },
         });
     }
@@ -258,22 +275,21 @@ export async function updateLeadInfo(id: string, data: any) {
     const lead = await prisma.lead.findUnique({ where: { id }});
     if (!lead) return;
 
-    await prisma.lead.update({
-        where: { id },
-        data: {
-            name: data.name,
-            source: data.source,
-            stage: data.stage,
-            location: data.location,
-            tags: data.tags,
-            targetRevenue: data.targetRevenue ? parseFloat(data.targetRevenue) : null,
-            expectedProfit: data.expectedProfit ? parseFloat(data.expectedProfit) : null,
-            projectType: data.projectType,
-            expectedStartDate: data.expectedStartDate ? new Date(data.expectedStartDate) : null,
-            message: data.message,
-            lastActivityAt: new Date()
-        }
-    });
+    const updateData: any = {
+        source: data.source,
+        stage: data.stage,
+        location: data.location,
+        tags: data.tags,
+        targetRevenue: data.targetRevenue ? parseFloat(data.targetRevenue) : null,
+        expectedProfit: data.expectedProfit ? parseFloat(data.expectedProfit) : null,
+        projectType: data.projectType,
+        expectedStartDate: data.expectedStartDate ? new Date(data.expectedStartDate) : null,
+        message: data.message,
+        lastActivityAt: new Date()
+    };
+    if (data.name !== undefined) updateData.name = data.name;
+
+    await prisma.lead.update({ where: { id }, data: updateData });
 
     // Also update client if passed in
     if (data.clientName) {
@@ -281,7 +297,12 @@ export async function updateLeadInfo(id: string, data: any) {
             where: { id: lead.clientId },
             data: {
                 name: data.clientName,
-                addressLine1: data.location // Simple mapping for now
+                // Truthy-only: blank values from unrelated edits must not wipe a saved address.
+                // No "clear address" intent in current UX — revisit if/when one is added.
+                ...(data.addressLine1 ? { addressLine1: data.addressLine1 } : {}),
+                ...(data.city ? { city: data.city } : {}),
+                ...(data.state ? { state: data.state } : {}),
+                ...(data.zipCode ? { zipCode: data.zipCode } : {}),
             }
         });
     }
