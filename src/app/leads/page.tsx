@@ -3,12 +3,13 @@ export const dynamic = "force-dynamic";
 
 import { useState, useMemo, useEffect } from "react";
 import Avatar from "@/components/Avatar";
-import { getLeads, deleteLead } from "@/lib/actions";
+import { getLeads, deleteLead, deleteLeads, copyLeads } from "@/lib/actions";
 import Link from "next/link";
 import AddLeadButton from "./AddLeadButton";
 import LeadStageDropdown from "./[id]/LeadStageDropdown";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import BulkActionBar, { DeleteIcon, CopyIcon } from "@/components/BulkActionBar";
 
 type SortKey = "name" | "stage" | "client" | "source" | "projectType" | "targetRevenue" | "lastActivity";
 type SortDir = "asc" | "desc";
@@ -71,6 +72,8 @@ export default function LeadsPage() {
     const [sourceFilter, setSourceFilter] = useState("");
     const [typeFilter, setTypeFilter] = useState("");
     const [deletingId, setDeletingId] = useState<string | null>(null);
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const [isBulking, setIsBulking] = useState(false);
 
     useEffect(() => {
         getLeads().then(data => {
@@ -108,6 +111,56 @@ export default function LeadsPage() {
             toast.error(err?.message || "Failed to delete lead");
         } finally {
             setDeletingId(null);
+        }
+    }
+
+    async function refreshLeads() {
+        try {
+            const data = await getLeads();
+            setLeads(data);
+        } catch (err) {
+            console.error("[Leads] Failed to refresh:", err);
+        }
+    }
+
+    async function handleBulkDelete() {
+        if (selectedIds.length === 0) return;
+        if (!confirm(`Delete ${selectedIds.length} lead${selectedIds.length === 1 ? "" : "s"}? This cannot be undone.`)) return;
+        setIsBulking(true);
+        try {
+            const res = await deleteLeads(selectedIds);
+            setSelectedIds([]);
+            await refreshLeads();
+            if (res.skipped.length > 0) {
+                toast.success(`Deleted ${res.deleted} · ${res.skipped.length} skipped (${res.skipped[0].reason})`);
+            } else {
+                toast.success(`Deleted ${res.deleted} lead${res.deleted === 1 ? "" : "s"}`);
+            }
+        } catch (err: any) {
+            toast.error(err?.message || "Failed to delete leads");
+        } finally {
+            setIsBulking(false);
+        }
+    }
+
+    async function handleBulkCopy() {
+        if (selectedIds.length === 0) return;
+        setIsBulking(true);
+        try {
+            const res = await copyLeads(selectedIds);
+            setSelectedIds([]);
+            await refreshLeads();
+            if (res.created.length === 0) {
+                toast.error("No leads were copied");
+            } else if (res.skipped.length > 0) {
+                toast.success(`Copied ${res.created.length} lead${res.created.length === 1 ? "" : "s"} · ${res.skipped.length} skipped`);
+            } else {
+                toast.success(`Copied ${res.created.length} lead${res.created.length === 1 ? "" : "s"}`);
+            }
+        } catch (err: any) {
+            toast.error(err?.message || "Failed to copy leads");
+        } finally {
+            setIsBulking(false);
         }
     }
 
@@ -268,6 +321,24 @@ export default function LeadsPage() {
                     ))}
                 </div>
                 <div className="flex items-center gap-2 pb-2">
+                    <BulkActionBar
+                        count={selectedIds.length}
+                        actions={[
+                            {
+                                label: "Copy",
+                                icon: CopyIcon,
+                                onClick: handleBulkCopy,
+                                disabled: isBulking,
+                            },
+                            {
+                                label: "Delete",
+                                icon: DeleteIcon,
+                                onClick: handleBulkDelete,
+                                variant: "danger",
+                                disabled: isBulking,
+                            },
+                        ]}
+                    />
                     <input
                         type="text"
                         placeholder="Search leads..."
@@ -332,6 +403,17 @@ export default function LeadsPage() {
                     <table className="w-full text-sm">
                         <thead className="bg-slate-50 border-b border-hui-border">
                             <tr>
+                                <th scope="col" className="px-4 py-3 w-10 text-center" onClick={e => e.stopPropagation()}>
+                                    <input
+                                        type="checkbox"
+                                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                        checked={filtered.length > 0 && filtered.every((l: any) => selectedIds.includes(l.id))}
+                                        onChange={e => {
+                                            if (e.target.checked) setSelectedIds(filtered.map((l: any) => l.id));
+                                            else setSelectedIds([]);
+                                        }}
+                                    />
+                                </th>
                                 <SORT_HEADER col="name">Lead Name</SORT_HEADER>
                                 <SORT_HEADER col="stage">Stage</SORT_HEADER>
                                 <SORT_HEADER col="client">Client</SORT_HEADER>
@@ -344,12 +426,24 @@ export default function LeadsPage() {
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                             {filtered.map((l: any) => {
+                                const isSelected = selectedIds.includes(l.id);
                                 return (
                                     <tr
                                         key={l.id}
-                                        className="hover:bg-slate-50 cursor-pointer transition group"
+                                        className={`hover:bg-slate-50 cursor-pointer transition group ${isSelected ? "bg-indigo-50/30" : ""}`}
                                         onClick={() => window.location.href = `/leads/${l.id}`}
                                     >
+                                        <td className="px-4 py-4 text-center" onClick={e => e.stopPropagation()}>
+                                            <input
+                                                type="checkbox"
+                                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                                checked={isSelected}
+                                                onChange={e => {
+                                                    if (e.target.checked) setSelectedIds([...selectedIds, l.id]);
+                                                    else setSelectedIds(selectedIds.filter(id => id !== l.id));
+                                                }}
+                                            />
+                                        </td>
                                         <td className="px-6 py-4 font-medium text-hui-textMain group-hover:text-hui-primary transition">
                                             {l.name}
                                         </td>

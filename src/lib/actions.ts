@@ -266,6 +266,56 @@ export async function deleteLead(id: string) {
     revalidatePath(`/leads`);
 }
 
+export async function deleteLeads(ids: string[]): Promise<{ deleted: number; skipped: { id: string; reason: string }[] }> {
+    let deleted = 0;
+    const skipped: { id: string; reason: string }[] = [];
+    for (const id of ids) {
+        try {
+            await deleteLead(id);
+            deleted++;
+        } catch (e: any) {
+            skipped.push({ id, reason: e?.message ?? "unknown" });
+        }
+    }
+    revalidatePath("/leads");
+    return { deleted, skipped };
+}
+
+export async function copyLeads(ids: string[]): Promise<{ created: string[]; skipped: { id: string; reason: string }[] }> {
+    const created: string[] = [];
+    const skipped: { id: string; reason: string }[] = [];
+    for (const id of ids) {
+        try {
+            const src = await prisma.lead.findUnique({ where: { id } });
+            if (!src) { skipped.push({ id, reason: "not found" }); continue; }
+            const copy = await prisma.lead.create({
+                data: {
+                    name: `${src.name} (Copy)`,
+                    clientId: src.clientId,
+                    stage: "New",
+                    source: src.source,
+                    projectType: src.projectType,
+                    location: src.location,
+                    targetRevenue: src.targetRevenue,
+                    expectedStartDate: src.expectedStartDate,
+                    tags: src.tags,
+                    expectedProfit: src.expectedProfit,
+                    lastActivityAt: new Date(),
+                    managerId: src.managerId,
+                    isUnread: true,
+                    isArchived: false,
+                    message: src.message,
+                },
+            });
+            created.push(copy.id);
+        } catch (e: any) {
+            skipped.push({ id, reason: e?.message ?? "unknown" });
+        }
+    }
+    revalidatePath("/leads");
+    return { created, skipped };
+}
+
 export async function updateLeadAssignment(id: string, managerId: string | null) {
     const session = await getServerSession(authOptions);
     const caller = session?.user?.email
@@ -2175,6 +2225,42 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
         projectId: targetProjectId ?? original.projectId,
         leadId: targetProjectId ? null : original.leadId,
     };
+}
+
+// =============================================
+// Bulk Estimate Actions
+// =============================================
+
+export async function deleteEstimates(ids: string[]): Promise<{ deleted: number; skipped: { id: string; reason: string }[] }> {
+    let deleted = 0;
+    const skipped: { id: string; reason: string }[] = [];
+    for (const id of ids) {
+        try {
+            const res = await deleteEstimate(id);
+            if (res.success) deleted++;
+            else skipped.push({ id, reason: res.error ?? "unknown" });
+        } catch (e: any) {
+            skipped.push({ id, reason: e?.message ?? "unknown" });
+        }
+    }
+    return { deleted, skipped };
+}
+
+export async function duplicateEstimates(
+    ids: string[],
+    targetProjectId?: string,
+): Promise<{ createdIds: string[]; skipped: { id: string; reason: string }[] }> {
+    const createdIds: string[] = [];
+    const skipped: { id: string; reason: string }[] = [];
+    for (const id of ids) {
+        try {
+            const res = await duplicateEstimate(id, targetProjectId);
+            createdIds.push(res.id);
+        } catch (e: any) {
+            skipped.push({ id, reason: e?.message ?? "unknown" });
+        }
+    }
+    return { createdIds, skipped };
 }
 
 // =============================================

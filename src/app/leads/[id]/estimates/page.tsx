@@ -1,7 +1,8 @@
-import { getLead, createDraftLeadEstimate } from "@/lib/actions";
+import { getLead, createDraftLeadEstimate, getProjects } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import StatusBadge from "@/components/StatusBadge";
+import LeadEstimatesTable from "./LeadEstimatesTable";
 import { formatCurrency } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -29,6 +30,15 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
     const approvedEstimates = allEstimates.filter((e: any) => e.status === "Approved" || e.status === "Sent");
     const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const totalAll = allEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
+
+    // Active projects for "Copy to project" bulk action — exclude Archived
+    let allActiveProjects: { id: string; name: string }[] = [];
+    try {
+        const allProjs = await getProjects();
+        allActiveProjects = allProjs
+            .filter((p: any) => p.status !== "Archived")
+            .map((p: any) => ({ id: p.id, name: p.name }));
+    } catch {}
 
     async function handleNewEstimate() {
         "use server";
@@ -139,57 +149,11 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                                 <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">Lead Estimates</h2>
                             </div>
                         )}
-                        <div className="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
-                            <table className="w-full text-sm text-left">
-                                <thead>
-                                    <tr className="bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-slate-200">
-                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Estimate</th>
-                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider">Status</th>
-                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Amount</th>
-                                        <th className="px-6 py-3.5 font-semibold text-xs text-slate-500 uppercase tracking-wider text-right">Date</th>
-                                        <th className="w-12"></th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-100">
-                                    {leadEstimates.length === 0 && (
-                                        <tr>
-                                            <td colSpan={5} className="px-6 py-16 text-center">
-                                                <div className="flex flex-col items-center gap-3">
-                                                    <div className="w-14 h-14 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center">
-                                                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
-                                                    </div>
-                                                    <p className="text-sm font-medium text-slate-500">No lead estimates yet</p>
-                                                    <p className="text-xs text-slate-400 max-w-xs">Create your first estimate to start sending proposals to this lead.</p>
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    )}
-                                    {leadEstimates.map((est: any) => (
-                                        <tr key={est.id} className="hover:bg-slate-50/80 transition group">
-                                            <td className="px-6 py-4">
-                                                <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="font-medium text-hui-textMain hover:text-hui-primary transition-colors flex items-center gap-2">
-                                                    <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center shrink-0 border border-indigo-100/50">
-                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
-                                                    </div>
-                                                    <div>
-                                                        <span className="text-xs text-slate-400 font-mono">{est.code}</span>
-                                                        <span className="ml-2">{est.title}</span>
-                                                    </div>
-                                                </Link>
-                                            </td>
-                                            <td className="px-6 py-4"><StatusBadge status={est.status} /></td>
-                                            <td className="px-6 py-4 text-right font-semibold text-slate-700">{formatCurrency(est.totalAmount)}</td>
-                                            <td className="px-6 py-4 text-right text-slate-400 text-xs">{new Date(est.createdAt).toLocaleDateString()}</td>
-                                            <td className="px-4 py-4">
-                                                <Link href={`/leads/${lead.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
-                                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
-                                                </Link>
-                                            </td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
+                        <LeadEstimatesTable
+                            leadId={lead.id}
+                            estimates={leadEstimates}
+                            allProjects={allActiveProjects}
+                        />
                     </div>
                 </div>
             </div>

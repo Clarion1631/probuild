@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { updateProjectStatus, deleteProjects, updateProjectTags } from "@/lib/actions";
 import { CustomizeStatusModal, ManageStatusModal, ProjectStatus } from "./StatusModals";
 import ProjectsKanbanBoard from "./ProjectsKanbanBoard";
+import BulkActionBar, { DeleteIcon } from "@/components/BulkActionBar";
 
 const DEFAULT_PROJECT_STATUSES: ProjectStatus[] = [
     { value: "Open", label: "Open", color: "bg-blue-100 text-blue-700", dot: "bg-blue-500", rawColor: "#3b82f6", isActive: true },
@@ -227,19 +228,19 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                 </div>
 
                 {/* Bulk Actions Toolbar for List View */}
-                {viewMode === "list" && selectedIds.length > 0 && (
-                    <div className="flex items-center gap-3 bg-red-50 text-red-700 px-4 py-2 rounded-lg border border-red-200 animate-in fade-in slide-in-from-bottom-2">
-                        <span className="text-sm font-semibold">{selectedIds.length} selected</span>
-                        <div className="h-4 w-px bg-red-200"></div>
-                        <button 
-                            onClick={handleDeleteSelected}
-                            disabled={isDeleting}
-                            className="text-sm font-semibold flex items-center gap-1.5 hover:text-red-800 disabled:opacity-50"
-                        >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                            Delete
-                        </button>
-                    </div>
+                {viewMode === "list" && (
+                    <BulkActionBar
+                        count={selectedIds.length}
+                        actions={[
+                            {
+                                label: "Delete",
+                                icon: DeleteIcon,
+                                onClick: handleDeleteSelected,
+                                variant: "danger",
+                                disabled: isDeleting,
+                            },
+                        ]}
+                    />
                 )}
             </div>
 
