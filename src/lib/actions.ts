@@ -2042,7 +2042,7 @@ export async function deleteEstimate(estimateId: string) {
 // Duplicate Estimate
 // =============================================
 
-export async function duplicateEstimate(estimateId: string, targetProjectId?: string) {
+export async function duplicateEstimate(estimateId: string, targetProjectId?: string, newTitle?: string) {
     const original = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -2061,7 +2061,7 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
 
     const newEstimate = await prisma.estimate.create({
         data: {
-            title: `Copy of ${original.title}`,
+            title: newTitle?.trim() || `Copy of ${original.title}`,
             projectId: targetProjectId ?? original.projectId,
             leadId: targetProjectId ? null : original.leadId,
             code,

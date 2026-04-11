@@ -149,6 +149,7 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                             </form>
                                             <CopyToProjectButton
                                                 estimateId={est.id}
+                                                estimateTitle={est.title}
                                                 currentProjectId={resolvedParams.id}
                                                 allProjects={allActiveProjects}
                                             />
