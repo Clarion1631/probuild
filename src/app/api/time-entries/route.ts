@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { toNum } from "@/lib/prisma-helpers";
 
 export async function GET(req: Request) {
     const session = await getServerSession(authOptions);
@@ -135,8 +136,8 @@ export async function PUT(req: Request) {
     let durationHours = durationMs / (1000 * 60 * 60);
     if (durationHours < 0) durationHours = 0;
 
-    const laborCost = durationHours * Number(user.hourlyRate || 0);
-    const burdenCost = durationHours * Number(user.burdenRate || 0);
+    const laborCost = durationHours * toNum(user.hourlyRate);
+    const burdenCost = durationHours * toNum(user.burdenRate);
 
     const updateData: any = {
         endTime: end,

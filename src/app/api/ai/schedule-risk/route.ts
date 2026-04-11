@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { getAnthropicText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
 
 interface ScheduleTask {
@@ -83,8 +84,7 @@ Recommended completion adjustment: [date or "none needed"].`;
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const textBlock = response.content.find(b => b.type === 'text');
-    const analysis = (textBlock && 'text' in textBlock ? (textBlock as any).text as string : '').trim();
+    const analysis = getAnthropicText(response.content);
 
     return NextResponse.json({ success: true, analysis });
 }

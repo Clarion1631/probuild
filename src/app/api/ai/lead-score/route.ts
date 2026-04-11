@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -72,8 +73,7 @@ CONFIDENCE NOTE: [1-2 sentences on what would increase or decrease this score]`;
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const textBlock = response.content.find(b => b.type === 'text');
-    const analysis = (textBlock && 'text' in textBlock ? (textBlock as any).text as string : '').trim();
+    const analysis = getAnthropicText(response.content);
 
     // Parse probability
     const probMatch = analysis.match(/CLOSE PROBABILITY:\s*(\d+)%/);

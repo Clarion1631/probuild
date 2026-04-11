@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -17,7 +18,12 @@ export async function POST(req: NextRequest) {
             select: { totalAmount: true, status: true, createdAt: true },
         }),
         prisma.invoice.findMany({
-            select: { totalAmount: true, status: true, balanceDue: true, createdAt: true },
+            select: {
+                totalAmount: true,
+                status: true,
+                createdAt: true,
+                payments: { select: { amount: true, status: true } },
+            },
         }),
         prisma.lead.findMany({
             select: { stage: true, targetRevenue: true, createdAt: true },
@@ -36,7 +42,13 @@ export async function POST(req: NextRequest) {
     const totalPipeline = leads.reduce((s, l) => s + Number(l.targetRevenue || 0), 0);
     const wonLeads = leads.filter(l => l.stage === "Won");
     const totalRevenue = invoices.reduce((s, i) => s + Number(i.totalAmount || 0), 0);
-    const totalPaid = invoices.reduce((s, i) => s + (Number(i.totalAmount || 0) - Number(i.balanceDue || 0)), 0);
+    const totalPaid = invoices.reduce(
+        (sum, invoice) =>
+            sum + invoice.payments.reduce((invoiceSum, payment) => {
+                return payment.status === "Paid" ? invoiceSum + Number(payment.amount || 0) : invoiceSum;
+            }, 0),
+        0
+    );
     const outstandingAR = totalRevenue - totalPaid;
     const recentEstimatesTotal = estimates.reduce((s, e) => s + Number(e.totalAmount || 0), 0);
     const laborCost30d = timeEntries.reduce((s, e) => s + Number(e.laborCost || 0) + Number(e.burdenCost || 0), 0);
@@ -118,8 +130,7 @@ TOP RISKS
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const textBlock = response.content.find(b => b.type === 'text');
-    const summary = (textBlock && 'text' in textBlock ? (textBlock as any).text as string : '').trim();
+    const summary = getAnthropicText(response.content);
 
     return NextResponse.json({
         success: true,

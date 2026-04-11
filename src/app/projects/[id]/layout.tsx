@@ -1,5 +1,4 @@
 import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
-import ProjectMessagingToggle from "@/components/ProjectMessagingToggle";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { getProjectLead, getLeadsForLinking, getUnreadMessageCount } from "@/lib/actions";
 import { authOptions, getSessionOrDev } from "@/lib/auth";
@@ -42,18 +41,9 @@ export default async function ProjectLayout({
         }
     }
 
-    const [lead, allLeads, unreadCount, project] = await Promise.all([
-        getProjectLead(id),
-        getLeadsForLinking(),
-        getUnreadMessageCount(id, "TEAM"),
-        prisma.project.findUnique({
-            where: { id },
-            select: {
-                client: { select: { name: true, email: true, primaryPhone: true } },
-                estimates: { select: { id: true, code: true, title: true, status: true }, orderBy: { createdAt: "desc" } },
-            },
-        }),
-    ]);
+    const lead = await getProjectLead(id);
+    const allLeads = await getLeadsForLinking();
+    const unreadCount = await getUnreadMessageCount(id, "TEAM");
 
     return (
         <div className="flex h-full -mx-6 -my-6 bg-slate-50">
@@ -68,16 +58,6 @@ export default async function ProjectLayout({
                     {children}
                 </ErrorBoundary>
             </div>
-            <ProjectMessagingToggle
-                projectId={id}
-                clientName={project?.client?.name || "Client"}
-                clientEmail={project?.client?.email || null}
-                clientPhone={(project?.client as any)?.primaryPhone || null}
-                estimates={project?.estimates ?? []}
-                currentUserName={session.user.name || undefined}
-                currentUserEmail={session.user.email || undefined}
-                unreadCount={unreadCount}
-            />
         </div>
     );
 }

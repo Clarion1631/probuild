@@ -1,12 +1,41 @@
 "use server";
 
-import { prisma } from "./prisma";
-import { safeEstimateInclude, safeEstimateSelect } from "./prisma-helpers";
-import { revalidatePath, unstable_cache } from "next/cache";
-import { sendNotification } from "./email";
-import { formatCurrency } from "./utils";
 import { getServerSession } from "next-auth";
+import { prisma } from "./prisma";
+import { revalidatePath, unstable_cache } from "next/cache";
 import { authOptions } from "./auth";
+import { sendNotification } from "./email";
+import { safeEstimateSelect, toNum } from "./prisma-helpers";
+import { formatCurrency } from "./utils";
+
+// Safe estimate include that omits columns not yet migrated to the database.
+// Remove this wrapper once the DB Push workflow succeeds and the Estimate table
+// has: processingFeeMarkup, hideProcessingFee, expirationDate, archivedAt.
+const safeEstimateInclude = {
+    select: {
+        id: true,
+        number: true,
+        title: true,
+        projectId: true,
+        leadId: true,
+        code: true,
+        status: true,
+        privacy: true,
+        createdAt: true,
+        totalAmount: true,
+        balanceDue: true,
+        items: true,
+        expenses: true,
+        paymentSchedules: true,
+        approvedBy: true,
+        approvedAt: true,
+        approvalIp: true,
+        approvalUserAgent: true,
+        signatureUrl: true,
+        contractId: true,
+        viewedAt: true,
+    },
+} as const;
 
 export async function getLeads() {
     const leads = await prisma.lead.findMany({
@@ -1803,7 +1832,7 @@ export async function recordPayment(paymentId: string, invoiceId: string, timest
     });
 
     const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    const newBalance = Math.max(0, Math.round((Number(invoice!.balanceDue || 0) - Number(payment.amount || 0)) * 100) / 100);
+    const newBalance = Math.max(0, toNum(invoice!.balanceDue) - toNum(payment.amount));
     const newStatus = newBalance <= 0 ? "Paid" : "Partially Paid";
 
     await prisma.invoice.update({
@@ -1858,9 +1887,9 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
 
     for (const item of items) {
         if (item.type === "Labor") {
-            totalLaborBudget += Number(item.total ?? 0);
+            totalLaborBudget += toNum(item.total);
         } else {
-            totalMaterialBudget += Number(item.total ?? 0);
+            totalMaterialBudget += toNum(item.total);
         }
     }
 
@@ -2132,7 +2161,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
                 baseCost: item.baseCost,
                 markupPercent: item.markupPercent,
                 unitCost: item.unitCost,
-                total: (Number(item.quantity) || 0) * (Number(item.unitCost) || 0),
+                total: toNum(item.quantity) * toNum(item.unitCost),
                 order: item.order,
                 parentId: item.parentId,
                 costCodeId: item.costCodeId,
@@ -2275,11 +2304,11 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
     const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
     if (unpaidSchedules.length > 0) {
-        const estimateTotal = estimate.totalAmount?.toNumber() || 0;
+        const estimateTotal = toNum(estimate.totalAmount);
         // Half-cent-safe currency rounding
         const rc = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-        const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+        const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
         const balanceDue = rc(estimateTotal - paidSum);
 
         // Recalculate percentage-based unpaid milestones so stale DB values (from edits
@@ -2294,17 +2323,17 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
             const fixedUnpaidSum = unpaidSchedules
                 .filter(s => (s.percentage != null ? Number(s.percentage) : 0) <= 0)
-                .reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0);
+                .reduce((sum, s) => sum + toNum(s.amount), 0);
             const lastMilestone = pctUnpaid[pctUnpaid.length - 1];
             const lastAmount = rc(balanceDue - fixedUnpaidSum - allButLastSum);
 
             if (lastAmount >= 0) {
                 const updates: { id: string; amount: number }[] = [];
                 allButLast.forEach((s, i) => {
-                    if (Math.abs(allButLastAmounts[i] - (s.amount?.toNumber() || 0)) > 0.001)
+                    if (Math.abs(allButLastAmounts[i] - toNum(s.amount)) > 0.001)
                         updates.push({ id: s.id, amount: allButLastAmounts[i] });
                 });
-                if (Math.abs(lastAmount - (lastMilestone.amount?.toNumber() || 0)) > 0.001)
+                if (Math.abs(lastAmount - toNum(lastMilestone.amount)) > 0.001)
                     updates.push({ id: lastMilestone.id, amount: lastAmount });
 
                 if (updates.length > 0) {
@@ -2317,7 +2346,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
             }
         }
 
-        const unpaidSum = schedules.reduce((sum, s) => sum + (s.amount?.toNumber() || 0), 0) - paidSum;
+        const unpaidSum = schedules.reduce((sum, s) => sum + toNum(s.amount), 0) - paidSum;
         const unpaidRounded = rc(unpaidSum);
         if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
             const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
@@ -2504,14 +2533,8 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     }
 
     // Revalidate paths
-    if (estimate.projectId) {
-        revalidatePath(`/projects/${estimate.projectId}/estimates`);
-        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
-    }
-    if (estimate.leadId) {
-        revalidatePath(`/leads/${estimate.leadId}`);
-        revalidatePath(`/leads/${estimate.leadId}/estimates`);
-    }
+    if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
+    if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
     revalidatePath("/estimates");
 
     return { success: true, sentTo: recipientEmail };
@@ -3200,8 +3223,8 @@ export async function aiGeneratePunchlist(taskId: string) {
     const prompt = `You are an expert construction project manager. Generate a detailed punch list for this construction task.
 
 TASK: "${task.name}"
-PROJECT: "${task.project?.name ?? "Unknown"}"
-PROJECT TYPE: ${task.project?.type ?? "General Construction"}
+PROJECT: "${task.project?.name || "Unknown Project"}"
+PROJECT TYPE: ${task.project?.type || "General Construction"}
 
 Generate 5-10 specific, actionable punch list items that a foreman would check before marking this task complete. Be specific to the trade and scope of work.
 
@@ -4986,7 +5009,7 @@ export async function getProjectBidPackages(projectId: string) {
 }
 
 export async function getBidPackage(id: string) {
-    return prisma.bidPackage.findUnique({
+    const pkg = await prisma.bidPackage.findUnique({
         where: { id },
         include: {
             scopes: { orderBy: { order: "asc" } },
@@ -4994,6 +5017,21 @@ export async function getBidPackage(id: string) {
             project: { select: { id: true, name: true } },
         },
     });
+
+    if (!pkg) return null;
+
+    return {
+        ...pkg,
+        totalBudget: pkg.totalBudget === null ? null : toNum(pkg.totalBudget),
+        scopes: pkg.scopes.map((scope) => ({
+            ...scope,
+            budgetAmount: scope.budgetAmount === null ? null : toNum(scope.budgetAmount),
+        })),
+        invitations: pkg.invitations.map((invitation) => ({
+            ...invitation,
+            bidAmount: invitation.bidAmount === null ? null : toNum(invitation.bidAmount),
+        })),
+    };
 }
 
 export async function createBidPackage(projectId: string, data: {

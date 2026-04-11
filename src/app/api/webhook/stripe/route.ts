@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
+import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
-import { findOrCreateClientThread, logActivity } from "@/lib/actions";
 
 export async function POST(req: Request) {
     const payload = await req.text();
@@ -36,13 +36,17 @@ export async function POST(req: Request) {
                 }
 
                 const metadata = session.metadata;
+                if (!metadata?.paymentScheduleId || !metadata?.invoiceId) {
+                    console.error("Missing metadata in session:", session.id);
+                    break;
+                }
 
                 // Get payment intent to determine the method used
                 let paymentMethod = "unknown";
                 if (session.payment_intent) {
                     try {
                         const paymentIntent = await stripe.paymentIntents.retrieve(session.payment_intent as string);
-                        const pmType = paymentIntent.payment_method_types?.[0];
+                        const pmType = paymentIntent.payment_method_types?.[0]; // e.g. "card", "us_bank_account", "affirm"
                         if (pmType) {
                             if (pmType === "us_bank_account") paymentMethod = "ach";
                             else if (pmType === "card") paymentMethod = "card";
@@ -53,136 +57,31 @@ export async function POST(req: Request) {
                     }
                 }
 
-                // ── Estimate payment branch ──────────────────────────────────
-                if (metadata?.estimatePaymentScheduleId) {
-                    // Atomic idempotency: updateMany with status != "Paid" closes TOCTOU race
-                    const updatedEstSchedule = await prisma.$transaction(async (tx) => {
-                        const result = await tx.estimatePaymentSchedule.updateMany({
-                            where: { id: metadata.estimatePaymentScheduleId, status: { not: "Paid" } },
-                            data: {
-                                status: "Paid",
-                                stripePaymentIntentId: session.payment_intent as string | null,
-                                paymentMethod,
-                                paymentDate: new Date(),
-                                paidAt: new Date(),
-                            },
-                        });
-                        if (result.count === 0) return null;
-
-                        const schedule = await tx.estimatePaymentSchedule.findUnique({
-                            where: { id: metadata.estimatePaymentScheduleId },
-                            include: { estimate: true },
-                        });
-
-                        const estimate = schedule!.estimate;
-                        const newBalance = Math.max(0, Number(estimate.balanceDue || 0) - Number(schedule!.amount));
-                        const newStatus = newBalance <= 0 ? "Paid" : estimate.status;
-
-                        await tx.estimate.update({
-                            where: { id: estimate.id },
-                            data: { balanceDue: newBalance, status: newStatus },
-                        });
-
-                        return schedule;
-                    });
-
-                    if (!updatedEstSchedule) {
-                        console.log(`[webhook] EstimatePaymentSchedule ${metadata.estimatePaymentScheduleId} already paid — skipping duplicate event ${event.id}`);
-                        break;
-                    }
-
-                    const estimate = updatedEstSchedule.estimate;
-                    const newEstBalance = Math.max(0, Number(estimate.balanceDue || 0) - Number(updatedEstSchedule.amount));
-
-                    const estSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                    if (estSettings?.notificationEmail) {
-                        await sendNotification(
-                            estSettings.notificationEmail,
-                            `Estimate Payment Received: ${updatedEstSchedule.name} - ${estimate.code}`,
-                            `<div style="font-family: sans-serif; padding: 20px;">
-                                <h2>Estimate Payment Received! 🎉</h2>
-                                <p>A payment of <strong>${formatCurrency(updatedEstSchedule.amount)}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Estimate #${estimate.code}.</p>
-                                <p>Milestone: ${updatedEstSchedule.name}</p>
-                                <p>Remaining Estimate Balance: ${formatCurrency(newEstBalance)}</p>
-                            </div>`
-                        );
-                    }
-
-                    // Post activity to message thread if project-linked
-                    const projectId = estimate.projectId;
-                    if (projectId) {
-                        try {
-                            const thread = await findOrCreateClientThread(projectId);
-                            await prisma.message.create({
-                                data: {
-                                    threadId: thread.id,
-                                    senderType: "CLIENT",
-                                    senderName: "System",
-                                    body: `💰 Estimate payment received: ${formatCurrency(updatedEstSchedule.amount)} via ${paymentMethod.toUpperCase()} for Estimate #${estimate.code} — ${updatedEstSchedule.name}`,
-                                },
-                            });
-                        } catch (e) {
-                            console.error("[webhook] Failed to post estimate payment activity:", e);
-                        }
-                        await logActivity({
-                            projectId,
-                            actorType: "CLIENT",
-                            actorName: "Client",
-                            action: "paid_invoice",
-                            entityType: "estimate",
-                            entityId: estimate.id,
-                            entityName: `Estimate #${estimate.code} — ${updatedEstSchedule.name}`,
-                            metadata: { amount: Number(updatedEstSchedule.amount), paymentMethod },
-                        });
-                    }
-                    break;
-                }
-
-                // ── Invoice payment branch ───────────────────────────────────
-                if (!metadata?.paymentScheduleId || !metadata?.invoiceId) {
-                    console.error("Missing metadata in session:", session.id);
-                    break;
-                }
-
-                // Idempotency: skip if already paid (duplicate webhook delivery)
-                const existingSchedule = await prisma.paymentSchedule.findUnique({
+                // Update PaymentSchedule to Paid
+                const updatedSchedule = await prisma.paymentSchedule.update({
                     where: { id: metadata.paymentScheduleId },
-                    select: { status: true, stripePaymentIntentId: true }
-                });
-                if (existingSchedule?.status === "Paid") {
-                    console.log(`[webhook] PaymentSchedule ${metadata.paymentScheduleId} already paid — skipping duplicate event ${event.id}`);
-                    break;
-                }
-
-                // Atomic: update schedule and invoice together
-                const [updatedSchedule] = await prisma.$transaction(async (tx) => {
-                    const schedule = await tx.paymentSchedule.update({
-                        where: { id: metadata.paymentScheduleId },
-                        data: {
-                            status: "Paid",
-                            stripePaymentIntentId: session.payment_intent as string | null,
-                            paymentMethod: paymentMethod,
-                            paymentDate: new Date(),
-                            paidAt: new Date(),
-                        },
-                        include: { invoice: true }
-                    });
-
-                    const invoice = schedule.invoice;
-                    const newBalance = Math.max(0, Number(invoice.balanceDue || 0) - Number(schedule.amount));
-                    const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
-
-                    await tx.invoice.update({
-                        where: { id: invoice.id },
-                        data: { balanceDue: newBalance, status: newStatus }
-                    });
-
-                    return [schedule];
+                    data: {
+                        status: "Paid",
+                        stripePaymentIntentId: session.payment_intent as string | null,
+                        paymentMethod: paymentMethod,
+                        paymentDate: new Date(),
+                        paidAt: new Date(),
+                    },
+                    include: { invoice: true }
                 });
 
+                // Update Invoice balance and status
                 const invoice = updatedSchedule.invoice;
-                const newBalance = Math.max(0, Number(invoice.balanceDue || 0) - Number(updatedSchedule.amount));
+                const newBalance = Math.max(0, toNum(invoice.balanceDue) - toNum(updatedSchedule.amount));
                 const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
+
+                await prisma.invoice.update({
+                    where: { id: invoice.id },
+                    data: {
+                        balanceDue: newBalance,
+                        status: newStatus
+                    }
+                });
 
                 // Send notification email
                 const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -198,65 +97,23 @@ export async function POST(req: Request) {
                         </div>`
                     );
                 }
-
-                // Post payment activity to message thread
-                if (invoice.projectId) {
-                    try {
-                        const thread = await findOrCreateClientThread(invoice.projectId);
-                        await prisma.message.create({
-                            data: {
-                                threadId: thread.id,
-                                senderType: "CLIENT",
-                                senderName: "System",
-                                body: `💰 Payment received: ${formatCurrency(updatedSchedule.amount)} via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code} — ${updatedSchedule.name}`,
-                            },
-                        });
-                    } catch (e) {
-                        console.error("[webhook] Failed to post payment activity:", e);
-                    }
-                    await logActivity({
-                        projectId: invoice.projectId,
-                        actorType: "CLIENT",
-                        actorName: "Client",
-                        action: "paid_invoice",
-                        entityType: "invoice",
-                        entityId: invoice.id,
-                        entityName: `Invoice #${invoice.code} — ${updatedSchedule.name}`,
-                        metadata: { amount: Number(updatedSchedule.amount), paymentMethod },
-                    });
-                }
                 break;
             }
             case "checkout.session.async_payment_failed": {
                 const session = event.data.object as any;
                 const metadata = session.metadata;
-
-                // Estimate branch
-                if (metadata?.estimatePaymentScheduleId) {
-                    await prisma.estimatePaymentSchedule.updateMany({
-                        where: { id: metadata.estimatePaymentScheduleId, status: { not: "Paid" } },
-                        data: { status: "Pending", stripeSessionId: null },
-                    });
-                    const estFailSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                    if (estFailSettings?.notificationEmail) {
-                        await sendNotification(
-                            estFailSettings.notificationEmail,
-                            `🚨 ACH Estimate Payment Failed`,
-                            `<p>An ACH payment for estimate milestone <strong>${metadata.estimatePaymentScheduleId}</strong> has failed to settle.</p>
-                             <p>Please check your Stripe dashboard for details.</p>`
-                        );
-                    }
-                    break;
-                }
-
-                // Invoice branch
                 if (!metadata?.paymentScheduleId) break;
 
+                // Update PaymentSchedule to Failed or just leave Pending but notify
                 await prisma.paymentSchedule.update({
                     where: { id: metadata.paymentScheduleId },
-                    data: { status: "Pending" }
+                    data: {
+                        status: "Pending", // Or "Failed" if you want a dedicated status
+                        // Could add a notes field if necessary
+                    }
                 });
 
+                // Send Notification
                 const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
                 if (settings?.notificationEmail) {
                     await sendNotification(
@@ -273,32 +130,6 @@ export async function POST(req: Request) {
                 const paymentIntentId: string | null = charge.payment_intent ?? null;
                 if (!paymentIntentId) break;
 
-                // Use this-event refund amount (not cumulative amount_refunded)
-                const refundedAmount = (charge.refunds?.data?.[0]?.amount ?? charge.amount_refunded ?? 0) / 100;
-
-                // Check estimate payment schedule first
-                const estSchedule = await prisma.estimatePaymentSchedule.findFirst({
-                    where: { stripePaymentIntentId: paymentIntentId },
-                    include: { estimate: true },
-                });
-                if (estSchedule) {
-                    if (estSchedule.status !== "Paid") break;
-                    await prisma.$transaction(async (tx) => {
-                        await tx.estimatePaymentSchedule.update({
-                            where: { id: estSchedule.id },
-                            data: { status: "Pending", paidAt: null },
-                        });
-                        await tx.estimate.update({
-                            where: { id: estSchedule.estimate.id },
-                            data: {
-                                balanceDue: Number(estSchedule.estimate.balanceDue || 0) + refundedAmount,
-                                status: "Approved",
-                            },
-                        });
-                    });
-                    break;
-                }
-
                 // Find the payment schedule tied to this payment intent and reverse it
                 const schedule = await prisma.paymentSchedule.findFirst({
                     where: { stripePaymentIntentId: paymentIntentId },
@@ -306,26 +137,20 @@ export async function POST(req: Request) {
                 });
                 if (!schedule) break;
 
-                // Idempotency: skip if already reversed
-                if (schedule.status === "Pending" || schedule.status === "Refunded") {
-                    console.log(`[webhook] Schedule ${schedule.id} already reversed — skipping duplicate refund event ${event.id}`);
-                    break;
-                }
+                const refundedAmount = (charge.amount_refunded ?? 0) / 100; // Stripe amounts are in cents
 
-                // Atomic: reverse schedule and restore invoice together
-                await prisma.$transaction(async (tx) => {
-                    await tx.paymentSchedule.update({
-                        where: { id: schedule.id },
-                        data: { status: "Pending", paidAt: null },
-                    });
+                await prisma.paymentSchedule.update({
+                    where: { id: schedule.id },
+                    data: { status: "Pending", paidAt: null },
+                });
 
-                    await tx.invoice.update({
-                        where: { id: schedule.invoice.id },
-                        data: {
-                            balanceDue: Number(schedule.invoice.balanceDue || 0) + refundedAmount,
-                            status: "Sent",
-                        },
-                    });
+                // Restore invoice balance
+                await prisma.invoice.update({
+                    where: { id: schedule.invoice.id },
+                    data: {
+                        balanceDue: toNum(schedule.invoice.balanceDue) + refundedAmount,
+                        status: "Sent",
+                    },
                 });
 
                 const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -363,16 +188,6 @@ export async function POST(req: Request) {
             case "checkout.session.expired": {
                 const expired = event.data.object as any;
                 const expiredMeta = expired.metadata;
-
-                // Estimate branch: clear stale session ID so client can retry
-                if (expiredMeta?.estimatePaymentScheduleId) {
-                    await prisma.estimatePaymentSchedule.updateMany({
-                        where: { id: expiredMeta.estimatePaymentScheduleId, status: { not: "Paid" } },
-                        data: { stripeSessionId: null },
-                    }).catch(() => {});
-                    break;
-                }
-
                 if (!expiredMeta?.paymentScheduleId) break;
 
                 const expiredSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });

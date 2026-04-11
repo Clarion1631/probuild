@@ -1,37 +1,10 @@
-import { PDFDocument, rgb, StandardFonts, PDFImage } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
-
-async function fetchAndEmbedLogo(doc: PDFDocument, url: string): Promise<PDFImage | null> {
-    try {
-        // SSRF guard: only allow HTTPS URLs from known safe hosts
-        const parsed = new URL(url);
-        if (parsed.protocol !== 'https:') return null;
-        const allowedHosts = [
-            process.env.NEXT_PUBLIC_SUPABASE_URL ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).hostname : null,
-            'ghzdbzdnwjxazvmcefbh.supabase.co',
-        ].filter(Boolean);
-        const isAllowed = allowedHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`));
-        if (!isAllowed) {
-            console.warn('Logo URL blocked (not in allowlist):', parsed.hostname);
-            return null;
-        }
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        const buffer = Buffer.from(await res.arrayBuffer());
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('png') || url.toLowerCase().endsWith('.png')) {
-            return await doc.embedPng(buffer);
-        }
-        return await doc.embedJpg(buffer);
-    } catch (err) {
-        console.warn('Could not embed logo in PDF:', err);
-        return null;
-    }
-}
+import { toNum } from './prisma-helpers';
 
 // Color helpers
 const colors = {
-    primary: rgb(15 / 255, 23 / 255, 42 / 255),       // slate-900 (matches portal)
+    primary: rgb(79 / 255, 70 / 255, 229 / 255),     // indigo-600
     textMain: rgb(15 / 255, 23 / 255, 42 / 255),      // slate-900
     textMuted: rgb(100 / 255, 116 / 255, 139 / 255),   // slate-500
     border: rgb(226 / 255, 232 / 255, 240 / 255),      // slate-200
@@ -88,55 +61,46 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y = pageHeight - 40;
 
-    // --- Logo + Company Name + Contact Info ---
-    let logoImage: PDFImage | null = null;
-    if (company?.logoUrl) {
-        logoImage = await fetchAndEmbedLogo(doc, company.logoUrl);
-    }
-
-    let textX = margin;
-    if (logoImage) {
-        const maxLogoH = 40;
-        const maxLogoW = 120;
-        const scale = Math.min(maxLogoW / logoImage.width, maxLogoH / logoImage.height, 1);
-        const logoW = logoImage.width * scale;
-        const logoH = logoImage.height * scale;
-        page.drawImage(logoImage, {
-            x: margin, y: y - logoH + 12, width: logoW, height: logoH,
-        });
-        textX = margin + logoW + 12;
-    }
-
+    // --- Company Name ---
     if (company?.companyName) {
         page.drawText(company.companyName.toUpperCase(), {
-            x: textX, y, size: 11, font: helveticaBold, color: colors.textMain,
+            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
         });
     }
 
-    // Contact info
-    const contactLines: string[] = [];
-    if (company?.address) contactLines.push(company.address);
-    if (company?.phone) contactLines.push(company.phone);
-    if (company?.email) contactLines.push(company.email);
-    if (company?.licenseNumber) contactLines.push(`Lic# ${company.licenseNumber.replace(/[\r\n\t]/g, "").trim().slice(0, 50)}`);
-
-    let contactY = y;
-    for (const line of contactLines) {
-        contactY -= 12;
-        page.drawText(line, {
-            x: textX, y: contactY, size: 8, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    const headerTopY = Math.min(contactY, y) - 20;
-
-    // Right side header: "ESTIMATE" label (portal style, top-right)
-    const rightX = pageWidth - margin;
-    const estimateHeadLabel = 'ESTIMATE';
-    const estimateHeadWidth = helveticaBold.widthOfTextAtSize(estimateHeadLabel, 22);
-    page.drawText(estimateHeadLabel, {
-        x: rightX - estimateHeadWidth, y: headerTopY, size: 22, font: helveticaBold, color: colors.primary,
+    // --- Title ---
+    y -= 30;
+    page.drawText(estimate.title || 'Estimate', {
+        x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
     });
+
+    // --- Estimate Info ---
+    y -= 30;
+
+    // Left: Client info
+    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
+    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
+
+    page.drawText('ESTIMATE TO', {
+        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
+    });
+
+    if (clientName) {
+        y -= 16;
+        page.drawText(clientName, {
+            x: margin, y, size: 11, font: helvetica, color: colors.textMain,
+        });
+    }
+    if (clientEmail) {
+        y -= 14;
+        page.drawText(clientEmail, {
+            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
+        });
+    }
+
+    // Right side: Estimate # / Date / Status
+    const rightX = pageWidth - margin;
+    let ry = y + (clientEmail ? 30 : 16);
 
     const drawRightLabel = (label: string, value: string, yPos: number) => {
         page.drawText(label, {
@@ -148,63 +112,14 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
     };
 
-    let ry = headerTopY - 24;
     drawRightLabel('Estimate No.', estimate.code || '', ry);
     ry -= 16;
     drawRightLabel('Date', new Date(estimate.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
     ry -= 16;
     drawRightLabel('Status', estimate.status || 'Draft', ry);
 
-    // --- Client + Project section ---
-    y = headerTopY - 70;
-
-    // Left: "PREPARED FOR" + client info
-    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
-    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
-    const client = estimate.project?.client || estimate.lead?.client;
-    const clientAddress = client ? [client.addressLine1, client.city, client.state, client.zipCode].filter(Boolean).join(', ') : '';
-
-    page.drawText('PREPARED FOR', {
-        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
-    });
-
-    let leftY = y;
-    if (clientName) {
-        leftY -= 16;
-        page.drawText(clientName, {
-            x: margin, y: leftY, size: 11, font: helvetica, color: colors.textMain,
-        });
-    }
-    if (clientAddress) {
-        leftY -= 14;
-        page.drawText(clientAddress, {
-            x: margin, y: leftY, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-    if (clientEmail) {
-        leftY -= 14;
-        page.drawText(clientEmail, {
-            x: margin, y: leftY, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    // Right: "PROJECT" section
-    const halfX = margin + contentWidth * 0.5;
-    page.drawText('PROJECT', {
-        x: halfX, y, size: 9, font: helveticaBold, color: colors.textMuted,
-    });
-    const projectTitle = estimate.title || '';
-    let rightY = y;
-    if (projectTitle) {
-        rightY -= 16;
-        page.drawText(projectTitle, {
-            x: halfX, y: rightY, size: 11, font: helvetica, color: colors.textMain,
-        });
-    }
-
-    y = Math.min(leftY, rightY) - 24;
-
     // --- Separator ---
+    y -= 20;
     page.drawLine({
         start: { x: margin, y }, end: { x: pageWidth - margin, y },
         thickness: 0.5, color: colors.border,
@@ -220,7 +135,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     };
 
     function drawTableHeader() {
-        page.drawText('DESCRIPTION', {
+        page.drawText('ITEM DESCRIPTION', {
             x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
         const qtyLabel = 'QTY';
@@ -228,12 +143,12 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         page.drawText(qtyLabel, {
             x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
-        const ucLabel = 'UNIT PRICE';
+        const ucLabel = 'UNIT COST';
         const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
         page.drawText(ucLabel, {
             x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
-        const totalLabel = 'AMOUNT';
+        const totalLabel = 'TOTAL';
         const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
         page.drawText(totalLabel, {
             x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
@@ -249,9 +164,8 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
 
     drawTableHeader();
 
-    // --- Table Rows --- skip blank placeholder rows (no name and zero total)
+    // --- Table Rows ---
     for (const item of estimate.items) {
-        if (!item.name?.trim() && Number(item.total ?? 0) === 0) continue;
         checkNewPage(100);
 
         const isSubItem = !!item.parentId;
@@ -277,43 +191,20 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(Number(item.unitCost ?? 0));
+        const ucStr = formatCurrency(toNum(item.unitCost));
         const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(Number(item.total ?? 0));
+        const totalStr = formatCurrency(toNum(item.total));
         const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
         });
 
-        // Description (below name, word-wrapped in muted text)
-        if (item.description) {
-            y -= 14;
-            const descWords = item.description.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().split(' ');
-            let descLine = '';
-            for (const word of descWords) {
-                const testLine = descLine ? `${descLine} ${word}` : word;
-                if (helvetica.widthOfTextAtSize(testLine, 8) > maxNameWidth && descLine) {
-                    checkNewPage(14);
-                    page.drawText(descLine, { x: nameX, y, size: 8, font: helvetica, color: colors.textMuted });
-                    y -= 11;
-                    descLine = word;
-                } else {
-                    descLine = testLine;
-                }
-            }
-            if (descLine) {
-                checkNewPage(14);
-                page.drawText(descLine, { x: nameX, y, size: 8, font: helvetica, color: colors.textMuted });
-            }
-            y -= 14;
-        } else {
-            y -= 20;
-        }
+        y -= 20;
     }
 
     // --- Totals Section ---
@@ -326,8 +217,8 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((sum, item) => sum + Number(item.total || 0), 0);
-    const tax = subtotal * 0.088;
+    const subtotal = estimate.items.reduce((sum, item) => sum + toNum(item.total), 0);
+    const tax = subtotal * 0.087;
     const total = subtotal + tax;
 
     // Subtotal
@@ -343,7 +234,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     y -= 18;
 
     // Tax
-    page.drawText('Tax (8.8%)', {
+    page.drawText('Estimated Tax (8.7%)', {
         x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
     });
     const taxStr = formatCurrency(tax);
@@ -382,75 +273,27 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         for (const sched of estimate.paymentSchedules) {
             checkNewPage(60);
 
-            const schedName = sched.percentage ? `${sched.name || ''} (${sched.percentage}%)` : (sched.name || '');
-            page.drawText(schedName, {
+            page.drawText(sched.name || '', {
                 x: margin, y, size: 9, font: helveticaBold, color: colors.textMain,
             });
 
-            if (sched.dueDate) {
-                const dateStr = new Date(sched.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                page.drawText(dateStr, {
-                    x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
-                });
-            }
+            const schedInfo: string[] = [];
+            if (sched.percentage) schedInfo.push(`${sched.percentage}%`);
+            if (sched.amount) schedInfo.push(formatCurrency(toNum(sched.amount)));
+            const schedText = schedInfo.join('  ');
 
-            if (sched.amount) {
-                const amtStr = formatCurrency(Number(sched.amount));
-                const amtWidth = helveticaBold.widthOfTextAtSize(amtStr, 9);
-                page.drawText(amtStr, {
-                    x: cols.total - amtWidth, y, size: 9, font: helveticaBold, color: colors.textMain,
+            page.drawText(schedText, {
+                x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
+            });
+
+            if (sched.dueDate) {
+                const dateStr = new Date(sched.dueDate).toLocaleDateString();
+                const dateWidth = helvetica.widthOfTextAtSize(dateStr, 9);
+                page.drawText(dateStr, {
+                    x: cols.total - dateWidth, y, size: 9, font: helvetica, color: colors.textMuted,
                 });
             }
             y -= 18;
-        }
-    }
-
-    // --- Terms & Conditions ---
-    if ((estimate as any).termsAndConditions) {
-        y -= 40;
-        checkNewPage(120);
-
-        page.drawText('Terms & Conditions', {
-            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
-        });
-        y -= 18;
-
-        // Strip HTML tags and pre-compute wrapped lines
-        const rawTerms: string = (estimate as any).termsAndConditions;
-        const plainTerms = rawTerms.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        const tcPadding = 12;
-        const tcWidth = contentWidth - tcPadding * 2;
-        const tcLines: string[] = [];
-        let tcLine = '';
-        for (const word of plainTerms.split(' ')) {
-            const testLine = tcLine ? `${tcLine} ${word}` : word;
-            if (helvetica.widthOfTextAtSize(testLine, 9) > tcWidth && tcLine) {
-                tcLines.push(tcLine);
-                tcLine = word;
-            } else {
-                tcLine = testLine;
-            }
-        }
-        if (tcLine) tcLines.push(tcLine);
-
-        if (tcLines.length > 0) {
-            // Draw background box
-            const boxHeight = tcLines.length * 14 + tcPadding * 2;
-            checkNewPage(boxHeight + 20);
-            page.drawRectangle({
-                x: margin, y: y - boxHeight, width: contentWidth, height: boxHeight,
-                color: colors.bgLight,
-                borderColor: colors.border,
-                borderWidth: 1,
-            });
-
-            // Draw text inside box
-            let tcY = y - tcPadding;
-            for (const ln of tcLines) {
-                page.drawText(ln, { x: margin + tcPadding, y: tcY, size: 9, font: helvetica, color: colors.textMuted });
-                tcY -= 14;
-            }
-            y = tcY - tcPadding;
         }
     }
 
@@ -478,6 +321,13 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         page.drawText(`Date:          ${estimate.approvedAt ? new Date(estimate.approvedAt).toLocaleString() : new Date().toLocaleString()}`, {
             x: margin, y, size: 10, font: helvetica, color: colors.textMain,
         });
+        if (estimate.approvalIp) {
+            y -= 15;
+            page.drawText(`IP Address:  ${estimate.approvalIp}`, {
+                x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
+            });
+        }
+
         // Signature Image
         if (estimate.signatureUrl && estimate.signatureUrl.startsWith('data:image/png;base64,')) {
             try {
@@ -683,14 +533,14 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(Number(item.unitCost ?? 0));
+        const ucStr = formatCurrency(toNum(item.unitCost));
         const ucStrWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(Number(item.total ?? 0));
+        const totalStr = formatCurrency(toNum(item.total));
         const totalStrWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalStrWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
@@ -709,7 +559,7 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     });
     y -= 25;
 
-    const total = Number(po.totalAmount ?? 0);
+    const total = toNum(po.totalAmount);
 
     // Total line
     const labelX = cols.unitCost - 60;

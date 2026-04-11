@@ -117,7 +117,7 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
         startTransition(async () => {
             try {
                 const updated = await togglePunchItem(itemId);
-                if (!updated) return;
+                if (!updated) throw new Error("Punch item not found");
                 setTasks(prev => prev.map(t => t.id === taskId
                     ? { ...t, punchItems: t.punchItems?.map(p => p.id === itemId ? { ...p, completed: updated.completed } : p) }
                     : t

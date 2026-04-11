@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { toNum } from "@/lib/prisma-helpers";
 import { stripe } from "@/lib/stripe";
 
 export async function POST(req: Request) {
@@ -142,13 +143,13 @@ export async function POST(req: Request) {
         const projectName = paymentSchedule.invoice.project?.name || "Services";
 
         let feeLineItem = null;
-        if (settings?.passProcessingFee && selectedMethod && selectedMethod !== "us_bank_account") {
-            const rate = Number(settings.cardProcessingRate ?? 2.9);
-            const flat = Number(settings.cardProcessingFlat ?? 0.30);
-            const feeAmount = Number(paymentSchedule.amount) * (rate / 100) + flat;
-            const feeName = flat > 0
-                ? `Processing Fee (${rate}% + $${flat.toFixed(2)})`
-                : `Processing Fee (${rate}%)`;
+        if (settings?.passProcessingFee && selectedMethod && selectedMethod !== 'us_bank_account') {
+            const rate = toNum(settings.cardProcessingRate ?? 2.9);
+            const flat = toNum(settings.cardProcessingFlat ?? 0.30);
+            const feeAmount = (toNum(paymentSchedule.amount) * (rate / 100)) + flat;
+            
+            const feeName = flat > 0 ? `Processing Fee (${rate}% + $${flat.toFixed(2)})` : `Processing Fee (${rate}%)`;
+            
             feeLineItem = {
                 price_data: {
                     currency: "usd",
@@ -167,7 +168,7 @@ export async function POST(req: Request) {
                         name: `Invoice #${paymentSchedule.invoice.code} — ${paymentSchedule.name}`,
                         description: `${projectName} • ${clientName}`,
                     },
-                    unit_amount: Math.round(Number(paymentSchedule.amount) * 100),
+                    unit_amount: Math.round(toNum(paymentSchedule.amount) * 100), // Stripe expects cents
                 },
                 quantity: 1,
             },

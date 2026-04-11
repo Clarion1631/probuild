@@ -2,68 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-
-async function createGitHubIssue(title: string, description: string, currentPage: string | null) {
-  const token = process.env.GITHUB_TOKEN;
-  const repo = process.env.GITHUB_REPO || "Clarion1631/probuild";
-
-  if (!token) {
-    console.warn("[FeatureRequest] No GITHUB_TOKEN — skipping issue creation");
-    return null;
-  }
-
-  const [owner, repoName] = repo.split("/");
-
-  const body = [
-    `## Feature Request`,
-    ``,
-    description,
-    ``,
-    `---`,
-    `**Source:** Help Chat Widget`,
-    currentPage ? `**Page:** \`${currentPage}\`` : "",
-    `**Created:** ${new Date().toISOString()}`,
-    ``,
-    `> Auto-created from ProBuild in-app feature request`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  try {
-    const res = await fetch(
-      `https://api.github.com/repos/${owner}/${repoName}/issues`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: `[Feature Request] ${title}`,
-          body,
-          labels: ["feature-request", "from-chat"],
-        }),
-      }
-    );
-
-    if (!res.ok) {
-      const err = await res.text();
-      console.error("[FeatureRequest] GitHub API error:", res.status, err);
-      return null;
-    }
-
-    const issue = await res.json();
-    return {
-      number: issue.number as number,
-      url: issue.html_url as string,
-    };
-  } catch (error) {
-    console.error("[FeatureRequest] GitHub issue creation failed:", error);
-    return null;
-  }
-}
+import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -79,8 +18,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { title, description, currentPage } = await req.json();
-  const sessionUserId = (session.user as any).id;
+  const userId = (session.user as any).id;
+  const { title, description, currentPage, conversationId } = await req.json();
 
   if (!title || !description) {
     return NextResponse.json(
@@ -90,38 +29,57 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    // 1. Create GitHub Issue
-    const ghIssue = await createGitHubIssue(title, description, currentPage);
+    if (conversationId) {
+      const conversation = await prisma.chatConversation.findFirst({
+        where: { id: conversationId, userId },
+        select: { id: true },
+      });
 
-    // 2. Save to HelpRequest table — use session userId so Requests tab can find it
+      if (!conversation) {
+        return NextResponse.json(
+          { error: "Conversation not found" },
+          { status: 404 }
+        );
+      }
+    }
+
+    const ghIssue = await createHelpChatGitHubIssue({
+      title,
+      description,
+      currentPage,
+      labelPrefix: "Feature Request",
+      labels: ["feature-request", "from-chat"],
+      metadata: conversationId
+        ? [`**Conversation ID:** \`${conversationId}\``]
+        : [],
+    });
+    const externalIssueRef = ghIssue ? `github-issue:${ghIssue.number}` : null;
+
     const result = await prisma.$queryRaw<any[]>`
       INSERT INTO "HelpRequest" (
-        "userId", "type", "question", "response", "currentPage", "status"
+        "userId",
+        "type",
+        "question",
+        "response",
+        "currentPage",
+        "status",
+        "changeLocation",
+        "externalIssueRef",
+        "conversationId"
       )
       VALUES (
-        ${sessionUserId},
+        ${userId},
         'feature_request',
         ${title},
         ${description},
         ${currentPage || null},
-        'open'
+        'submitted',
+        ${ghIssue?.url || null},
+        ${externalIssueRef},
+        ${conversationId || null}
       )
       RETURNING *
     `;
-
-    // 3. If GitHub issue was created, try to store the link (best-effort — columns may not exist)
-    if (ghIssue && result[0]) {
-      try {
-        await prisma.$executeRaw`
-          UPDATE "HelpRequest"
-          SET "changeDescription" = ${`GitHub Issue #${ghIssue.number}`},
-              "changeLocation" = ${ghIssue.url}
-          WHERE "id" = ${result[0].id}::uuid
-        `;
-      } catch {
-        // Column doesn't exist — not fatal, issue link is still returned in the response
-      }
-    }
 
     return NextResponse.json({
       request: result[0],

@@ -28,7 +28,7 @@ export async function GET(req: NextRequest) {
 
     const entries = await prisma.timeEntry.findMany({
         where,
-        include: { user: true, project: true },
+        include: { user: true, project: true, costCode: true },
         orderBy: { startTime: "asc" },
     });
 
@@ -45,9 +45,10 @@ export async function GET(req: NextRequest) {
             ? new Date(entry.startTime).toLocaleDateString("en-US")
             : "";
         const project = (entry.project?.name || "").replace(/,/g, " ");
-        const notes = ((entry as any).notes || "").replace(/,/g, " ").replace(/\n/g, " ");
+        const costCode = (entry.costCode?.code || "").replace(/,/g, " ");
+        const notes = "";
 
-        rows.push(`"${name}","${gustoId}","${hours}","${date}","${project}","${notes}"`);
+        rows.push(`"${name}","${gustoId}","${hours}","${date}","${project}","${costCode}","${notes}"`);
     }
 
     const csv = rows.join("\n");

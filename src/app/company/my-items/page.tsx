@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/prisma";
+import { toNum } from "@/lib/prisma-helpers";
 import MyItemsClient from "./MyItemsClient";
 
 export default async function MyItemsPage() {
@@ -13,7 +14,10 @@ export default async function MyItemsPage() {
         prisma.costCode.findMany({ where: { isActive: true }, orderBy: { code: "asc" }, select: { id: true, code: true, name: true } }),
     ]);
 
-    const items = rawItems.map(i => ({ ...i, unitCost: Number(i.unitCost) }));
-
-    return <MyItemsClient items={items} costCodes={costCodes} />;
+    return (
+        <MyItemsClient
+            items={rawItems.map((item) => ({ ...item, unitCost: toNum(item.unitCost) }))}
+            costCodes={costCodes}
+        />
+    );
 }

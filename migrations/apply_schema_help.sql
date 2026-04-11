@@ -11,5 +11,13 @@ CREATE TABLE IF NOT EXISTS "HelpRequest" (
   "verifiedAt" TIMESTAMPTZ,
   "changeDescription" TEXT,
   "changeLocation" TEXT,
+  "externalIssueRef" TEXT,
+  "conversationId" TEXT,
   "createdAt" TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS "HelpRequest_conversationId_idx"
+  ON "HelpRequest" ("conversationId");
+
+CREATE INDEX IF NOT EXISTS "HelpRequest_externalIssueRef_idx"
+  ON "HelpRequest" ("externalIssueRef");

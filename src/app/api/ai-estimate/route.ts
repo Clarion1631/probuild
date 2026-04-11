@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 type CostCode = { id: string; code: string; name: string };
@@ -18,6 +20,7 @@ type AiPhase = {
 };
 type AiMilestone = { name?: string; percentage?: number };
 type AiData = { phases: AiPhase[]; paymentMilestones: AiMilestone[] };
+type EstimateItem = ReturnType<typeof makeItem>;
 
 export const maxDuration = 300; // 5 min — Claude needs time for large estimates
 
@@ -113,8 +116,7 @@ Sort phases in logical construction order. Make the estimate thorough and profes
             messages: [{ role: "user", content: prompt }],
         });
 
-        const textBlock = response.content.find(b => b.type === 'text');
-        const rawText = textBlock && 'text' in textBlock ? (textBlock as any).text as string : '';
+        const rawText = getAnthropicText(response.content);
 
         if (!rawText) {
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
@@ -154,10 +156,10 @@ Sort phases in logical construction order. Make the estimate thorough and profes
             if (ct.name) typeMap[ct.name] = ct.id;
         }
 
-        // Build flat items array with parent-child hierarchy
-        const estimateItems: ReturnType<typeof makeItem>[] = [];
+        // Transform AI phases into the grouped estimate-item structure the editor expects.
         const ts = Date.now();
         let order = 0;
+        const estimateItems: EstimateItem[] = [];
 
         for (let pi = 0; pi < aiPhases.length; pi++) {
             const phase = aiPhases[pi];
