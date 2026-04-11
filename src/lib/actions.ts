@@ -2023,12 +2023,13 @@ export async function saveCompanySettings(data: any) {
     return { success: true };
 }
 
-export async function deleteEstimate(estimateId: string) {
+export async function deleteEstimate(estimateId: string): Promise<{ success: boolean; error?: string }> {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
-        select: { projectId: true, leadId: true },
+        select: { projectId: true, leadId: true, status: true },
     });
     if (!estimate) return { success: false, error: "Estimate not found" };
+    if (estimate.status === "Approved") return { success: false, error: "Approved estimates cannot be deleted" };
 
     // Delete related Budget
     const budget = await prisma.budget.findUnique({ where: { estimateId } });

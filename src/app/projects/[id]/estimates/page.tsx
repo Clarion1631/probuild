@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import EstimatesListClient from "./EstimatesListClient";
 import CopyToProjectButton from "@/components/CopyToProjectButton";
+import DeleteEstimateButton from "@/components/DeleteEstimateButton";
 import { formatCurrency } from "@/lib/utils";
 
 export default async function EstimatesPage({ params }: { params: Promise<{ id: string }> }) {
@@ -152,6 +153,11 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
                                                 estimateTitle={est.title}
                                                 currentProjectId={resolvedParams.id}
                                                 allProjects={allActiveProjects}
+                                            />
+                                            <DeleteEstimateButton
+                                                estimateId={est.id}
+                                                estimateTitle={est.title}
+                                                status={est.status}
                                             />
                                             <Link href={`/projects/${project.id}/estimates/${est.id}`} className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition">
                                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>
