@@ -49,7 +49,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
     const [showSidebar, setShowSidebar] = useState(false);
-    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments">("overview");
+    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments" | "history">("overview");
     const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
     const [showTerms, setShowTerms] = useState(false);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
@@ -70,6 +70,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showSubitemSuggestions, setShowSubitemSuggestions] = useState<string | null>(null);
     const [selectedSuggestionIndices, setSelectedSuggestionIndices] = useState<Set<number>>(new Set());
     const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+    const [history, setHistory] = useState<Array<{ ts: number; label: string; snapshot: any[] }>>([]);
+    const [showHistory, setShowHistory] = useState(false);
 
     // Derived: sum of children totals per section header
     const sectionTotals = useMemo(() => {
@@ -440,6 +442,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
     async function handleSave() {
+        captureHistory(new Date().toLocaleString());
         setIsSaving(true);
         // Recompute section header totals from children before saving
         const childTotals = new Map<string, number>();
@@ -547,8 +550,19 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         return Math.random().toString(36).substr(2, 9);
     }
 
-    function addItem(parentId: string | null = null) {
-        setItems([...items, {
+    function captureHistory(label: string) {
+        setHistory(prev => [{ ts: Date.now(), label, snapshot: JSON.parse(JSON.stringify(items)) }, ...prev.slice(0, 49)]);
+    }
+
+    function revertToHistory(entry: { ts: number; label: string; snapshot: any[] }) {
+        if (!confirm(`Revert to "${entry.label}"? Unsaved changes will be lost.`)) return;
+        setItems(entry.snapshot);
+        setShowHistory(false);
+        toast.success(`Reverted to ${entry.label}`);
+    }
+
+    function makeBlankItem(parentId: string | null) {
+        return {
             id: generateId(),
             name: "",
             description: "",
@@ -560,8 +574,53 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             total: 0,
             parentId,
             costCodeId: null,
-            costTypeId: null
-        }]);
+            costTypeId: null,
+        };
+    }
+
+    function addItem(parentId: string | null = null) {
+        if (parentId) {
+            // Insert after the last existing child of this parent
+            const lastChildIdx = items.reduce((last, it, idx) => it.parentId === parentId ? idx : last, -1);
+            const insertAt = lastChildIdx >= 0 ? lastChildIdx + 1 : (items.findIndex(i => i.id === parentId) + 1);
+            const newItems = [...items];
+            newItems.splice(insertAt, 0, makeBlankItem(parentId));
+            setItems(newItems);
+        } else {
+            setItems([...items, makeBlankItem(null)]);
+        }
+    }
+
+    /** "Add Sub-item": carry parent description into new sub-item, clear parent description */
+    function addSubItem(parentIndex: number) {
+        const parent = items[parentIndex];
+        const desc = parent.description || "";
+        const newItems = [...items];
+        newItems[parentIndex] = { ...parent, description: "" };
+        const lastChildIdx = newItems.reduce((last, it, idx) => it.parentId === parent.id ? idx : last, parentIndex);
+        const newSub = { ...makeBlankItem(parent.id), description: desc };
+        newItems.splice(lastChildIdx + 1, 0, newSub);
+        setItems(newItems);
+    }
+
+    /** Insert a blank item right after `afterIndex` with the given parentId */
+    function addItemAfter(afterIndex: number, parentId: string | null) {
+        const newItems = [...items];
+        newItems.splice(afterIndex + 1, 0, makeBlankItem(parentId));
+        setItems(newItems);
+    }
+
+    /** Insert a new category (+ one blank sub-item) right after `afterIndex` */
+    function addCategoryAfter(afterIndex: number) {
+        const catId = generateId();
+        const newCat = {
+            id: catId, name: "", description: "", type: "Section",
+            quantity: 1, baseCost: 0, markupPercent: 25, unitCost: 0, total: 0,
+            parentId: null, costCodeId: null, costTypeId: null, isSection: true,
+        };
+        const newItems = [...items];
+        newItems.splice(afterIndex + 1, 0, newCat, makeBlankItem(catId));
+        setItems(newItems);
     }
 
     async function handleAiGenerate() {
@@ -692,10 +751,43 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
     function onDragEnd(result: any) {
         if (!result.destination) return;
-        const newItems = Array.from(items);
-        const [reorderedItem] = newItems.splice(result.source.index, 1);
-        newItems.splice(result.destination.index, 0, reorderedItem);
-        setItems(newItems);
+        const srcIdx = result.source.index;
+        const dstIdx = result.destination.index;
+        if (srcIdx === dstIdx) return;
+
+        const dragged = items[srcIdx];
+        const draggedIsCategory = !dragged.parentId && sectionIds.has(dragged.id);
+
+        if (draggedIsCategory) {
+            // Move the category header and all its children as a block
+            const children = items.filter(i => i.parentId === dragged.id);
+            const block = [dragged, ...children];
+            const withoutBlock = items.filter(i => i.id !== dragged.id && i.parentId !== dragged.id);
+            const adjustedDst = Math.max(0, Math.min(dstIdx - (srcIdx < dstIdx ? block.length - 1 : 0), withoutBlock.length));
+            withoutBlock.splice(adjustedDst, 0, ...block);
+            setItems(withoutBlock);
+        } else {
+            const newItems = Array.from(items);
+            newItems.splice(srcIdx, 1);
+            newItems.splice(dstIdx, 0, dragged);
+
+            // Recompute parentId for the dragged item based on its new neighbours
+            const itemBefore = dstIdx > 0 ? newItems[dstIdx - 1] : null;
+            let newParentId: string | null = dragged.parentId;
+            if (!itemBefore) {
+                newParentId = null;
+            } else if (!itemBefore.parentId && newItems.some(i => i !== newItems[dstIdx] && i.parentId === itemBefore.id)) {
+                // Dropped right after a category header → become its child
+                newParentId = itemBefore.id;
+            } else if (itemBefore.parentId) {
+                // Dropped after a sub-item → join that category
+                newParentId = itemBefore.parentId;
+            } else {
+                newParentId = null;
+            }
+            newItems[dstIdx] = { ...newItems[dstIdx], parentId: newParentId };
+            setItems(newItems);
+        }
     }
 
     return (
@@ -1131,10 +1223,16 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
                                                                         />
                                                                     </div>
-                                                                    <input type="text" value={item.name} onChange={e => updateItem(index, "name", e.target.value)}
-                                                                        placeholder="Section name"
-                                                                        className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
-                                                                    />
+                                                                    <div className="flex-1 flex flex-col">
+                                                                        <input type="text" value={item.name} onChange={e => updateItem(index, "name", e.target.value)}
+                                                                            placeholder="Category name"
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
+                                                                        />
+                                                                        <div className="flex items-center gap-3 mt-1 opacity-40 group-hover:opacity-100 transition">
+                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">+ Add Sub-item</button>
+                                                                            <button onClick={() => addCategoryAfter(index + items.filter(i => i.parentId === item.id).length)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium">+ Add Category Below</button>
+                                                                        </div>
+                                                                    </div>
                                                                     <div className="flex items-center gap-3 ml-auto">
                                                                         {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
                                                                         <span className="text-sm font-semibold text-slate-700 w-32 text-right">{formatCurrency(sectionTotal)}</span>
@@ -1203,23 +1301,33 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             </button>
                                                                         )}
                                                                     </div>
-                                                                    {!isSubItem && (
-                                                                        <div className="flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition">
-                                                                            <button onClick={() => addItem(item.id)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
+                                                                    <div className="flex items-center gap-2 mt-1 opacity-40 group-hover:opacity-100 transition">
+                                                                        {!isSubItem && (
+                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
                                                                                 + Add Sub-item
                                                                             </button>
-                                                                            {item.name?.trim() && (
-                                                                                <button
-                                                                                    onClick={() => suggestSubitems(index)}
-                                                                                    disabled={aiSuggestingSubitems === item.id}
-                                                                                    className="text-[10px] text-amber-500 hover:text-amber-700 font-medium flex items-center gap-0.5 disabled:opacity-50 disabled:animate-pulse"
-                                                                                >
-                                                                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
-                                                                                    {aiSuggestingSubitems === item.id ? "Thinking..." : "AI Sub-items"}
-                                                                                </button>
-                                                                            )}
-                                                                        </div>
-                                                                    )}
+                                                                        )}
+                                                                        {isSubItem && (
+                                                                            <button onClick={() => addItemAfter(index, item.parentId)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
+                                                                                + Add Item Below
+                                                                            </button>
+                                                                        )}
+                                                                        {!isSubItem && (
+                                                                            <button onClick={() => addCategoryAfter(index)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium">
+                                                                                + Add Category Here
+                                                                            </button>
+                                                                        )}
+                                                                        {!isSubItem && item.name?.trim() && (
+                                                                            <button
+                                                                                onClick={() => suggestSubitems(index)}
+                                                                                disabled={aiSuggestingSubitems === item.id}
+                                                                                className="text-[10px] text-amber-500 hover:text-amber-700 font-medium flex items-center gap-0.5 disabled:opacity-50 disabled:animate-pulse"
+                                                                            >
+                                                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
+                                                                                {aiSuggestingSubitems === item.id ? "Thinking..." : "AI Sub-items"}
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
                                                                     {/* AI sub-item suggestions popover */}
                                                                     {showSubitemSuggestions === item.id && aiSubitemSuggestions.length > 0 && (
                                                                         <div className="mt-2 bg-amber-50 border border-amber-200 rounded-lg p-3 shadow-sm">
@@ -1409,12 +1517,18 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </Droppable>
                             </DragDropContext>
 
-                            <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={() => addItem(null)}>
-                                <button className="text-sm font-semibold text-indigo-500 group-hover:text-indigo-600 flex items-center gap-2 transition">
-                                    <span className="bg-indigo-50 text-indigo-500 group-hover:bg-indigo-100 rounded p-1">
+                            <div className="p-4 px-8 border-t border-slate-100 bg-white flex items-center gap-4">
+                                <button onClick={() => addItem(null)} className="text-sm font-semibold text-indigo-500 hover:text-indigo-600 flex items-center gap-2 transition group/btn">
+                                    <span className="bg-indigo-50 text-indigo-500 group-hover/btn:bg-indigo-100 rounded p-1">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
                                     </span>
                                     Add New Item
+                                </button>
+                                <button onClick={() => addCategoryAfter(items.length - 1)} className="text-sm font-semibold text-slate-400 hover:text-slate-600 flex items-center gap-2 transition group/btn">
+                                    <span className="bg-slate-50 text-slate-400 group-hover/btn:bg-slate-100 rounded p-1">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                                    </span>
+                                    Add New Category
                                 </button>
                             </div>
                         </div>
@@ -1725,6 +1839,10 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             onClick={() => setSidebarTab("comments")}
                             className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "comments" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Comments</button>
+                        <button
+                            onClick={() => setSidebarTab("history")}
+                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "history" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                        >History</button>
                     </div>
 
                     {sidebarTab === "overview" && (
@@ -1907,6 +2025,35 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 currentUserName={undefined}
                                 showClientTab={true}
                             />
+                        </div>
+                    )}
+
+                    {sidebarTab === "history" && (
+                        <div className="p-4 space-y-3 flex-1 overflow-y-auto">
+                            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Saved Snapshots</p>
+                            {history.length === 0 ? (
+                                <div className="text-center py-10">
+                                    <svg className="w-8 h-8 text-slate-200 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                    <p className="text-xs text-slate-400">No history yet. Save the estimate to create a snapshot.</p>
+                                </div>
+                            ) : (
+                                history.map((entry, i) => (
+                                    <div key={entry.ts} className="bg-slate-50 border border-slate-100 rounded-lg p-3 hover:border-indigo-200 hover:bg-indigo-50/30 transition group">
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div>
+                                                <p className="text-xs font-semibold text-slate-700">{entry.label}</p>
+                                                <p className="text-[10px] text-slate-400 mt-0.5">{entry.snapshot.length} items</p>
+                                            </div>
+                                            <button
+                                                onClick={() => revertToHistory(entry)}
+                                                className="text-[10px] font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition opacity-0 group-hover:opacity-100"
+                                            >
+                                                Revert
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
                         </div>
                     )}
                 </div>
