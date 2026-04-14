@@ -98,15 +98,26 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
             }
 
             // Step 2: upload each file directly to Supabase (bypasses Vercel's 4.5 MB limit)
-            await Promise.all(
+            const uploadResults = await Promise.all(
                 signData.uploads.map((upload: any, i: number) =>
                     fetch(upload.signedUrl, {
                         method: "PUT",
-                        headers: { "Content-Type": fileArray[i].type || "application/octet-stream" },
+                        headers: {
+                            "Content-Type": fileArray[i].type || "application/octet-stream",
+                            "x-upsert": "false",
+                        },
                         body: fileArray[i],
                     })
                 )
             );
+            for (let i = 0; i < uploadResults.length; i++) {
+                const r = uploadResults[i];
+                if (!r.ok) {
+                    let msg = `Storage upload failed (${r.status})`;
+                    try { const t = await r.text(); if (t) msg = t; } catch {}
+                    throw new Error(msg);
+                }
+            }
 
             // Step 3: register file records in the database
             const regRes = await fetch("/api/files/register", {
