@@ -40,17 +40,53 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         const { toJpeg } = await import("html-to-image");
         const { jsPDF } = await import("jspdf");
 
-        // Render full element at 2× pixel ratio for sharp text
-        const imgData = await toJpeg(element, { quality: 0.95, pixelRatio: 2 });
-
         const pdf = new jsPDF("p", "mm", "a4");
         const pageW = pdf.internal.pageSize.getWidth();   // 210 mm
         const pageH = pdf.internal.pageSize.getHeight();  // 297 mm
-        const marginTop = 10;     // mm gap at top of each page
-        const marginBottom = 14;  // mm gap at bottom (room for page number + buffer)
-        const usableH = pageH - marginTop - marginBottom;
+        const marginTop = 10;
+        const marginBottom = 14;
+        const usableH = pageH - marginTop - marginBottom; // 273 mm per page
 
-        // Load into an Image so we can canvas-slice it per page
+        // ── Step 1: Measure row positions BEFORE rendering ────────────────
+        // CSS px relative to the element's top-left — scroll-independent
+        const elTop = element.getBoundingClientRect().top + window.scrollY;
+        const cssToMm = pageW / element.offsetWidth;
+        const totalHeightMm = element.offsetHeight * cssToMm;
+
+        // Every element with data-pdf-row must not be cut through
+        const rowEls = Array.from(element.querySelectorAll("[data-pdf-row]"));
+        const rowsMm = rowEls.map(row => {
+            const r = row.getBoundingClientRect();
+            return {
+                top:    (r.top    + window.scrollY - elTop) * cssToMm,
+                bottom: (r.bottom + window.scrollY - elTop) * cssToMm,
+            };
+        });
+
+        // ── Step 2: Find safe page-break points (always between rows) ─────
+        const breaks: number[] = [0]; // start-mm of each page's content slice
+        let cursor = 0;
+        while (cursor < totalHeightMm) {
+            const limit = cursor + usableH;
+            if (limit >= totalHeightMm) break;
+
+            // Walk rows to find the first one that would be cut
+            let safeBreak = limit;
+            for (const row of rowsMm) {
+                if (row.top > cursor && row.bottom > limit) {
+                    // This row overflows — snap break to just before it
+                    safeBreak = Math.max(cursor + 1, row.top - 1);
+                    break;
+                }
+            }
+            breaks.push(safeBreak);
+            cursor = safeBreak;
+        }
+        breaks.push(totalHeightMm);
+
+        // ── Step 3: Render full element at 2× ────────────────────────────
+        const imgData = await toJpeg(element, { quality: 0.95, pixelRatio: 2 });
+
         const img = new Image();
         img.src = imgData;
         await new Promise<void>((resolve, reject) => {
@@ -58,31 +94,29 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             img.onerror = () => reject(new Error("img load failed"));
         });
 
-        // px per mm — img.width = element.offsetWidth × pixelRatio (2)
-        const pxPerMm = img.width / pageW;
-        const usableHPx = usableH * pxPerMm;
-        const totalPages = Math.ceil(img.height / usableHPx);
+        const pxPerMm = img.width / pageW; // rendered px per mm
+        const totalPages = breaks.length - 1;
 
+        // ── Step 4: Slice at safe break points and add pages ─────────────
         for (let page = 0; page < totalPages; page++) {
             if (page > 0) pdf.addPage();
 
-            const srcY = Math.round(page * usableHPx);
-            const srcH = Math.min(Math.ceil(usableHPx), img.height - srcY);
-            const renderH = srcH / pxPerMm; // back to mm for addImage
+            const startMm = breaks[page];
+            const sliceHMm = breaks[page + 1] - startMm;
+            const srcY = Math.round(startMm * pxPerMm);
+            const srcH = Math.round(sliceHMm * pxPerMm);
 
-            // Slice this page's strip from the full render
             const slice = document.createElement("canvas");
-            slice.width = img.width;
-            slice.height = srcH;
+            slice.width  = img.width;
+            slice.height = Math.max(1, srcH);
             const ctx = slice.getContext("2d")!;
             ctx.fillStyle = "#ffffff";
             ctx.fillRect(0, 0, slice.width, slice.height);
             ctx.drawImage(img, 0, srcY, img.width, srcH, 0, 0, img.width, srcH);
-            const sliceData = slice.toDataURL("image/jpeg", 0.92);
 
-            pdf.addImage(sliceData, "JPEG", 0, marginTop, pageW, renderH);
+            pdf.addImage(slice.toDataURL("image/jpeg", 0.92), "JPEG", 0, marginTop, pageW, sliceHMm);
 
-            // Page number centred at the very bottom
+            // Page number
             pdf.setFont("helvetica", "normal");
             pdf.setFontSize(8);
             pdf.setTextColor(160, 160, 160);
@@ -425,7 +459,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                     return (
                                         <React.Fragment key={item.id}>
                                             {/* Category header — matches editor section style */}
-                                            <div className="flex items-center px-4 py-3 bg-slate-100 border-l-4 border-slate-700">
+                                            <div data-pdf-row="true" className="flex items-center px-4 py-3 bg-slate-100 border-l-4 border-slate-700">
                                                 <div className="flex-1 font-semibold text-sm text-slate-800 pl-4">{item.name}</div>
                                                 <div className="w-20"></div>
                                                 <div className="w-32"></div>
@@ -433,7 +467,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                             </div>
                                             {/* Sub-items — indented */}
                                             {item.subItems.map((sub: any) => (
-                                                <div key={sub.id} className="flex items-start bg-slate-50/30 border-l-2 border-transparent ml-8">
+                                                <div data-pdf-row="true" key={sub.id} className="flex items-start bg-slate-50/30 border-l-2 border-transparent ml-8">
                                                     <div className="flex-1 py-2.5 pl-8">
                                                         <div className="text-sm text-slate-700">{sub.name}</div>
                                                         {sub.description && <div className="text-xs text-slate-400 mt-0.5 leading-relaxed">{sub.description}</div>}
@@ -449,7 +483,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                                 // Standalone item
                                 return (
-                                    <div key={item.id} className="flex items-start px-8 py-3 bg-white">
+                                    <div data-pdf-row="true" key={item.id} className="flex items-start px-8 py-3 bg-white">
                                         <div className="flex-1">
                                             <div className="text-sm font-medium text-slate-800">{item.name}</div>
                                             {item.description && <div className="text-xs text-slate-500 mt-0.5 leading-relaxed">{item.description}</div>}
@@ -498,7 +532,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 {schedules.filter((s: any) => s.name !== "Payment in Full").map((p: any) => {
                                     const isPaid = p.status === "Paid";
                                     return (
-                                        <div key={p.id} className={`flex flex-wrap justify-between items-center px-5 py-3 text-sm border-b last:border-b-0 border-slate-100 gap-3 ${isPaid ? "bg-green-50" : ""}`}>
+                                        <div data-pdf-row="true" key={p.id} className={`flex flex-wrap justify-between items-center px-5 py-3 text-sm border-b last:border-b-0 border-slate-100 gap-3 ${isPaid ? "bg-green-50" : ""}`}>
                                             <div>
                                                 <div className="flex items-center gap-2">
                                                     <span className="font-medium text-slate-700">{p.name}</span>
