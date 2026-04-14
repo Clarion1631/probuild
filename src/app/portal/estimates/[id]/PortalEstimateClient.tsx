@@ -301,7 +301,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
             {/* Payment status banners — hidden in capture mode */}
             {paymentStatus === "success" && !isCapture && (
-                <div className="max-w-4xl mx-auto px-4 pt-4 print:hidden">
+                <div className="max-w-6xl mx-auto px-4 pt-4 print:hidden">
                     <div className="bg-green-50 border border-green-200 rounded-lg px-5 py-3 flex items-center gap-3">
                         <svg className="w-5 h-5 text-green-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                         <p className="text-sm font-medium text-green-800">Payment successful! Your milestone has been marked as paid.</p>
@@ -309,7 +309,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 </div>
             )}
             {paymentStatus === "cancelled" && !isCapture && (
-                <div className="max-w-4xl mx-auto px-4 pt-4 print:hidden">
+                <div className="max-w-6xl mx-auto px-4 pt-4 print:hidden">
                     <div className="bg-amber-50 border border-amber-200 rounded-lg px-5 py-3 flex items-center gap-3">
                         <svg className="w-5 h-5 text-amber-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                         <p className="text-sm font-medium text-amber-800">Payment was cancelled. You can try again anytime.</p>
@@ -318,7 +318,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             )}
 
             {/* Document Container */}
-            <div className={`max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
+            <div className={`max-w-6xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
                 <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.06)] border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Premium top accent bar — matches estimate editor */}
