@@ -1081,7 +1081,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                 <p className="text-sm font-medium text-slate-800">{a.name}</p>
                                                 <p className="text-xs text-slate-400">{a.items.length} item{a.items.length !== 1 ? 's' : ''}</p>
                                             </div>
-                                            <button onClick={(e) => handleDeleteAssembly(a.id, e)} className="text-slate-300 hover:text-red-500 opacity-30 group-hover:opacity-100 transition p-1" title="Delete assembly">
+                                            <button onClick={(e) => handleDeleteAssembly(a.id, e)} className="text-slate-300 hover:text-red-500 transition p-1" title="Delete assembly">
                                                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                                             </button>
                                         </div>
@@ -1207,7 +1207,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                 <div ref={provided.innerRef} {...provided.draggableProps}
                                                                     className={`flex items-center px-4 py-2.5 bg-slate-100 border-l-4 border-hui-primary group transition ${snapshot.isDragging ? "shadow-lg z-50" : ""}`}
                                                                 >
-                                                                    <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-400 hover:text-slate-600 cursor-grab opacity-30 group-hover:opacity-100">
+                                                                    <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-400 hover:text-slate-600 cursor-grab">
                                                                         <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
                                                                     </div>
                                                                     <button onClick={() => setCollapsedSections(prev => { const n = new Set(prev); n.has(item.id) ? n.delete(item.id) : n.add(item.id); return n; })}
@@ -1228,7 +1228,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             placeholder="Category name"
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
                                                                         />
-                                                                        <div className="flex items-center gap-3 mt-1 opacity-40 group-hover:opacity-100 transition">
+                                                                        <div className="flex items-center gap-3 mt-1 transition">
                                                                             <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">+ Add Sub-item</button>
                                                                             <button onClick={() => addCategoryAfter(index + items.filter(i => i.parentId === item.id).length)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium">+ Add Category Below</button>
                                                                         </div>
@@ -1236,7 +1236,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                     <div className="flex items-center gap-3 ml-auto">
                                                                         {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
                                                                         <span className="text-sm font-semibold text-slate-700 w-32 text-right">{formatCurrency(sectionTotal)}</span>
-                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-30 group-hover:opacity-100">
+                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition">
                                                                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                         </button>
                                                                     </div>
@@ -1255,7 +1255,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                 {...provided.draggableProps}
                                                                 className={`flex items-center px-6 py-3 bg-white group hover:bg-slate-50 transition border-l-2 ${snapshot.isDragging ? "shadow-lg border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "border-transparent ml-8 bg-slate-50/30" : "border-transparent"}`}
                                                             >
-                                                                <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab opacity-30 group-hover:opacity-100">
+                                                                <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab">
                                                                     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
                                                                 </div>
                                                                 <div className="w-8">
@@ -1295,13 +1295,13 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 onClick={() => suggestDescription(index)}
                                                                                 disabled={aiSuggestingDesc === item.id}
                                                                                 title="AI: suggest description"
-                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition opacity-30 group-hover:opacity-100 disabled:opacity-50 disabled:animate-pulse"
+                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse"
                                                                             >
                                                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
                                                                             </button>
                                                                         )}
                                                                     </div>
-                                                                    <div className="flex items-center gap-2 mt-1 opacity-40 group-hover:opacity-100 transition">
+                                                                    <div className="flex items-center gap-2 mt-1 transition">
                                                                         {!isSubItem && (
                                                                             <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
                                                                                 + Add Sub-item
@@ -1502,7 +1502,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 </button>
                                                                             </span>
                                                                         )}
-                                                                        <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-30 group-hover:opacity-100">
+                                                                        <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition">
                                                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                                         </button>
                                                                     </div>
@@ -1586,7 +1586,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                 />
                                             </div>
                                             <div className="w-10 pt-0.5 flex justify-end">
-                                                <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-30 group-hover:opacity-100">
+                                                <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition">
                                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                 </button>
                                             </div>
@@ -1717,7 +1717,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     <span className="truncate">{f.name}</span>
                                                     <span className="text-xs text-slate-400 flex-shrink-0">{formatFileSize(f.size)}</span>
                                                 </a>
-                                                <button onClick={() => handleDeleteFile(f.id)} className="text-slate-400 hover:text-red-500 opacity-30 group-hover:opacity-100 transition ml-2" title="Delete">
+                                                <button onClick={() => handleDeleteFile(f.id)} className="text-slate-400 hover:text-red-500 transition ml-2" title="Delete">
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg>
                                                 </button>
                                             </div>
@@ -2046,7 +2046,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                             </div>
                                             <button
                                                 onClick={() => revertToHistory(entry)}
-                                                className="text-[10px] font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition opacity-30 group-hover:opacity-100"
+                                                className="text-[10px] font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition"
                                             >
                                                 Revert
                                             </button>
