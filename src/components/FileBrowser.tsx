@@ -78,22 +78,59 @@ export default function FileBrowser({ projectId, leadId }: { projectId?: string;
         if (!fileList || fileList.length === 0) return;
         setIsUploading(true);
         try {
-            const formData = new FormData();
-            if (projectId) formData.append("projectId", projectId);
-            if (leadId) formData.append("leadId", leadId);
-            if (currentFolder) formData.append("folderId", currentFolder);
+            const fileArray = Array.from(fileList);
 
-            Array.from(fileList).forEach(f => formData.append("files", f));
-
-            const res = await fetch("/api/files", { method: "POST", body: formData });
-            const data = await res.json();
-            if (!res.ok) {
-                toast.error(data.error || `Upload failed (${res.status})`);
-                console.error("Upload error:", data);
+            // Step 1: get signed upload URLs from the server (tiny JSON request, no file data)
+            const signRes = await fetch("/api/files/signed-upload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    projectId,
+                    leadId,
+                    folderId: currentFolder,
+                    files: fileArray.map(f => ({ name: f.name, size: f.size, mimeType: f.type || "application/octet-stream" })),
+                }),
+            });
+            const signData = await signRes.json();
+            if (!signRes.ok) {
+                toast.error(signData.error || `Upload failed (${signRes.status})`);
                 return;
             }
-            setFiles(prev => [...data.files, ...prev]);
-            toast.success(`${data.files.length} file${data.files.length > 1 ? "s" : ""} uploaded`);
+
+            // Step 2: upload each file directly to Supabase (bypasses Vercel's 4.5 MB limit)
+            await Promise.all(
+                signData.uploads.map((upload: any, i: number) =>
+                    fetch(upload.signedUrl, {
+                        method: "PUT",
+                        headers: { "Content-Type": fileArray[i].type || "application/octet-stream" },
+                        body: fileArray[i],
+                    })
+                )
+            );
+
+            // Step 3: register file records in the database
+            const regRes = await fetch("/api/files/register", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    files: signData.uploads.map((upload: any) => ({
+                        name: upload.name,
+                        url: upload.publicUrl,
+                        size: upload.size,
+                        mimeType: upload.mimeType,
+                        projectId: upload.projectId,
+                        leadId: upload.leadId,
+                        folderId: upload.folderId,
+                    })),
+                }),
+            });
+            const regData = await regRes.json();
+            if (!regRes.ok) {
+                toast.error(regData.error || `Failed to save file records (${regRes.status})`);
+                return;
+            }
+            setFiles(prev => [...regData.files, ...prev]);
+            toast.success(`${regData.files.length} file${regData.files.length > 1 ? "s" : ""} uploaded`);
         } catch (err: any) {
             console.error("Upload error:", err);
             toast.error(err.message || "Upload failed — check console for details");
