@@ -362,17 +362,23 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                         {/* Bill To */}
                         <div className="mt-8 pt-6 border-t border-slate-100">
-                            <div className="grid grid-cols-2 gap-8">
+                            <div className="grid grid-cols-3 gap-8">
                                 <div>
                                     <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Prepared For</p>
                                     <p className="text-sm font-semibold text-slate-800">{initialEstimate.clientName || "Client"}</p>
-                                    <p className="text-sm text-slate-500">{initialEstimate.title}</p>
+                                    {initialEstimate.clientEmail && <p className="text-sm text-slate-500">{initialEstimate.clientEmail}</p>}
                                 </div>
                                 <div>
                                     <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
                                     <p className="text-sm font-semibold text-slate-800">{initialEstimate.title || "Project"}</p>
                                     <p className="text-sm text-slate-500">{initialEstimate.projectName || initialEstimate.leadName || ""}</p>
                                 </div>
+                                {initialEstimate.jobsiteAddress && (
+                                    <div>
+                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Jobsite Address</p>
+                                        <p className="text-sm text-slate-700">{initialEstimate.jobsiteAddress}</p>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </div>

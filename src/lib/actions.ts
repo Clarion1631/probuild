@@ -825,38 +825,41 @@ export async function convertLeadToProject(leadId: string) {
 }
 
 export async function createDraftEstimate(projectId: string) {
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
-
     const estimate = await prisma.estimate.create({
         data: {
             title: "Draft Estimate",
             projectId,
-            code,
+            code: "EST-TEMP",
             status: "Draft",
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
         },
     });
+
+    // Use the DB-assigned autoincrement number for a collision-free code
+    const code = `EST-${String(estimate.number).padStart(5, "0")}`;
+    await prisma.estimate.update({ where: { id: estimate.id }, data: { code } });
 
     revalidatePath(`/projects/${projectId}/estimates`);
     return { id: estimate.id };
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
-
     const estimate = await prisma.estimate.create({
         data: {
             title: "Draft Estimate",
             leadId,
-            code,
+            code: "EST-TEMP",
             status: "Draft",
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
         },
     });
+
+    const code = `EST-${String(estimate.number).padStart(5, "0")}`;
+    await prisma.estimate.update({ where: { id: estimate.id }, data: { code } });
 
     revalidatePath(`/leads/${leadId}`);
     return { id: estimate.id };
@@ -959,10 +962,24 @@ export async function updateEstimateStatus(id: string, status: string, leadId?: 
 }
 
 export async function getEstimateForPortal(id: string) {
+    // IDOR #2 fix: require a resolvable portal session and gate the fetch by
+    // the estimate's owning clientId chain (project.clientId OR lead.clientId).
+    // Before this check, anyone with a guessed estimate id could read it.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return null;
+
+    const ownershipFilter = {
+        id,
+        OR: [
+            { project: { is: { clientId: sessionClientId } } },
+            { lead: { is: { clientId: sessionClientId } } },
+        ],
+    };
+
     let estimate: any;
     try {
-        estimate = await prisma.estimate.findUnique({
-            where: { id },
+        estimate = await prisma.estimate.findFirst({
+            where: ownershipFilter,
             include: {
                 project: { include: { client: true } },
                 lead: { include: { client: true } },
@@ -973,8 +990,8 @@ export async function getEstimateForPortal(id: string) {
     } catch (err) {
         console.error("[getEstimateForPortal] Primary query failed:", err);
         try {
-            estimate = await prisma.estimate.findUnique({
-                where: { id },
+            estimate = await prisma.estimate.findFirst({
+                where: ownershipFilter,
                 select: {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
@@ -1008,6 +1025,7 @@ export async function getEstimateForPortal(id: string) {
         projectName: estimate.project?.name || estimate.lead?.name || null,
         clientName: estimate.project?.client?.name || estimate.lead?.client?.name || "Unknown Client",
         clientEmail: estimate.project?.client?.email || estimate.lead?.client?.email || null,
+        jobsiteAddress: estimate.project?.location || estimate.lead?.location || null,
     }));
 }
 
@@ -1170,17 +1188,47 @@ export async function logPortalVisit(projectId: string, clientName: string) {
     }
 }
 
+/**
+ * Append a system-generated event line (contract sent / viewed / signed) onto the
+ * lead's ClientMessage thread or the project's Message thread, so team members
+ * see the event inline with other messages on the detail page.
+ *
+ * IMPORTANT — field semantics (Codex peer review blocker #3):
+ *
+ * These rows are NOT outbound communications — no email was sent, no SMS went
+ * out. They are system events that happen to share the messaging surface for
+ * display purposes. To avoid corrupting message history and confusing other
+ * subsystems, every field carries a distinct SYSTEM sentinel:
+ *
+ *   - `direction: "SYSTEM"` (not INBOUND/OUTBOUND). Anything filtering on
+ *     real directions skips these cleanly.
+ *   - `channel:   "system"` (not email/sms/both/app). The scheduled-message
+ *     cron filters on `status: "SCHEDULED"` so these will never be re-sent,
+ *     but using a distinct channel also makes them filterable anywhere else.
+ *   - `status:    "SYSTEM"` (not SENT/SCHEDULED/FAILED). Never matched by the
+ *     cron's `SCHEDULED` query; explicit enough for any downstream filter.
+ *   - `sentViaEmail: false`, `sentViaSms: false` — nothing actually went out.
+ *
+ * Client-facing API routes must exclude SYSTEM rows before returning messages
+ * to a portal client (the current routes don't expose ClientMessage to clients,
+ * only to the team, so this is belt-and-suspenders).
+ *
+ * Errors are swallowed on purpose: a system-log write failure must never block
+ * the primary action (contract send / sign / view). Log and move on.
+ */
 async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
     try {
         if (leadId) {
             await prisma.clientMessage.create({
                 data: {
                     leadId,
-                    direction: "OUTBOUND",   // system events are team-side, not client-originating
+                    direction: "SYSTEM",     // distinct from INBOUND/OUTBOUND real messages
                     senderName: "System",
                     body,
-                    channel: "email",
-                    status: "SENT",
+                    channel: "system",       // distinct from email/sms/both/app
+                    status: "SYSTEM",        // never matched by the SCHEDULED cron
+                    sentViaEmail: false,
+                    sentViaSms: false,
                 },
             });
         } else if (projectId) {
@@ -1188,7 +1236,7 @@ async function postActivityToThread(leadId: string | null, projectId: string | n
             await prisma.message.create({
                 data: {
                     threadId: thread.id,
-                    senderType: "TEAM",      // system events are team-side, not client-originating
+                    senderType: "SYSTEM",    // was "TEAM"; distinct from real sender types
                     senderName: "System",
                     body,
                 },
@@ -1316,6 +1364,33 @@ export async function markContractViewed(contractId: string, accessToken?: strin
 }
 
 export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, capturedPdfUrl?: string) {
+    // Codex R2 blocker fix: distinguish internal admin from portal client.
+    // Internal admins (User row with ADMIN/MANAGER role) skip ownership check.
+    // Portal clients (no User row or non-admin role) must prove ownership.
+    const session = await getServerSession(authOptions);
+    if (session?.user?.email) {
+        const internalUser = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { role: true },
+        });
+        const isAdmin = internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
+        if (!isAdmin) {
+            const sessionClientId = await resolveSessionClientId();
+            if (!sessionClientId) return null; // no client match or ambiguous = deny
+            const owned = await prisma.estimate.findFirst({
+                where: {
+                    id: estimateId,
+                    OR: [
+                        { project: { clientId: sessionClientId } },
+                        { lead: { clientId: sessionClientId } },
+                    ],
+                },
+                select: { id: true },
+            });
+            if (!owned) return null;
+        }
+    }
+
     const approvedAt = new Date();
 
     await prisma.estimate.update({
@@ -1618,9 +1693,19 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
 }
 
 export async function getInvoiceForPortal(id: string) {
+    // IDOR-3 fix: gate by portal session's clientId
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return null;
+
     try {
-        const invoice = await prisma.invoice.findUnique({
-            where: { id },
+        const invoice = await prisma.invoice.findFirst({
+            where: {
+                id,
+                OR: [
+                    { clientId: sessionClientId },
+                    { project: { clientId: sessionClientId } },
+                ],
+            },
             include: {
                 project: { include: { client: true } },
                 client: true,
@@ -1845,11 +1930,9 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
     if (!project) throw new Error("Project not found");
 
-    const code = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
-
     const invoice = await prisma.invoice.create({
         data: {
-            code,
+            code: "INV-TEMP",
             projectId: estimate.projectId!,
             clientId: project.clientId,
             status: "Draft",
@@ -1857,6 +1940,10 @@ export async function createInvoiceFromEstimate(estimateId: string) {
             balanceDue: estimate.totalAmount || 0,
         },
     });
+
+    // Use DB-assigned autoincrement for collision-free code
+    const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
+    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
 
     const schedules = await prisma.estimatePaymentSchedule.findMany({
         where: { estimateId },
@@ -1905,11 +1992,10 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
     if (!entries.length) throw new Error("No matching time entries found");
 
     const totalAmount = entries.reduce((sum, e) => sum + (Number(e.laborCost) || 0), 0);
-    const code = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
 
     const invoice = await prisma.invoice.create({
         data: {
-            code,
+            code: "INV-TEMP",
             projectId,
             clientId: project.clientId,
             status: "Draft",
@@ -1917,6 +2003,9 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
             balanceDue: totalAmount,
         },
     });
+
+    const invoiceCode2 = `INV-${String(invoice.number).padStart(5, "0")}`;
+    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode2 } });
 
     // Create one payment schedule entry per time entry as line items
     for (const entry of entries) {
@@ -2146,20 +2235,22 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
         if (!target) throw new Error("Target project not found");
     }
 
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
-
     const newEstimate = await prisma.estimate.create({
         data: {
             title: newTitle?.trim() || `Copy of ${original.title}`,
             projectId: targetProjectId ?? original.projectId,
             leadId: targetProjectId ? null : original.leadId,
-            code,
+            code: "EST-TEMP",
             status: "Draft",
             totalAmount: original.totalAmount,
             balanceDue: original.totalAmount,
             privacy: original.privacy,
         },
     });
+
+    // Use DB-assigned autoincrement for collision-free code
+    const copyCode = `EST-${String(newEstimate.number).padStart(5, "0")}`;
+    await prisma.estimate.update({ where: { id: newEstimate.id }, data: { code: copyCode } });
 
     // Build old-to-new ID mapping for parentId references
     const idMap: Record<string, string> = {};
@@ -2312,19 +2403,20 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
     });
     if (!template) throw new Error("Template not found");
 
-    const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
-
     const estimate = await prisma.estimate.create({
         data: {
             title: template.name,
             projectId,
-            code,
+            code: "EST-TEMP",
             status: "Draft",
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
         },
     });
+
+    const templateCode = `EST-${String(estimate.number).padStart(5, "0")}`;
+    await prisma.estimate.update({ where: { id: estimate.id }, data: { code: templateCode } });
 
     for (const item of template.items) {
         await prisma.estimateItem.create({
@@ -2710,10 +2802,20 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         });
     }
 
+    // GAP-1: Auto-update lead stage to "Estimate Sent" if applicable
+    if (estimate.leadId) {
+        const lead = await prisma.lead.findUnique({ where: { id: estimate.leadId }, select: { stage: true } });
+        const earlyStages = ["New", "Followed Up", "Connected"];
+        if (lead && earlyStages.includes(lead.stage)) {
+            await prisma.lead.update({ where: { id: estimate.leadId }, data: { stage: "Estimate Sent" } });
+        }
+    }
+
     // Revalidate paths
     if (estimate.projectId) revalidatePath(`/projects/${estimate.projectId}/estimates`);
     if (estimate.leadId) revalidatePath(`/leads/${estimate.leadId}`);
     revalidatePath("/estimates");
+    revalidatePath("/leads");
 
     return { success: true, sentTo: recipientEmail };
     } catch (err) {
@@ -2997,8 +3099,22 @@ export async function sendContractToClient(contractId: string) {
 
     // Status/sentAt update is now separate — it does NOT touch accessToken, so it
     // can never clobber a token another writer has already set.
-    await prisma.contract.update({
-        where: { id: contractId },
+    //
+    // ─── Codex round-2 blocker: resend-after-sign race ───
+    // Before this guard, `sendContractToClient` blindly wrote `status: "Sent"`.
+    // A human clicking Resend while the client was mid-sign (or the recurring
+    // cron racing a portal signature) could revert `Signed` → `Sent`, reopening
+    // the contract and defeating the idempotency guard in `approveContract`.
+    // Fix: only transition if the row is still in a pre-sign state. Losing
+    // resends against an already-signed contract become no-ops (we still send
+    // the email so the client gets their link, but we do NOT clobber status).
+    // Recurring contracts that the cron re-arms legitimately re-enter "Sent"
+    // from an earlier "Sent"/"Viewed" cycle — the whitelist includes those.
+    await prisma.contract.updateMany({
+        where: {
+            id: contractId,
+            status: { in: ["Draft", "Sent", "Viewed"] },
+        },
         data: {
             status: "Sent",
             sentAt: new Date(),
@@ -3130,50 +3246,82 @@ export async function approveContract(contractId: string, signatureName: string,
     if (!contract) throw new Error("Contract not found");
 
     const now = new Date();
+    const isRecurring = !!(contract.recurringDays && contract.recurringDays > 0);
 
-    // Always save a signing record for historical audit
-    await prisma.contractSigningRecord.create({
-        data: {
-            contractId,
-            signedBy: signatureName,
-            signedAt: now,
-            signatureUrl: signatureDataUrl || null,
-            userAgent,
-            periodStart: contract.nextDueDate
-                ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
-                : contract.sentAt || contract.createdAt,
-            periodEnd: now,
+    // ─── Atomic state transition (Codex peer review blocker #1) ───
+    // Before this guard, approveContract was not idempotent: two concurrent
+    // requests (email-link retry, portal browser race) could each insert a
+    // ContractSigningRecord and overwrite approvedBy/approvedAt, corrupting
+    // the audit trail of a one-time contract.
+    //
+    // Fix: do the status flip as a conditional `updateMany` that only matches
+    // rows in a signable state. `Signed`/`Finalized` rows are filtered out,
+    // so the second caller gets count=0 and we throw. Insert the signing
+    // record ONLY after this transition wins — losing races never persist.
+    //
+    // Recurring contracts are excepted: they explicitly re-enter the Sent state
+    // on each cycle, so a second sign is legal. For recurring, concurrent sign
+    // races within the same cycle are tolerated as duplicate audit records
+    // (noise, not correctness).
+    // ─── Codex round-2 real-issue: atomicity of transition + audit record ───
+    // The state transition and ContractSigningRecord insert must commit or
+    // abort together. If the record insert failed after the status flip, the
+    // contract would be stuck `Signed` with no audit row, and the guard below
+    // would reject every retry with "not in a signable state" — losing the
+    // audit trail permanently. Wrap both writes in prisma.$transaction so a
+    // downstream failure rolls back the status flip and the client can retry.
+    const periodStart = contract.nextDueDate
+        ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
+        : contract.sentAt || contract.createdAt;
+
+    await prisma.$transaction(async (tx) => {
+        if (!isRecurring) {
+            const transition = await tx.contract.updateMany({
+                where: {
+                    id: contractId,
+                    status: { in: ["Draft", "Sent", "Viewed"] },
+                },
+                data: {
+                    status: "Signed",
+                    approvedBy: signatureName,
+                    approvedAt: now,
+                    approvalUserAgent: userAgent,
+                    signatureUrl: signatureDataUrl || null,
+                },
+            });
+            if (transition.count === 0) {
+                throw new Error("Contract is not in a signable state (already signed or finalized)");
+            }
+        } else {
+            const nextDue = new Date(now.getTime() + contract.recurringDays! * 86400000);
+            await tx.contract.update({
+                where: { id: contractId },
+                data: {
+                    approvedBy: signatureName,
+                    approvedAt: now,
+                    approvalUserAgent: userAgent,
+                    signatureUrl: signatureDataUrl || null,
+                    status: "Sent", // Reset to Sent so it can be signed again next cycle
+                    viewedAt: null,
+                    nextDueDate: nextDue,
+                }
+            });
         }
-    });
 
-    if (contract.recurringDays && contract.recurringDays > 0) {
-        // Recurring contract: save the signature, then reset for next cycle
-        const nextDue = new Date(now.getTime() + contract.recurringDays * 86400000);
-        await prisma.contract.update({
-            where: { id: contractId },
+        // Audit record — inside the same transaction as the state flip, so
+        // a failure here aborts the whole thing and the client can retry.
+        await tx.contractSigningRecord.create({
             data: {
-                approvedBy: signatureName,
-                approvedAt: now,
-                approvalUserAgent: userAgent,
+                contractId,
+                signedBy: signatureName,
+                signedAt: now,
                 signatureUrl: signatureDataUrl || null,
-                status: "Sent", // Reset to Sent so it can be signed again next cycle
-                viewedAt: null,
-                nextDueDate: nextDue,
+                userAgent,
+                periodStart,
+                periodEnd: now,
             }
         });
-    } else {
-        // One-time contract: mark as signed permanently
-        await prisma.contract.update({
-            where: { id: contractId },
-            data: {
-                status: "Signed",
-                approvedBy: signatureName,
-                approvedAt: now,
-                approvalUserAgent: userAgent,
-                signatureUrl: signatureDataUrl || null,
-            }
-        });
-    }
+    });
 
     const settings = await getCompanySettings();
     if (settings.notificationEmail) {
@@ -3207,7 +3355,22 @@ export async function approveContract(contractId: string, signatureName: string,
     );
 
     revalidatePath("/");
-    return { success: true };
+
+    // GAP-3: Check if the linked estimate has payment schedules → signal UI to prompt deposit invoice
+    let depositReady = false;
+    let linkedEstimateId: string | null = null;
+    if (contract.projectId) {
+        const linkedEstimate = await prisma.estimate.findFirst({
+            where: { projectId: contract.projectId, status: "Approved" },
+            include: { paymentSchedules: { where: { status: "Pending" }, take: 1 } },
+        });
+        if (linkedEstimate && linkedEstimate.paymentSchedules.length > 0) {
+            depositReady = true;
+            linkedEstimateId = linkedEstimate.id;
+        }
+    }
+
+    return { success: true, depositReady, linkedEstimateId };
 }
 
 export async function getContractSigningHistory(contractId: string) {
@@ -4054,8 +4217,6 @@ export async function saveSubcontractorExplicitProjects(subId: string, projectId
 
 export async function createChangeOrder(projectId: string, estimateId: string, itemIds?: string[]) {
     "use server";
-    const count = await prisma.changeOrder.count({ where: { projectId } });
-    const code = `CO-${Math.floor(1000 + Math.random() * 9000)}`;
 
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
@@ -4068,10 +4229,13 @@ export async function createChangeOrder(projectId: string, estimateId: string, i
             title: `Change Order for ${estimate.title}`,
             projectId,
             estimateId,
-            code,
+            code: "CO-TEMP",
             status: "Draft",
         }
     });
+
+    const coCode = `CO-${String(changeOrder.number).padStart(5, "0")}`;
+    await prisma.changeOrder.update({ where: { id: changeOrder.id }, data: { code: coCode } });
 
     if (itemIds && itemIds.length > 0) {
         const selectedItems = estimate.items.filter(i => itemIds.includes(i.id));
@@ -4121,6 +4285,26 @@ export async function getChangeOrder(id: string) {
     });
 }
 
+export async function getChangeOrderForPortal(id: string) {
+    "use server";
+    // IDOR-4 fix: gate by portal session's clientId
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return null;
+
+    return await prisma.changeOrder.findFirst({
+        where: {
+            id,
+            project: { clientId: sessionClientId },
+        },
+        include: {
+            project: { include: { client: true } },
+            estimate: { select: { title: true, code: true } },
+            items: { orderBy: { order: "asc" } },
+            paymentSchedules: { orderBy: { order: "asc" } }
+        }
+    });
+}
+
 export async function updateChangeOrder(id: string, data: any) {
     "use server";
     const co = await prisma.changeOrder.update({
@@ -4152,6 +4336,25 @@ export async function updateChangeOrderStatus(id: string, status: string, projec
 
 export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     "use server";
+    // Codex R2 blocker fix: distinguish internal admin from portal client.
+    const session = await getServerSession(authOptions);
+    if (session?.user?.email) {
+        const internalUser = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { role: true },
+        });
+        const isAdmin = internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
+        if (!isAdmin) {
+            const sessionClientId = await resolveSessionClientId();
+            if (!sessionClientId) return null;
+            const owned = await prisma.changeOrder.findFirst({
+                where: { id, project: { clientId: sessionClientId } },
+                select: { id: true },
+            });
+            if (!owned) return null;
+        }
+    }
+
     const approvedAt = new Date();
     const co = await prisma.changeOrder.update({
         where: { id },
@@ -4166,6 +4369,82 @@ export async function approveChangeOrder(id: string, signatureName: string, user
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
+}
+
+export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+    "use server";
+    const co = await prisma.changeOrder.findUnique({
+        where: { id: changeOrderId },
+        include: {
+            project: { include: { client: true } },
+            items: { orderBy: { order: "asc" } },
+        }
+    });
+
+    if (!co) return { success: false, error: "Change order not found" };
+    const client = co.project?.client;
+    if (!client?.email) return { success: false, error: "Client has no email address" };
+
+    // Update status to Sent (only if still in Draft or Sent state)
+    await prisma.changeOrder.updateMany({
+        where: { id: changeOrderId, status: { in: ["Draft", "Sent"] } },
+        data: { status: "Sent", sentAt: new Date() }
+    });
+
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+    const portalUrl = `${appUrl}/portal/change-orders/${changeOrderId}`;
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const companyName = settings?.companyName || "Your Contractor";
+
+    await sendNotification(
+        client.email,
+        `${companyName} sent you a change order to review`,
+        `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Change Order for Your Review</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    ${companyName} has sent you a change order titled "<strong>${co.title}</strong>" for project <strong>${co.project?.name || "your project"}</strong>.
+                    Please review the scope changes and approve or decline.
+                </p>
+                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
+                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(co.totalAmount)}</div>
+                </div>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        Review Change Order
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center;">
+                    Or copy this link: ${portalUrl}
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                Sent via ProBuild &bull; ${companyName}
+            </p>
+        </body>
+        </html>`,
+        undefined,
+        { fromName: companyName, replyTo: settings?.email || undefined }
+    );
+
+    // Log activity
+    await logActivity({
+        projectId: co.projectId,
+        actorType: "TEAM",
+        actorName: companyName,
+        action: "sent_change_order",
+        entityType: "change_order",
+        entityId: changeOrderId,
+        entityName: `Change Order ${co.code || co.title}`,
+    });
+
+    revalidatePath(`/projects/${co.projectId}/change-orders/${changeOrderId}`);
+    revalidatePath(`/projects/${co.projectId}/change-orders`);
+    return { success: true, sentTo: client.email };
 }
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
