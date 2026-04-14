@@ -46,8 +46,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         const pdf = new jsPDF("p", "mm", "a4");
         const pageW = pdf.internal.pageSize.getWidth();   // 210 mm
         const pageH = pdf.internal.pageSize.getHeight();  // 297 mm
-        const marginTop = 8;      // mm gap at top of each page
-        const marginBottom = 12;  // mm gap at bottom (room for page number)
+        const marginTop = 10;     // mm gap at top of each page
+        const marginBottom = 14;  // mm gap at bottom (room for page number + buffer)
         const usableH = pageH - marginTop - marginBottom;
 
         // Load into an Image so we can canvas-slice it per page
@@ -319,7 +319,10 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
             {/* Document Container */}
             <div className={`max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
-                <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.06)] border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+
+                    {/* Premium top accent bar — matches estimate editor */}
+                    <div className="h-1.5 w-full bg-slate-800"></div>
 
                     {/* Document Header */}
                     <div className="px-10 pt-10 pb-8 border-b border-slate-200">
@@ -397,66 +400,77 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </div>
                     )}
 
-                    {/* Line Items Table */}
-                    <div className="px-10 py-8">
-                        <table className="w-full text-sm">
-                            <thead>
-                                <tr className="border-b-2 border-slate-200">
-                                    <th className="text-left py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider">Description</th>
-                                    <th className="text-center py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-20">Qty</th>
-                                    <th className="text-right py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-28">Unit Price</th>
-                                    <th className="text-right py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-28">Amount</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-100">
-                                {items.map((item: any) => {
-                                    const hasSubItems = item.subItems && item.subItems.length > 0;
-                                    const itemTotal = calculateTotal(item);
+                    {/* Line Items — editor-matched layout */}
+                    <div className="bg-white">
+                        {/* Column headers */}
+                        <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-3.5 uppercase tracking-wider">
+                            <div className="flex-1">Item Description</div>
+                            <div className="w-20 text-right">Qty</div>
+                            <div className="w-32 text-right">Unit Price</div>
+                            <div className="w-32 text-right">Amount</div>
+                        </div>
+
+                        <div className="divide-y divide-slate-100">
+                            {items.map((item: any) => {
+                                const hasSubItems = item.subItems && item.subItems.length > 0;
+                                const itemTotal = calculateTotal(item);
+
+                                if (hasSubItems) {
                                     return (
                                         <React.Fragment key={item.id}>
-                                            <tr className={hasSubItems ? "bg-slate-50/50" : ""}>
-                                                <td className="py-3">
-                                                    <div className="font-medium text-slate-800">{item.name}</div>
-                                                    {item.description && <div className="text-xs text-slate-500 mt-0.5">{item.description}</div>}
-                                                </td>
-                                                <td className="py-3 text-center text-slate-600">{!hasSubItems ? item.quantity : ""}</td>
-                                                <td className="py-3 text-right text-slate-600">{!hasSubItems ? formatCurrency(item.unitCost) : ""}</td>
-                                                <td className="py-3 text-right font-medium text-slate-800">{formatCurrency(itemTotal)}</td>
-                                            </tr>
-                                            {hasSubItems && item.subItems.map((sub: any) => (
-                                                <tr key={sub.id}>
-                                                    <td className="py-2.5 pl-6">
-                                                        <div className="text-slate-600 flex items-center gap-1">
-                                                            <span className="text-slate-300">└</span> {sub.name}
-                                                        </div>
-                                                        {sub.description && <div className="text-xs text-slate-400 ml-5 mt-0.5">{sub.description}</div>}
-                                                    </td>
-                                                    <td className="py-2.5 text-center text-slate-500">{sub.quantity}</td>
-                                                    <td className="py-2.5 text-right text-slate-500">{formatCurrency(sub.unitCost)}</td>
-                                                    <td className="py-2.5 text-right text-slate-700">{formatCurrency(sub.total)}</td>
-                                                </tr>
+                                            {/* Category header — matches editor section style */}
+                                            <div className="flex items-center px-4 py-3 bg-slate-100 border-l-4 border-slate-700">
+                                                <div className="flex-1 font-semibold text-sm text-slate-800 pl-4">{item.name}</div>
+                                                <div className="w-20"></div>
+                                                <div className="w-32"></div>
+                                                <div className="w-32 text-right font-semibold text-sm text-slate-700 pr-8">{formatCurrency(itemTotal)}</div>
+                                            </div>
+                                            {/* Sub-items — indented */}
+                                            {item.subItems.map((sub: any) => (
+                                                <div key={sub.id} className="flex items-start bg-slate-50/30 border-l-2 border-transparent ml-8">
+                                                    <div className="flex-1 py-2.5 pl-8">
+                                                        <div className="text-sm text-slate-700">{sub.name}</div>
+                                                        {sub.description && <div className="text-xs text-slate-400 mt-0.5 leading-relaxed">{sub.description}</div>}
+                                                    </div>
+                                                    <div className="w-20 py-2.5 text-right text-sm text-slate-500">{sub.quantity}</div>
+                                                    <div className="w-32 py-2.5 text-right text-sm text-slate-500 pr-2">{formatCurrency(sub.unitCost)}</div>
+                                                    <div className="w-32 py-2.5 text-right text-sm font-medium text-slate-700 pr-8">{formatCurrency(Number(sub.total))}</div>
+                                                </div>
                                             ))}
                                         </React.Fragment>
                                     );
-                                })}
-                            </tbody>
-                        </table>
+                                }
 
-                        {/* Totals */}
-                        <div className="flex justify-end mt-6">
-                            <div className="w-72">
-                                <div className="flex justify-between py-2 text-sm text-slate-600">
-                                    <span>Subtotal</span>
-                                    <span>{formatCurrency(subtotal)}</span>
-                                </div>
-                                <div className="flex justify-between py-2 text-sm text-slate-600">
-                                    <span>Tax (8.8%)</span>
-                                    <span>{formatCurrency(tax)}</span>
-                                </div>
-                                <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-slate-800">
-                                    <span>Total</span>
-                                    <span>{formatCurrency(total)}</span>
-                                </div>
+                                // Standalone item
+                                return (
+                                    <div key={item.id} className="flex items-start px-8 py-3 bg-white">
+                                        <div className="flex-1">
+                                            <div className="text-sm font-medium text-slate-800">{item.name}</div>
+                                            {item.description && <div className="text-xs text-slate-500 mt-0.5 leading-relaxed">{item.description}</div>}
+                                        </div>
+                                        <div className="w-20 text-right text-sm text-slate-600 pt-0.5">{item.quantity}</div>
+                                        <div className="w-32 text-right text-sm text-slate-600 pt-0.5">{formatCurrency(item.unitCost)}</div>
+                                        <div className="w-32 text-right text-sm font-semibold text-slate-800 pt-0.5">{formatCurrency(itemTotal)}</div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    {/* Totals */}
+                    <div className="px-10 py-8 border-t border-slate-100 flex justify-end">
+                        <div className="w-72 space-y-2 text-sm">
+                            <div className="flex justify-between text-slate-500 font-medium">
+                                <span>Subtotal</span>
+                                <span className="text-slate-800">{formatCurrency(subtotal)}</span>
+                            </div>
+                            <div className="flex justify-between text-slate-500 font-medium">
+                                <span>Tax (8.8%)</span>
+                                <span className="text-slate-800">{formatCurrency(tax)}</span>
+                            </div>
+                            <div className="border-t-2 border-slate-800 pt-3 mt-1 flex justify-between text-lg font-bold text-slate-800">
+                                <span>Total</span>
+                                <span>{formatCurrency(total)}</span>
                             </div>
                         </div>
                     </div>
