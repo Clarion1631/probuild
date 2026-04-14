@@ -72,6 +72,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
     const [history, setHistory] = useState<Array<{ ts: number; label: string; snapshot: any[] }>>([]);
     const [showHistory, setShowHistory] = useState(false);
+    const [expandedHistoryTs, setExpandedHistoryTs] = useState<number | null>(null);
 
     // Derived: sum of children totals per section header
     const sectionTotals = useMemo(() => {
@@ -555,10 +556,22 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     }
 
     function revertToHistory(entry: { ts: number; label: string; snapshot: any[] }) {
-        if (!confirm(`Revert to "${entry.label}"? Unsaved changes will be lost.`)) return;
         setItems(entry.snapshot);
-        setShowHistory(false);
+        setExpandedHistoryTs(null);
         toast.success(`Reverted to ${entry.label}`);
+    }
+
+    function diffSnapshots(prev: any[], curr: any[]) {
+        const prevMap = new Map(prev.map(i => [i.id, i]));
+        const currMap = new Map(curr.map(i => [i.id, i]));
+        const added   = curr.filter(i => !prevMap.has(i.id) && i.name?.trim());
+        const removed = prev.filter(i => !currMap.has(i.id) && i.name?.trim());
+        const changed = curr.filter(i => {
+            const p = prevMap.get(i.id);
+            if (!p || !i.name?.trim()) return false;
+            return p.name !== i.name || String(p.quantity) !== String(i.quantity) || String(p.unitCost) !== String(i.unitCost);
+        });
+        return { added, removed, changed };
     }
 
     function makeBlankItem(parentId: string | null) {
@@ -2029,30 +2042,81 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     )}
 
                     {sidebarTab === "history" && (
-                        <div className="p-4 space-y-3 flex-1 overflow-y-auto">
-                            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Saved Snapshots</p>
+                        <div className="p-4 space-y-2 flex-1 overflow-y-auto">
+                            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3">Saved Snapshots</p>
                             {history.length === 0 ? (
                                 <div className="text-center py-10">
                                     <svg className="w-8 h-8 text-slate-200 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                     <p className="text-xs text-slate-400">No history yet. Save the estimate to create a snapshot.</p>
                                 </div>
                             ) : (
-                                history.map((entry, i) => (
-                                    <div key={entry.ts} className="bg-slate-50 border border-slate-100 rounded-lg p-3 hover:border-indigo-200 hover:bg-indigo-50/30 transition group">
-                                        <div className="flex items-start justify-between gap-2">
-                                            <div>
-                                                <p className="text-xs font-semibold text-slate-700">{entry.label}</p>
-                                                <p className="text-[10px] text-slate-400 mt-0.5">{entry.snapshot.length} items</p>
-                                            </div>
+                                history.map((entry) => {
+                                    const isOpen = expandedHistoryTs === entry.ts;
+                                    const diff = diffSnapshots(entry.snapshot, items);
+                                    const hasChanges = diff.added.length + diff.removed.length + diff.changed.length > 0;
+                                    return (
+                                        <div key={entry.ts} className={`border rounded-lg overflow-hidden transition ${isOpen ? "border-indigo-300 shadow-sm" : "border-slate-100"}`}>
                                             <button
-                                                onClick={() => revertToHistory(entry)}
-                                                className="text-[10px] font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition"
+                                                onClick={() => setExpandedHistoryTs(isOpen ? null : entry.ts)}
+                                                className="w-full flex items-start justify-between gap-2 px-3 py-2.5 text-left hover:bg-slate-50 transition"
                                             >
-                                                Revert
+                                                <div>
+                                                    <p className="text-xs font-semibold text-slate-700">{entry.label}</p>
+                                                    <p className="text-[10px] text-slate-400 mt-0.5 flex gap-2">
+                                                        <span>{entry.snapshot.length} items</span>
+                                                        {hasChanges && (
+                                                            <span className="flex gap-1.5">
+                                                                {diff.added.length > 0 && <span className="text-green-600">+{diff.added.length}</span>}
+                                                                {diff.removed.length > 0 && <span className="text-red-500">−{diff.removed.length}</span>}
+                                                                {diff.changed.length > 0 && <span className="text-amber-500">~{diff.changed.length}</span>}
+                                                            </span>
+                                                        )}
+                                                        {!hasChanges && <span className="text-slate-300">(current)</span>}
+                                                    </p>
+                                                </div>
+                                                <svg className={`w-3.5 h-3.5 text-slate-400 mt-0.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
                                             </button>
+                                            {isOpen && (
+                                                <div className="border-t border-slate-100 bg-slate-50 px-3 pb-3 pt-2 space-y-2">
+                                                    {!hasChanges && <p className="text-[10px] text-slate-400 italic">No differences from current state.</p>}
+                                                    {diff.added.length > 0 && (
+                                                        <div>
+                                                            <p className="text-[10px] font-semibold text-green-700 uppercase mb-1">Added (since this snapshot)</p>
+                                                            {diff.added.map((i: any) => <p key={i.id} className="text-[11px] text-green-700 bg-green-50 rounded px-2 py-0.5 mb-0.5">+ {i.name || "(unnamed)"}</p>)}
+                                                        </div>
+                                                    )}
+                                                    {diff.removed.length > 0 && (
+                                                        <div>
+                                                            <p className="text-[10px] font-semibold text-red-600 uppercase mb-1">Removed (since this snapshot)</p>
+                                                            {diff.removed.map((i: any) => <p key={i.id} className="text-[11px] text-red-600 bg-red-50 rounded px-2 py-0.5 mb-0.5">− {i.name || "(unnamed)"}</p>)}
+                                                        </div>
+                                                    )}
+                                                    {diff.changed.length > 0 && (
+                                                        <div>
+                                                            <p className="text-[10px] font-semibold text-amber-700 uppercase mb-1">Modified</p>
+                                                            {diff.changed.map((i: any) => {
+                                                                const prev = entry.snapshot.find((p: any) => p.id === i.id);
+                                                                return (
+                                                                    <div key={i.id} className="text-[11px] text-amber-800 bg-amber-50 rounded px-2 py-1 mb-0.5">
+                                                                        <span className="font-medium">{i.name}</span>
+                                                                        {prev && String(prev.quantity) !== String(i.quantity) && <span className="text-slate-500"> qty {prev.quantity}→{i.quantity}</span>}
+                                                                        {prev && String(prev.unitCost) !== String(i.unitCost) && <span className="text-slate-500"> ${prev.unitCost}→${i.unitCost}</span>}
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                    <button
+                                                        onClick={() => revertToHistory(entry)}
+                                                        className="mt-1 w-full text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded px-3 py-1.5 transition"
+                                                    >
+                                                        Revert to this snapshot
+                                                    </button>
+                                                </div>
+                                            )}
                                         </div>
-                                    </div>
-                                ))
+                                    );
+                                })
                             )}
                         </div>
                     )}

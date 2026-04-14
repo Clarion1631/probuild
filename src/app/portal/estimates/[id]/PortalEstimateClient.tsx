@@ -39,21 +39,69 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     async function buildPdf(element: HTMLElement): Promise<import("jspdf").jsPDF> {
         const { toJpeg } = await import("html-to-image");
         const { jsPDF } = await import("jspdf");
-        const imgData = await toJpeg(element, { quality: 0.85, pixelRatio: 1.5 });
+
+        // Render full element at 2× pixel ratio for sharp text
+        const imgData = await toJpeg(element, { quality: 0.95, pixelRatio: 2 });
+
         const pdf = new jsPDF("p", "mm", "a4");
-        const pdfWidth = pdf.internal.pageSize.getWidth();
-        const pdfPageHeight = pdf.internal.pageSize.getHeight();
-        const imgRenderedHeight = (element.offsetHeight * pdfWidth) / element.offsetWidth;
-        let heightLeft = imgRenderedHeight;
-        let position = 0;
-        pdf.addImage(imgData, "JPEG", 0, position, pdfWidth, imgRenderedHeight);
-        heightLeft -= pdfPageHeight;
-        while (heightLeft > 0) {
-            position -= pdfPageHeight;
-            pdf.addPage();
-            pdf.addImage(imgData, "JPEG", 0, position, pdfWidth, imgRenderedHeight);
-            heightLeft -= pdfPageHeight;
+        const pageW = pdf.internal.pageSize.getWidth();   // 210 mm
+        const pageH = pdf.internal.pageSize.getHeight();  // 297 mm
+        const marginTop = 8;      // mm gap at top of each page
+        const marginBottom = 12;  // mm gap at bottom (room for page number)
+        const usableH = pageH - marginTop - marginBottom;
+
+        // Load into an Image so we can canvas-slice it per page
+        const img = new Image();
+        img.src = imgData;
+        await new Promise<void>((resolve, reject) => {
+            img.onload = () => resolve();
+            img.onerror = () => reject(new Error("img load failed"));
+        });
+
+        // px per mm — img.width = element.offsetWidth × pixelRatio (2)
+        const pxPerMm = img.width / pageW;
+        const usableHPx = usableH * pxPerMm;
+        const totalPages = Math.ceil(img.height / usableHPx);
+
+        for (let page = 0; page < totalPages; page++) {
+            if (page > 0) pdf.addPage();
+
+            const srcY = Math.round(page * usableHPx);
+            const srcH = Math.min(Math.ceil(usableHPx), img.height - srcY);
+            const renderH = srcH / pxPerMm; // back to mm for addImage
+
+            // Slice this page's strip from the full render
+            const slice = document.createElement("canvas");
+            slice.width = img.width;
+            slice.height = srcH;
+            const ctx = slice.getContext("2d")!;
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, slice.width, slice.height);
+            ctx.drawImage(img, 0, srcY, img.width, srcH, 0, 0, img.width, srcH);
+            const sliceData = slice.toDataURL("image/jpeg", 0.92);
+
+            pdf.addImage(sliceData, "JPEG", 0, marginTop, pageW, renderH);
+
+            // Page number centred at the very bottom
+            pdf.setFont("helvetica", "normal");
+            pdf.setFontSize(8);
+            pdf.setTextColor(160, 160, 160);
+            pdf.text(`Page ${page + 1} of ${totalPages}`, pageW / 2, pageH - 4, { align: "center" });
+
+            // Continuation header on pages 2+
+            if (page > 0) {
+                pdf.setFillColor(248, 249, 250);
+                pdf.rect(0, 0, pageW, marginTop - 1, "F");
+                pdf.setFont("helvetica", "bold");
+                pdf.setFontSize(7);
+                pdf.setTextColor(110, 110, 110);
+                pdf.text(
+                    `${companyName}  •  Estimate ${initialEstimate.code}  (continued)`,
+                    pageW / 2, 5.5, { align: "center" }
+                );
+            }
         }
+
         return pdf;
     }
 
