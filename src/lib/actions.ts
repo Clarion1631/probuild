@@ -962,24 +962,84 @@ export async function updateEstimateStatus(id: string, status: string, leadId?: 
 }
 
 export async function getEstimateForPortal(id: string) {
-    // IDOR #2 fix: require a resolvable portal session and gate the fetch by
-    // the estimate's owning clientId chain (project.clientId OR lead.clientId).
-    // Before this check, anyone with a guessed estimate id could read it.
-    const sessionClientId = await resolveSessionClientId();
-    if (!sessionClientId) return null;
+    // Staff members (any user with a role on their session) can preview any estimate.
+    // Portal clients must pass the IDOR ownership check below.
+    const staffSession = await getServerSession(authOptions);
+    const isStaff = !!(staffSession?.user as any)?.role;
 
-    const ownershipFilter = {
-        id,
-        OR: [
-            { project: { is: { clientId: sessionClientId } } },
-            { lead: { is: { clientId: sessionClientId } } },
-        ],
-    };
+    if (!isStaff) {
+        // IDOR #2 fix: require a resolvable portal session and gate the fetch by
+        // the estimate's owning clientId chain (project.clientId OR lead.clientId).
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
 
+        // Restrict the query to the client's own estimates below
+        const ownershipFilter = {
+            id,
+            OR: [
+                { project: { is: { clientId: sessionClientId } } },
+                { lead: { is: { clientId: sessionClientId } } },
+            ],
+        };
+
+        let estimate: any;
+        try {
+            estimate = await prisma.estimate.findFirst({
+                where: ownershipFilter,
+                include: {
+                    project: { include: { client: true } },
+                    lead: { include: { client: true } },
+                    items: { orderBy: { order: "asc" } },
+                    paymentSchedules: { orderBy: { order: "asc" } },
+                },
+            });
+        } catch (err) {
+            console.error("[getEstimateForPortal] Primary query failed:", err);
+            try {
+                estimate = await prisma.estimate.findFirst({
+                    where: ownershipFilter,
+                    select: {
+                        id: true, number: true, title: true, projectId: true, leadId: true,
+                        code: true, status: true, privacy: true, createdAt: true,
+                        totalAmount: true, balanceDue: true,
+                        approvedBy: true, approvedAt: true,
+                        approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
+                        project: { include: { client: true } },
+                        lead: { include: { client: true } },
+                        items: {
+                            orderBy: { order: "asc" },
+                            select: {
+                                id: true, estimateId: true, name: true, description: true, type: true,
+                                quantity: true, baseCost: true, markupPercent: true, unitCost: true,
+                                total: true, order: true, parentId: true,
+                                costCodeId: true, costTypeId: true, createdAt: true,
+                            },
+                        },
+                        paymentSchedules: { orderBy: { order: "asc" } },
+                    },
+                });
+            } catch (fallbackErr) {
+                console.error("[getEstimateForPortal] Fallback query also failed:", fallbackErr);
+                return null;
+            }
+        }
+
+        if (!estimate) return null;
+
+        return JSON.parse(JSON.stringify({
+            ...estimate,
+            projectName: estimate.project?.name || estimate.lead?.name || null,
+            clientName: estimate.project?.client?.name || estimate.lead?.client?.name || "Unknown Client",
+            clientEmail: estimate.project?.client?.email || estimate.lead?.client?.email || null,
+            jobsiteAddress: estimate.project?.location || estimate.lead?.location || null,
+        }));
+    }
+
+    // Staff path: no ownership restriction — just fetch by id
     let estimate: any;
     try {
         estimate = await prisma.estimate.findFirst({
-            where: ownershipFilter,
+            where: { id },
             include: {
                 project: { include: { client: true } },
                 lead: { include: { client: true } },
@@ -991,7 +1051,7 @@ export async function getEstimateForPortal(id: string) {
         console.error("[getEstimateForPortal] Primary query failed:", err);
         try {
             estimate = await prisma.estimate.findFirst({
-                where: ownershipFilter,
+                where: { id },
                 select: {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
