@@ -3,6 +3,7 @@
 import { useState, useRef } from "react";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { internalBudget, bufferPercent, bufferColor, bufferBgColor } from "@/lib/budget-math";
 
 export default function ExpensesTab({ estimateId, projectId, items }: { estimateId: string, projectId: string, items: any[] }) {
     const [expenses, setExpenses] = useState<any[]>(items.flatMap(item => item.expenses || []));
@@ -153,11 +154,39 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
     }
 
     // Calculate Variance By Item
-    const varianceByItem = items.reduce((acc, item) => {
+    const varianceByItem = items.reduce((acc: any[], item: any) => {
         const itemExpenses = expenses.filter(e => e.itemId === item.id);
-        const actualCost = itemExpenses.reduce((sum, e) => sum + e.amount, 0);
-        const budgetedCost = Number(item.quantity || 0) * Number(item.unitCost || 0);
-        acc.push({ ...item, actualCost, budgetedCost, variance: budgetedCost - actualCost });
+        const actualCost = itemExpenses.reduce((sum: number, e: any) => sum + e.amount, 0);
+        const budget = internalBudget({
+            budgetQuantity: item.budgetQuantity,
+            quantity: item.quantity || 0,
+            budgetRate: item.budgetRate,
+            baseCost: item.baseCost,
+        });
+        const budgetedCost = budget ?? 0;
+        const sellPrice = Number(item.quantity || 0) * Number(item.unitCost || 0);
+        const buffer = bufferPercent({
+            quantity: item.quantity || 0,
+            unitCost: item.unitCost || 0,
+            budgetQuantity: item.budgetQuantity,
+            budgetRate: item.budgetRate,
+            baseCost: item.baseCost,
+        });
+        const poAmount = item.purchaseOrder ? Number(item.purchaseOrder.totalAmount) : null;
+        const poCode = item.purchaseOrder?.code || null;
+        const poVendor = item.purchaseOrder?.vendor?.name || null;
+
+        acc.push({
+            ...item,
+            actualCost,
+            budgetedCost,
+            sellPrice,
+            buffer,
+            poAmount,
+            poCode,
+            poVendor,
+            variance: budgetedCost - actualCost,
+        });
         return acc;
     }, []);
 
@@ -194,7 +223,7 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
 
             {/* Variance Overview */}
             <div className="space-y-4">
-                <div className="grid grid-cols-3 gap-6">
+                <div className="grid grid-cols-5 gap-6">
                     <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
                         <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">Total Budget</p>
                         <p className="text-3xl font-extrabold text-slate-800">{formatCurrency(totalBudget)}</p>
@@ -207,6 +236,34 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                         <p className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${totalVariance >= 0 ? "text-emerald-600" : "text-red-600"}`}>Variance</p>
                         <p className={`text-3xl font-extrabold ${totalVariance >= 0 ? "text-emerald-700" : "text-red-700"}`}>
                             {totalVariance >= 0 ? "+" : "-"}{formatCurrency(Math.abs(totalVariance))}
+                        </p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
+                        <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">PO Committed</p>
+                        <p className="text-3xl font-extrabold text-slate-800">
+                            {formatCurrency(varianceByItem.reduce((sum: number, item: any) => sum + (item.poAmount || 0), 0))}
+                        </p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
+                        <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">Avg Buffer</p>
+                        <p className={`text-3xl font-extrabold ${bufferColor(
+                            (() => {
+                                const withBuffer = varianceByItem.filter((i: any) => i.buffer != null);
+                                if (withBuffer.length === 0) return null;
+                                const totalSell = withBuffer.reduce((s: number, i: any) => s + i.sellPrice, 0);
+                                if (totalSell === 0) return null;
+                                const totalBudget = withBuffer.reduce((s: number, i: any) => s + i.budgetedCost, 0);
+                                return ((totalSell - totalBudget) / totalSell) * 100;
+                            })()
+                        )}`}>
+                            {(() => {
+                                const withBuffer = varianceByItem.filter((i: any) => i.buffer != null);
+                                if (withBuffer.length === 0) return "—";
+                                const totalSell = withBuffer.reduce((s: number, i: any) => s + i.sellPrice, 0);
+                                if (totalSell === 0) return "—";
+                                const totalBudget = withBuffer.reduce((s: number, i: any) => s + i.budgetedCost, 0);
+                                return `${(((totalSell - totalBudget) / totalSell) * 100).toFixed(1)}%`;
+                            })()}
                         </p>
                     </div>
                 </div>
@@ -238,23 +295,47 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                 <div className="px-8 py-5 border-b border-slate-100 bg-slate-50/50">
                     <h3 className="font-bold text-slate-800 tracking-tight">Cost Breakdown by Phase</h3>
                 </div>
+                <div className="flex text-[10px] font-bold text-slate-400 uppercase tracking-wider px-6 py-3 border-b border-slate-100">
+                    <div className="w-[20%]">Phase</div>
+                    <div className="w-[13%] text-right">Internal Budget</div>
+                    <div className="w-[13%] text-right">PO / Sub</div>
+                    <div className="w-[13%] text-right">Sell Price</div>
+                    <div className="w-[10%] text-right">Buffer</div>
+                    <div className="w-[13%] text-right">Actual</div>
+                    <div className="w-[10%] text-right">Variance</div>
+                </div>
                 <div className="divide-y divide-slate-50">
                     {varianceByItem.map((item: any) => (
                         <div key={item.id} className="p-4 px-6 flex items-center justify-between hover:bg-slate-50">
-                            <div className="w-1/3">
+                            <div className="w-[20%]">
                                 <p className="font-medium text-slate-800">{item.name}</p>
                                 <p className="text-xs text-slate-500">{item.type}</p>
                             </div>
-                            <div className="w-1/6 text-right">
-                                <p className="text-xs text-slate-500 mb-1">Budget</p>
-                                <p className="text-sm font-medium">{formatCurrency(item.budgetedCost)}</p>
+                            <div className="w-[13%] text-right">
+                                <p className="text-sm font-medium">{item.budgetedCost > 0 ? formatCurrency(item.budgetedCost) : "—"}</p>
                             </div>
-                            <div className="w-1/6 text-right">
-                                <p className="text-xs text-slate-500 mb-1">Actual</p>
+                            <div className="w-[13%] text-right">
+                                {item.poCode ? (
+                                    <div>
+                                        <p className="text-sm font-medium">{formatCurrency(item.poAmount)}</p>
+                                        <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-medium">{item.poCode}</span>
+                                    </div>
+                                ) : (
+                                    <p className="text-sm text-slate-300">—</p>
+                                )}
+                            </div>
+                            <div className="w-[13%] text-right">
+                                <p className="text-sm font-medium">{formatCurrency(item.sellPrice)}</p>
+                            </div>
+                            <div className="w-[10%] text-right">
+                                <p className={`text-sm font-bold ${bufferColor(item.buffer)}`}>
+                                    {item.buffer != null ? `${item.buffer.toFixed(1)}%` : "—"}
+                                </p>
+                            </div>
+                            <div className="w-[13%] text-right">
                                 <p className="text-sm font-medium">{formatCurrency(item.actualCost)}</p>
                             </div>
-                            <div className="w-1/6 text-right">
-                                <p className="text-xs text-slate-500 mb-1">Variance</p>
+                            <div className="w-[10%] text-right">
                                 <p className={`text-sm font-bold ${item.variance >= 0 ? "text-green-600" : "text-red-600"}`}>
                                     {formatCurrency(item.variance)}
                                 </p>

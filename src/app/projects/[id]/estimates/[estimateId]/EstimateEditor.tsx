@@ -4,7 +4,7 @@
 const rm = (n: number) => Math.round(n * 100) / 100;
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -15,6 +15,9 @@ import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import ReusableSignaturePad from "@/components/ReusableSignaturePad";
 import DocumentComments from "@/components/DocumentComments";
+import BudgetStrip from "./BudgetStrip";
+import POQuickCreateModal from "./POQuickCreateModal";
+import { internalBudget } from "@/lib/budget-math";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
@@ -73,6 +76,10 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [history, setHistory] = useState<Array<{ ts: number; label: string; snapshot: any[] }>>([]);
     const [showHistory, setShowHistory] = useState(false);
     const [expandedHistoryTs, setExpandedHistoryTs] = useState<number | null>(null);
+    const [poCreateItemId, setPOCreateItemId] = useState<string | null>(null);
+    const [poLinkItemId, setPOLinkItemId] = useState<string | null>(null);
+    const [projectPOs, setProjectPOs] = useState<any[]>([]);
+    const [loadingPOs, setLoadingPOs] = useState(false);
 
     // Derived: sum of children totals per section header
     const sectionTotals = useMemo(() => {
@@ -414,7 +421,12 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
-    const subtotal = items.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
+    // Subtotal from leaf items only (sections would double-count)
+    const subtotal = items.reduce((acc, item) => {
+        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+        if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+        return acc;
+    }, 0);
     const taxRate = defaultTax ? defaultTax.rate / 100 : 0.088;
     const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
@@ -438,7 +450,12 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     }, [total]);
 
     // Internal margin calculations
-    const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
+    // Base cost from leaf items only (sections would double-count)
+    const totalBaseCost = items.reduce((acc, item) => {
+        if (item.parentId) return acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0));
+        if (!items.some((i: any) => i.parentId === item.id)) return acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0));
+        return acc;
+    }, 0);
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
@@ -732,6 +749,42 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         const itemToRemove = items[index];
         // Also remove children if it's a parent
         setItems(items.filter((item, i) => i !== index && item.parentId !== itemToRemove.id));
+    }
+
+    async function handleLinkPO(itemId: string) {
+        setPOLinkItemId(itemId);
+        if (context.type !== "project") return;
+        setLoadingPOs(true);
+        try {
+            const pos = await getProjectPurchaseOrdersForLinking(context.id);
+            setProjectPOs(pos);
+        } catch { toast.error("Failed to load purchase orders"); }
+        finally { setLoadingPOs(false); }
+    }
+
+    async function handleSelectPO(itemId: string, po: any) {
+        try {
+            await linkPOToEstimateItem(itemId, po.id);
+            const idx = items.findIndex((i: any) => i.id === itemId);
+            if (idx >= 0) updateItem(idx, "purchaseOrderId", po.id);
+            if (idx >= 0) updateItem(idx, "purchaseOrder", po);
+            toast.success(`Linked ${po.code}`);
+        } catch (err: any) { toast.error(err.message); }
+        finally { setPOLinkItemId(null); }
+    }
+
+    async function handleUnlinkPO(itemId: string) {
+        try {
+            await unlinkPOFromEstimateItem(itemId);
+            const idx = items.findIndex((i: any) => i.id === itemId);
+            if (idx >= 0) { updateItem(idx, "purchaseOrderId", null); updateItem(idx, "purchaseOrder", null); }
+            toast.success("PO unlinked");
+        } catch (err: any) { toast.error(err.message); }
+    }
+
+    function handlePOCreated(itemId: string, po: any) {
+        const idx = items.findIndex((i: any) => i.id === itemId);
+        if (idx >= 0) { updateItem(idx, "purchaseOrderId", po.id); updateItem(idx, "purchaseOrder", po); }
     }
 
     function addPaymentSchedule() {
@@ -1178,6 +1231,28 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                             {/* Items Grid with DnD */}
                             <div className="bg-white">
+                                {sectionIds.size > 0 && (
+                                    <div className="flex justify-end px-8 pt-3 pb-1">
+                                        <button
+                                            onClick={() => {
+                                                if (collapsedSections.size === sectionIds.size) {
+                                                    setCollapsedSections(new Set());
+                                                } else {
+                                                    setCollapsedSections(new Set(sectionIds));
+                                                }
+                                            }}
+                                            className="text-xs text-slate-400 hover:text-slate-600 font-medium flex items-center gap-1 transition"
+                                        >
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                {collapsedSections.size === sectionIds.size
+                                                    ? <path d="M7 10l5 5 5-5" />
+                                                    : <path d="M7 14l5-5 5 5" />
+                                                }
+                                            </svg>
+                                            {collapsedSections.size === sectionIds.size ? "Expand All" : "Collapse All"}
+                                        </button>
+                                    </div>
+                                )}
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
                                 <div className="w-8"></div>
                                 <div className="w-8 pt-0.5">
@@ -1262,7 +1337,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                 // ── Regular item row ────────────────────────────────────────
                                                 return (
                                                     <Draggable key={item.id} draggableId={item.id} index={index}>
-                                                        {(provided, snapshot) => (
+                                                        {(provided, snapshot) => (<>
                                                             <div
                                                                 ref={provided.innerRef}
                                                                 {...provided.draggableProps}
@@ -1520,7 +1595,19 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                         </button>
                                                                     </div>
                                                             </div>
-                                                        )}
+                                                            {viewMode === "internal" && !isSection && (
+                                                                <BudgetStrip
+                                                                    item={item}
+                                                                    index={index}
+                                                                    updateItem={updateItem}
+                                                                    contextType={context.type}
+                                                                    onLinkPO={handleLinkPO}
+                                                                    onCreatePO={(id) => setPOCreateItemId(id)}
+                                                                    onUnlinkPO={handleUnlinkPO}
+                                                                    onViewPO={(poId) => window.open(`/projects/${context.id}/purchase-orders/${poId}`, "_blank")}
+                                                                />
+                                                            )}
+                                                        </>)}
                                                     </Draggable>
                                                 );
                                             })}
@@ -2294,6 +2381,50 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     onClose={() => setShowPaymentModal(false)}
                     onSaved={() => router.refresh()}
                 />
+            )}
+
+            {poCreateItemId && context.type === "project" && (
+                <POQuickCreateModal
+                    estimateItemId={poCreateItemId}
+                    suggestedAmount={(() => {
+                        const itm = items.find((i: any) => i.id === poCreateItemId);
+                        if (!itm) return null;
+                        const b = internalBudget({ budgetQuantity: itm.budgetQuantity, quantity: parseFloat(itm.quantity) || 0, budgetRate: itm.budgetRate, baseCost: itm.baseCost });
+                        return b;
+                    })()}
+                    projectId={context.id}
+                    onClose={() => setPOCreateItemId(null)}
+                    onCreated={(po) => handlePOCreated(poCreateItemId, po)}
+                />
+            )}
+
+            {poLinkItemId && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+                    <div className="bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-sm overflow-hidden">
+                        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                            <h3 className="font-bold text-slate-800">Link Purchase Order</h3>
+                            <button onClick={() => setPOLinkItemId(null)} className="text-slate-400 hover:text-slate-600">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-4 max-h-60 overflow-y-auto divide-y divide-slate-50">
+                            {loadingPOs ? (
+                                <div className="text-sm text-slate-400 text-center py-4">Loading...</div>
+                            ) : projectPOs.length === 0 ? (
+                                <div className="text-sm text-slate-400 text-center py-4">No purchase orders found</div>
+                            ) : projectPOs.map(po => (
+                                <button
+                                    key={po.id}
+                                    onClick={() => handleSelectPO(poLinkItemId, po)}
+                                    className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 transition flex justify-between items-center"
+                                >
+                                    <span className="font-medium">{po.code} — {po.vendor?.name}</span>
+                                    <span className="text-slate-500">{formatCurrency(Number(po.totalAmount))}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     );

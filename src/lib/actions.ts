@@ -915,7 +915,12 @@ export async function getEstimate(id: string) {
             include: {
                 items: {
                     orderBy: { order: "asc" },
-                    include: { expenses: true, costCode: true, costType: true },
+                    include: {
+                        expenses: true,
+                        costCode: true,
+                        costType: true,
+                        purchaseOrder: { include: { vendor: true } },
+                    },
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
@@ -941,6 +946,10 @@ export async function getEstimate(id: string) {
                         total: true, order: true, parentId: true,
                         costCodeId: true, costTypeId: true, createdAt: true,
                         expenses: true, costCode: true, costType: true,
+                        approvalStatus: true, approvalNote: true,
+                        purchaseOrderId: true,
+                        budgetQuantity: true, budgetUnit: true, budgetRate: true,
+                        purchaseOrder: { select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } } },
                     },
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
@@ -1865,6 +1874,10 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         parentId: item.parentId || null,
         costCodeId: item.costCodeId || null,
         costTypeId: item.costTypeId || null,
+        purchaseOrderId: item.purchaseOrderId || null,
+        budgetQuantity: item.budgetQuantity != null ? (parseFloat(item.budgetQuantity) || null) : null,
+        budgetUnit: item.budgetUnit || null,
+        budgetRate: item.budgetRate != null ? (parseFloat(item.budgetRate) || null) : null,
     });
 
     const parentItems = items.filter((i: any) => !i.parentId);
@@ -5971,4 +5984,75 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
         return { success: false, count: 0, error: "Update failed — database column may not be migrated yet" };
     }
     return { success: true, count: itemIds.length }
+}
+
+export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrderId: string) {
+    "use server";
+    const item = await prisma.estimateItem.findUnique({
+        where: { id: estimateItemId },
+        include: { estimate: { select: { projectId: true } } },
+    });
+    if (!item) throw new Error("Estimate item not found");
+    if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
+
+    const po = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId } });
+    if (!po) throw new Error("Purchase order not found");
+    if (po.projectId !== item.estimate.projectId) throw new Error("PO must belong to the same project");
+
+    await prisma.estimateItem.update({
+        where: { id: estimateItemId },
+        data: { purchaseOrderId },
+    });
+    return po;
+}
+
+export async function unlinkPOFromEstimateItem(estimateItemId: string) {
+    "use server";
+    await prisma.estimateItem.update({
+        where: { id: estimateItemId },
+        data: { purchaseOrderId: null },
+    });
+}
+
+export async function quickCreatePOAndLink(estimateItemId: string, data: { vendorId: string; amount: number; notes?: string }) {
+    "use server";
+    const item = await prisma.estimateItem.findUnique({
+        where: { id: estimateItemId },
+        include: { estimate: { select: { projectId: true } } },
+    });
+    if (!item) throw new Error("Estimate item not found");
+    if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
+
+    const projectId = item.estimate.projectId;
+    const count = await prisma.purchaseOrder.count({ where: { projectId } });
+    const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
+
+    const po = await prisma.purchaseOrder.create({
+        data: {
+            projectId,
+            vendorId: data.vendorId,
+            code,
+            totalAmount: data.amount,
+            notes: data.notes || null,
+            status: "Draft",
+        },
+        include: { vendor: true },
+    });
+
+    await prisma.estimateItem.update({
+        where: { id: estimateItemId },
+        data: { purchaseOrderId: po.id },
+    });
+
+    revalidatePath(`/projects/${projectId}/purchase-orders`);
+    return po;
+}
+
+export async function getProjectPurchaseOrdersForLinking(projectId: string) {
+    "use server";
+    return prisma.purchaseOrder.findMany({
+        where: { projectId },
+        select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } },
+        orderBy: { createdAt: "desc" },
+    });
 }

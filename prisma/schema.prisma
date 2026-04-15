@@ -318,11 +318,17 @@ model EstimateItem {
   costType      CostType?      @relation(fields: [costTypeId], references: [id])
   approvalStatus String?        // pending, approved, rejected
   approvalNote   String?
+  purchaseOrderId  String?
+  purchaseOrder    PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  budgetQuantity   Float?
+  budgetUnit       String?
+  budgetRate       Decimal?
   timeEntries    TimeEntry[]
   scheduleTasks  ScheduleTask[]
   createdAt      DateTime       @default(now())
 
   @@index([estimateId])
+  @@index([purchaseOrderId])
 }
 
 model Expense {
@@ -1080,6 +1086,7 @@ model PurchaseOrder {
   files    PurchaseOrderFile[]
   expenses Expense[]
   messages PurchaseOrderMessage[]
+  estimateItems EstimateItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
