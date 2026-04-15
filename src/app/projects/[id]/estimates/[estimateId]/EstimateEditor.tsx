@@ -1007,17 +1007,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         >Internal</button>
                     </div>
 
-                    {viewMode === "internal" && (
-                        <button
-                            onClick={() => handleAiFill()}
-                            disabled={isAiFilling}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition ${isAiFilling ? "bg-indigo-100 text-indigo-400 cursor-wait" : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm"}`}
-                        >
-                            <svg className={`w-3.5 h-3.5 ${isAiFilling ? "animate-spin" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
-                            {isAiFilling ? "Filling..." : "AI Fill Budgets"}
-                        </button>
-                    )}
-
                     <div className="h-4 w-px bg-hui-border"></div>
 
                     {/* More dropdown for secondary actions */}
@@ -1050,6 +1039,16 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         <svg className="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                                         {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
                                     </button>
+                                    {viewMode === "internal" && (
+                                        <button
+                                            onClick={() => { handleAiFill(); setShowMoreMenu(false); }}
+                                            disabled={isAiFilling}
+                                            className="w-full text-left px-4 py-2.5 hover:bg-indigo-50 flex items-center gap-2.5 text-indigo-700 disabled:opacity-50"
+                                        >
+                                            <svg className={`w-4 h-4 text-indigo-500 ${isAiFilling ? "animate-pulse" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
+                                            {isAiFilling ? "Filling budgets..." : "AI Fill Budgets"}
+                                        </button>
+                                    )}
                                     <button
                                         onClick={() => { setShowSidebar(v => !v); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
