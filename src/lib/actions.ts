@@ -5010,6 +5010,51 @@ export async function deletePurchaseOrderFile(fileId: string) {
     revalidatePath(`/projects/${file.purchaseOrder.projectId}/purchase-orders/${file.purchaseOrderId}`);
 }
 
+// Upload a File object (not FormData) to a newly created PO — used after PDF-extract flow
+export async function uploadPurchaseOrderFileFromBuffer(
+    purchaseOrderId: string,
+    projectId: string,
+    formData: FormData
+) {
+    "use server";
+    const file = formData.get("file") as File;
+    if (!file) return;
+
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
+
+    const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storagePath = `purchase-orders/${purchaseOrderId}/${Date.now()}_${safeName}`;
+
+    const { error: uploadError } = await supabase.storage
+        .from(STORAGE_BUCKET)
+        .upload(storagePath, buffer, {
+            contentType: file.type || "application/octet-stream",
+            upsert: false,
+        });
+
+    if (uploadError) return; // non-fatal — PO was already created
+
+    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl || storagePath;
+
+    await prisma.purchaseOrderFile.create({
+        data: {
+            purchaseOrderId,
+            name: file.name,
+            url: publicUrl,
+            size: file.size,
+            type: file.type || "application/octet-stream",
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}/purchase-orders/${purchaseOrderId}`);
+}
+
 export async function uploadEstimateFile(estimateId: string, formData: FormData) {
     "use server";
     const file = formData.get("file") as File;

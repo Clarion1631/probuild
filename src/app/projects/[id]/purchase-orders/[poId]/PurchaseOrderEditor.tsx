@@ -1,12 +1,12 @@
 "use client";
 
-import { useState } from "react";
-import { createPurchaseOrder, updatePurchaseOrder, deletePurchaseOrder, sendPurchaseOrder, approvePurchaseOrder, uploadPurchaseOrderFile, deletePurchaseOrderFile } from "@/lib/actions";
+import { useState, useRef, useCallback } from "react";
+import { createPurchaseOrder, updatePurchaseOrder, deletePurchaseOrder, sendPurchaseOrder, approvePurchaseOrder, uploadPurchaseOrderFile, deletePurchaseOrderFile, createVendor, uploadPurchaseOrderFileFromBuffer } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import StatusBadge from "@/components/StatusBadge";
 import Link from "next/link";
-import { Trash2, Plus, Upload, FileText, CheckCircle2 } from "lucide-react";
+import { Trash2, Plus, Upload, FileText, CheckCircle2, Sparkles, X, Loader2 } from "lucide-react";
 import POMessageThread from "./POMessageThread";
 
 interface Context {
@@ -39,6 +39,18 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     const [isApproving, setIsApproving] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
 
+    // PDF extract state (new PO only)
+    const [isDraggingOver, setIsDraggingOver] = useState(false);
+    const [isExtracting, setIsExtracting] = useState(false);
+    const [pendingFile, setPendingFile] = useState<File | null>(null);
+    const [extractedVendorInfo, setExtractedVendorInfo] = useState<{
+        name: string; email: string | null; phone: string | null; address: string | null;
+    } | null>(null);
+    const [pendingNewVendor, setPendingNewVendor] = useState<{
+        name: string; email: string | null; phone: string | null; address: string | null;
+    } | null>(null); // set when vendor didn't exist — will be created on save
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
     // Dynamic calculations
     const totalAmount = items.reduce((acc, curr) => acc + (Number(curr.total) || 0), 0);
 
@@ -64,6 +76,90 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     const removeItem = (index: number) => {
         const newItems = items.filter((_, i) => i !== index);
         setItems(newItems);
+    };
+
+    const processPdfFile = useCallback(async (file: File) => {
+        if (!file.type.includes("pdf") && !file.name.toLowerCase().endsWith(".pdf")) {
+            return toast.error("Please upload a PDF file");
+        }
+        if (file.size > 5 * 1024 * 1024) {
+            return toast.error("File too large — max 5MB");
+        }
+
+        setIsExtracting(true);
+        setPendingFile(file);
+        toast.loading("Reading PDF with AI...", { id: "pdf-extract" });
+
+        try {
+            const arrayBuf = await file.arrayBuffer();
+            const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
+
+            const res = await fetch("/api/purchase-orders/extract-pdf", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ base64, filename: file.name, fileSize: file.size }),
+            });
+
+            const data = await res.json();
+            if (!res.ok) {
+                toast.error(data.error || "Extraction failed", { id: "pdf-extract" });
+                setPendingFile(null);
+                return;
+            }
+
+            toast.dismiss("pdf-extract");
+
+            // Populate line items
+            if (data.lineItems?.length > 0) {
+                setItems(data.lineItems.map((item: any, i: number) => ({
+                    id: `temp-${Math.random()}`,
+                    description: item.description || "",
+                    quantity: Number(item.quantity) || 1,
+                    unitCost: Number(item.unitCost) || 0,
+                    total: Number(item.total) || (Number(item.quantity) * Number(item.unitCost)) || 0,
+                    costCodeId: null,
+                    order: i,
+                })));
+            }
+
+            // Populate notes/terms
+            if (data.notes) setNotes(data.notes);
+            if (data.terms) setTerms(data.terms);
+
+            // Vendor matching
+            if (data.vendorMatch?.matched && data.vendorMatch.vendorId) {
+                setVendorId(data.vendorMatch.vendorId);
+                setExtractedVendorInfo(data.vendor);
+                setPendingNewVendor(null);
+                toast.success(`Vendor matched: ${data.vendorMatch.vendorName}`);
+            } else if (data.vendor?.name) {
+                setExtractedVendorInfo(data.vendor);
+                setPendingNewVendor(data.vendor);
+                toast.success(`AI extracted ${data.lineItems?.length || 0} items — new vendor "${data.vendor.name}" will be created on save`);
+            } else {
+                toast.success(`AI extracted ${data.lineItems?.length || 0} line items`);
+            }
+        } catch (err: any) {
+            toast.error("Failed to extract PDF — fill form manually", { id: "pdf-extract" });
+            setPendingFile(null);
+        } finally {
+            setIsExtracting(false);
+        }
+    }, []);
+
+    const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDraggingOver(true); };
+    const handleDragLeave = () => setIsDraggingOver(false);
+    const handleDrop = (e: React.DragEvent) => {
+        e.preventDefault();
+        setIsDraggingOver(false);
+        const file = e.dataTransfer.files[0];
+        if (file) processPdfFile(file);
+    };
+    const handleDropZoneClick = () => fileInputRef.current?.click();
+    const handleDropZoneFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (file) processPdfFile(file);
+        e.target.value = "";
     };
 
     const handleSave = async () => {
@@ -97,7 +193,32 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                 res = await updatePurchaseOrder(initialData.id, submitData);
                 toast.success("Purchase Order updated");
             } else {
-                res = await createPurchaseOrder(context.projectId, submitData);
+                // If vendor wasn't matched, create it now
+                let finalVendorId = vendorId;
+                if (pendingNewVendor && !vendorId) {
+                    const newVendor = await createVendor({
+                        name: pendingNewVendor.name,
+                        email: pendingNewVendor.email || undefined,
+                        phone: pendingNewVendor.phone || undefined,
+                        address: pendingNewVendor.address || undefined,
+                    });
+                    finalVendorId = newVendor.id;
+                }
+
+                res = await createPurchaseOrder(context.projectId, { ...submitData, vendorId: finalVendorId });
+
+                // Upload the PDF if user dropped one
+                if (pendingFile && res?.id) {
+                    try {
+                        const fd = new FormData();
+                        fd.append("file", pendingFile);
+                        await uploadPurchaseOrderFileFromBuffer(res.id, context.projectId, fd);
+                    } catch {
+                        // non-fatal — PO was created successfully
+                        toast.error("PO created but PDF attachment failed — re-upload manually");
+                    }
+                }
+
                 toast.success("Purchase Order created");
                 router.replace(`/projects/${context.projectId}/purchase-orders/${res.id}`);
             }
@@ -315,6 +436,71 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                             </span>
                         </div>
                     </div>
+
+                    {/* PDF Drop Zone — only shown on new PO */}
+                    {!isEditing && (
+                        <div>
+                            <input
+                                ref={fileInputRef}
+                                type="file"
+                                accept="application/pdf,.pdf"
+                                className="hidden"
+                                onChange={handleDropZoneFileChange}
+                            />
+                            {!pendingFile ? (
+                                <div
+                                    onDragOver={handleDragOver}
+                                    onDragLeave={handleDragLeave}
+                                    onDrop={handleDrop}
+                                    onClick={handleDropZoneClick}
+                                    className={`hui-card border-2 border-dashed cursor-pointer transition-all p-8 flex flex-col items-center gap-3 ${
+                                        isDraggingOver
+                                            ? "border-amber-400 bg-amber-50"
+                                            : "border-slate-200 bg-white hover:border-amber-300 hover:bg-amber-50/30"
+                                    }`}
+                                >
+                                    <div className="w-12 h-12 rounded-full bg-amber-100 flex items-center justify-center">
+                                        <Sparkles className="w-6 h-6 text-amber-600" />
+                                    </div>
+                                    <div className="text-center">
+                                        <p className="font-semibold text-slate-700">Drop a vendor PDF to auto-fill</p>
+                                        <p className="text-sm text-slate-400 mt-1">Quote, invoice, or receipt — Claude will extract vendor & line items</p>
+                                    </div>
+                                    <span className="text-xs text-slate-400 bg-slate-100 rounded px-2 py-1">PDF · max 5MB · or click to browse</span>
+                                </div>
+                            ) : isExtracting ? (
+                                <div className="hui-card border border-amber-200 bg-amber-50 p-6 flex items-center gap-4">
+                                    <Loader2 className="w-6 h-6 text-amber-600 animate-spin shrink-0" />
+                                    <div>
+                                        <p className="font-semibold text-amber-800">Reading {pendingFile.name}…</p>
+                                        <p className="text-sm text-amber-600">Claude is extracting vendor info and line items</p>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="hui-card border border-emerald-200 bg-emerald-50 p-4 flex items-center justify-between gap-4">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-9 h-9 rounded-lg bg-emerald-100 flex items-center justify-center shrink-0">
+                                            <FileText className="w-5 h-5 text-emerald-600" />
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-semibold text-emerald-800">{pendingFile.name}</p>
+                                            <p className="text-xs text-emerald-600">
+                                                Will be saved as attachment when you click Save
+                                                {pendingNewVendor && ` · New vendor "${pendingNewVendor.name}" will be created`}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        onClick={() => { setPendingFile(null); setExtractedVendorInfo(null); setPendingNewVendor(null); }}
+                                        className="text-emerald-500 hover:text-red-500 p-1.5 rounded transition shrink-0"
+                                        title="Remove PDF"
+                                    >
+                                        <X className="w-4 h-4" />
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    )}
 
                     {/* Builder Table */}
                     <div className="hui-card shadow-sm border border-hui-border">
