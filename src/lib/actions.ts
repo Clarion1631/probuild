@@ -702,7 +702,7 @@ export async function getProjects() {
         orderBy: { viewedAt: "desc" },
         include: {
             client: true,
-            estimates: { select: { totalAmount: true } },
+            estimates: { select: { totalAmount: true, status: true } },
         },
     });
     return JSON.parse(JSON.stringify(projects.map((p: any) => ({

@@ -144,8 +144,11 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     const totalCount = projects.length;
     const inProgressCount = projects.filter((p: any) => p.status === "In Progress" || p.status === "Open").length;
     const completedCount = projects.filter((p: any) => p.status === "Done" || p.status === "Closed").length;
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Paid"];
     const totalRevenue = projects.reduce((sum: number, p: any) => {
-        const est = (p.estimates || []).reduce((s: number, e: any) => s + Number(e.totalAmount || 0), 0);
+        const est = (p.estimates || [])
+            .filter((e: any) => APPROVED_STATUSES.includes(e.status))
+            .reduce((s: number, e: any) => s + Number(e.totalAmount || 0), 0);
         return sum + est;
     }, 0);
 

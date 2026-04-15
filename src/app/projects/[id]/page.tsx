@@ -54,7 +54,10 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     const today = new Date();
     const now = Date.now();
 
-    const totalBudget = estimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Paid"];
+    const totalBudget = estimates
+        .filter((e: any) => APPROVED_STATUSES.includes(e.status))
+        .reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const completedTasks = tasks.filter((t: any) => t.status === "Complete").length;
     const inProgressTasks = tasks.filter((t: any) => t.status === "In Progress").length;
     const taskProgress = tasks.length > 0 ? Math.round((completedTasks / tasks.length) * 100) : 0;
