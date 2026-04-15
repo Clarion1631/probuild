@@ -102,6 +102,14 @@ python compare.py --local --page "Page Name"   # single page local test
 - **GoldenTouch Pro URL** is `https://probuild-amber.vercel.app` — that's the live Vercel deployment
 - **WSL env vars** — `setx` vars (VERCEL_TOKEN, STRIPE_API_KEY, etc.) are Windows-only, NOT available in WSL
 
+## UI: hover-reveal buttons must support no-hover devices
+ProBuild is used across different browsers, OS configs, and pointer types (some users may be on Chromebooks or devices where CSS `:hover` doesn't fire reliably). **Any button hidden via `opacity-0 group-hover:opacity-100` MUST also include `[@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto`** so it stays visible on devices without reliable hover. This was discovered when Richard's browser silently hid all Add Sub-item / Add Category / delete buttons on the estimate editor.
+
+Pattern to use:
+```
+className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition"
+```
+
 ## Feature Decision Rule
 Before building anything, answer: **"What remodeling problem does this solve, for which role, and can AI automate it?"**
 If a feature doesn't map to a real workflow step for a real role (estimator, PM, field crew, bookkeeper, owner, client, sub), don't build it. No redundancy.
