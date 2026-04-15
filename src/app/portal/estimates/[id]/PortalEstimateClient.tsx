@@ -308,7 +308,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const companyLicense = companySettings?.licenseNumber || "";
 
     return (
-        <div className="min-h-screen bg-slate-100 font-sans">
+        <div className="min-h-screen bg-slate-50 font-sans">
             {/* Minimal Top Bar — hidden in capture mode */}
             <header className={`bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden${isCapture ? " hidden" : ""}`}>
                 <div className="flex items-center gap-3">
@@ -356,10 +356,10 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
             {/* Document Container */}
             <div className={`max-w-6xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
-                <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.06)] border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-lg shadow-sm overflow-hidden print:shadow-none print:rounded-none">
 
-                    {/* Premium top accent bar — matches estimate editor */}
-                    <div className="h-1.5 w-full bg-slate-800"></div>
+                    {/* Top accent bar */}
+                    <div className="h-1 w-full bg-slate-700"></div>
 
                     {/* Document Header */}
                     <div className="px-10 pt-10 pb-8 border-b border-slate-200">
@@ -446,14 +446,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     {/* Line Items — editor-matched layout */}
                     <div className="bg-white">
                         {/* Column headers */}
-                        <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-3.5 uppercase tracking-wider">
+                        <div className="flex text-[11px] font-bold text-slate-400 border-b border-slate-200 px-10 py-3.5 uppercase tracking-wider">
                             <div className="flex-1">Item Description</div>
                             <div className="w-20 text-right">Qty</div>
                             <div className="w-32 text-right">Unit Price</div>
                             <div className="w-32 text-right">Amount</div>
                         </div>
 
-                        <div className="divide-y divide-slate-100">
+                        <div className="divide-y divide-slate-100/80">
                             {items.map((item: any) => {
                                 const hasSubItems = item.subItems && item.subItems.length > 0;
                                 const itemTotal = calculateTotal(item);
@@ -461,23 +461,23 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 if (hasSubItems) {
                                     return (
                                         <React.Fragment key={item.id}>
-                                            {/* Category header — matches editor section style */}
-                                            <div data-pdf-row="true" className="flex items-center px-4 py-3 bg-slate-100 border-l-4 border-slate-700">
-                                                <div className="flex-1 font-semibold text-sm text-slate-800 pl-4">{item.name}</div>
+                                            {/* Category header */}
+                                            <div data-pdf-row="true" className="flex items-center px-10 py-3.5 bg-slate-50">
+                                                <div className="flex-1 font-bold text-sm text-slate-800">{item.name}</div>
                                                 <div className="w-20"></div>
                                                 <div className="w-32"></div>
-                                                <div className="w-32 text-right font-semibold text-sm text-slate-700 pr-8">{formatCurrency(itemTotal)}</div>
+                                                <div className="w-32 text-right font-bold text-sm text-slate-800">{formatCurrency(itemTotal)}</div>
                                             </div>
-                                            {/* Sub-items — indented */}
+                                            {/* Sub-items */}
                                             {item.subItems.map((sub: any) => (
-                                                <div data-pdf-row="true" key={sub.id} className="flex items-start bg-slate-50/30 border-l-2 border-transparent ml-8">
-                                                    <div className="flex-1 py-2.5 pl-8">
-                                                        <div className="text-sm text-slate-700">{sub.name}</div>
-                                                        {sub.description && <div className="text-xs text-slate-400 mt-0.5 leading-relaxed">{sub.description}</div>}
+                                                <div data-pdf-row="true" key={sub.id} className="flex items-start bg-white px-10 py-3">
+                                                    <div className="flex-1 pl-6">
+                                                        <div className="text-sm font-medium text-slate-700">{sub.name}</div>
+                                                        {sub.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{sub.description}</div>}
                                                     </div>
-                                                    <div className="w-20 py-2.5 text-right text-sm text-slate-500">{sub.quantity}</div>
-                                                    <div className="w-32 py-2.5 text-right text-sm text-slate-500 pr-2">{formatCurrency(sub.unitCost)}</div>
-                                                    <div className="w-32 py-2.5 text-right text-sm font-medium text-slate-700 pr-8">{formatCurrency(Number(sub.total))}</div>
+                                                    <div className="w-20 text-right text-sm text-slate-500">{sub.quantity}</div>
+                                                    <div className="w-32 text-right text-sm text-slate-500">{formatCurrency(sub.unitCost)}</div>
+                                                    <div className="w-32 text-right text-sm font-semibold text-slate-700">{formatCurrency(Number(sub.total))}</div>
                                                 </div>
                                             ))}
                                         </React.Fragment>
@@ -486,14 +486,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                                 // Standalone item
                                 return (
-                                    <div data-pdf-row="true" key={item.id} className="flex items-start px-8 py-3 bg-white">
+                                    <div data-pdf-row="true" key={item.id} className="flex items-start px-10 py-3 bg-white">
                                         <div className="flex-1">
                                             <div className="text-sm font-medium text-slate-800">{item.name}</div>
-                                            {item.description && <div className="text-xs text-slate-500 mt-0.5 leading-relaxed">{item.description}</div>}
+                                            {item.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{item.description}</div>}
                                         </div>
-                                        <div className="w-20 text-right text-sm text-slate-600 pt-0.5">{item.quantity}</div>
-                                        <div className="w-32 text-right text-sm text-slate-600 pt-0.5">{formatCurrency(item.unitCost)}</div>
-                                        <div className="w-32 text-right text-sm font-semibold text-slate-800 pt-0.5">{formatCurrency(itemTotal)}</div>
+                                        <div className="w-20 text-right text-sm text-slate-500">{item.quantity}</div>
+                                        <div className="w-32 text-right text-sm text-slate-500">{formatCurrency(item.unitCost)}</div>
+                                        <div className="w-32 text-right text-sm font-semibold text-slate-800">{formatCurrency(itemTotal)}</div>
                                     </div>
                                 );
                             })}
@@ -658,7 +658,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     )}
 
                     {/* Footer */}
-                    <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
+                    <div className="bg-slate-50/60 border-t border-slate-100 px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This estimate was prepared by {companyName}.{companyLicense && ` Lic# ${companyLicense}.`} {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
                         </p>
