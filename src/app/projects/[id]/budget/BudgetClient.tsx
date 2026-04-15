@@ -217,7 +217,7 @@ export default function BudgetClient({ project, data }: { project: { id: string;
         // Filter estimates by status
         const activeStatuses = [
             ...(includeStatuses.estimateSent ? ["Sent"] : []),
-            ...(includeStatuses.estimateApproved ? ["Approved", "Invoiced", "Partially Paid"] : []),
+            ...(includeStatuses.estimateApproved ? ["Approved", "Invoiced", "Partially Paid", "Paid"] : []),
         ];
         const activeCOStatuses = [
             ...(includeStatuses.coApproved ? ["Approved"] : []),

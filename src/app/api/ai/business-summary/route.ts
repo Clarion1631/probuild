@@ -56,7 +56,8 @@ export async function POST(req: NextRequest) {
     const totalHours30d = timeEntries.reduce((s, e) => s + (e.durationHours || 0), 0);
 
     const projectMargins = projects.map(p => {
-        const approved = p.estimates.find(e => e.status === "Approved" || e.status === "Sent");
+        const APPROVED_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
+        const approved = p.estimates.find(e => APPROVED_STATUSES.includes(e.status));
         return { name: p.name, status: p.status, budget: Number(approved?.totalAmount || 0), client: p.client?.name || "N/A" };
     });
 

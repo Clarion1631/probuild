@@ -38,7 +38,8 @@ export async function POST(req: NextRequest) {
 
     if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
 
-    const approvedEstimate = estimates.find(e => e.status === "Approved" || e.status === "Sent") || estimates[0];
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
+    const approvedEstimate = estimates.find(e => APPROVED_STATUSES.includes(e.status)) || estimates[0];
     const budget = Number(approvedEstimate?.totalAmount || 0);
     const totalHours = timeEntries.reduce((s, e) => s + (e.durationHours || 0), 0);
     const laborActual = timeEntries.reduce((s, e) => s + Number(e.laborCost || 0) + Number(e.burdenCost || 0), 0);

@@ -27,7 +27,8 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
     // Combined for stats (already deduplicated by construction above)
     const allEstimates = [...leadEstimates, ...projectEstimates];
 
-    const approvedEstimates = allEstimates.filter((e: any) => e.status === "Approved" || e.status === "Sent");
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
+    const approvedEstimates = allEstimates.filter((e: any) => APPROVED_STATUSES.includes(e.status));
     const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const totalAll = allEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
 
