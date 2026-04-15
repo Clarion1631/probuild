@@ -69,7 +69,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
             <Sidebar />
             <div className="flex-1 flex flex-col overflow-hidden">
                 <Header />
-                <main className="flex-1 p-6 overflow-auto">
+                <main className="flex-1 p-6 overflow-y-auto overflow-x-hidden">
                     {children}
                 </main>
             </div>
