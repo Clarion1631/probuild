@@ -44,6 +44,16 @@ export function bufferPercent(item: {
 }
 
 /**
+ * Calculate sell price from cost and target margin percentage.
+ * Formula: sell = cost / (1 - margin/100).
+ * Returns 0 if margin >= 100 (would be infinite).
+ */
+export function sellFromMargin(cost: number, marginPct: number): number {
+  if (marginPct >= 100) return 0;
+  return cost / (1 - marginPct / 100);
+}
+
+/**
  * Color class for buffer percentage badge.
  * Green >= 20%, amber 10-19%, red < 10%.
  */

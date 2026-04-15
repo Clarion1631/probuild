@@ -17,7 +17,7 @@ import ReusableSignaturePad from "@/components/ReusableSignaturePad";
 import DocumentComments from "@/components/DocumentComments";
 import BudgetStrip from "./BudgetStrip";
 import POQuickCreateModal from "./POQuickCreateModal";
-import { internalBudget } from "@/lib/budget-math";
+import { internalBudget, sellFromMargin } from "@/lib/budget-math";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
@@ -50,6 +50,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showPaymentModal, setShowPaymentModal] = useState(false);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
+    const [aiFillItemId, setAiFillItemId] = useState<string | null>(null);
+    const [isAiFilling, setIsAiFilling] = useState(false);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
     const [showSidebar, setShowSidebar] = useState(false);
     const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments" | "history">("overview");
@@ -791,6 +793,80 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (idx >= 0) { updateItem(idx, "purchaseOrderId", po.id); updateItem(idx, "purchaseOrder", po); }
     }
 
+    async function handleAiFill(itemId?: string) {
+        const leafItems = items.filter(item => {
+            if (!item.parentId && items.some((i: any) => i.parentId === item.id)) return false;
+            return true;
+        });
+        const targetItems = itemId
+            ? leafItems.filter(i => i.id === itemId)
+            : leafItems.filter(i => internalBudget({ budgetQuantity: i.budgetQuantity, quantity: parseFloat(i.quantity) || 0, budgetRate: i.budgetRate, baseCost: i.baseCost }) == null);
+
+        if (targetItems.length === 0) {
+            toast.info("All items already have budgets");
+            return;
+        }
+
+        setIsAiFilling(true);
+        if (itemId) setAiFillItemId(itemId);
+
+        try {
+            const res = await fetch("/api/ai-estimate/budget-fill", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: targetItems.map(i => ({
+                        id: i.id,
+                        name: i.name || "",
+                        description: i.description || "",
+                        type: i.type || "Material",
+                        quantity: parseFloat(i.quantity) || 1,
+                        unitCost: parseFloat(i.unitCost) || 0,
+                        budgetRate: i.budgetRate,
+                        budgetUnit: i.budgetUnit,
+                    })),
+                    projectContext: `${context.name} (${context.type})`,
+                    location: context.location || "Vancouver, WA",
+                }),
+            });
+
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.error || "AI budget fill failed");
+            }
+
+            const { suggestions } = await res.json();
+            let filled = 0;
+            setItems(prev => {
+                const next = [...prev];
+                for (const s of suggestions) {
+                    const idx = next.findIndex((i: any) => i.id === s.id);
+                    if (idx < 0) continue;
+                    const rate = parseFloat(s.budgetRate) || 0;
+                    const margin = parseFloat(s.marginPercent) || 25;
+                    next[idx] = {
+                        ...next[idx],
+                        budgetRate: rate > 0 ? String(rate) : null,
+                        baseCost: rate > 0 ? String(rate) : null,
+                        budgetUnit: s.budgetUnit || next[idx].budgetUnit,
+                        budgetQuantity: s.budgetQuantity || next[idx].budgetQuantity,
+                        markupPercent: margin,
+                        unitCost: sellFromMargin(rate, margin).toFixed(2),
+                    };
+                    filled++;
+                }
+                return next;
+            });
+
+            toast.success(`AI filled budgets for ${filled} item${filled !== 1 ? "s" : ""} — review and adjust`);
+        } catch (err: any) {
+            toast.error(err.message || "AI budget fill failed");
+        } finally {
+            setIsAiFilling(false);
+            setAiFillItemId(null);
+        }
+    }
+
     function addPaymentSchedule() {
         setPaymentSchedules([...paymentSchedules, {
             id: generateId(),
@@ -927,9 +1003,20 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         >Client</button>
                         <button
                             onClick={() => setViewMode("internal")}
-                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-amber-50 text-amber-800 shadow-sm border border-amber-200" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-indigo-50 text-indigo-800 shadow-sm border border-indigo-200" : "text-slate-500 hover:text-slate-700"}`}
                         >Internal</button>
                     </div>
+
+                    {viewMode === "internal" && (
+                        <button
+                            onClick={() => handleAiFill()}
+                            disabled={isAiFilling}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition ${isAiFilling ? "bg-indigo-100 text-indigo-400 cursor-wait" : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm"}`}
+                        >
+                            <svg className={`w-3.5 h-3.5 ${isAiFilling ? "animate-spin" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
+                            {isAiFilling ? "Filling..." : "AI Fill Budgets"}
+                        </button>
+                    )}
 
                     <div className="h-4 w-px bg-hui-border"></div>
 
@@ -1577,6 +1664,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                     onCreatePO={(id) => setPOCreateItemId(id)}
                                                                     onUnlinkPO={handleUnlinkPO}
                                                                     onViewPO={(poId) => window.open(`/projects/${context.id}/purchase-orders/${poId}`, "_blank")}
+                                                                    onAiFill={(id) => handleAiFill(id)}
+                                                                    isAiFilling={isAiFilling && (aiFillItemId === item.id || aiFillItemId === null)}
                                                                 />
                                                             )}
                                                         </>)}
@@ -1725,27 +1814,27 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                             {/* Internal Margin Summary */}
                             {viewMode === "internal" && (
-                                <div className="bg-amber-50/60 border-t border-amber-200 px-10 py-4 flex items-center justify-between">
+                                <div className="bg-indigo-50/60 border-t border-indigo-200 px-10 py-4 flex items-center justify-between">
                                     <div className="flex items-center gap-2">
-                                        <svg className="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-                                        <span className="text-xs font-semibold text-amber-800 uppercase tracking-wider">Internal Margin Summary</span>
+                                        <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                                        <span className="text-xs font-semibold text-indigo-800 uppercase tracking-wider">Internal Margin Summary</span>
                                     </div>
                                     <div className="flex items-center gap-6 text-sm">
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Base Cost</div>
-                                            <div className="font-bold text-amber-900">{formatCurrency(totalBaseCost)}</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Internal Budget</div>
+                                            <div className="font-bold text-indigo-900">{formatCurrency(totalBaseCost)}</div>
                                         </div>
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Markup</div>
-                                            <div className="font-bold text-amber-900">{formatCurrency(totalMarkup)}</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Profit</div>
+                                            <div className="font-bold text-indigo-900">{formatCurrency(totalMarkup)}</div>
                                         </div>
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Margin</div>
-                                            <div className="font-bold text-amber-900">{profitMargin.toFixed(1)}%</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Margin</div>
+                                            <div className="font-bold text-indigo-900">{profitMargin.toFixed(1)}%</div>
                                         </div>
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Sell Price</div>
-                                            <div className="font-bold text-amber-900">{formatCurrency(subtotal)}</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Sell Total</div>
+                                            <div className="font-bold text-indigo-900">{formatCurrency(subtotal)}</div>
                                         </div>
                                     </div>
                                 </div>
@@ -1923,13 +2012,35 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             <div>
                                 <div className="flex items-center justify-between mb-1.5">
                                     <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Financials</label>
-                                    <span className="text-[11px] text-slate-400">
-                                        {items.length} items{paymentSchedules.length > 0 && ` · ${paymentSchedules.length} milestones`}
-                                    </span>
+                                    {viewMode === "internal" && (() => {
+                                        const leafItems = items.filter(item => {
+                                            if (!item.parentId && items.some((i: any) => i.parentId === item.id)) return false;
+                                            return true;
+                                        });
+                                        const budgeted = leafItems.filter(i => internalBudget({ budgetQuantity: i.budgetQuantity, quantity: parseFloat(i.quantity) || 0, budgetRate: i.budgetRate, baseCost: i.baseCost }) != null).length;
+                                        const totalLeaf = leafItems.length;
+                                        const allBudgeted = budgeted === totalLeaf;
+                                        return (
+                                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${allBudgeted ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+                                                {budgeted}/{totalLeaf} budgeted
+                                            </span>
+                                        );
+                                    })()}
+                                    {viewMode !== "internal" && (
+                                        <span className="text-[11px] text-slate-400">
+                                            {items.length} items{paymentSchedules.length > 0 && ` · ${paymentSchedules.length} milestones`}
+                                        </span>
+                                    )}
                                 </div>
                                 <div className="bg-slate-50 rounded-lg p-2.5 divide-y divide-slate-200">
-                                    <div className="flex justify-between items-baseline pb-2">
-                                        <span className="text-[10px] text-slate-500 font-medium uppercase">Subtotal</span>
+                                    {viewMode === "internal" && (
+                                        <div className="flex justify-between items-baseline pb-2">
+                                            <span className="text-[10px] text-indigo-500 font-medium uppercase">Internal Budget</span>
+                                            <span className="text-sm font-semibold text-indigo-700">{formatCurrency(totalBaseCost)}</span>
+                                        </div>
+                                    )}
+                                    <div className="flex justify-between items-baseline py-2">
+                                        <span className="text-[10px] text-slate-500 font-medium uppercase">{viewMode === "internal" ? "Sell Total" : "Subtotal"}</span>
                                         <span className="text-sm font-semibold text-slate-700">{formatCurrency(subtotal)}</span>
                                     </div>
                                     <div className="flex justify-between items-baseline py-2">
@@ -1938,8 +2049,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     </div>
                                     {viewMode === "internal" && (
                                         <div className="flex justify-between items-baseline pt-2">
-                                            <span className="text-[10px] text-amber-600 font-medium uppercase">Margin</span>
-                                            <span className="text-sm font-bold text-amber-700">{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</span>
+                                            <span className={`text-[10px] font-medium uppercase ${profitMargin >= 20 ? "text-emerald-600" : profitMargin >= 10 ? "text-amber-600" : "text-red-600"}`}>Margin</span>
+                                            <span className={`text-sm font-bold ${profitMargin >= 20 ? "text-emerald-700" : profitMargin >= 10 ? "text-amber-700" : "text-red-700"}`}>{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</span>
                                         </div>
                                     )}
                                 </div>

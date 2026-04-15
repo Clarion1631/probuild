@@ -2,13 +2,13 @@
 
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
-import { internalBudget, bufferPercent, bufferColor, bufferBgColor } from "@/lib/budget-math";
+import { internalBudget, bufferPercent, bufferColor, bufferBgColor, sellFromMargin } from "@/lib/budget-math";
 import { toast } from "sonner";
 
 const UNIT_SUGGESTIONS = ["hrs", "sqft", "lf", "ea", "lump sum", "units", "days"];
 
-/** Returns a numeric markup %, defaulting to 25 when the value is empty/NaN. */
-function effectiveMarkup(raw: string | number | null | undefined): number {
+/** Returns a numeric margin %, defaulting to 25 when the value is empty/NaN. */
+function effectiveMargin(raw: string | number | null | undefined): number {
     const n = parseFloat(String(raw ?? ""));
     return Number.isFinite(n) ? n : 25;
 }
@@ -22,10 +22,12 @@ interface BudgetStripProps {
     onCreatePO: (itemId: string) => void;
     onUnlinkPO: (itemId: string) => void;
     onViewPO: (poId: string) => void;
+    onAiFill?: (itemId: string) => void;
+    isAiFilling?: boolean;
 }
 
 export default function BudgetStrip({
-    item, index, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO
+    item, index, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO, onAiFill, isAiFilling
 }: BudgetStripProps) {
     const [showUnitDropdown, setShowUnitDropdown] = useState(false);
     const [showPOPopover, setShowPOPopover] = useState(false);
@@ -48,9 +50,24 @@ export default function BudgetStrip({
 
     const po = item.purchaseOrder;
     const isLead = contextType === "lead";
+    const margin = effectiveMargin(item.markupPercent);
+    const rate = parseFloat(budgetRateVal) || 0;
+    const sellPrice = sellFromMargin(rate, margin);
 
     return (
         <div className="flex items-center gap-3 px-4 py-2 ml-14 mr-2 mb-1 rounded-lg bg-indigo-50/60 border-l-3 border-indigo-300 text-xs">
+            {/* AI Fill Button */}
+            {onAiFill && (
+                <button
+                    onClick={() => onAiFill(item.id)}
+                    disabled={isAiFilling}
+                    className={`flex items-center justify-center w-5 h-5 rounded hover:bg-indigo-100 transition flex-shrink-0 ${isAiFilling ? "animate-pulse text-indigo-400" : "text-indigo-300 hover:text-indigo-600"}`}
+                    title="AI suggest budget"
+                >
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
+                </button>
+            )}
+
             {/* Budget Inputs */}
             <div className="flex items-center gap-1.5">
                 <label className="text-indigo-400 font-medium whitespace-nowrap">Budget:</label>
@@ -95,12 +112,11 @@ export default function BudgetStrip({
                         value={budgetRateVal}
                         onChange={e => {
                             const val = e.target.value === "" ? null : e.target.value;
-                            const rate = parseFloat(e.target.value) || 0;
-                            const mp = effectiveMarkup(item.markupPercent);
+                            const r = parseFloat(e.target.value) || 0;
+                            const m = effectiveMargin(item.markupPercent);
                             updateItem(index, "budgetRate", val);
-                            // Only sync baseCost when rate is meaningful; null means "not entered"
-                            updateItem(index, "baseCost", rate > 0 ? val : null);
-                            updateItem(index, "unitCost", (rate * (1 + mp / 100)).toFixed(2));
+                            updateItem(index, "baseCost", r > 0 ? val : null);
+                            updateItem(index, "unitCost", sellFromMargin(r, m).toFixed(2));
                         }}
                         className="w-20 bg-white border border-indigo-200 rounded pl-4 pr-1.5 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
                         placeholder="Rate"
@@ -116,20 +132,19 @@ export default function BudgetStrip({
             {/* Divider */}
             <div className="w-px h-5 bg-indigo-200" />
 
-            {/* Markup + Sell Price */}
+            {/* Margin + Sell Price */}
             <div className="flex items-center gap-1.5">
-                <label className="text-indigo-400 font-medium whitespace-nowrap">Markup:</label>
+                <label className="text-indigo-400 font-medium whitespace-nowrap">Margin:</label>
                 <div className="relative">
                     <input
                         type="number"
                         value={item.markupPercent ?? 25}
                         onChange={e => {
-                            const mp = effectiveMarkup(e.target.value);
-                            const rate = parseFloat(budgetRateVal) || 0;
-                            // Store null when cleared so ?? 25 fallback works consistently
+                            const m = effectiveMargin(e.target.value);
+                            const r = parseFloat(budgetRateVal) || 0;
                             updateItem(index, "markupPercent", e.target.value === "" ? null : e.target.value);
-                            updateItem(index, "baseCost", rate > 0 ? rate.toString() : null);
-                            updateItem(index, "unitCost", (rate * (1 + mp / 100)).toFixed(2));
+                            updateItem(index, "baseCost", r > 0 ? r.toString() : null);
+                            updateItem(index, "unitCost", sellFromMargin(r, m).toFixed(2));
                         }}
                         className="w-14 bg-white border border-indigo-200 rounded px-1.5 pr-4 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
                         step="any"
@@ -138,7 +153,7 @@ export default function BudgetStrip({
                 </div>
                 <span className="text-indigo-300">&rarr;</span>
                 <span className="font-semibold text-indigo-700 whitespace-nowrap">
-                    {formatCurrency((parseFloat(budgetRateVal) || 0) * (1 + effectiveMarkup(item.markupPercent) / 100))}
+                    {formatCurrency(sellPrice)}
                 </span>
             </div>
 
