@@ -358,9 +358,6 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             <div className={`max-w-6xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
                 <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-lg shadow-sm overflow-hidden print:shadow-none print:rounded-none">
 
-                    {/* Top accent bar */}
-                    <div className="h-1 w-full bg-slate-700"></div>
-
                     {/* Document Header */}
                     <div className="px-10 pt-10 pb-8 border-b border-slate-200">
                         <div className="flex justify-between items-start">
