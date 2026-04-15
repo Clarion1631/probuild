@@ -811,35 +811,45 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (itemId) setAiFillItemId(itemId);
 
         try {
-            const res = await fetch("/api/ai-estimate/budget-fill", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    items: targetItems.map(i => ({
-                        id: i.id,
-                        name: i.name || "",
-                        description: i.description || "",
-                        type: i.type || "Material",
-                        quantity: parseFloat(i.quantity) || 1,
-                        unitCost: parseFloat(i.unitCost) || 0,
-                        budgetRate: i.budgetRate,
-                        budgetUnit: i.budgetUnit,
-                    })),
-                    projectContext: `${context.name} (${context.type})`,
-                    location: context.location || "Vancouver, WA",
-                }),
-            });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.error || "AI budget fill failed");
+            // Chunk into batches of 25 so large estimates don't hit token limits
+            const CHUNK_SIZE = 25;
+            const chunks: typeof targetItems[] = [];
+            for (let i = 0; i < targetItems.length; i += CHUNK_SIZE) {
+                chunks.push(targetItems.slice(i, i + CHUNK_SIZE));
             }
 
-            const { suggestions } = await res.json();
+            const allSuggestions: any[] = [];
+            for (const chunk of chunks) {
+                const res = await fetch("/api/ai-estimate/budget-fill", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        items: chunk.map(i => ({
+                            id: i.id,
+                            name: i.name || "",
+                            description: i.description || "",
+                            type: i.type || "Material",
+                            quantity: parseFloat(i.quantity) || 1,
+                            unitCost: parseFloat(i.unitCost) || 0,
+                            budgetRate: i.budgetRate,
+                            budgetUnit: i.budgetUnit,
+                        })),
+                        projectContext: `${context.name} (${context.type})`,
+                        location: context.location || "Vancouver, WA",
+                    }),
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.error || "AI budget fill failed");
+                }
+                const { suggestions } = await res.json();
+                allSuggestions.push(...suggestions);
+            }
+
             let filled = 0;
             setItems(prev => {
-                const next = [...prev];
-                for (const s of suggestions) {
+                const next = prev.map(item => ({ ...item }));
+                for (const s of allSuggestions) {
                     const idx = next.findIndex((i: any) => i.id === s.id);
                     if (idx < 0) continue;
                     const rate = parseFloat(s.budgetRate) || 0;

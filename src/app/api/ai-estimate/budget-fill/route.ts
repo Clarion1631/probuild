@@ -105,7 +105,7 @@ Return ONLY a valid JSON object:
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
             model: "claude-sonnet-4-6",
-            max_tokens: 4000,
+            max_tokens: 8000,
             messages: [{ role: "user", content: prompt }],
         });
 
