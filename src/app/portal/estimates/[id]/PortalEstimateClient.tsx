@@ -45,7 +45,9 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         const pageH = pdf.internal.pageSize.getHeight();  // 297 mm
         const marginTop = 0;
         const marginBottom = 6;   // just enough for page number at bottom
+        const bannerH = 8;        // continuation banner height on pages 2+
         const usableH = pageH - marginBottom; // ~291 mm per page
+        const effectiveH = usableH - bannerH; // 283 mm — accounts for banner on page 2+
 
         // ── Step 1: Measure row positions BEFORE rendering ────────────────
         // CSS px relative to the element's top-left — scroll-independent
@@ -67,15 +69,20 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         const breaks: number[] = [0]; // start-mm of each page's content slice
         let cursor = 0;
         while (cursor < totalHeightMm) {
-            const limit = cursor + usableH;
+            const limit = cursor + effectiveH;
             if (limit >= totalHeightMm) break;
 
-            // Walk rows to find the first one that would be cut
+            // Walk rows: track the bottom of the last row that fits entirely,
+            // then snap the break there (not to row.top-1, which can cut the previous row).
             let safeBreak = limit;
+            let lastFitBottom = cursor;
             for (const row of rowsMm) {
-                if (row.top > cursor && row.bottom > limit) {
-                    // This row overflows — snap break to just before it
-                    safeBreak = Math.max(cursor + 1, row.top - 1);
+                if (row.top <= cursor) continue; // already past
+                if (row.bottom <= limit) {
+                    lastFitBottom = row.bottom;  // this row fits — remember it
+                } else {
+                    // This row overflows — break after the last row that fit
+                    safeBreak = Math.max(cursor + 1, lastFitBottom);
                     break;
                 }
             }
@@ -114,8 +121,9 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             ctx.fillRect(0, 0, slice.width, slice.height);
             ctx.drawImage(img, 0, srcY, img.width, srcH, 0, 0, img.width, srcH);
 
-            // Content fills from y=0, edge-to-edge
-            pdf.addImage(slice.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, pageW, sliceHMm);
+            // Content starts below banner on pages 2+ so banner doesn't overlap it
+            const contentY = page > 0 ? bannerH : 0;
+            pdf.addImage(slice.toDataURL("image/jpeg", 0.92), "JPEG", 0, contentY, pageW, sliceHMm);
 
             // Page number — small text in bottom margin strip
             pdf.setFont("helvetica", "normal");
