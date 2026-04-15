@@ -54,7 +54,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     const today = new Date();
     const now = Date.now();
 
-    const APPROVED_STATUSES = ["Approved", "Invoiced", "Paid"];
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
     const totalBudget = estimates
         .filter((e: any) => APPROVED_STATUSES.includes(e.status))
         .reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);

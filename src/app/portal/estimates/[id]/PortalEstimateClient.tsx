@@ -86,6 +86,9 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     break;
                 }
             }
+            // Guard: if no rows fit (single row taller than effectiveH), force a full-page
+            // advance so the while loop doesn't stall at cursor+1 indefinitely.
+            if (safeBreak <= cursor) safeBreak = limit;
             breaks.push(safeBreak);
             cursor = safeBreak;
         }
