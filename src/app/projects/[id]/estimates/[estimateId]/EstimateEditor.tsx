@@ -452,8 +452,12 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     // Internal margin calculations
     // Base cost from leaf items only (sections would double-count)
     const totalBaseCost = items.reduce((acc, item) => {
-        if (item.parentId) return acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0));
-        if (!items.some((i: any) => i.parentId === item.id)) return acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0));
+        const rate = (item.budgetRate !== null && item.budgetRate !== undefined && item.budgetRate !== "")
+            ? parseFloat(item.budgetRate)
+            : (parseFloat(item.baseCost) || 0);
+        const qty = item.budgetQuantity ?? (parseFloat(item.quantity) || 0);
+        if (item.parentId) return acc + (qty * rate);
+        if (!items.some((i: any) => i.parentId === item.id)) return acc + (qty * rate);
         return acc;
     }, 0);
     const totalMarkup = subtotal - totalBaseCost;
@@ -1253,7 +1257,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         </button>
                                     </div>
                                 )}
-                                <div className="flex items-center text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-4 py-3 uppercase tracking-wider">
+                                <div className="flex items-center gap-1 text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-4 py-3 uppercase tracking-wider">
                                 <div className="w-6"></div>
                                 <div className="w-6 pt-0.5">
                                     <input
@@ -1265,8 +1269,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </div>
                                 <div className="flex-1">Item</div>
                                 <div className="w-20 text-right">Qty</div>
-                                {viewMode === "internal" && <div className="w-24 text-right text-amber-500">Base Cost</div>}
-                                {viewMode === "internal" && <div className="w-16 text-right text-amber-500">Markup</div>}
                                 <div className="w-28 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
                                 <div className="w-28 text-right">Total</div>
                                 <div className="w-24 text-right">Approval</div>
@@ -1314,15 +1316,15 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             placeholder="Category name"
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
                                                                         />
-                                                                        <div className="flex items-center gap-3 mt-1 transition">
-                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">+ Add Sub-item</button>
-                                                                            <button onClick={() => addCategoryAfter(index + items.filter(i => i.parentId === item.id).length)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium">+ Add Category Below</button>
+                                                                        <div className="flex items-center gap-3 mt-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150">
+                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium focus-visible:opacity-100">+ Add Sub-item</button>
+                                                                            <button onClick={() => addCategoryAfter(index + items.filter(i => i.parentId === item.id).length)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium focus-visible:opacity-100">+ Add Category Below</button>
                                                                         </div>
                                                                     </div>
                                                                     <div className="flex items-center gap-3 ml-auto">
                                                                         {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
-                                                                        <span className="text-sm font-semibold text-slate-700 w-32 text-right">{formatCurrency(sectionTotal)}</span>
-                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition">
+                                                                        <span className="text-sm font-semibold text-slate-700 w-28 text-right">{formatCurrency(sectionTotal)}</span>
+                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto">
                                                                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                         </button>
                                                                     </div>
@@ -1339,7 +1341,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                             <div
                                                                 ref={provided.innerRef}
                                                                 {...provided.draggableProps}
-                                                                className={`px-4 py-2 bg-white group hover:bg-slate-50/80 transition border-l-2 ${snapshot.isDragging ? "shadow-lg border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "border-transparent ml-6 border-l border-slate-200 bg-slate-50/30" : "border-transparent"}`}
+                                                                className={`px-4 py-2 bg-white group hover:bg-slate-50/80 transition ${snapshot.isDragging ? "shadow-lg border-l-2 border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "ml-6 border-l border-slate-200 bg-slate-50/30" : "border-l-2 border-transparent"}`}
                                                             >
                                                                 {/* ── Tier 1: Name + Numbers ── */}
                                                                 <div className="flex items-center gap-1">
@@ -1372,47 +1374,19 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                                         />
                                                                     </div>
-                                                                    {viewMode === "internal" && (
-                                                                        <div className="w-24 px-1 text-right relative flex-shrink-0">
-                                                                            <span className="absolute left-3 top-1.5 text-amber-400 text-sm">$</span>
-                                                                            <input
-                                                                                type="number"
-                                                                                value={item.baseCost ?? 0}
-                                                                                onChange={e => {
-                                                                                    const bc = parseFloat(e.target.value) || 0;
-                                                                                    const mp = parseFloat(item.markupPercent) || 0;
-                                                                                    updateItem(index, "baseCost", e.target.value);
-                                                                                    updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
-                                                                                }}
-                                                                                className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 pl-5 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
-                                                                            />
-                                                                        </div>
-                                                                    )}
-                                                                    {viewMode === "internal" && (
-                                                                        <div className="w-16 px-1 text-right relative flex-shrink-0">
-                                                                            <input
-                                                                                type="number"
-                                                                                value={item.markupPercent ?? 25}
-                                                                                onChange={e => {
-                                                                                    const mp = parseFloat(e.target.value) || 0;
-                                                                                    const bc = parseFloat(item.baseCost) || 0;
-                                                                                    updateItem(index, "markupPercent", e.target.value);
-                                                                                    updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
-                                                                                }}
-                                                                                className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
-                                                                            />
-                                                                            <span className="absolute right-3 top-2 text-amber-400 text-xs">%</span>
-                                                                        </div>
-                                                                    )}
-                                                                    <div className="w-28 px-2 text-right relative flex-shrink-0">
-                                                                        <span className="absolute left-4 top-1.5 text-slate-400 text-sm">$</span>
+                                                                    {(() => { const isLocked = viewMode === "internal" && !!(item.budgetRate ?? item.baseCost); return (
+                                                                    <div className="w-28 px-2 flex items-center justify-end flex-shrink-0">
+                                                                        <span className={`text-sm flex-shrink-0 ${isLocked ? "text-slate-300" : "text-slate-400"}`}>$</span>
                                                                         <input
                                                                             type="number"
                                                                             value={item.unitCost}
                                                                             onChange={e => updateItem(index, "unitCost", e.target.value)}
-                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-5 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                            readOnly={isLocked}
+                                                                            aria-label="Unit cost"
+                                                                            className={`w-20 focus:outline-none rounded px-1 py-1 text-right transition text-sm font-medium ${isLocked ? "bg-transparent text-slate-400 cursor-default" : "bg-transparent focus:bg-white focus:ring-1 ring-slate-200 hover:bg-slate-50 text-slate-700"}`}
                                                                         />
                                                                     </div>
+                                                                    ); })()}
                                                                     <div className="w-28 px-2 text-right font-semibold text-slate-800 text-sm flex-shrink-0">
                                                                         {formatCurrency(itemTotal)}
                                                                     </div>
@@ -1428,16 +1402,16 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 Rejected
                                                                             </span>
                                                                         ) : (
-                                                                            <span className="opacity-0 group-hover:opacity-100 transition flex gap-0.5">
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition" title="Approve">
+                                                                            <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 </button>
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition" title="Reject">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 </button>
                                                                             </span>
                                                                         )}
-                                                                        <button onClick={() => removeItem(index)} className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1 transition">
+                                                                        <button onClick={() => removeItem(index)} className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1 transition">
                                                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                                         </button>
                                                                     </div>
@@ -1462,14 +1436,14 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 onClick={() => suggestDescription(index)}
                                                                                 disabled={aiSuggestingDesc === item.id}
                                                                                 title="AI: suggest description"
-                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 group-hover:opacity-100"
+                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto"
                                                                             >
                                                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
                                                                             </button>
                                                                         )}
                                                                     </div>
                                                                     {/* Phase/Type pills + action buttons — hover only */}
-                                                                    <div className="flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150">
+                                                                    <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150">
                                                                         <select
                                                                             value={item.costCodeId || ""}
                                                                             onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
@@ -1944,60 +1918,51 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     </div>
 
                     {sidebarTab === "overview" && (
-                        <div className="p-5 space-y-5">
-                            {/* Status */}
+                        <div className="p-4 space-y-3">
+                            {/* Financials */}
                             <div>
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block">Status</label>
-                                <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold ${
-                                    status === "Draft" ? "bg-slate-100 text-slate-600" :
-                                    status === "Sent" ? "bg-amber-50 text-amber-700" :
-                                    status === "Viewed" ? "bg-blue-50 text-blue-700" :
-                                    status === "Approved" ? "bg-green-50 text-green-700" :
-                                    status === "Invoiced" ? "bg-teal-50 text-teal-700" :
-                                    status === "Paid" ? "bg-emerald-50 text-emerald-700" :
-                                    "bg-slate-100 text-slate-500"
-                                }`}>{status}</span>
-                            </div>
-
-                            {/* Amounts */}
-                            <div className="space-y-3">
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Financials</label>
-                                <div className="grid grid-cols-2 gap-3">
-                                    <div className="bg-slate-50 rounded-lg p-3">
-                                        <p className="text-[10px] text-slate-500 font-medium uppercase">Subtotal</p>
-                                        <p className="text-sm font-bold text-slate-800">{formatCurrency(subtotal)}</p>
-                                    </div>
-                                    <div className="bg-indigo-50 rounded-lg p-3">
-                                        <p className="text-[10px] text-indigo-500 font-medium uppercase">Total</p>
-                                        <p className="text-sm font-bold text-indigo-700">{formatCurrency(total)}</p>
-                                    </div>
+                                <div className="flex items-center justify-between mb-1.5">
+                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Financials</label>
+                                    <span className="text-[11px] text-slate-400">
+                                        {items.length} items{paymentSchedules.length > 0 && ` · ${paymentSchedules.length} milestones`}
+                                    </span>
                                 </div>
-                                {viewMode === "internal" && (
-                                    <div className="bg-amber-50 rounded-lg p-3">
-                                        <p className="text-[10px] text-amber-600 font-medium uppercase">Profit Margin</p>
-                                        <p className="text-sm font-bold text-amber-800">{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</p>
+                                <div className="bg-slate-50 rounded-lg p-2.5 divide-y divide-slate-200">
+                                    <div className="flex justify-between items-baseline pb-2">
+                                        <span className="text-[10px] text-slate-500 font-medium uppercase">Subtotal</span>
+                                        <span className="text-sm font-semibold text-slate-700">{formatCurrency(subtotal)}</span>
                                     </div>
-                                )}
+                                    <div className="flex justify-between items-baseline py-2">
+                                        <span className="text-[10px] text-indigo-500 font-medium uppercase">Total</span>
+                                        <span className="text-sm font-bold text-indigo-700">{formatCurrency(total)}</span>
+                                    </div>
+                                    {viewMode === "internal" && (
+                                        <div className="flex justify-between items-baseline pt-2">
+                                            <span className="text-[10px] text-amber-600 font-medium uppercase">Margin</span>
+                                            <span className="text-sm font-bold text-amber-700">{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</span>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
 
                             {/* Key Dates */}
-                            <div className="space-y-2">
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Key Dates</label>
-                                <div className="space-y-2 text-sm">
+                            <div>
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 block">Key Dates</label>
+                                <div className="space-y-1 text-xs">
                                     <div className="flex justify-between">
                                         <span className="text-slate-500">Created</span>
-                                        <span className="text-slate-800 font-medium">{new Date(initialEstimate.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                        <span className="text-slate-700 font-medium">{new Date(initialEstimate.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                     </div>
                                     {initialEstimate.sentAt && (
                                         <div className="flex justify-between">
                                             <span className="text-slate-500">Sent</span>
-                                            <span className="text-slate-800 font-medium">{new Date(initialEstimate.sentAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                            <span className="text-slate-700 font-medium">{new Date(initialEstimate.sentAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                         </div>
                                     )}
                                     {initialEstimate.viewedAt && (
                                         <div className="flex justify-between">
                                             <span className="text-slate-500">Viewed</span>
-                                            <span className="text-slate-800 font-medium">{new Date(initialEstimate.viewedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                            <span className="text-slate-700 font-medium">{new Date(initialEstimate.viewedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                         </div>
                                     )}
                                     {initialEstimate.approvedAt && (
@@ -2009,46 +1974,33 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     {expirationDate && (
                                         <div className="flex justify-between">
                                             <span className="text-slate-500">Expires</span>
-                                            <span className={`font-medium ${new Date(expirationDate) < new Date() ? 'text-red-600' : 'text-slate-800'}`}>{new Date(expirationDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                            <span className={`font-medium ${new Date(expirationDate) < new Date() ? 'text-red-600' : 'text-slate-700'}`}>{new Date(expirationDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                         </div>
                                     )}
                                 </div>
                             </div>
 
                             {/* Client Info */}
-                            <div className="space-y-2">
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Client</label>
-                                <div className="bg-slate-50 rounded-lg p-3 space-y-1">
-                                    <p className="text-sm font-semibold text-slate-800">{context.clientName}</p>
-                                    {context.clientEmail && <p className="text-xs text-slate-500">{context.clientEmail}</p>}
-                                    {context.location && <p className="text-xs text-slate-500">{context.location}</p>}
+                            <div>
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 block">Client</label>
+                                <div className="bg-slate-50 rounded-lg px-2.5 py-2 space-y-0.5">
+                                    <p className="text-xs font-semibold text-slate-800 truncate">{context.clientName}</p>
+                                    {context.clientEmail && <p className="text-[11px] text-slate-500 truncate">{context.clientEmail}</p>}
+                                    {context.location && <p className="text-[11px] text-slate-500 truncate">{context.location}</p>}
                                 </div>
                             </div>
 
                             {/* Signature */}
                             {initialEstimate.signatureUrl && (
-                                <div className="space-y-2">
-                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Signature</label>
-                                    <div className="bg-green-50 rounded-lg p-3 border border-green-200">
-                                        <div className="flex items-center gap-2 mb-2">
-                                            <svg className="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                            <span className="text-xs font-semibold text-green-700">Signed by {initialEstimate.approvedBy || 'Client'}</span>
-                                        </div>
-                                        <img src={initialEstimate.signatureUrl} alt="Signature" className="max-h-16 rounded" />
+                                <div>
+                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 block">Signature</label>
+                                    <div className="bg-green-50 rounded-lg px-2.5 py-2 border border-green-200 flex items-center gap-2.5">
+                                        <svg className="w-3.5 h-3.5 text-green-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                        <span className="text-[11px] font-semibold text-green-700 truncate flex-1 min-w-0">Signed by {initialEstimate.approvedBy || 'Client'}</span>
+                                        <img src={initialEstimate.signatureUrl} alt="Signature" className="max-h-10 max-w-[120px] object-contain rounded shrink-0" />
                                     </div>
                                 </div>
                             )}
-
-                            {/* Items Summary */}
-                            <div>
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block">Items</label>
-                                <div className="text-sm text-slate-600">
-                                    <span className="font-semibold text-slate-800">{items.length}</span> line items
-                                    {paymentSchedules.length > 0 && (
-                                        <> &middot; <span className="font-semibold text-slate-800">{paymentSchedules.length}</span> payment milestones</>
-                                    )}
-                                </div>
-                            </div>
                         </div>
                     )}
 
