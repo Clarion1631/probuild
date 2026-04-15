@@ -5017,6 +5017,9 @@ export async function uploadPurchaseOrderFileFromBuffer(
     formData: FormData
 ) {
     "use server";
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+
     const file = formData.get("file") as File;
     if (!file) return;
 

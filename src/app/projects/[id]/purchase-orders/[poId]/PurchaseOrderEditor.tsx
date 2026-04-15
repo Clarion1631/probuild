@@ -50,6 +50,7 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
         name: string; email: string | null; phone: string | null; address: string | null;
     } | null>(null); // set when vendor didn't exist — will be created on save
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const isSavingRef = useRef(false); // sync guard against double-tap Save
 
     // Dynamic calculations
     const totalAmount = items.reduce((acc, curr) => acc + (Number(curr.total) || 0), 0);
@@ -92,7 +93,13 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
 
         try {
             const arrayBuf = await file.arrayBuffer();
-            const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
+            // Chunk-loop avoids call-stack overflow on files > ~64KB
+            const uint8 = new Uint8Array(arrayBuf);
+            let binary = "";
+            for (let i = 0; i < uint8.length; i += 8192) {
+                binary += String.fromCharCode(...uint8.subarray(i, i + 8192));
+            }
+            const base64 = btoa(binary);
 
             const res = await fetch("/api/purchase-orders/extract-pdf", {
                 method: "POST",
@@ -163,11 +170,13 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     };
 
     const handleSave = async () => {
-        if (!vendorId) return toast.error("Please select a vendor");
+        if (isSavingRef.current) return; // guard against double-tap
+        if (!vendorId && !pendingNewVendor) return toast.error("Please select a vendor");
         if (items.length === 0) return toast.error("Please add at least one line item");
         const hasEmptyNames = items.some(i => !i.description.trim());
         if (hasEmptyNames) return toast.error("All items must have a description");
 
+        isSavingRef.current = true;
         setIsSaving(true);
         const submitData = {
             vendorId,
@@ -225,7 +234,9 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
         } catch (error: any) {
             toast.error(error.message || "Failed to save PO");
         } finally {
+            isSavingRef.current = false;
             setIsSaving(false);
+            setPendingNewVendor(null); // clear stale state after save attempt
         }
     };
 
