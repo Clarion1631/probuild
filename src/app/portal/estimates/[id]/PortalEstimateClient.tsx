@@ -43,9 +43,9 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         const pdf = new jsPDF("p", "mm", "a4");
         const pageW = pdf.internal.pageSize.getWidth();   // 210 mm
         const pageH = pdf.internal.pageSize.getHeight();  // 297 mm
-        const marginTop = 10;
-        const marginBottom = 14;
-        const usableH = pageH - marginTop - marginBottom; // 273 mm per page
+        const marginTop = 0;
+        const marginBottom = 6;   // just enough for page number at bottom
+        const usableH = pageH - marginBottom; // ~291 mm per page
 
         // ── Step 1: Measure row positions BEFORE rendering ────────────────
         // CSS px relative to the element's top-left — scroll-independent
@@ -114,24 +114,27 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             ctx.fillRect(0, 0, slice.width, slice.height);
             ctx.drawImage(img, 0, srcY, img.width, srcH, 0, 0, img.width, srcH);
 
-            pdf.addImage(slice.toDataURL("image/jpeg", 0.92), "JPEG", 0, marginTop, pageW, sliceHMm);
+            // Content fills from y=0, edge-to-edge
+            pdf.addImage(slice.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, pageW, sliceHMm);
 
-            // Page number
+            // Page number — small text in bottom margin strip
             pdf.setFont("helvetica", "normal");
-            pdf.setFontSize(8);
-            pdf.setTextColor(160, 160, 160);
-            pdf.text(`Page ${page + 1} of ${totalPages}`, pageW / 2, pageH - 4, { align: "center" });
+            pdf.setFontSize(7);
+            pdf.setTextColor(180, 180, 180);
+            pdf.text(`Page ${page + 1} of ${totalPages}`, pageW / 2, pageH - 1.5, { align: "center" });
 
-            // Continuation header on pages 2+
+            // Continuation banner on pages 2+ — overlaid on top of content
             if (page > 0) {
                 pdf.setFillColor(248, 249, 250);
-                pdf.rect(0, 0, pageW, marginTop - 1, "F");
+                pdf.rect(0, 0, pageW, 8, "F");
+                pdf.setDrawColor(220, 220, 220);
+                pdf.line(0, 8, pageW, 8);
                 pdf.setFont("helvetica", "bold");
                 pdf.setFontSize(7);
                 pdf.setTextColor(110, 110, 110);
                 pdf.text(
                     `${companyName}  •  Estimate ${initialEstimate.code}  (continued)`,
-                    pageW / 2, 5.5, { align: "center" }
+                    pageW / 2, 5, { align: "center" }
                 );
             }
         }
