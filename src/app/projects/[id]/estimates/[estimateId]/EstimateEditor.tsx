@@ -1412,7 +1412,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                             placeholder="Category name"
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
                                                                         />
-                                                                        <div className="flex items-center gap-3 mt-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150">
+                                                                        <div className="flex items-center gap-3 mt-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                             <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium focus-visible:opacity-100">+ Add Sub-item</button>
                                                                             <button onClick={() => addCategoryAfter(index + items.filter(i => i.parentId === item.id).length)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium focus-visible:opacity-100">+ Add Category Below</button>
                                                                         </div>
@@ -1420,7 +1420,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                     <div className="flex items-center gap-3 ml-auto">
                                                                         {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
                                                                         <span className="text-sm font-semibold text-slate-700 w-28 text-right">{formatCurrency(sectionTotal)}</span>
-                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto">
+                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                         </button>
                                                                     </div>
@@ -1498,7 +1498,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 Rejected
                                                                             </span>
                                                                         ) : (
-                                                                            <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5">
+                                                                            <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                                 <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 </button>
@@ -1507,7 +1507,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 </button>
                                                                             </span>
                                                                         )}
-                                                                        <button onClick={() => removeItem(index)} className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1 transition">
+                                                                        <button onClick={() => removeItem(index)} className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1 transition">
                                                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                                         </button>
                                                                     </div>
@@ -1532,14 +1532,14 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 onClick={() => suggestDescription(index)}
                                                                                 disabled={aiSuggestingDesc === item.id}
                                                                                 title="AI: suggest description"
-                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto"
+                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto"
                                                                             >
                                                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
                                                                             </button>
                                                                         )}
                                                                     </div>
                                                                     {/* Phase/Type pills + action buttons — hover only */}
-                                                                    <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150">
+                                                                    <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                         <select
                                                                             value={item.costCodeId || ""}
                                                                             onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
