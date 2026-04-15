@@ -5988,6 +5988,9 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
 
 export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrderId: string) {
     "use server";
+    const session = await getServerSession(authOptions);
+    if (!session) throw new Error("Unauthorized");
+
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
         include: { estimate: { select: { projectId: true } } },
@@ -6003,19 +6006,33 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
         where: { id: estimateItemId },
         data: { purchaseOrderId },
     });
+    revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
     return po;
 }
 
 export async function unlinkPOFromEstimateItem(estimateItemId: string) {
     "use server";
+    const session = await getServerSession(authOptions);
+    if (!session) throw new Error("Unauthorized");
+
+    const item = await prisma.estimateItem.findUnique({
+        where: { id: estimateItemId },
+        include: { estimate: { select: { projectId: true } } },
+    });
     await prisma.estimateItem.update({
         where: { id: estimateItemId },
         data: { purchaseOrderId: null },
     });
+    if (item?.estimate.projectId) {
+        revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
+    }
 }
 
 export async function quickCreatePOAndLink(estimateItemId: string, data: { vendorId: string; amount: number; notes?: string }) {
     "use server";
+    const session = await getServerSession(authOptions);
+    if (!session) throw new Error("Unauthorized");
+
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
         include: { estimate: { select: { projectId: true } } },
@@ -6024,20 +6041,30 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
 
     const projectId = item.estimate.projectId;
-    const count = await prisma.purchaseOrder.count({ where: { projectId } });
-    const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
 
-    const po = await prisma.purchaseOrder.create({
-        data: {
-            projectId,
-            vendorId: data.vendorId,
-            code,
-            totalAmount: data.amount,
-            notes: data.notes || null,
-            status: "Draft",
-        },
-        include: { vendor: true },
-    });
+    // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count
+    let po: any;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const count = await prisma.purchaseOrder.count({ where: { projectId } });
+        const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
+        try {
+            po = await prisma.purchaseOrder.create({
+                data: {
+                    projectId,
+                    vendorId: data.vendorId,
+                    code,
+                    totalAmount: data.amount,
+                    notes: data.notes || null,
+                    status: "Draft",
+                },
+                include: { vendor: true },
+            });
+            break;
+        } catch (e: any) {
+            // Unique constraint violation on code — retry with next number
+            if (attempt === 4) throw e;
+        }
+    }
 
     await prisma.estimateItem.update({
         where: { id: estimateItemId },
@@ -6045,11 +6072,15 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
     });
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
+    revalidatePath(`/projects/${projectId}/estimates`);
     return po;
 }
 
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
     "use server";
+    const session = await getServerSession(authOptions);
+    if (!session) throw new Error("Unauthorized");
+
     return prisma.purchaseOrder.findMany({
         where: { projectId },
         select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } },

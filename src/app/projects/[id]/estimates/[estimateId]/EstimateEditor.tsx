@@ -752,8 +752,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     }
 
     async function handleLinkPO(itemId: string) {
-        setPOLinkItemId(itemId);
         if (context.type !== "project") return;
+        setPOLinkItemId(itemId);
         setLoadingPOs(true);
         try {
             const pos = await getProjectPurchaseOrdersForLinking(context.id);
