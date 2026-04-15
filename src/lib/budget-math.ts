@@ -19,7 +19,7 @@ export function internalBudget(item: {
   const rateRaw = item.budgetRate ?? item.baseCost;
   if (rateRaw == null || rateRaw === "") return null;
   const rate = typeof rateRaw === "string" ? parseFloat(rateRaw) : rateRaw;
-  if (isNaN(rate)) return null;
+  if (isNaN(rate) || rate === 0) return null;
   return qty * rate;
 }
 
