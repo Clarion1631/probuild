@@ -1,5 +1,3 @@
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import Link from 'next/link';
 import { notFound } from "next/navigation";
@@ -8,15 +6,18 @@ import PortalPayButton from "@/components/PortalPayButton";
 import { getPortalVisibility } from "@/lib/actions";
 import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
+import { resolveSessionClientId } from "@/lib/portal-auth";
 
 export default async function PortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const params = await props.params;
     const projectId = params.id;
-    
-    // Auth-less access: URL provides the capability, no session required
-    // We just fetch the project and its related data
+
+    // IDOR-5 fix: gate by portal session's clientId
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return notFound();
+
     const project = await prisma.project.findFirst({
-        where: { id: projectId },
+        where: { id: projectId, clientId: sessionClientId },
         include: {
             client: true,
             estimates: {
@@ -56,10 +57,10 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
     });
 
 
+    if (!project) return notFound();
+
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const visibility = await getPortalVisibility(projectId);
-
-    if (!project) return notFound();
 
     const clientName = project.client?.name || "Client";
     const clientEmail = project.client?.email || "";

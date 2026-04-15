@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, approveChangeOrder } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, approveChangeOrder, sendChangeOrderToClient } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -20,6 +20,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [showSignModal, setShowSignModal] = useState(false);
     const [signName, setSignName] = useState("");
     const [isSigning, setIsSigning] = useState(false);
+    const [isSending, setIsSending] = useState(false);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
     const tax = subtotal * 0.088;
@@ -167,15 +168,30 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                         Delete
                     </button>
                     <button
-                        onClick={() => {
-                            if (confirm("Mark as Sent and lock editing?")) {
+                        disabled={isSending}
+                        onClick={async () => {
+                            if (!confirm("Save and send this change order to the client for approval?")) return;
+                            setIsSending(true);
+                            try {
+                                // Save first, then send email
                                 setStatus("Sent");
-                                handleSave();
+                                await handleSave();
+                                const result = await sendChangeOrderToClient(initialData.id);
+                                if (result.success) {
+                                    toast.success(`Change order sent to ${result.sentTo}`);
+                                    router.refresh();
+                                } else {
+                                    toast.error(result.error || "Failed to send");
+                                }
+                            } catch {
+                                toast.error("Failed to send change order");
+                            } finally {
+                                setIsSending(false);
                             }
                         }}
-                        className="hui-btn hui-btn-secondary bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200"
+                        className="hui-btn hui-btn-secondary bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200 disabled:opacity-50"
                     >
-                        Send for Approval
+                        {isSending ? "Sending..." : "Send for Approval"}
                     </button>
                     <button
                         onClick={handleSave}

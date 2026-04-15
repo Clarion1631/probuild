@@ -1,11 +1,11 @@
-import { getChangeOrder, getCompanySettings, getPortalVisibility } from "@/lib/actions";
+import { getChangeOrderForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import PortalChangeOrderClient from "./PortalChangeOrderClient";
 import Link from "next/link";
 
 export default async function PortalChangeOrderPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
-    const changeOrder = await getChangeOrder(resolvedParams.id);
+    const changeOrder = await getChangeOrderForPortal(resolvedParams.id);
     const settings = await getCompanySettings();
 
     if (!changeOrder) {

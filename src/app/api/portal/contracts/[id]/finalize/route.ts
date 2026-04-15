@@ -59,69 +59,151 @@ export async function POST(
 
         // Only accept finalization for contracts that have been signed
         if (contract.status !== "Signed") {
+            // Already finalized? Return the existing file so a stuck retry from the
+            // client browser (e.g. a second submit before navigation) doesn't fail.
+            if (contract.status === "Finalized") {
+                const existingFile = await prisma.projectFile.findFirst({
+                    where: {
+                        ...(contract.projectId ? { projectId: contract.projectId } : { leadId: contract.leadId! }),
+                        name: `Executed_Contract_${contract.id}.pdf`,
+                        mimeType: "application/pdf",
+                    },
+                    orderBy: { createdAt: "desc" },
+                });
+                if (existingFile) {
+                    return NextResponse.json({ success: true, file: existingFile, alreadyFinalized: true });
+                }
+            }
             return NextResponse.json({ error: "Contract has not been signed" }, { status: 403 });
         }
 
-        let formData;
-        try {
-            formData = await req.formData();
-        } catch (parseErr: any) {
-            console.error("FormData parse error:", parseErr);
-            return NextResponse.json({ error: "Invalid form data" }, { status: 400 });
-        }
-
-        const pdfBlob = formData.get("pdf") as File | null;
-        if (!pdfBlob) {
-            return NextResponse.json({ error: "No PDF file attached" }, { status: 400 });
-        }
-
-        const bytes = await pdfBlob.arrayBuffer();
-        const buffer = Buffer.from(bytes);
-
-        // Upload to Supabase Bucket.
-        // Filename embeds the contractId so lookups can unambiguously map a PDF back
-        // to its contract even when titles collide. `getExecutedContractPdf` matches
-        // on `contains: "_Executed_Contract_{id}."`.
-        const prefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
-        const safeName = `Executed_Contract_${contract.id}.pdf`;
-        const storagePath = `${prefix}/${Date.now()}_${safeName}`;
-
-        const { data: uploadData, error: uploadError } = await supabase.storage
-            .from(STORAGE_BUCKET)
-            .upload(storagePath, buffer, {
-                contentType: "application/pdf",
-                upsert: false,
+        // ─── Atomic Signed → Finalized transition (Codex peer review blocker #2) ───
+        // Before this guard, two concurrent finalize POSTs could both pass the
+        // `status !== "Signed"` check above, both upload PDFs to Supabase, both
+        // create ProjectFile rows, then both flip status to Finalized — leaving
+        // orphan files and duplicate DB records. Fix: race on a conditional
+        // `updateMany` BEFORE any side effects. Only the caller whose update
+        // actually matches a `Signed` row proceeds. Losers fall through to the
+        // idempotent existing-file response.
+        const transition = await prisma.contract.updateMany({
+            where: { id, status: "Signed" },
+            data: { status: "Finalized" },
+        });
+        if (transition.count === 0) {
+            const existingFile = await prisma.projectFile.findFirst({
+                where: {
+                    ...(contract.projectId ? { projectId: contract.projectId } : { leadId: contract.leadId! }),
+                    name: `Executed_Contract_${contract.id}.pdf`,
+                    mimeType: "application/pdf",
+                },
+                orderBy: { createdAt: "desc" },
             });
-
-        if (uploadError) {
-            console.error("Supabase upload error:", uploadError);
-            return NextResponse.json({ error: `Storage upload failed: ${uploadError.message}` }, { status: 500 });
+            if (existingFile) {
+                return NextResponse.json({ success: true, file: existingFile, alreadyFinalized: true });
+            }
+            return NextResponse.json({ error: "Contract is not in a signable state" }, { status: 409 });
         }
 
-        // Generate public URL
-        const { data: urlData } = supabase.storage
-            .from(STORAGE_BUCKET)
-            .getPublicUrl(storagePath);
-
-        const publicUrl = urlData?.publicUrl || storagePath;
-
-        // Mark contract as Finalized to prevent duplicate submissions
-        await prisma.contract.update({
-            where: { id },
-            data: { status: "Finalized" }
-        });
-
-        // Archive as a Project File in the database
-        const record = await prisma.projectFile.create({
-            data: {
-                name: safeName,
-                url: publicUrl,
-                size: buffer.length,
-                mimeType: "application/pdf",
-                ...(contract.projectId && { projectId: contract.projectId }),
-                ...(contract.leadId && { leadId: contract.leadId }),
+        // ─── Codex round-2 blocker: uncaught post-transition paths ───
+        // Before this wrapper, operations between the state flip and the
+        // ProjectFile.create could throw in ways the explicit-try blocks didn't
+        // catch (e.g. `pdfBlob.arrayBuffer()` on a corrupt stream, an aborted
+        // request surfacing mid-upload, Supabase client panics). The outer
+        // function-level catch at the bottom returns 500 but does NOT roll back
+        // status, so the contract wedges `Finalized` with no file. Fix: wrap the
+        // whole post-transition pipeline in one try/catch; only mark `committed`
+        // after ProjectFile.create returns, and in `catch` unconditionally roll
+        // back status + best-effort remove any uploaded storage object.
+        let record: any = null;
+        let buffer: Buffer = Buffer.alloc(0);
+        let safeName = `Executed_Contract_${contract.id}.pdf`;
+        let publicUrl = "";
+        let committed = false;
+        let storagePathUploaded: string | null = null;
+        try {
+            let formData;
+            try {
+                formData = await req.formData();
+            } catch (parseErr: any) {
+                console.error("FormData parse error:", parseErr);
+                // Rollback in finally via `committed === false`.
+                throw new Error("Invalid form data");
             }
-        });
+
+            const pdfBlob = formData.get("pdf") as File | null;
+            if (!pdfBlob) {
+                throw new Error("No PDF file attached");
+            }
+
+            const bytes = await pdfBlob.arrayBuffer();
+            buffer = Buffer.from(bytes);
+
+            // Upload to Supabase Bucket.
+            // Filename embeds the contractId so lookups can unambiguously map a PDF back
+            // to its contract even when titles collide. `getExecutedContractPdf` matches
+            // on exact-equality with `Executed_Contract_{id}.pdf`.
+            const prefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
+            const storagePath = `${prefix}/${Date.now()}_${safeName}`;
+
+            const { error: uploadError } = await supabase.storage
+                .from(STORAGE_BUCKET)
+                .upload(storagePath, buffer, {
+                    contentType: "application/pdf",
+                    upsert: false,
+                });
+
+            if (uploadError) {
+                console.error("Supabase upload error:", uploadError);
+                throw new Error(`Storage upload failed: ${uploadError.message}`);
+            }
+            storagePathUploaded = storagePath;
+
+            // Generate public URL
+            const { data: urlData } = supabase.storage
+                .from(STORAGE_BUCKET)
+                .getPublicUrl(storagePath);
+
+            publicUrl = urlData?.publicUrl || storagePath;
+
+            // Archive as a Project File in the database. Status is ALREADY Finalized
+            // from the conditional transition above — do not update it again here.
+            record = await prisma.projectFile.create({
+                data: {
+                    name: safeName,
+                    url: publicUrl,
+                    size: buffer.length,
+                    mimeType: "application/pdf",
+                    ...(contract.projectId && { projectId: contract.projectId }),
+                    ...(contract.leadId && { leadId: contract.leadId }),
+                }
+            });
+            committed = true;
+        } catch (pipelineErr: any) {
+            console.error("Finalize pipeline error:", pipelineErr);
+            if (!committed) {
+                // Roll the contract back to Signed so the user can retry.
+                await prisma.contract.updateMany({
+                    where: { id, status: "Finalized" },
+                    data: { status: "Signed" },
+                });
+                // Best-effort cleanup of any uploaded storage object so a retry
+                // doesn't leave orphans.
+                if (storagePathUploaded) {
+                    try {
+                        await supabase.storage.from(STORAGE_BUCKET).remove([storagePathUploaded]);
+                    } catch {}
+                }
+            }
+            const msg = pipelineErr?.message ?? String(pipelineErr);
+            // Map the sentinel strings we threw above back to their status codes.
+            if (msg === "Invalid form data") {
+                return NextResponse.json({ error: msg }, { status: 400 });
+            }
+            if (msg === "No PDF file attached") {
+                return NextResponse.json({ error: msg }, { status: 400 });
+            }
+            return NextResponse.json({ error: `Failed to finalize contract: ${msg}` }, { status: 500 });
+        }
 
         // Resolve client/company details for email
         const clientEmail = contract.project?.client?.email || contract.lead?.client?.email;

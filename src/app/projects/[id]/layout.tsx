@@ -53,7 +53,7 @@ export default async function ProjectLayout({
                 availableLeads={JSON.parse(JSON.stringify(allLeads))}
                 unreadMessageCount={unreadCount}
             />
-            <div className="flex-1 p-6 overflow-y-auto w-full">
+            <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden w-full min-w-0">
                 <ErrorBoundary fallbackTitle="Project error">
                     {children}
                 </ErrorBoundary>

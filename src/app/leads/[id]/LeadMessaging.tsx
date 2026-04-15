@@ -432,10 +432,32 @@ export default function LeadMessaging({
                     </div>
                 ) : (
                     messages.map((msg, idx) => {
+                        const isSystem = msg.direction === "SYSTEM";
                         const isOutbound = msg.direction === "OUTBOUND";
                         const showDate = idx === 0 ||
                             formatMsgDate(msg.createdAt) !== formatMsgDate(messages[idx - 1].createdAt);
                         const atts = parseAttachments(msg.attachments);
+
+                        // System event line — rendered as a centered, subdued banner so it
+                        // doesn't look like an inbound client message. These are written by
+                        // postActivityToThread() for contract-sent / viewed / signed events.
+                        // Body is plain text emitted by server code (not user input), so
+                        // direct text render is safe — no sanitizer or innerHTML needed.
+                        if (isSystem) {
+                            return (
+                                <div key={msg.id}>
+                                    {showDate && (
+                                        <div className="text-center text-xs text-slate-400 my-4 font-medium">{formatMsgDate(msg.createdAt)}</div>
+                                    )}
+                                    <div className="flex justify-center my-3">
+                                        <div className="max-w-[80%] text-center text-xs text-slate-500 bg-slate-100 border border-slate-200 rounded-full px-4 py-1.5">
+                                            <span className="whitespace-pre-wrap">{msg.body ?? ""}</span>
+                                            <span className="ml-2 text-slate-400">· {formatMsgTime(msg.createdAt)}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        }
 
                         return (
                             <div key={msg.id}>

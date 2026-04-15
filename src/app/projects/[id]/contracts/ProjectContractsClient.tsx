@@ -113,7 +113,12 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
     const handleSend = async (contractId: string) => {
         try {
             const result = await sendContractToClient(contractId);
-            toast.success(`Sent to ${result.sentTo}`);
+            // Parity with LeadContractsClient: surface both the recipient name and email,
+            // plus the project context, so the user can verify the right person got the link.
+            toast.success(
+                `Contract sent to ${result.clientName || clientName} at ${result.sentTo}`,
+                { description: `Project: ${projectName}` }
+            );
             window.location.reload();
         } catch (e: any) { toast.error(e.message || "Failed to send"); }
     };
@@ -267,7 +272,11 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                                     <div className="flex items-center gap-3 text-xs text-slate-500 flex-wrap">
                                         <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
                                         {c.sentAt && <span>· Sent {new Date(c.sentAt).toLocaleDateString()}</span>}
-                                        {c.approvedBy && <span className="text-green-600 font-medium">· Client: {c.approvedBy}</span>}
+                                        {c.approvedBy && c.approvedAt && (
+                                            <span className="text-green-600 font-medium">
+                                                · Signed by {c.approvedBy} on {new Date(c.approvedAt).toLocaleDateString()}
+                                            </span>
+                                        )}
                                         {c.contractorSignedBy && (
                                             <span className="text-violet-600 font-medium flex items-center gap-1">
                                                 · Contractor: {c.contractorSignedBy}
@@ -288,6 +297,18 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                                         <button onClick={() => handleViewHistory(c.id)} className="px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition border border-indigo-200">
                                             📋 History
                                         </button>
+                                    )}
+                                    {c.executedPdfUrl && (
+                                        <a
+                                            href={c.executedPdfUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            onClick={e => e.stopPropagation()}
+                                            className="px-3 py-1.5 text-xs font-medium text-green-700 bg-green-50 rounded-lg hover:bg-green-100 transition border border-green-200"
+                                            title="Download signed PDF"
+                                        >
+                                            ⬇ PDF
+                                        </a>
                                     )}
                                     {c.contractorSignedBy ? (
                                         <span className="px-3 py-1.5 text-xs font-medium rounded-lg border text-violet-700 bg-violet-50 border-violet-200 flex items-center gap-1">

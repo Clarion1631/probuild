@@ -5,7 +5,10 @@ import { toast } from "sonner";
 
 interface MessageData {
     id: string;
-    senderType: "CLIENT" | "TEAM";
+    // SYSTEM = auto-generated activity banner (e.g. contract sent/signed).
+    // Written by postActivityToThread in src/lib/actions.ts — rendered as a
+    // centered subdued pill, not as a chat bubble.
+    senderType: "CLIENT" | "TEAM" | "SYSTEM";
     senderName: string;
     senderEmail?: string;
     body: string;
@@ -45,10 +48,12 @@ export default function ProjectChat({
             const data = await res.json();
             setMessages(data.messages || []);
 
-            // Mark unread messages from the OTHER side as read
+            // Mark unread messages from the OTHER side as read.
+            // SYSTEM banners are activity log entries, not real incoming
+            // messages — skip the PATCH so they don't churn read timestamps.
             const unread = (data.messages || []).filter(
                 (m: MessageData) =>
-                    m.senderType !== perspective && !m.readAt
+                    m.senderType !== perspective && m.senderType !== "SYSTEM" && !m.readAt
             );
             for (const msg of unread) {
                 fetch(`/api/messages/${msg.id}/read`, { method: "PATCH" }).catch((err) => console.error("[Chat] Failed to mark as read:", err));
@@ -180,9 +185,34 @@ export default function ProjectChat({
                 ) : (
                     messages.map((msg, idx) => {
                         const own = isOwnMessage(msg);
+                        const isSystem = msg.senderType === "SYSTEM";
                         // Show date separator
                         const showDate = idx === 0 ||
                             new Date(msg.createdAt).toDateString() !== new Date(messages[idx - 1].createdAt).toDateString();
+
+                        // SYSTEM activity banners (contract sent/viewed/signed, etc.)
+                        // render as a centered subdued pill instead of a chat bubble.
+                        // Body is server-generated plain text from postActivityToThread —
+                        // safe to render as text (no HTML, no user input).
+                        if (isSystem) {
+                            return (
+                                <div key={msg.id}>
+                                    {showDate && (
+                                        <div className="flex items-center justify-center py-2">
+                                            <span className="text-[10px] font-medium text-slate-400 bg-white px-3 py-1 rounded-full border border-slate-200 shadow-sm">
+                                                {new Date(msg.createdAt).toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })}
+                                            </span>
+                                        </div>
+                                    )}
+                                    <div className="flex justify-center my-1">
+                                        <div className="max-w-[80%] text-center text-xs text-slate-500 bg-slate-100 border border-slate-200 rounded-full px-4 py-1.5">
+                                            <span className="whitespace-pre-wrap">{msg.body ?? ""}</span>
+                                            <span className="ml-2 text-slate-400">· {formatTime(msg.createdAt)}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        }
 
                         return (
                             <div key={msg.id}>
