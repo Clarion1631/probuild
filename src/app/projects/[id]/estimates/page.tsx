@@ -23,8 +23,9 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
             .map((p: any) => ({ id: p.id, name: p.name }));
     } catch {}
 
-    // Calculate real stats
-    const approvedEstimates = estimates.filter((e: any) => e.status === 'Approved' || e.status === 'Sent');
+    // Calculate real stats — only count estimates the client has accepted
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
+    const approvedEstimates = estimates.filter((e: any) => APPROVED_STATUSES.includes(e.status));
     const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const totalAll = estimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const winRate = estimates.length > 0 ? Math.round((approvedEstimates.length / estimates.length) * 100) : 0;
