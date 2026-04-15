@@ -1994,24 +1994,24 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
             {/* Right Sidebar */}
             {showSidebar && (
-                <div className="w-80 border-l border-slate-200 bg-white flex flex-col overflow-y-auto shrink-0">
+                <div className="w-96 border-l border-slate-200 bg-white flex flex-col overflow-y-auto overflow-x-hidden shrink-0">
                     {/* Sidebar Tabs */}
                     <div className="flex border-b border-slate-200 sticky top-0 bg-white z-10">
                         <button
                             onClick={() => setSidebarTab("overview")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "overview" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "overview" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Overview</button>
                         <button
                             onClick={() => setSidebarTab("activity")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "activity" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "activity" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Activity</button>
                         <button
                             onClick={() => setSidebarTab("comments")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "comments" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "comments" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Comments</button>
                         <button
                             onClick={() => setSidebarTab("history")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "history" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "history" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >History</button>
                     </div>
 
