@@ -4,7 +4,11 @@
       "Bash(npm run:*)",
       "mcp__Claude_Preview__preview_start",
       "Read(//c/Users/jat00/.claude/**)",
-      "Read(//c/Users/jat00/OneDrive/Documents/Claude/**)"
+      "Read(//c/Users/jat00/OneDrive/Documents/Claude/**)",
+      "Bash(command -v codex)",
+      "Bash(command -v jq)",
+      "Read(//c/Users/jat00/.codex/**)",
+      "Bash(npx next:*)"
     ]
   }
 }

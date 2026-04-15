@@ -509,7 +509,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     </div>
 
                     {/* Totals */}
-                    <div className="px-10 py-8 border-t border-slate-100 flex justify-end">
+                    <div data-pdf-row="true" className="px-10 py-8 border-t border-slate-100 flex justify-end">
                         <div className="w-72 space-y-2 text-sm">
                             <div className="flex justify-between text-slate-500 font-medium">
                                 <span>Subtotal</span>
@@ -584,7 +584,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                     {/* Terms & Conditions */}
                     {initialEstimate.termsAndConditions && (
-                        <div className="px-10 pb-8 border-t border-slate-200 pt-8">
+                        <div data-pdf-row="true" className="px-10 pb-8 border-t border-slate-200 pt-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Terms & Conditions</h2>
                             <div className="bg-slate-50 rounded-md p-6 border border-slate-100">
                                 <div
@@ -597,7 +597,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                     {/* Signature / Approval Area — hidden in capture mode */}
                     {!isApproved && !isCapture && (
-                        <div className="px-10 pb-10 print:hidden">
+                        <div data-pdf-row="true" className="px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">
                                     <h3 className="text-lg font-bold text-slate-800 mb-2">Ready to Approve?</h3>
@@ -666,7 +666,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     )}
 
                     {/* Footer */}
-                    <div className="bg-slate-50/60 border-t border-slate-100 px-10 py-4 text-center">
+                    <div data-pdf-row="true" className="bg-slate-50/60 border-t border-slate-100 px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This estimate was prepared by {companyName}.{companyLicense && ` Lic# ${companyLicense}.`} {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
                         </p>
