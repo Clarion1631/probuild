@@ -1253,25 +1253,23 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         </button>
                                     </div>
                                 )}
-                                <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
-                                <div className="w-8"></div>
-                                <div className="w-8 pt-0.5">
-                                    <input 
-                                        type="checkbox" 
+                                <div className="flex items-center text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-4 py-3 uppercase tracking-wider">
+                                <div className="w-6"></div>
+                                <div className="w-6 pt-0.5">
+                                    <input
+                                        type="checkbox"
                                         checked={items.length > 0 && selectedItemIds.length === items.length}
                                         onChange={(e) => setSelectedItemIds(e.target.checked ? items.map(i => i.id) : [])}
                                         className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
                                     />
                                 </div>
-                                <div className="flex-1">Item Description</div>
-                                <div className="w-32">Phase</div>
-                                <div className="w-32">Type</div>
-                                <div className="w-24 text-right">Qty</div>
-                                {viewMode === "internal" && <div className="w-28 text-right text-amber-500">Base Cost</div>}
-                                {viewMode === "internal" && <div className="w-20 text-right text-amber-500">Markup %</div>}
-                                <div className="w-32 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
-                                <div className="w-32 text-right">Total</div>
-                                <div className="w-28 text-right">Approval</div>
+                                <div className="flex-1">Item</div>
+                                <div className="w-20 text-right">Qty</div>
+                                {viewMode === "internal" && <div className="w-24 text-right text-amber-500">Base Cost</div>}
+                                {viewMode === "internal" && <div className="w-16 text-right text-amber-500">Markup</div>}
+                                <div className="w-28 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
+                                <div className="w-28 text-right">Total</div>
+                                <div className="w-24 text-right">Approval</div>
                             </div>
 
                             <DragDropContext onDragEnd={onDragEnd}>
@@ -1341,31 +1339,112 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                             <div
                                                                 ref={provided.innerRef}
                                                                 {...provided.draggableProps}
-                                                                className={`flex items-center px-6 py-3 bg-white group hover:bg-slate-50 transition border-l-2 ${snapshot.isDragging ? "shadow-lg border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "border-transparent ml-8 bg-slate-50/30" : "border-transparent"}`}
+                                                                className={`px-4 py-2 bg-white group hover:bg-slate-50/80 transition border-l-2 ${snapshot.isDragging ? "shadow-lg border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "border-transparent ml-6 border-l border-slate-200 bg-slate-50/30" : "border-transparent"}`}
                                                             >
-                                                                <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab">
-                                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
-                                                                </div>
-                                                                <div className="w-8">
-                                                                    <input 
-                                                                        type="checkbox" 
-                                                                        checked={selectedItemIds.includes(item.id)}
-                                                                        onChange={(e) => {
-                                                                            if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]);
-                                                                            else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id));
-                                                                        }}
-                                                                        className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
-                                                                    />
-                                                                </div>
-                                                                <div className="flex-1 flex flex-col">
+                                                                {/* ── Tier 1: Name + Numbers ── */}
+                                                                <div className="flex items-center gap-1">
+                                                                    <div {...provided.dragHandleProps} className="w-6 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab flex-shrink-0">
+                                                                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
+                                                                    </div>
+                                                                    <div className="w-6 flex-shrink-0">
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={selectedItemIds.includes(item.id)}
+                                                                            onChange={(e) => {
+                                                                                if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]);
+                                                                                else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id));
+                                                                            }}
+                                                                            className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                                                        />
+                                                                    </div>
                                                                     <input
                                                                         type="text"
                                                                         value={item.name}
                                                                         onChange={e => updateItem(index, "name", e.target.value)}
                                                                         placeholder="Item name"
-                                                                        className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
+                                                                        className={`flex-1 min-w-0 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
                                                                     />
-                                                                    <div className="flex items-start gap-1 mt-0.5">
+                                                                    <div className="w-20 px-2 text-right flex-shrink-0">
+                                                                        <input
+                                                                            type="number"
+                                                                            value={item.quantity}
+                                                                            onChange={e => updateItem(index, "quantity", e.target.value)}
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                        />
+                                                                    </div>
+                                                                    {viewMode === "internal" && (
+                                                                        <div className="w-24 px-1 text-right relative flex-shrink-0">
+                                                                            <span className="absolute left-3 top-1.5 text-amber-400 text-sm">$</span>
+                                                                            <input
+                                                                                type="number"
+                                                                                value={item.baseCost ?? 0}
+                                                                                onChange={e => {
+                                                                                    const bc = parseFloat(e.target.value) || 0;
+                                                                                    const mp = parseFloat(item.markupPercent) || 0;
+                                                                                    updateItem(index, "baseCost", e.target.value);
+                                                                                    updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
+                                                                                }}
+                                                                                className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 pl-5 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
+                                                                            />
+                                                                        </div>
+                                                                    )}
+                                                                    {viewMode === "internal" && (
+                                                                        <div className="w-16 px-1 text-right relative flex-shrink-0">
+                                                                            <input
+                                                                                type="number"
+                                                                                value={item.markupPercent ?? 25}
+                                                                                onChange={e => {
+                                                                                    const mp = parseFloat(e.target.value) || 0;
+                                                                                    const bc = parseFloat(item.baseCost) || 0;
+                                                                                    updateItem(index, "markupPercent", e.target.value);
+                                                                                    updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
+                                                                                }}
+                                                                                className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
+                                                                            />
+                                                                            <span className="absolute right-3 top-2 text-amber-400 text-xs">%</span>
+                                                                        </div>
+                                                                    )}
+                                                                    <div className="w-28 px-2 text-right relative flex-shrink-0">
+                                                                        <span className="absolute left-4 top-1.5 text-slate-400 text-sm">$</span>
+                                                                        <input
+                                                                            type="number"
+                                                                            value={item.unitCost}
+                                                                            onChange={e => updateItem(index, "unitCost", e.target.value)}
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-5 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                        />
+                                                                    </div>
+                                                                    <div className="w-28 px-2 text-right font-semibold text-slate-800 text-sm flex-shrink-0">
+                                                                        {formatCurrency(itemTotal)}
+                                                                    </div>
+                                                                    <div className="w-24 flex items-center justify-end gap-0.5 flex-shrink-0">
+                                                                        {item.approvalStatus === "approved" ? (
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                                Approved
+                                                                            </span>
+                                                                        ) : item.approvalStatus === "rejected" ? (
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                                Rejected
+                                                                            </span>
+                                                                        ) : (
+                                                                            <span className="opacity-0 group-hover:opacity-100 transition flex gap-0.5">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition" title="Approve">
+                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                                </button>
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition" title="Reject">
+                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                                </button>
+                                                                            </span>
+                                                                        )}
+                                                                        <button onClick={() => removeItem(index)} className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1 transition">
+                                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                                {/* ── Tier 2: Description + Metadata (full width) ── */}
+                                                                <div className={`${isSubItem ? 'pl-8' : 'pl-14'} pr-2 mt-0.5`}>
+                                                                    <div className="flex items-start gap-1">
                                                                         <textarea
                                                                             ref={el => autoExpand(el)}
                                                                             value={item.description || ""}
@@ -1374,35 +1453,65 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 autoExpand(e.target);
                                                                             }}
                                                                             onInput={e => autoExpand(e.target as HTMLTextAreaElement)}
-                                                                            placeholder="Description — click sparkle to auto-fill with AI"
+                                                                            placeholder="Add description..."
                                                                             rows={1}
-                                                                            className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 -ml-2 transition text-xs text-hui-textMuted resize-none overflow-hidden"
+                                                                            className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 transition text-xs text-hui-textMuted resize-none overflow-hidden"
                                                                         />
                                                                         {item.name?.trim() && (
                                                                             <button
                                                                                 onClick={() => suggestDescription(index)}
                                                                                 disabled={aiSuggestingDesc === item.id}
                                                                                 title="AI: suggest description"
-                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse"
+                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 group-hover:opacity-100"
                                                                             >
                                                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
                                                                             </button>
                                                                         )}
                                                                     </div>
-                                                                    <div className="flex items-center gap-2 mt-1 transition">
+                                                                    {/* Phase/Type pills + action buttons — hover only */}
+                                                                    <div className="flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150">
+                                                                        <select
+                                                                            value={item.costCodeId || ""}
+                                                                            onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
+                                                                            className="bg-slate-100 hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-hui-textMuted text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition"
+                                                                        >
+                                                                            <option value="">Phase</option>
+                                                                            {costCodes.map(cc => (
+                                                                                <option key={cc.id} value={cc.id}>{cc.code}</option>
+                                                                            ))}
+                                                                        </select>
+                                                                        <select
+                                                                            value={item.costTypeId || ""}
+                                                                            onChange={e => {
+                                                                                updateItem(index, "costTypeId", e.target.value || null);
+                                                                                const ct = costTypes.find(c => c.id === e.target.value);
+                                                                                if (ct) updateItem(index, "type", ct.name);
+                                                                            }}
+                                                                            className={`hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition ${
+                                                                                costTypes.find(c => c.id === item.costTypeId)?.name === 'Allowance'
+                                                                                    ? 'bg-amber-100 text-amber-700 font-semibold'
+                                                                                    : 'bg-slate-100 text-hui-textMuted'
+                                                                            }`}
+                                                                        >
+                                                                            <option value="">Type</option>
+                                                                            {costTypes.map(ct => (
+                                                                                <option key={ct.id} value={ct.id}>{ct.name}</option>
+                                                                            ))}
+                                                                        </select>
+                                                                        <span className="w-px h-3 bg-slate-200"></span>
                                                                         {!isSubItem && (
-                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
-                                                                                + Add Sub-item
+                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">
+                                                                                + Sub-item
                                                                             </button>
                                                                         )}
                                                                         {isSubItem && (
-                                                                            <button onClick={() => addItemAfter(index, item.parentId)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
-                                                                                + Add Item Below
+                                                                            <button onClick={() => addItemAfter(index, item.parentId)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">
+                                                                                + Item Below
                                                                             </button>
                                                                         )}
                                                                         {!isSubItem && (
                                                                             <button onClick={() => addCategoryAfter(index)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium">
-                                                                                + Add Category Here
+                                                                                + Category
                                                                             </button>
                                                                         )}
                                                                         {!isSubItem && item.name?.trim() && (
@@ -1483,117 +1592,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                         </div>
                                                                     )}
                                                                 </div>
-                                                                <div className="w-32 px-2">
-                                                                    <select
-                                                                        value={item.costCodeId || ""}
-                                                                        onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
-                                                                        className="bg-transparent focus:outline-none text-hui-textMuted w-full text-xs truncate"
-                                                                    >
-                                                                        <option value="">No Phase</option>
-                                                                        {costCodes.map(cc => (
-                                                                            <option key={cc.id} value={cc.id}>{cc.code}</option>
-                                                                        ))}
-                                                                    </select>
-                                                                </div>
-                                                                <div className="w-32 px-4">
-                                                                    <select
-                                                                        value={item.costTypeId || ""}
-                                                                        onChange={e => {
-                                                                            updateItem(index, "costTypeId", e.target.value || null);
-                                                                            // Also update legacy type field for backwards compat
-                                                                            const ct = costTypes.find(c => c.id === e.target.value);
-                                                                            if (ct) updateItem(index, "type", ct.name);
-                                                                        }}
-                                                                        className={`bg-transparent focus:outline-none w-full text-sm ${
-                                                                            costTypes.find(c => c.id === item.costTypeId)?.name === 'Allowance'
-                                                                                ? 'text-amber-600 font-semibold'
-                                                                                : 'text-hui-textMuted'
-                                                                        }`}
-                                                                    >
-                                                                        <option value="">Cost Type</option>
-                                                                        {costTypes.map(ct => (
-                                                                            <option key={ct.id} value={ct.id}>{ct.name}</option>
-                                                                        ))}
-                                                                    </select>
-                                                                    </div>
-                                                                     <div className="w-24 px-4 pt-1 text-right">
-                                                                         <input
-                                                                             type="number"
-                                                                             value={item.quantity}
-                                                                             onChange={e => updateItem(index, "quantity", e.target.value)}
-                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
-                                                                         />
-                                                                     </div>
-                                                                     {viewMode === "internal" && (
-                                                                         <div className="w-28 px-2 pt-1 text-right relative">
-                                                                             <span className="absolute left-4 top-1.5 text-amber-400 text-sm">$</span>
-                                                                             <input
-                                                                                 type="number"
-                                                                                 value={item.baseCost ?? 0}
-                                                                                 onChange={e => {
-                                                                                     const bc = parseFloat(e.target.value) || 0;
-                                                                                     const mp = parseFloat(item.markupPercent) || 0;
-                                                                                     updateItem(index, "baseCost", e.target.value);
-                                                                                     updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
-                                                                                 }}
-                                                                                 className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 pl-5 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
-                                                                             />
-                                                                         </div>
-                                                                     )}
-                                                                     {viewMode === "internal" && (
-                                                                         <div className="w-20 px-1 pt-1 text-right relative">
-                                                                             <input
-                                                                                 type="number"
-                                                                                 value={item.markupPercent ?? 25}
-                                                                                 onChange={e => {
-                                                                                     const mp = parseFloat(e.target.value) || 0;
-                                                                                     const bc = parseFloat(item.baseCost) || 0;
-                                                                                     updateItem(index, "markupPercent", e.target.value);
-                                                                                     updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
-                                                                                 }}
-                                                                                 className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
-                                                                             />
-                                                                             <span className="absolute right-3 top-2 text-amber-400 text-xs">%</span>
-                                                                         </div>
-                                                                     )}
-                                                                     <div className="w-32 px-4 pt-1 text-right relative">
-                                                                         <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
-                                                                         <input
-                                                                             type="number"
-                                                                             value={item.unitCost}
-                                                                             onChange={e => updateItem(index, "unitCost", e.target.value)}
-                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
-                                                                             readOnly={viewMode === "internal"}
-                                                                         />
-                                                                     </div>
-                                                                    <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
-                                                                        {formatCurrency(itemTotal)}
-                                                                    </div>
-                                                                    <div className="w-28 pt-1 flex items-center justify-end gap-0.5">
-                                                                        {item.approvalStatus === "approved" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
-                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                                                Approved
-                                                                            </span>
-                                                                        ) : item.approvalStatus === "rejected" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
-                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                                                                                Rejected
-                                                                            </span>
-                                                                        ) : (
-                                                                            <span className="opacity-30 group-hover:opacity-100 transition flex gap-0.5">
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-300 hover:text-green-600 transition" title="Approve">
-                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                                                </button>
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-300 hover:text-red-500 transition" title="Reject">
-                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                                                                                </button>
-                                                                            </span>
-                                                                        )}
-                                                                        <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition">
-                                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                                        </button>
-                                                                    </div>
                                                             </div>
                                                             {viewMode === "internal" && !isSection && (
                                                                 <BudgetStrip
