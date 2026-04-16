@@ -16,7 +16,7 @@ interface UserPermission {
     estimates: boolean;
     invoices: boolean;
     contracts: boolean;
-    floorPlans: boolean;
+    roomDesigner: boolean;
     changeOrders: boolean;
     financialReports: boolean;
     timeClock: boolean;
@@ -46,7 +46,7 @@ const DEFAULT_PERMISSIONS: UserPermission = {
     estimates: false,
     invoices: false,
     contracts: false,
-    floorPlans: true,
+    roomDesigner: true,
     changeOrders: false,
     financialReports: false,
     timeClock: true,
@@ -200,7 +200,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
         { key: "estimates", label: "Estimates" },
         { key: "invoices", label: "Invoices" },
         { key: "contracts", label: "Contracts" },
-        { key: "floorPlans", label: "Floor Plans" },
+        { key: "roomDesigner", label: "Room Designer" },
         { key: "changeOrders", label: "Change Orders" },
         { key: "timeClock", label: "Time Clock" },
         { key: "dailyLogs", label: "Daily Logs" },

@@ -29,7 +29,7 @@ export default function LeadSidebar({ leadId, leadName, clientName, onConvert }:
         { key: "tasks", label: "Tasks", href: `/leads/${leadId}/tasks`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
         )},
-        { key: "3d-floor-plans", label: "3D Floor Plans", href: `/leads/${leadId}/floor-plans`, icon: (
+        { key: "room-designer", label: "Room Designer", href: `/leads/${leadId}/room-designer`, icon: (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
         )},
         { key: "schedule", label: "Schedule", href: `/leads/${leadId}/schedule`, icon: (

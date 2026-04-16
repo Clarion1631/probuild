@@ -43,9 +43,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                 orderBy: { createdAt: 'desc' },
                 include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true } } }
             },
-            floorPlans: {
-                orderBy: { createdAt: 'desc' }
-            },
+            // Room Designer data is Stage 4 (client share links) — intentionally not exposed in the portal yet.
             dailyLogs: {
                 orderBy: { date: 'desc' },
                 include: {
@@ -272,35 +270,7 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
                 </div>
                 )}
 
-                {/* Floor Plans Section */}
-                {visibility.showFiles && (
-                <div className="md:col-span-2 mt-4">
-                    <h2 className="text-xl font-bold text-hui-textMain mb-4 flex items-center gap-2">
-                        <svg className="w-5 h-5 text-hui-textMuted" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" /></svg>
-                        3D Floor Plans &amp; Designs
-                    </h2>
-                    {project.floorPlans.length === 0 ? (
-                        <div className="bg-hui-background border border-hui-border rounded-lg p-6 text-center text-hui-textMuted text-sm">
-                            No 3D floor plans available yet.
-                        </div>
-                    ) : (
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {project.floorPlans.map(plan => (
-                                <div key={plan.id} className="block hui-card overflow-hidden group">
-                                    <div className="h-32 bg-slate-100 relative overflow-hidden flex items-center justify-center">
-                                        <div className="absolute inset-0 bg-gradient-to-br from-slate-200 to-slate-100" />
-                                        <svg className="w-10 h-10 text-slate-300 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M14 10l-2 1m0 0l-2-1m2 1v2.5M20 7l-2 1m2-1l-2-1m2 1v2.5M14 4l-2-1-2 1M4 7l2-1M4 7l2 1M4 7v2.5M12 21l-2-1m2 1l2-1m-2 1v-2.5M6 18l-2-1v-2.5M18 18l2-1v-2.5" /></svg>
-                                    </div>
-                                    <div className="p-4 flex justify-between items-center">
-                                        <h3 className="font-semibold text-hui-textMain truncate">{plan.name}</h3>
-                                        <span className="text-xs text-hui-textMuted">{new Date(plan.createdAt).toLocaleDateString()}</span>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-                )}
+                {/* Room Designer portal view is Stage 4 (client share links). Not rendered in Stage 0. */}
 
                 {/* Daily Logs Section */}
                 {visibility.showDailyLogs && (

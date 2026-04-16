@@ -22,14 +22,14 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                     </div>
                     <div className="flex-1 overflow-y-auto w-full p-4 space-y-6">
                         {/* Planning */}
-                        {(can("contracts") || can("estimates") || can("takeoffs") || can("floorPlans")) && (
+                        {(can("contracts") || can("estimates") || can("takeoffs") || can("roomDesigner")) && (
                             <div>
                                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Planning</h3>
                                 <ul className="space-y-2 text-sm">
                                     {can("contracts") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Contracts</Link></li>}
                                     {can("estimates") && <li><Link href="/estimates" className="hover:text-hui-primary block transition">All Estimates</Link></li>}
                                     {can("takeoffs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Takeoffs</Link></li>}
-                                    {can("floorPlans") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All 3D Floor Plans</Link></li>}
+                                    {can("roomDesigner") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Room Designs</Link></li>}
                                 </ul>
                             </div>
                         )}

@@ -8,7 +8,7 @@ export type PermissionKey =
     | "companySettings" | "costCodesCategories"
     // Project screens
     | "schedules" | "estimates" | "invoices" | "contracts"
-    | "floorPlans" | "changeOrders" | "financialReports"
+    | "roomDesigner" | "changeOrders" | "financialReports"
     | "timeClock" | "dailyLogs" | "files" | "takeoffs"
     // Leads
     | "createLead" | "clientCommunication" | "leadAccess";
@@ -54,7 +54,7 @@ export const ALL_PERMISSION_KEYS: PermissionKey[] = [
     "companySettings", "costCodesCategories",
     // Project screens
     "schedules", "estimates", "invoices", "contracts",
-    "floorPlans", "changeOrders", "financialReports",
+    "roomDesigner", "changeOrders", "financialReports",
     "timeClock", "dailyLogs", "files", "takeoffs",
     // Leads
     "createLead", "clientCommunication", "leadAccess",
@@ -88,9 +88,9 @@ export function canAccessProject(
 // Default permissions by role (used when no UserPermission record exists)
 function getDefaultPermission(role: string, key: PermissionKey): boolean {
     const defaults: Record<string, PermissionKey[]> = {
-        FIELD_CREW: ["schedules", "floorPlans", "timeClock", "dailyLogs", "files", "costCodesCategories"],
+        FIELD_CREW: ["schedules", "roomDesigner", "timeClock", "dailyLogs", "files", "costCodesCategories"],
         FINANCE: ["estimates", "invoices", "financialReports", "timeClock", "changeOrders", "costCodesCategories"],
-        EMPLOYEE: ["schedules", "floorPlans", "timeClock", "dailyLogs", "files", "costCodesCategories"],
+        EMPLOYEE: ["schedules", "roomDesigner", "timeClock", "dailyLogs", "files", "costCodesCategories"],
     };
 
     return (defaults[role] || defaults.EMPLOYEE)?.includes(key) ?? false;
@@ -139,7 +139,7 @@ export const PERMISSION_GROUPS = {
             { key: "estimates", label: "Estimates" },
             { key: "invoices", label: "Invoices" },
             { key: "contracts", label: "Contracts" },
-            { key: "floorPlans", label: "3D Floor Plans" },
+            { key: "roomDesigner", label: "Room Designer" },
             { key: "changeOrders", label: "Change Orders" },
             { key: "financialReports", label: "Financial Reports" },
             { key: "timeClock", label: "Time, Expenses, and Rates" },

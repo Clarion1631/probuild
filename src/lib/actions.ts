@@ -9,6 +9,7 @@ import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
 
 // Safe estimate include that omits columns not yet migrated to the database.
 // Remove this wrapper once the DB Push workflow succeeds and the Estimate table
@@ -125,7 +126,7 @@ export async function getLead(id: string) {
             tasks: {
                 orderBy: { createdAt: "desc" }
             },
-            floorPlans: true,
+            roomDesigns: true,
             // Pull the linked project + its estimates so the lead estimates page
             // can surface project estimates alongside lead-direct ones.
             project: {
@@ -715,7 +716,7 @@ export async function getProject(id: string) {
     const include = {
         client: true,
         estimates: safeEstimateInclude,
-        floorPlans: true,
+        roomDesigns: true,
         contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
     } as const;
 
@@ -799,10 +800,12 @@ export async function convertLeadToProject(leadId: string) {
         });
 
         // Relink child records to the new project.
-        // Estimate and FloorPlan have no onDelete:Cascade on their lead FK — keep leadId so they
-        // remain visible from both the lead view and the project view.
+        // Estimate has no onDelete:Cascade on its lead FK — keep leadId so it
+        // remains visible from both the lead view and the project view.
         await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id } });
-        await tx.floorPlan.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        // RoomDesign has an owner-XOR CHECK constraint (projectId XOR leadId), so we must
+        // clear leadId when setting projectId in the same transaction.
+        await tx.roomDesign.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         // The remaining models have onDelete:Cascade on their lead FK — clear leadId to prevent
         // cascade-deletion of project records if the lead is ever deleted post-conversion.
         await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
@@ -865,46 +868,174 @@ export async function createDraftLeadEstimate(leadId: string) {
     return { id: estimate.id };
 }
 
-export async function createDraftFloorPlan(projectId: string) {
-    const floorPlan = await prisma.floorPlan.create({
-        data: {
-            name: "New Floor Plan",
-            projectId,
-        },
-    });
+// ─────────────────────────────────────────────────────────────────────────────
+// Room Designer (Stage 0) — replaces the old FloorPlan actions. Supports both
+// projects and leads (same owner-XOR pattern as Estimate). Mutations enforce
+// the XOR at the app layer; the DB also has a CHECK constraint for defense.
+//
+// SECURITY: every function below resolves the caller from NextAuth and verifies
+// ownership before touching a row. The /api/rooms route layer has its own
+// guards; these duplicate them so server-action callers (form posts, Next
+// Link traversal to server components) can't bypass auth by calling the action
+// directly.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    revalidatePath(`/projects/${projectId}/floor-plans`);
-    return { id: floorPlan.id };
+async function resolveCaller() {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) return null;
+    return prisma.user.findUnique({
+        where: { email: session.user.email },
+        select: { id: true, role: true },
+    });
 }
 
-export async function createDraftLeadFloorPlan(leadId: string) {
-    const floorPlan = await prisma.floorPlan.create({
-        data: {
-            name: "New Floor Plan",
-            leadId,
-        },
+async function callerCanAccessProject(caller: { id: string; role: string }, projectId: string) {
+    if (caller.role === "ADMIN" || caller.role === "MANAGER") return true;
+    const pa = await prisma.projectAccess.findFirst({
+        where: { userId: caller.id, projectId },
+        select: { id: true },
     });
-
-    revalidatePath(`/leads/${leadId}/floor-plans`);
-    return { id: floorPlan.id };
+    if (pa) return true;
+    const crew = await prisma.project.findFirst({
+        where: { id: projectId, crew: { some: { id: caller.id } } },
+        select: { id: true },
+    });
+    return !!crew;
 }
 
-export async function getFloorPlan(id: string) {
-    return await prisma.floorPlan.findUnique({ where: { id } });
+async function callerCanAccessLead(caller: { id: string; role: string }, leadId: string) {
+    if (caller.role === "ADMIN" || caller.role === "MANAGER") return true;
+    const lead = await prisma.lead.findFirst({
+        where: { id: leadId, managerId: caller.id },
+        select: { id: true },
+    });
+    return !!lead;
 }
 
-export async function saveFloorPlanData(id: string, relatedId: string, data: string, isLead: boolean = false) {
-    await prisma.floorPlan.update({
-        where: { id },
-        data: { data },
-    });
+async function callerCanAccessRoom(
+    caller: { id: string; role: string },
+    room: { projectId: string | null; leadId: string | null },
+) {
+    if (caller.role === "ADMIN" || caller.role === "MANAGER") return true;
+    if (room.projectId) return callerCanAccessProject(caller, room.projectId);
+    if (room.leadId) return callerCanAccessLead(caller, room.leadId);
+    return false;
+}
 
-    if (isLead) {
-        revalidatePath(`/leads/${relatedId}/floor-plans`);
-    } else {
-        revalidatePath(`/projects/${relatedId}/floor-plans`);
+export async function createDraftRoom(opts: {
+    projectId?: string;
+    leadId?: string;
+    name?: string;
+    roomType?: RoomType;
+}) {
+    const caller = await resolveCaller();
+    if (!caller) throw new Error("Unauthorized");
+
+    const { projectId, leadId, name, roomType } = opts;
+    if (!!projectId === !!leadId) {
+        throw new Error("createDraftRoom requires exactly one of projectId or leadId");
     }
+    if (projectId && !(await callerCanAccessProject(caller, projectId))) throw new Error("Forbidden");
+    if (leadId && !(await callerCanAccessLead(caller, leadId))) throw new Error("Forbidden");
+
+    const room = await prisma.roomDesign.create({
+        data: {
+            name: name ?? "New Room",
+            roomType: roomType ?? "kitchen",
+            projectId: projectId ?? null,
+            leadId: leadId ?? null,
+            layoutJson: buildDefaultLayout() as any,
+        },
+    });
+    if (projectId) revalidatePath(`/projects/${projectId}/room-designer`);
+    if (leadId) revalidatePath(`/leads/${leadId}/room-designer`);
+    return { id: room.id };
+}
+
+export async function getRoom(id: string) {
+    const caller = await resolveCaller();
+    if (!caller) return null;
+
+    const room = await prisma.roomDesign.findUnique({
+        where: { id },
+        include: { assets: true },
+    });
+    if (!room) return null;
+    if (!(await callerCanAccessRoom(caller, room))) return null;
+    return JSON.parse(JSON.stringify(room));
+}
+
+export async function deleteRoom(id: string) {
+    const caller = await resolveCaller();
+    if (!caller) throw new Error("Unauthorized");
+
+    const room = await prisma.roomDesign.findUnique({
+        where: { id },
+        select: { projectId: true, leadId: true },
+    });
+    if (!room) return { success: false };
+    if (!(await callerCanAccessRoom(caller, room))) throw new Error("Forbidden");
+
+    await prisma.roomDesign.delete({ where: { id } });
+    if (room.projectId) revalidatePath(`/projects/${room.projectId}/room-designer`);
+    if (room.leadId) revalidatePath(`/leads/${room.leadId}/room-designer`);
     return { success: true };
+}
+
+export async function renameRoom(id: string, name: string) {
+    const caller = await resolveCaller();
+    if (!caller) throw new Error("Unauthorized");
+
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Room name cannot be empty");
+
+    const existing = await prisma.roomDesign.findUnique({
+        where: { id },
+        select: { projectId: true, leadId: true },
+    });
+    if (!existing) throw new Error("Room not found");
+    if (!(await callerCanAccessRoom(caller, existing))) throw new Error("Forbidden");
+
+    const room = await prisma.roomDesign.update({
+        where: { id },
+        data: { name: trimmed },
+        select: { projectId: true, leadId: true },
+    });
+    if (room.projectId) revalidatePath(`/projects/${room.projectId}/room-designer`);
+    if (room.leadId) revalidatePath(`/leads/${room.leadId}/room-designer`);
+    return { success: true };
+}
+
+export async function listRoomsForProject(projectId: string) {
+    const caller = await resolveCaller();
+    if (!caller) return [];
+    if (!(await callerCanAccessProject(caller, projectId))) return [];
+
+    const rooms = await prisma.roomDesign.findMany({
+        where: { projectId },
+        orderBy: { updatedAt: "desc" },
+        select: {
+            id: true, name: true, roomType: true, thumbnail: true,
+            updatedAt: true, createdAt: true,
+        },
+    });
+    return JSON.parse(JSON.stringify(rooms));
+}
+
+export async function listRoomsForLead(leadId: string) {
+    const caller = await resolveCaller();
+    if (!caller) return [];
+    if (!(await callerCanAccessLead(caller, leadId))) return [];
+
+    const rooms = await prisma.roomDesign.findMany({
+        where: { leadId },
+        orderBy: { updatedAt: "desc" },
+        select: {
+            id: true, name: true, roomType: true, thumbnail: true,
+            updatedAt: true, createdAt: true,
+        },
+    });
+    return JSON.parse(JSON.stringify(rooms));
 }
 
 export async function getEstimate(id: string) {
