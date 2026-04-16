@@ -6,8 +6,9 @@
 // payload will be funneled — it produces the same RoomSnapshot shape the canvas
 // consumes.
 
-import type { PlacedAsset, RoomLayout, RoomSnapshot, RoomType } from "@/components/room-designer/types";
+import type { PlacedAsset, RoomLayout, RoomLighting, RoomSnapshot, RoomType } from "@/components/room-designer/types";
 import { buildDefaultLayout } from "@/components/room-designer/types";
+import { DEFAULT_PRESET, HDRI_PRESETS, type HdriPreset } from "@/lib/room-designer/hdri-presets";
 
 // DB shape (matches Prisma RoomDesign + RoomAsset[]).
 export interface DbRoomAsset {
@@ -111,7 +112,18 @@ function parseLayout(raw: unknown): RoomLayout {
         walls: obj.walls,
         camera: obj.camera,
         surfaces: obj.surfaces ?? {},
+        lighting: parseLighting(obj.lighting),
     };
+}
+
+// Stage 4: lighting defaults in when older rooms have no `lighting` block.
+// Unknown preset keys degrade to DEFAULT_PRESET rather than being dropped.
+function parseLighting(raw: unknown): RoomLighting {
+    if (!raw || typeof raw !== "object") return { hdriPreset: DEFAULT_PRESET };
+    const obj = raw as Partial<RoomLighting>;
+    const key = obj.hdriPreset as HdriPreset | undefined;
+    if (key && key in HDRI_PRESETS) return { hdriPreset: key };
+    return { hdriPreset: DEFAULT_PRESET };
 }
 
 function normalizeRoomType(rt: string): RoomType {

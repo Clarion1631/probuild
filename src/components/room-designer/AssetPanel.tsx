@@ -1,108 +1,67 @@
-// Left sidebar — browse assets and drop them into the room. Stage 0 just uses
-// a click-to-place flow (drops the asset at the room origin). Stage 1 will add
-// drag-and-drop onto the canvas.
+// Left sidebar — browse assets and start placement.
+//
+// Stage 2 behavior:
+//   Click an asset card → startPlacing(asset) — asset attaches to cursor,
+//   AssetGhost follows the PlacementPlane's cursor in the canvas, click
+//   on the canvas confirms. Escape cancels.
+//
+// Stage 1 (real GLTF + thumbnails): AssetCard will render asset.thumbnailPath
+// in the image slot when present. No changes needed here.
 
-import { useMemo, useState } from "react";
-import { ASSETS_BY_CATEGORY, CATEGORY_COLORS, type Asset } from "@/lib/room-designer/asset-registry";
-import type { AssetCategory, PlacedAsset } from "./types";
+import { useState } from "react";
+import type { Asset } from "@/lib/room-designer/asset-registry";
+import type { AssetCategory } from "./types";
+import { AssetGrid } from "./AssetGrid";
+import { AssetSearch } from "./AssetSearch";
+import { CategoryTabs } from "./CategoryTabs";
+import { useAssetLibrary } from "./hooks/useAssetLibrary";
 import { useRoomStore } from "./hooks/useRoomStore";
 
-const CATEGORIES: { key: AssetCategory; label: string; icon: string }[] = [
-    { key: "cabinet", label: "Cabinets", icon: "▦" },
-    { key: "appliance", label: "Appliances", icon: "◨" },
-    { key: "fixture", label: "Fixtures", icon: "◉" },
-    { key: "window", label: "Windows", icon: "▣" },
-    { key: "door", label: "Doors", icon: "▯" },
-];
-
-function newId() {
-    return `temp-${Math.random().toString(36).slice(2, 10)}`;
-}
-
 export function AssetPanel() {
-    const [active, setActive] = useState<AssetCategory>("cabinet");
+    const [category, setCategory] = useState<AssetCategory>("cabinet");
     const [query, setQuery] = useState("");
-    const addAsset = useRoomStore((s) => s.addAsset);
 
-    const items = useMemo(() => {
-        const base = ASSETS_BY_CATEGORY[active];
-        const q = query.trim().toLowerCase();
-        if (!q) return base;
-        return base.filter(
-            (a) =>
-                a.name.toLowerCase().includes(q) ||
-                a.subcategory.toLowerCase().includes(q) ||
-                a.tags.some((t) => t.toLowerCase().includes(q)),
-        );
-    }, [active, query]);
+    const placingAsset = useRoomStore((s) => s.placingAsset);
+    const startPlacing = useRoomStore((s) => s.startPlacing);
+    const cancelPlacing = useRoomStore((s) => s.cancelPlacing);
 
-    function place(a: Asset) {
-        const placed: PlacedAsset = {
-            id: newId(),
-            assetId: a.id,
-            assetType: a.category,
-            position: { x: 0, y: 0, z: 0 },
-            rotationY: 0,
-            scale: { x: 1, y: 1, z: 1 },
-        };
-        addAsset(placed);
+    const items = useAssetLibrary(category, query);
+
+    function handleSelect(asset: Asset) {
+        // Clicking the active asset again cancels placement — nice escape hatch.
+        if (placingAsset?.id === asset.id) {
+            cancelPlacing();
+            return;
+        }
+        startPlacing(asset);
     }
 
     return (
         <div className="flex h-full flex-col gap-3 border-r border-slate-200 bg-white p-3">
-            <h2 className="text-sm font-semibold text-slate-900">Asset Library</h2>
-
-            <div className="flex flex-wrap gap-1">
-                {CATEGORIES.map((c) => (
-                    <button
-                        key={c.key}
-                        onClick={() => setActive(c.key)}
-                        className={`rounded-md border px-2 py-1 text-xs font-medium transition ${
-                            active === c.key
-                                ? "border-slate-800 bg-slate-900 text-white"
-                                : "border-slate-200 bg-white text-slate-700 hover:border-slate-300"
-                        }`}
-                    >
-                        <span className="mr-1">{c.icon}</span>
-                        {c.label}
-                    </button>
-                ))}
+            <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-slate-900">Asset Library</h2>
+                {placingAsset && (
+                    <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                        Placing: {placingAsset.name}
+                    </span>
+                )}
             </div>
 
-            <input
-                type="text"
-                placeholder="Search…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                className="hui-input py-1 text-sm"
+            <AssetSearch value={query} onChange={setQuery} />
+            <CategoryTabs active={category} onChange={setCategory} />
+
+            {/* AssetGrid owns its own scroll container so it can window rows. */}
+            <AssetGrid
+                items={items}
+                activeAssetId={placingAsset?.id ?? null}
+                onSelect={handleSelect}
             />
 
-            <div className="flex-1 overflow-y-auto">
-                <div className="grid grid-cols-2 gap-2">
-                    {items.map((a) => (
-                        <button
-                            key={a.id}
-                            onClick={() => place(a)}
-                            className="group flex flex-col items-stretch overflow-hidden rounded-md border border-slate-200 bg-white text-left transition hover:border-slate-400 hover:shadow-sm"
-                            title={`${a.name}\n${(a.dimensions.width * 39.37).toFixed(1)}" W × ${(a.dimensions.height * 39.37).toFixed(1)}" H × ${(a.dimensions.depth * 39.37).toFixed(1)}" D`}
-                        >
-                            <div
-                                className="flex h-16 items-center justify-center text-2xl text-white/90"
-                                style={{ backgroundColor: CATEGORY_COLORS[a.category] }}
-                            >
-                                {CATEGORIES.find((c) => c.key === a.category)?.icon ?? "▦"}
-                            </div>
-                            <div className="p-1.5">
-                                <div className="truncate text-xs font-medium text-slate-800">{a.name}</div>
-                                <div className="truncate text-[10px] text-slate-500">{a.subcategory}</div>
-                            </div>
-                        </button>
-                    ))}
-                    {items.length === 0 && (
-                        <div className="col-span-2 py-8 text-center text-xs text-slate-400">No assets match.</div>
-                    )}
+            {placingAsset && (
+                <div className="rounded-md border border-blue-200 bg-blue-50 p-2 text-[11px] text-blue-900">
+                    Click on the canvas to place, or press Esc to cancel.
                 </div>
-            </div>
+            )}
         </div>
     );
 }

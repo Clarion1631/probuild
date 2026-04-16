@@ -1,10 +1,16 @@
 // Swaps between a top-down orthographic camera (2D plan view) and a tilted
 // perspective camera (3D view) based on the store's viewMode. OrbitControls
 // let the user pan/zoom/rotate in 3D; in 2D they're locked to pan + zoom only.
+//
+// Stage 3: exposes the OrbitControls instance via CanvasContext so the
+// TransformGizmo can disable orbit during drag, and useCameraPresets can
+// tween the target when the user clicks a view preset.
 
 import { OrbitControls, OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
 import type { RoomLayout, ViewMode } from "@/components/room-designer/types";
 import { roomBounds } from "@/components/room-designer/core/geometry";
+import { useCanvasContext } from "./CanvasContext";
+import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 
 interface CameraRigProps {
     layout: RoomLayout;
@@ -12,6 +18,7 @@ interface CameraRigProps {
 }
 
 export function CameraRig({ layout, viewMode }: CameraRigProps) {
+    const { orbitRef } = useCanvasContext();
     const { minX, maxX, minZ, maxZ } = roomBounds(layout);
     const cx = (minX + maxX) / 2;
     const cz = (minZ + maxZ) / 2;
@@ -30,6 +37,7 @@ export function CameraRig({ layout, viewMode }: CameraRigProps) {
                     up={[0, 0, -1]}
                 />
                 <OrbitControls
+                    ref={orbitRef as React.RefObject<OrbitControlsImpl>}
                     enableRotate={false}
                     enablePan
                     enableZoom
@@ -56,6 +64,7 @@ export function CameraRig({ layout, viewMode }: CameraRigProps) {
         <>
             <PerspectiveCamera makeDefault position={camPos} fov={50} near={0.1} far={500} />
             <OrbitControls
+                ref={orbitRef as React.RefObject<OrbitControlsImpl>}
                 enableRotate
                 enablePan
                 enableZoom

@@ -11,6 +11,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { RoomType } from "./types";
+import {
+    ROOM_TEMPLATES,
+    TEMPLATE_ORDER,
+    type TemplateKey,
+} from "@/lib/room-designer/templates";
 
 interface RoomSummary {
     id: string;
@@ -56,19 +61,29 @@ export function RoomList({ rooms, ownerType, ownerId }: RoomListProps) {
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [name, setName] = useState("");
     const [roomType, setRoomType] = useState<RoomType>("kitchen");
+    // Selecting a template locks roomType to the template's own roomType so
+    // a "master_bath" template can't be saved as a kitchen.
+    const [templateKey, setTemplateKey] = useState<TemplateKey | "">("");
     const [creating, setCreating] = useState(false);
     const [, startTransition] = useTransition();
 
     const basePath = ownerType === "project" ? `/projects/${ownerId}/room-designer` : `/leads/${ownerId}/room-designer`;
+
+    const selectedTemplate = templateKey ? ROOM_TEMPLATES[templateKey] : null;
+    const effectiveRoomType: RoomType = selectedTemplate ? selectedTemplate.roomType : roomType;
 
     async function handleCreate(e: React.FormEvent) {
         e.preventDefault();
         if (!name.trim()) return;
         setCreating(true);
         try {
-            const body: Record<string, string> = { name: name.trim(), roomType };
+            const body: Record<string, string> = {
+                name: name.trim(),
+                roomType: effectiveRoomType,
+            };
             if (ownerType === "project") body.projectId = ownerId;
             else body.leadId = ownerId;
+            if (templateKey) body.templateKey = templateKey;
             const res = await fetch("/api/rooms", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -79,6 +94,7 @@ export function RoomList({ rooms, ownerType, ownerId }: RoomListProps) {
             toast.success("Room created");
             setIsModalOpen(false);
             setName("");
+            setTemplateKey("");
             router.push(`${basePath}/${created.id}`);
         } catch (err) {
             toast.error("Couldn't create room");
@@ -205,9 +221,15 @@ export function RoomList({ rooms, ownerType, ownerId }: RoomListProps) {
                         <div>
                             <label className="mb-1 block text-xs font-medium text-slate-700">Room type</label>
                             <select
-                                className="hui-input w-full"
-                                value={roomType}
+                                className="hui-input w-full disabled:bg-slate-50 disabled:text-slate-500"
+                                value={effectiveRoomType}
                                 onChange={(e) => setRoomType(e.target.value as RoomType)}
+                                disabled={!!selectedTemplate}
+                                title={
+                                    selectedTemplate
+                                        ? "Room type is set by the selected template"
+                                        : undefined
+                                }
                             >
                                 {ROOM_TYPE_OPTIONS.map((opt) => (
                                     <option key={opt.value} value={opt.value}>
@@ -215,6 +237,43 @@ export function RoomList({ rooms, ownerType, ownerId }: RoomListProps) {
                                     </option>
                                 ))}
                             </select>
+                        </div>
+                        <div>
+                            <label className="mb-1 block text-xs font-medium text-slate-700">
+                                Start from template <span className="text-slate-400">(optional)</span>
+                            </label>
+                            <select
+                                className="hui-input w-full"
+                                value={templateKey}
+                                onChange={(e) => setTemplateKey(e.target.value as TemplateKey | "")}
+                            >
+                                <option value="">Empty room</option>
+                                <optgroup label="Kitchens">
+                                    {TEMPLATE_ORDER.filter(
+                                        (k) => ROOM_TEMPLATES[k].roomType === "kitchen",
+                                    ).map((k) => (
+                                        <option key={k} value={k}>
+                                            {ROOM_TEMPLATES[k].label} ·{" "}
+                                            {ROOM_TEMPLATES[k].widthFt}&apos;×{ROOM_TEMPLATES[k].lengthFt}&apos;
+                                        </option>
+                                    ))}
+                                </optgroup>
+                                <optgroup label="Bathrooms">
+                                    {TEMPLATE_ORDER.filter(
+                                        (k) => ROOM_TEMPLATES[k].roomType === "bathroom",
+                                    ).map((k) => (
+                                        <option key={k} value={k}>
+                                            {ROOM_TEMPLATES[k].label} ·{" "}
+                                            {ROOM_TEMPLATES[k].widthFt}&apos;×{ROOM_TEMPLATES[k].lengthFt}&apos;
+                                        </option>
+                                    ))}
+                                </optgroup>
+                            </select>
+                            {selectedTemplate && (
+                                <p className="mt-1 text-xs text-slate-500">
+                                    {selectedTemplate.description}
+                                </p>
+                            )}
                         </div>
                         <div className="flex justify-end gap-2 pt-2">
                             <button

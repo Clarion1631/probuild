@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { linkProjectToLead } from "@/lib/actions";
 import { toast } from "sonner";
 import { usePermissions } from "@/components/PermissionsProvider";
+import { RoomDesignerNavContent } from "@/components/room-designer/RoomDesignerNavContent";
 
 interface ProjectInnerSidebarProps {
     projectId: string;
@@ -37,6 +38,11 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
     const { permissions, isAdmin, loaded } = usePermissions();
 
     const can = (key?: string) => !key || !loaded || !!permissions[key];
+
+    // When editing a single room, replace the project nav with room-designer
+    // tools (back link + asset library) so the editor has one combined rail
+    // instead of a left sidebar AND a second right panel.
+    const isRoomEditor = /^\/projects\/[^/]+\/room-designer\/[^/]+$/.test(pathname || "");
 
     const toggleSidebar = () => {
         setSidebarCollapsed(prev => {
@@ -154,8 +160,13 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
         {/* Inner sidebar: always 224px wide, clipped by inner wrapper when collapsed. */}
         <div id="project-inner-sidebar" className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
 
-            {/* Top bar — back link (hidden when collapsed) */}
-            {!sidebarCollapsed && (
+            {/* Room editor mode: swap entire sidebar content for the room-designer rail. */}
+            {!sidebarCollapsed && isRoomEditor && (
+                <RoomDesignerNavContent backHref={`/projects/${projectId}/room-designer`} />
+            )}
+
+            {/* Top bar — back link (hidden when collapsed or when in room editor) */}
+            {!sidebarCollapsed && !isRoomEditor && (
                 <div className="flex items-center border-b border-hui-border px-2 py-2 shrink-0">
                     <Link
                         href="/projects"
@@ -170,7 +181,7 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
             )}
 
             {/* Expanded content */}
-            {!sidebarCollapsed && <>
+            {!sidebarCollapsed && !isRoomEditor && <>
 
             {/* Client Portal Link */}
             <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0">

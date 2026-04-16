@@ -5,6 +5,7 @@
 
 import dynamic from "next/dynamic";
 import type { RoomSnapshot } from "./types";
+import type { OwnerContext } from "@/lib/room-designer/owner-context";
 
 const RoomDesigner = dynamic(
     () => import("./RoomDesigner").then((m) => m.RoomDesigner),
@@ -18,9 +19,16 @@ const RoomDesigner = dynamic(
     },
 );
 
+export interface RoomDesignerInitialShareState {
+    enabled: boolean;
+    token: string | null;
+}
+
 interface RoomDesignerClientProps {
     snapshot: RoomSnapshot;
     roomName: string;
+    ownerContext: OwnerContext;
+    initialShareState: RoomDesignerInitialShareState;
 }
 
 export default function RoomDesignerClient(props: RoomDesignerClientProps) {

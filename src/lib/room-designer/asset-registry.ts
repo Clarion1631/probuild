@@ -407,6 +407,92 @@ export const ASSET_REGISTRY: Asset[] = [
         dimensions: { width: 0.762, height: 2.032, depth: 0.0381 },
         tags: ["door", "pocket"],
     },
+
+    // ───────── Lighting (5) — optional category, Stage 1.5 addition.
+    // Dimensions are Stage 0 AABB estimates in meters. Stage 2 swaps to
+    // the real GLB bounding box via the asset-resolve pipeline.
+    {
+        id: "ceiling-light-1",
+        name: "Flush Mount Ceiling Light",
+        category: "lighting",
+        subcategory: "ceiling",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.35, height: 0.15, depth: 0.35 },
+        tags: ["light", "ceiling", "flush-mount"],
+    },
+    {
+        id: "ceiling-light-2",
+        name: "Pendant Ceiling Light",
+        category: "lighting",
+        subcategory: "ceiling",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.30, height: 0.45, depth: 0.30 },
+        tags: ["light", "ceiling", "pendant"],
+    },
+    {
+        id: "chandelier",
+        name: "Chandelier",
+        category: "lighting",
+        subcategory: "ceiling",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.70, height: 0.80, depth: 0.70 },
+        tags: ["light", "ceiling", "chandelier"],
+    },
+    {
+        id: "floor-lamp",
+        name: "Floor Lamp",
+        category: "lighting",
+        subcategory: "floor",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.40, height: 1.60, depth: 0.40 },
+        tags: ["light", "floor", "lamp"],
+    },
+    {
+        id: "desk-lamp",
+        name: "Desk Lamp",
+        category: "lighting",
+        subcategory: "table",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.20, height: 0.50, depth: 0.25 },
+        tags: ["light", "table", "lamp"],
+    },
+
+    // ───────── Plants (3) — optional category, Stage 1.5 addition.
+    {
+        id: "houseplant-small",
+        name: "Small Houseplant",
+        category: "plants",
+        subcategory: "table",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.30, height: 0.40, depth: 0.30 },
+        tags: ["plant", "small", "decor"],
+    },
+    {
+        id: "houseplant-medium",
+        name: "Medium Houseplant",
+        category: "plants",
+        subcategory: "floor",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.45, height: 0.80, depth: 0.45 },
+        tags: ["plant", "medium", "decor"],
+    },
+    {
+        id: "houseplant-large",
+        name: "Large Houseplant",
+        category: "plants",
+        subcategory: "floor",
+        modelPath: null,
+        thumbnailPath: null,
+        dimensions: { width: 0.60, height: 1.40, depth: 0.60 },
+        tags: ["plant", "large", "decor"],
+    },
 ];
 
 export const ASSETS_BY_CATEGORY: Record<AssetCategory, Asset[]> = {
@@ -415,6 +501,8 @@ export const ASSETS_BY_CATEGORY: Record<AssetCategory, Asset[]> = {
     fixture: ASSET_REGISTRY.filter((a) => a.category === "fixture"),
     window: ASSET_REGISTRY.filter((a) => a.category === "window"),
     door: ASSET_REGISTRY.filter((a) => a.category === "door"),
+    lighting: ASSET_REGISTRY.filter((a) => a.category === "lighting"),
+    plants: ASSET_REGISTRY.filter((a) => a.category === "plants"),
 };
 
 export function getAsset(id: string): Asset | undefined {
@@ -428,4 +516,6 @@ export const CATEGORY_COLORS: Record<AssetCategory, string> = {
     fixture: "#d4d8de",
     window: "#9cc7e8",
     door: "#6b4f3a",
+    lighting: "#f5c542",
+    plants: "#5a9b56",
 };
