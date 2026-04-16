@@ -11,6 +11,9 @@
     "lint": "eslint",
     "test:e2e": "playwright test",
     "test:qa": "npx playwright test e2e/quality-gate.spec.ts",
+    "assets:download": "tsx scripts/download-assets.ts",
+    "assets:download:dry": "tsx scripts/download-assets.ts --dry-run",
+    "download-hdri": "tsx scripts/download-hdri.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {
@@ -26,6 +29,7 @@
     "@radix-ui/react-toast": "^1.2.15",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
+    "@react-three/postprocessing": "^3.0.4",
     "@stripe/stripe-js": "^8.9.0",
     "@supabase/supabase-js": "^2.99.0",
     "@tailwindcss/typography": "^0.5.19",
@@ -74,14 +78,21 @@
     "zustand": "^5.0.11"
   },
   "devDependencies": {
+    "@gltf-transform/core": "^4.1.2",
+    "@gltf-transform/extensions": "^4.1.2",
+    "@gltf-transform/functions": "^4.1.2",
     "@playwright/test": "^1.59.1",
     "@tailwindcss/postcss": "^4",
+    "@types/adm-zip": "^0.5.7",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "adm-zip": "^0.5.16",
+    "draco3dgltf": "^1.5.7",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
+    "tsx": "^4.19.2",
     "typescript": "^5"
   }
 }

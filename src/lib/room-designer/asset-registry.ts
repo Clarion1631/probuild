@@ -1,12 +1,15 @@
 // Master asset registry for the Room Designer.
 //
-// STAGE 0: placeholders only. modelPath and thumbnailPath are null — the canvas
-// renders box geometry sized from `dimensions`. Stage 1 will populate real GLTF
-// paths downloaded from Poly Haven / ambientCG / Kenney and thumbnails generated
-// from them.
+// STAGE 0 shape preserved. STAGE 1 adds optional license/source fields and a
+// sibling MATERIAL_REGISTRY in ./material-registry.ts. Runtime path resolution
+// (reading room-designer-assets/manifest.json from Supabase Storage) lands in
+// Stage 2 via a getResolvedAsset(id) helper.
 //
-// Do NOT add license/source fields with placeholder values here. Those land in
-// Stage 1 when real assets replace the boxes.
+// STAGE 2 TODO: src/app/api/assets/route.ts returns this registry with
+// modelPath/thumbnailPath=null. Stage 2 must fetch manifest.json from Supabase
+// and merge the GLB URLs into the response (or do the merge client-side).
+// `force-static` was removed in Stage 1.5 so the route can run dynamically
+// when the merge lands.
 
 import type { AssetCategory } from "@/components/room-designer/types";
 
@@ -15,10 +18,12 @@ export interface Asset {
     name: string;
     category: AssetCategory;
     subcategory: string;
-    modelPath: string | null; // Stage 0: null. Stage 1: /assets/room-designer/models/...
+    modelPath: string | null; // Stage 0: null (box fallback). Stage 2: Supabase public URL.
     thumbnailPath: string | null; // Stage 0: null (UI renders category icon fallback).
     dimensions: { width: number; height: number; depth: number }; // meters
     tags: string[];
+    license?: "CC0" | "CC-BY" | "MIT"; // populated by manifest lookup in Stage 2
+    source?: string; // e.g. "polyhaven:modern_armchair_01"
 }
 
 // Dimensions drawn from standard millwork/appliance catalogs, converted to meters.
