@@ -40,6 +40,8 @@
     "node_modules",
     "e2e",
     "playwright.config.ts",
-    "playwright.config.prod.ts"
+    "playwright.config.prod.ts",
+    "scripts",
+    "_stage2_parked"
   ]
 }

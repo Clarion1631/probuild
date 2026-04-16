@@ -15,7 +15,7 @@ export default async function LeadRoomEditorPage(
     const snapshot = importFromProBuild(room as any);
 
     return (
-        <div className="fixed inset-0 top-0 flex flex-col">
+        <div className="fixed inset-0 z-[60] flex flex-col">
             <RoomDesignerClient snapshot={snapshot} roomName={room.name} />
         </div>
     );
