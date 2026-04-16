@@ -64,3 +64,17 @@ output/
 config.py
 config.py
 __pycache__/
+
+# Room Designer — local staging only. Final assets live in Supabase Storage.
+public/assets/room-designer/
+
+# Room Designer — CC0 vendor kits used by scripts/download-assets.ts.
+# Contents are redistributable under their source licenses; don't bloat git.
+scripts/vendor/*
+!scripts/vendor/README.md
+
+# Per-machine Claude Code + Supabase CLI artifacts (not source)
+.claude/settings.local.json
+.claude/skills/
+docs/superpowers/
+supabase/.temp/
