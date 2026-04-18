@@ -2,15 +2,14 @@
 
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
-import { internalBudget, bufferPercent, bufferColor, bufferBgColor, sellFromMargin } from "@/lib/budget-math";
-import { toast } from "sonner";
+import { internalBudget, bufferPercent, bufferColor, bufferBgColor, costFromMargin, derivedMarginPct } from "@/lib/budget-math";
 
 const UNIT_SUGGESTIONS = ["hrs", "sqft", "lf", "ea", "lump sum", "units", "days"];
 
-/** Returns a numeric margin %, defaulting to 25 when the value is empty/NaN. */
+/** Returns a numeric margin %, defaulting to 25 when the value is empty/NaN. Capped at 99 to prevent costFromMargin returning 0. */
 function effectiveMargin(raw: string | number | null | undefined): number {
     const n = parseFloat(String(raw ?? ""));
-    return Number.isFinite(n) ? n : 25;
+    return Number.isFinite(n) ? Math.min(n, 99) : 25;
 }
 
 interface BudgetStripProps {
@@ -22,12 +21,10 @@ interface BudgetStripProps {
     onCreatePO: (itemId: string) => void;
     onUnlinkPO: (itemId: string) => void;
     onViewPO: (poId: string) => void;
-    onAiFill?: (itemId: string) => void;
-    isAiFilling?: boolean;
 }
 
 export default function BudgetStrip({
-    item, index, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO, onAiFill, isAiFilling
+    item, index, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO
 }: BudgetStripProps) {
     const [showUnitDropdown, setShowUnitDropdown] = useState(false);
     const [showPOPopover, setShowPOPopover] = useState(false);
@@ -50,22 +47,22 @@ export default function BudgetStrip({
 
     const po = item.purchaseOrder;
     const isLead = contextType === "lead";
-    const margin = effectiveMargin(item.markupPercent);
-    const rate = parseFloat(budgetRateVal) || 0;
-    const sellPrice = sellFromMargin(rate, margin);
+    const isPoLocked = item.purchaseOrderId != null;
+    const sellPrice = parseFloat(item.unitCost) || 0;
 
     return (
         <div className="flex items-center gap-3 px-4 py-2 ml-14 mr-2 mb-1 rounded-lg bg-indigo-50/60 border-l-3 border-indigo-300 text-xs">
-            {/* AI Fill Button */}
-            {onAiFill && (
-                <button
-                    onClick={() => onAiFill(item.id)}
-                    disabled={isAiFilling}
-                    className={`flex items-center justify-center w-5 h-5 rounded hover:bg-indigo-100 transition flex-shrink-0 ${isAiFilling ? "animate-pulse text-indigo-400" : "text-indigo-300 hover:text-indigo-600"}`}
-                    title="AI suggest budget"
+            {/* PO lock indicator — budget is committed, AI/Reset will skip this row */}
+            {isPoLocked && (
+                <span
+                    className="flex items-center justify-center w-5 h-5 text-slate-500 flex-shrink-0"
+                    title={`Budget protected by PO${po?.code ? ` ${po.code}` : ""}`}
                 >
-                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
-                </button>
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3" y="11" width="18" height="11" rx="2" />
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                    </svg>
+                </span>
             )}
 
             {/* Budget Inputs */}
@@ -111,12 +108,16 @@ export default function BudgetStrip({
                         type="number"
                         value={budgetRateVal}
                         onChange={e => {
+                            // Budget-side edit: update budget fields only. Customer price (unitCost)
+                            // is the source of truth — we derive margin from it, never the reverse.
                             const val = e.target.value === "" ? null : e.target.value;
                             const r = parseFloat(e.target.value) || 0;
-                            const m = effectiveMargin(item.markupPercent);
+                            const price = parseFloat(item.unitCost) || 0;
                             updateItem(index, "budgetRate", val);
                             updateItem(index, "baseCost", r > 0 ? val : null);
-                            updateItem(index, "unitCost", sellFromMargin(r, m).toFixed(2));
+                            if (r > 0 && price > 0) {
+                                updateItem(index, "markupPercent", derivedMarginPct(r, price).toFixed(2));
+                            }
                         }}
                         className="w-20 bg-white border border-indigo-200 rounded pl-4 pr-1.5 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
                         placeholder="Rate"
@@ -140,13 +141,20 @@ export default function BudgetStrip({
                         type="number"
                         value={item.markupPercent ?? 25}
                         onChange={e => {
+                            // Margin edit: recompute budgetRate from the preserved sell price.
+                            // unitCost is never written — customer pricing stays locked.
                             const m = effectiveMargin(e.target.value);
-                            const r = parseFloat(budgetRateVal) || 0;
+                            const price = parseFloat(item.unitCost) || 0;
                             updateItem(index, "markupPercent", e.target.value === "" ? null : e.target.value);
-                            updateItem(index, "baseCost", r > 0 ? r.toString() : null);
-                            updateItem(index, "unitCost", sellFromMargin(r, m).toFixed(2));
+                            if (price > 0) {
+                                const newRate = costFromMargin(price, m);
+                                const rateStr = newRate.toFixed(2);
+                                updateItem(index, "budgetRate", rateStr);
+                                updateItem(index, "baseCost", rateStr);
+                            }
                         }}
-                        className="w-14 bg-white border border-indigo-200 rounded px-1.5 pr-4 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
+                        disabled={isPoLocked}
+                        className="w-14 bg-white border border-indigo-200 rounded px-1.5 pr-4 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed"
                         step="any"
                     />
                     <span className="absolute right-1.5 top-1 text-indigo-300 text-[10px]">%</span>

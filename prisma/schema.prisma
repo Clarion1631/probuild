@@ -265,6 +265,9 @@ model Estimate {
   expirationDate      DateTime?
   archivedAt          DateTime?
 
+  // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
+  targetMarginPercent Float     @default(25)
+
   // Phase 7: Contracts & Approvals
   approvedBy        String?
   approvedAt        DateTime?

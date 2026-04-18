@@ -364,7 +364,20 @@ export async function updateLeadInfo(id: string, data: any) {
     };
     if (data.name !== undefined) updateData.name = data.name;
 
-    await prisma.lead.update({ where: { id }, data: updateData });
+    let linkedProjectId: string | undefined;
+
+    await prisma.$transaction(async (tx) => {
+        await tx.lead.update({ where: { id }, data: updateData });
+
+        // Sync location to linked project so the estimate header stays up to date
+        if (data.location !== undefined) {
+            const linked = await tx.project.findUnique({ where: { leadId: id }, select: { id: true } });
+            if (linked) {
+                await tx.project.update({ where: { id: linked.id }, data: { location: data.location || null } });
+                linkedProjectId = linked.id;
+            }
+        }
+    });
 
     // Also update client if passed in
     if (data.clientName) {
@@ -385,6 +398,7 @@ export async function updateLeadInfo(id: string, data: any) {
 
     revalidatePath(`/leads`);
     revalidatePath(`/leads/${id}`);
+    if (linkedProjectId) revalidatePath(`/projects/${linkedProjectId}`, 'layout');
 }
 
 export async function getClients() {
@@ -1959,7 +1973,9 @@ export async function markInvoiceViewed(invoiceId: string) {
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
-    // Update estimate — try full update, fallback to safe fields if columns missing
+    // Update estimate — try full update, fallback to safe fields if columns missing.
+    // targetMarginPercent must live in safeData so a failure on the main payload does
+    // not silently revert the AI budget target to the default.
     const safeData = {
         title: data.title,
         code: data.code,
@@ -1967,6 +1983,9 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         totalAmount: data.totalAmount,
         balanceDue: data.totalAmount,
         ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
+        ...(data.targetMarginPercent !== undefined && {
+            targetMarginPercent: Math.max(0, Math.min(70, parseFloat(data.targetMarginPercent) || 25)),
+        }),
     };
     try {
         await prisma.estimate.update({
@@ -4146,6 +4165,20 @@ export async function updateProjectName(projectId: string, name: string) {
         data: { name }
     });
     revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`, 'layout');
+    return { success: true };
+}
+
+export async function updateProjectLocation(projectId: string, location: string) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { location: location || null }
+    });
     revalidatePath(`/projects/${projectId}`, 'layout');
     return { success: true };
 }

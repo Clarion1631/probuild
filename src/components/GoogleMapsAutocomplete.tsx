@@ -7,7 +7,7 @@ declare global {
     }
 }
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface GoogleMapsAutocompleteProps {
     value: string;
@@ -76,6 +76,7 @@ export default function GoogleMapsAutocomplete({
     placeholder,
 }: GoogleMapsAutocompleteProps) {
     const inputRef = useRef<HTMLInputElement>(null);
+    const [mapsError, setMapsError] = useState(false);
 
     // I3: Store callbacks in refs so Autocomplete is initialised once per mount,
     // not recreated whenever the parent passes a new function reference.
@@ -130,7 +131,7 @@ export default function GoogleMapsAutocomplete({
                 });
             })
             .catch(() => {
-                // Script failed to load — autocomplete silently unavailable
+                if (!cancelled) setMapsError(true);
             });
 
         // I3: cleanup on unmount removes listener, prevents stale handler leaks
@@ -144,13 +145,18 @@ export default function GoogleMapsAutocomplete({
     }, []); // empty deps — init once per mount; callbacks stay fresh via refs
 
     return (
-        <input
-            ref={inputRef}
-            type="text"
-            value={value}
-            onChange={(e) => onChangeRef.current(e.target.value)}
-            className={className}
-            placeholder={placeholder}
-        />
+        <div className="w-full">
+            <input
+                ref={inputRef}
+                type="text"
+                value={value}
+                onChange={(e) => onChangeRef.current(e.target.value)}
+                className={className}
+                placeholder={placeholder}
+            />
+            {mapsError && (
+                <p className="text-xs text-amber-600 mt-1">Address lookup unavailable — type address manually.</p>
+            )}
+        </div>
     );
 }

@@ -17,7 +17,7 @@ import ReusableSignaturePad from "@/components/ReusableSignaturePad";
 import DocumentComments from "@/components/DocumentComments";
 import BudgetStrip from "./BudgetStrip";
 import POQuickCreateModal from "./POQuickCreateModal";
-import { internalBudget, sellFromMargin } from "@/lib/budget-math";
+import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 
 export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
     const router = useRouter();
@@ -50,8 +50,9 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showPaymentModal, setShowPaymentModal] = useState(false);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
-    const [aiFillItemId, setAiFillItemId] = useState<string | null>(null);
     const [isAiFilling, setIsAiFilling] = useState(false);
+    const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
+    const [overwriteExisting, setOverwriteExisting] = useState(false);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
     const [showSidebar, setShowSidebar] = useState(false);
     const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments" | "history">("overview");
@@ -494,6 +495,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             memo: memo || null,
             termsAndConditions: termsAndConditions || null,
             signatureUrl: signatureUrl || null,
+            targetMarginPercent: parseFloat(targetMargin) || 25,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -793,88 +795,201 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (idx >= 0) { updateItem(idx, "purchaseOrderId", po.id); updateItem(idx, "purchaseOrder", po); }
     }
 
-    async function handleAiFill(itemId?: string) {
+    async function handleAiFillAll({ overwriteExisting: overwrite }: { overwriteExisting: boolean }) {
+        // Only leaf items (no children) are eligible — section headers are skipped.
         const leafItems = items.filter(item => {
             if (!item.parentId && items.some((i: any) => i.parentId === item.id)) return false;
             return true;
         });
-        const targetItems = itemId
-            ? leafItems.filter(i => i.id === itemId)
-            : leafItems.filter(i => internalBudget({ budgetQuantity: i.budgetQuantity, quantity: parseFloat(i.quantity) || 0, budgetRate: i.budgetRate, baseCost: i.baseCost }) == null);
 
-        if (targetItems.length === 0) {
-            toast.info("All items already have budgets");
+        // Lock partition. PO-locked items are ALWAYS skipped regardless of overwrite flag —
+        // a cut purchase order is a real dollar commitment, not a suggestion.
+        const isPoLocked = (it: any) => it.purchaseOrderId != null;
+        const hasBudget = (it: any) => {
+            const n = parseFloat(it.budgetRate);
+            return Number.isFinite(n) && n > 0;
+        };
+
+        const poLocked = leafItems.filter(isPoLocked);
+        const eligible = leafItems.filter(it => !isPoLocked(it));
+        const toSend = overwrite ? eligible : eligible.filter(it => !hasBudget(it));
+        const lockedForThisRun = eligible.filter(it => !toSend.includes(it)).concat(poLocked);
+
+        if (toSend.length === 0) {
+            toast.info("No items to fill — all budgets are set. Enable Overwrite to regenerate.");
             return;
         }
 
+        // Aggregate locked contributions so AI can distribute remaining margin correctly.
+        let lockedSell = 0;
+        let lockedBudget = 0;
+        for (const it of lockedForThisRun) {
+            const qty = parseFloat(it.quantity) || 0;
+            const price = parseFloat(it.unitCost) || 0;
+            const rate = parseFloat(it.budgetRate);
+            lockedSell += qty * price;
+            // PO-locked item with no recorded budget: treat its committed cost as sell (0% margin)
+            // so the AI distributes the rest against a conservative baseline.
+            lockedBudget += Number.isFinite(rate) && rate > 0 ? qty * rate : qty * price;
+        }
+
+        const tgt = Math.max(0, Math.min(70, parseFloat(targetMargin) || 25));
+
         setIsAiFilling(true);
-        if (itemId) setAiFillItemId(itemId);
-
         try {
-            // Chunk into batches of 25 so large estimates don't hit token limits
-            const CHUNK_SIZE = 25;
-            const chunks: typeof targetItems[] = [];
-            for (let i = 0; i < targetItems.length; i += CHUNK_SIZE) {
-                chunks.push(targetItems.slice(i, i + CHUNK_SIZE));
-            }
-
-            const allSuggestions: any[] = [];
-            for (const chunk of chunks) {
-                const res = await fetch("/api/ai-estimate/budget-fill", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        items: chunk.map(i => ({
+            const res = await fetch("/api/ai-estimate/budget-fill", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: toSend.map(i => {
+                        const qty = parseFloat(i.quantity) || 1;
+                        const price = parseFloat(i.unitCost) || 0;
+                        return {
                             id: i.id,
                             name: i.name || "",
                             description: i.description || "",
                             type: i.type || "Material",
-                            quantity: parseFloat(i.quantity) || 1,
-                            unitCost: parseFloat(i.unitCost) || 0,
-                            budgetRate: i.budgetRate,
-                            budgetUnit: i.budgetUnit,
-                        })),
-                        projectContext: `${context.name} (${context.type})`,
-                        location: context.location || "Vancouver, WA",
+                            quantity: qty,
+                            unitCost: price,
+                            lineTotal: qty * price,
+                        };
                     }),
-                });
-                if (!res.ok) {
-                    const err = await res.json();
-                    throw new Error(err.error || "AI budget fill failed");
-                }
-                const { suggestions } = await res.json();
-                allSuggestions.push(...suggestions);
+                    lockedContributions: { totalSellAmount: lockedSell, totalBudgetAmount: lockedBudget },
+                    targetMarginPercent: tgt,
+                    projectContext: `${context.name} (${context.type})`,
+                    location: context.location || "Vancouver, WA",
+                }),
+            });
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.error || "AI budget fill failed");
             }
+            const { suggestions, notes } = await res.json();
 
+            // Client-side enforcement guard: only apply suggestions for items we actually sent.
+            // Drops stray/hallucinated IDs and any attempt by AI to touch a locked item.
+            const sendableIds = new Set(toSend.map(i => i.id));
+            const validSuggestions = (suggestions || []).filter((s: any) => sendableIds.has(s.id));
+
+            // First pass: apply raw AI budgetRates, mirror sell quantity, derive margin.
+            // Track newly-filled item IDs so we can rescale them in the second pass.
+            const newlyFilledIds = new Set<string>(validSuggestions.map((s: any) => s.id));
             let filled = 0;
+
             setItems(prev => {
                 const next = prev.map(item => ({ ...item }));
-                for (const s of allSuggestions) {
+
+                for (const s of validSuggestions) {
                     const idx = next.findIndex((i: any) => i.id === s.id);
                     if (idx < 0) continue;
-                    const rate = parseFloat(s.budgetRate) || 0;
-                    const margin = parseFloat(s.marginPercent) || 25;
+                    const rate = Math.max(0, parseFloat(s.budgetRate) || 0);
+                    const sellQty = parseFloat(next[idx].quantity) || 0;
+                    const sellPrice = parseFloat(next[idx].unitCost) || 0;
                     next[idx] = {
                         ...next[idx],
                         budgetRate: rate > 0 ? String(rate) : null,
                         baseCost: rate > 0 ? String(rate) : null,
                         budgetUnit: s.budgetUnit || next[idx].budgetUnit,
-                        budgetQuantity: s.budgetQuantity || next[idx].budgetQuantity,
-                        markupPercent: margin,
-                        unitCost: sellFromMargin(rate, margin).toFixed(2),
+                        budgetQuantity: sellQty,
+                        markupPercent: derivedMarginPct(rate, sellPrice),
+                        // DO NOT touch: unitCost, quantity, total, purchaseOrderId
                     };
                     filled++;
                 }
+
+                // Second pass: post-AI rescale to force target margin.
+                // LLMs don't reliably hit weighted targets — scale newly-filled budgetRates
+                // proportionally so (lockedBudget + newAiBudget) / grandSell hits target.
+                const grandSell = lockedSell + next.reduce((sum, it) => {
+                    if (!newlyFilledIds.has(it.id)) return sum;
+                    const q = parseFloat(it.quantity) || 0;
+                    const p = parseFloat(it.unitCost) || 0;
+                    return sum + q * p;
+                }, 0);
+                const targetBudgetTotal = grandSell * (1 - tgt / 100);
+                const neededFromAi = Math.max(0, targetBudgetTotal - lockedBudget);
+                const actualAiBudget = next.reduce((sum, it) => {
+                    if (!newlyFilledIds.has(it.id)) return sum;
+                    const q = parseFloat(it.quantity) || 0;
+                    const r = parseFloat(it.budgetRate);
+                    return sum + (Number.isFinite(r) ? q * r : 0);
+                }, 0);
+
+                let scale = actualAiBudget > 0 ? neededFromAi / actualAiBudget : 1;
+                let clamped = false;
+                if (scale < 0.3) { scale = 0.3; clamped = true; }
+                if (scale > 3.0) { scale = 3.0; clamped = true; }
+
+                if (Math.abs(scale - 1) > 0.005 && scale > 0) {
+                    for (let idx = 0; idx < next.length; idx++) {
+                        if (!newlyFilledIds.has(next[idx].id)) continue;
+                        const r = parseFloat(next[idx].budgetRate);
+                        if (!Number.isFinite(r) || r <= 0) continue;
+                        const sellPrice = parseFloat(next[idx].unitCost) || 0;
+                        // Don't let rescale push budget above sell (would invert margin).
+                        let newRate = r * scale;
+                        if (sellPrice > 0 && newRate >= sellPrice) newRate = sellPrice * 0.99;
+                        if (newRate < 0) newRate = 0;
+                        next[idx] = {
+                            ...next[idx],
+                            budgetRate: newRate > 0 ? String(newRate) : null,
+                            baseCost: newRate > 0 ? String(newRate) : null,
+                            markupPercent: derivedMarginPct(newRate, sellPrice),
+                        };
+                    }
+                    if (clamped) {
+                        // Schedule warning after state commit
+                        setTimeout(() => toast.warning("Margin target approximated — AI estimate was far off"), 0);
+                    }
+                }
+
+                // Compute actual weighted margin for the toast (client-computed, not AI-reported).
+                let totalSell = 0;
+                let totalBudget = 0;
+                for (const it of next) {
+                    const q = parseFloat(it.quantity) || 0;
+                    const p = parseFloat(it.unitCost) || 0;
+                    const r = parseFloat(it.budgetRate);
+                    // Only count leaf items (same filter as above) in the margin total.
+                    const isLeaf = !(!it.parentId && next.some((c: any) => c.parentId === it.id));
+                    if (!isLeaf) continue;
+                    totalSell += q * p;
+                    if (Number.isFinite(r) && r > 0) totalBudget += q * r;
+                }
+                const actualMargin = totalSell > 0 ? ((totalSell - totalBudget) / totalSell) * 100 : 0;
+
+                // Schedule toast after state commit
+                setTimeout(() => {
+                    const base = `AI filled ${filled} budget${filled !== 1 ? "s" : ""} — margin ${actualMargin.toFixed(1)}% (target ${tgt}%)`;
+                    toast.success(notes ? `${base}\n${notes}` : base);
+                }, 0);
+
                 return next;
             });
-
-            toast.success(`AI filled budgets for ${filled} item${filled !== 1 ? "s" : ""} — review and adjust`);
         } catch (err: any) {
             toast.error(err.message || "AI budget fill failed");
         } finally {
             setIsAiFilling(false);
-            setAiFillItemId(null);
         }
+    }
+
+    function handleClearBudgets() {
+        if (!window.confirm("Clear all budget values? Items with purchase orders will be preserved.")) return;
+        const resetMargin = Math.max(0, Math.min(70, parseFloat(targetMargin) || 25));
+        setItems(prev => prev.map(it => {
+            if (it.purchaseOrderId != null) return it;                            // PO-locked, never touch
+            if (!it.parentId && prev.some((c: any) => c.parentId === it.id)) return it; // category header
+            return {
+                ...it,
+                budgetRate: null,
+                baseCost: null,
+                budgetQuantity: null,
+                budgetUnit: null,
+                markupPercent: resetMargin,
+                // unitCost/quantity/total untouched
+            };
+        }));
+        toast.success("Budgets cleared — PO-committed items kept");
     }
 
     function addPaymentSchedule() {
@@ -1049,16 +1164,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         <svg className="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                                         {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
                                     </button>
-                                    {viewMode === "internal" && (
-                                        <button
-                                            onClick={() => { handleAiFill(); setShowMoreMenu(false); }}
-                                            disabled={isAiFilling}
-                                            className="w-full text-left px-4 py-2.5 hover:bg-indigo-50 flex items-center gap-2.5 text-indigo-700 disabled:opacity-50"
-                                        >
-                                            <svg className={`w-4 h-4 text-indigo-500 ${isAiFilling ? "animate-pulse" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
-                                            {isAiFilling ? "Filling budgets..." : "AI Fill Budgets"}
-                                        </button>
-                                    )}
                                     <button
                                         onClick={() => { setShowSidebar(v => !v); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
@@ -1292,6 +1397,56 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         <div className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
                             {/* Subtle Gradient Accent Top Line */}
                             <div className="h-1.5 w-full bg-slate-800"></div>
+
+                            {/* Internal-only: Budget fill control cluster */}
+                            {viewMode === "internal" && (
+                                <div className="px-10 py-4 bg-indigo-50/40 border-b border-indigo-100 flex flex-wrap items-center gap-4">
+                                    <div className="flex items-center gap-2">
+                                        <label htmlFor="targetMargin" className="text-xs font-semibold uppercase tracking-wider text-indigo-700">Target margin</label>
+                                        <div className="relative">
+                                            <input
+                                                id="targetMargin"
+                                                type="number"
+                                                min={0}
+                                                max={70}
+                                                step={1}
+                                                value={targetMargin}
+                                                onChange={e => setTargetMargin(e.target.value)}
+                                                className="w-20 px-2 py-1.5 pr-6 text-sm font-semibold text-slate-800 bg-white border border-indigo-200 rounded focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                                            />
+                                            <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-slate-500 pointer-events-none">%</span>
+                                        </div>
+                                    </div>
+                                    <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none" title="PO-committed items are always protected regardless of this setting.">
+                                        <input
+                                            type="checkbox"
+                                            checked={overwriteExisting}
+                                            onChange={e => setOverwriteExisting(e.target.checked)}
+                                            className="w-4 h-4 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-300"
+                                        />
+                                        Overwrite existing budgets
+                                    </label>
+                                    <div className="flex-1" />
+                                    <button
+                                        onClick={() => handleAiFillAll({ overwriteExisting })}
+                                        disabled={isAiFilling}
+                                        className="hui-btn hui-btn-primary text-sm flex items-center gap-2 disabled:opacity-50"
+                                        title="AI distributes budgets across items so overall margin lands on the target."
+                                    >
+                                        <svg className={`w-4 h-4 ${isAiFilling ? "animate-pulse" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
+                                        {isAiFilling ? "Filling…" : "AI fill budgets"}
+                                    </button>
+                                    <button
+                                        onClick={handleClearBudgets}
+                                        disabled={isAiFilling}
+                                        className="hui-btn hui-btn-secondary text-sm text-red-600 hover:text-red-700 disabled:opacity-50"
+                                        title="Clear all budget values (PO-committed items are preserved)."
+                                    >
+                                        Clear budgets
+                                    </button>
+                                </div>
+                            )}
+
                             {/* Document Header */}
                             <div className="p-10 pb-12 space-y-10 border-b border-slate-100">
                                 <input
@@ -1673,8 +1828,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                     onCreatePO={(id) => setPOCreateItemId(id)}
                                                                     onUnlinkPO={handleUnlinkPO}
                                                                     onViewPO={(poId) => window.open(`/projects/${context.id}/purchase-orders/${poId}`, "_blank")}
-                                                                    onAiFill={(id) => handleAiFill(id)}
-                                                                    isAiFilling={isAiFilling && (aiFillItemId === item.id || aiFillItemId === null)}
                                                                 />
                                                             )}
                                                         </>)}

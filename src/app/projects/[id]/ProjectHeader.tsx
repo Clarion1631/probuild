@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { updateProjectName } from "@/lib/actions";
+import { updateProjectName, updateProjectLocation } from "@/lib/actions";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 
@@ -18,6 +18,13 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
     const [value, setValue] = useState(name);
     const [saving, setSaving] = useState(false);
     const inputRef = useRef<HTMLInputElement>(null);
+
+    const [editingLocation, setEditingLocation] = useState(false);
+    const [locationValue, setLocationValue] = useState(location || "");
+    const [savingLocation, setSavingLocation] = useState(false);
+    const locationInputRef = useRef<HTMLInputElement>(null);
+    const locationEscapedRef = useRef(false);
+
     const router = useRouter();
 
     useEffect(() => {
@@ -26,6 +33,31 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
             inputRef.current.select();
         }
     }, [editing]);
+
+    useEffect(() => {
+        if (editingLocation && locationInputRef.current) {
+            locationInputRef.current.focus();
+            locationInputRef.current.select();
+        }
+    }, [editingLocation]);
+
+    const handleSaveLocation = async () => {
+        if (locationEscapedRef.current) { locationEscapedRef.current = false; return; }
+        const trimmed = locationValue.trim();
+        setSavingLocation(true);
+        try {
+            await updateProjectLocation(projectId, trimmed);
+            toast.success("Location updated");
+            setEditingLocation(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e.message || "Failed to update location");
+            setLocationValue(location || "");
+            setEditingLocation(false);
+        } finally {
+            setSavingLocation(false);
+        }
+    };
 
     const handleSave = async () => {
         const trimmed = value.trim();
@@ -95,7 +127,36 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
                                 </svg>
                             </h1>
                         )}
-                        <p className="text-sm text-hui-textMuted">{clientName} · {location || "No location"}</p>
+                        <p className="text-sm text-hui-textMuted group/location flex items-center gap-1">
+                            {clientName} ·{" "}
+                            {editingLocation ? (
+                                <input
+                                    ref={locationInputRef}
+                                    value={locationValue}
+                                    onChange={e => setLocationValue(e.target.value)}
+                                    onBlur={handleSaveLocation}
+                                    onKeyDown={e => {
+                                        if (e.key === "Enter") handleSaveLocation();
+                                        if (e.key === "Escape") { locationEscapedRef.current = true; setLocationValue(location || ""); setEditingLocation(false); }
+                                    }}
+                                    disabled={savingLocation}
+                                    placeholder="Add location"
+                                    className="bg-transparent border-b border-indigo-400 outline-none text-sm text-hui-textMuted min-w-[180px]"
+                                />
+                            ) : (
+                                <span
+                                    className="cursor-pointer hover:text-hui-textMain flex items-center gap-1"
+                                    onClick={() => setEditingLocation(true)}
+                                    title="Click to edit location"
+                                >
+                                    {location || "No location"}
+                                    <svg className="w-3 h-3 opacity-0 group-hover/location:opacity-100 [@media(hover:none)]:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2">
+                                        <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+                                        <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+                                    </svg>
+                                </span>
+                            )}
+                        </p>
                     </div>
                 </div>
             </div>
