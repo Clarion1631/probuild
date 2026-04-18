@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -17,12 +17,70 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [notes, setNotes] = useState(initialInvoice.notes || "");
     const [isSavingNotes, setIsSavingNotes] = useState(false);
     const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
+    const [showAddMilestone, setShowAddMilestone] = useState(false);
+    const [milestoneName, setMilestoneName] = useState("");
+    const [milestoneAmount, setMilestoneAmount] = useState("");
+    const [milestoneDueDate, setMilestoneDueDate] = useState<string>("");
+    const [isAddingMilestone, setIsAddingMilestone] = useState(false);
+    const [isUndoing, setIsUndoing] = useState<string | null>(null);
 
     async function handleRecordPayment(paymentId: string) {
         setIsRecording(paymentId);
         await recordPayment(paymentId, initialInvoice.id, new Date(selectedDate).getTime());
         setIsRecording(null);
         router.refresh();
+    }
+
+    async function handleAddMilestone() {
+        const amount = Number(milestoneAmount);
+        if (!milestoneName.trim()) {
+            toast.error("Milestone name is required");
+            return;
+        }
+        if (!Number.isFinite(amount) || amount <= 0) {
+            toast.error("Amount must be greater than zero");
+            return;
+        }
+        setIsAddingMilestone(true);
+        try {
+            await addInvoiceMilestone(initialInvoice.id, {
+                name: milestoneName.trim(),
+                amount,
+                dueDate: milestoneDueDate || null,
+            });
+            toast.success("Milestone added");
+            setMilestoneName("");
+            setMilestoneAmount("");
+            setMilestoneDueDate("");
+            setShowAddMilestone(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to add milestone");
+        } finally {
+            setIsAddingMilestone(false);
+        }
+    }
+
+    async function handleUnrecord(paymentId: string, recordedDate: string | null) {
+        setIsUndoing(paymentId);
+        try {
+            await unrecordPayment(paymentId, initialInvoice.id);
+            router.refresh();
+            toast("Payment unrecorded", {
+                action: {
+                    label: "Redo",
+                    onClick: async () => {
+                        const ts = recordedDate ? new Date(recordedDate).getTime() : Date.now();
+                        await recordPayment(paymentId, initialInvoice.id, ts);
+                        router.refresh();
+                    },
+                },
+            });
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to unrecord payment");
+        } finally {
+            setIsUndoing(null);
+        }
     }
 
     async function handleIssueInvoice() {
@@ -269,10 +327,68 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg>
                                 Payment Schedule
                             </h2>
-                            <span className="text-xs text-hui-textMuted">
-                                {paidCount} of {totalCount} paid
-                            </span>
+                            <div className="flex items-center gap-3">
+                                <span className="text-xs text-hui-textMuted">
+                                    {paidCount} of {totalCount} paid
+                                </span>
+                                <button
+                                    onClick={() => setShowAddMilestone(v => !v)}
+                                    className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
+                                >
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
+                                    {showAddMilestone ? "Cancel" : "Add Milestone"}
+                                </button>
+                            </div>
                         </div>
+                        {showAddMilestone && (
+                            <div className="px-6 py-4 border-b border-hui-border bg-amber-50/40">
+                                <div className="grid grid-cols-12 gap-3 items-end">
+                                    <div className="col-span-5">
+                                        <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Description</label>
+                                        <input
+                                            type="text"
+                                            value={milestoneName}
+                                            onChange={e => setMilestoneName(e.target.value)}
+                                            placeholder="e.g. Final Payment"
+                                            className="hui-input w-full text-sm"
+                                        />
+                                    </div>
+                                    <div className="col-span-3">
+                                        <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Amount ($)</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            step="0.01"
+                                            value={milestoneAmount}
+                                            onChange={e => setMilestoneAmount(e.target.value)}
+                                            placeholder="0.00"
+                                            className="hui-input w-full text-sm"
+                                        />
+                                    </div>
+                                    <div className="col-span-3">
+                                        <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Due Date (optional)</label>
+                                        <input
+                                            type="date"
+                                            value={milestoneDueDate}
+                                            onChange={e => setMilestoneDueDate(e.target.value)}
+                                            className="hui-input w-full text-sm"
+                                        />
+                                    </div>
+                                    <div className="col-span-1">
+                                        <button
+                                            onClick={handleAddMilestone}
+                                            disabled={isAddingMilestone}
+                                            className="hui-btn hui-btn-primary text-sm w-full disabled:opacity-50"
+                                        >
+                                            {isAddingMilestone ? "..." : "Add"}
+                                        </button>
+                                    </div>
+                                </div>
+                                <p className="text-[11px] text-hui-textMuted mt-2">
+                                    Adds a new payment milestone and increases the invoice total by this amount.
+                                </p>
+                            </div>
+                        )}
                         <table className="w-full text-sm text-left">
                             <thead className="bg-white text-hui-textMuted border-b border-hui-border">
                                 <tr>
@@ -339,10 +455,20 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                     </>
                                                 )}
                                                 {payment.status === 'Paid' && (
-                                                    <span className="text-xs text-emerald-600 font-medium flex items-center gap-1">
-                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6 9 17l-5-5" /></svg>
-                                                        Paid
-                                                    </span>
+                                                    <>
+                                                        <span className="text-xs text-emerald-600 font-medium flex items-center gap-1">
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6 9 17l-5-5" /></svg>
+                                                            Paid
+                                                        </span>
+                                                        <button
+                                                            onClick={() => handleUnrecord(payment.id, payment.paymentDate)}
+                                                            disabled={isUndoing === payment.id}
+                                                            className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50"
+                                                            title="Mark as unpaid"
+                                                        >
+                                                            {isUndoing === payment.id ? "Undoing..." : "Undo"}
+                                                        </button>
+                                                    </>
                                                 )}
                                             </td>
                                         </tr>

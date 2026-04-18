@@ -39,7 +39,7 @@ export default async function PortalDashboard() {
                 orderBy: { createdAt: 'desc' },
                 include: {
                     invoices: {
-                        where: { status: { in: ['Issued', 'Overdue'] } },
+                        where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
                         select: { id: true, balanceDue: true }
                     }
                 }

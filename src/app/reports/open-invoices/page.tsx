@@ -20,7 +20,7 @@ export default async function OpenInvoicesPage() {
     if (!session?.user) return redirect("/login");
 
     const invoices = await prisma.invoice.findMany({
-        where: { status: { in: ["Issued", "Overdue"] } },
+        where: { status: { in: ["Issued", "Overdue", "Partially Paid"] } },
         include: {
             project: { select: { id: true, name: true } },
             client: { select: { id: true, name: true } },

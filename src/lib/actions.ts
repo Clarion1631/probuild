@@ -9,6 +9,7 @@ import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
 
 // Safe estimate include that omits columns not yet migrated to the database.
@@ -2293,6 +2294,112 @@ export async function recordPayment(paymentId: string, invoiceId: string, timest
     revalidatePath(`/projects/${invoice!.projectId}/invoices`);
     revalidatePath(`/projects/${invoice!.projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
+
+    return { success: true };
+}
+
+async function assertInvoicePermission() {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "invoices")) throw new Error("Forbidden");
+    return user;
+}
+
+export async function addInvoiceMilestone(
+    invoiceId: string,
+    input: { name: string; amount: number; dueDate?: string | null },
+) {
+    await assertInvoicePermission();
+
+    const name = (input.name || "").trim();
+    const amount = Number(input.amount);
+    if (!name) throw new Error("Milestone name is required");
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error("Milestone amount must be greater than zero");
+
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+    if (!invoice) throw new Error("Invoice not found");
+
+    await prisma.paymentSchedule.create({
+        data: {
+            invoiceId,
+            name,
+            amount,
+            status: "Pending",
+            dueDate: input.dueDate ? new Date(input.dueDate) : null,
+        },
+    });
+
+    const nextStatus = invoice.status === "Paid" ? "Partially Paid" : invoice.status;
+    await prisma.invoice.update({
+        where: { id: invoiceId },
+        data: {
+            totalAmount: { increment: amount },
+            balanceDue: { increment: amount },
+            ...(nextStatus !== invoice.status ? { status: nextStatus } : {}),
+        },
+    });
+
+    revalidatePath(`/projects/${invoice.projectId}/invoices`);
+    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/open-invoices`);
+
+    return { success: true };
+}
+
+export async function unrecordPayment(paymentId: string, invoiceId: string) {
+    await assertInvoicePermission();
+
+    const projectId = await prisma.$transaction(async (tx) => {
+        const payment = await tx.paymentSchedule.findUnique({ where: { id: paymentId } });
+        if (!payment) throw new Error("Payment not found");
+        if (payment.status !== "Paid") return null;
+
+        const invoice = await tx.invoice.findUnique({
+            where: { id: invoiceId },
+            include: { payments: true },
+        });
+        if (!invoice) throw new Error("Invoice not found");
+
+        await tx.paymentSchedule.update({
+            where: { id: paymentId },
+            data: { status: "Pending", paymentDate: null, paidAt: null },
+        });
+
+        const amount = toNum(payment.amount);
+        const cappedDelta = Math.min(amount, Math.max(0, toNum(invoice.totalAmount) - toNum(invoice.balanceDue)));
+
+        const otherPaidExists = invoice.payments.some(
+            (p) => p.id !== paymentId && p.status === "Paid",
+        );
+        const projectedBalance = toNum(invoice.balanceDue) + cappedDelta;
+        let newStatus: string;
+        if (projectedBalance <= 0) {
+            newStatus = "Paid";
+        } else if (otherPaidExists) {
+            newStatus = "Partially Paid";
+        } else if (invoice.status === "Overdue") {
+            newStatus = "Overdue";
+        } else {
+            newStatus = "Issued";
+        }
+
+        await tx.invoice.update({
+            where: { id: invoiceId },
+            data: { balanceDue: { increment: cappedDelta }, status: newStatus },
+        });
+
+        return invoice.projectId;
+    });
+
+    if (!projectId) return { success: false };
+
+    revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/open-invoices`);
 
     return { success: true };
 }
