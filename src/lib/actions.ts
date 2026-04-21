@@ -1590,31 +1590,30 @@ export async function markContractViewed(contractId: string, accessToken?: strin
 }
 
 export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, capturedPdfUrl?: string) {
-    // Codex R2 blocker fix: distinguish internal admin from portal client.
-    // Internal admins (User row with ADMIN/MANAGER role) skip ownership check.
-    // Portal clients (no User row or non-admin role) must prove ownership.
+    // Auth: internal admins skip ownership check; portal clients must prove ownership.
     const session = await getServerSession(authOptions);
+    let isAdmin = false;
     if (session?.user?.email) {
         const internalUser = await prisma.user.findUnique({
             where: { email: session.user.email },
             select: { role: true },
         });
-        const isAdmin = internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
-        if (!isAdmin) {
-            const sessionClientId = await resolveSessionClientId();
-            if (!sessionClientId) return null; // no client match or ambiguous = deny
-            const owned = await prisma.estimate.findFirst({
-                where: {
-                    id: estimateId,
-                    OR: [
-                        { project: { clientId: sessionClientId } },
-                        { lead: { clientId: sessionClientId } },
-                    ],
-                },
-                select: { id: true },
-            });
-            if (!owned) return null;
-        }
+        isAdmin = !!internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
+    }
+    if (!isAdmin) {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
+        const owned = await prisma.estimate.findFirst({
+            where: {
+                id: estimateId,
+                OR: [
+                    { project: { clientId: sessionClientId } },
+                    { lead: { clientId: sessionClientId } },
+                ],
+            },
+            select: { id: true },
+        });
+        if (!owned) return null;
     }
 
     const approvedAt = new Date();
@@ -1857,7 +1856,16 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
         });
     }
 
-    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/invoices/${invoiceId}`;
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+    const clientId = invoice.clientId || invoice.project?.clientId;
+    let portalUrl: string;
+    if (clientId) {
+        const { signClientPortalToken } = await import("./client-portal-auth");
+        const token = await signClientPortalToken(clientId, recipientEmail.toLowerCase());
+        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/invoices/${invoiceId}`)}`;
+    } else {
+        portalUrl = `${appUrl}/portal/invoices/${invoiceId}`;
+    }
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
@@ -3144,7 +3152,15 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     }
 
     // Send email notification to client
-    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/portal/estimates/${estimateId}`;
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+    let portalUrl: string;
+    if (client?.id) {
+        const { signClientPortalToken } = await import("./client-portal-auth");
+        const token = await signClientPortalToken(client.id, recipientEmail.toLowerCase());
+        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/estimates/${estimateId}`)}`;
+    } else {
+        portalUrl = `${appUrl}/portal/estimates/${estimateId}`;
+    }
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
@@ -4816,23 +4832,24 @@ export async function updateChangeOrderStatus(id: string, status: string, projec
 
 export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     "use server";
-    // Codex R2 blocker fix: distinguish internal admin from portal client.
+    // Auth: internal admins skip ownership check; portal clients must prove ownership.
     const session = await getServerSession(authOptions);
+    let isAdmin = false;
     if (session?.user?.email) {
         const internalUser = await prisma.user.findUnique({
             where: { email: session.user.email },
             select: { role: true },
         });
-        const isAdmin = internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
-        if (!isAdmin) {
-            const sessionClientId = await resolveSessionClientId();
-            if (!sessionClientId) return null;
-            const owned = await prisma.changeOrder.findFirst({
-                where: { id, project: { clientId: sessionClientId } },
-                select: { id: true },
-            });
-            if (!owned) return null;
-        }
+        isAdmin = !!internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
+    }
+    if (!isAdmin) {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
+        const owned = await prisma.changeOrder.findFirst({
+            where: { id, project: { clientId: sessionClientId } },
+            select: { id: true },
+        });
+        if (!owned) return null;
     }
 
     const approvedAt = new Date();

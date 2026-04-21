@@ -8,25 +8,23 @@ import Avatar from "@/components/Avatar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 
 export default async function PortalDashboard() {
-    const session = await getServerSession(authOptions);
-    const email = session?.user?.email?.toLowerCase();
-
-    if (!email) {
-        return <div className="p-8 text-center">Please log in to access your portal.</div>;
-    }
-
-    // Resolve the session to exactly one Client row. If the email maps to zero or
-    // more-than-one client records, refuse the listing entirely rather than
-    // cross-authorizing. Client.email is nullable + non-unique in the schema.
     const sessionClientId = await resolveSessionClientId();
+
     if (!sessionClientId) {
+        const session = await getServerSession(authOptions);
+        const email = session?.user?.email?.toLowerCase();
         return (
             <div className="max-w-4xl mx-auto py-16 px-4 text-center">
                 <div className="w-16 h-16 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-6">
                     <svg className="w-8 h-8 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
                 </div>
                 <h1 className="text-2xl font-bold text-hui-textMain mb-2">Welcome to your Portal!</h1>
-                <p className="text-hui-textMuted mb-6">We couldn't find any projects currently linked to <strong>{email}</strong>.</p>
+                <p className="text-hui-textMuted mb-6">
+                    {email
+                        ? <>We couldn't find any projects currently linked to <strong>{email}</strong>.</>
+                        : "Please use the link from your email to access your portal."
+                    }
+                </p>
                 <p className="text-hui-textMuted text-sm">If you believe this is an error, please double-check with your project manager that this is the email address they added to your file.</p>
             </div>
         );
@@ -78,7 +76,7 @@ export default async function PortalDashboard() {
                     <svg className="w-8 h-8 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
                 </div>
                 <h1 className="text-2xl font-bold text-hui-textMain mb-2">Welcome to your Portal!</h1>
-                <p className="text-hui-textMuted mb-6">We couldn't find any projects currently linked to <strong>{email}</strong>.</p>
+                <p className="text-hui-textMuted mb-6">We couldn't find any projects linked to your account.</p>
                 <p className="text-hui-textMuted text-sm">If you believe this is an error, please double-check with your project manager that this is the email address they added to your file.</p>
             </div>
         );

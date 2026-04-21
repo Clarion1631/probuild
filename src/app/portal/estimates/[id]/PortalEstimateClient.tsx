@@ -592,15 +592,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                     {/* Terms & Conditions */}
                     {initialEstimate.termsAndConditions && (
-                        <div data-pdf-row="true" className="px-10 pb-8 border-t border-slate-200 pt-8">
-                            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Terms & Conditions</h2>
-                            <div className="bg-slate-50 rounded-md p-6 border border-slate-100">
-                                <div
-                                    className="prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-sm"
-                                    dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(initialEstimate.termsAndConditions ?? "") }}
-                                />
-                            </div>
-                        </div>
+                        <TermsAndConditions html={initialEstimate.termsAndConditions} />
                     )}
 
                     {/* Signature / Approval Area — hidden in capture mode */}
@@ -681,6 +673,47 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     </div>
                 </div>
             </div>
+        </div>
+    );
+}
+
+function TermsAndConditions({ html }: { html: string }) {
+    const ref = useRef<HTMLDivElement>(null);
+    const sanitized = DOMPurify.sanitize(html);
+
+    // After mount, wrap each top-level block element in a data-pdf-row wrapper
+    // so the PDF paginator can break between paragraphs/sections instead of
+    // treating the entire terms block as one atomic chunk.
+    useEffect(() => {
+        if (!ref.current) return;
+        const container = ref.current;
+        const children = Array.from(container.children) as HTMLElement[];
+        children.forEach(child => {
+            child.setAttribute("data-pdf-row", "true");
+        });
+    }, [sanitized]);
+
+    // Strip leading heading if it duplicates our own "Terms & Conditions" label
+    const stripped = sanitized.replace(
+        /^\s*<h[1-6][^>]*>\s*Terms\s*(?:&amp;|&)\s*Conditions\s*<\/h[1-6]>\s*/i,
+        ""
+    );
+
+    return (
+        <div className="px-10 pb-10 border-t border-slate-200 pt-8">
+            {/* Section heading — always rendered once */}
+            <div data-pdf-row="true" className="flex items-center gap-2 mb-4">
+                <svg className="w-4 h-4 text-slate-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Terms &amp; Conditions</h2>
+            </div>
+            {/* Content — each top-level block gets data-pdf-row for clean page breaks */}
+            <div
+                ref={ref}
+                className="border-l-2 border-slate-300 pl-6 py-1 prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2"
+                dangerouslySetInnerHTML={{ __html: stripped }}
+            />
         </div>
     );
 }
