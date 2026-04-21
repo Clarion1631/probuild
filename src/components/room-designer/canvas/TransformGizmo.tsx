@@ -84,9 +84,9 @@ export function TransformGizmo() {
             translationSnap={snapOn ? gridSize : null}
             rotationSnap={snapOn ? Math.PI / 12 : null}
             scaleSnap={snapOn ? 0.1 : null}
-            showX
-            showZ
-            showY
+            showX={toolMode === "translate"}
+            showZ={toolMode === "translate"}
+            showY={toolMode === "translate" || toolMode === "rotate"}
             onMouseUp={() => {
                 if (!primaryId || !asset) return;
                 const obj = meshRefs.current.get(primaryId) as Group | undefined;

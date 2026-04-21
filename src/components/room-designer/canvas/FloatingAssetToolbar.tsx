@@ -86,6 +86,7 @@ export function FloatingAssetToolbar({ asset, topY }: Props) {
                 <button
                     type="button"
                     title={locked ? "Unlock (click to edit)" : "Lock in place"}
+                    aria-label={locked ? "Unlock position" : "Lock position"}
                     onClick={() => setAssetLocked(asset.id, !locked)}
                     className={
                         BTN +
