@@ -65,9 +65,13 @@ export async function POST(
             try {
                 // Ensure the 'from' email is verified in Resend for the user's domain.
                 // If not, we just catch the error and continue.
+                const inviteCc = client.additionalEmail && client.additionalEmail !== emailToInvite
+                    ? [client.additionalEmail]
+                    : undefined;
                 const { error } = await resend.emails.send({
                     from: 'ProBuild <notifications@goldentouchremodeling.com>',
                     to: emailToInvite,
+                    cc: inviteCc,
                     subject: 'Invitation to Customer Portal',
                     html: `
                     <!DOCTYPE html>

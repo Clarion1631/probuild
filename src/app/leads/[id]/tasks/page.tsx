@@ -52,6 +52,7 @@ export default async function LeadTasksPage({ params }: { params: Promise<{ id: 
                 clientId={lead.client?.id || ""}
                 clientName={lead.client?.name || ""}
                 clientEmail={lead.client?.email || null}
+                clientAdditionalEmail={(lead.client as any)?.additionalEmail || null}
                 clientPhone={(lead.client as any)?.primaryPhone || null}
                 clientAddress={(lead.client as any)?.addressLine1 || null}
                 clientCity={(lead.client as any)?.city || null}

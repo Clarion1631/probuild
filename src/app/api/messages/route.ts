@@ -189,6 +189,10 @@ export async function POST(request: Request) {
                 );
             } else if (senderType === "TEAM" && project?.client?.email) {
                 // Team sent a message → notify the client
+                const clientAdditionalEmail = (project.client as any)?.additionalEmail as string | undefined;
+                const msgCc = clientAdditionalEmail && clientAdditionalEmail.toLowerCase() !== project.client.email.toLowerCase()
+                    ? [clientAdditionalEmail]
+                    : undefined;
                 await sendNotification(
                     project.client?.email,
                     `${companyName} sent you a message — ${project.name}`,
@@ -210,7 +214,9 @@ export async function POST(request: Request) {
                                 </a>
                             </div>
                         </div>
-                    </body></html>`
+                    </body></html>`,
+                    undefined,
+                    msgCc ? { cc: msgCc } : undefined
                 );
             }
             // Send SMS notification

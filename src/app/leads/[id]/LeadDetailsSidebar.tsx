@@ -23,6 +23,7 @@ interface LeadDetailsSidebarProps {
     clientId: string;
     clientName: string;
     clientEmail: string | null;
+    clientAdditionalEmail: string | null;
     clientPhone: string | null;
     clientAddress: string | null;
     clientCity: string | null;
@@ -35,7 +36,7 @@ interface LeadDetailsSidebarProps {
 
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
-    clientId, clientName, clientEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
+    clientId, clientName, clientEmail, clientAdditionalEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
     initialMessage, managerId, managerName,
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
@@ -44,6 +45,7 @@ export default function LeadDetailsSidebar({
     const [editingClient, setEditingClient] = useState(false);
     const [cName, setCName] = useState(clientName);
     const [cEmail, setCEmail] = useState(clientEmail || "");
+    const [cAdditionalEmail, setCAdditionalEmail] = useState(clientAdditionalEmail || "");
     const [cPhone, setCPhone] = useState(clientPhone || "");
     const [cAddr, setCAddr] = useState(clientAddress || "");
     const [cCity, setCCity] = useState(clientCity || "");
@@ -124,6 +126,7 @@ export default function LeadDetailsSidebar({
             await updateClient(clientId, {
                 name: cName,
                 email: cEmail || undefined,
+                additionalEmail: cAdditionalEmail || undefined,
                 primaryPhone: cPhone || undefined,
                 addressLine1: cAddr || undefined,
                 city: cCity || undefined,
@@ -256,6 +259,10 @@ export default function LeadDetailsSidebar({
                             <input type="email" value={cEmail} onChange={e => setCEmail(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                         <div>
+                            <label className="text-xs text-slate-500 block mb-1">Email 2 <span className="text-slate-400">(spouse / partner)</span></label>
+                            <input type="email" value={cAdditionalEmail} onChange={e => setCAdditionalEmail(e.target.value)} className="hui-input w-full text-sm" placeholder="Optional" />
+                        </div>
+                        <div>
                             <label className="text-xs text-slate-500 block mb-1">Phone</label>
                             <input type="tel" value={cPhone} onChange={e => setCPhone(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
@@ -297,6 +304,10 @@ export default function LeadDetailsSidebar({
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Email</span>
                             <span className="text-sm text-green-600">{clientEmail ? maskEmail(clientEmail) : <span className="text-slate-400 italic">Not set</span>}</span>
+                        </div>
+                        <div className="flex items-center justify-between py-2 border-b border-slate-50">
+                            <span className="text-sm text-slate-600">Email 2</span>
+                            <span className="text-sm text-green-600">{clientAdditionalEmail ? maskEmail(clientAdditionalEmail) : <span className="text-slate-400 italic">Not set</span>}</span>
                         </div>
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Phone Number</span>

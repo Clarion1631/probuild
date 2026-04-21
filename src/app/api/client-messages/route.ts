@@ -44,6 +44,7 @@ export async function POST(request: Request) {
 
     // Resolve client info from lead or project
     let clientEmail: string | null = null;
+    let clientAdditionalEmail: string | null = null;
     let clientPhone: string | null = null;
     let estimates: { id: string; code: string; title: string; status: string }[] = [];
 
@@ -57,6 +58,7 @@ export async function POST(request: Request) {
         });
         if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
         clientEmail = lead.client?.email ?? null;
+        clientAdditionalEmail = (lead.client as any)?.additionalEmail ?? null;
         clientPhone = lead.client?.primaryPhone ?? null;
         estimates = lead.estimates;
     } else {
@@ -69,8 +71,17 @@ export async function POST(request: Request) {
         });
         if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
         clientEmail = project.client?.email ?? null;
+        clientAdditionalEmail = (project.client as any)?.additionalEmail ?? null;
         clientPhone = project.client?.primaryPhone ?? null;
         estimates = project.estimates;
+    }
+
+    // Auto-prepend secondary client email (spouse/partner) to CC list
+    let resolvedCcEmails: string[] = ccEmails;
+    if (clientAdditionalEmail && clientEmail &&
+        clientAdditionalEmail.toLowerCase() !== clientEmail.toLowerCase() &&
+        !resolvedCcEmails.some((e: string) => e.toLowerCase() === clientAdditionalEmail!.toLowerCase())) {
+        resolvedCcEmails = [clientAdditionalEmail, ...resolvedCcEmails];
     }
 
     const senderName = session?.user?.name || session?.user?.email || "Team";
@@ -129,7 +140,7 @@ export async function POST(request: Request) {
                     <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
                 </body></html>`,
                 emailAttachments.length > 0 ? emailAttachments : undefined,
-                { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails.length > 0 ? ccEmails : undefined }
+                { fromName: companyName, replyTo: settings?.email || undefined, cc: resolvedCcEmails.length > 0 ? resolvedCcEmails : undefined }
             );
             sentViaEmail = true;
         }
@@ -158,7 +169,7 @@ export async function POST(request: Request) {
             sentViaSms,
             status: isScheduled ? "SCHEDULED" : "SENT",
             scheduledFor: isScheduled ? parseDate : null,
-            ccEmails: ccEmails.length > 0 ? JSON.stringify(ccEmails) : null,
+            ccEmails: resolvedCcEmails.length > 0 ? JSON.stringify(resolvedCcEmails) : null,
         },
     });
 

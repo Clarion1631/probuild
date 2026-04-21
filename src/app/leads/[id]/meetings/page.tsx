@@ -57,6 +57,7 @@ export default async function LeadMeetingsPage({ params }: { params: Promise<{ i
                 clientId={lead.client.id}
                 clientName={lead.client.name}
                 clientEmail={lead.client.email}
+                clientAdditionalEmail={(lead.client as any)?.additionalEmail || null}
                 clientPhone={(lead.client as any)?.primaryPhone || null}
                 clientAddress={(lead.client as any)?.addressLine1 || null}
                 clientCity={(lead.client as any)?.city || null}

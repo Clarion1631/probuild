@@ -12,6 +12,14 @@ import { resolveSessionClientId } from "./portal-auth";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
 
+// Build a CC array for a secondary client email (spouse/partner).
+// Returns undefined when additionalEmail is absent, empty, or identical to the primary (case-insensitive).
+function buildCc(primaryEmail: string, additionalEmail?: string | null): string[] | undefined {
+    if (!additionalEmail) return undefined;
+    if (additionalEmail.toLowerCase() === primaryEmail.toLowerCase()) return undefined;
+    return [additionalEmail];
+}
+
 // Safe estimate include that omits columns not yet migrated to the database.
 // Remove this wrapper once the DB Push workflow succeeds and the Estimate table
 // has: processingFeeMarkup, hideProcessingFee, expirationDate, archivedAt.
@@ -460,7 +468,7 @@ export async function updateClient(clientId: string, data: { name?: string; emai
         data: {
             name: data.name,
             email: data.email,
-            additionalEmail: data.additionalEmail ?? undefined,
+            additionalEmail: data.additionalEmail || undefined,
             primaryPhone: data.primaryPhone,
             addressLine1: data.addressLine1,
             city: data.city,
@@ -655,9 +663,7 @@ END:VCALENDAR`;
 
         // 2. Send to Client
         if (lead.client.email) {
-            const meetingCc = (lead.client as any).additionalEmail && (lead.client as any).additionalEmail !== lead.client.email
-                ? [(lead.client as any).additionalEmail as string]
-                : undefined;
+            const meetingCc = buildCc(lead.client.email || "", (lead.client as any).additionalEmail);
             await sendNotification(
                 lead.client.email,
                 `Meeting Scheduled: ${data.title}`,
@@ -1669,9 +1675,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 
     // ─── 1. Email the CUSTOMER a professional confirmation ───
     if (clientEmail) {
-        const approvedCc = clientAdditionalEmail && clientAdditionalEmail !== clientEmail
-            ? [clientAdditionalEmail]
-            : undefined;
+        const approvedCc = buildCc(clientEmail || "", clientAdditionalEmail);
         await sendNotification(
             clientEmail,
             `Your Approved Estimate — ${estimateCode}`,
@@ -1858,9 +1862,7 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
     const companyName = settings?.companyName || "Your Contractor";
 
     const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
-    const invoiceCc = invoiceAdditionalEmail && invoiceAdditionalEmail !== recipientEmail
-        ? [invoiceAdditionalEmail]
-        : undefined;
+    const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
     await sendNotification(
         recipientEmail,
         `${companyName} sent you an invoice — ${invoice.code}`,
@@ -3598,9 +3600,7 @@ export async function sendContractToClient(contractId: string) {
                 : ""}
         </div>`;
 
-    const contractCc = (client as any).additionalEmail && (client as any).additionalEmail !== client.email
-        ? [(client as any).additionalEmail as string]
-        : undefined;
+    const contractCc = buildCc(client.email, (client as any).additionalEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a contract to review`,
@@ -3625,7 +3625,7 @@ export async function sendContractToClient(contractId: string) {
         </body>
         </html>`,
         undefined,
-        contractCc ? { cc: contractCc } : undefined
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: contractCc }
     );
 
     // Log to activity feed — project side uses ActivityLog, lead side uses the client message thread.
@@ -4594,10 +4594,7 @@ export async function emailPortalLinkToClient(projectId: string) {
     
     // Send email using our enhanced library fn
     const { sendNotification } = await import('@/lib/email');
-    const portalAdditionalEmail = (project.client as any).additionalEmail as string | undefined;
-    const portalCc = portalAdditionalEmail && portalAdditionalEmail !== project.client.email
-        ? [portalAdditionalEmail]
-        : undefined;
+    const portalCc = buildCc(project.client.email, (project.client as any).additionalEmail);
     const result = await sendNotification(
         project.client.email,
         `Your Dashboard for ${project.name} is Ready`,
@@ -4879,9 +4876,7 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
-    const changeOrderCc = (client as any).additionalEmail && (client as any).additionalEmail !== client.email
-        ? [(client as any).additionalEmail as string]
-        : undefined;
+    const changeOrderCc = buildCc(client.email, (client as any).additionalEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a change order to review`,
@@ -5745,10 +5740,7 @@ export async function sendSelectionBoardToClient(boardId: string) {
     if (clientEmail) {
         const settings = await getCompanySettings();
         const portalUrl = `https://probuild.goldentouchremodeling.com/portal/projects/${board.projectId}/selections`;
-        const selectionAdditionalEmail = (board.project.client as any)?.additionalEmail as string | undefined;
-        const selectionCc = selectionAdditionalEmail && selectionAdditionalEmail !== clientEmail
-            ? [selectionAdditionalEmail]
-            : undefined;
+        const selectionCc = buildCc(clientEmail, (board.project.client as any)?.additionalEmail);
         await sendNotification(
             clientEmail,
             `Selection Board Ready: ${board.title}`,
