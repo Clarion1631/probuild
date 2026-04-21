@@ -453,13 +453,14 @@ export async function createClient(data: { name: string; email?: string; company
     return client;
 }
 
-export async function updateClient(clientId: string, data: { name?: string; email?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
+export async function updateClient(clientId: string, data: { name?: string; email?: string; additionalEmail?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
     "use server";
     const client = await prisma.client.update({
         where: { id: clientId },
         data: {
             name: data.name,
             email: data.email,
+            additionalEmail: data.additionalEmail ?? undefined,
             primaryPhone: data.primaryPhone,
             addressLine1: data.addressLine1,
             city: data.city,
@@ -654,11 +655,15 @@ END:VCALENDAR`;
 
         // 2. Send to Client
         if (lead.client.email) {
+            const meetingCc = (lead.client as any).additionalEmail && (lead.client as any).additionalEmail !== lead.client.email
+                ? [(lead.client as any).additionalEmail as string]
+                : undefined;
             await sendNotification(
                 lead.client.email,
                 `Meeting Scheduled: ${data.title}`,
                 `<p>Hi ${lead.client.name},<br><br>We have scheduled a meeting to discuss your project: ${data.title}.<br>Time: ${startDate.toLocaleString()}<br><br>Please see the attached calendar invite.<br><br>Thanks,<br>Golden Touch Remodeling</p>`,
-                attachments
+                attachments,
+                meetingCc ? { cc: meetingCc } : undefined
             );
         }
     } catch (e) {
@@ -1081,7 +1086,7 @@ export async function getEstimate(id: string) {
             select: {
                 id: true, number: true, title: true, projectId: true, leadId: true,
                 code: true, status: true, privacy: true, createdAt: true,
-                totalAmount: true, balanceDue: true,
+                totalAmount: true, balanceDue: true, taxExempt: true,
                 approvedBy: true, approvedAt: true,
                 approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                 items: {
@@ -1156,7 +1161,7 @@ export async function getEstimateForPortal(id: string) {
                     select: {
                         id: true, number: true, title: true, projectId: true, leadId: true,
                         code: true, status: true, privacy: true, createdAt: true,
-                        totalAmount: true, balanceDue: true,
+                        totalAmount: true, balanceDue: true, taxExempt: true,
                         approvedBy: true, approvedAt: true,
                         approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                         project: { include: { client: true } },
@@ -1210,7 +1215,7 @@ export async function getEstimateForPortal(id: string) {
                 select: {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
-                    totalAmount: true, balanceDue: true,
+                    totalAmount: true, balanceDue: true, taxExempt: true,
                     approvedBy: true, approvedAt: true,
                     approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                     project: { include: { client: true } },
@@ -1624,8 +1629,8 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         where: { id: estimateId },
         select: {
             projectId: true, leadId: true, code: true, title: true,
-            project: { select: { id: true, name: true, client: { select: { name: true, email: true } } } },
-            lead: { select: { name: true, client: { select: { name: true, email: true } } } },
+            project: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
+            lead: { select: { name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
         },
     });
 
@@ -1635,6 +1640,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     const projectName = estimate?.project?.name || estimate?.lead?.name || "your project";
     const clientName = estimate?.project?.client?.name || estimate?.lead?.client?.name || signatureName;
     const clientEmail = estimate?.project?.client?.email || estimate?.lead?.client?.email || null;
+    const clientAdditionalEmail = estimate?.project?.client?.additionalEmail || estimate?.lead?.client?.additionalEmail || null;
     const pdfFilename = `Signed_Estimate_${estimateCode}.pdf`;
 
     // Generate PDF — prefer the portal-captured version (pixel-perfect), fall back to pdf-lib
@@ -1663,6 +1669,9 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 
     // ─── 1. Email the CUSTOMER a professional confirmation ───
     if (clientEmail) {
+        const approvedCc = clientAdditionalEmail && clientAdditionalEmail !== clientEmail
+            ? [clientAdditionalEmail]
+            : undefined;
         await sendNotification(
             clientEmail,
             `Your Approved Estimate — ${estimateCode}`,
@@ -1688,7 +1697,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                 <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;">${companyName}${settings.address ? ` • ${settings.address}` : ""}</p>
             </div>`,
             attachments,
-            { fromName: companyName, replyTo: settings.email || undefined }
+            { fromName: companyName, replyTo: settings.email || undefined, cc: approvedCc }
         );
     }
 
@@ -1848,6 +1857,10 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
+    const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
+    const invoiceCc = invoiceAdditionalEmail && invoiceAdditionalEmail !== recipientEmail
+        ? [invoiceAdditionalEmail]
+        : undefined;
     await sendNotification(
         recipientEmail,
         `${companyName} sent you an invoice — ${invoice.code}`,
@@ -1883,7 +1896,7 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
         </body>
         </html>`,
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc }
     );
 
     // Log to activity feed (project-scoped only)
@@ -3063,6 +3076,15 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     const recipientEmail = overrideEmail || client?.email;
     if (!recipientEmail) return { success: false, error: "No email address found for this client. Please add an email address before sending." };
 
+    // Auto-include secondary client email (spouse/partner) if set
+    const clientAdditionalEmailForEstimate = (client as any)?.additionalEmail as string | undefined;
+    if (clientAdditionalEmailForEstimate) {
+        ccEmails = ccEmails ? [...ccEmails] : [];
+        if (!ccEmails.some(e => e.toLowerCase() === clientAdditionalEmailForEstimate.toLowerCase())) {
+            ccEmails.unshift(clientAdditionalEmailForEstimate);
+        }
+    }
+
     // Remove the primary recipient from CC to avoid Resend duplicate-recipient errors
     if (ccEmails && ccEmails.length > 0) {
         const recipientLower = recipientEmail.toLowerCase();
@@ -3576,6 +3598,9 @@ export async function sendContractToClient(contractId: string) {
                 : ""}
         </div>`;
 
+    const contractCc = (client as any).additionalEmail && (client as any).additionalEmail !== client.email
+        ? [(client as any).additionalEmail as string]
+        : undefined;
     await sendNotification(
         client.email,
         `${companyName} sent you a contract to review`,
@@ -3598,7 +3623,9 @@ export async function sendContractToClient(contractId: string) {
                 <p style="color: #999; font-size: 13px; margin: 0;">If you have any questions, reply to this email or contact us directly.</p>
             </div>
         </body>
-        </html>`
+        </html>`,
+        undefined,
+        contractCc ? { cc: contractCc } : undefined
     );
 
     // Log to activity feed — project side uses ActivityLog, lead side uses the client message thread.
@@ -4567,10 +4594,16 @@ export async function emailPortalLinkToClient(projectId: string) {
     
     // Send email using our enhanced library fn
     const { sendNotification } = await import('@/lib/email');
+    const portalAdditionalEmail = (project.client as any).additionalEmail as string | undefined;
+    const portalCc = portalAdditionalEmail && portalAdditionalEmail !== project.client.email
+        ? [portalAdditionalEmail]
+        : undefined;
     const result = await sendNotification(
         project.client.email,
         `Your Dashboard for ${project.name} is Ready`,
-        `<p>Hi ${project.client.name},</p><p>We have updated the portal for your project: <strong>${project.name}</strong>.</p><p><a href="${portalUrl}" style="display:inline-block;padding:10px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:5px;">Access Your Client Dashboard</a></p><p>From here you can view estimates, invoices, updates, and more.</p><br/>Thanks,<br/>Golden Touch Remodeling`
+        `<p>Hi ${project.client.name},</p><p>We have updated the portal for your project: <strong>${project.name}</strong>.</p><p><a href="${portalUrl}" style="display:inline-block;padding:10px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:5px;">Access Your Client Dashboard</a></p><p>From here you can view estimates, invoices, updates, and more.</p><br/>Thanks,<br/>Golden Touch Remodeling`,
+        undefined,
+        portalCc ? { cc: portalCc } : undefined
     );
     
     if (result.success && result.id) {
@@ -4846,6 +4879,9 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
+    const changeOrderCc = (client as any).additionalEmail && (client as any).additionalEmail !== client.email
+        ? [(client as any).additionalEmail as string]
+        : undefined;
     await sendNotification(
         client.email,
         `${companyName} sent you a change order to review`,
@@ -4878,7 +4914,7 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
         </body>
         </html>`,
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc }
     );
 
     // Log activity
@@ -5709,6 +5745,10 @@ export async function sendSelectionBoardToClient(boardId: string) {
     if (clientEmail) {
         const settings = await getCompanySettings();
         const portalUrl = `https://probuild.goldentouchremodeling.com/portal/projects/${board.projectId}/selections`;
+        const selectionAdditionalEmail = (board.project.client as any)?.additionalEmail as string | undefined;
+        const selectionCc = selectionAdditionalEmail && selectionAdditionalEmail !== clientEmail
+            ? [selectionAdditionalEmail]
+            : undefined;
         await sendNotification(
             clientEmail,
             `Selection Board Ready: ${board.title}`,
@@ -5719,7 +5759,9 @@ export async function sendSelectionBoardToClient(boardId: string) {
                 <p>Please review the options and make your selections:</p>
                 <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
                 <p style="color:#666;font-size:13px;">— ${settings.companyName || 'Your Project Team'}</p>
-            </div>`
+            </div>`,
+            undefined,
+            selectionCc ? { cc: selectionCc } : undefined
         );
     }
 

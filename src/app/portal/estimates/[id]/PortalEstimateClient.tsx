@@ -300,7 +300,13 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     });
 
     const subtotal = items.reduce((sum: number, item: any) => sum + calculateTotal(item), 0);
-    const tax = subtotal * 0.088;
+    const taxExempt = !!initialEstimate.taxExempt;
+    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
+    try { salesTaxes = companySettings?.salesTaxes ? JSON.parse(companySettings.salesTaxes) : []; } catch { /* ignore */ }
+    const defaultTax = salesTaxes.find((t: any) => t.isDefault) || salesTaxes[0] || null;
+    const taxRate = taxExempt ? 0 : (defaultTax ? defaultTax.rate / 100 : 0.088);
+    const taxLabel = taxExempt ? null : (defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Tax (8.8%)");
+    const tax = subtotal * taxRate;
     const total = subtotal + tax;
     // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update
     const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");
@@ -515,10 +521,12 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 <span>Subtotal</span>
                                 <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                             </div>
-                            <div className="flex justify-between text-slate-500 font-medium">
-                                <span>Tax (8.8%)</span>
-                                <span className="text-slate-800">{formatCurrency(tax)}</span>
-                            </div>
+                            {!taxExempt && taxLabel && (
+                                <div className="flex justify-between text-slate-500 font-medium">
+                                    <span>{taxLabel}</span>
+                                    <span className="text-slate-800">{formatCurrency(tax)}</span>
+                                </div>
+                            )}
                             <div className="border-t-2 border-slate-800 pt-3 mt-1 flex justify-between text-lg font-bold text-slate-800">
                                 <span>Total</span>
                                 <span>{formatCurrency(total)}</span>
