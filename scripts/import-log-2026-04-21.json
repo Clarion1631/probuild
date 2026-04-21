@@ -1,0 +1,71 @@
+{
+  "timestamp": "2026-04-21T03:12:01.250Z",
+  "dryRun": true,
+  "csvPath": "C:/Users/jat00/Downloads/user_data_csv_8fa8b25b8c.csv/user_data_csv_8fa8b25b8c.csv",
+  "stats": {
+    "clients": {
+      "created": 0,
+      "skipped": 107,
+      "updated": 0,
+      "errors": []
+    },
+    "vendors": {
+      "created": 0,
+      "skipped": 10,
+      "errors": []
+    },
+    "leads": {
+      "created": 68,
+      "skipped": 0,
+      "filtered": 13,
+      "errors": []
+    },
+    "projects": {
+      "created": 68,
+      "skipped": 5,
+      "errors": []
+    },
+    "estimates": {
+      "created": 74,
+      "skipped": 32,
+      "errors": []
+    },
+    "items": {
+      "created": 813,
+      "skipped": 0,
+      "errors": []
+    },
+    "invoices": {
+      "created": 37,
+      "skipped": 2,
+      "errors": []
+    },
+    "contracts": {
+      "created": 12,
+      "skipped": 1,
+      "errors": []
+    },
+    "milestones": {
+      "created": 321,
+      "skipped": 114,
+      "errors": []
+    },
+    "notes": {
+      "created": 0,
+      "skipped": 23,
+      "errors": []
+    },
+    "products": {
+      "created": 123,
+      "skipped": 0,
+      "errors": []
+    }
+  },
+  "lookupSizes": {
+    "clients": 115,
+    "vendors": 10,
+    "leads": 0,
+    "projects": 67,
+    "documents": 74
+  }
+}
