@@ -1869,18 +1869,23 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     <div className="w-32">Percentage</div>
                                     <div className="w-32">Amount</div>
                                     <div className="w-40 text-right">Due Date</div>
+                                    <div className="w-32 text-right">Status</div>
                                     <div className="w-10"></div>
                                 </div>
                                 <div className="divide-y divide-slate-50">
-                                    {paymentSchedules.map((schedule, index) => (
-                                        <div key={schedule.id || index} className="flex items-center px-8 py-4 bg-white group hover:bg-slate-50/50 transition-colors border-l-4 border-transparent">
+                                    {paymentSchedules.map((schedule, index) => {
+                                        const isPaid = schedule.status === "Paid";
+                                        const paidOn = schedule.paidAt || schedule.paymentDate;
+                                        return (
+                                        <div key={schedule.id || index} className={`flex items-center px-8 py-4 transition-colors border-l-4 ${isPaid ? 'bg-green-50/60 border-green-400' : 'bg-white hover:bg-slate-50/50 border-transparent group'}`}>
                                             <div className="flex-1">
                                                 <input
                                                     type="text"
                                                     value={schedule.name}
                                                     onChange={e => updatePaymentSchedule(index, "name", e.target.value)}
                                                     placeholder="e.g. Initial Deposit"
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800"
+                                                    disabled={isPaid}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800 disabled:cursor-default"
                                                 />
                                             </div>
                                             <div className="w-32 px-4 relative">
@@ -1889,7 +1894,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     value={schedule.percentage}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium text-slate-600"
+                                                    disabled={isPaid}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium text-slate-600 disabled:cursor-default"
                                                 />
                                                 <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
                                             </div>
@@ -1899,7 +1905,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     type="number"
                                                     value={schedule.amount}
                                                     onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
+                                                    disabled={isPaid}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800 disabled:cursor-default"
                                                 />
                                             </div>
                                             <div className="w-40 px-4 text-right">
@@ -1907,16 +1914,35 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     type="date"
                                                     value={schedule.dueDate ? new Date(schedule.dueDate).toISOString().split('T')[0] : ''}
                                                     onChange={e => updatePaymentSchedule(index, "dueDate", new Date(e.target.value).toISOString())}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500"
+                                                    disabled={isPaid}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500 disabled:cursor-default"
                                                 />
                                             </div>
+                                            <div className="w-32 px-4 text-right">
+                                                {isPaid ? (
+                                                    <div className="flex flex-col items-end gap-0.5">
+                                                        <span className="inline-flex items-center gap-1 text-[11px] font-bold uppercase text-green-700 bg-green-100 px-2 py-0.5 rounded-full">
+                                                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                                                            Paid
+                                                        </span>
+                                                        {paidOn && (
+                                                            <span className="text-[10px] text-slate-400">{new Date(paidOn).toLocaleDateString()}</span>
+                                                        )}
+                                                    </div>
+                                                ) : (
+                                                    <span className="text-[11px] font-medium text-slate-400 uppercase tracking-wide">Pending</span>
+                                                )}
+                                            </div>
                                             <div className="w-10 pt-0.5 flex justify-end">
-                                                <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                </button>
+                                                {!isPaid && (
+                                                    <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                    </button>
+                                                )}
                                             </div>
                                         </div>
-                                    ))}
+                                        );
+                                    })}
                                 </div>
                             </div>
                         )}

@@ -5,7 +5,7 @@ import { markInvoiceViewed } from "@/lib/actions";
 import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
 
-export default function PortalInvoiceClient({ initialInvoice, companySettings }: { initialInvoice: any, companySettings?: any }) {
+export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
 
     useEffect(() => {
@@ -21,6 +21,16 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
+            {/* Payment success banner */}
+            {paymentSuccess && (
+                <div className="bg-green-50 border-b border-green-200 px-6 py-3 flex items-center gap-2 print:hidden">
+                    <svg className="w-5 h-5 text-green-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <p className="text-sm font-medium text-green-800">Payment received! Thank you — a receipt has been sent to your email.</p>
+                </div>
+            )}
+
             {/* Top Bar */}
             <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden">
                 <div className="flex items-center gap-3">

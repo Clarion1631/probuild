@@ -55,6 +55,13 @@ export async function POST(req: Request) {
 
                 // ── Invoice payment branch ──────────────────────────────────
                 if (metadata?.paymentScheduleId && metadata?.invoiceId) {
+                    // Check pre-update status so we only send emails once (idempotent against Stripe retries)
+                    const preUpdate = await prisma.paymentSchedule.findUnique({
+                        where: { id: metadata.paymentScheduleId },
+                        select: { status: true },
+                    });
+                    const wasAlreadyPaid = preUpdate?.status === "Paid";
+
                     await prisma.paymentSchedule.update({
                         where: { id: metadata.paymentScheduleId },
                         data: {
@@ -70,7 +77,7 @@ export async function POST(req: Request) {
                     const allInvSchedules = await prisma.paymentSchedule.findMany({
                         where: { invoiceId: metadata.invoiceId },
                     });
-                    const invoice = await prisma.invoice.findUnique({ where: { id: metadata.invoiceId } });
+                    const invoice = await prisma.invoice.findUnique({ where: { id: metadata.invoiceId }, include: { client: true } });
                     if (invoice) {
                         const totalInvPaid = allInvSchedules
                             .filter(s => s.status === "Paid")
@@ -85,7 +92,8 @@ export async function POST(req: Request) {
 
                         const paidSchedule = allInvSchedules.find(s => s.id === metadata.paymentScheduleId);
                         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                        if (settings?.notificationEmail && paidSchedule) {
+                        const companyName = settings?.companyName || "Golden Touch Remodeling";
+                        if (!wasAlreadyPaid && settings?.notificationEmail && paidSchedule) {
                             await sendNotification(
                                 settings.notificationEmail,
                                 `Payment Received: ${paidSchedule.name} - ${invoice.code}`,
@@ -95,6 +103,32 @@ export async function POST(req: Request) {
                                     <p>Milestone: ${paidSchedule.name}</p>
                                     <p>Remaining Invoice Balance: ${formatCurrency(newBalance)}</p>
                                 </div>`
+                            );
+                        }
+
+                        // Send receipt to customer (only on first application — idempotent against retries)
+                        if (!wasAlreadyPaid && paidSchedule && invoice.client?.email) {
+                            const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || ''}/portal/invoices/${invoice.id}`;
+                            await sendNotification(
+                                invoice.client.email,
+                                `Payment Receipt — Invoice #${invoice.code}`,
+                                `<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+                                    <h2 style="color:#166534;margin-bottom:8px;">Payment Confirmed</h2>
+                                    <p>Hi ${invoice.client.name || 'there'},</p>
+                                    <p>We've received your payment of <strong>${formatCurrency(paidSchedule.amount)}</strong> for <strong>${paidSchedule.name}</strong> on Invoice #${invoice.code}.</p>
+                                    ${newBalance > 0
+                                        ? `<p>Remaining balance: <strong>${formatCurrency(newBalance)}</strong></p>`
+                                        : `<p>Your invoice is now <strong>paid in full</strong>. Thank you!</p>`
+                                    }
+                                    <p style="margin-top:24px;">
+                                        <a href="${portalUrl}" style="background:#166534;color:white;padding:10px 20px;text-decoration:none;border-radius:6px;font-weight:600;">View Invoice</a>
+                                    </p>
+                                    <p style="color:#9ca3af;font-size:12px;margin-top:32px;">
+                                        ${companyName}${settings?.phone ? ` · ${settings.phone}` : ''}${settings?.email ? ` · ${settings.email}` : ''}
+                                    </p>
+                                </div>`,
+                                undefined,
+                                { replyTo: settings?.email ?? undefined }
                             );
                         }
                     }

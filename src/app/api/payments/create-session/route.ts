@@ -179,7 +179,7 @@ export async function POST(req: Request) {
             payment_method_types: paymentMethodTypes,
             line_items: lineItems,
             mode: "payment",
-            success_url: `${appUrl}/portal/invoices/${invoiceId}?payment=success`,
+            success_url: `${appUrl}/portal/invoices/${invoiceId}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${appUrl}/portal/invoices/${invoiceId}?payment=cancelled`,
             metadata: {
                 invoiceId: paymentSchedule.invoiceId,

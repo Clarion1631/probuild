@@ -2,9 +2,80 @@ import { getInvoiceForPortal, getCompanySettings, getPortalVisibility } from "@/
 import { notFound } from "next/navigation";
 import PortalInvoiceClient from "./PortalInvoiceClient";
 import Link from "next/link";
+import { prisma } from "@/lib/prisma";
+import { stripe } from "@/lib/stripe";
+import { toNum } from "@/lib/prisma-helpers";
 
-export default async function PortalInvoicePage({ params }: { params: Promise<{ id: string }> }) {
+async function verifyStripeSession(sessionId: string, invoiceId: string): Promise<void> {
+    try {
+        const existing = await prisma.paymentSchedule.findFirst({
+            where: { stripeSessionId: sessionId, status: "Paid" },
+        });
+        if (existing) return;
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        if (session.payment_status !== "paid") return;
+
+        const metadata = session.metadata;
+        if (!metadata?.paymentScheduleId || !metadata?.invoiceId) return;
+
+        // Ownership check: ensure this Stripe session belongs to the invoice being viewed
+        if (metadata.invoiceId !== invoiceId) return;
+
+        let paymentMethod = "card";
+        if (session.payment_intent) {
+            try {
+                const pi = await stripe.paymentIntents.retrieve(session.payment_intent as string);
+                const pmType = pi.payment_method_types?.[0];
+                if (pmType === "us_bank_account") paymentMethod = "ach";
+                else if (pmType) paymentMethod = pmType;
+            } catch {}
+        }
+
+        await prisma.paymentSchedule.update({
+            where: { id: metadata.paymentScheduleId },
+            data: {
+                status: "Paid",
+                stripePaymentIntentId: session.payment_intent as string | null,
+                paymentMethod,
+                paymentDate: new Date(),
+                paidAt: new Date(),
+            },
+        });
+
+        const allSchedules = await prisma.paymentSchedule.findMany({
+            where: { invoiceId: metadata.invoiceId },
+        });
+        const invoice = await prisma.invoice.findUnique({ where: { id: metadata.invoiceId } });
+        if (invoice) {
+            const totalPaid = allSchedules
+                .filter(s => s.status === "Paid")
+                .reduce((sum, s) => sum + toNum(s.amount), 0);
+            const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+            await prisma.invoice.update({
+                where: { id: invoice.id },
+                data: { balanceDue: newBalance, status: newBalance <= 0 ? "Paid" : invoice.status },
+            });
+        }
+    } catch (e) {
+        console.error("verifyStripeSession error:", e);
+    }
+}
+
+export default async function PortalInvoicePage({
+    params,
+    searchParams,
+}: {
+    params: Promise<{ id: string }>;
+    searchParams: Promise<{ payment?: string; session_id?: string }>;
+}) {
     const resolvedParams = await params;
+    const resolvedSearch = await searchParams;
+
+    if (resolvedSearch.session_id) {
+        await verifyStripeSession(resolvedSearch.session_id, resolvedParams.id);
+    }
+
     const invoice = await getInvoiceForPortal(resolvedParams.id);
     const settings = await getCompanySettings();
 
@@ -31,5 +102,11 @@ export default async function PortalInvoicePage({ params }: { params: Promise<{ 
         }
     }
 
-    return <PortalInvoiceClient initialInvoice={invoice} companySettings={settings} />;
+    return (
+        <PortalInvoiceClient
+            initialInvoice={invoice}
+            companySettings={settings}
+            paymentSuccess={resolvedSearch.payment === "success"}
+        />
+    );
 }
