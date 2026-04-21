@@ -2201,6 +2201,54 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     return { id: invoice.id, projectId: estimate.projectId };
 }
 
+export async function createOneOffInvoice(
+    projectId: string,
+    items: { name: string; amount: number; dueDate?: string | null }[],
+) {
+    await assertInvoicePermission();
+
+    if (!items.length) throw new Error("At least one line item is required");
+
+    const validatedItems = items.map((item, i) => {
+        const name = (item.name || "").trim();
+        const amount = Math.round(Number(item.amount) * 100) / 100;
+        if (!name) throw new Error(`Item ${i + 1}: description is required`);
+        if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Item ${i + 1}: amount must be greater than zero`);
+        return { name, amount, dueDate: item.dueDate || null };
+    });
+
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) throw new Error("Project not found");
+
+    const total = Math.round(validatedItems.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+
+    // Nest schedule creation inside invoice.create so both are atomic in one DB round-trip
+    const invoice = await prisma.invoice.create({
+        data: {
+            code: "INV-TEMP",
+            projectId,
+            clientId: project.clientId,
+            status: "Draft",
+            totalAmount: total,
+            balanceDue: total,
+            payments: {
+                create: validatedItems.map((item) => ({
+                    name: item.name,
+                    amount: item.amount,
+                    status: "Pending",
+                    dueDate: item.dueDate ? new Date(item.dueDate) : null,
+                })),
+            },
+        },
+    });
+
+    const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
+    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
+
+    revalidatePath(`/projects/${projectId}/invoices`);
+    return { id: invoice.id, projectId };
+}
+
 export async function createInvoiceFromTimeEntries(projectId: string, timeEntryIds: string[]) {
     "use server";
     if (!timeEntryIds.length) throw new Error("No time entries selected");

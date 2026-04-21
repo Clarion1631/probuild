@@ -33,7 +33,7 @@ export default async function NewInvoicePage({ params }: { params: { id: string 
                     
                     <div>
                         <h1 className="text-2xl font-bold text-hui-textMain mb-2">Generate New Invoice</h1>
-                        <p className="text-hui-textMuted text-sm">Select an estimate to automatically generate an invoice with mapped line items from the estimate's payment schedule.</p>
+                        <p className="text-hui-textMuted text-sm">Generate an invoice from an existing estimate, or create a custom invoice with manual line items.</p>
                     </div>
 
                     <NewInvoiceClient project={project} estimates={estimates} />
