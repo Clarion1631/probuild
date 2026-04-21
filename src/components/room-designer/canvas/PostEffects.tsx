@@ -24,7 +24,7 @@ interface PostEffectsProps {
 export function PostEffects({ enabled }: PostEffectsProps) {
     if (!enabled) return null;
     return (
-        <EffectComposer multisampling={4}>
+        <EffectComposer multisampling={0}>
             <SSAO
                 radius={0.5}
                 intensity={1.2}

@@ -10,9 +10,9 @@ interface SelectionOutlineProps {
 
 export function SelectionOutline({ width, height, depth }: SelectionOutlineProps) {
     return (
-        <mesh>
+        <mesh renderOrder={999}>
             <boxGeometry args={[width * 1.02, height * 1.02, depth * 1.02]} />
-            <meshBasicMaterial color="#2f7dff" wireframe />
+            <meshBasicMaterial color="#2f7dff" wireframe depthTest={false} />
         </mesh>
     );
 }

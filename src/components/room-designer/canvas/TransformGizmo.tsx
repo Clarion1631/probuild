@@ -1,24 +1,18 @@
-// Stage 3: 3D transform gizmo that attaches to the currently-selected asset.
-// Uses drei's <TransformControls>. Three landmines addressed here:
-//
-//   (i) Imperative attach/detach — passing `object={ref.current}` as a JSX
-//       prop captures a one-render-stale snapshot and briefly targets the
-//       wrong asset. We call controls.attach(obj) in a useEffect instead.
-//
-//  (ii) Commit on mouseUp, not onObjectChange — onObjectChange fires at
-//       60fps during drag; each store write re-renders the AssetNode group
-//       and fights the gizmo's imperative transform → jitter. Read the
-//       final group transform on mouseUp and commit once.
-//
-// (iii) `dragging-changed` toggles OrbitControls enabled. Without this,
-//       dragging a gizmo arrow also rotates the camera.
-
 import { useEffect, useRef } from "react";
 import { TransformControls } from "@react-three/drei";
-import type { Group, Object3D } from "three";
+import type { Group, Object3D, Material, Mesh } from "three";
 import type { TransformControls as TransformControlsImpl } from "three-stdlib";
 import { useRoomStore, useSelectedAssetId } from "@/components/room-designer/hooks/useRoomStore";
 import { isLocked } from "@/lib/room-designer/asset-view";
+import { getAsset } from "@/lib/room-designer/asset-registry";
+import { resolveDimensions } from "@/lib/room-designer/asset-resolve";
+import {
+    snapToWall,
+    snapToAdjacent,
+    aabbOf,
+    type AABB,
+} from "@/components/room-designer/core/snap-utils";
+import type { SnapLine } from "@/components/room-designer/canvas/AssetGhost";
 import { useCanvasContext } from "./CanvasContext";
 
 export function TransformGizmo() {
@@ -28,16 +22,17 @@ export function TransformGizmo() {
     const toolMode = useRoomStore((s) => s.toolMode);
     const snapOn = useRoomStore((s) => s.snapToGrid);
     const gridSize = useRoomStore((s) => s.gridSize);
+    const walls = useRoomStore((s) => s.layout.walls);
     const updateAsset = useRoomStore((s) => s.updateAsset);
+    const setTransformSnapLines = useRoomStore((s) => s.setTransformSnapLines);
 
     const asset = primaryId ? assets.find((a) => a.id === primaryId) ?? null : null;
-    // Multi-select uses the alignment toolbar, not the gizmo.
     const active = selectionCount === 1 && asset !== null && !isLocked(asset);
 
     const { orbitRef, meshRefs } = useCanvasContext();
     const transformRef = useRef<TransformControlsImpl | null>(null);
 
-    // (i) Imperative attach/detach on selection change.
+    // Imperative attach/detach on selection change.
     useEffect(() => {
         const controls = transformRef.current;
         if (!controls) return;
@@ -48,12 +43,20 @@ export function TransformGizmo() {
         const obj = meshRefs.current.get(primaryId);
         if (obj) {
             controls.attach(obj as Object3D);
+            controls.traverse((child) => {
+                child.renderOrder = 9999;
+                const mesh = child as Mesh;
+                const mat = mesh.material as Material | undefined;
+                if (mat && "depthTest" in mat) {
+                    (mat as Material & { depthTest: boolean }).depthTest = false;
+                }
+            });
         } else {
             controls.detach();
         }
     }, [primaryId, active, meshRefs]);
 
-    // (iii) OrbitControls coupling.
+    // OrbitControls coupling — disable orbit while dragging gizmo.
     useEffect(() => {
         const controls = transformRef.current;
         if (!controls) return;
@@ -71,9 +74,6 @@ export function TransformGizmo() {
         };
     }, [orbitRef]);
 
-    // Reset mode on every render — TransformControls mode is an exposed prop.
-    // drei rebinds on the prop change. This is cheap.
-
     return (
         <TransformControls
             ref={(ref) => {
@@ -81,19 +81,74 @@ export function TransformGizmo() {
             }}
             mode={toolMode}
             translationSnap={snapOn ? gridSize : null}
-            rotationSnap={snapOn ? Math.PI / 12 : null} // 15°
+            rotationSnap={snapOn ? Math.PI / 12 : null}
             scaleSnap={snapOn ? 0.1 : null}
-            showX
-            showZ
-            showY={toolMode !== "translate"}
+            showX={toolMode !== "rotate"}
+            showZ={toolMode !== "rotate"}
+            showY={toolMode === "rotate"}
             onMouseUp={() => {
                 if (!primaryId || !asset) return;
                 const obj = meshRefs.current.get(primaryId) as Group | undefined;
                 if (!obj) return;
-                const y = toolMode === "translate" ? Math.max(0, obj.position.y) : asset.position.y;
+
+                let finalX = obj.position.x;
+                let finalZ = obj.position.z;
+                let finalY = toolMode === "translate" ? Math.max(0, obj.position.y) : asset.position.y;
+                let finalRotY = obj.rotation.y;
+
+                if (toolMode === "translate") {
+                    const registry = getAsset(asset.assetId);
+                    if (registry) {
+                        const dims = resolveDimensions(asset, registry);
+                        const snapLines: SnapLine[] = [];
+
+                        // Wall snap (snap-on-release: no feedback loop)
+                        const w = snapToWall(dims.depth, finalX, finalZ, walls);
+                        if (w.snapped) {
+                            finalX = w.x;
+                            finalZ = w.z;
+                            finalRotY = w.rotationY;
+                            snapLines.push({
+                                kind: "wall",
+                                from: [asset.position.x, 0.01, asset.position.z],
+                                to: [finalX, 0.01, finalZ],
+                            });
+                        }
+
+                        // Adjacent snap — exclude self
+                        const otherBoxes: AABB[] = [];
+                        for (const a of assets) {
+                            if (a.id === primaryId) continue;
+                            const box = aabbOf(a);
+                            if (box) otherBoxes.push(box);
+                        }
+                        const adj = snapToAdjacent(dims.width, dims.depth, finalX, finalZ, otherBoxes);
+                        if (adj.x !== finalX || adj.z !== finalZ) {
+                            snapLines.push({
+                                kind: "edge",
+                                from: [finalX, 0.01, finalZ],
+                                to: [adj.x, 0.01, adj.z],
+                            });
+                            finalX = adj.x;
+                            finalZ = adj.z;
+                        }
+
+                        // Flash snap indicators briefly, then clear
+                        if (snapLines.length > 0) {
+                            setTransformSnapLines(snapLines);
+                            setTimeout(() => setTransformSnapLines([]), 600);
+                        }
+
+                        // Apply snapped position back to the 3D object so it
+                        // visually jumps to the final position
+                        obj.position.set(finalX, finalY, finalZ);
+                        obj.rotation.y = finalRotY;
+                    }
+                }
+
                 updateAsset(primaryId, {
-                    position: { x: obj.position.x, y, z: obj.position.z },
-                    rotationY: obj.rotation.y,
+                    position: { x: finalX, y: finalY, z: finalZ },
+                    rotationY: finalRotY,
                     scale: { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z },
                 });
             }}

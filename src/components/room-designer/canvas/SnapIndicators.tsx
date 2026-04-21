@@ -11,6 +11,7 @@
 import { Line, Html } from "@react-three/drei";
 import type { GhostPose } from "./AssetGhost";
 import { fmtInches } from "@/lib/room-designer/units";
+import { useRoomStore } from "@/components/room-designer/hooks/useRoomStore";
 
 const COLOR: Record<string, string> = {
     grid: "#3b82f6",
@@ -52,6 +53,26 @@ export function SnapIndicators({ pose }: Props) {
                     </div>
                 </Html>
             )}
+        </group>
+    );
+}
+
+export function TransformSnapIndicators() {
+    const lines = useRoomStore((s) => s.transformSnapLines);
+    if (lines.length === 0) return null;
+
+    return (
+        <group>
+            {lines.map((line, i) => (
+                <Line
+                    key={i}
+                    points={[line.from, line.to]}
+                    color={COLOR[line.kind] ?? "#94a3b8"}
+                    lineWidth={1.8}
+                    transparent
+                    opacity={0.9}
+                />
+            ))}
         </group>
     );
 }

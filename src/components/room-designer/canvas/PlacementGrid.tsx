@@ -10,7 +10,7 @@ export function PlacementGrid() {
 
     return (
         <Grid
-            position={[0, 0.002, 0]}
+            position={[0, 0.005, 0]}
             args={[40, 40]}
             cellSize={gridSize}
             cellThickness={0.8}

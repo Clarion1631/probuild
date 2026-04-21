@@ -1,30 +1,19 @@
-// Stage 3: floating HTML toolbar that hovers above the currently-selected
-// asset. Uses drei's <Html> inside the AssetNode's group so it tracks the
-// asset position in screen space. Visible only for single-select.
-
 import { Html } from "@react-three/drei";
-import type { PlacedAsset, ToolMode } from "@/components/room-designer/types";
+import type { PlacedAsset } from "@/components/room-designer/types";
 import { useRoomStore } from "@/components/room-designer/hooks/useRoomStore";
 import { isLocked } from "@/lib/room-designer/asset-view";
 
 interface Props {
     asset: PlacedAsset;
-    topY: number; // local Y of the asset's top (height/2)
+    topY: number;
 }
-
-const MODES: Array<{ mode: ToolMode; label: string; short: string }> = [
-    { mode: "translate", label: "Move (1)", short: "Move" },
-    { mode: "rotate", label: "Rotate (2)", short: "Rotate" },
-    { mode: "scale", label: "Scale (3)", short: "Scale" },
-];
 
 function newDuplicateId(): string {
     return `temp-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export function FloatingAssetToolbar({ asset, topY }: Props) {
-    const toolMode = useRoomStore((s) => s.toolMode);
-    const setToolMode = useRoomStore((s) => s.setToolMode);
+    const updateAsset = useRoomStore((s) => s.updateAsset);
     const addAsset = useRoomStore((s) => s.addAsset);
     const setAssetLocked = useRoomStore((s) => s.setAssetLocked);
     const removeAsset = useRoomStore((s) => s.removeAsset);
@@ -32,6 +21,13 @@ export function FloatingAssetToolbar({ asset, topY }: Props) {
     const selectAsset = useRoomStore((s) => s.selectAsset);
 
     const locked = isLocked(asset);
+
+    const rotate90 = () => {
+        const TWO_PI = 2 * Math.PI;
+        updateAsset(asset.id, {
+            rotationY: ((asset.rotationY + Math.PI / 2) % TWO_PI + TWO_PI) % TWO_PI,
+        });
+    };
 
     const duplicate = () => {
         const dup: PlacedAsset = {
@@ -58,24 +54,16 @@ export function FloatingAssetToolbar({ asset, topY }: Props) {
                 onClick={(e) => e.stopPropagation()}
                 onPointerDown={(e) => e.stopPropagation()}
             >
-                {MODES.map((m) => (
-                    <button
-                        key={m.mode}
-                        type="button"
-                        title={m.label}
-                        disabled={locked}
-                        onClick={() => setToolMode(m.mode)}
-                        className={
-                            (toolMode === m.mode
-                                ? "bg-blue-500 text-white "
-                                : "bg-white text-slate-700 hover:bg-slate-100 ") +
-                            "rounded px-2 py-1 text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                        }
-                    >
-                        {m.short}
-                    </button>
-                ))}
-                <div className="mx-1 h-4 w-px bg-slate-200" />
+                <button
+                    type="button"
+                    title="Rotate 90° (R)"
+                    disabled={locked}
+                    onClick={rotate90}
+                    className="rounded px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                    Rotate 90°
+                </button>
+                <div className="mx-0.5 h-4 w-px bg-slate-200" />
                 <button
                     type="button"
                     title="Duplicate (Ctrl+D)"

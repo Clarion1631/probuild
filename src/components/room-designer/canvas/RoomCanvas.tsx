@@ -32,7 +32,7 @@ import { AssetGhost } from "./AssetGhost";
 import { CanvasContextProvider } from "./CanvasContext";
 import { TransformGizmo } from "./TransformGizmo";
 import { NavigationCube } from "./NavigationCube";
-import { SnapIndicators } from "./SnapIndicators";
+import { SnapIndicators, TransformSnapIndicators } from "./SnapIndicators";
 import { ClearanceOverlay } from "./ClearanceOverlay";
 import { WindowLights } from "./WindowLights";
 import { PostEffects } from "./PostEffects";
@@ -57,7 +57,7 @@ export function RoomCanvas() {
     return (
         <Canvas
             shadows
-            dpr={[1, 2]}
+            dpr={[1, 1.5]}
             gl={{
                 antialias: true,
                 preserveDrawingBuffer: true,
@@ -117,6 +117,7 @@ export function RoomCanvas() {
 
                 {/* Stage 3 canvas overlays */}
                 <TransformGizmo />
+                <TransformSnapIndicators />
                 <NavigationCube />
                 <ClearanceOverlay />
                 <MeasurementsOverlay />

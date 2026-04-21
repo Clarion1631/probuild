@@ -206,6 +206,8 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
                     ↷ Redo
                 </button>
 
+                <ToolModeIndicator />
+
                 <div className="mx-2 h-5 w-px bg-slate-200" />
 
                 <button
@@ -319,6 +321,25 @@ function timeAgo(ts: number): string {
     if (m < 60) return `${m}m ago`;
     const h = Math.floor(m / 60);
     return `${h}h ago`;
+}
+
+// ─────────────── Tool mode indicator ───────────────
+function ToolModeIndicator() {
+    const toolMode = useRoomStore((s) => s.toolMode);
+    const hasSelection = useRoomStore((s) => s.selectedAssetIds.length > 0);
+    if (!hasSelection) return null;
+
+    const labels: Record<string, string> = {
+        translate: "Move (1)",
+        rotate: "Rotate (2)",
+        scale: "Scale (3)",
+    };
+
+    return (
+        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">
+            {labels[toolMode] ?? toolMode}
+        </span>
+    );
 }
 
 // ─────────────── FX toggle (Stage 4 — SSAO + Bloom) ───────────────

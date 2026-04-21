@@ -18,6 +18,7 @@ import type { Asset } from "@/lib/room-designer/asset-registry";
 import { isLocked } from "@/lib/room-designer/asset-view";
 import { DEFAULT_PRESET, type HdriPreset } from "@/lib/room-designer/hdri-presets";
 import type * as THREE from "three";
+import type { SnapLine } from "@/components/room-designer/canvas/AssetGhost";
 
 /**
  * Non-serializable handles into the live R3F scene. Populated on Canvas mount
@@ -86,6 +87,7 @@ export interface RoomStoreState {
     snapToGrid: boolean;
     gridSize: number; // meters; default 0.1524 (6")
     focusPropertiesTick: number;
+    transformSnapLines: SnapLine[];
 
     // persistence
     dirty: boolean;
@@ -142,6 +144,7 @@ export interface RoomStoreState {
     setSnapToGrid: (v: boolean) => void;
     setGridSize: (m: number) => void;
     requestFocusProperties: () => void;
+    setTransformSnapLines: (lines: SnapLine[]) => void;
 
     // actions — history
     undo: () => void;
@@ -212,6 +215,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
     snapToGrid: true,
     gridSize: 0.1524, // 6 inches
     focusPropertiesTick: 0,
+    transformSnapLines: [],
 
     dirty: false,
     lastSavedAt: null,
@@ -322,11 +326,14 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
             };
         }),
 
-    // Single-select — overwrites any existing multi-selection.
     selectAsset: (id) =>
         set((s) =>
             id !== null
-                ? { selectedAssetIds: [id], activeSurface: null }
+                ? {
+                    selectedAssetIds: [id],
+                    activeSurface: null,
+                    toolMode: s.selectedAssetIds.length === 0 ? "translate" as ToolMode : s.toolMode,
+                }
                 : { selectedAssetIds: [], activeSurface: s.activeSurface },
         ),
 
@@ -429,6 +436,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
     setGridSize: (gridSize) => set({ gridSize }),
     requestFocusProperties: () =>
         set((s) => ({ focusPropertiesTick: s.focusPropertiesTick + 1 })),
+    setTransformSnapLines: (transformSnapLines) => set({ transformSnapLines }),
 
     // Undo/redo MUST mark dirty = true so the next autosave writes the new current position.
     // Treating undo as "back to clean state" is the common bug that lets the server retain
