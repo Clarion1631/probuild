@@ -2418,30 +2418,34 @@ export async function splitInvoiceMilestones(
 
     const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
 
-    // Replace only Pending milestones — preserve any already-Paid ones
-    await prisma.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
-
-    await prisma.paymentSchedule.createMany({
-        data: validated.map((m) => ({
-            invoiceId,
-            name: m.name,
-            amount: m.amount,
-            status: "Pending",
-            dueDate: m.dueDate ? new Date(m.dueDate) : null,
-        })),
-    });
-
     // Recalculate balanceDue: paid amount stays the same, only pending changes
     const paidAmount = Math.round(
         (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
     ) / 100;
     const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-    const newStatus = newBalance <= 0 ? "Paid" : invoice.status === "Draft" ? "Draft" : "Issued";
+    const newStatus =
+        newBalance <= 0 ? "Paid"
+        : invoice.status === "Draft" ? "Draft"
+        : invoice.status === "Overdue" ? "Overdue"
+        : "Issued";
 
-    await prisma.invoice.update({
-        where: { id: invoiceId },
-        data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
-    });
+    // Array-form transaction — atomic with pgbouncer, no interactive session needed
+    await prisma.$transaction([
+        prisma.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } }),
+        prisma.paymentSchedule.createMany({
+            data: validated.map((m) => ({
+                invoiceId,
+                name: m.name,
+                amount: m.amount,
+                status: "Pending",
+                dueDate: m.dueDate ? new Date(m.dueDate) : null,
+            })),
+        }),
+        prisma.invoice.update({
+            where: { id: invoiceId },
+            data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
+        }),
+    ]);
 
     revalidatePath(`/projects/${invoice.projectId}/invoices`);
     revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
