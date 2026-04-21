@@ -50,6 +50,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showPaymentModal, setShowPaymentModal] = useState(false);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
+    const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
     const [isAiFilling, setIsAiFilling] = useState(false);
     const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
     const [overwriteExisting, setOverwriteExisting] = useState(false);
@@ -430,7 +431,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
         return acc;
     }, 0);
-    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.088;
+    const taxRate = taxExempt ? 0 : (defaultTax ? defaultTax.rate / 100 : 0.088);
     const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
@@ -496,6 +497,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             termsAndConditions: termsAndConditions || null,
             signatureUrl: signatureUrl || null,
             targetMarginPercent: parseFloat(targetMargin) || 25,
+            taxExempt,
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -726,7 +728,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     }, 0);
                     const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
                     await saveEstimate(initialEstimate.id, context.id, context.type, {
-                        title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
+                        title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
                     }, mappedItems);
                     toast.success("Estimate auto-saved");
                     router.refresh();
@@ -1926,10 +1928,26 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         <span>Subtotal</span>
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
-                                    <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>{taxName}</span>
-                                        <span className="text-slate-800">{formatCurrency(tax)}</span>
-                                    </div>
+                                    {!taxExempt && (
+                                        <div className="flex justify-between text-slate-500 font-medium">
+                                            <span>{taxName}</span>
+                                            <span className="text-slate-800">{formatCurrency(tax)}</span>
+                                        </div>
+                                    )}
+                                    {viewMode === "internal" && (
+                                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                                            <input
+                                                type="checkbox"
+                                                id="taxExempt"
+                                                checked={taxExempt}
+                                                onChange={(e) => setTaxExempt(e.target.checked)}
+                                                className="accent-hui-primary"
+                                            />
+                                            <label htmlFor="taxExempt" className="cursor-pointer select-none">
+                                                Tax exempt (subcontractor / resale)
+                                            </label>
+                                        </div>
+                                    )}
                                     {/* Processing Fee Markup — hidden from client view by default */}
                                     {(viewMode === "internal" || !hideProcessingFee) && (
                                         <div className="flex justify-between items-center text-slate-500 font-medium">

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -23,6 +23,13 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [milestoneDueDate, setMilestoneDueDate] = useState<string>("");
     const [isAddingMilestone, setIsAddingMilestone] = useState(false);
     const [isUndoing, setIsUndoing] = useState<string | null>(null);
+
+    // Split payments state
+    type SplitRow = { id: number; name: string; amount: string };
+    let splitNextId = 1;
+    const [showSplit, setShowSplit] = useState(false);
+    const [splitRows, setSplitRows] = useState<SplitRow[]>([{ id: splitNextId++, name: "", amount: "" }]);
+    const [isSplitting, setIsSplitting] = useState(false);
 
     async function handleRecordPayment(paymentId: string) {
         setIsRecording(paymentId);
@@ -58,6 +65,25 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
             toast.error(e?.message || "Failed to add milestone");
         } finally {
             setIsAddingMilestone(false);
+        }
+    }
+
+    async function handleSplit() {
+        const valid = splitRows.filter((r) => r.name.trim() && parseFloat(r.amount) > 0);
+        if (!valid.length) return;
+        setIsSplitting(true);
+        try {
+            await splitInvoiceMilestones(
+                initialInvoice.id,
+                valid.map((r) => ({ name: r.name.trim(), amount: parseFloat(r.amount) })),
+            );
+            toast.success("Payment schedule updated");
+            setShowSplit(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to update payment schedule");
+        } finally {
+            setIsSplitting(false);
         }
     }
 
@@ -332,14 +358,81 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                     {paidCount} of {totalCount} paid
                                 </span>
                                 <button
-                                    onClick={() => setShowAddMilestone(v => !v)}
+                                    onClick={() => { setShowSplit(v => !v); setShowAddMilestone(false); }}
+                                    className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
+                                >
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+                                    {showSplit ? "Cancel" : "Split payments"}
+                                </button>
+                                <button
+                                    onClick={() => { setShowAddMilestone(v => !v); setShowSplit(false); }}
                                     className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
                                 >
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
-                                    {showAddMilestone ? "Cancel" : "Add Milestone"}
+                                    {showAddMilestone ? "Cancel" : "Add extra charge"}
                                 </button>
                             </div>
                         </div>
+                        {showSplit && (
+                            <div className="px-6 py-4 border-b border-hui-border bg-blue-50/40">
+                                <p className="text-xs text-hui-textMuted mb-3">
+                                    Define how the balance is split into payment installments. Replaces existing pending milestones and recalculates the invoice total.
+                                </p>
+                                <div className="space-y-2 mb-3">
+                                    <div className="grid grid-cols-[1fr_140px_32px] gap-2 px-1">
+                                        <span className="text-[11px] uppercase tracking-wide text-hui-textMuted">Description</span>
+                                        <span className="text-[11px] uppercase tracking-wide text-hui-textMuted">Amount</span>
+                                        <span />
+                                    </div>
+                                    {splitRows.map((row) => (
+                                        <div key={row.id} className="grid grid-cols-[1fr_140px_32px] gap-2 items-center">
+                                            <input
+                                                type="text"
+                                                placeholder="e.g. Deposit, Final Payment"
+                                                value={row.name}
+                                                onChange={(e) => setSplitRows(prev => prev.map(r => r.id === row.id ? { ...r, name: e.target.value } : r))}
+                                                className="hui-input text-sm"
+                                            />
+                                            <div className="relative">
+                                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-hui-textMuted text-sm">$</span>
+                                                <input
+                                                    type="number"
+                                                    min="0"
+                                                    step="0.01"
+                                                    placeholder="0.00"
+                                                    value={row.amount}
+                                                    onChange={(e) => setSplitRows(prev => prev.map(r => r.id === row.id ? { ...r, amount: e.target.value } : r))}
+                                                    className="hui-input text-sm pl-6 w-full"
+                                                />
+                                            </div>
+                                            <button
+                                                onClick={() => setSplitRows(prev => prev.filter(r => r.id !== row.id))}
+                                                disabled={splitRows.length === 1}
+                                                className="p-1 rounded text-hui-textMuted hover:text-red-500 hover:bg-red-50 disabled:opacity-30 transition"
+                                            >
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="flex items-center justify-between">
+                                    <button
+                                        onClick={() => setSplitRows(prev => [...prev, { id: Date.now(), name: "", amount: "" }])}
+                                        className="text-xs text-hui-primary hover:underline flex items-center gap-1"
+                                    >
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>
+                                        Add row
+                                    </button>
+                                    <button
+                                        onClick={handleSplit}
+                                        disabled={isSplitting || !splitRows.some(r => r.name.trim() && parseFloat(r.amount) > 0)}
+                                        className="hui-btn hui-btn-primary text-sm disabled:opacity-50"
+                                    >
+                                        {isSplitting ? "Saving..." : "Apply schedule"}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                         {showAddMilestone && (
                             <div className="px-6 py-4 border-b border-hui-border bg-amber-50/40">
                                 <div className="grid grid-cols-12 gap-3 items-end">

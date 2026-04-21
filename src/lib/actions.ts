@@ -1998,6 +1998,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
                 ...(data.memo !== undefined && { memo: data.memo }),
                 ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+                ...(data.taxExempt !== undefined && { taxExempt: !!data.taxExempt }),
             },
         });
     } catch {
@@ -2392,6 +2393,59 @@ export async function addInvoiceMilestone(
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
     revalidatePath(`/reports/open-invoices`);
+
+    return { success: true };
+}
+
+export async function splitInvoiceMilestones(
+    invoiceId: string,
+    milestones: { name: string; amount: number; dueDate?: string | null }[],
+) {
+    await assertInvoicePermission();
+
+    if (!milestones.length) throw new Error("At least one milestone is required");
+
+    const validated = milestones.map((m, i) => {
+        const name = (m.name || "").trim();
+        const amount = Math.round(Number(m.amount) * 100) / 100;
+        if (!name) throw new Error(`Milestone ${i + 1}: name is required`);
+        if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Milestone ${i + 1}: amount must be greater than zero`);
+        return { name, amount, dueDate: m.dueDate || null };
+    });
+
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+    if (!invoice) throw new Error("Invoice not found");
+
+    const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
+
+    // Replace only Pending milestones — preserve any already-Paid ones
+    await prisma.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
+
+    await prisma.paymentSchedule.createMany({
+        data: validated.map((m) => ({
+            invoiceId,
+            name: m.name,
+            amount: m.amount,
+            status: "Pending",
+            dueDate: m.dueDate ? new Date(m.dueDate) : null,
+        })),
+    });
+
+    // Recalculate balanceDue: paid amount stays the same, only pending changes
+    const paidAmount = Math.round(
+        (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
+    ) / 100;
+    const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
+    const newStatus = newBalance <= 0 ? "Paid" : invoice.status === "Draft" ? "Draft" : "Issued";
+
+    await prisma.invoice.update({
+        where: { id: invoiceId },
+        data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
+    });
+
+    revalidatePath(`/projects/${invoice.projectId}/invoices`);
+    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/invoices`);
 
     return { success: true };
 }

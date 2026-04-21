@@ -264,6 +264,7 @@ model Estimate {
   hideProcessingFee   Boolean   @default(true)
   expirationDate      DateTime?
   archivedAt          DateTime?
+  taxExempt           Boolean   @default(false)
 
   // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
   targetMarginPercent Float     @default(25)
