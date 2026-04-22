@@ -7,17 +7,27 @@ import { getPortalVisibility } from "@/lib/actions";
 import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
 import { resolveSessionClientId } from "@/lib/portal-auth";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
 
 export default async function PortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const params = await props.params;
     const projectId = params.id;
 
-    // IDOR-5 fix: gate by portal session's clientId
-    const sessionClientId = await resolveSessionClientId();
-    if (!sessionClientId) return notFound();
+    const staffSession = await getServerSession(authOptions);
+    const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
+
+    let projectWhere: any;
+    if (isStaff) {
+        projectWhere = { id: projectId };
+    } else {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return notFound();
+        projectWhere = { id: projectId, clientId: sessionClientId };
+    }
 
     const project = await prisma.project.findFirst({
-        where: { id: projectId, clientId: sessionClientId },
+        where: projectWhere,
         include: {
             client: true,
             estimates: {
@@ -84,7 +94,16 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
 
     return (
         <div className="max-w-5xl mx-auto py-8">
-            <PortalVisitTracker projectId={projectId} clientName={project.client?.name || "Client"} />
+            {!isStaff && <PortalVisitTracker projectId={projectId} clientName={project.client?.name || "Client"} />}
+            {isStaff && (
+                <div className="mb-4 px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800 flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                    </svg>
+                    Staff Preview — this is what the client sees
+                </div>
+            )}
             <div className="mb-6">
                 <Link href="/portal" className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm w-fit">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>

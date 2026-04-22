@@ -1931,19 +1931,44 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
 }
 
 export async function getInvoiceForPortal(id: string) {
-    // IDOR-3 fix: gate by portal session's clientId
-    const sessionClientId = await resolveSessionClientId();
-    if (!sessionClientId) return null;
+    const staffSession = await getServerSession(authOptions);
+    const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
+
+    if (!isStaff) {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
+
+        try {
+            const invoice = await prisma.invoice.findFirst({
+                where: {
+                    id,
+                    OR: [
+                        { clientId: sessionClientId },
+                        { project: { clientId: sessionClientId } },
+                    ],
+                },
+                include: {
+                    project: { include: { client: true } },
+                    client: true,
+                    payments: { orderBy: { createdAt: "asc" } },
+                },
+            });
+            if (!invoice) return null;
+            return {
+                ...invoice,
+                projectName: invoice.project?.name || null,
+                clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
+                clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
+            };
+        } catch (err) {
+            console.error("[getInvoiceForPortal] Query failed:", err);
+            return null;
+        }
+    }
 
     try {
         const invoice = await prisma.invoice.findFirst({
-            where: {
-                id,
-                OR: [
-                    { clientId: sessionClientId },
-                    { project: { clientId: sessionClientId } },
-                ],
-            },
+            where: { id },
             include: {
                 project: { include: { client: true } },
                 client: true,
