@@ -16,6 +16,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
+    const companyLicense = companySettings?.licenseNumber || "";
     const isPaid = initialInvoice.status === "Paid";
     const totalPaid = Number(initialInvoice.totalAmount || 0) - Number(initialInvoice.balanceDue || 0);
 
@@ -63,6 +64,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                 {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
                                 {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
                                 {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
+                                {companyLicense && <p className="text-sm text-slate-500">License # {companyLicense}</p>}
                             </div>
                             <div className="text-right">
                                 <h1 className="text-2xl font-bold text-slate-800 tracking-tight">INVOICE</h1>
@@ -201,7 +203,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     {/* Footer */}
                     <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
-                            This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
+                            This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`} {companyLicense && `License # ${companyLicense}.`}
                         </p>
                     </div>
                 </div>
