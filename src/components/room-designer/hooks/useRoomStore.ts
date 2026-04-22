@@ -58,6 +58,7 @@ export interface RoomStoreState {
     // UI
     viewMode: ViewMode;
     isDragging: boolean;
+    draggingAssetId: string | null;
 
     // Stage 3: transform gizmo mode ("translate" | "rotate" | "scale").
     toolMode: ToolMode;
@@ -131,6 +132,8 @@ export interface RoomStoreState {
     // actions — UI
     setViewMode: (mode: ViewMode) => void;
     setDragging: (isDragging: boolean) => void;
+    startDraggingAsset: (id: string) => void;
+    stopDraggingAsset: () => void;
     setToolMode: (m: ToolMode) => void;
     openContextMenu: (id: string, x: number, y: number) => void;
     closeContextMenu: () => void;
@@ -198,6 +201,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
 
     viewMode: "3d",
     isDragging: false,
+    draggingAssetId: null,
 
     toolMode: "translate",
     contextMenu: null,
@@ -422,6 +426,8 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
 
     setViewMode: (viewMode) => set({ viewMode }),
     setDragging: (isDragging) => set({ isDragging }),
+    startDraggingAsset: (id) => set({ draggingAssetId: id }),
+    stopDraggingAsset: () => set({ draggingAssetId: null }),
     setToolMode: (toolMode) => set({ toolMode }),
     openContextMenu: (id, x, y) => set({ contextMenu: { id, x, y } }),
     closeContextMenu: () => set({ contextMenu: null }),

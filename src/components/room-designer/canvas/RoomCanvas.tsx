@@ -31,6 +31,7 @@ import { PlacementPlane } from "./PlacementPlane";
 import { AssetGhost } from "./AssetGhost";
 import { CanvasContextProvider } from "./CanvasContext";
 import { TransformGizmo } from "./TransformGizmo";
+import { DragPlane } from "./DragPlane";
 import { NavigationCube } from "./NavigationCube";
 import { SnapIndicators, TransformSnapIndicators } from "./SnapIndicators";
 import { ClearanceOverlay } from "./ClearanceOverlay";
@@ -117,6 +118,7 @@ export function RoomCanvas() {
 
                 {/* Stage 3 canvas overlays */}
                 <TransformGizmo />
+                <DragPlane />
                 <TransformSnapIndicators />
                 <NavigationCube />
                 <ClearanceOverlay />

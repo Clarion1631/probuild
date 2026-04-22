@@ -28,7 +28,7 @@
 //   - FloatingAssetToolbar renders above the asset only for single-select.
 
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { useFrame } from "@react-three/fiber";
+import { useFrame, type ThreeEvent } from "@react-three/fiber";
 import { Text, useGLTF } from "@react-three/drei";
 import { Box3, Vector3, type Group, type Material, type Mesh } from "three";
 import type { PlacedAsset } from "@/components/room-designer/types";
@@ -44,7 +44,6 @@ import {
     useManifestReady,
 } from "@/lib/room-designer/asset-manifest";
 import { useRoomStore } from "@/components/room-designer/hooks/useRoomStore";
-import { SelectionOutline } from "./SelectionOutline";
 import { FloatingAssetToolbar } from "./FloatingAssetToolbar";
 import { useCanvasContext } from "./CanvasContext";
 
@@ -66,10 +65,12 @@ export function AssetNode({ asset, selected, isPrimary, onSelect }: AssetNodePro
     const [isFar, setIsFar] = useState(false);
     const frameCounter = useRef(0);
     const registry = getAsset(asset.assetId);
-    const { meshRefs } = useCanvasContext();
+    const { meshRefs, orbitRef } = useCanvasContext();
     const groupRef = useRef<Group | null>(null);
     const openContextMenu = useRoomStore((s) => s.openContextMenu);
     const requestFocusProperties = useRoomStore((s) => s.requestFocusProperties);
+    const toolMode = useRoomStore((s) => s.toolMode);
+    const startDraggingAsset = useRoomStore((s) => s.startDraggingAsset);
 
     // Subscribe to manifest readiness so the GLB branch can activate after
     // the Supabase fetch resolves. No-op once loaded.
@@ -155,6 +156,13 @@ export function AssetNode({ asset, selected, isPrimary, onSelect }: AssetNodePro
                 e.stopPropagation();
                 onSelect(asset.id, e.nativeEvent.shiftKey);
             }}
+            onPointerDown={(e: ThreeEvent<PointerEvent>) => {
+                if (!selected || locked || toolMode !== "translate") return;
+                e.stopPropagation();
+                const orbit = orbitRef.current;
+                if (orbit) orbit.enabled = false;
+                startDraggingAsset(asset.id);
+            }}
             onDoubleClick={(e) => {
                 e.stopPropagation();
                 onSelect(asset.id, false);
@@ -182,11 +190,13 @@ export function AssetNode({ asset, selected, isPrimary, onSelect }: AssetNodePro
                 <mesh castShadow={!isFar} receiveShadow>
                     <boxGeometry args={[width, height, depth]} />
                     <meshStandardMaterial
-                        color={color}
+                        color={selected ? "#60a5fa" : hovered ? "#93c5fd" : color}
                         roughness={0.6}
-                        metalness={0.05}
+                        metalness={selected ? 0.15 : 0.05}
                         transparent={locked}
                         opacity={locked ? 0.85 : 1}
+                        emissive={selected ? "#1d4ed8" : "#000000"}
+                        emissiveIntensity={selected ? 0.15 : 0}
                     />
                 </mesh>
             )}
@@ -204,8 +214,6 @@ export function AssetNode({ asset, selected, isPrimary, onSelect }: AssetNodePro
                     {locked ? `🔒 ${label}` : label}
                 </Text>
             )}
-
-            {selected && <SelectionOutline width={width} height={height} depth={depth} />}
 
             {selected && isPrimary && (
                 <FloatingAssetToolbar asset={asset} topY={height / 2} />
