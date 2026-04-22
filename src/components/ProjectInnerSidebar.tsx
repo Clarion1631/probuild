@@ -10,6 +10,8 @@ import { RoomDesignerNavContent } from "@/components/room-designer/RoomDesignerN
 
 interface ProjectInnerSidebarProps {
     projectId: string;
+    projectName?: string;
+    clientName?: string;
     lead?: { id: string; name: string } | null;
     availableLeads?: { id: string; name: string; stage: string; client: { name: string } | null }[];
     unreadMessageCount?: number;
@@ -22,7 +24,7 @@ type NavSection = {
     items: NavItem[];
 };
 
-export default function ProjectInnerSidebar({ projectId, lead, availableLeads = [], unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
+export default function ProjectInnerSidebar({ projectId, projectName, clientName, lead, availableLeads = [], unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
     const pathname = usePathname();
     const router = useRouter();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
@@ -182,6 +184,14 @@ export default function ProjectInnerSidebar({ projectId, lead, availableLeads = 
 
             {/* Expanded content */}
             {!sidebarCollapsed && !isRoomEditor && <>
+
+            {/* Project identity */}
+            {(projectName || clientName) && (
+                <div className="px-4 py-3 border-b border-hui-border bg-white shrink-0">
+                    {projectName && <p className="text-sm font-semibold text-hui-textMain truncate">{projectName}</p>}
+                    {clientName && <p className="text-xs text-slate-500 truncate">{clientName}</p>}
+                </div>
+            )}
 
             {/* Client Portal Link */}
             <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0">

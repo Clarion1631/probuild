@@ -41,14 +41,22 @@ export default async function ProjectLayout({
         }
     }
 
-    const lead = await getProjectLead(id);
-    const allLeads = await getLeadsForLinking();
-    const unreadCount = await getUnreadMessageCount(id, "TEAM");
+    const [lead, allLeads, unreadCount, project] = await Promise.all([
+        getProjectLead(id),
+        getLeadsForLinking(),
+        getUnreadMessageCount(id, "TEAM"),
+        prisma.project.findUnique({
+            where: { id },
+            select: { name: true, client: { select: { name: true } } },
+        }),
+    ]);
 
     return (
         <div className="flex h-full -mx-6 -my-6 bg-slate-50">
             <ProjectInnerSidebar
                 projectId={id}
+                projectName={project?.name}
+                clientName={project?.client?.name}
                 lead={lead ? { id: lead.id, name: lead.name } : null}
                 availableLeads={JSON.parse(JSON.stringify(allLeads))}
                 unreadMessageCount={unreadCount}
