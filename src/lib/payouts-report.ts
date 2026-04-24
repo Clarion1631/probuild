@@ -58,8 +58,8 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
             ? prisma.expense.findMany({
                 where: {
                     OR: [
-                        { date: { gte: filters.from, lte: filters.to } },
-                        { AND: [{ date: null }, { createdAt: { gte: filters.from, lte: filters.to } }] },
+                        { date: { gte: filters.from, lt: filters.to } },
+                        { AND: [{ date: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
                     // Expense → Project via estimate.projectId
                     ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
@@ -77,8 +77,8 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
                 where: {
                     status: { in: ["Sent", "Received"] },
                     OR: [
-                        { sentAt: { gte: filters.from, lte: filters.to } },
-                        { AND: [{ sentAt: null }, { createdAt: { gte: filters.from, lte: filters.to } }] },
+                        { sentAt: { gte: filters.from, lt: filters.to } },
+                        { AND: [{ sentAt: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
                     ...(filters.projectId ? { projectId: filters.projectId } : {}),
                 },

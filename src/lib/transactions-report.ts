@@ -64,8 +64,8 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
                 where: {
                     status: "Paid",
                     OR: [
-                        { paidAt: { gte: filters.from, lte: filters.to } },
-                        { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lte: filters.to } }] },
+                        { paidAt: { gte: filters.from, lt: filters.to } },
+                        { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lt: filters.to } }] },
                     ],
                     ...(filters.projectId ? { invoice: { projectId: filters.projectId } } : {}),
                 },
@@ -85,8 +85,8 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
             ? prisma.expense.findMany({
                 where: {
                     OR: [
-                        { date: { gte: filters.from, lte: filters.to } },
-                        { AND: [{ date: null }, { createdAt: { gte: filters.from, lte: filters.to } }] },
+                        { date: { gte: filters.from, lt: filters.to } },
+                        { AND: [{ date: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
                     ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
                 },
@@ -102,8 +102,8 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
                 where: {
                     status: { in: ["Sent", "Received"] },
                     OR: [
-                        { sentAt: { gte: filters.from, lte: filters.to } },
-                        { AND: [{ sentAt: null }, { createdAt: { gte: filters.from, lte: filters.to } }] },
+                        { sentAt: { gte: filters.from, lt: filters.to } },
+                        { AND: [{ sentAt: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
                     ...(filters.projectId ? { projectId: filters.projectId } : {}),
                 },

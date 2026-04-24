@@ -41,7 +41,7 @@ export function stringifyTimeBillingFilters(f: Partial<TimeBillingFilters>): str
 export async function queryTimeBillingData(filters: TimeBillingFilters) {
     return prisma.timeEntry.findMany({
         where: {
-            startTime: { gte: filters.from, lte: filters.to },
+            startTime: { gte: filters.from, lt: filters.to },
             ...(filters.userId ? { userId: filters.userId } : {}),
             ...(filters.projectId ? { projectId: filters.projectId } : {}),
         },

@@ -18,12 +18,12 @@ export function formatLocalDateString(d: Date): string {
     return `${y}-${m}-${day}`;
 }
 
-/** Current-month from/to as local start-of-day / end-of-day. */
+/** Current-month from/to: start-of-first-day and start-of-next-month (exclusive upper bound). */
 export function defaultMonthRange(): { from: Date; to: Date } {
     const now = new Date();
     return {
         from: new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0),
-        to: new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999),
+        to: new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0),
     };
 }
 
@@ -33,10 +33,11 @@ export function parseDateParam(s: string | undefined, fallback: Date): Date {
     return d ? new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0) : fallback;
 }
 
+/** Returns start of the NEXT day — use with Prisma `lt:` for a correct inclusive end-of-day bound. */
 export function parseDateParamEod(s: string | undefined, fallback: Date): Date {
     if (!s) return fallback;
     const d = parseLocalDateString(s);
-    return d ? new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999) : fallback;
+    return d ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0) : fallback;
 }
 
 export type SearchParamMap = Record<string, string | string[] | undefined>;

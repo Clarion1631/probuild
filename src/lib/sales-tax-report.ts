@@ -111,7 +111,7 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
         const invoicePayments = await prisma.paymentSchedule.findMany({
             where: {
                 status: "Paid",
-                paymentDate: { gte: filters.from, lte: filters.to },
+                paymentDate: { gte: filters.from, lt: filters.to },
                 ...(filters.methods ? { paymentMethod: { in: filters.methods } } : {}),
                 invoice: {
                     ...(filters.clientId ? { clientId: filters.clientId } : {}),
@@ -198,7 +198,7 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
         const estimatePayments = await prisma.estimatePaymentSchedule.findMany({
             where: {
                 status: "Paid",
-                paymentDate: { gte: filters.from, lte: filters.to },
+                paymentDate: { gte: filters.from, lt: filters.to },
                 ...(filters.methods ? { paymentMethod: { in: filters.methods } } : {}),
                 estimate: {
                     ...(filters.projectId ? { projectId: filters.projectId } : {}),
@@ -257,7 +257,7 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
         const invoices = await prisma.invoice.findMany({
             where: {
                 status: { not: "Draft" },
-                issueDate: { gte: filters.from, lte: filters.to },
+                issueDate: { gte: filters.from, lt: filters.to },
                 ...(filters.clientId ? { clientId: filters.clientId } : {}),
                 ...(filters.projectId ? { projectId: filters.projectId } : {}),
             },

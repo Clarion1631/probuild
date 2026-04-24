@@ -59,8 +59,8 @@ export async function queryPaymentsData(filters: PaymentsFilters): Promise<{
         where: {
             status: "Paid",
             OR: [
-                { paidAt: { gte: filters.from, lte: filters.to } },
-                { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lte: filters.to } }] },
+                { paidAt: { gte: filters.from, lt: filters.to } },
+                { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lt: filters.to } }] },
             ],
             ...(filters.methods.length ? { paymentMethod: { in: filters.methods } } : {}),
             invoice: {
