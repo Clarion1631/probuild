@@ -6,11 +6,18 @@ import { toNum } from "@/lib/prisma-helpers";
 
 export const maxDuration = 60;
 
-interface BackfillDetail {
+export interface BackfillDetail {
     sessionId: string;
     type: "invoice" | "estimate" | "unknown";
     id: string;
     action: "synced" | "skipped" | "no_metadata" | "not_found";
+    // Human-readable context
+    clientName?: string;
+    docCode?: string;
+    milestoneName?: string;
+    amount?: number;
+    paymentDate?: string;
+    paymentMethod?: string;
 }
 
 interface BackfillError {
@@ -54,13 +61,11 @@ export async function POST(req: Request) {
             page = await (stripe.checkout.sessions.list as any)({
                 status: "complete",
                 created: { gte: startTs, lte: endTs },
-                // Expand the nested payment_method so we read the actual method used, not the allowed set
                 expand: ["data.payment_intent", "data.payment_intent.payment_method"],
                 limit: 100,
                 ...(startingAfter ? { starting_after: startingAfter } : {}),
             });
         } catch (err: any) {
-            // Return partial results so the operator can see what ran before the Stripe error
             const processed = details.filter(d => d.action === "synced").length;
             const skipped = details.filter(d => d.action === "skipped").length;
             return NextResponse.json(
@@ -70,7 +75,7 @@ export async function POST(req: Request) {
         }
 
         if (page.has_more && page.data.length === 0) {
-            errors.push({ sessionId: "pagination", message: "Stripe returned has_more=true with empty page — aborting to avoid infinite loop" });
+            errors.push({ sessionId: "pagination", message: "Stripe returned has_more=true with empty page — aborting" });
             break;
         }
 
@@ -99,8 +104,6 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
     const metadata = session.metadata ?? {};
     const paymentDate = new Date(session.created * 1000);
 
-    // Read the actual payment method used (expanded payment_intent.payment_method),
-    // not payment_method_types which is only the allowed set for the session.
     let paymentMethod = "unknown";
     const pi = session.payment_intent;
     if (pi && typeof pi === "object") {
@@ -116,18 +119,32 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         const scheduleId = metadata.paymentScheduleId as string;
         const invoiceId = metadata.invoiceId as string;
 
-        // Look up by canonical ID first; only fall back to PI ID if no match
-        let existing = await prisma.paymentSchedule.findUnique({ where: { id: scheduleId } });
+        let existing = await prisma.paymentSchedule.findUnique({
+            where: { id: scheduleId },
+            include: { invoice: { include: { client: true } } },
+        });
         if (!existing && paymentIntentId) {
-            existing = await prisma.paymentSchedule.findFirst({ where: { stripePaymentIntentId: paymentIntentId } });
+            existing = await prisma.paymentSchedule.findFirst({
+                where: { stripePaymentIntentId: paymentIntentId },
+                include: { invoice: { include: { client: true } } },
+            });
         }
 
+        const context: Partial<BackfillDetail> = {
+            clientName: existing?.invoice?.client?.name ?? undefined,
+            docCode: existing?.invoice?.code ?? undefined,
+            milestoneName: existing?.name ?? undefined,
+            amount: existing ? toNum(existing.amount) : undefined,
+            paymentDate: paymentDate.toISOString(),
+            paymentMethod,
+        };
+
         if (!existing) {
-            details.push({ sessionId: session.id, type: "invoice", id: scheduleId, action: "not_found" });
+            details.push({ sessionId: session.id, type: "invoice", id: scheduleId, action: "not_found", ...context });
             return;
         }
         if (existing.status === "Paid") {
-            details.push({ sessionId: session.id, type: "invoice", id: scheduleId, action: "skipped" });
+            details.push({ sessionId: session.id, type: "invoice", id: existing.id, action: "skipped", ...context });
             return;
         }
 
@@ -135,14 +152,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
             await prisma.$transaction(async (t) => {
                 await t.paymentSchedule.update({
                     where: { id: existing!.id },
-                    data: {
-                        status: "Paid",
-                        stripeSessionId: session.id,
-                        stripePaymentIntentId: paymentIntentId,
-                        paymentMethod,
-                        paymentDate,
-                        paidAt: paymentDate,
-                    },
+                    data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
                 });
                 const siblings = await t.paymentSchedule.findMany({ where: { invoiceId } });
                 const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
@@ -154,7 +164,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
             });
         }
 
-        details.push({ sessionId: session.id, type: "invoice", id: scheduleId, action: "synced" });
+        details.push({ sessionId: session.id, type: "invoice", id: existing.id, action: "synced", ...context });
         return;
     }
 
@@ -163,17 +173,50 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         const scheduleId = metadata.estimatePaymentScheduleId as string;
         const estimateId = metadata.estimateId as string;
 
-        let existing = await prisma.estimatePaymentSchedule.findUnique({ where: { id: scheduleId } });
+        let existing = await prisma.estimatePaymentSchedule.findUnique({
+            where: { id: scheduleId },
+            include: {
+                estimate: {
+                    include: {
+                        project: { include: { client: true } },
+                        lead: { include: { client: true } },
+                    },
+                },
+            },
+        });
         if (!existing && paymentIntentId) {
-            existing = await prisma.estimatePaymentSchedule.findFirst({ where: { stripePaymentIntentId: paymentIntentId } });
+            existing = await prisma.estimatePaymentSchedule.findFirst({
+                where: { stripePaymentIntentId: paymentIntentId },
+                include: {
+                    estimate: {
+                        include: {
+                            project: { include: { client: true } },
+                            lead: { include: { client: true } },
+                        },
+                    },
+                },
+            });
         }
 
+        const clientName = existing?.estimate?.project?.client?.name
+            ?? existing?.estimate?.lead?.client?.name
+            ?? undefined;
+
+        const context: Partial<BackfillDetail> = {
+            clientName,
+            docCode: existing?.estimate?.code ?? undefined,
+            milestoneName: existing?.name ?? undefined,
+            amount: existing ? toNum(existing.amount) : undefined,
+            paymentDate: paymentDate.toISOString(),
+            paymentMethod,
+        };
+
         if (!existing) {
-            details.push({ sessionId: session.id, type: "estimate", id: scheduleId, action: "not_found" });
+            details.push({ sessionId: session.id, type: "estimate", id: scheduleId, action: "not_found", ...context });
             return;
         }
         if (existing.status === "Paid") {
-            details.push({ sessionId: session.id, type: "estimate", id: scheduleId, action: "skipped" });
+            details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "skipped", ...context });
             return;
         }
 
@@ -181,14 +224,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
             await prisma.$transaction(async (t) => {
                 await t.estimatePaymentSchedule.update({
                     where: { id: existing!.id },
-                    data: {
-                        status: "Paid",
-                        stripeSessionId: session.id,
-                        stripePaymentIntentId: paymentIntentId,
-                        paymentMethod,
-                        paymentDate,
-                        paidAt: paymentDate,
-                    },
+                    data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
                 });
                 const siblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId } });
                 const estimate = await t.estimate.findUnique({ where: { id: estimateId } });
@@ -199,7 +235,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
             });
         }
 
-        details.push({ sessionId: session.id, type: "estimate", id: scheduleId, action: "synced" });
+        details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "synced", ...context });
         return;
     }
 

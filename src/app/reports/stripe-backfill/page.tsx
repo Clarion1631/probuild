@@ -7,6 +7,12 @@ interface BackfillDetail {
     type: "invoice" | "estimate" | "unknown";
     id: string;
     action: "synced" | "skipped" | "no_metadata" | "not_found";
+    clientName?: string;
+    docCode?: string;
+    milestoneName?: string;
+    amount?: number;
+    paymentDate?: string;
+    paymentMethod?: string;
 }
 
 interface BackfillError {
@@ -22,10 +28,10 @@ interface BackfillResult {
 }
 
 const ACTION_LABEL: Record<string, string> = {
-    synced: "Synced",
+    synced: "Will sync",
     skipped: "Already paid",
-    not_found: "Not found in DB",
-    no_metadata: "No ProBuild metadata",
+    not_found: "Not found",
+    no_metadata: "No metadata",
 };
 
 const ACTION_COLOR: Record<string, string> = {
@@ -37,6 +43,23 @@ const ACTION_COLOR: Record<string, string> = {
 
 function toLocalDate(d: Date) {
     return d.toISOString().slice(0, 10);
+}
+
+function formatCurrency(n?: number) {
+    if (n == null) return "—";
+    return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatDate(iso?: string) {
+    if (!iso) return "—";
+    return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatMethod(m?: string) {
+    if (!m || m === "unknown") return "—";
+    if (m === "ach") return "ACH";
+    if (m === "card") return "Card";
+    return m;
 }
 
 export default function StripeBackfillPage() {
@@ -63,6 +86,8 @@ export default function StripeBackfillPage() {
             const data = await res.json();
             if (!res.ok) {
                 setApiError(data.error ?? "Unknown error");
+                // Show partial results if the API returned them alongside the error
+                if (data.details) setResult(data);
             } else {
                 setResult(data);
             }
@@ -74,9 +99,10 @@ export default function StripeBackfillPage() {
     }
 
     const visibleDetails = result?.details.filter(d => d.action !== "no_metadata") ?? [];
+    const noMetadataCount = result?.details.filter(d => d.action === "no_metadata").length ?? 0;
 
     return (
-        <div className="max-w-3xl mx-auto py-8 px-6 space-y-8">
+        <div className="max-w-5xl mx-auto py-8 px-6 space-y-8">
             <div>
                 <h1 className="text-2xl font-bold text-hui-textMain">Stripe Payment Sync</h1>
                 <p className="text-hui-textMuted text-sm mt-1">
@@ -175,23 +201,40 @@ export default function StripeBackfillPage() {
                     {/* Detail table */}
                     {visibleDetails.length > 0 && (
                         <div className="hui-card overflow-hidden">
-                            <table className="w-full text-xs">
+                            <table className="w-full text-sm">
                                 <thead className="bg-slate-50 border-b border-hui-border">
                                     <tr>
-                                        <th className="text-left px-4 py-2.5 font-medium text-hui-textMuted">Session ID</th>
-                                        <th className="text-left px-4 py-2.5 font-medium text-hui-textMuted">Type</th>
-                                        <th className="text-left px-4 py-2.5 font-medium text-hui-textMuted">Schedule ID</th>
-                                        <th className="text-left px-4 py-2.5 font-medium text-hui-textMuted">Status</th>
+                                        <th className="text-left px-4 py-3 font-medium text-hui-textMuted">Client</th>
+                                        <th className="text-left px-4 py-3 font-medium text-hui-textMuted">Document</th>
+                                        <th className="text-left px-4 py-3 font-medium text-hui-textMuted">Milestone</th>
+                                        <th className="text-right px-4 py-3 font-medium text-hui-textMuted">Amount</th>
+                                        <th className="text-left px-4 py-3 font-medium text-hui-textMuted">Date</th>
+                                        <th className="text-left px-4 py-3 font-medium text-hui-textMuted">Method</th>
+                                        <th className="text-left px-4 py-3 font-medium text-hui-textMuted">Status</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-hui-border">
                                     {visibleDetails.map((d, i) => (
                                         <tr key={i} className="hover:bg-slate-50">
-                                            <td className="px-4 py-2 font-mono text-slate-500 truncate max-w-[160px]">{d.sessionId}</td>
-                                            <td className="px-4 py-2 capitalize text-hui-textMain">{d.type}</td>
-                                            <td className="px-4 py-2 font-mono text-slate-500 truncate max-w-[160px]">{d.id}</td>
-                                            <td className="px-4 py-2">
-                                                <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-medium ${ACTION_COLOR[d.action] ?? ""}`}>
+                                            <td className="px-4 py-3 font-medium text-hui-textMain">
+                                                {d.clientName ?? <span className="text-hui-textMuted italic">Unknown</span>}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted">
+                                                <span className="capitalize text-xs font-medium text-hui-textMuted mr-1">{d.type}</span>
+                                                {d.docCode ?? "—"}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted">{d.milestoneName ?? "—"}</td>
+                                            <td className="px-4 py-3 text-right font-medium text-hui-textMain tabular-nums">
+                                                {formatCurrency(d.amount)}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted whitespace-nowrap">
+                                                {formatDate(d.paymentDate)}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted">
+                                                {formatMethod(d.paymentMethod)}
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${ACTION_COLOR[d.action] ?? ""}`}>
                                                     {ACTION_LABEL[d.action] ?? d.action}
                                                 </span>
                                             </td>
@@ -199,9 +242,9 @@ export default function StripeBackfillPage() {
                                     ))}
                                 </tbody>
                             </table>
-                            {result.details.filter(d => d.action === "no_metadata").length > 0 && (
+                            {noMetadataCount > 0 && (
                                 <p className="text-xs text-hui-textMuted px-4 py-2 border-t border-hui-border">
-                                    {result.details.filter(d => d.action === "no_metadata").length} Stripe sessions had no ProBuild metadata and were skipped.
+                                    {noMetadataCount} Stripe session{noMetadataCount !== 1 ? "s" : ""} had no ProBuild metadata and were skipped.
                                 </p>
                             )}
                         </div>
