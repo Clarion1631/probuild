@@ -31,6 +31,11 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
     }
 
+    // Live writes restricted to ADMIN only
+    if (!dryRun && user.role !== "ADMIN") {
+        return NextResponse.json({ error: "Live backfill requires ADMIN role" }, { status: 403 });
+    }
+
     const startTs = Math.floor(new Date(startDate).getTime() / 1000);
     const endTs = Math.floor(new Date(endDate).getTime() / 1000);
     if (isNaN(startTs) || isNaN(endTs) || startTs >= endTs) {
@@ -40,7 +45,6 @@ export async function POST(req: Request) {
     const details: BackfillDetail[] = [];
     const errors: BackfillError[] = [];
 
-    // Paginate through all paid checkout sessions in the date range
     let startingAfter: string | undefined;
     let hasMore = true;
 
@@ -50,12 +54,24 @@ export async function POST(req: Request) {
             page = await (stripe.checkout.sessions.list as any)({
                 status: "complete",
                 created: { gte: startTs, lte: endTs },
-                expand: ["data.payment_intent"],
+                // Expand the nested payment_method so we read the actual method used, not the allowed set
+                expand: ["data.payment_intent", "data.payment_intent.payment_method"],
                 limit: 100,
                 ...(startingAfter ? { starting_after: startingAfter } : {}),
             });
         } catch (err: any) {
-            return NextResponse.json({ error: `Stripe API error: ${err.message}` }, { status: 500 });
+            // Return partial results so the operator can see what ran before the Stripe error
+            const processed = details.filter(d => d.action === "synced").length;
+            const skipped = details.filter(d => d.action === "skipped").length;
+            return NextResponse.json(
+                { error: `Stripe API error: ${err.message}`, processed, skipped, errors, details },
+                { status: 500 }
+            );
+        }
+
+        if (page.has_more && page.data.length === 0) {
+            errors.push({ sessionId: "pagination", message: "Stripe returned has_more=true with empty page — aborting to avoid infinite loop" });
+            break;
         }
 
         for (const session of page.data as any[]) {
@@ -83,25 +99,28 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
     const metadata = session.metadata ?? {};
     const paymentDate = new Date(session.created * 1000);
 
-    // Detect payment method from the expanded payment intent
+    // Read the actual payment method used (expanded payment_intent.payment_method),
+    // not payment_method_types which is only the allowed set for the session.
     let paymentMethod = "unknown";
     const pi = session.payment_intent;
     if (pi && typeof pi === "object") {
-        const pmType = pi.payment_method_types?.[0];
+        const pmType: string | undefined = pi.payment_method?.type;
         if (pmType === "us_bank_account") paymentMethod = "ach";
         else if (pmType === "card") paymentMethod = "card";
         else if (pmType) paymentMethod = pmType;
     }
-    const paymentIntentId = typeof pi === "string" ? pi : pi?.id ?? null;
+    const paymentIntentId: string | null = typeof pi === "string" ? pi : pi?.id ?? null;
 
     // ── Invoice branch ────────────────────────────────────────────────────────
     if (metadata.paymentScheduleId && metadata.invoiceId) {
         const scheduleId = metadata.paymentScheduleId as string;
         const invoiceId = metadata.invoiceId as string;
 
-        const existing = await prisma.paymentSchedule.findFirst({
-            where: { OR: [{ id: scheduleId }, ...(paymentIntentId ? [{ stripePaymentIntentId: paymentIntentId }] : [])] },
-        });
+        // Look up by canonical ID first; only fall back to PI ID if no match
+        let existing = await prisma.paymentSchedule.findUnique({ where: { id: scheduleId } });
+        if (!existing && paymentIntentId) {
+            existing = await prisma.paymentSchedule.findFirst({ where: { stripePaymentIntentId: paymentIntentId } });
+        }
 
         if (!existing) {
             details.push({ sessionId: session.id, type: "invoice", id: scheduleId, action: "not_found" });
@@ -115,7 +134,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         if (!dryRun) {
             await prisma.$transaction(async (t) => {
                 await t.paymentSchedule.update({
-                    where: { id: existing.id },
+                    where: { id: existing!.id },
                     data: {
                         status: "Paid",
                         stripeSessionId: session.id,
@@ -144,9 +163,10 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         const scheduleId = metadata.estimatePaymentScheduleId as string;
         const estimateId = metadata.estimateId as string;
 
-        const existing = await prisma.estimatePaymentSchedule.findFirst({
-            where: { OR: [{ id: scheduleId }, ...(paymentIntentId ? [{ stripePaymentIntentId: paymentIntentId }] : [])] },
-        });
+        let existing = await prisma.estimatePaymentSchedule.findUnique({ where: { id: scheduleId } });
+        if (!existing && paymentIntentId) {
+            existing = await prisma.estimatePaymentSchedule.findFirst({ where: { stripePaymentIntentId: paymentIntentId } });
+        }
 
         if (!existing) {
             details.push({ sessionId: session.id, type: "estimate", id: scheduleId, action: "not_found" });
@@ -160,7 +180,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         if (!dryRun) {
             await prisma.$transaction(async (t) => {
                 await t.estimatePaymentSchedule.update({
-                    where: { id: existing.id },
+                    where: { id: existing!.id },
                     data: {
                         status: "Paid",
                         stripeSessionId: session.id,
@@ -183,6 +203,5 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         return;
     }
 
-    // No recognizable metadata
     details.push({ sessionId: session.id, type: "unknown", id: session.id, action: "no_metadata" });
 }
