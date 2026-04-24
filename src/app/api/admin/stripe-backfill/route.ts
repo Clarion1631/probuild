@@ -48,7 +48,7 @@ export async function POST(req: Request) {
         let page: any;
         try {
             page = await (stripe.checkout.sessions.list as any)({
-                payment_status: "paid",
+                status: "complete",
                 created: { gte: startTs, lte: endTs },
                 expand: ["data.payment_intent"],
                 limit: 100,
@@ -59,6 +59,7 @@ export async function POST(req: Request) {
         }
 
         for (const session of page.data as any[]) {
+            if (session.payment_status !== "paid") continue;
             try {
                 await processSession(session, dryRun, details);
             } catch (err: any) {
