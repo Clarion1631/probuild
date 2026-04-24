@@ -2196,6 +2196,36 @@ export async function archiveEstimate(estimateId: string) {
     return { success: true, archived };
 }
 
+// Returns the default sales tax rate (percent, e.g. 8.8) from CompanySettings.
+// Returns 0 if no default is configured. Safe to call often — the singleton row is tiny.
+async function getDefaultSalesTaxRate(): Promise<number> {
+    const settings = await prisma.companySettings.findUnique({
+        where: { id: "singleton" },
+        select: { salesTaxes: true },
+    });
+    if (!settings?.salesTaxes) return 0;
+    try {
+        const taxes = JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number; isDefault?: boolean }>;
+        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
+        const def = taxes.find(t => t.isDefault) || taxes[0];
+        return typeof def.rate === "number" ? def.rate : 0;
+    } catch {
+        return 0;
+    }
+}
+
+// Reverse-out tax from a total (total = subtotal + subtotal * rate/100).
+// If exempt or rate <= 0, the whole amount is subtotal and taxAmount is 0.
+function deriveInvoiceTaxFields(totalAmount: number, ratePercent: number, isExempt: boolean) {
+    if (isExempt || ratePercent <= 0) {
+        return { subtotal: totalAmount, taxRate: 0, taxAmount: 0 };
+    }
+    const factor = ratePercent / (100 + ratePercent);
+    const taxAmount = Math.round(totalAmount * factor * 100) / 100;
+    const subtotal = Math.round((totalAmount - taxAmount) * 100) / 100;
+    return { subtotal, taxRate: ratePercent, taxAmount };
+}
+
 export async function createInvoiceFromEstimate(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
@@ -2203,14 +2233,21 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
     if (!project) throw new Error("Project not found");
 
+    const total = toNum(estimate.totalAmount || 0);
+    const rate = await getDefaultSalesTaxRate();
+    const tax = deriveInvoiceTaxFields(total, rate, !!estimate.taxExempt);
+
     const invoice = await prisma.invoice.create({
         data: {
             code: "INV-TEMP",
             projectId: estimate.projectId!,
             clientId: project.clientId,
             status: "Draft",
-            totalAmount: estimate.totalAmount || 0,
-            balanceDue: estimate.totalAmount || 0,
+            totalAmount: total,
+            balanceDue: total,
+            subtotal: tax.subtotal,
+            taxRate: tax.taxRate,
+            taxAmount: tax.taxAmount,
         },
     });
 
@@ -2270,6 +2307,8 @@ export async function createOneOffInvoice(
     if (!project) throw new Error("Project not found");
 
     const total = Math.round(validatedItems.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+    const rate = await getDefaultSalesTaxRate();
+    const tax = deriveInvoiceTaxFields(total, rate, false);
 
     // Nest schedule creation inside invoice.create so both are atomic in one DB round-trip
     const invoice = await prisma.invoice.create({
@@ -2280,6 +2319,9 @@ export async function createOneOffInvoice(
             status: "Draft",
             totalAmount: total,
             balanceDue: total,
+            subtotal: tax.subtotal,
+            taxRate: tax.taxRate,
+            taxAmount: tax.taxAmount,
             payments: {
                 create: validatedItems.map((item) => ({
                     name: item.name,
@@ -2313,6 +2355,8 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
     if (!entries.length) throw new Error("No matching time entries found");
 
     const totalAmount = entries.reduce((sum, e) => sum + (Number(e.laborCost) || 0), 0);
+    const rate = await getDefaultSalesTaxRate();
+    const tax = deriveInvoiceTaxFields(totalAmount, rate, false);
 
     const invoice = await prisma.invoice.create({
         data: {
@@ -2322,6 +2366,9 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
             status: "Draft",
             totalAmount,
             balanceDue: totalAmount,
+            subtotal: tax.subtotal,
+            taxRate: tax.taxRate,
+            taxAmount: tax.taxAmount,
         },
     });
 
@@ -2367,32 +2414,220 @@ export async function getInvoice(id: string) {
     return invoice;
 }
 
-export async function recordPayment(paymentId: string, invoiceId: string, timestamp: number) {
+/** Parse a payment-date input into a Date.
+ *  Accepts:
+ *   - `YYYY-MM-DD` (strict — end-anchored, rejects overflow) → interpreted as LOCAL midnight
+ *     so the stored value matches the calendar day the user typed.
+ *   - A positive epoch-ms number → treated as an absolute instant.
+ *   - An ISO-8601 datetime with a time component → `new Date()` (UTC semantics).
+ *  Rejects: empty strings, 0/negative numbers, non-strict YYYY-M-D-ish shapes. */
+function parsePaymentDateInput(input: number | string): Date | null {
+    if (typeof input === "number") {
+        if (!Number.isFinite(input) || input <= 0) return null;
+        const d = new Date(input);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    if (typeof input !== "string" || input.trim() === "") return null;
+    // Strict YYYY-MM-DD → local midnight (primary path from the date picker).
+    const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
+    if (ymd) {
+        const y = Number(ymd[1]);
+        const mo = Number(ymd[2]);
+        const d = Number(ymd[3]);
+        if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+        const dt = new Date(y, mo - 1, d);
+        if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+        return dt;
+    }
+    // Accept full ISO datetimes (e.g. "2026-04-20T14:30:00Z") for API callers that pass them.
+    const dt = new Date(input);
+    return isNaN(dt.getTime()) ? null : dt;
+}
+
+export async function recordPayment(
+    paymentId: string,
+    invoiceId: string,
+    input: {
+        paymentDate: number | string;
+        method: "check" | "cash";
+        referenceNumber?: string | null;
+        notes?: string | null;
+    },
+) {
+    await assertInvoicePermission();
+
+    const method = input.method;
+    if (method !== "check" && method !== "cash") {
+        return { success: false, error: "Payment method must be 'check' or 'cash'" as const };
+    }
+    const referenceNumber = (input.referenceNumber || "").trim() || null;
+    if (method === "check" && !referenceNumber) {
+        return { success: false, error: "Check number is required" as const };
+    }
+    const notes = (input.notes || "").trim() || null;
+    const paymentDate = parsePaymentDateInput(input.paymentDate);
+    if (!paymentDate) {
+        return { success: false, error: "Invalid payment date" as const };
+    }
+
     const payment = await prisma.paymentSchedule.findUnique({ where: { id: paymentId } });
-    if (!payment || payment.status === "Paid") return { success: false };
+    if (!payment) return { success: false, error: "Milestone not found" as const };
+    if (payment.status === "Paid") return { success: false, error: "Milestone already paid" as const };
+    if (payment.invoiceId !== invoiceId) return { success: false, error: "Milestone/invoice mismatch" as const };
 
     await prisma.paymentSchedule.update({
         where: { id: paymentId },
         data: {
             status: "Paid",
-            paymentDate: new Date(timestamp),
+            paymentDate,
+            paidAt: new Date(),
+            paymentMethod: method,
+            referenceNumber,
+            notes,
         },
     });
 
+    // Recalculate from scratch (matches Stripe webhook) to avoid drift.
     const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    const newBalance = Math.max(0, toNum(invoice!.balanceDue) - toNum(payment.amount));
-    const newStatus = newBalance <= 0 ? "Paid" : "Partially Paid";
+    if (!invoice) return { success: false, error: "Invoice not found" as const };
+
+    const allSchedules = await prisma.paymentSchedule.findMany({ where: { invoiceId } });
+    const totalPaid = allSchedules
+        .filter((s) => s.status === "Paid")
+        .reduce((sum, s) => sum + toNum(s.amount), 0);
+    const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+    const newStatus =
+        newBalance <= 0 ? "Paid"
+        : totalPaid > 0 ? "Partially Paid"
+        : invoice.status;
 
     await prisma.invoice.update({
         where: { id: invoiceId },
         data: { balanceDue: newBalance, status: newStatus },
     });
 
-    revalidatePath(`/projects/${invoice!.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice!.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/projects/${invoice.projectId}/invoices`);
+    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/open-invoices`);
+    revalidatePath(`/reports/sales-tax`);
 
     return { success: true };
+}
+
+export async function recordEstimatePayment(
+    paymentId: string,
+    estimateId: string,
+    input: {
+        paymentDate: number | string;
+        method: "check" | "cash";
+        referenceNumber?: string | null;
+        notes?: string | null;
+    },
+) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+
+    const method = input.method;
+    if (method !== "check" && method !== "cash") {
+        return { success: false, error: "Payment method must be 'check' or 'cash'" as const };
+    }
+    const referenceNumber = (input.referenceNumber || "").trim() || null;
+    if (method === "check" && !referenceNumber) {
+        return { success: false, error: "Check number is required" as const };
+    }
+    const notes = (input.notes || "").trim() || null;
+    const paymentDate = parsePaymentDateInput(input.paymentDate);
+    if (!paymentDate) {
+        return { success: false, error: "Invalid payment date" as const };
+    }
+
+    const payment = await prisma.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
+    if (!payment) return { success: false, error: "Milestone not found" as const };
+    if (payment.status === "Paid") return { success: false, error: "Milestone already paid" as const };
+    if (payment.estimateId !== estimateId) return { success: false, error: "Milestone/estimate mismatch" as const };
+
+    await prisma.estimatePaymentSchedule.update({
+        where: { id: paymentId },
+        data: {
+            status: "Paid",
+            paymentDate,
+            paidAt: new Date(),
+            paymentMethod: method,
+            referenceNumber,
+            notes,
+        },
+    });
+
+    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    if (!estimate) return { success: false, error: "Estimate not found" as const };
+
+    const allSchedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+    const totalPaid = allSchedules
+        .filter((s) => s.status === "Paid")
+        .reduce((sum, s) => sum + toNum(s.amount), 0);
+    const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+
+    await prisma.estimate.update({
+        where: { id: estimateId },
+        data: { balanceDue: newBalance },
+    });
+
+    if (estimate.projectId) {
+        revalidatePath(`/projects/${estimate.projectId}/estimates`);
+        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+    }
+    if (estimate.leadId) {
+        revalidatePath(`/leads/${estimate.leadId}/estimates`);
+        revalidatePath(`/leads/${estimate.leadId}/estimates/${estimateId}`);
+    }
+    revalidatePath(`/estimates`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/sales-tax`);
+
+    return { success: true };
+}
+
+export async function sendPaymentReceipt(paymentScheduleId: string) {
+    await assertInvoicePermission();
+    const { sendInvoicePaymentReceiptOnly } = await import("./payment-notifications");
+    const result = await sendInvoicePaymentReceiptOnly(paymentScheduleId);
+
+    if (result.success) {
+        const schedule = await prisma.paymentSchedule.findUnique({
+            where: { id: paymentScheduleId },
+            include: { invoice: true },
+        });
+        if (schedule?.invoice) {
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+        }
+    }
+    return result;
+}
+
+export async function sendEstimatePaymentReceipt(paymentScheduleId: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+
+    const { sendEstimatePaymentReceiptOnly } = await import("./payment-notifications");
+    const result = await sendEstimatePaymentReceiptOnly(paymentScheduleId);
+
+    if (result.success) {
+        const schedule = await prisma.estimatePaymentSchedule.findUnique({
+            where: { id: paymentScheduleId },
+            include: { estimate: true },
+        });
+        if (schedule?.estimate?.projectId) {
+            revalidatePath(`/projects/${schedule.estimate.projectId}/estimates/${schedule.estimateId}`);
+        }
+        if (schedule?.estimate?.leadId) {
+            revalidatePath(`/leads/${schedule.estimate.leadId}/estimates/${schedule.estimateId}`);
+        }
+    }
+    return result;
 }
 
 async function assertInvoicePermission() {

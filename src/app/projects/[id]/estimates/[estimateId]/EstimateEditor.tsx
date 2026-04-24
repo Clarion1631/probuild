@@ -4,13 +4,28 @@
 const rm = (n: number) => Math.round(n * 100) / 100;
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
 import SendEstimateModal from "@/components/SendEstimateModal";
 import SelectVendorModal from "./SelectVendorModal";
 import LogPaymentModal from "./LogPaymentModal";
+import RecordPaymentModal from "@/components/RecordPaymentModal";
+
+const EST_METHOD_LABELS: Record<string, string> = {
+    card: "Card",
+    ach: "ACH",
+    check: "Check",
+    cash: "Cash",
+};
+function formatEstPaymentMethod(method: string | null | undefined, ref: string | null | undefined): string {
+    if (!method) return "";
+    const label = EST_METHOD_LABELS[method] ?? method.toUpperCase();
+    if (method === "check" && ref) return `Check #${ref}`;
+    if (ref) return `${label} · ${ref}`;
+    return label;
+}
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import ReusableSignaturePad from "@/components/ReusableSignaturePad";
@@ -48,6 +63,9 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [isCreatingPO, setIsCreatingPO] = useState(false);
     const [isSyncingQB, setIsSyncingQB] = useState(false);
     const [showPaymentModal, setShowPaymentModal] = useState(false);
+    const [recordingEstPayment, setRecordingEstPayment] = useState<{ id: string; name: string; amount: number } | null>(null);
+    const [isSendingEstReceipt, setIsSendingEstReceipt] = useState<string | null>(null);
+    const savedScheduleIds = useMemo(() => new Set((initialEstimate.paymentSchedules || []).map((s: any) => s.id)), [initialEstimate.paymentSchedules]);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
@@ -1876,6 +1894,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     {paymentSchedules.map((schedule, index) => {
                                         const isPaid = schedule.status === "Paid";
                                         const paidOn = schedule.paidAt || schedule.paymentDate;
+                                        const isSavedSchedule = !!schedule.id && savedScheduleIds.has(schedule.id);
+                                        const methodLabel = formatEstPaymentMethod(schedule.paymentMethod, schedule.referenceNumber);
                                         return (
                                         <div key={schedule.id || index} className={`flex items-center px-8 py-4 transition-colors border-l-4 ${isPaid ? 'bg-green-50/60 border-green-400' : 'bg-white hover:bg-slate-50/50 border-transparent group'}`}>
                                             <div className="flex-1">
@@ -1887,6 +1907,9 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     disabled={isPaid}
                                                     className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800 disabled:cursor-default"
                                                 />
+                                                {isPaid && methodLabel && (
+                                                    <div className="text-[11px] text-slate-400 mt-0.5 ml-0">{methodLabel}</div>
+                                                )}
                                             </div>
                                             <div className="w-32 px-4 relative">
                                                 <input
@@ -1928,7 +1951,40 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                         {paidOn && (
                                                             <span className="text-[10px] text-slate-400">{new Date(paidOn).toLocaleDateString()}</span>
                                                         )}
+                                                        <button
+                                                            onClick={async () => {
+                                                                if (!schedule.id) return;
+                                                                setIsSendingEstReceipt(schedule.id);
+                                                                try {
+                                                                    const result = await sendEstimatePaymentReceipt(schedule.id);
+                                                                    if (result.success) {
+                                                                        toast.success("Receipt sent");
+                                                                        router.refresh();
+                                                                    } else {
+                                                                        toast.error(result.error || "Failed to send receipt");
+                                                                    }
+                                                                } catch (e: any) {
+                                                                    toast.error(e?.message || "Failed to send receipt");
+                                                                } finally {
+                                                                    setIsSendingEstReceipt(null);
+                                                                }
+                                                            }}
+                                                            disabled={isSendingEstReceipt === schedule.id}
+                                                            title={schedule.receiptSentAt ? `Last sent ${new Date(schedule.receiptSentAt).toLocaleString()}` : undefined}
+                                                            className="mt-1 text-[10px] text-indigo-600 hover:text-indigo-700 underline underline-offset-2 disabled:opacity-50"
+                                                        >
+                                                            {isSendingEstReceipt === schedule.id
+                                                                ? "Sending..."
+                                                                : schedule.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
+                                                        </button>
                                                     </div>
+                                                ) : isSavedSchedule ? (
+                                                    <button
+                                                        onClick={() => setRecordingEstPayment({ id: schedule.id, name: schedule.name || "Milestone", amount: Number(schedule.amount) || 0 })}
+                                                        className="hui-btn hui-btn-primary py-1 px-2 text-[11px] h-7"
+                                                    >
+                                                        Record Payment
+                                                    </button>
                                                 ) : (
                                                     <span className="text-[11px] font-medium text-slate-400 uppercase tracking-wide">Pending</span>
                                                 )}
@@ -2647,6 +2703,19 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     balanceDue={Number(initialEstimate.balanceDue) || 0}
                     onClose={() => setShowPaymentModal(false)}
                     onSaved={() => router.refresh()}
+                />
+            )}
+
+            {recordingEstPayment && (
+                <RecordPaymentModal
+                    milestoneName={recordingEstPayment.name}
+                    amount={recordingEstPayment.amount}
+                    onClose={() => setRecordingEstPayment(null)}
+                    onSubmit={async (input) => {
+                        const result = await recordEstimatePayment(recordingEstPayment.id, initialEstimate.id, input);
+                        if (result.success) router.refresh();
+                        return { success: result.success, error: (result as any).error };
+                    }}
                 />
             )}
 

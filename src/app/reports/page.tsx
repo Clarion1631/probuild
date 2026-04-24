@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { authOptions, getSessionOrDev } from "@/lib/auth";
+import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 
@@ -35,9 +35,9 @@ const REPORT_SECTIONS = [
         heading: "Tax & Compliance",
         reports: [
             {
-                title: "Tax Liability",
-                description: "Sales tax collected vs owed by month. Shows total tax on invoiced and paid revenue.",
-                href: "/reports/tax-liability",
+                title: "Sales Tax",
+                description: "Cash or accrual basis sales tax report. Filter by date range, client, project, and payment method with CSV export for your bookkeeper.",
+                href: "/reports/sales-tax",
             },
         ],
     },
@@ -90,6 +90,8 @@ export default async function ReportsPage() {
         return <div className="p-8 text-red-500">Access Denied.</div>;
     }
 
+    const isAdmin = !user || user.role === "ADMIN" || user.role === "MANAGER";
+
     return (
         <div className="max-w-4xl mx-auto py-8 px-6 space-y-10">
             <h1 className="text-2xl font-bold text-hui-textMain">Reports</h1>
@@ -121,6 +123,28 @@ export default async function ReportsPage() {
                     </div>
                 </div>
             ))}
+
+            {isAdmin && (
+                <div>
+                    <h2 className="text-xs font-semibold uppercase tracking-widest text-hui-textMuted mb-4 flex items-center gap-2">
+                        <span className="inline-block w-3 h-3 rounded-full bg-hui-primary" />
+                        Admin Tools
+                    </h2>
+                    <div className="space-y-3">
+                        <div className="hui-card p-5 flex items-center justify-between gap-4">
+                            <div>
+                                <div className="font-semibold text-hui-textMain text-sm">Stripe Payment Sync</div>
+                                <div className="text-hui-textMuted text-sm mt-0.5">
+                                    Backfill historical Stripe payments that were missed by the webhook. Run a dry run first to preview, then apply.
+                                </div>
+                            </div>
+                            <Link href="/reports/stripe-backfill" className="hui-btn hui-btn-secondary shrink-0 text-sm">
+                                Open Tool
+                            </Link>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

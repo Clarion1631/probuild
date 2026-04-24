@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import ErrorBoundary from "@/components/ErrorBoundary";
+import { usePermissions } from "@/components/PermissionsProvider";
 
 const NAV_SECTIONS = [
     {
@@ -11,6 +12,7 @@ const NAV_SECTIONS = [
             { label: "Open Invoices", href: "/reports/open-invoices" },
             { label: "Payouts", href: "/reports/payouts" },
             { label: "Transactions", href: "/reports/transactions" },
+            { label: "Sales Tax", href: "/reports/sales-tax" },
         ],
     },
     {
@@ -32,10 +34,18 @@ const NAV_SECTIONS = [
             { label: "All Estimates", href: "/estimates" },
         ],
     },
+    {
+        heading: "Admin Tools",
+        adminOnly: true,
+        items: [
+            { label: "Stripe Payment Sync", href: "/reports/stripe-backfill" },
+        ],
+    },
 ];
 
 export default function ReportsLayout({ children }: { children: React.ReactNode }) {
     const pathname = usePathname();
+    const { isAdmin } = usePermissions();
 
     return (
         <div className="flex min-h-[calc(100vh-1px)] h-full overflow-hidden bg-hui-background text-slate-900 w-full">
@@ -47,7 +57,7 @@ export default function ReportsLayout({ children }: { children: React.ReactNode 
                     </Link>
 
                     <div className="space-y-5">
-                        {NAV_SECTIONS.map((section) => (
+                        {NAV_SECTIONS.filter(s => !s.adminOnly || isAdmin).map((section) => (
                             <div key={section.heading}>
                                 <p className="text-[10px] font-semibold uppercase tracking-widest text-hui-textMuted mb-1.5 px-3">
                                     {section.heading}

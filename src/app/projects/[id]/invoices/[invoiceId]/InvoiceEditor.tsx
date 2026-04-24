@@ -1,28 +1,44 @@
 "use client";
 
 import { useState } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
+import RecordPaymentModal from "@/components/RecordPaymentModal";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 
+const METHOD_LABELS: Record<string, string> = {
+    card: "Card",
+    ach: "ACH",
+    check: "Check",
+    cash: "Cash",
+};
+
+function formatPaymentMethod(method: string | null | undefined, ref: string | null | undefined): string {
+    if (!method) return "";
+    const label = METHOD_LABELS[method] ?? method.toUpperCase();
+    if (method === "check" && ref) return `Check #${ref}`;
+    if (ref) return `${label} · ${ref}`;
+    return label;
+}
+
 export default function InvoiceEditor({ project, initialInvoice }: { project: any, initialInvoice: any }) {
     const router = useRouter();
-    const [isRecording, setIsRecording] = useState<string | null>(null);
     const [isIssuing, setIsIssuing] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [showSendModal, setShowSendModal] = useState(false);
     const [notes, setNotes] = useState(initialInvoice.notes || "");
     const [isSavingNotes, setIsSavingNotes] = useState(false);
-    const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
     const [showAddMilestone, setShowAddMilestone] = useState(false);
     const [milestoneName, setMilestoneName] = useState("");
     const [milestoneAmount, setMilestoneAmount] = useState("");
     const [milestoneDueDate, setMilestoneDueDate] = useState<string>("");
     const [isAddingMilestone, setIsAddingMilestone] = useState(false);
     const [isUndoing, setIsUndoing] = useState<string | null>(null);
+    const [recordingFor, setRecordingFor] = useState<{ id: string; name: string; amount: number } | null>(null);
+    const [isSendingReceipt, setIsSendingReceipt] = useState<string | null>(null);
 
     // Split payments state
     type SplitRow = { id: number; name: string; amount: string };
@@ -31,11 +47,21 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [splitRows, setSplitRows] = useState<SplitRow[]>([{ id: splitNextId++, name: "", amount: "" }]);
     const [isSplitting, setIsSplitting] = useState(false);
 
-    async function handleRecordPayment(paymentId: string) {
-        setIsRecording(paymentId);
-        await recordPayment(paymentId, initialInvoice.id, new Date(selectedDate).getTime());
-        setIsRecording(null);
-        router.refresh();
+    async function handleSendReceipt(paymentId: string) {
+        setIsSendingReceipt(paymentId);
+        try {
+            const result = await sendPaymentReceipt(paymentId);
+            if (result.success) {
+                toast.success("Receipt sent");
+                router.refresh();
+            } else {
+                toast.error(result.error || "Failed to send receipt");
+            }
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to send receipt");
+        } finally {
+            setIsSendingReceipt(null);
+        }
     }
 
     async function handleAddMilestone() {
@@ -87,21 +113,12 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
         }
     }
 
-    async function handleUnrecord(paymentId: string, recordedDate: string | null) {
+    async function handleUnrecord(paymentId: string) {
         setIsUndoing(paymentId);
         try {
             await unrecordPayment(paymentId, initialInvoice.id);
+            toast("Payment unrecorded");
             router.refresh();
-            toast("Payment unrecorded", {
-                action: {
-                    label: "Redo",
-                    onClick: async () => {
-                        const ts = recordedDate ? new Date(recordedDate).getTime() : Date.now();
-                        await recordPayment(paymentId, initialInvoice.id, ts);
-                        router.refresh();
-                    },
-                },
-            });
         } catch (e: any) {
             toast.error(e?.message || "Failed to unrecord payment");
         } finally {
@@ -488,9 +505,18 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 )}
                                 {initialInvoice.payments?.map((payment: any) => {
                                     const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && payment.status !== "Paid";
+                                    const methodLabel = formatPaymentMethod(payment.paymentMethod, payment.referenceNumber);
+                                    const receiptSentLabel = payment.receiptSentAt
+                                        ? `Last sent ${new Date(payment.receiptSentAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
+                                        : undefined;
                                     return (
                                         <tr key={payment.id} className={`hover:bg-slate-50 transition ${isPastDue ? 'bg-red-50/30' : ''}`}>
-                                            <td className="px-6 py-4 font-medium text-hui-textMain">{payment.name}</td>
+                                            <td className="px-6 py-4 font-medium text-hui-textMain">
+                                                <div>{payment.name}</div>
+                                                {payment.status === 'Paid' && methodLabel && (
+                                                    <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{methodLabel}</div>
+                                                )}
+                                            </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
                                                 {payment.dueDate ? (
                                                     <span className={isPastDue ? 'text-red-600 font-medium' : ''}>
@@ -510,40 +536,39 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                     ? new Date(payment.paymentDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
                                                     : '—'}
                                             </td>
-                                            <td className="px-6 py-4 text-right flex items-center justify-end gap-2">
-                                                {payment.status !== 'Paid' && (
-                                                    <>
-                                                        <input
-                                                            type="date"
-                                                            className="hui-input py-1 px-2 text-xs w-auto h-8"
-                                                            value={selectedDate}
-                                                            onChange={(e) => setSelectedDate(e.target.value)}
-                                                        />
+                                            <td className="px-6 py-4 text-right">
+                                                <div className="flex items-center justify-end gap-2 flex-wrap">
+                                                    {payment.status !== 'Paid' && (
                                                         <button
-                                                            onClick={() => handleRecordPayment(payment.id)}
-                                                            disabled={isRecording === payment.id}
-                                                            className="hui-btn hui-btn-primary py-1 px-3 text-xs w-auto h-8 disabled:opacity-50 flex items-center justify-center whitespace-nowrap"
+                                                            onClick={() => setRecordingFor({ id: payment.id, name: payment.name, amount: Number(payment.amount) })}
+                                                            className="hui-btn hui-btn-primary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
                                                         >
-                                                            {isRecording === payment.id ? "Recording..." : "Record Payment"}
+                                                            Record Payment
                                                         </button>
-                                                    </>
-                                                )}
-                                                {payment.status === 'Paid' && (
-                                                    <>
-                                                        <span className="text-xs text-emerald-600 font-medium flex items-center gap-1">
-                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6 9 17l-5-5" /></svg>
-                                                            Paid
-                                                        </span>
-                                                        <button
-                                                            onClick={() => handleUnrecord(payment.id, payment.paymentDate)}
-                                                            disabled={isUndoing === payment.id}
-                                                            className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50"
-                                                            title="Mark as unpaid"
-                                                        >
-                                                            {isUndoing === payment.id ? "Undoing..." : "Undo"}
-                                                        </button>
-                                                    </>
-                                                )}
+                                                    )}
+                                                    {payment.status === 'Paid' && (
+                                                        <>
+                                                            <button
+                                                                onClick={() => handleSendReceipt(payment.id)}
+                                                                disabled={isSendingReceipt === payment.id}
+                                                                title={receiptSentLabel}
+                                                                className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 disabled:opacity-50 flex items-center justify-center whitespace-nowrap"
+                                                            >
+                                                                {isSendingReceipt === payment.id
+                                                                    ? "Sending..."
+                                                                    : payment.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleUnrecord(payment.id)}
+                                                                disabled={isUndoing === payment.id}
+                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50"
+                                                                title="Mark as unpaid"
+                                                            >
+                                                                {isUndoing === payment.id ? "Undoing..." : "Undo"}
+                                                            </button>
+                                                        </>
+                                                    )}
+                                                </div>
                                             </td>
                                         </tr>
                                     );
@@ -561,6 +586,20 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                     invoiceId={initialInvoice.id}
                     clientEmail={clientEmail}
                     onClose={() => { setShowSendModal(false); router.refresh(); }}
+                />
+            )}
+
+            {/* Record Payment Modal */}
+            {recordingFor && (
+                <RecordPaymentModal
+                    milestoneName={recordingFor.name}
+                    amount={recordingFor.amount}
+                    onClose={() => setRecordingFor(null)}
+                    onSubmit={async (input) => {
+                        const result = await recordPayment(recordingFor.id, initialInvoice.id, input);
+                        if (result.success) router.refresh();
+                        return { success: result.success, error: (result as any).error };
+                    }}
                 />
             )}
         </div>

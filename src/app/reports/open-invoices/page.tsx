@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import { parseOpenInvoicesFilters, queryOpenInvoicesData } from "@/lib/open-invoices-report";
+import OpenInvoicesFiltersForm from "./OpenInvoicesFiltersForm";
 
 function agingBucket(issueDate: Date | null): string {
     if (!issueDate) return "90+";
@@ -15,27 +17,28 @@ function agingBucket(issueDate: Date | null): string {
 
 const BUCKET_ORDER = ["0–30", "31–60", "61–90", "90+"];
 
-export default async function OpenInvoicesPage() {
+export default async function OpenInvoicesPage({
+    searchParams,
+}: {
+    searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
     const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
 
-    const invoices = await prisma.invoice.findMany({
-        where: { status: { in: ["Issued", "Overdue", "Partially Paid"] } },
-        include: {
-            project: { select: { id: true, name: true } },
-            client: { select: { id: true, name: true } },
-        },
-        orderBy: { issueDate: "asc" },
-    });
+    const params = await searchParams;
+    const filters = parseOpenInvoicesFilters(params);
+
+    const [invoices, clients, projects] = await Promise.all([
+        queryOpenInvoicesData(filters),
+        prisma.client.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+        prisma.project.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    ]);
 
     const totalOutstanding = invoices.reduce((sum, inv) => sum + Number(inv.balanceDue), 0);
     const overdueCount = invoices.filter(i => i.status === "Overdue").length;
 
     const byBucket: Record<string, typeof invoices> = { "0–30": [], "31–60": [], "61–90": [], "90+": [] };
-    for (const inv of invoices) {
-        const bucket = agingBucket(inv.issueDate);
-        byBucket[bucket].push(inv);
-    }
+    for (const inv of invoices) byBucket[agingBucket(inv.issueDate)].push(inv);
 
     const bucketTotals = BUCKET_ORDER.map(b => ({
         label: b,
@@ -52,7 +55,8 @@ export default async function OpenInvoicesPage() {
                 <p className="text-sm text-hui-textMuted mt-1">Invoices that have been issued but not yet paid.</p>
             </div>
 
-            {/* Summary cards */}
+            <OpenInvoicesFiltersForm filters={filters} clients={clients} projects={projects} />
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 {bucketTotals.map(b => (
                     <div key={b.label} className="hui-card p-4">
@@ -63,7 +67,6 @@ export default async function OpenInvoicesPage() {
                 ))}
             </div>
 
-            {/* Totals banner */}
             <div className="hui-card p-4 flex items-center justify-between">
                 <div>
                     <p className="text-sm text-hui-textMuted">Total Outstanding</p>
@@ -79,9 +82,8 @@ export default async function OpenInvoicesPage() {
                 </div>
             </div>
 
-            {/* Table by aging bucket */}
             {invoices.length === 0 ? (
-                <div className="hui-card p-12 text-center text-hui-textMuted text-sm">No open invoices.</div>
+                <div className="hui-card p-12 text-center text-hui-textMuted text-sm">No open invoices matching current filters.</div>
             ) : (
                 BUCKET_ORDER.filter(b => byBucket[b].length > 0).map(bucket => (
                     <div key={bucket} className="hui-card overflow-hidden">
@@ -105,9 +107,7 @@ export default async function OpenInvoicesPage() {
                                 {byBucket[bucket].map(inv => (
                                     <tr key={inv.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
                                         <td className="px-4 py-3 font-mono text-xs">
-                                            <Link href={`/projects/${inv.project.id}/invoices/${inv.id}`} className="text-hui-primary hover:underline">
-                                                {inv.code}
-                                            </Link>
+                                            <Link href={`/projects/${inv.project.id}/invoices/${inv.id}`} className="text-hui-primary hover:underline">{inv.code}</Link>
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMain">
                                             <Link href={`/projects/${inv.project.id}`} className="hover:underline">{inv.project.name}</Link>

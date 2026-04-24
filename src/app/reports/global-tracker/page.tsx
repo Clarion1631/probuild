@@ -3,36 +3,31 @@ import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import { parseGlobalTrackerFilters, queryGlobalTrackerData } from "@/lib/global-tracker-report";
+import GlobalTrackerFiltersForm from "./GlobalTrackerFiltersForm";
 
-export default async function GlobalTrackerPage() {
+export default async function GlobalTrackerPage({
+    searchParams,
+}: {
+    searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
     const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
 
-    const projects = await prisma.project.findMany({
-        orderBy: { createdAt: "desc" },
-        include: {
-            client: { select: { name: true } },
-            estimates: { select: { totalAmount: true, status: true } },
-            invoices: { select: { totalAmount: true, balanceDue: true, status: true } },
-            scheduleTasks: { select: { id: true, status: true } },
-            dailyLogs: { select: { createdAt: true } },
-            changeOrders: { select: { createdAt: true } },
-        },
-    });
+    const params = await searchParams;
+    const filters = parseGlobalTrackerFilters(params);
+
+    const [projects, clients] = await Promise.all([
+        queryGlobalTrackerData(filters),
+        prisma.client.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    ]);
 
     const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
 
     type Row = {
-        id: string;
-        name: string;
-        client: string;
-        status: string;
-        budget: number;
-        invoiced: number;
-        paid: number;
-        balance: number;
-        schedPct: number | null;
-        lastActivity: Date | null;
+        id: string; name: string; client: string; status: string;
+        budget: number; invoiced: number; paid: number; balance: number;
+        schedPct: number | null; lastActivity: Date | null;
     };
 
     const rows: Row[] = projects.map(p => {
@@ -53,18 +48,7 @@ export default async function GlobalTrackerPage() {
         ];
         const lastActivity = dates.length > 0 ? dates.reduce((a, b) => a > b ? a : b) : null;
 
-        return {
-            id: p.id,
-            name: p.name,
-            client: p.client.name,
-            status: p.status,
-            budget,
-            invoiced,
-            paid,
-            balance,
-            schedPct,
-            lastActivity,
-        };
+        return { id: p.id, name: p.name, client: p.client.name, status: p.status, budget, invoiced, paid, balance, schedPct, lastActivity };
     });
 
     const totalBudget = rows.reduce((s, r) => s + r.budget, 0);
@@ -86,7 +70,8 @@ export default async function GlobalTrackerPage() {
                 <p className="text-sm text-hui-textMuted mt-1">Cross-project financial and schedule overview.</p>
             </div>
 
-            {/* Summary stat cards */}
+            <GlobalTrackerFiltersForm filters={filters} clients={clients} />
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="hui-card p-4">
                     <p className="text-xs text-hui-textMuted font-medium">Total Budget</p>
@@ -106,7 +91,6 @@ export default async function GlobalTrackerPage() {
                 </div>
             </div>
 
-            {/* Table */}
             <div className="hui-card overflow-hidden">
                 <table className="w-full text-sm">
                     <thead>
@@ -123,47 +107,50 @@ export default async function GlobalTrackerPage() {
                         </tr>
                     </thead>
                     <tbody>
-                        {rows.map(r => (
-                            <tr key={r.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
-                                <td className="px-4 py-3 font-medium">
-                                    <Link href={`/projects/${r.id}`} className="text-hui-primary hover:underline">{r.name}</Link>
-                                </td>
-                                <td className="px-4 py-3 text-hui-textMuted">{r.client}</td>
-                                <td className="px-4 py-3">
-                                    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${statusColor(r.status)}`}>
-                                        {r.status}
-                                    </span>
-                                </td>
-                                <td className="px-4 py-3 text-right text-hui-textMuted">{r.budget > 0 ? fmt(r.budget) : "—"}</td>
-                                <td className="px-4 py-3 text-right text-hui-textMuted">{r.invoiced > 0 ? fmt(r.invoiced) : "—"}</td>
-                                <td className="px-4 py-3 text-right text-green-600 font-medium">{r.paid > 0 ? fmt(r.paid) : "—"}</td>
-                                <td className="px-4 py-3 text-right text-hui-textMain font-semibold">{r.balance > 0 ? fmt(r.balance) : "—"}</td>
-                                <td className="px-4 py-3">
-                                    {r.schedPct !== null ? (
-                                        <div className="flex items-center gap-2">
-                                            <div className="flex-1 h-1.5 bg-hui-border rounded-full overflow-hidden min-w-[60px]">
-                                                <div className="h-full bg-hui-primary rounded-full" style={{ width: `${r.schedPct}%` }} />
-                                            </div>
-                                            <span className="text-xs text-hui-textMuted whitespace-nowrap">{r.schedPct}%</span>
-                                        </div>
-                                    ) : (
-                                        <span className="text-xs text-hui-textMuted">—</span>
-                                    )}
-                                </td>
-                                <td className="px-4 py-3 text-xs text-hui-textMuted">
-                                    {r.lastActivity ? new Date(r.lastActivity).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—"}
-                                </td>
+                        {rows.length === 0 ? (
+                            <tr>
+                                <td colSpan={9} className="px-4 py-12 text-center text-hui-textMuted text-sm">No projects match current filters.</td>
                             </tr>
-                        ))}
-                        {/* Summary row */}
-                        <tr className="bg-hui-surface font-semibold border-t-2 border-hui-border">
-                            <td className="px-4 py-3 text-hui-textMain" colSpan={3}>Total ({rows.length} projects)</td>
-                            <td className="px-4 py-3 text-right text-hui-textMain">{fmt(totalBudget)}</td>
-                            <td className="px-4 py-3 text-right text-hui-textMain">{fmt(totalInvoiced)}</td>
-                            <td className="px-4 py-3 text-right text-green-600">{fmt(totalPaid)}</td>
-                            <td className="px-4 py-3 text-right text-hui-textMain">{fmt(totalBalance)}</td>
-                            <td className="px-4 py-3" colSpan={2} />
-                        </tr>
+                        ) : (
+                            rows.map(r => (
+                                <tr key={r.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
+                                    <td className="px-4 py-3 font-medium">
+                                        <Link href={`/projects/${r.id}`} className="text-hui-primary hover:underline">{r.name}</Link>
+                                    </td>
+                                    <td className="px-4 py-3 text-hui-textMuted">{r.client}</td>
+                                    <td className="px-4 py-3">
+                                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${statusColor(r.status)}`}>{r.status}</span>
+                                    </td>
+                                    <td className="px-4 py-3 text-right text-hui-textMuted">{r.budget > 0 ? fmt(r.budget) : "—"}</td>
+                                    <td className="px-4 py-3 text-right text-hui-textMuted">{r.invoiced > 0 ? fmt(r.invoiced) : "—"}</td>
+                                    <td className="px-4 py-3 text-right text-green-600 font-medium">{r.paid > 0 ? fmt(r.paid) : "—"}</td>
+                                    <td className="px-4 py-3 text-right text-hui-textMain font-semibold">{r.balance > 0 ? fmt(r.balance) : "—"}</td>
+                                    <td className="px-4 py-3">
+                                        {r.schedPct !== null ? (
+                                            <div className="flex items-center gap-2">
+                                                <div className="flex-1 h-1.5 bg-hui-border rounded-full overflow-hidden min-w-[60px]">
+                                                    <div className="h-full bg-hui-primary rounded-full" style={{ width: `${r.schedPct}%` }} />
+                                                </div>
+                                                <span className="text-xs text-hui-textMuted whitespace-nowrap">{r.schedPct}%</span>
+                                            </div>
+                                        ) : <span className="text-xs text-hui-textMuted">—</span>}
+                                    </td>
+                                    <td className="px-4 py-3 text-xs text-hui-textMuted">
+                                        {r.lastActivity ? new Date(r.lastActivity).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—"}
+                                    </td>
+                                </tr>
+                            ))
+                        )}
+                        {rows.length > 0 && (
+                            <tr className="bg-hui-surface font-semibold border-t-2 border-hui-border">
+                                <td className="px-4 py-3 text-hui-textMain" colSpan={3}>Total ({rows.length} project{rows.length !== 1 ? "s" : ""})</td>
+                                <td className="px-4 py-3 text-right text-hui-textMain">{fmt(totalBudget)}</td>
+                                <td className="px-4 py-3 text-right text-hui-textMain">{fmt(totalInvoiced)}</td>
+                                <td className="px-4 py-3 text-right text-green-600">{fmt(totalPaid)}</td>
+                                <td className="px-4 py-3 text-right text-hui-textMain">{fmt(totalBalance)}</td>
+                                <td className="px-4 py-3" colSpan={2} />
+                            </tr>
+                        )}
                     </tbody>
                 </table>
             </div>

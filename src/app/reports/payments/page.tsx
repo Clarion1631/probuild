@@ -3,72 +3,70 @@ import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import { parsePaymentsFilters, queryPaymentsData } from "@/lib/payments-report";
+import { formatLocalDateString } from "@/lib/report-utils";
+import PaymentsFiltersForm from "./PaymentsFiltersForm";
 
-export default async function PaymentsReportPage() {
+export default async function PaymentsReportPage({
+    searchParams,
+}: {
+    searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
     const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
 
-    const payments = await prisma.paymentSchedule.findMany({
-        where: { status: "Paid" },
-        include: {
-            invoice: {
-                select: {
-                    id: true,
-                    code: true,
-                    project: { select: { id: true, name: true } },
-                    client: { select: { id: true, name: true } },
-                },
-            },
-        },
-        orderBy: { paidAt: "desc" },
-    });
+    const params = await searchParams;
+    const filters = parsePaymentsFilters(params);
 
-    const totalCollected = payments.reduce((sum, p) => sum + Number(p.amount), 0);
+    const [{ rows, summary }, clients, projects] = await Promise.all([
+        queryPaymentsData(filters),
+        prisma.client.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+        prisma.project.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    ]);
 
-    // Group by month
-    const byMonth: Record<string, typeof payments> = {};
-    for (const p of payments) {
-        const d = p.paidAt ?? p.paymentDate ?? p.createdAt;
-        const key = new Date(d).toLocaleString("en-US", { month: "long", year: "numeric" });
+    const byMonth: Record<string, typeof rows> = {};
+    for (const r of rows) {
+        const key = new Date(r.date).toLocaleString("en-US", { month: "long", year: "numeric" });
         if (!byMonth[key]) byMonth[key] = [];
-        byMonth[key].push(p);
+        byMonth[key].push(r);
     }
     const months = Object.keys(byMonth);
 
     const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
+    const dateLabel = `${formatLocalDateString(filters.from)} → ${formatLocalDateString(filters.to)}`;
 
     return (
         <div className="max-w-5xl mx-auto py-8 px-6 space-y-6">
             <div>
                 <h1 className="text-2xl font-bold text-hui-textMain">Payments Received</h1>
-                <p className="text-sm text-hui-textMuted mt-1">All collected payments, grouped by month.</p>
+                <p className="text-sm text-hui-textMuted mt-1">Collected payments grouped by month · {dateLabel}</p>
             </div>
 
-            {/* Summary */}
+            <PaymentsFiltersForm filters={filters} clients={clients} projects={projects} />
+
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="hui-card p-4">
                     <p className="text-xs text-hui-textMuted font-medium">Total Collected</p>
-                    <p className="text-3xl font-bold text-hui-textMain mt-1">{fmt(totalCollected)}</p>
+                    <p className="text-3xl font-bold text-hui-textMain mt-1">{fmt(summary.total)}</p>
                 </div>
                 <div className="hui-card p-4">
                     <p className="text-xs text-hui-textMuted font-medium">Total Payments</p>
-                    <p className="text-3xl font-bold text-hui-textMain mt-1">{payments.length}</p>
+                    <p className="text-3xl font-bold text-hui-textMain mt-1">{summary.count}</p>
                 </div>
                 <div className="hui-card p-4">
                     <p className="text-xs text-hui-textMuted font-medium">Avg Payment</p>
-                    <p className="text-3xl font-bold text-hui-textMain mt-1">{payments.length ? fmt(totalCollected / payments.length) : "$0"}</p>
+                    <p className="text-3xl font-bold text-hui-textMain mt-1">{summary.count ? fmt(summary.avg) : "$0"}</p>
                 </div>
             </div>
 
-            {/* By month */}
-            {payments.length === 0 ? (
-                <div className="hui-card p-12 text-center text-hui-textMuted text-sm">No payments recorded yet.</div>
+            {rows.length === 0 ? (
+                <div className="hui-card p-12 text-center text-hui-textMuted text-sm">No payments in this period.</div>
             ) : (
                 months.map(month => (
                     <div key={month} className="hui-card overflow-hidden">
                         <div className="px-4 py-3 border-b border-hui-border bg-hui-surface flex items-center justify-between">
                             <span className="text-sm font-semibold text-hui-textMain">{month}</span>
-                            <span className="text-sm text-hui-textMuted">{fmt(byMonth[month].reduce((s, p) => s + Number(p.amount), 0))}</span>
+                            <span className="text-sm text-hui-textMuted">{fmt(byMonth[month].reduce((s, r) => s + r.amount, 0))}</span>
                         </div>
                         <table className="w-full text-sm">
                             <thead>
@@ -83,28 +81,25 @@ export default async function PaymentsReportPage() {
                                 </tr>
                             </thead>
                             <tbody>
-                                {byMonth[month].map(p => {
-                                    const paidDate = p.paidAt ?? p.paymentDate;
-                                    return (
-                                        <tr key={p.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
-                                            <td className="px-4 py-3 text-hui-textMuted text-xs">{p.name}</td>
-                                            <td className="px-4 py-3 font-mono text-xs">
-                                                <Link href={`/projects/${p.invoice.project.id}/invoices/${p.invoice.id}`} className="text-hui-primary hover:underline">
-                                                    {p.invoice.code}
-                                                </Link>
-                                            </td>
-                                            <td className="px-4 py-3 text-hui-textMain">
-                                                <Link href={`/projects/${p.invoice.project.id}`} className="hover:underline">{p.invoice.project.name}</Link>
-                                            </td>
-                                            <td className="px-4 py-3 text-hui-textMuted">{p.invoice.client.name}</td>
-                                            <td className="px-4 py-3 text-hui-textMuted">
-                                                {paidDate ? new Date(paidDate).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—"}
-                                            </td>
-                                            <td className="px-4 py-3 text-hui-textMuted capitalize">{p.paymentMethod ?? "—"}</td>
-                                            <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(Number(p.amount))}</td>
-                                        </tr>
-                                    );
-                                })}
+                                {byMonth[month].map(r => (
+                                    <tr key={r.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
+                                        <td className="px-4 py-3 text-hui-textMuted text-xs">{r.name}</td>
+                                        <td className="px-4 py-3 font-mono text-xs">
+                                            <Link href={`/projects/${r.projectId}/invoices/${r.invoiceId}`} className="text-hui-primary hover:underline">
+                                                {r.invoiceCode}
+                                            </Link>
+                                        </td>
+                                        <td className="px-4 py-3 text-hui-textMain">
+                                            <Link href={`/projects/${r.projectId}`} className="hover:underline">{r.projectName}</Link>
+                                        </td>
+                                        <td className="px-4 py-3 text-hui-textMuted">{r.clientName}</td>
+                                        <td className="px-4 py-3 text-hui-textMuted">
+                                            {new Date(r.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                                        </td>
+                                        <td className="px-4 py-3 text-hui-textMuted capitalize">{r.paymentMethod ?? "—"}</td>
+                                        <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(r.amount)}</td>
+                                    </tr>
+                                ))}
                             </tbody>
                         </table>
                     </div>

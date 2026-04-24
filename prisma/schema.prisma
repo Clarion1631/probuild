@@ -320,7 +320,10 @@ model EstimatePaymentSchedule {
   status                String    @default("Pending")
   stripeSessionId       String?
   stripePaymentIntentId String?
-  paymentMethod         String?
+  paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"
+  referenceNumber       String? // check # / confirmation #
+  notes                 String? // free-form memo
+  receiptSentAt         DateTime? // last time admin sent the receipt email
   paidAt                DateTime?
   paymentDate           DateTime?
 
@@ -398,6 +401,9 @@ model Invoice {
   client      Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
   status      String    @default("Draft") // Draft, Issued, Paid, Overdue
   totalAmount Decimal     @default(0)
+  subtotal    Decimal     @default(0)  // pre-tax
+  taxRate     Decimal     @default(0)  // percent, e.g. 8.8
+  taxAmount   Decimal     @default(0)  // dollars
   balanceDue  Decimal     @default(0)
   notes       String?
   issueDate   DateTime?
@@ -422,7 +428,10 @@ model PaymentSchedule {
   paymentDate           DateTime?
   stripeSessionId       String?
   stripePaymentIntentId String?
-  paymentMethod         String?
+  paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"
+  referenceNumber       String? // check # / confirmation #
+  notes                 String? // free-form memo
+  receiptSentAt         DateTime? // last time admin sent the receipt email
   paidAt                DateTime?
   createdAt             DateTime  @default(now())
 
