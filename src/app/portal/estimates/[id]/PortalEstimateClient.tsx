@@ -706,9 +706,10 @@ function TermsAndConditions({ html }: { html: string }) {
         });
     }, [sanitized, isRichHtml]);
 
-    // Strip leading heading if it duplicates our own "Terms & Conditions" label
+    // Strip leading heading/paragraph if it duplicates our own "Terms & Conditions" label.
+    // Handles nested inline tags (<strong>, <em>, etc.) and "and" vs "&" variants.
     const stripped = sanitized.replace(
-        /^\s*<h[1-6][^>]*>\s*Terms\s*(?:&amp;|&)\s*Conditions\s*<\/h[1-6]>\s*/i,
+        /^\s*<(h[1-6]|p)[^>]*>(?:\s*<(?!\/)[^>]*>)*\s*Terms\s*(?:&amp;|&|and)\s*Conditions\s*(?:\s*<\/[^>]+>)*\s*<\/\1>\s*/i,
         ""
     );
 
