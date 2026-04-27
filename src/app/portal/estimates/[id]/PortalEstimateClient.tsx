@@ -679,25 +679,40 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
 function TermsAndConditions({ html }: { html: string }) {
     const ref = useRef<HTMLDivElement>(null);
-    const sanitized = DOMPurify.sanitize(html);
+
+    // Detect rich HTML by whether the content starts with a block-level tag.
+    // Legacy plain-text snapshots never start with "<p" or "<h"; editor-produced
+    // HTML always does. Anchoring to trimStart() avoids false-positives from
+    // angle brackets appearing mid-sentence in plain text.
+    const trimmed = html.trimStart();
+    const isRichHtml =
+        trimmed.startsWith("<p") ||
+        trimmed.startsWith("<h") ||
+        trimmed.startsWith("<ul") ||
+        trimmed.startsWith("<ol") ||
+        trimmed.startsWith("<div");
+
+    const sanitized = isRichHtml ? DOMPurify.sanitize(html) : "";
 
     // After mount, wrap each top-level block element in a data-pdf-row wrapper
     // so the PDF paginator can break between paragraphs/sections instead of
     // treating the entire terms block as one atomic chunk.
     useEffect(() => {
-        if (!ref.current) return;
+        if (!ref.current || !isRichHtml) return;
         const container = ref.current;
         const children = Array.from(container.children) as HTMLElement[];
         children.forEach(child => {
             child.setAttribute("data-pdf-row", "true");
         });
-    }, [sanitized]);
+    }, [sanitized, isRichHtml]);
 
     // Strip leading heading if it duplicates our own "Terms & Conditions" label
     const stripped = sanitized.replace(
         /^\s*<h[1-6][^>]*>\s*Terms\s*(?:&amp;|&)\s*Conditions\s*<\/h[1-6]>\s*/i,
         ""
     );
+
+    const contentClassName = "border-l-2 border-slate-300 pl-6 py-1 prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2";
 
     return (
         <div className="px-10 pb-10 border-t border-slate-200 pt-8">
@@ -708,12 +723,19 @@ function TermsAndConditions({ html }: { html: string }) {
                 </svg>
                 <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Terms &amp; Conditions</h2>
             </div>
-            {/* Content — each top-level block gets data-pdf-row for clean page breaks */}
-            <div
-                ref={ref}
-                className="border-l-2 border-slate-300 pl-6 py-1 prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2"
-                dangerouslySetInnerHTML={{ __html: stripped }}
-            />
+            {isRichHtml ? (
+                /* Rich HTML path — sanitized and injected; each block gets data-pdf-row via useEffect */
+                <div
+                    ref={ref}
+                    className={contentClassName}
+                    dangerouslySetInnerHTML={{ __html: stripped }}
+                />
+            ) : (
+                /* Legacy plain-text path — rendered as JSX to avoid markup injection */
+                <div data-pdf-row="true" className={contentClassName}>
+                    <p className="whitespace-pre-wrap">{html}</p>
+                </div>
+            )}
         </div>
     );
 }
