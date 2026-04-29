@@ -41,6 +41,10 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const [isDownloading, setIsDownloading] = useState(false);
     // C5 — temporarily override approved state to show "Approved" badge during pre-approval capture
     const [approvedOverride, setApprovedOverride] = useState<boolean | null>(null);
+    // C6 — temporarily override signature block data so the captured PDF includes the signature
+    const [signatureBlockOverride, setSignatureBlockOverride] = useState<{
+        approvedBy: string; signatureUrl: string; approvedAt: Date;
+    } | null>(null);
     const viewedRef = useRef(false);
     const documentRef = useRef<HTMLDivElement>(null);
     const searchParams = useSearchParams();
@@ -262,8 +266,9 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         try {
             const userAgent = window.navigator.userAgent;
 
-            // Step 1: Temporarily show "Approved" badge in the DOM so the captured PDF
-            // reflects the final approved state rather than "Pending Approval" (C5)
+            // Step 1: Temporarily show "Approved" badge and signature block in the DOM so the
+            // captured PDF reflects the final signed state (C5/C6)
+            setSignatureBlockOverride({ approvedBy: signature.trim(), signatureUrl: signatureDataUrl!, approvedAt: new Date() });
             setApprovedOverride(true);
             // Give React one frame to re-render the badge before capturing
             await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
@@ -302,6 +307,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         } catch (e) {
             // Restore the badge to real status on error
             setApprovedOverride(null);
+            setSignatureBlockOverride(null);
             setError("Something went wrong processing your approval.");
         } finally {
             setIsSubmitting(false);
@@ -496,7 +502,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     </div>
 
                     {/* Signed Badge */}
-                    {isApproved && initialEstimate.approvedBy && (
+                    {isApproved && (signatureBlockOverride?.approvedBy || initialEstimate.approvedBy) && (
                         <div className="mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
                             <div className="flex items-start gap-3">
                                 <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">
@@ -504,15 +510,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 </div>
                                 <div>
                                     <h3 className="text-sm font-semibold text-green-800">Electronically Signed and Approved</h3>
-                                    <p className="text-sm text-green-700 mt-0.5">Signed by: <strong>{initialEstimate.approvedBy}</strong></p>
-                                    <p className="text-xs text-green-600 mt-0.5">{new Date(initialEstimate.approvedAt).toLocaleString()}</p>
+                                    <p className="text-sm text-green-700 mt-0.5">Signed by: <strong>{signatureBlockOverride?.approvedBy ?? initialEstimate.approvedBy}</strong></p>
+                                    <p className="text-xs text-green-600 mt-0.5">{new Date(signatureBlockOverride?.approvedAt ?? initialEstimate.approvedAt).toLocaleString()}</p>
                                     <p className="text-xs text-green-700 mt-1 flex items-center gap-1.5"><svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg> A copy of the signed PDF has been sent to your email.</p>
                                 </div>
                             </div>
-                            {initialEstimate.signatureUrl && (
+                            {(signatureBlockOverride?.signatureUrl || initialEstimate.signatureUrl) && (
                                 <div className="mt-4 pt-4 border-t border-green-200 flex flex-col items-start">
                                     <span className="text-[10px] text-green-600 uppercase font-semibold mb-2">Electronic Signature</span>
-                                    <img src={initialEstimate.signatureUrl} alt="Signature" className="h-16 object-contain mix-blend-multiply" />
+                                    <img src={signatureBlockOverride?.signatureUrl ?? initialEstimate.signatureUrl} alt="Signature" className="h-16 object-contain mix-blend-multiply" />
                                 </div>
                             )}
                         </div>
