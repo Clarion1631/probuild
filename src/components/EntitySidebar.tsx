@@ -29,10 +29,12 @@ export default function EntitySidebar({
     const can = (key?: string) => !key || !loaded || !!permissions[key];
     const id = entity.id;
 
+    const collapseKey = `${entity.type}SidebarCollapsed`;
+
     useEffect(() => {
-        const stored = localStorage.getItem("projectSidebarCollapsed");
+        const stored = localStorage.getItem(collapseKey);
         if (stored === "true") setSidebarCollapsed(true);
-    }, []);
+    }, [collapseKey]);
 
     const isRoomEditor =
         /^\/projects\/[^/]+\/room-designer\/[^/]+$/.test(pathname || "") ||
@@ -41,7 +43,7 @@ export default function EntitySidebar({
     const toggleSidebar = () => {
         setSidebarCollapsed(prev => {
             const next = !prev;
-            localStorage.setItem("projectSidebarCollapsed", String(next));
+            localStorage.setItem(collapseKey, String(next));
             return next;
         });
     };

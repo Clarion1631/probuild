@@ -18,6 +18,9 @@ export async function POST(req: NextRequest) {
     if (!projectId && !leadId) {
         return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
     }
+    if (projectId && leadId) {
+        return NextResponse.json({ error: "Provide projectId or leadId, not both" }, { status: 400 });
+    }
 
     const companySettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
 

@@ -272,6 +272,10 @@ export async function deleteLead(id: string) {
     if (lead?.stage === "Won") {
         throw new Error("Cannot delete a converted lead. Archive it instead.");
     }
+    // Contract.lead FK is onDelete:SetNull — explicitly delete lead-only contracts to
+    // avoid orphaning rows with both leadId=null and projectId=null after the lead is gone.
+    // (Leads with a linked project are already blocked above, so all contracts here have projectId=null.)
+    await prisma.contract.deleteMany({ where: { leadId: id, projectId: null } });
     await prisma.lead.delete({
         where: { id }
     });
