@@ -45,7 +45,11 @@ export default async function ProjectLayout({
         getUnreadMessageCount(id, "TEAM"),
         prisma.project.findUnique({
             where: { id },
-            select: { name: true, client: { select: { name: true } } },
+            select: {
+                name: true,
+                client: { select: { name: true } },
+                lead: { select: { id: true, name: true } },
+            },
         }),
     ]);
 
@@ -55,6 +59,7 @@ export default async function ProjectLayout({
                 projectId={id}
                 projectName={project?.name}
                 clientName={project?.client?.name}
+                lead={project?.lead ?? null}
                 unreadMessageCount={unreadCount}
             />
             <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden w-full min-w-0">

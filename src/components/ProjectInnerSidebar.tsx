@@ -10,6 +10,7 @@ interface ProjectInnerSidebarProps {
     projectId: string;
     projectName?: string;
     clientName?: string;
+    lead?: { id: string; name: string } | null;
     unreadMessageCount?: number;
 }
 
@@ -20,7 +21,7 @@ type NavSection = {
     items: NavItem[];
 };
 
-export default function ProjectInnerSidebar({ projectId, projectName, clientName, unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
+export default function ProjectInnerSidebar({ projectId, projectName, clientName, lead, unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
     const pathname = usePathname();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -162,6 +163,17 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
                 <div className="px-4 py-3 border-b border-hui-border bg-white shrink-0">
                     {projectName && <p className="text-sm font-semibold text-hui-textMain truncate">{projectName}</p>}
                     {clientName && <p className="text-xs text-slate-500 truncate">{clientName}</p>}
+                    {lead && (
+                        <Link
+                            href={`/leads/${lead.id}`}
+                            className="mt-1.5 inline-flex items-center gap-1 text-[11px] text-amber-700 hover:text-amber-900 transition group"
+                        >
+                            <svg className="w-3 h-3 transition group-hover:-translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M15 19l-7-7 7-7" />
+                            </svg>
+                            <span>Back to lead</span>
+                        </Link>
+                    )}
                 </div>
             )}
 
