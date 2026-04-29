@@ -1,6 +1,4 @@
-import { getLead, getLeadMeetings, getLeadTasks } from "@/lib/actions";
-import { redirect } from "next/navigation";
-import LeadSidebar from "../LeadSidebar";
+import { getLead, getLeadMeetings } from "@/lib/actions";
 import LeadDetailsSidebar from "../LeadDetailsSidebar";
 import LeadMeetingsPanel from "./LeadMeetingsPanel";
 
@@ -11,14 +9,6 @@ export default async function LeadMeetingsPage({ params }: { params: Promise<{ i
 
     const meetings = await getLeadMeetings(resolvedParams.id);
 
-    async function handleConvert() {
-        "use server";
-        const { convertLeadToProject } = await import("@/lib/actions");
-        const project = await convertLeadToProject(lead!.id);
-        redirect(`/`);
-    }
-
-    // Serialize dates for client component
     const serializedMeetings = meetings.map((m: any) => ({
         ...m,
         scheduledAt: m.scheduledAt.toISOString(),
@@ -28,23 +18,12 @@ export default async function LeadMeetingsPage({ params }: { params: Promise<{ i
     }));
 
     return (
-        <div className="flex h-[calc(100vh-64px)] -m-6 overflow-hidden bg-hui-background">
-            {/* Left Sidebar - Navigation */}
-            <LeadSidebar
-                leadId={lead.id}
-                leadName={lead.name}
-                clientName={lead.client.name}
-                onConvert={handleConvert}
-            />
-
-            {/* Center - Meetings Panel */}
+        <>
             <LeadMeetingsPanel
                 leadId={lead.id}
                 clientName={lead.client.name}
                 meetings={serializedMeetings}
             />
-
-            {/* Right Sidebar - Details */}
             <LeadDetailsSidebar
                 leadId={lead.id}
                 leadName={lead.name}
@@ -65,6 +44,6 @@ export default async function LeadMeetingsPage({ params }: { params: Promise<{ i
                 clientZip={(lead.client as any)?.zipCode || null}
                 initialMessage={lead.message || null}
             />
-        </div>
+        </>
     );
 }

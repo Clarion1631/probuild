@@ -1,7 +1,7 @@
 import { getProject, getDocumentTemplates } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import ProjectContractsClient from "./ProjectContractsClient";
+import EntityContractsClient from "@/components/EntityContractsClient";
 
 export const dynamic = "force-dynamic";
 
@@ -11,15 +11,29 @@ export default async function ProjectContractsPage({ params }: { params: Promise
     if (!project) notFound();
 
     const templates = await getDocumentTemplates();
+    const linkedLeadId: string | null = (project as any).leadId ?? null;
 
-    // Lead/project parity (see lead-side page.tsx): fetch all executed PDF
-    // ProjectFiles for this project in one pass, then match to contracts by the
-    // naming convention set in /api/portal/contracts/[id]/finalize/route.ts.
-    // New files embed the contractId (`Executed_Contract_{contractId}.pdf`);
-    // legacy files use the safe-title prefix.
+    // Fetch all contracts visible to this project: those directly attached (projectId = X)
+    // and those on the linked originating lead (leadId = linked-lead-id).
+    // OR returns unique rows; no manual dedup needed.
+    const contracts = await prisma.contract.findMany({
+        where: {
+            OR: [
+                { projectId: project.id },
+                ...(linkedLeadId ? [{ leadId: linkedLeadId }] : []),
+            ],
+        },
+        include: { signingRecords: true },
+        orderBy: { createdAt: "desc" },
+    });
+
+    // Executed-PDF lookup: widen to cover files saved under either the project or the lead.
     const executedFiles = await prisma.projectFile.findMany({
         where: {
-            projectId: project.id,
+            OR: [
+                { projectId: project.id },
+                ...(linkedLeadId ? [{ leadId: linkedLeadId }] : []),
+            ],
             mimeType: "application/pdf",
             name: { contains: "Executed_Contract_" },
         },
@@ -35,19 +49,21 @@ export default async function ProjectContractsPage({ params }: { params: Promise
         return executedFiles.find(f => f.name.startsWith(safeName))?.url || null;
     };
 
-    const contracts = (project.contracts || []).map((c: any) => ({
-        ...c,
-        executedPdfUrl: findExecutedPdfUrl(c.id, c.title),
-    }));
+    const serialized = JSON.parse(JSON.stringify(
+        contracts.map(c => ({ ...c, executedPdfUrl: findExecutedPdfUrl(c.id, c.title) }))
+    ));
+
+    const linkedEntity = linkedLeadId
+        ? { type: "lead" as const, id: linkedLeadId, name: (project as any).lead?.name ?? "" }
+        : null;
 
     return (
         <div className="max-w-5xl mx-auto">
-            <ProjectContractsClient
-                projectId={id}
-                projectName={project.name}
-                clientName={project.client?.name || "Client"}
-                contracts={JSON.parse(JSON.stringify(contracts))}
-                templates={JSON.parse(JSON.stringify(templates || []))}
+            <EntityContractsClient
+                entity={{ type: "project", id: project.id, name: project.name, clientName: (project as any).client?.name || "Client" }}
+                contracts={serialized}
+                templates={templates.map((t: any) => ({ id: t.id, name: t.name, type: t.type }))}
+                linkedEntity={linkedEntity}
             />
         </div>
     );

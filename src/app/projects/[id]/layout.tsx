@@ -1,4 +1,4 @@
-import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
+import EntitySidebar from "@/components/EntitySidebar";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { getUnreadMessageCount } from "@/lib/actions";
 import { getSessionOrDev } from "@/lib/auth";
@@ -53,13 +53,15 @@ export default async function ProjectLayout({
         }),
     ]);
 
+    const linkedEntity = project?.lead
+        ? { type: "lead" as const, id: project.lead.id, name: project.lead.name }
+        : null;
+
     return (
         <div className="flex h-full -mx-6 -my-6 bg-slate-50">
-            <ProjectInnerSidebar
-                projectId={id}
-                projectName={project?.name}
-                clientName={project?.client?.name}
-                lead={project?.lead ?? null}
+            <EntitySidebar
+                entity={{ type: "project", id, name: project?.name ?? "", clientName: project?.client?.name }}
+                linkedEntity={linkedEntity}
                 unreadMessageCount={unreadCount}
             />
             <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden w-full min-w-0">

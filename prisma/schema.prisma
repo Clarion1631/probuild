@@ -43,6 +43,11 @@ model Client {
   additionalEmail String?
   additionalPhone String?
 
+  // Normalized E.164 (e.g. "+13609542757") for indexed phone lookups (Twilio inbound).
+  // Populated by createClient/updateClient via normalizeE164().
+  primaryPhoneE164    String?
+  additionalPhoneE164 String?
+
   addressLine1 String?
   addressLine2 String?
   city         String?
@@ -56,6 +61,9 @@ model Client {
   leads    Lead[]
   invoices Invoice[]
   retainers Retainer[]
+
+  @@index([primaryPhoneE164])
+  @@index([additionalPhoneE164])
 }
 
 model Lead {
@@ -156,6 +164,10 @@ model Project {
   viewedAt            DateTime                     @default(now())
   createdAt           DateTime                     @default(now())
   location            String?
+  // Geofencing for mobile time-clock (added for gtr-probuild-mobile integration)
+  locationLat            Float?
+  locationLng            Float?
+  geofenceRadiusMeters   Int?     @default(100)
   status              String                       @default("In Progress") // In Progress, Closed, Paid Ready to Start
   type                String? // Kitchen Remodeling, Patio, Water Damage
   code                String?
@@ -517,6 +529,17 @@ model TimeEntry {
   editedByManagerId String?
   editedAt          DateTime?
 
+  // Mobile edit audit (gtr-probuild-mobile)
+  isEdited          Boolean   @default(false)
+  originalStartTime DateTime?
+  originalEndTime   DateTime?
+  editNotes         String?
+
+  // Geofence telemetry (gtr-probuild-mobile)
+  offsiteMs         Int       @default(0)
+  isOffsite         Boolean   @default(false)
+  lastLocationCheck DateTime?
+
   @@index([projectId])
   @@index([userId])
 }
@@ -527,7 +550,7 @@ model Contract {
   projectId String?
   project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
   leadId    String?
-  lead      Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  lead      Lead?    @relation(fields: [leadId], references: [id], onDelete: SetNull)
 
   title  String
   body   String // HTML string of the legal agreement (with merge fields resolved)
@@ -972,6 +995,10 @@ model ClientMessage {
   ccEmails     String? // JSON array of emails
   createdAt    DateTime  @default(now())
   readAt       DateTime? // Set when the recipient (team or client) reads the message
+
+  // Twilio MessageSid for inbound idempotency + outbound observability.
+  // Partial-unique index in DB: WHERE "twilioMessageSid" IS NOT NULL.
+  twilioMessageSid String? @unique
 
   @@index([leadId])
   @@index([projectId])

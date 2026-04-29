@@ -3,42 +3,97 @@ import { prisma } from "@/lib/prisma";
 import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
+const ESTIMATE_ITEM_SELECT = {
+    id: true, code: true, title: true, status: true,
+    totalAmount: true, balanceDue: true, createdAt: true,
+    items: { where: { parentId: null }, orderBy: { order: "asc" }, select: { name: true, type: true, total: true } },
+} as const;
+
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
 
-    const { projectId, estimateId } = await req.json();
-    if (!projectId) return NextResponse.json({ error: "projectId required" }, { status: 400 });
+    const body = await req.json();
+    const { projectId, leadId, estimateId } = body as { projectId?: string; leadId?: string; estimateId?: string };
 
-    const [project, estimate, companySettings] = await Promise.all([
-        prisma.project.findUnique({
+    if (!projectId && !leadId) {
+        return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
+    }
+
+    const companySettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+
+    let clientName = "{{client_name}}";
+    let clientAddress = "{{client_address}}";
+    let entityName = "{{project_name}}";
+    let entityLocation: string | null = null;
+    let estimate: any = null;
+
+    if (projectId) {
+        // ── PROJECT PATH ──
+        const project = await prisma.project.findUnique({
             where: { id: projectId },
             include: { client: true },
-        }),
-        estimateId
-            ? prisma.estimate.findUnique({
-                where: { id: estimateId },
-                select: {
-                    id: true, code: true, title: true, status: true,
-                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
-                    items: { where: { parentId: null }, orderBy: { order: "asc" }, select: { name: true, type: true, total: true } },
-                },
-              })
-            : prisma.estimate.findFirst({
-                where: { projectId, status: { in: ["Approved", "Sent"] } },
-                select: {
-                    id: true, code: true, title: true, status: true,
-                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
-                    items: { where: { parentId: null }, orderBy: { order: "asc" }, select: { name: true, type: true, total: true } },
-                },
-              }),
-        prisma.companySettings.findUnique({ where: { id: "singleton" } }),
-    ]);
+        });
+        if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
 
-    if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
+        clientName = project.client?.name || "{{client_name}}";
+        clientAddress = [project.client?.addressLine1, project.client?.city, project.client?.state, project.client?.zipCode].filter(Boolean).join(", ") || "{{client_address}}";
+        entityName = project.name;
+        entityLocation = project.location;
+
+        estimate = estimateId
+            ? await prisma.estimate.findUnique({ where: { id: estimateId }, select: ESTIMATE_ITEM_SELECT })
+            : await prisma.estimate.findFirst({
+                where: { projectId, status: { in: ["Approved", "Sent"] } },
+                select: ESTIMATE_ITEM_SELECT,
+              });
+
+        // Fall back to any estimate if no approved/sent one
+        if (!estimate) {
+            estimate = await prisma.estimate.findFirst({
+                where: { projectId },
+                orderBy: { createdAt: "desc" },
+                select: ESTIMATE_ITEM_SELECT,
+            });
+        }
+    } else {
+        // ── LEAD PATH ──
+        const lead = await prisma.lead.findUnique({
+            where: { id: leadId },
+            include: { client: true },
+        });
+        if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+
+        clientName = lead.client?.name || "{{client_name}}";
+        clientAddress = [lead.client?.addressLine1, lead.client?.city, lead.client?.state, lead.client?.zipCode].filter(Boolean).join(", ") || "{{client_address}}";
+        entityName = lead.name;
+        entityLocation = lead.location ?? null;
+
+        estimate = await prisma.estimate.findFirst({
+            where: { leadId, status: { in: ["Approved", "Sent"] } },
+            orderBy: { createdAt: "desc" },
+            select: ESTIMATE_ITEM_SELECT,
+        });
+
+        // Fall back to any estimate on the lead
+        if (!estimate) {
+            estimate = await prisma.estimate.findFirst({
+                where: { leadId },
+                orderBy: { createdAt: "desc" },
+                select: ESTIMATE_ITEM_SELECT,
+            });
+        }
+
+        // No estimate at all — reject with a clear, actionable message
+        if (!estimate) {
+            return NextResponse.json({
+                error: "No estimate found for this lead. Create an estimate first so the AI can draft a contract with accurate scope and pricing.",
+            }, { status: 422 });
+        }
+    }
 
     const scopeItems = (estimate?.items || [])
-        .filter(i => i.type !== "Note")
-        .map(i => `- ${i.name}: $${Number(i.total).toLocaleString()}`)
+        .filter((i: any) => i.type !== "Note")
+        .map((i: any) => `- ${i.name}: $${Number(i.total).toLocaleString()}`)
         .join("\n");
 
     const prompt = `You are an expert construction contract attorney and contractor for residential remodeling in Vancouver, WA (Clark County).
@@ -52,7 +107,7 @@ PHONE: ${companySettings?.phone || ""}
 CLIENT: {{client_name}}
 CLIENT ADDRESS: {{client_address}}
 PROJECT: {{project_name}}
-LOCATION: ${project.location || "{{location}}"}
+LOCATION: ${entityLocation || "{{location}}"}
 DATE: {{date}}
 
 CONTRACT AMOUNT: $${Number(estimate?.totalAmount || 0).toLocaleString()}
