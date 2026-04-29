@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
+import { normalizeE164 } from "@/lib/phone";
 export const dynamic = 'force-dynamic';
 
 async function requireManagerSession() {
@@ -41,6 +42,13 @@ export async function PUT(
         const updateData: any = { ...data };
         if (initials) {
             updateData.initials = initials;
+        }
+        // Keep E.164 columns in sync when caller updates raw phone fields.
+        if ("primaryPhone" in data) {
+            updateData.primaryPhoneE164 = normalizeE164(data.primaryPhone);
+        }
+        if ("additionalPhone" in data) {
+            updateData.additionalPhoneE164 = normalizeE164(data.additionalPhone);
         }
 
         const client = await prisma.client.update({

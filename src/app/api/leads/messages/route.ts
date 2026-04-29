@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
-import { sendSMS } from "@/lib/sms";
+import { sendSMS, type SmsResult } from "@/lib/sms";
 
 export async function GET(request: Request) {
     const session = await getServerSession(authOptions);
@@ -83,6 +83,7 @@ export async function POST(request: Request) {
 
     let sentViaEmail = false;
     let sentViaSms = false;
+    let smsResult: SmsResult | null = null;
 
     if (!isScheduled) {
         const estimateLinksHtml = resolvedAttachments
@@ -117,9 +118,22 @@ export async function POST(request: Request) {
             const smsBody = resolvedAttachments.length > 0
                 ? `${companyName}: ${messageBody}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
                 : `${companyName}: ${messageBody}`;
-            await sendSMS(lead.client.primaryPhone, smsBody);
-            sentViaSms = true;
+            smsResult = await sendSMS(lead.client.primaryPhone, smsBody);
+            sentViaSms = smsResult.ok === true;
         }
+    }
+
+    let status: string;
+    if (isScheduled) {
+        status = "SCHEDULED";
+    } else if (channel === "email") {
+        status = sentViaEmail ? "SENT" : "FAILED";
+    } else if (channel === "sms") {
+        status = sentViaSms ? "SENT" : "FAILED";
+    } else if (channel === "both") {
+        status = (sentViaEmail || sentViaSms) ? "SENT" : "FAILED";
+    } else {
+        status = "SENT";
     }
 
     const message = await prisma.clientMessage.create({
@@ -134,9 +148,10 @@ export async function POST(request: Request) {
             attachments: resolvedAttachments.length > 0 ? JSON.stringify(resolvedAttachments) : null,
             sentViaEmail,
             sentViaSms,
-            status: isScheduled ? "SCHEDULED" : "SENT",
+            status,
             scheduledFor: isScheduled ? parseDate : null,
             ccEmails: ccEmails.length > 0 ? JSON.stringify(ccEmails) : null,
+            twilioMessageSid: smsResult?.ok ? smsResult.messageSid : null,
         },
     });
 

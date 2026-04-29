@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
-import { sendSMS } from "@/lib/sms";
+import { sendSMS, type SmsResult } from "@/lib/sms";
 
 // Prevent this hitting max duration, limit to batched amounts if needed
 // Vercel Cron hits this endpoint via GET
@@ -21,9 +21,8 @@ export async function GET(request: Request) {
                 scheduledFor: { lte: now }
             },
             include: {
-                lead: {
-                    include: { client: true }
-                }
+                lead: { include: { client: true } },
+                project: { include: { client: true } },
             },
             take: 20 // limit batch size per run
         });
@@ -41,8 +40,15 @@ export async function GET(request: Request) {
 
         for (const msg of scheduledMessages) {
             try {
-                const { lead, channel, body: messageBody, subject, senderName, attachments, ccEmails } = msg;
-                if (!lead) continue;
+                const { lead, project, channel, body: messageBody, subject, senderName, attachments, ccEmails } = msg;
+                // Resolve client from whichever side is bound (lead or project).
+                const client = lead?.client || project?.client || null;
+                if (!client) {
+                    console.warn(`[Cron] message ${msg.id} has no resolvable client (lead+project both missing); marking FAILED`);
+                    await prisma.clientMessage.update({ where: { id: msg.id }, data: { status: "FAILED" } });
+                    failCount++;
+                    continue;
+                }
 
                 const parsedAttachments: { type: string, id: string, name: string, url?: string }[] = attachments ? JSON.parse(attachments) : [];
                 const parsedCcEmails: string[] = ccEmails ? JSON.parse(ccEmails) : [];
@@ -69,12 +75,13 @@ export async function GET(request: Request) {
 
                 let sentViaEmail = false;
                 let sentViaSms = false;
+                let smsResult: SmsResult | null = null;
 
                 // Send email
-                if ((channel === "email" || channel === "both") && lead.client?.email) {
+                if ((channel === "email" || channel === "both") && client.email) {
                     const emailSubject = subject || `Message from ${companyName} about your project`;
                     await sendNotification(
-                        lead.client?.email,
+                        client.email,
                         emailSubject,
                         `<!DOCTYPE html>
                         <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
@@ -97,24 +104,33 @@ export async function GET(request: Request) {
                 }
 
                 // Send SMS
-                if ((channel === "sms" || channel === "both") && lead.client?.primaryPhone) {
+                if ((channel === "sms" || channel === "both") && client.primaryPhone) {
                     const smsBody = parsedAttachments.length > 0
                         ? `${companyName}: ${messageBody}\n\nView your estimate: ${parsedAttachments[0]?.url || appUrl}`
                         : `${companyName}: ${messageBody}`;
-                    await sendSMS(lead.client?.primaryPhone, smsBody);
-                    sentViaSms = true;
+                    smsResult = await sendSMS(client.primaryPhone, smsBody);
+                    sentViaSms = smsResult.ok === true;
                 }
+
+                // Determine status from actual delivery results across selected channels.
+                let finalStatus: "SENT" | "FAILED";
+                if (channel === "email") finalStatus = sentViaEmail ? "SENT" : "FAILED";
+                else if (channel === "sms") finalStatus = sentViaSms ? "SENT" : "FAILED";
+                else if (channel === "both") finalStatus = (sentViaEmail || sentViaSms) ? "SENT" : "FAILED";
+                else finalStatus = "SENT";
 
                 await prisma.clientMessage.update({
                     where: { id: msg.id },
                     data: {
-                        status: "SENT",
+                        status: finalStatus,
                         sentViaEmail: msg.sentViaEmail || sentViaEmail,
-                        sentViaSms: msg.sentViaSms || sentViaSms
+                        sentViaSms: msg.sentViaSms || sentViaSms,
+                        twilioMessageSid: smsResult?.ok ? smsResult.messageSid : msg.twilioMessageSid,
                     }
                 });
-                
-                sentCount++;
+
+                if (finalStatus === "SENT") sentCount++;
+                else failCount++;
             } catch (err) {
                 console.error(`[Cron] Error sending message ${msg.id}:`, err);
                 await prisma.clientMessage.update({

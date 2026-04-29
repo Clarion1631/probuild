@@ -11,6 +11,7 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
+import { normalizeE164 } from "./phone";
 
 // Build a CC array for a secondary client email (spouse/partner).
 // Returns undefined when additionalEmail is absent, empty, or identical to the primary (case-insensitive).
@@ -197,6 +198,7 @@ export async function createLead(data: { name: string; clientName: string; clien
                 initials,
                 email: data.clientEmail || null,
                 primaryPhone: data.clientPhone || null,
+                primaryPhoneE164: normalizeE164(data.clientPhone),
                 addressLine1: data.addressLine1 || null,
                 city: data.city || null,
                 state: data.state || null,
@@ -450,6 +452,7 @@ export async function createClient(data: { name: string; email?: string; company
             email: data.email || null,
             companyName: data.companyName || null,
             primaryPhone: data.primaryPhone || null,
+            primaryPhoneE164: normalizeE164(data.primaryPhone),
             addressLine1: data.addressLine1 || null,
             city: data.city || null,
             state: data.state || null,
@@ -470,6 +473,8 @@ export async function updateClient(clientId: string, data: { name?: string; emai
             email: data.email,
             additionalEmail: data.additionalEmail || undefined,
             primaryPhone: data.primaryPhone,
+            // Keep E164 in sync with the raw value when caller updates the phone.
+            ...(data.primaryPhone !== undefined ? { primaryPhoneE164: normalizeE164(data.primaryPhone) } : {}),
             addressLine1: data.addressLine1,
             city: data.city,
             state: data.state,

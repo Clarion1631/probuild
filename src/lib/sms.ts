@@ -1,45 +1,45 @@
-import twilio from 'twilio';
+import twilio from "twilio";
+import { normalizeE164 } from "./phone";
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 const fromNumber = process.env.TWILIO_PHONE_NUMBER;
+const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
 
-export async function sendSMS(toPhone: string, body: string) {
-    if (!toPhone) {
-        return;
+export type SmsResult =
+    | { ok: true; messageSid: string }
+    | { ok: false; error: string; mocked?: boolean };
+
+export async function sendSMS(toPhone: string, body: string): Promise<SmsResult> {
+    const normalized = normalizeE164(toPhone);
+    if (!normalized) {
+        return { ok: false, error: "invalid_phone" };
     }
 
-    // Normalize phone number — ensure it starts with +1 for US
-    let normalized = toPhone.replace(/[^+\d]/g, '');
-    if (!normalized.startsWith('+')) {
-        if (normalized.length === 10) {
-            normalized = '+1' + normalized;
-        } else if (normalized.length === 11 && normalized.startsWith('1')) {
-            normalized = '+' + normalized;
-        }
-    }
-
-    if (!accountSid || !authToken || !fromNumber) {
-        if (process.env.NODE_ENV !== 'production') {
+    const haveCreds = accountSid && authToken && (messagingServiceSid || fromNumber);
+    if (!haveCreds) {
+        if (process.env.NODE_ENV !== "production") {
             console.log("-----------------------------------------");
             console.log(`[MOCK SMS NOTIFICATION]`);
             console.log(`To: ${normalized}`);
-            console.log(`From: ${fromNumber || '+10000000000'}`);
             console.log(`Body: ${body}`);
             console.log("-----------------------------------------");
         }
-        return;
+        return { ok: false, error: "missing_credentials", mocked: true };
     }
 
     try {
-        const client = twilio(accountSid, authToken);
-        const message = await client.messages.create({
-            body,
-            from: fromNumber,
-            to: normalized,
-        });
-        return message;
-    } catch (error) {
-        console.error("Failed to send Twilio SMS:", error);
+        const client = twilio(accountSid!, authToken!);
+        const params: Record<string, string> = { body, to: normalized };
+        if (messagingServiceSid) {
+            params.messagingServiceSid = messagingServiceSid;
+        } else if (fromNumber) {
+            params.from = fromNumber;
+        }
+        const message = await client.messages.create(params as any);
+        return { ok: true, messageSid: message.sid };
+    } catch (err: any) {
+        console.error("[sendSMS] Twilio error:", err?.message || err);
+        return { ok: false, error: err?.message || "twilio_error" };
     }
 }

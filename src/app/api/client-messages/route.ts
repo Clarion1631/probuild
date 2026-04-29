@@ -3,13 +3,29 @@ import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
-import { sendSMS } from "@/lib/sms";
+import { sendSMS, type SmsResult } from "@/lib/sms";
 
-// GET /api/client-messages?leadId=X  OR  ?projectId=X
+// GET /api/client-messages?leadId=X  OR  ?projectId=X  OR  ?unmatched=true
 export async function GET(request: Request) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const { searchParams } = new URL(request.url);
     const leadId = searchParams.get("leadId");
     const projectId = searchParams.get("projectId");
+    const unmatched = searchParams.get("unmatched") === "true";
+
+    if (unmatched) {
+        // Inbound SMS from numbers we couldn't match to any Client are stored
+        // with both leadId and projectId null. Surface them via this filter.
+        const messages = await prisma.clientMessage.findMany({
+            where: { leadId: null, projectId: null, direction: "INBOUND" },
+            orderBy: { createdAt: "desc" },
+        });
+        return NextResponse.json({ messages });
+    }
 
     if (!leadId && !projectId) {
         return NextResponse.json({ error: "leadId or projectId required" }, { status: 400 });
@@ -26,6 +42,9 @@ export async function GET(request: Request) {
 // POST /api/client-messages — send an outbound message to the client
 export async function POST(request: Request) {
     const session = await getServerSession(authOptions);
+    if (!session?.user?.email) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
     const body = await request.json();
     const {
         leadId,
@@ -115,6 +134,7 @@ export async function POST(request: Request) {
 
     let sentViaEmail = false;
     let sentViaSms = false;
+    let smsResult: SmsResult | null = null;
 
     if (!isScheduled) {
         const estimateLinksHtml = resolvedAttachments
@@ -124,34 +144,52 @@ export async function POST(request: Request) {
 
         if ((channel === "email" || channel === "both") && clientEmail) {
             const emailSubject = subject || `Message from ${companyName} about your project`;
-            await sendNotification(
-                clientEmail,
-                emailSubject,
-                `<!DOCTYPE html>
-                <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:40px 20px;color:#333;">
-                    <div style="text-align:center;margin-bottom:32px;"><h1 style="font-size:24px;font-weight:700;margin:0;">${companyName}</h1></div>
-                    <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:32px;">
-                        <p style="color:#666;margin:0 0 8px;">From: <strong>${senderName}</strong></p>
-                        <div style="background:#f3f4f6;border-radius:8px;padding:16px;margin:16px 0;">
-                            <p style="margin:0;line-height:1.6;white-space:pre-wrap;">${messageBody}</p>
+            try {
+                await sendNotification(
+                    clientEmail,
+                    emailSubject,
+                    `<!DOCTYPE html>
+                    <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:40px 20px;color:#333;">
+                        <div style="text-align:center;margin-bottom:32px;"><h1 style="font-size:24px;font-weight:700;margin:0;">${companyName}</h1></div>
+                        <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:32px;">
+                            <p style="color:#666;margin:0 0 8px;">From: <strong>${senderName}</strong></p>
+                            <div style="background:#f3f4f6;border-radius:8px;padding:16px;margin:16px 0;">
+                                <p style="margin:0;line-height:1.6;white-space:pre-wrap;">${messageBody}</p>
+                            </div>
+                            ${estimateLinksHtml ? `<div style="margin-top:20px;text-align:center;">${estimateLinksHtml}</div>` : ""}
                         </div>
-                        ${estimateLinksHtml ? `<div style="margin-top:20px;text-align:center;">${estimateLinksHtml}</div>` : ""}
-                    </div>
-                    <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
-                </body></html>`,
-                emailAttachments.length > 0 ? emailAttachments : undefined,
-                { fromName: companyName, replyTo: settings?.email || undefined, cc: resolvedCcEmails.length > 0 ? resolvedCcEmails : undefined }
-            );
-            sentViaEmail = true;
+                        <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
+                    </body></html>`,
+                    emailAttachments.length > 0 ? emailAttachments : undefined,
+                    { fromName: companyName, replyTo: settings?.email || undefined, cc: resolvedCcEmails.length > 0 ? resolvedCcEmails : undefined }
+                );
+                sentViaEmail = true;
+            } catch (e) {
+                console.error("[clientMessages] email send failed:", e);
+            }
         }
 
         if ((channel === "sms" || channel === "both") && clientPhone) {
             const smsBody = resolvedAttachments.length > 0
                 ? `${companyName}: ${messageBody}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
                 : `${companyName}: ${messageBody}`;
-            await sendSMS(clientPhone, smsBody);
-            sentViaSms = true;
+            smsResult = await sendSMS(clientPhone, smsBody);
+            sentViaSms = smsResult.ok === true;
         }
+    }
+
+    // status is FAILED only if all selected channels failed; SCHEDULED if deferred; otherwise SENT.
+    let status: string;
+    if (isScheduled) {
+        status = "SCHEDULED";
+    } else if (channel === "email") {
+        status = sentViaEmail ? "SENT" : "FAILED";
+    } else if (channel === "sms") {
+        status = sentViaSms ? "SENT" : "FAILED";
+    } else if (channel === "both") {
+        status = (sentViaEmail || sentViaSms) ? "SENT" : "FAILED";
+    } else {
+        status = "SENT"; // "app" channel — internal-only, no external delivery
     }
 
     const message = await prisma.clientMessage.create({
@@ -167,9 +205,10 @@ export async function POST(request: Request) {
             attachments: resolvedAttachments.length > 0 ? JSON.stringify(resolvedAttachments) : null,
             sentViaEmail,
             sentViaSms,
-            status: isScheduled ? "SCHEDULED" : "SENT",
+            status,
             scheduledFor: isScheduled ? parseDate : null,
             ccEmails: resolvedCcEmails.length > 0 ? JSON.stringify(resolvedCcEmails) : null,
+            twilioMessageSid: smsResult?.ok ? smsResult.messageSid : null,
         },
     });
 
