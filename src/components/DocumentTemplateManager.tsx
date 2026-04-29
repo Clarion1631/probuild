@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { getDocumentTemplates, createDocumentTemplate, updateDocumentTemplate, deleteDocumentTemplate, getCompanySettings } from "@/lib/actions";
 import { toast } from "sonner";
+import DOMPurify from "dompurify";
 
 type Template = {
     id: string;
@@ -85,6 +86,11 @@ const typeColors: Record<string, string> = {
     contract: "bg-purple-50 text-purple-700 border-purple-200",
     disclaimer: "bg-amber-50 text-amber-700 border-amber-200",
     lien_release: "bg-rose-50 text-rose-700 border-rose-200",
+    change_order: "bg-orange-50 text-orange-700 border-orange-200",
+    draw_request: "bg-emerald-50 text-emerald-700 border-emerald-200",
+    warranty: "bg-teal-50 text-teal-700 border-teal-200",
+    punch_list: "bg-slate-100 text-slate-700 border-slate-300",
+    addendum: "bg-indigo-50 text-indigo-700 border-indigo-200",
 };
 
 const typeLabels: Record<string, string> = {
@@ -92,7 +98,16 @@ const typeLabels: Record<string, string> = {
     contract: "Contract",
     disclaimer: "Disclaimer",
     lien_release: "Lien Release",
+    change_order: "Change Order",
+    draw_request: "Draw Request",
+    warranty: "Warranty",
+    punch_list: "Punch List",
+    addendum: "Addendum",
 };
+
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
 function resolvePreview(html: string, company: CompanySettings): string {
     const data: Record<string, string> = {};
@@ -106,7 +121,7 @@ function resolvePreview(html: string, company: CompanySettings): string {
 
     return html.replace(/\{\{(\w+)\}\}/g, (match, key) => {
         const value = data[key];
-        if (value) return `<span style="background: #dbeafe; padding: 1px 4px; border-radius: 4px; font-weight: 600;">${value}</span>`;
+        if (value) return `<span style="background: #dbeafe; padding: 1px 4px; border-radius: 4px; font-weight: 600;">${escapeHtml(value)}</span>`;
         return `<span style="background: #fef3c7; padding: 1px 4px; border-radius: 4px; color: #92400e;">${match}</span>`;
     });
 }
@@ -289,7 +304,12 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                             >
                                 <option value="terms">Terms & Conditions</option>
                                 <option value="contract">Contract</option>
+                                <option value="change_order">Change Order</option>
+                                <option value="draw_request">Draw Request</option>
                                 <option value="lien_release">Lien Release</option>
+                                <option value="warranty">Warranty</option>
+                                <option value="punch_list">Punch List</option>
+                                <option value="addendum">Addendum</option>
                                 <option value="disclaimer">Disclaimer</option>
                             </select>
                         )}
@@ -403,7 +423,7 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                                         {form.body ? (
                                             <div
                                                 className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-headings:font-semibold prose-p:text-slate-600 prose-p:leading-relaxed prose-strong:text-slate-800 prose-li:text-slate-600"
-                                                dangerouslySetInnerHTML={{ __html: resolvePreview(form.body, company) }}
+                                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(resolvePreview(form.body, company)) }}
                                             />
                                         ) : (
                                             <div className="text-center py-16 text-slate-400">

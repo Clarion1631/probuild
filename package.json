@@ -91,6 +91,8 @@
     "draco3dgltf": "^1.5.7",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
     "tailwindcss": "^4",
     "tsx": "^4.19.2",
     "typescript": "^5"

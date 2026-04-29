@@ -45,7 +45,13 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
     const [blankTitle, setBlankTitle] = useState("");
     const [blankBody, setBlankBody] = useState("");
 
-    const contractTemplates = templates.filter(t => t.type === "contract" || t.type === "lien_release");
+    const contractTemplates = templates; // all types available for selection
+
+    const templateTypeLabel: Record<string, string> = {
+        contract: "Contract", lien_release: "Lien Release", change_order: "Change Order",
+        draw_request: "Draw Request", warranty: "Warranty", punch_list: "Punch List",
+        addendum: "Addendum", disclaimer: "Disclaimer", terms: "Terms & Conditions",
+    };
 
     // Auto-open create menu if navigated with ?action=create
     useEffect(() => {
@@ -427,7 +433,7 @@ export default function LeadContractsClient({ leadId, leadName, clientName, cont
                                             <div>
                                                 <p className="text-sm font-medium text-slate-800 uppercase tracking-wide">{t.name}</p>
                                                 <p className="text-xs text-slate-400 mt-0.5">
-                                                    {t.type === "lien_release" ? "Lien Release" : "Contract"}
+                                                    {templateTypeLabel[t.type] ?? t.type}
                                                 </p>
                                             </div>
                                             {selectedTemplate === t.id && (

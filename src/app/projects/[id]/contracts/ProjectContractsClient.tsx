@@ -43,7 +43,19 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
     const [contractorSignModal, setContractorSignModal] = useState<any>(null);
     const [signingAsContractor, setSigningAsContractor] = useState(false);
 
-    const contractTemplates = templates.filter(t => t.type === "contract" || t.type === "lien_release");
+    const contractTemplates = templates; // all types available for selection
+
+    const templateTypeLabel: Record<string, string> = {
+        contract: "Contracts", lien_release: "Lien Releases", change_order: "Change Orders",
+        draw_request: "Draw Requests", warranty: "Warranties", punch_list: "Punch Lists",
+        addendum: "Addenda", disclaimer: "Disclaimers", terms: "Terms & Conditions",
+    };
+
+    // Group templates by type for the picker optgroups.
+    const templatesByType = contractTemplates.reduce<Record<string, typeof contractTemplates>>((acc, t) => {
+        (acc[t.type] ??= []).push(t);
+        return acc;
+    }, {});
 
     const handleContractorSign = async (dataUrl: string, name: string) => {
         if (!contractorSignModal) return;
@@ -342,23 +354,20 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
             {showModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
                     <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
-                        <h3 className="text-lg font-bold text-hui-textMain mb-1">Create Contract / Lien Release</h3>
+                        <h3 className="text-lg font-bold text-hui-textMain mb-1">Create Document from Template</h3>
                         <p className="text-sm text-hui-textMuted mb-5">Merge fields will auto-fill from project data.</p>
                         <div className="space-y-4">
                             <div>
                                 <label className="block text-sm font-medium text-hui-textMain mb-1">Template</label>
                                 <select value={selectedTemplate} onChange={e => handleTemplateChange(e.target.value)} className="hui-input w-full">
                                     <option value="">Select a template...</option>
-                                    <optgroup label="Contracts">
-                                        {contractTemplates.filter(t => t.type === "contract").map(t => (
-                                            <option key={t.id} value={t.id}>{t.name}</option>
-                                        ))}
-                                    </optgroup>
-                                    <optgroup label="Lien Releases">
-                                        {contractTemplates.filter(t => t.type === "lien_release").map(t => (
-                                            <option key={t.id} value={t.id}>{t.name}</option>
-                                        ))}
-                                    </optgroup>
+                                    {Object.entries(templatesByType).map(([type, group]) => (
+                                        <optgroup key={type} label={templateTypeLabel[type] ?? type}>
+                                            {group.map(t => (
+                                                <option key={t.id} value={t.id}>{t.name}</option>
+                                            ))}
+                                        </optgroup>
+                                    ))}
                                 </select>
                             </div>
                             <div className="bg-slate-50 border border-slate-200 rounded-lg p-4">
