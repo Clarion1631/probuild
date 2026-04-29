@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import DOMPurify from "dompurify";
 import Avatar from "@/components/Avatar";
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
@@ -300,7 +301,7 @@ export default function ClientMessaging({
                                     <div className={`min-w-0 ${isSidebar ? "max-w-[85%]" : "max-w-[70%]"} ${isOutbound ? "items-end" : ""}`}>
                                         {!isOutbound && <p className="text-[10px] font-semibold text-slate-500 mb-1 ml-1">{msg.senderName}</p>}
                                         <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm overflow-hidden ${isOutbound ? "bg-green-600 text-white rounded-br-md" : "bg-white text-hui-textMain border border-slate-200 rounded-bl-md"}`}>
-                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none [overflow-wrap:anywhere] [&_a]:[word-break:break-all] [&_a]:[overflow-wrap:anywhere]" dangerouslySetInnerHTML={{ __html: msg.body }} />
+                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none [overflow-wrap:anywhere] [&_a]:[word-break:break-all] [&_a]:[overflow-wrap:anywhere]" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.body ?? "") }} />
                                             {atts.length > 0 && (
                                                 <div className="mt-2 pt-2 border-t border-white/20 flex flex-wrap gap-2">
                                                     {atts.map((a: any, i: number) => (
@@ -540,7 +541,7 @@ export default function ClientMessaging({
                                     <div className="border border-slate-200 rounded-xl p-8">
                                         <p className="text-slate-600 mb-4 mt-0">From: <strong>Team</strong></p>
                                         <div className="bg-slate-50 rounded-lg p-4 my-4">
-                                            <div className="m-0 leading-relaxed text-slate-800 prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: messageText || "Your message will appear here..." }} />
+                                            <div className="m-0 leading-relaxed text-slate-800 prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(messageText || "Your message will appear here...") }} />
                                         </div>
                                         {attachedEstimates.length > 0 && (
                                             <div className="mt-6 text-center">
