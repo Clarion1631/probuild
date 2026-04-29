@@ -1,11 +1,6 @@
 import twilio from "twilio";
 import { normalizeE164 } from "./phone";
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const fromNumber = process.env.TWILIO_PHONE_NUMBER;
-const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-
 export type SmsResult =
     | { ok: true; messageSid: string }
     | { ok: false; error: string; mocked?: boolean };
@@ -16,6 +11,12 @@ export async function sendSMS(toPhone: string, body: string): Promise<SmsResult>
         return { ok: false, error: "invalid_phone" };
     }
 
+    // Read at call time so warm instances always see current env vars.
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_PHONE_NUMBER;
+    const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
+
     const haveCreds = accountSid && authToken && (messagingServiceSid || fromNumber);
     if (!haveCreds) {
         if (process.env.NODE_ENV !== "production") {
@@ -24,6 +25,8 @@ export async function sendSMS(toPhone: string, body: string): Promise<SmsResult>
             console.log(`To: ${normalized}`);
             console.log(`Body: ${body}`);
             console.log("-----------------------------------------");
+        } else {
+            console.error("[sendSMS] missing credentials — accountSid:", !!accountSid, "authToken:", !!authToken, "messagingServiceSid:", !!messagingServiceSid, "fromNumber:", !!fromNumber);
         }
         return { ok: false, error: "missing_credentials", mocked: true };
     }
