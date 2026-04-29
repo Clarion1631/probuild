@@ -29,11 +29,17 @@ export async function POST(request: Request) {
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const signature = request.headers.get("x-twilio-signature") || "";
 
-    // Reconstruct the URL Twilio actually called (don't trust NEXT_PUBLIC_APP_URL —
-    // Twilio signs against the exact public URL it hit, including scheme + host).
-    const fwdProto = request.headers.get("x-forwarded-proto") || "https";
-    const fwdHost = request.headers.get("x-forwarded-host") || request.headers.get("host") || "";
-    const reconstructedUrl = `${fwdProto}://${fwdHost}/api/twilio/inbound`;
+    // Reconstruct the URL Twilio signed against. Vercel's x-forwarded-host can
+    // resolve to an internal deployment URL rather than the custom domain, causing
+    // signature mismatch. NEXT_PUBLIC_APP_URL is the authoritative public base and
+    // matches exactly what we configured in the Twilio Messaging Service webhook.
+    const appBase = process.env.NEXT_PUBLIC_APP_URL
+        || (() => {
+            const proto = request.headers.get("x-forwarded-proto") || "https";
+            const host = request.headers.get("x-forwarded-host") || request.headers.get("host") || "";
+            return `${proto}://${host}`;
+        })();
+    const reconstructedUrl = `${appBase}/api/twilio/inbound`;
 
     // Production: fail closed if creds missing or signature invalid.
     // Dev: skip validation only when TWILIO_AUTH_TOKEN is unset.
