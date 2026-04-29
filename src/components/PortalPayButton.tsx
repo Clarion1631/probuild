@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { formatCurrency } from "@/lib/utils";
 
 export default function PortalPayButton({
@@ -21,6 +21,8 @@ export default function PortalPayButton({
     const [isLoading, setIsLoading] = useState(false);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [selectedMethod, setSelectedMethod] = useState<string>("card");
+    const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
+    const inFlight = useRef(false);
 
     // Fee calculations — coerce all Decimal-sourced values to Number to prevent string concatenation
     const passFee = settings?.passProcessingFee === true;
@@ -32,10 +34,10 @@ export default function PortalPayButton({
     const feeAmount = (passFee && isFeeMethod) ? ((Number(amount) * (rate / 100)) + flat) : 0;
     const totalAmount = Number(amount) + feeAmount;
 
-    // Default to card initially, or whatever is enabled
-    // Only one method might be enabled, handle that if necessary.
-
     const handlePay = async (method: string) => {
+        if (inFlight.current) return;
+        inFlight.current = true;
+        setCheckoutUrl(null);
         setIsLoading(true);
         try {
             const res = await fetch("/api/payments/create-session", {
@@ -55,52 +57,71 @@ export default function PortalPayButton({
             }
 
             const { url } = await res.json();
-            if (url) {
-                window.location.href = url;
-            } else {
-                throw new Error("No URL returned from Stripe");
-            }
+            if (!url) throw new Error("No URL returned from Stripe");
+            setCheckoutUrl(url);
+            // Anchor below is the navigation path — no programmatic redirect.
         } catch (error: any) {
             console.error(error);
             alert(`Unable to process payment right now:\n\n${error.message || error}`);
             setIsLoading(false);
+            inFlight.current = false;
         }
     };
 
     const handleButtonClick = () => {
-        // If settings aren't provided or only one method or no pass fee, we could skip.
-        // But let's show the modal if multiple methods OR fees are involved.
         if (!settings || (!settings.enableBankTransfer && !settings.enableAffirm && !settings.enableKlarna && !settings.passProcessingFee)) {
-            // Just go straight to card checkout if nothing else is configured
             handlePay("card");
         } else {
             setIsModalOpen(true);
         }
     };
 
+    const outerClasses = "flex-shrink-0 w-auto px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded-md shadow-sm transition-colors flex items-center justify-center gap-2 no-underline";
+    const modalCtaClasses = "w-full mt-4 bg-emerald-600 hover:bg-emerald-700 text-white py-3 rounded-lg font-bold transition flex items-center justify-center gap-2 no-underline";
+
     return (
         <>
-            <button
-                onClick={handleButtonClick}
-                className="flex-shrink-0 w-full sm:w-auto px-4 py-2 bg-hui-primary hover:bg-hui-primaryHover text-white text-sm font-medium rounded-md shadow-sm transition-colors flex items-center justify-center gap-2"
-            >
-                {label} - ${Number(amount).toLocaleString()}
-            </button>
+            {checkoutUrl && !isModalOpen ? (
+                <a
+                    data-pay-button
+                    href={checkoutUrl}
+                    target="_top"
+                    className={outerClasses}
+                >
+                    Tap to continue to secure checkout →
+                </a>
+            ) : (
+                <button
+                    data-pay-button
+                    onClick={handleButtonClick}
+                    disabled={isLoading}
+                    className={outerClasses}
+                >
+                    {isLoading && !isModalOpen ? (
+                        <>
+                            <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            Connecting…
+                        </>
+                    ) : (
+                        <>{label} - ${Number(amount).toLocaleString()}</>
+                    )}
+                </button>
+            )}
 
             {isModalOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 animate-in fade-in duration-200">
                     <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col animate-in zoom-in-95 duration-200">
                         <div className="p-6 border-b border-gray-100 flex items-center justify-between">
                             <h3 className="text-xl font-bold text-hui-textMain">Choose Payment Method</h3>
-                            <button onClick={() => !isLoading && setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600 transition">
+                            <button onClick={() => !isLoading && !checkoutUrl && setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600 transition" aria-label="Close">
                                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                             </button>
                         </div>
-                        
+
                         <div className="p-6 space-y-4">
                             {settings?.enableCard !== false && (
-                                <label className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-all ${selectedMethod === 'card' ? 'border-hui-primary bg-hui-primary/5 ring-1 ring-hui-primary' : 'border-gray-200 hover:border-gray-300 bg-white'}`}>
-                                    <input type="radio" name="payment_method" value="card" checked={selectedMethod === 'card'} onChange={() => setSelectedMethod('card')} className="mt-1 w-4 h-4 text-hui-primary focus:ring-hui-primary" />
+                                <label className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-all ${selectedMethod === 'card' ? 'border-emerald-600 bg-emerald-50 ring-1 ring-emerald-600' : 'border-gray-200 hover:border-gray-300 bg-white'}`}>
+                                    <input type="radio" name="payment_method" value="card" checked={selectedMethod === 'card'} onChange={() => setSelectedMethod('card')} className="mt-1 w-4 h-4 text-emerald-600 focus:ring-emerald-600" />
                                     <div className="flex-1">
                                         <div className="flex justify-between items-center mb-1">
                                             <span className="font-semibold text-gray-900">Credit / Debit Card</span>
@@ -120,8 +141,8 @@ export default function PortalPayButton({
                             )}
 
                             {settings?.enableBankTransfer && (
-                                <label className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-all ${selectedMethod === 'us_bank_account' ? 'border-hui-primary bg-hui-primary/5 ring-1 ring-hui-primary' : 'border-gray-200 hover:border-gray-300 bg-white'}`}>
-                                    <input type="radio" name="payment_method" value="us_bank_account" checked={selectedMethod === 'us_bank_account'} onChange={() => setSelectedMethod('us_bank_account')} className="mt-1 w-4 h-4 text-hui-primary focus:ring-hui-primary" />
+                                <label className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-all ${selectedMethod === 'us_bank_account' ? 'border-emerald-600 bg-emerald-50 ring-1 ring-emerald-600' : 'border-gray-200 hover:border-gray-300 bg-white'}`}>
+                                    <input type="radio" name="payment_method" value="us_bank_account" checked={selectedMethod === 'us_bank_account'} onChange={() => setSelectedMethod('us_bank_account')} className="mt-1 w-4 h-4 text-emerald-600 focus:ring-emerald-600" />
                                     <div className="flex-1">
                                         <div className="flex justify-between items-center mb-1">
                                             <span className="font-semibold text-gray-900">ACH Bank Transfer</span>
@@ -135,8 +156,6 @@ export default function PortalPayButton({
                                     </div>
                                 </label>
                             )}
-
-                            {/* Additional methods like Affirm/Klarna can be added here if needed */}
                         </div>
 
                         <div className="bg-gray-50 p-6 space-y-3">
@@ -155,20 +174,32 @@ export default function PortalPayButton({
                                 <span>{formatCurrency(totalAmount)}</span>
                             </div>
 
-                            <button
-                                onClick={() => handlePay(selectedMethod)}
-                                disabled={isLoading}
-                                className="w-full mt-4 bg-hui-primary hover:bg-hui-primaryHover text-white py-3 rounded-lg font-bold transition flex items-center justify-center gap-2"
-                            >
-                                {isLoading ? (
-                                    <>
-                                        <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                                        Connecting securely to Stripe...
-                                    </>
-                                ) : (
-                                    `Continue to Checkout`
-                                )}
-                            </button>
+                            {checkoutUrl ? (
+                                <a
+                                    data-pay-button
+                                    href={checkoutUrl}
+                                    target="_top"
+                                    className={modalCtaClasses}
+                                >
+                                    Tap to continue to secure checkout →
+                                </a>
+                            ) : (
+                                <button
+                                    data-pay-button
+                                    onClick={() => handlePay(selectedMethod)}
+                                    disabled={isLoading}
+                                    className={modalCtaClasses}
+                                >
+                                    {isLoading ? (
+                                        <>
+                                            <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                            Connecting securely to Stripe…
+                                        </>
+                                    ) : (
+                                        `Continue to Checkout`
+                                    )}
+                                </button>
+                            )}
                         </div>
                     </div>
                 </div>

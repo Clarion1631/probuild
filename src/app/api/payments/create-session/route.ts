@@ -4,9 +4,13 @@ import { toNum } from "@/lib/prisma-helpers";
 import { stripe } from "@/lib/stripe";
 
 export async function POST(req: Request) {
+    const requestId = Math.random().toString(36).slice(2, 10);
+    const ua = req.headers.get("user-agent") || "";
     try {
         const body = await req.json();
         const { invoiceId, estimateId, paymentScheduleId, selectedMethod } = body;
+
+        console.info("[create-session] enter", { requestId, ua, paymentScheduleId, invoiceId, estimateId, selectedMethod });
 
         if (!paymentScheduleId) {
             return new NextResponse("Missing paymentScheduleId", { status: 400 });
@@ -17,6 +21,12 @@ export async function POST(req: Request) {
 
         const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || "http://localhost:3000";
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        // Idempotency key includes the schedule's current amount so admin amount edits invalidate
+        // any stale session, but rapid double-taps within the same amount window dedupe to one session.
+        const scheduleAmount = estimateId
+            ? (await prisma.estimatePaymentSchedule.findUnique({ where: { id: paymentScheduleId }, select: { amount: true } }))?.amount?.toString() || "0"
+            : (await prisma.paymentSchedule.findUnique({ where: { id: paymentScheduleId }, select: { amount: true } }))?.amount?.toString() || "0";
+        const idempotencyKey = `pay-session:${paymentScheduleId}:${selectedMethod || "default"}:${scheduleAmount}`;
 
         // Build payment method types
         const paymentMethodTypes: any[] = [];
@@ -114,13 +124,14 @@ export async function POST(req: Request) {
                     estimatePaymentScheduleId: schedule.id,
                     projectId: estimate.projectId || "none",
                 },
-            });
+            }, { idempotencyKey });
 
             await prisma.estimatePaymentSchedule.update({
                 where: { id: schedule.id },
                 data: { stripeSessionId: stripeSession.id },
             });
 
+            console.info("[create-session] success", { requestId, branch: "estimate", sessionId: stripeSession.id, paymentScheduleId });
             return NextResponse.json({ url: stripeSession.url });
         }
 
@@ -203,17 +214,18 @@ export async function POST(req: Request) {
                 paymentScheduleId: paymentSchedule.id,
                 projectId: projectId || "none",
             },
-        });
+        }, { idempotencyKey });
 
         await prisma.paymentSchedule.update({
             where: { id: paymentSchedule.id },
             data: { stripeSessionId: stripeSession.id },
         });
 
+        console.info("[create-session] success", { requestId, branch: "invoice", sessionId: stripeSession.id, paymentScheduleId });
         return NextResponse.json({ url: stripeSession.url });
 
     } catch (error: any) {
-        console.error("Error creating stripe session:", error);
+        console.error("[create-session] error", { requestId, message: error?.message, stack: error?.stack });
         return new NextResponse(error?.message || "Internal Server Error", { status: 500 });
     }
 }

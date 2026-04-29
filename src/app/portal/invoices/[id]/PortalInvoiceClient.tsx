@@ -5,11 +5,68 @@ import { markInvoiceViewed } from "@/lib/actions";
 import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
 
+class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
+    constructor(props: { children: React.ReactNode }) {
+        super(props);
+        this.state = { hasError: false };
+    }
+    static getDerivedStateFromError() {
+        return { hasError: true };
+    }
+    componentDidCatch(error: Error, info: React.ErrorInfo) {
+        console.error("[payment-section-error]", { message: error.message, stack: error.stack, info });
+    }
+    render() {
+        if (this.state.hasError) {
+            return (
+                <div className="px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
+                    Something went wrong loading the payment section. Please refresh the page or contact us to complete your payment.
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
 export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
 
     useEffect(() => {
         markInvoiceViewed(initialInvoice.id).catch(console.error);
+    }, [initialInvoice.id]);
+
+    // Telemetry: log Pay-button DOM state on mount so we can confirm visibility on iPhone customers
+    useEffect(() => {
+        const t = setTimeout(() => {
+            try {
+                const buttons = document.querySelectorAll('[data-pay-button]');
+                const report = Array.from(buttons).map(el => {
+                    const cs = window.getComputedStyle(el);
+                    const r = (el as HTMLElement).getBoundingClientRect();
+                    return {
+                        visible: r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) > 0,
+                        bg: cs.backgroundColor,
+                        color: cs.color,
+                        rect: { w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top), left: Math.round(r.left) },
+                        tag: el.tagName.toLowerCase(),
+                    };
+                });
+                console.info("[pay-button-render]", {
+                    page: "invoice",
+                    invoiceId: initialInvoice.id,
+                    ua: navigator.userAgent,
+                    viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
+                    buttonCount: buttons.length,
+                    buttons: report,
+                });
+                if ((window as any).Sentry?.addBreadcrumb) {
+                    (window as any).Sentry.addBreadcrumb({ category: "pay-button", level: "info", data: { page: "invoice", ua: navigator.userAgent, buttonCount: buttons.length, buttons: report } });
+                }
+            } catch (err) {
+                console.error("[pay-button-render] telemetry failed:", err);
+            }
+        }, 250);
+        return () => clearTimeout(t);
     }, [initialInvoice.id]);
 
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
@@ -137,6 +194,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                     {/* Payment Schedule */}
                     {initialInvoice.payments && initialInvoice.payments.length > 0 && (
+                        <PaymentSectionErrorBoundary>
                         <div className="px-10 py-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-4">Payment Schedule</h2>
                             <div className="space-y-3">
@@ -198,6 +256,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                 })}
                             </div>
                         </div>
+                        </PaymentSectionErrorBoundary>
                     )}
 
                     {/* Footer */}

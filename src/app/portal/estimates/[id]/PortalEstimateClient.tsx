@@ -9,6 +9,29 @@ import PortalPayButton from "@/components/PortalPayButton";
 import PortalPayInFullButton from "@/components/PortalPayInFullButton";
 import { formatCurrency } from "@/lib/utils";
 
+class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
+    constructor(props: { children: React.ReactNode }) {
+        super(props);
+        this.state = { hasError: false };
+    }
+    static getDerivedStateFromError() {
+        return { hasError: true };
+    }
+    componentDidCatch(error: Error, info: React.ErrorInfo) {
+        console.error("[payment-section-error]", { message: error.message, stack: error.stack, info });
+    }
+    render() {
+        if (this.state.hasError) {
+            return (
+                <div className="px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
+                    Something went wrong loading the payment section. Please refresh the page or contact us to complete your payment.
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
 export default function PortalEstimateClient({ initialEstimate, companySettings }: { initialEstimate: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
     const [signature, setSignature] = useState("");
@@ -318,6 +341,44 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         schedules.length === 0 ||
         schedules.some(s => s.name === "Payment in Full" && s.status !== "Paid" && !s.stripeSessionId)
     );
+
+    // Telemetry: log Pay-button DOM state on mount so we can confirm visibility on iPhone customers
+    useEffect(() => {
+        const t = setTimeout(() => {
+            try {
+                const buttons = document.querySelectorAll('[data-pay-button]');
+                const report = Array.from(buttons).map(el => {
+                    const cs = window.getComputedStyle(el);
+                    const r = (el as HTMLElement).getBoundingClientRect();
+                    return {
+                        visible: r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) > 0,
+                        bg: cs.backgroundColor,
+                        color: cs.color,
+                        rect: { w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top), left: Math.round(r.left) },
+                        tag: el.tagName.toLowerCase(),
+                    };
+                });
+                console.info("[pay-button-render]", {
+                    page: "estimate",
+                    estimateId: initialEstimate.id,
+                    ua: navigator.userAgent,
+                    viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
+                    gates: { isApproved, stripeEnabled, scheduleCount: schedules.length, paymentStatus, showPayInFull },
+                    buttonCount: buttons.length,
+                    buttons: report,
+                });
+                if ((window as any).Sentry?.addBreadcrumb) {
+                    (window as any).Sentry.addBreadcrumb({ category: "pay-button", level: "info", data: { page: "estimate", ua: navigator.userAgent, buttonCount: buttons.length, buttons: report } });
+                }
+            } catch (err) {
+                console.error("[pay-button-render] telemetry failed:", err);
+            }
+        }, 250);
+        return () => clearTimeout(t);
+        // Mount-only: capture initial render state. Gate values are read fresh inside the effect.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [initialEstimate.id]);
+
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
@@ -536,15 +597,18 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                     {/* Pay in Full — hidden in capture mode */}
                     {showPayInFull && !isCapture && (
-                        <PortalPayInFullButton
-                            estimateId={initialEstimate.id}
-                            displayAmount={total}
-                            settings={companySettings}
-                        />
+                        <PaymentSectionErrorBoundary>
+                            <PortalPayInFullButton
+                                estimateId={initialEstimate.id}
+                                displayAmount={total}
+                                settings={companySettings}
+                            />
+                        </PaymentSectionErrorBoundary>
                     )}
 
                     {/* Payment Schedule — hide auto-created "Payment in Full" rows from milestone list */}
                     {schedules.filter((s: any) => s.name !== "Payment in Full").length > 0 && (
+                        <PaymentSectionErrorBoundary>
                         <div className="px-10 pb-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment Schedule</h2>
                             <div className="border border-slate-200 rounded-md overflow-hidden">
@@ -588,6 +652,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 })}
                             </div>
                         </div>
+                        </PaymentSectionErrorBoundary>
                     )}
 
                     {/* Terms & Conditions */}
