@@ -57,6 +57,9 @@ export async function POST(req: Request) {
             const estimate = schedule.estimate;
             const clientName =
                 estimate.project?.client?.name || estimate.lead?.client?.name || "Client";
+            const rawClientEmail =
+                (estimate.project?.client?.email || estimate.lead?.client?.email || "").trim();
+            const clientEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawClientEmail) ? rawClientEmail : null;
             const projectName =
                 estimate.project?.name || estimate.lead?.name || "Services";
 
@@ -100,6 +103,12 @@ export async function POST(req: Request) {
                 mode: "payment",
                 success_url: `${appUrl}/portal/estimates/${estimateId}?payment=success`,
                 cancel_url: `${appUrl}/portal/estimates/${estimateId}?payment=cancelled`,
+                ...(clientEmail
+                    ? {
+                        customer_email: clientEmail,
+                        payment_intent_data: { receipt_email: clientEmail },
+                    }
+                    : {}),
                 metadata: {
                     estimateId,
                     estimatePaymentScheduleId: schedule.id,
@@ -140,6 +149,8 @@ export async function POST(req: Request) {
 
         const projectId = paymentSchedule.invoice.projectId;
         const clientName = paymentSchedule.invoice.project?.client?.name || "Client";
+        const rawClientEmail = (paymentSchedule.invoice.project?.client?.email || "").trim();
+        const clientEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawClientEmail) ? rawClientEmail : null;
         const projectName = paymentSchedule.invoice.project?.name || "Services";
 
         let feeLineItem = null;
@@ -181,6 +192,12 @@ export async function POST(req: Request) {
             mode: "payment",
             success_url: `${appUrl}/portal/invoices/${invoiceId}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${appUrl}/portal/invoices/${invoiceId}?payment=cancelled`,
+            ...(clientEmail
+                ? {
+                    customer_email: clientEmail,
+                    payment_intent_data: { receipt_email: clientEmail },
+                }
+                : {}),
             metadata: {
                 invoiceId: paymentSchedule.invoiceId,
                 paymentScheduleId: paymentSchedule.id,
