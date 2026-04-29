@@ -15,7 +15,7 @@ export default async function middleware(req: any, event: any) {
             signIn: "/login",
         },
     });
-    
+
     return authMiddleware(req as any, event);
 }
 
@@ -25,6 +25,7 @@ export const config = {
          * Match all request paths except for the ones starting with:
          * - api/auth (NextAuth endpoints)
          * - api/cron (System automated cron tasks)
+         * - api/twilio (Twilio webhooks — validated by Twilio signature, not session)
          * - api/webhook (Stripe webhooks)
          * - api/payments (Client portal payment sessions)
          * - api/portal (Public backend handlers for documents)
@@ -35,6 +36,6 @@ export const config = {
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          */
-        "/((?!api/auth|api/cron|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
     ],
 };
