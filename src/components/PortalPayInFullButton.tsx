@@ -59,7 +59,7 @@ export default function PortalPayInFullButton({
             <div className="border border-indigo-200 rounded-lg bg-indigo-50 px-6 py-5 flex flex-wrap items-center justify-between gap-4">
                 <div>
                     <p className="text-sm font-semibold text-indigo-900">Ready to pay?</p>
-                    <p className="text-xs text-indigo-700 mt-0.5">Secure checkout via Stripe — card or bank transfer accepted.</p>
+                    <p className="text-xs text-indigo-700 mt-0.5">Secure checkout via Stripe — card payment accepted.</p>
                 </div>
                 <div className="flex items-center gap-4">
                     <span className="text-lg font-bold text-indigo-900">{formatCurrency(displayAmount)}</span>
