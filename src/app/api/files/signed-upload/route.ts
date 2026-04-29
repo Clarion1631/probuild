@@ -1,21 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
+import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 
 export const maxDuration = 30;
 
 type FileInfo = { name: string; size: number; mimeType: string };
 
 // POST: generate signed upload URLs so the browser can upload directly to Supabase,
-// bypassing Vercel's 4.5 MB serverless payload limit.
+// bypassing Vercel's 4.5 MB serverless payload limit. Hybrid auth — accepts NextAuth
+// session (web) or mobile JWT (mobile).
 export async function POST(req: NextRequest) {
     try {
-        const session = await getServerSession(authOptions);
-        if (!session?.user?.email) {
-            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-        }
+        const auth = await authenticateMobileOrSession(req);
+        if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+        const { user } = auth;
 
         const supabase = getSupabase();
         if (!supabase) {
@@ -38,13 +37,23 @@ export async function POST(req: NextRequest) {
         }
 
         if (projectId) {
-            const callerUser = await prisma.user.findUnique({
-                where: { email: session.user.email },
-                select: { role: true, projectAccess: { where: { projectId }, select: { projectId: true } } },
-            });
-            const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
-            if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
+            // Reuse the canonical project-access check (ProjectAccess record OR crew
+            // assignment OR ADMIN/MANAGER role) so mobile and web behave identically.
+            const allowed = await userCanAccessProject(user, projectId);
+            if (!allowed) {
                 return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
+        } else if (leadId) {
+            // Lead uploads are web-only flows (no mobile equivalent today). ADMINs always
+            // pass; MANAGERs and everyone else must own the lead. This matches the gate
+            // on /api/files/register so a caller can't get a signed URL they can't then
+            // register against.
+            if (user.role !== "ADMIN") {
+                const lead = await prisma.lead.findFirst({
+                    where: { id: leadId, managerId: user.id },
+                    select: { id: true },
+                });
+                if (!lead) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
             }
         }
 
@@ -52,7 +61,13 @@ export async function POST(req: NextRequest) {
             files.map(async (f: FileInfo) => {
                 const prefix = projectId ? `projects/${projectId}` : `leads/${leadId}`;
                 const safeName = f.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-                const storagePath = `${prefix}/${Date.now()}_${safeName}`;
+                // Collision safety: two files registered in the same millisecond would
+                // share a path without a random suffix. UUID v4 keeps storage paths unique.
+                const uniq =
+                    (typeof crypto !== "undefined" && "randomUUID" in crypto
+                        ? crypto.randomUUID()
+                        : Math.random().toString(36).slice(2)) + "";
+                const storagePath = `${prefix}/${Date.now()}_${uniq.slice(0, 8)}_${safeName}`;
 
                 const { data, error } = await supabase.storage
                     .from(STORAGE_BUCKET)

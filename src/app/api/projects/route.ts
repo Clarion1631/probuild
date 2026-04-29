@@ -1,24 +1,12 @@
 import { NextResponse } from "next/server";
 export const dynamic = 'force-dynamic';
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 
 export async function GET(req: Request) {
-    const session = await getServerSession(authOptions);
-    let user;
-
-    const authHeader = req.headers.get("authorization");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.split(" ")[1];
-        user = await prisma.user.findUnique({ where: { id: token } });
-    }
-
-    if (!user && session?.user?.email) {
-        user = await prisma.user.findUnique({ where: { email: session.user.email } });
-    }
-
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const auth = await authenticateMobileOrSession(req);
+    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+    const { user } = auth;
 
     let projects;
 
