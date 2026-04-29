@@ -385,7 +385,7 @@ export default function LeadMessaging({
             </div>
 
             {/* Message Thread */}
-            <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6 bg-slate-50/50">
+            <div ref={scrollRef} className="flex-1 overflow-y-auto overflow-x-hidden px-6 py-6 bg-slate-50/50">
                 {/* Date divider */}
                 <div className="text-center text-xs text-slate-400 mb-6 font-medium">{formattedDate}</div>
 
@@ -470,16 +470,16 @@ export default function LeadMessaging({
                                             <Avatar name={msg.senderName} color="blue" />
                                         </div>
                                     )}
-                                    <div className={`max-w-[70%] ${isOutbound ? "items-end" : ""}`}>
+                                    <div className={`min-w-0 max-w-[70%] ${isOutbound ? "items-end" : ""}`}>
                                         {!isOutbound && (
                                             <p className="text-[10px] font-semibold text-slate-500 mb-1 ml-1">{msg.senderName}</p>
                                         )}
-                                        <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${
+                                        <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm overflow-hidden ${
                                             isOutbound
                                                 ? "bg-green-600 text-white rounded-br-md prose-invert prose-a:text-green-200"
                                                 : "bg-white text-hui-textMain border border-slate-200 rounded-bl-md"
                                         }`}>
-                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.body ?? "") }} />
+                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none" style={{ overflowWrap: "anywhere", wordBreak: "break-word" }} dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.body ?? "") }} />
 
                                             {/* Attachment chips */}
                                             {atts.length > 0 && (
