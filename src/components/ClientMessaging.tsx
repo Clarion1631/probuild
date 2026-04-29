@@ -249,7 +249,7 @@ export default function ClientMessaging({
             </div>
 
             {/* Message Thread */}
-            <div ref={scrollRef} className={`flex-1 overflow-y-auto ${isSidebar ? "px-3 py-3" : "px-6 py-6"} bg-slate-50/50`}>
+            <div ref={scrollRef} className={`flex-1 overflow-y-auto overflow-x-hidden ${isSidebar ? "px-3 py-3" : "px-6 py-6"} bg-slate-50/50`}>
                 {/* Lead context header (leads only) */}
                 {!isSidebar && entityType === "lead" && createdDate && (
                     <div className="text-center text-xs text-slate-400 mb-6 font-medium">
