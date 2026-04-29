@@ -21,6 +21,8 @@ export async function POST(req: Request) {
 
         const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || "http://localhost:3000";
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        // BNPL methods have no separate rate config — exclude them from card fee pass-through
+        const NO_FEE_METHODS = ["us_bank_account", "affirm", "klarna"];
         // Idempotency key includes the schedule's current amount so admin amount edits invalidate
         // any stale session, but rapid double-taps within the same amount window dedupe to one session.
         const scheduleAmount = estimateId
@@ -90,7 +92,7 @@ export async function POST(req: Request) {
 
             // Processing fee
             let feeLineItem = null;
-            if (settings?.passProcessingFee && selectedMethod && selectedMethod !== "us_bank_account") {
+            if (settings?.passProcessingFee && selectedMethod && !NO_FEE_METHODS.includes(selectedMethod)) {
                 const rate = Number(settings.cardProcessingRate ?? 2.9);
                 const flat = Number(settings.cardProcessingFlat ?? 0.30);
                 const feeAmount = Number(schedule.amount) * (rate / 100) + flat;
@@ -172,6 +174,9 @@ export async function POST(req: Request) {
         if (paymentSchedule.status === "Paid") {
             return new NextResponse("This milestone has already been paid", { status: 400 });
         }
+        if (toNum(paymentSchedule.amount) <= 0) {
+            return new NextResponse("Payment schedule has no amount — please update the milestone in the invoice editor.", { status: 400 });
+        }
 
         const projectId = paymentSchedule.invoice.projectId;
         const clientName = paymentSchedule.invoice.project?.client?.name || "Client";
@@ -180,7 +185,7 @@ export async function POST(req: Request) {
         const projectName = paymentSchedule.invoice.project?.name || "Services";
 
         let feeLineItem = null;
-        if (settings?.passProcessingFee && selectedMethod && selectedMethod !== 'us_bank_account') {
+        if (settings?.passProcessingFee && selectedMethod && !NO_FEE_METHODS.includes(selectedMethod)) {
             const rate = toNum(settings.cardProcessingRate ?? 2.9);
             const flat = toNum(settings.cardProcessingFlat ?? 0.30);
             const feeAmount = (toNum(paymentSchedule.amount) * (rate / 100)) + flat;
