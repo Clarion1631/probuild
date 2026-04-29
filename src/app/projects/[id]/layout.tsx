@@ -1,7 +1,7 @@
 import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { getUnreadMessageCount } from "@/lib/actions";
-import { authOptions, getSessionOrDev } from "@/lib/auth";
+import { getSessionOrDev } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 

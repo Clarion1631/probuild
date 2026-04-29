@@ -788,9 +788,10 @@ export async function convertLeadToProject(leadId: string) {
         // RoomDesign has an owner-XOR CHECK constraint (projectId XOR leadId), so we must
         // clear leadId when setting projectId in the same transaction.
         await tx.roomDesign.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        // The remaining models have onDelete:Cascade on their lead FK — clear leadId to prevent
-        // cascade-deletion of project records if the lead is ever deleted post-conversion.
-        await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        // Contract.lead FK is onDelete:SetNull — keep leadId so contracts remain visible from
+        // both the lead view and the project view (same pattern as Estimate).
+        await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        // The remaining models still have onDelete:Cascade on their lead FK — clear leadId.
         await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
