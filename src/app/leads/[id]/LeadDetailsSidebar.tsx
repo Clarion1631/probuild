@@ -170,10 +170,11 @@ export default function LeadDetailsSidebar({
     const addressesMatch = !!formatAddress() && !!location &&
         normalizeAddress(location) === normalizeAddress(formatAddress()!);
 
-    const maskEmail = (email: string) => {
-        const [user, domain] = email.split("@");
-        if (!domain) return email;
-        return `${user[0]}${"*".repeat(Math.min(user.length - 1, 5))}@${domain}`;
+    const formatPhone = (phone: string) => {
+        const digits = phone.replace(/\D/g, "");
+        if (digits.length === 10) return `(${digits.slice(0,3)}) ${digits.slice(3,6)}-${digits.slice(6)}`;
+        if (digits.length === 11 && digits[0] === "1") return `+1 (${digits.slice(1,4)}) ${digits.slice(4,7)}-${digits.slice(7)}`;
+        return phone;
     };
 
     const DetailRow = ({ label, value, fieldKey, type = "text" }: { label: string; value: string | null; fieldKey?: string; type?: string }) => {
@@ -303,11 +304,11 @@ export default function LeadDetailsSidebar({
                         </div>
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Email</span>
-                            <span className="text-sm text-green-600">{clientEmail ? maskEmail(clientEmail) : <span className="text-slate-400 italic">Not set</span>}</span>
+                            <span className="text-sm text-green-600">{clientEmail ? clientEmail : <span className="text-slate-400 italic">Not set</span>}</span>
                         </div>
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Email 2</span>
-                            <span className="text-sm text-green-600">{clientAdditionalEmail ? maskEmail(clientAdditionalEmail) : <span className="text-slate-400 italic">Not set</span>}</span>
+                            <span className="text-sm text-green-600">{clientAdditionalEmail ? clientAdditionalEmail : <span className="text-slate-400 italic">Not set</span>}</span>
                         </div>
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Phone Number</span>
@@ -315,27 +316,25 @@ export default function LeadDetailsSidebar({
                                 {clientPhone ? (
                                     <>
                                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
-                                        {clientPhone}
+                                        {formatPhone(clientPhone)}
                                     </>
                                 ) : <span className="text-slate-400 italic">Not set</span>}
                             </span>
                         </div>
                         <div className="flex flex-col py-2">
-                            <div className="flex items-start justify-between mb-2">
-                                <span className="text-sm text-slate-600 shrink-0 mr-3">Client Contact Address</span>
-                                <span className="text-sm text-hui-textMain flex items-start gap-1.5 min-w-0">
-                                    {formatAddress() ? (
-                                        <>
-                                            <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition shrink-0 mt-0.5" title="Directions">
-                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                                            </a>
-                                            <span className="break-words">{formatAddress()}</span>
-                                        </>
-                                    ) : <span className="text-slate-400 italic">Not set</span>}
-                                </span>
-                            </div>
+                            <span className="text-sm text-slate-600 mb-1">Client Contact Address</span>
+                            <span className="text-sm text-hui-textMain flex items-start gap-1.5 min-w-0">
+                                {formatAddress() ? (
+                                    <>
+                                        <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition shrink-0 mt-0.5" title="Directions">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                        </a>
+                                        <span className="break-words min-w-0">{formatAddress()}</span>
+                                    </>
+                                ) : <span className="text-slate-400 italic">Not set</span>}
+                            </span>
                             {formatAddress() && !addressesMatch && (
-                                <div className="mt-1 w-[280px]">
+                                <div className="mt-2 w-full">
                                     <GoogleMapPreview address={formatAddress()!} />
                                 </div>
                             )}

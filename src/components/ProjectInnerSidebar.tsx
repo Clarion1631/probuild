@@ -2,9 +2,7 @@
 
 import Link from "next/link";
 import { useState, useEffect } from "react";
-import { usePathname, useRouter } from "next/navigation";
-import { linkProjectToLead } from "@/lib/actions";
-import { toast } from "sonner";
+import { usePathname } from "next/navigation";
 import { usePermissions } from "@/components/PermissionsProvider";
 import { RoomDesignerNavContent } from "@/components/room-designer/RoomDesignerNavContent";
 
@@ -12,8 +10,6 @@ interface ProjectInnerSidebarProps {
     projectId: string;
     projectName?: string;
     clientName?: string;
-    lead?: { id: string; name: string } | null;
-    availableLeads?: { id: string; name: string; stage: string; client: { name: string } | null }[];
     unreadMessageCount?: number;
 }
 
@@ -24,20 +20,15 @@ type NavSection = {
     items: NavItem[];
 };
 
-export default function ProjectInnerSidebar({ projectId, projectName, clientName, lead, availableLeads = [], unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
+export default function ProjectInnerSidebar({ projectId, projectName, clientName, unreadMessageCount = 0 }: ProjectInnerSidebarProps) {
     const pathname = usePathname();
-    const router = useRouter();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
     useEffect(() => {
         const stored = localStorage.getItem("projectSidebarCollapsed");
         if (stored === "true") setSidebarCollapsed(true);
     }, []);
-    const [showLinkModal, setShowLinkModal] = useState(false);
-    const [linking, setLinking] = useState(false);
-    const [searchTerm, setSearchTerm] = useState("");
-    const [currentLead, setCurrentLead] = useState(lead || null);
-    const { permissions, isAdmin, loaded } = usePermissions();
+    const { permissions, loaded } = usePermissions();
 
     const can = (key?: string) => !key || !loaded || !!permissions[key];
 
@@ -102,25 +93,6 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
             [sectionId]: !prev[sectionId],
         }));
     };
-
-    const handleLinkLead = async (leadId: string) => {
-        setLinking(true);
-        try {
-            await linkProjectToLead(projectId, leadId);
-            const linked = availableLeads.find(l => l.id === leadId);
-            if (linked) setCurrentLead({ id: linked.id, name: linked.name });
-            toast.success("Lead linked to project!");
-            setShowLinkModal(false);
-            router.refresh();
-        } catch (e: any) {
-            toast.error(e.message || "Failed to link lead");
-        } finally { setLinking(false); }
-    };
-
-    const filtered = availableLeads.filter(l =>
-        l.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        (l.client?.name || "").toLowerCase().includes(searchTerm.toLowerCase())
-    );
 
     return (
         <>
@@ -209,49 +181,6 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
                 <h2 className="text-sm font-bold uppercase tracking-wider"><Link href={`/projects/${projectId}`} className="text-hui-textMain hover:text-hui-accent transition-colors">Project Overview</Link></h2>
             </div>
 
-            {/* Lead Link - Prominent */}
-            {(currentLead || isAdmin) && (
-                <div className="px-3 pt-3 pb-1 shrink-0">
-                    {currentLead ? (
-                        <Link
-                            href={`/leads/${currentLead.id}`}
-                            className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 hover:from-amber-100 hover:to-orange-100 transition"
-                        >
-                            <div className="w-7 h-7 bg-amber-100 rounded-lg flex items-center justify-center shrink-0">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="1.5">
-                                    <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" />
-                                    <circle cx="9" cy="7" r="4" />
-                                    <path d="M22 21v-2a4 4 0 00-3-3.87" />
-                                    <path d="M16 3.13a4 4 0 010 7.75" />
-                                </svg>
-                            </div>
-                            <div className="min-w-0 flex-1">
-                                <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider">Lead</p>
-                                <p className="text-xs font-medium text-amber-800 truncate">{currentLead.name}</p>
-                            </div>
-                            <svg className="w-3.5 h-3.5 text-amber-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                            </svg>
-                        </Link>
-                    ) : (
-                        <button
-                            onClick={() => setShowLinkModal(true)}
-                            className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-slate-50 border border-dashed border-slate-300 hover:border-amber-300 hover:bg-amber-50 transition text-slate-400 hover:text-amber-600 group"
-                        >
-                            <div className="w-7 h-7 bg-slate-100 group-hover:bg-amber-100 rounded-lg flex items-center justify-center shrink-0 transition">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                                    <path d="M12 5v14M5 12h14" />
-                                </svg>
-                            </div>
-                            <div className="text-left">
-                                <p className="text-[10px] font-semibold uppercase tracking-wider">Link Lead</p>
-                                <p className="text-[10px]">Connect to a lead</p>
-                            </div>
-                        </button>
-                    )}
-                </div>
-            )}
-
             {/* Scrollable nav */}
             <div className="flex-1 overflow-y-auto w-full">
                 <div className="p-3">
@@ -313,50 +242,6 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
         </div>
         </div>{/* end inner clip wrapper */}
         </div>{/* end outer sizer */}
-
-        {/* Link Lead Modal (fixed overlay, outside sizing divs) */}
-        {showLinkModal && (
-            <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-                <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-5 max-h-[70vh] flex flex-col">
-                    <div className="flex items-center justify-between mb-3">
-                        <h3 className="text-base font-bold text-hui-textMain">Link Lead to Project</h3>
-                        <button onClick={() => setShowLinkModal(false)} className="text-slate-400 hover:text-slate-600 text-lg">&times;</button>
-                    </div>
-
-                    <input
-                        type="text"
-                        placeholder="Search leads..."
-                        value={searchTerm}
-                        onChange={e => setSearchTerm(e.target.value)}
-                        className="hui-input w-full mb-3 text-sm"
-                        autoFocus
-                    />
-
-                    <div className="flex-1 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-                        {filtered.length === 0 ? (
-                            <div className="p-4 text-center text-sm text-slate-400">No leads found</div>
-                        ) : (
-                            filtered.map(l => (
-                                <button
-                                    key={l.id}
-                                    onClick={() => handleLinkLead(l.id)}
-                                    disabled={linking}
-                                    className="w-full text-left px-4 py-3 hover:bg-amber-50 transition flex items-center justify-between group disabled:opacity-50"
-                                >
-                                    <div className="min-w-0">
-                                        <p className="text-sm font-medium text-hui-textMain truncate">{l.name}</p>
-                                        <p className="text-xs text-slate-400">{l.client?.name || "No client"} · {l.stage}</p>
-                                    </div>
-                                    <span className="text-xs text-amber-600 font-medium opacity-0 group-hover:opacity-100 transition shrink-0 ml-2">
-                                        Link →
-                                    </span>
-                                </button>
-                            ))
-                        )}
-                    </div>
-                </div>
-            </div>
-        )}
         </>
     );
 }

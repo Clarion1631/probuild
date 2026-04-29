@@ -758,50 +758,6 @@ export async function getProject(id: string) {
     return project ? JSON.parse(JSON.stringify(project)) : null;
 }
 
-export async function getProjectLead(projectId: string) {
-    // Direct approach: use leadId if set
-    const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { leadId: true, clientId: true, lead: { select: { id: true, name: true, stage: true } } },
-    });
-    if (!project) return null;
-    if (project.lead) return project.lead;
-    // Fallback: find lead by matching client
-    const lead = await prisma.lead.findFirst({
-        where: { clientId: project.clientId },
-        orderBy: { createdAt: "desc" },
-        select: { id: true, name: true, stage: true },
-    });
-    return lead;
-}
-
-export async function linkProjectToLead(projectId: string, leadId: string) {
-    "use server";
-    if (!leadId) throw new Error("leadId is required — unlinking a project from its lead is no longer supported");
-    const session = await getServerSession(authOptions);
-    const caller = session?.user?.email
-        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
-        : null;
-    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
-    const project = await prisma.project.update({
-        where: { id: projectId },
-        data: { leadId },
-    });
-    revalidatePath(`/projects/${projectId}`, 'layout');
-    revalidatePath(`/projects`);
-    return project;
-}
-
-export async function getLeadsForLinking() {
-    "use server";
-    const leads = await prisma.lead.findMany({
-        orderBy: { createdAt: "desc" },
-        select: { id: true, name: true, stage: true, client: { select: { name: true } } },
-        take: 50,
-    });
-    return leads;
-}
-
 export async function convertLeadToProject(leadId: string) {
     const lead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!lead) throw new Error("Lead not found");

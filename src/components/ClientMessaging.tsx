@@ -300,7 +300,7 @@ export default function ClientMessaging({
                                     <div className={`${isSidebar ? "max-w-[85%]" : "max-w-[70%]"} ${isOutbound ? "items-end" : ""}`}>
                                         {!isOutbound && <p className="text-[10px] font-semibold text-slate-500 mb-1 ml-1">{msg.senderName}</p>}
                                         <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${isOutbound ? "bg-green-600 text-white rounded-br-md" : "bg-white text-hui-textMain border border-slate-200 rounded-bl-md"}`}>
-                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: msg.body }} />
+                                            <div className="whitespace-pre-wrap prose prose-sm max-w-none break-words" dangerouslySetInnerHTML={{ __html: msg.body }} />
                                             {atts.length > 0 && (
                                                 <div className="mt-2 pt-2 border-t border-white/20 flex flex-wrap gap-2">
                                                     {atts.map((a: any, i: number) => (

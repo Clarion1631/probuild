@@ -1,6 +1,6 @@
 import ProjectInnerSidebar from "@/components/ProjectInnerSidebar";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import { getProjectLead, getLeadsForLinking, getUnreadMessageCount } from "@/lib/actions";
+import { getUnreadMessageCount } from "@/lib/actions";
 import { authOptions, getSessionOrDev } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
@@ -41,9 +41,7 @@ export default async function ProjectLayout({
         }
     }
 
-    const [lead, allLeads, unreadCount, project] = await Promise.all([
-        getProjectLead(id),
-        getLeadsForLinking(),
+    const [unreadCount, project] = await Promise.all([
         getUnreadMessageCount(id, "TEAM"),
         prisma.project.findUnique({
             where: { id },
@@ -57,8 +55,6 @@ export default async function ProjectLayout({
                 projectId={id}
                 projectName={project?.name}
                 clientName={project?.client?.name}
-                lead={lead ? { id: lead.id, name: lead.name } : null}
-                availableLeads={JSON.parse(JSON.stringify(allLeads))}
                 unreadMessageCount={unreadCount}
             />
             <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden w-full min-w-0">
