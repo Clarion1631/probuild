@@ -1,5 +1,6 @@
 import { getLead, getDocumentTemplates } from "@/lib/actions";
-import LeadMessaging from "./LeadMessaging";
+import ClientMessaging from "@/components/ClientMessaging";
+import LeadMessagingHeader from "./LeadMessagingHeader";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
 import { prisma } from "@/lib/prisma";
 
@@ -27,17 +28,24 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
 
     return (
         <>
-            <LeadMessaging
-                leadId={lead.id}
+            <ClientMessaging
+                entityId={lead.id}
+                entityType="lead"
                 clientName={lead.client?.name || ""}
-                leadName={lead.name}
+                clientEmail={lead.client?.email || null}
+                clientPhone={(lead.client as any)?.primaryPhone || null}
+                estimates={estimates}
                 leadSource={lead.source}
                 createdAt={typeof lead.createdAt === "string" ? lead.createdAt : lead.createdAt.toISOString()}
                 location={lead.location}
-                clientEmail={lead.client?.email || null}
-                clientPhone={(lead.client as any)?.primaryPhone || null}
                 initialMessage={leadFull?.message || null}
-                estimates={estimates}
+                headerContent={
+                    <LeadMessagingHeader
+                        leadId={lead.id}
+                        leadName={lead.name}
+                        clientName={lead.client?.name || ""}
+                    />
+                }
             />
             <LeadDetailsSidebar
                 leadId={lead.id}

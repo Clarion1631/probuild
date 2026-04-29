@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import type { ReactNode } from "react";
 import DOMPurify from "dompurify";
 import Avatar from "@/components/Avatar";
 import { useEditor, EditorContent } from '@tiptap/react';
@@ -42,12 +43,13 @@ interface ClientMessagingProps {
     location?: string | null;
     initialMessage?: string | null;
     variant?: "full" | "sidebar";
+    headerContent?: ReactNode;
 }
 
 export default function ClientMessaging({
     entityId, entityType, clientName, clientEmail, clientPhone,
     estimates, leadName, leadSource, createdAt, location, initialMessage,
-    variant = "full",
+    variant = "full", headerContent,
 }: ClientMessagingProps) {
     const [messages, setMessages] = useState<ClientMessageData[]>([]);
     const [messageText, setMessageText] = useState("");
@@ -229,25 +231,27 @@ export default function ClientMessaging({
 
     return (
         <div className={`flex flex-col bg-white ${isSidebar ? "h-full" : "flex-1 min-w-0"}`}>
-            {/* Header */}
-            <div className={`${isSidebar ? "px-4 py-3" : "px-5 py-3.5"} border-b border-hui-border flex items-center justify-between bg-white sticky top-0 z-10`}>
-                <div className="flex items-center gap-3">
-                    <Avatar name={clientName} color="blue" />
-                    <div>
-                        <h2 className={`${isSidebar ? "text-sm" : "text-lg"} font-bold text-hui-textMain`}>{clientName}</h2>
-                        {clientEmail && <p className="text-[10px] text-slate-400">{clientEmail}</p>}
+            {/* Header — custom slot or default */}
+            {headerContent ?? (
+                <div className={`${isSidebar ? "px-4 py-3" : "px-5 py-3.5"} border-b border-hui-border flex items-center justify-between bg-white sticky top-0 z-10`}>
+                    <div className="flex items-center gap-3">
+                        <Avatar name={clientName} color="blue" />
+                        <div>
+                            <h2 className={`${isSidebar ? "text-sm" : "text-lg"} font-bold text-hui-textMain`}>{clientName}</h2>
+                            {clientEmail && <p className="text-[10px] text-slate-400">{clientEmail}</p>}
+                        </div>
                     </div>
+                    {!isSidebar && (
+                        <button
+                            className="ml-2 px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-md transition shadow-sm flex items-center gap-1.5"
+                            onClick={() => editor?.commands.focus()}
+                        >
+                            New
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M6 9l6 6 6-6"/></svg>
+                        </button>
+                    )}
                 </div>
-                {!isSidebar && (
-                    <button
-                        className="ml-2 px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-md transition shadow-sm flex items-center gap-1.5"
-                        onClick={() => editor?.commands.focus()}
-                    >
-                        New
-                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M6 9l6 6 6-6"/></svg>
-                    </button>
-                )}
-            </div>
+            )}
 
             {/* Message Thread */}
             <div ref={scrollRef} className={`flex-1 overflow-y-auto overflow-x-hidden ${isSidebar ? "px-3 py-3" : "px-6 py-6"} bg-slate-50/50`}>
@@ -288,9 +292,27 @@ export default function ClientMessaging({
                     </div>
                 ) : (
                     messages.map((msg, idx) => {
+                        const isSystem = msg.direction === "SYSTEM";
                         const isOutbound = msg.direction === "OUTBOUND";
                         const showDate = idx === 0 || formatMsgDate(msg.createdAt) !== formatMsgDate(messages[idx - 1].createdAt);
                         const atts = parseAttachments(msg.attachments);
+
+                        if (isSystem) {
+                            return (
+                                <div key={msg.id}>
+                                    {showDate && (
+                                        <div className="text-center text-xs text-slate-400 my-4 font-medium">{formatMsgDate(msg.createdAt)}</div>
+                                    )}
+                                    <div className="flex justify-center my-3">
+                                        <div className="max-w-[80%] text-center text-xs text-slate-500 bg-slate-100 border border-slate-200 rounded-full px-4 py-1.5">
+                                            <span className="whitespace-pre-wrap">{msg.body ?? ""}</span>
+                                            <span className="ml-2 text-slate-400">· {formatMsgTime(msg.createdAt)}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        }
+
                         return (
                             <div key={msg.id}>
                                 {showDate && <div className="text-center text-xs text-slate-400 my-4 font-medium">{formatMsgDate(msg.createdAt)}</div>}
