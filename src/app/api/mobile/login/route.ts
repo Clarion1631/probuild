@@ -2,10 +2,10 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { SignJWT } from "jose";
 import bcrypt from "bcryptjs";
+import { MOBILE_TOKEN_TYPE, getMobileJwtSecret } from "@/lib/mobile-auth";
 
 export const dynamic = 'force-dynamic';
 
-const JWT_SECRET = new TextEncoder().encode(process.env.NEXTAUTH_SECRET);
 const TOKEN_EXPIRY = "24h";
 
 export async function POST(req: Request) {
@@ -27,11 +27,12 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: "Invalid email or PIN" }, { status: 401 });
         }
 
-        const token = await new SignJWT({ sub: user.id, role: user.role })
+        const token = await new SignJWT({ role: user.role, typ: MOBILE_TOKEN_TYPE })
             .setProtectedHeader({ alg: "HS256" })
+            .setSubject(user.id)
             .setIssuedAt()
             .setExpirationTime(TOKEN_EXPIRY)
-            .sign(JWT_SECRET);
+            .sign(getMobileJwtSecret());
 
         return NextResponse.json({
             user: {
