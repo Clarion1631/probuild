@@ -97,13 +97,8 @@ python compare.py --local --page "Page Name"   # single page local test
 - Known prod project ID: `cmn7tlgiv0001phwqjzwk75or`
 - Do NOT try psql, prisma direct connect, or supabase CLI to query prod — use the API
 
-## Messaging component map — TWO components, same bubble markup
-**Lead pages** (`/leads/[id]`) render `src/app/leads/[id]/LeadMessaging.tsx`  
-**Project pages** (`/projects/[id]/messages`) render `src/components/ClientMessaging.tsx`
-
-Both have identical message bubble markup. **Any bug in bubble rendering must be fixed in BOTH files.** Before touching either, read the page component (`page.tsx`) first to confirm which one renders.
-
-Refactor target: extract shared bubble into `src/components/MessageBubble.tsx` to eliminate this duplication.
+## Messaging component
+`src/components/ClientMessaging.tsx` is the single canonical messaging component used by both lead pages (`/leads/[id]`) and project pages (`/projects/[id]/messages`). It accepts a swappable `headerContent` slot for per-context headers. `LeadMessaging.tsx` was deleted in commit `363b70c`.
 
 ## Common pitfalls
 - **config.py is gitignored** — never commit it, it contains secrets

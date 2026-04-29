@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
 import { sendSMS, type SmsResult } from "@/lib/sms";
+import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 
 // GET /api/client-messages?leadId=X  OR  ?projectId=X  OR  ?unmatched=true
 export async function GET(request: Request) {
@@ -20,9 +21,14 @@ export async function GET(request: Request) {
     if (unmatched) {
         // Inbound SMS from numbers we couldn't match to any Client are stored
         // with both leadId and projectId null. Surface them via this filter.
+        // NOTE: this endpoint is session-gated only, not permission-gated.
+        // Any future browser client calling this API must add a server-side
+        // clientCommunication permission check before shipping. The /manager/inbox
+        // page bypasses this route by reading Prisma directly and is correctly gated.
         const messages = await prisma.clientMessage.findMany({
             where: { leadId: null, projectId: null, direction: "INBOUND" },
             orderBy: { createdAt: "desc" },
+            take: 100,
         });
         return NextResponse.json({ messages });
     }
@@ -41,9 +47,12 @@ export async function GET(request: Request) {
 
 // POST /api/client-messages — send an outbound message to the client
 export async function POST(request: Request) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    if (!hasPermission(user, "clientCommunication")) {
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
     const body = await request.json();
     const {
@@ -103,8 +112,8 @@ export async function POST(request: Request) {
         resolvedCcEmails = [clientAdditionalEmail, ...resolvedCcEmails];
     }
 
-    const senderName = session?.user?.name || session?.user?.email || "Team";
-    const senderEmail = session?.user?.email || null;
+    const senderName = user.name || user.email || "Team";
+    const senderEmail = user.email || null;
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
