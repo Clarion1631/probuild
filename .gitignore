@@ -78,3 +78,6 @@ scripts/vendor/*
 .claude/skills/
 docs/superpowers/
 supabase/.temp/
+
+# Template backup files produced by scripts/seed-residential-templates.mjs
+scripts/.template-backup-*.json
