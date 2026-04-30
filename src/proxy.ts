@@ -9,6 +9,14 @@ export default async function middleware(req: any, event: any) {
         return NextResponse.next();
     }
 
+    // API requests carrying `Authorization: Bearer <jwt>` are mobile clients. Their
+    // route handlers verify the JWT via authenticateMobileOrSession themselves; redirecting
+    // them to /login (a browser flow) would 307-redirect every mobile API call.
+    const authHeader = req.headers?.get?.("authorization");
+    if (typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")) {
+        return NextResponse.next();
+    }
+
     // Existing authentication logic for other environments
     const authMiddleware = withAuth({
         pages: {
@@ -36,6 +44,6 @@ export const config = {
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          */
-        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
     ],
 };
