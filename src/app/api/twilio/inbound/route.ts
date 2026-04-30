@@ -78,6 +78,8 @@ export async function POST(request: Request) {
     if (OPT_OUT_KEYWORDS.has(body.trim().toUpperCase())) return emptyTwiml();
 
     // Lookup client by indexed E.164 columns (primary OR additional).
+    // findFirst tie-break: if two distinct Client records share the same phone,
+    // one is returned arbitrarily. Rare in practice; disambiguation UX is out of scope.
     const client = fromE164
         ? await prisma.client.findFirst({
             where: {

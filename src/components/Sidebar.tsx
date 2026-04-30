@@ -38,13 +38,14 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                                     </div>
                                 )}
                                 {/* Management */}
-                                {(can("schedules") || can("dailyLogs") || can("timeClock")) && (
+                                {(can("schedules") || can("dailyLogs") || can("timeClock") || can("clientCommunication")) && (
                                     <div>
                                         <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
                                         <ul className="space-y-2 text-sm">
                                             {can("schedules") && <li><Link href="/manager/schedule" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>}
                                             {can("dailyLogs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>}
                                             {can("timeClock") && <li><Link href="/time-clock" className="hover:text-hui-primary block transition">Time &amp; Expenses</Link></li>}
+                                            {can("clientCommunication") && <li><Link href="/manager/inbox" className="hover:text-hui-primary block transition">Unmatched Inbox</Link></li>}
                                         </ul>
                                     </div>
                                 )}
