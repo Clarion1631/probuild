@@ -4,9 +4,10 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 
 // POST /api/client-messages/mark-read
-// Body: { leadId: string } OR { projectId: string }
-// Marks all unread INBOUND ClientMessages for the entity as read.
-// Requires the session user to have access to the resource.
+// Body: { clientId: string } OR { leadId: string } OR { projectId: string }
+// Marks all unread INBOUND ClientMessages as read.
+// clientId marks ALL messages for the client (unified view);
+// leadId/projectId marks entity-scoped messages only (legacy).
 export async function POST(request: Request) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
@@ -14,10 +15,10 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { leadId, projectId } = body;
+    const { clientId, leadId, projectId } = body;
 
-    if (!leadId && !projectId) {
-        return NextResponse.json({ error: "leadId or projectId required" }, { status: 400 });
+    if (!clientId && !leadId && !projectId) {
+        return NextResponse.json({ error: "clientId, leadId, or projectId required" }, { status: 400 });
     }
 
     // Resolve the session user
@@ -27,15 +28,30 @@ export async function POST(request: Request) {
     });
     if (!user) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
-    // Authorization guard: verify access to the resource
-    if (projectId) {
+    // Authorization guard
+    if (clientId) {
+        // Client-level: ADMIN/MANAGER bypass; others must have access to at
+        // least one of the client's projects.
+        if (user.role !== "ADMIN" && user.role !== "MANAGER") {
+            const hasAccess = await prisma.project.findFirst({
+                where: {
+                    clientId,
+                    OR: [
+                        { userAccess: { some: { userId: user.id } } },
+                        { crew: { some: { id: user.id } } },
+                    ],
+                },
+                select: { id: true },
+            });
+            if (!hasAccess) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+    } else if (projectId) {
         if (user.role !== "ADMIN" && user.role !== "MANAGER") {
             const access = await prisma.projectAccess.findUnique({
                 where: { userId_projectId: { userId: user.id, projectId } },
                 select: { id: true },
             });
             if (!access) {
-                // Also allow crew members
                 const crewAccess = await prisma.project.findFirst({
                     where: { id: projectId, crew: { some: { id: user.id } } },
                     select: { id: true },
@@ -44,15 +60,17 @@ export async function POST(request: Request) {
             }
         }
     } else if (leadId) {
-        // For leads: ADMIN/MANAGER always have access; other roles are blocked
         if (user.role !== "ADMIN" && user.role !== "MANAGER") {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
     }
 
-    const where = leadId
-        ? { leadId, direction: "INBOUND", readAt: null }
-        : { projectId, direction: "INBOUND", readAt: null };
+    // Build the where clause based on which key was provided
+    const where = clientId
+        ? { clientId, direction: "INBOUND", readAt: null }
+        : leadId
+            ? { leadId, direction: "INBOUND", readAt: null }
+            : { projectId, direction: "INBOUND", readAt: null };
 
     const { count } = await prisma.clientMessage.updateMany({
         where,

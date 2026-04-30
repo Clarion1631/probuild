@@ -1411,8 +1411,11 @@ export async function logPortalVisit(projectId: string, clientName: string) {
 async function postActivityToThread(leadId: string | null, projectId: string | null, body: string) {
     try {
         if (leadId) {
+            // Resolve clientId for unified conversation view
+            const lead = await prisma.lead.findUnique({ where: { id: leadId }, select: { clientId: true } });
             await prisma.clientMessage.create({
                 data: {
+                    clientId: lead?.clientId ?? null,
                     leadId,
                     direction: "SYSTEM",     // distinct from INBOUND/OUTBOUND real messages
                     senderName: "System",
@@ -3465,8 +3468,11 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         : `📄 Estimate sent: ${estimate.title || estimate.code}\n\n🔗 Portal link: ${portalUrl}`;
 
     if (estimate.leadId) {
+        // Resolve clientId for unified conversation view
+        const lead = await prisma.lead.findUnique({ where: { id: estimate.leadId }, select: { clientId: true } });
         await prisma.clientMessage.create({
             data: {
+                clientId: lead?.clientId ?? null,
                 leadId: estimate.leadId,
                 direction: "OUTBOUND",
                 senderName: companyName,

@@ -122,11 +122,14 @@ export default function ClientMessaging({
         fetchMessages();
         fetchTeamMembers();
         // Mark inbound messages as read when the conversation is opened
-        const entityKey = entityType === "lead" ? "leadId" : "projectId";
+        // Use clientId for unified mark-read across all entities
+        const markReadBody = clientId
+            ? { clientId }
+            : { [entityType === "lead" ? "leadId" : "projectId"]: entityId };
         fetch("/api/client-messages/mark-read", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ [entityKey]: entityId }),
+            body: JSON.stringify(markReadBody),
         }).catch(() => {}); // non-critical, ignore errors
         pollRef.current = setInterval(fetchMessages, 10000);
         return () => { if (pollRef.current) clearInterval(pollRef.current); };

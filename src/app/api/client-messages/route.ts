@@ -36,7 +36,31 @@ export async function GET(request: Request) {
 
     // Unified client-level query: returns ALL messages for a client across
     // all their leads and projects in a single chronological timeline.
+    // Resource-level auth: verify caller has access to at least one of the
+    // client's leads/projects (ADMIN/MANAGER bypass).
     if (clientId) {
+        const user = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { id: true, role: true },
+        });
+        if (!user) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+
+        if (user.role !== "ADMIN" && user.role !== "MANAGER") {
+            const hasAccess = await prisma.project.findFirst({
+                where: {
+                    clientId,
+                    OR: [
+                        { userAccess: { some: { userId: user.id } } },
+                        { crew: { some: { id: user.id } } },
+                    ],
+                },
+                select: { id: true },
+            });
+            if (!hasAccess) {
+                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
+        }
+
         const messages = await prisma.clientMessage.findMany({
             where: { clientId },
             orderBy: { createdAt: "asc" },
