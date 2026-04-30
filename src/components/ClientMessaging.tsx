@@ -230,7 +230,7 @@ export default function ClientMessaging({
     const isSidebar = variant === "sidebar";
 
     return (
-        <div className={`flex flex-col bg-white ${isSidebar ? "h-full" : "flex-1 min-w-0"}`}>
+        <div className={`flex flex-col bg-white min-h-0 ${isSidebar ? "h-full" : "flex-1 min-w-0"}`}>
             {/* Header — custom slot or default */}
             {headerContent ?? (
                 <div className={`${isSidebar ? "px-4 py-3" : "px-5 py-3.5"} border-b border-hui-border flex items-center justify-between bg-white sticky top-0 z-10`}>

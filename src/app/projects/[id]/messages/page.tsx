@@ -33,7 +33,7 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
                 </p>
             </div>
 
-            <div className="bg-white border border-hui-border rounded-xl overflow-hidden" style={{ height: "calc(100vh - 240px)" }}>
+            <div className="bg-white border border-hui-border rounded-xl overflow-hidden flex flex-col min-h-0" style={{ height: "calc(100svh - 240px)", minHeight: "300px" }}>
                 <ClientMessaging
                     entityId={projectId}
                     entityType="project"
