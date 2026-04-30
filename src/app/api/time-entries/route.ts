@@ -1,34 +1,13 @@
 export const dynamic = 'force-dynamic';
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
+import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 
 export async function GET(req: Request) {
-    const session = await getServerSession(authOptions);
-    let user;
-
-    const authHeader = req.headers.get("authorization");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.split(" ")[1];
-        user = await prisma.user.findUnique({ where: { id: token } });
-    }
-
-    if (!user && session?.user?.email) {
-        user = await prisma.user.findUnique({ where: { email: session.user.email } });
-        if (!user) {
-            user = await prisma.user.create({
-                data: {
-                    email: session.user.email,
-                    name: session.user.name,
-                    role: 'EMPLOYEE'
-                }
-            });
-        }
-    }
-
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const auth = await authenticateMobileOrSession(req);
+    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+    const { user } = auth;
 
     const { searchParams } = new URL(req.url);
     const projectId = searchParams.get('projectId');
@@ -57,29 +36,9 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-    const session = await getServerSession(authOptions);
-    let user;
-
-    const authHeader = req.headers.get("authorization");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.split(" ")[1];
-        user = await prisma.user.findUnique({ where: { id: token } });
-    }
-
-    if (!user && session?.user?.email) {
-        user = await prisma.user.findUnique({ where: { email: session.user.email } });
-        if (!user) {
-            user = await prisma.user.create({
-                data: {
-                    email: session.user.email,
-                    name: session.user.name,
-                    role: 'EMPLOYEE'
-                }
-            });
-        }
-    }
-
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const auth = await authenticateMobileOrSession(req);
+    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+    const { user } = auth;
 
     const body = await req.json();
     const { projectId, costCodeId, estimateItemId, startTime, latitude, longitude } = body;
@@ -87,6 +46,9 @@ export async function POST(req: Request) {
     if (!projectId) {
         return NextResponse.json({ error: "Project ID is required" }, { status: 400 });
     }
+
+    const fail = await assertProjectAccess(user, projectId);
+    if (fail) return fail;
 
     const timeEntry = await prisma.timeEntry.create({
         data: {
@@ -104,20 +66,9 @@ export async function POST(req: Request) {
 }
 
 export async function PUT(req: Request) {
-    const session = await getServerSession(authOptions);
-    let user;
-
-    const authHeader = req.headers.get("authorization");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.split(" ")[1];
-        user = await prisma.user.findUnique({ where: { id: token } });
-    }
-
-    if (!user && session?.user?.email) {
-        user = await prisma.user.findUnique({ where: { email: session.user.email } });
-    }
-
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const auth = await authenticateMobileOrSession(req);
+    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+    const { user } = auth;
 
     const body = await req.json();
     const { id, endTime, latitude, longitude } = body;
@@ -136,8 +87,14 @@ export async function PUT(req: Request) {
     let durationHours = durationMs / (1000 * 60 * 60);
     if (durationHours < 0) durationHours = 0;
 
-    const laborCost = durationHours * toNum(user.hourlyRate);
-    const burdenCost = durationHours * toNum(user.burdenRate);
+    // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
+    // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
+    const owner = existing.userId === user.id
+        ? user
+        : await prisma.user.findUnique({ where: { id: existing.userId } });
+    if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
+    const laborCost = durationHours * toNum(owner.hourlyRate);
+    const burdenCost = durationHours * toNum(owner.burdenRate);
 
     const updateData: any = {
         endTime: end,

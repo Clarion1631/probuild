@@ -1,12 +1,9 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { SignJWT } from "jose";
 import bcrypt from "bcryptjs";
+import { signMobileToken } from "@/lib/mobile-auth";
 
 export const dynamic = 'force-dynamic';
-
-const JWT_SECRET = new TextEncoder().encode(process.env.NEXTAUTH_SECRET);
-const TOKEN_EXPIRY = "24h";
 
 export async function POST(req: Request) {
     try {
@@ -21,17 +18,20 @@ export async function POST(req: Request) {
             where: { email: email.toLowerCase() }
         });
 
-        // Use bcrypt.compare for constant-time PIN verification
+        // Constant-time PIN verification (only meaningful when user.pinCode is set)
         const pinValid = user?.pinCode ? await bcrypt.compare(pinCode, user.pinCode) : false;
         if (!user || !pinValid || user.status === "DISABLED") {
             return NextResponse.json({ error: "Invalid email or PIN" }, { status: 401 });
         }
 
-        const token = await new SignJWT({ sub: user.id, role: user.role })
-            .setProtectedHeader({ alg: "HS256" })
-            .setIssuedAt()
-            .setExpirationTime(TOKEN_EXPIRY)
-            .sign(JWT_SECRET);
+        // Mirror /api/mobile/google-login + NextAuth signIn callback: a successful first
+        // sign-in flips PENDING -> ACTIVATED. Without this the PIN path is inconsistent
+        // with Google and PENDING users would be silently auth'd without activation.
+        if (user.status === "PENDING") {
+            await prisma.user.update({ where: { id: user.id }, data: { status: "ACTIVATED" } });
+        }
+
+        const token = await signMobileToken(user, "pin");
 
         return NextResponse.json({
             user: {
