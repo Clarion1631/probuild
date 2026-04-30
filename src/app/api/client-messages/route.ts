@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
-import { sendSMS, type SmsResult } from "@/lib/sms";
+import { sendSMS, htmlToSmsText, type SmsResult } from "@/lib/sms";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 
 // GET /api/client-messages?leadId=X  OR  ?projectId=X  OR  ?unmatched=true
@@ -179,9 +179,10 @@ export async function POST(request: Request) {
         }
 
         if ((channel === "sms" || channel === "both") && clientPhone) {
+            const plainText = htmlToSmsText(messageBody);
             const smsBody = resolvedAttachments.length > 0
-                ? `${companyName}: ${messageBody}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
-                : `${companyName}: ${messageBody}`;
+                ? `${companyName}: ${plainText}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
+                : `${companyName}: ${plainText}`;
             smsResult = await sendSMS(clientPhone, smsBody);
             sentViaSms = smsResult.ok === true;
         }

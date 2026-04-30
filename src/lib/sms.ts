@@ -1,6 +1,24 @@
 import twilio from "twilio";
 import { normalizeE164 } from "./phone";
 
+/** Convert Tiptap HTML to plain text suitable for SMS. */
+export function htmlToSmsText(html: string): string {
+    return html
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<\/li>/gi, "\n")
+        .replace(/<li[^>]*>/gi, "• ")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
 export type SmsResult =
     | { ok: true; messageSid: string }
     | { ok: false; error: string; mocked?: boolean };
