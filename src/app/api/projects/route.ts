@@ -11,32 +11,31 @@ export async function GET(req: Request) {
     let projects;
 
     if (user.role === 'MANAGER' || user.role === 'ADMIN') {
-        // Admins and Managers see all projects
         projects = await prisma.project.findMany({
-            orderBy: { createdAt: 'desc' }
+            where: { status: { not: "Closed" } },
+            orderBy: { createdAt: 'desc' },
         });
     } else {
-        // Other roles: filter by ProjectAccess records
-        const accessRecords = await prisma.projectAccess.findMany({
-            where: { userId: user.id },
-            select: { projectId: true },
-        });
-        const allowedIds = accessRecords.map(a => a.projectId);
+        const [accessRecords, crewProjects] = await Promise.all([
+            prisma.projectAccess.findMany({
+                where: { userId: user.id },
+                select: { projectId: true },
+            }),
+            prisma.project.findMany({
+                where: { crew: { some: { id: user.id } } },
+                select: { id: true },
+            }),
+        ]);
 
-        if (allowedIds.length === 0) {
-            // Fall back to crew assignment if no ProjectAccess records exist yet
-            projects = await prisma.project.findMany({
-                where: {
-                    crew: { some: { id: user.id } }
-                },
-                orderBy: { createdAt: 'desc' }
-            });
-        } else {
-            projects = await prisma.project.findMany({
-                where: { id: { in: allowedIds } },
-                orderBy: { createdAt: 'desc' }
-            });
-        }
+        const allIds = [...new Set([
+            ...accessRecords.map(a => a.projectId),
+            ...crewProjects.map(p => p.id),
+        ])];
+
+        projects = allIds.length === 0 ? [] : await prisma.project.findMany({
+            where: { id: { in: allIds }, status: { not: "Closed" } },
+            orderBy: { createdAt: 'desc' },
+        });
     }
 
     return NextResponse.json(projects);
