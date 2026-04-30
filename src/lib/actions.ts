@@ -2360,7 +2360,13 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
         });
     }
 
+    await prisma.timeEntry.updateMany({
+        where: { id: { in: timeEntryIds } },
+        data: { invoicedAt: new Date() },
+    });
+
     revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/projects/${projectId}/time-expenses`);
     return { id: invoice.id, projectId };
 }
 

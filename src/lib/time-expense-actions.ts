@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
+import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 
 // ─── Time Entry Actions ────────────────────────────────────────
 
@@ -82,6 +83,38 @@ export async function deleteTimeEntry(id: string) {
     revalidatePath(`/projects/${entry.projectId}/budget`);
 }
 
+export async function deleteTimeEntries(
+    ids: string[]
+): Promise<{ deleted: number }> {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+    if (!ids.length) return { deleted: 0 };
+
+    const entries = await prisma.timeEntry.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, projectId: true, invoicedAt: true },
+    });
+
+    const allowed = entries.filter(
+        e => !e.invoicedAt && canAccessProject(user, e.projectId)
+    );
+    if (!allowed.length) return { deleted: 0 };
+
+    const allowedIds = allowed.map(e => e.id);
+    const projectIds = new Set(allowed.map(e => e.projectId));
+
+    const result = await prisma.timeEntry.deleteMany({
+        where: { id: { in: allowedIds } },
+    });
+
+    for (const projectId of projectIds) {
+        revalidatePath(`/projects/${projectId}/time-expenses`);
+        revalidatePath(`/projects/${projectId}/budget`);
+    }
+    return { deleted: result.count };
+}
+
 // ─── Expense Actions ───────────────────────────────────────────
 
 export async function createExpense(data: {
@@ -125,6 +158,40 @@ export async function deleteExpense(id: string, projectId: string) {
 
     revalidatePath(`/projects/${projectId}/time-expenses`);
     revalidatePath(`/projects/${projectId}/budget`);
+}
+
+export async function deleteExpenses(
+    ids: string[]
+): Promise<{ deleted: number }> {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+    if (!ids.length) return { deleted: 0 };
+
+    const expenses = await prisma.expense.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, estimate: { select: { projectId: true } } },
+    });
+
+    const allowed = expenses.filter(
+        e => e.estimate?.projectId && canAccessProject(user, e.estimate.projectId)
+    );
+    if (!allowed.length) return { deleted: 0 };
+
+    const allowedIds = allowed.map(e => e.id);
+    const projectIds = new Set(
+        allowed.map(e => e.estimate!.projectId).filter(Boolean) as string[]
+    );
+
+    const result = await prisma.expense.deleteMany({
+        where: { id: { in: allowedIds } },
+    });
+
+    for (const projectId of projectIds) {
+        revalidatePath(`/projects/${projectId}/time-expenses`);
+        revalidatePath(`/projects/${projectId}/budget`);
+    }
+    return { deleted: result.count };
 }
 
 // ─── Individual Data Fetching ─────────────────────────────────

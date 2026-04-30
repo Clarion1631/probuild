@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useCallback } from "react";
 import { toast } from "sonner";
-import { deleteExpense, getExpenses } from "@/lib/time-expense-actions";
+import { deleteExpense, deleteExpenses, getExpenses } from "@/lib/time-expense-actions";
 
 interface Expense {
     id: string;
@@ -40,6 +40,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
     const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
     const [filter, setFilter] = useState("");
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
     const refreshExpenses = useCallback(async () => {
         try {
@@ -77,6 +78,34 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
         }
         return list;
     }, [expenses, filter, statusFilter]);
+
+    function toggleSelect(id: string) {
+        setSelectedIds(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    }
+
+    function toggleAll() {
+        if (selectedIds.size === filtered.length) setSelectedIds(new Set());
+        else setSelectedIds(new Set(filtered.map(e => e.id)));
+    }
+
+    async function handleBulkDelete() {
+        if (selectedIds.size === 0) return;
+        const n = selectedIds.size;
+        if (!confirm(`Delete ${n} expense${n === 1 ? "" : "s"}?`)) return;
+        try {
+            const res = await deleteExpenses(Array.from(selectedIds));
+            toast.success(`Deleted ${res.deleted} expense${res.deleted === 1 ? "" : "s"}`);
+            setSelectedIds(new Set());
+            await refreshExpenses();
+        } catch (err: any) {
+            toast.error(err.message || "Failed to delete expenses");
+        }
+    }
 
     async function handleDelete(id: string) {
         if (!confirm("Delete this expense?")) return;
@@ -155,6 +184,17 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         <option value="Pending">Pending</option>
                         <option value="Reviewed">Reviewed</option>
                     </select>
+                    {selectedIds.size > 0 && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
+                        <button
+                            onClick={handleBulkDelete}
+                            className="hui-btn bg-white border border-red-300 text-red-600 hover:bg-red-50 text-sm px-3 py-1.5 flex items-center gap-1.5"
+                        >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+                            </svg>
+                            Delete ({selectedIds.size})
+                        </button>
+                    )}
                 </div>
                 <div className="flex items-center gap-2">
                     <button onClick={handleExport} className="hui-btn bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-1.5">
@@ -184,6 +224,9 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         <table className="w-full text-sm">
                             <thead>
                                 <tr className="bg-slate-50 border-b border-slate-200">
+                                    <th className="px-4 py-3 text-left w-10">
+                                        <input type="checkbox" checked={selectedIds.size === filtered.length && filtered.length > 0} onChange={toggleAll} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                    </th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Date</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Vendor</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Description</th>
@@ -198,6 +241,9 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                             <tbody className="divide-y divide-slate-100">
                                 {filtered.map(expense => (
                                     <tr key={expense.id} className="hover:bg-slate-50 transition">
+                                        <td className="px-4 py-3">
+                                            <input type="checkbox" checked={selectedIds.has(expense.id)} onChange={() => toggleSelect(expense.id)} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                        </td>
                                         <td className="px-4 py-3 text-slate-600 tabular-nums">{expense.date ? new Date(expense.date).toLocaleDateString() : "—"}</td>
                                         <td className="px-4 py-3 font-medium text-hui-textMain">{expense.vendor || "—"}</td>
                                         <td className="px-4 py-3 text-slate-600 max-w-[200px] truncate">{expense.description || "—"}</td>

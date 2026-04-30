@@ -540,6 +540,9 @@ model TimeEntry {
   isOffsite         Boolean   @default(false)
   lastLocationCheck DateTime?
 
+  // Invoice linkage — set when pulled into a cost-plus invoice
+  invoicedAt DateTime?
+
   @@index([projectId])
   @@index([userId])
 }
