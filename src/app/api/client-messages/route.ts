@@ -181,8 +181,8 @@ export async function POST(request: Request) {
         if ((channel === "sms" || channel === "both") && clientPhone) {
             const plainText = htmlToSmsText(messageBody);
             const smsBody = resolvedAttachments.length > 0
-                ? `${companyName}: ${plainText}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
-                : `${companyName}: ${plainText}`;
+                ? `${plainText}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
+                : plainText;
             smsResult = await sendSMS(clientPhone, smsBody);
             sentViaSms = smsResult.ok === true;
         }
