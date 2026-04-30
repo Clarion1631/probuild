@@ -31,6 +31,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
             <ClientMessaging
                 entityId={lead.id}
                 entityType="lead"
+                clientId={lead.client?.id || ""}
                 clientName={lead.client?.name || ""}
                 clientEmail={lead.client?.email || null}
                 clientPhone={(lead.client as any)?.primaryPhone || null}

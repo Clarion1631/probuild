@@ -6,7 +6,7 @@ import { sendNotification } from "@/lib/email";
 import { sendSMS, htmlToSmsText, type SmsResult } from "@/lib/sms";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 
-// GET /api/client-messages?leadId=X  OR  ?projectId=X  OR  ?unmatched=true
+// GET /api/client-messages?clientId=X  OR  ?leadId=X  OR  ?projectId=X  OR  ?unmatched=true
 export async function GET(request: Request) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
@@ -14,6 +14,7 @@ export async function GET(request: Request) {
     }
 
     const { searchParams } = new URL(request.url);
+    const clientId = searchParams.get("clientId");
     const leadId = searchParams.get("leadId");
     const projectId = searchParams.get("projectId");
     const unmatched = searchParams.get("unmatched") === "true";
@@ -33,10 +34,25 @@ export async function GET(request: Request) {
         return NextResponse.json({ messages });
     }
 
-    if (!leadId && !projectId) {
-        return NextResponse.json({ error: "leadId or projectId required" }, { status: 400 });
+    // Unified client-level query: returns ALL messages for a client across
+    // all their leads and projects in a single chronological timeline.
+    if (clientId) {
+        const messages = await prisma.clientMessage.findMany({
+            where: { clientId },
+            orderBy: { createdAt: "asc" },
+            include: {
+                lead: { select: { id: true, name: true } },
+                project: { select: { id: true, name: true } },
+            },
+        });
+        return NextResponse.json({ messages });
     }
 
+    if (!leadId && !projectId) {
+        return NextResponse.json({ error: "clientId, leadId, or projectId required" }, { status: 400 });
+    }
+
+    // Legacy entity-level queries (kept for backward compatibility)
     const messages = await prisma.clientMessage.findMany({
         where: leadId ? { leadId } : { projectId: projectId! },
         orderBy: { createdAt: "asc" },
@@ -71,6 +87,7 @@ export async function POST(request: Request) {
     }
 
     // Resolve client info from lead or project
+    let resolvedClientId: string | null = null;
     let clientEmail: string | null = null;
     let clientAdditionalEmail: string | null = null;
     let clientPhone: string | null = null;
@@ -85,6 +102,7 @@ export async function POST(request: Request) {
             },
         });
         if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+        resolvedClientId = lead.clientId;
         clientEmail = lead.client?.email ?? null;
         clientAdditionalEmail = (lead.client as any)?.additionalEmail ?? null;
         clientPhone = lead.client?.primaryPhone ?? null;
@@ -98,6 +116,7 @@ export async function POST(request: Request) {
             },
         });
         if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
+        resolvedClientId = project.clientId;
         clientEmail = project.client?.email ?? null;
         clientAdditionalEmail = (project.client as any)?.additionalEmail ?? null;
         clientPhone = project.client?.primaryPhone ?? null;
@@ -204,6 +223,7 @@ export async function POST(request: Request) {
 
     const message = await prisma.clientMessage.create({
         data: {
+            clientId: resolvedClientId,
             leadId: leadId || null,
             projectId: projectId || null,
             direction: "OUTBOUND",

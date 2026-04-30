@@ -13,6 +13,7 @@ interface EstimateOption {
 
 interface ProjectMessagingPanelProps {
     projectId: string;
+    clientId: string;
     clientName: string;
     clientEmail?: string | null;
     clientPhone?: string | null;
@@ -24,7 +25,7 @@ interface ProjectMessagingPanelProps {
 }
 
 export default function ProjectMessagingPanel({
-    projectId, clientName, clientEmail, clientPhone, estimates,
+    projectId, clientId, clientName, clientEmail, clientPhone, estimates,
     currentUserName, currentUserEmail, onToggle,
 }: ProjectMessagingPanelProps) {
     const [activeTab, setActiveTab] = useState<"client" | "team">("client");
@@ -75,6 +76,7 @@ export default function ProjectMessagingPanel({
                     <ClientMessaging
                         entityId={projectId}
                         entityType="project"
+                        clientId={clientId}
                         clientName={clientName}
                         clientEmail={clientEmail}
                         clientPhone={clientPhone}

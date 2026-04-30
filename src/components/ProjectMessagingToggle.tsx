@@ -12,6 +12,7 @@ interface EstimateOption {
 
 interface ProjectMessagingToggleProps {
     projectId: string;
+    clientId: string;
     clientName: string;
     clientEmail?: string | null;
     clientPhone?: string | null;
@@ -22,7 +23,7 @@ interface ProjectMessagingToggleProps {
 }
 
 export default function ProjectMessagingToggle({
-    projectId, clientName, clientEmail, clientPhone, estimates,
+    projectId, clientId, clientName, clientEmail, clientPhone, estimates,
     currentUserName, currentUserEmail, unreadCount = 0,
 }: ProjectMessagingToggleProps) {
     // undefined = pre-mount (renders collapsed strip to avoid CLS flash)
@@ -77,6 +78,7 @@ export default function ProjectMessagingToggle({
         <div className="w-[380px] shrink-0 h-full">
             <ProjectMessagingPanel
                 projectId={projectId}
+                clientId={clientId}
                 clientName={clientName}
                 clientEmail={clientEmail}
                 clientPhone={clientPhone}

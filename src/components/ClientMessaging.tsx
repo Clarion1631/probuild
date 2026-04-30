@@ -32,6 +32,7 @@ interface EstimateOption {
 interface ClientMessagingProps {
     entityId: string;
     entityType: "lead" | "project";
+    clientId: string; // Unified cross-entity queries: all messages for this client
     clientName: string;
     clientEmail?: string | null;
     clientPhone?: string | null;
@@ -47,7 +48,7 @@ interface ClientMessagingProps {
 }
 
 export default function ClientMessaging({
-    entityId, entityType, clientName, clientEmail, clientPhone,
+    entityId, entityType, clientId, clientName, clientEmail, clientPhone,
     estimates, leadName, leadSource, createdAt, location, initialMessage,
     variant = "full", headerContent,
 }: ClientMessagingProps) {
@@ -91,20 +92,21 @@ export default function ClientMessaging({
         },
     });
 
-    const entityParam = entityType === "lead" ? `leadId=${entityId}` : `projectId=${entityId}`;
+    // Fetch by clientId for unified conversation view across all leads/projects
+    const fetchParam = clientId ? `clientId=${clientId}` : (entityType === "lead" ? `leadId=${entityId}` : `projectId=${entityId}`);
     const createdDate = createdAt ? new Date(createdAt) : null;
     const daysSince = createdDate ? Math.floor((Date.now() - createdDate.getTime()) / (1000 * 60 * 60 * 24)) : 0;
 
     const fetchMessages = useCallback(async () => {
         try {
-            const res = await fetch(`/api/client-messages?${entityParam}`);
+            const res = await fetch(`/api/client-messages?${fetchParam}`);
             if (!res.ok) return;
             const data = await res.json();
             setMessages(data.messages || []);
         } catch {} finally {
             setLoading(false);
         }
-    }, [entityParam]);
+    }, [fetchParam]);
 
     const fetchTeamMembers = useCallback(async () => {
         try {

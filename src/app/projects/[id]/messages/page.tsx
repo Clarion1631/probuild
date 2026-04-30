@@ -15,7 +15,7 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
         select: {
             id: true,
             name: true,
-            client: { select: { name: true, email: true, primaryPhone: true } },
+            client: { select: { id: true, name: true, email: true, primaryPhone: true } },
             estimates: { select: { id: true, code: true, title: true, status: true } },
         },
     });
@@ -37,6 +37,7 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
                 <ClientMessaging
                     entityId={projectId}
                     entityType="project"
+                    clientId={project.client.id}
                     clientName={project.client.name}
                     clientEmail={project.client.email}
                     clientPhone={project.client.primaryPhone}

@@ -57,10 +57,11 @@ model Client {
 
   internalNotes String?
 
-  projects Project[]
-  leads    Lead[]
-  invoices Invoice[]
-  retainers Retainer[]
+  projects       Project[]
+  leads          Lead[]
+  invoices       Invoice[]
+  retainers      Retainer[]
+  clientMessages ClientMessage[]
 
   @@index([primaryPhoneE164])
   @@index([additionalPhoneE164])
@@ -979,7 +980,10 @@ model Message {
 
 model ClientMessage {
   id           String    @id @default(cuid())
-  // Belongs to either a Lead OR a Project (one must be set)
+  // Client-level FK for unified conversation view (all messages for one client)
+  clientId     String?
+  client       Client?   @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  // Entity context: which lead/project the message was sent from/threaded to
   leadId       String?
   lead         Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
   projectId    String?
@@ -1003,6 +1007,7 @@ model ClientMessage {
   // Partial-unique index in DB: WHERE "twilioMessageSid" IS NOT NULL.
   twilioMessageSid String? @unique
 
+  @@index([clientId])
   @@index([leadId])
   @@index([projectId])
   @@index([createdAt])

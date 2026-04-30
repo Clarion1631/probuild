@@ -151,6 +151,7 @@ export async function POST(request: Request) {
     try {
         await prisma.clientMessage.create({
             data: {
+                clientId: client?.id ?? null,
                 leadId,
                 projectId,
                 direction: "INBOUND",
