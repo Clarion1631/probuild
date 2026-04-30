@@ -25,6 +25,7 @@ export async function getCurrentUserWithPermissions() {
         include: {
             permissions: true,
             projectAccess: { select: { projectId: true } },
+            assignedProjects: { select: { id: true } },
         },
     });
 
@@ -74,15 +75,13 @@ export function getEffectivePermissions(
 
 // Check if user can access a specific project
 export function canAccessProject(
-    user: { role: string; projectAccess?: { projectId: string }[] },
+    user: { role: string; projectAccess?: { projectId: string }[]; assignedProjects?: { id: string }[] },
     projectId: string
 ): boolean {
-    // Admins and Managers see all projects
     if (ADMIN_ROLES.includes(user.role)) return true;
-
-    // Check project access list
-    if (!user.projectAccess) return false;
-    return user.projectAccess.some(pa => pa.projectId === projectId);
+    if (user.projectAccess?.some(pa => pa.projectId === projectId)) return true;
+    if (user.assignedProjects?.some(p => p.id === projectId)) return true;
+    return false;
 }
 
 // Default permissions by role (used when no UserPermission record exists)
