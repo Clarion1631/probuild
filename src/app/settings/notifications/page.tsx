@@ -10,7 +10,10 @@ export default async function NotificationsPage() {
                 <h1 className="text-2xl font-bold text-hui-textMain">Notifications</h1>
                 <p className="text-sm text-hui-textMuted mt-1">Configure when and how you receive email alerts.</p>
             </div>
-            <NotificationsClient initialEmail={settings?.notificationEmail ?? ""} />
+            <NotificationsClient
+                initialEmail={settings?.notificationEmail ?? ""}
+                initialToggles={settings?.notificationToggles ?? null}
+            />
         </div>
     );
 }

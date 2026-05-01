@@ -641,6 +641,9 @@ model CompanySettings {
   // Sales taxes
   salesTaxes String? // JSON array: [{name, rate, isDefault}]
 
+  // Notification event toggles
+  notificationToggles String? // JSON: {newLead, estimateViewed, estimateSigned, contractSigned, invoiceViewed, paymentReceived, messageReceived}
+
   updatedAt DateTime @updatedAt
 }
 

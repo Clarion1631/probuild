@@ -13,17 +13,35 @@ const NOTIFICATION_EVENTS = [
     { key: "messageReceived", label: "New Message", description: "When a client or subcontractor sends a message" },
 ];
 
-export default function NotificationsClient({ initialEmail }: { initialEmail: string }) {
+function parseToggles(raw: string | null): Record<string, boolean> {
+    const defaults = Object.fromEntries(NOTIFICATION_EVENTS.map(e => [e.key, true]));
+    if (!raw) return defaults;
+    try {
+        const parsed = JSON.parse(raw);
+        return { ...defaults, ...parsed };
+    } catch {
+        return defaults;
+    }
+}
+
+export default function NotificationsClient({
+    initialEmail,
+    initialToggles,
+}: {
+    initialEmail: string;
+    initialToggles: string | null;
+}) {
     const [email, setEmail] = useState(initialEmail);
-    const [events, setEvents] = useState<Record<string, boolean>>(() =>
-        Object.fromEntries(NOTIFICATION_EVENTS.map(e => [e.key, true]))
-    );
+    const [events, setEvents] = useState<Record<string, boolean>>(() => parseToggles(initialToggles));
     const [isPending, startTransition] = useTransition();
 
     const handleSave = () => {
         startTransition(async () => {
             try {
-                await saveCompanySettings({ notificationEmail: email } as any);
+                await saveCompanySettings({
+                    notificationEmail: email,
+                    notificationToggles: JSON.stringify(events),
+                } as any);
                 toast.success("Notification settings saved");
             } catch {
                 toast.error("Failed to save settings");

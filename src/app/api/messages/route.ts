@@ -105,11 +105,13 @@ export async function POST(request: Request) {
         const companyName = settings?.companyName || "Your Contractor";
         const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
+        const msgToggleOn = !settings?.notificationToggles || (() => { try { return JSON.parse(settings.notificationToggles!).messageReceived !== false; } catch { return true; } })();
+
         // Logic for Subcontractor Thread Notifications
         if (subcontractorId) {
             const sub = await prisma.subcontractor.findUnique({ where: { id: subcontractorId } });
-            
-            if (senderType === "SUBCONTRACTOR" && settings?.notificationEmail) {
+
+            if (senderType === "SUBCONTRACTOR" && settings?.notificationEmail && msgToggleOn) {
                 // Sub sent a message → notify the team
                 await sendNotification(
                     settings.notificationEmail,
@@ -162,7 +164,7 @@ export async function POST(request: Request) {
             }
         } else {
             // Client Thread Notifications
-            if (senderType === "CLIENT" && settings?.notificationEmail) {
+            if (senderType === "CLIENT" && settings?.notificationEmail && msgToggleOn) {
                 // Client sent a message → notify the team
                 await sendNotification(
                     settings.notificationEmail,

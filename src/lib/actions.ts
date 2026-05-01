@@ -13,6 +13,18 @@ import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
 import { normalizeE164 } from "./phone";
 
+type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
+
+function isNotificationEnabled(settings: { notificationToggles?: string | null } | null, key: NotificationToggleKey): boolean {
+    if (!settings?.notificationToggles) return true;
+    try {
+        const toggles = JSON.parse(settings.notificationToggles);
+        return toggles[key] !== false;
+    } catch {
+        return true;
+    }
+}
+
 // Build a CC array for a secondary client email (spouse/partner).
 // Returns undefined when additionalEmail is absent, empty, or identical to the primary (case-insensitive).
 function buildCc(primaryEmail: string, additionalEmail?: string | null): string[] | undefined {
@@ -244,6 +256,24 @@ export async function createLead(data: { name: string; clientName: string; clien
     });
 
     revalidatePath("/leads");
+
+    const settings = await getCompanySettings();
+    if (settings.notificationEmail && isNotificationEnabled(settings, "newLead")) {
+        await sendNotification(
+            settings.notificationEmail,
+            `New Lead: ${data.name}`,
+            `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 20px;">
+                    <h3 style="margin: 0 0 8px; color: #166534;">New Lead Created</h3>
+                    <p style="margin: 0 0 4px; color: #333;"><strong>${data.clientName}</strong> — ${data.name}</p>
+                    ${data.source ? `<p style="margin: 0 0 4px; color: #666; font-size: 13px;">Source: ${data.source}</p>` : ""}
+                    ${data.projectType ? `<p style="margin: 0 0 4px; color: #666; font-size: 13px;">Type: ${data.projectType}</p>` : ""}
+                    ${data.location ? `<p style="margin: 0; color: #666; font-size: 13px;">Location: ${data.location}</p>` : ""}
+                </div>
+            </div>`
+        );
+    }
+
     return { id: lead.id };
 }
 
@@ -1461,7 +1491,7 @@ export async function markEstimateViewed(estimateId: string) {
         const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || "A client";
         const projectName = estimate.project?.name || estimate.lead?.name || "";
         const settings = await getCompanySettings();
-        if (settings.notificationEmail) {
+        if (settings.notificationEmail && isNotificationEnabled(settings, "estimateViewed")) {
             await sendNotification(
                 settings.notificationEmail,
                 `👁️ Estimate Viewed — ${estimate.title || estimate.code}`,
@@ -1678,7 +1708,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     }
 
     // ─── 2. Email the COMPANY notification ───
-    if (settings.notificationEmail) {
+    if (settings.notificationEmail && isNotificationEnabled(settings, "estimateSigned")) {
         await sendNotification(
             settings.notificationEmail,
             `✅ Estimate Approved: ${estimateCode}`,
@@ -1978,7 +2008,7 @@ export async function markInvoiceViewed(invoiceId: string) {
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
         const settings = await getCompanySettings();
-        if (settings.notificationEmail) {
+        if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
             await sendNotification(
                 settings.notificationEmail,
                 `👁️ Invoice Viewed — ${invoice.code}`,
@@ -2937,9 +2967,11 @@ export async function saveCompanySettings(data: any) {
             workdayStart: data.workdayStart,
             workdayEnd: data.workdayEnd,
             salesTaxes: data.salesTaxes,
+            ...(data.notificationToggles !== undefined ? { notificationToggles: data.notificationToggles } : {}),
         },
     });
 
+    revalidatePath("/settings/notifications");
     revalidatePath("/settings/company");
     revalidatePath("/portal");
     revalidatePath("/"); // bust company-settings cache
@@ -4108,7 +4140,7 @@ export async function approveContract(contractId: string, signatureName: string,
     });
 
     const settings = await getCompanySettings();
-    if (settings.notificationEmail) {
+    if (settings.notificationEmail && isNotificationEnabled(settings, "contractSigned")) {
         const isRecurring = contract.recurringDays && contract.recurringDays > 0;
         await sendNotification(
             settings.notificationEmail,

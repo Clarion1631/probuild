@@ -2,6 +2,11 @@ import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
 
+function isToggleOn(settings: { notificationToggles?: string | null } | null, key: string): boolean {
+    if (!settings?.notificationToggles) return true;
+    try { return JSON.parse(settings.notificationToggles)[key] !== false; } catch { return true; }
+}
+
 type ScheduleLike = {
     id: string;
     name: string;
@@ -94,7 +99,7 @@ export async function sendInvoicePaymentReceivedEmails(opts: {
     const companyName = settings?.companyName || "Golden Touch Remodeling";
     const methodLabel = formatMethod(method, referenceNumber);
 
-    if (settings?.notificationEmail) {
+    if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
         await sendNotification(
             settings.notificationEmail,
             `Payment Received: ${schedule.name} - ${invoice.code}`,
@@ -150,7 +155,7 @@ export async function sendEstimatePaymentReceivedEmails(opts: {
     const companyName = settings?.companyName || "Golden Touch Remodeling";
     const methodLabel = formatMethod(method, referenceNumber);
 
-    if (settings?.notificationEmail) {
+    if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
         await sendNotification(
             settings.notificationEmail,
             `Estimate Payment Received: ${schedule.name} - ${estimate.code}`,
