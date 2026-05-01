@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { ChevronLeft, Save } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
+import TeamMemberProjectAccess from "./TeamMemberProjectAccess";
 
 interface UserPermission {
     manageTeamMembers: boolean;
@@ -23,6 +24,7 @@ interface UserPermission {
     dailyLogs: boolean;
     files: boolean;
     takeoffs: boolean;
+    autoGrantNewProjects: boolean;
 }
 
 interface User {
@@ -34,6 +36,7 @@ interface User {
     burdenRate: number;
     hasPin: boolean;
     permissions: UserPermission | null;
+    projectAccess?: { projectId: string; project?: { id: string } | null }[];
 }
 
 const DEFAULT_PERMISSIONS: UserPermission = {
@@ -53,6 +56,7 @@ const DEFAULT_PERMISSIONS: UserPermission = {
     dailyLogs: true,
     files: true,
     takeoffs: false,
+    autoGrantNewProjects: true,
 };
 
 export default function TeamMemberEditPage({ params }: { params: Promise<{ id: string }> }) {
@@ -61,6 +65,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [allProjects, setAllProjects] = useState<any[]>([]);
 
     // Form state
     const [firstName, setFirstName] = useState("");
@@ -80,7 +85,8 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
         try {
             const res = await fetch(`/api/users/${id}`);
             if (res.ok) {
-                const { user: found } = await res.json();
+                const { user: found, allProjects: projects } = await res.json();
+                setAllProjects(projects || []);
                 if (found) {
                     setUser(found);
                     const names = (found.name || "").split(" ");
@@ -306,6 +312,15 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                         ))}
                     </div>
                 </div>
+
+                {/* Project Assignments */}
+                <TeamMemberProjectAccess
+                    userId={id}
+                    userRole={role}
+                    initialProjectIds={user?.projectAccess?.map((pa: { project?: { id: string } | null; projectId?: string }) => pa.project?.id || pa.projectId).filter((id): id is string => !!id) || []}
+                    allProjects={allProjects}
+                    autoGrantNewProjects={permissions.autoGrantNewProjects}
+                />
 
                 {/* Rates & App Access */}
                 <div className="grid grid-cols-2 gap-8">

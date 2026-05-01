@@ -812,6 +812,10 @@ export async function convertLeadToProject(leadId: string) {
         return project;
     });
 
+    // Auto-grant access to eligible team members
+    const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
+    await autoGrantProjectAccessToEligibleUsers(project.id);
+
     revalidatePath("/leads");
     revalidatePath("/projects");
     revalidatePath(`/leads/${leadId}`);

@@ -134,5 +134,9 @@ export async function POST(req: Request) {
         },
     });
 
+    // Auto-grant access to eligible team members
+    const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
+    await autoGrantProjectAccessToEligibleUsers(created.id);
+
     return NextResponse.json(created);
 }

@@ -71,15 +71,17 @@ export async function POST(req: Request) {
         });
 
         // Create default permissions record
-        await prisma.userPermission.create({ data: { userId: newUser.id } });
+        const permission = await prisma.userPermission.create({ data: { userId: newUser.id } });
 
-        // Auto-grant access to all existing projects if autoGrantNewProjects is default
-        const allProjects = await prisma.project.findMany({ select: { id: true } });
-        if (allProjects.length > 0) {
-            await prisma.projectAccess.createMany({
-                data: allProjects.map(p => ({ userId: newUser.id, projectId: p.id })),
-                skipDuplicates: true,
-            });
+        // Auto-grant access to all existing projects if autoGrantNewProjects is enabled
+        if (permission.autoGrantNewProjects) {
+            const allProjects = await prisma.project.findMany({ select: { id: true } });
+            if (allProjects.length > 0) {
+                await prisma.projectAccess.createMany({
+                    data: allProjects.map(p => ({ userId: newUser.id, projectId: p.id })),
+                    skipDuplicates: true,
+                });
+            }
         }
 
         // Send invite email

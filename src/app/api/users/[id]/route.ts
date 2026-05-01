@@ -72,13 +72,27 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
-        // Update permissions if provided
+        // Update permissions if provided (allowlisted fields only)
         if (permissions) {
-            await prisma.userPermission.upsert({
-                where: { userId: id },
-                create: { userId: id, ...permissions },
-                update: permissions,
-            });
+            const ALLOWED_PERMISSION_FIELDS = [
+                "manageTeamMembers", "manageSubs", "manageVendors", "companySettings",
+                "costCodesCategories", "schedules", "estimates", "invoices", "contracts",
+                "roomDesigner", "changeOrders", "financialReports", "timeClock",
+                "dailyLogs", "files", "takeoffs", "autoGrantNewProjects",
+            ] as const;
+            const sanitized: Record<string, boolean> = {};
+            for (const key of ALLOWED_PERMISSION_FIELDS) {
+                if (key in permissions && typeof permissions[key] === "boolean") {
+                    sanitized[key] = permissions[key];
+                }
+            }
+            if (Object.keys(sanitized).length > 0) {
+                await prisma.userPermission.upsert({
+                    where: { userId: id },
+                    create: { userId: id, ...sanitized },
+                    update: sanitized,
+                });
+            }
         }
 
         // Update project access if provided
@@ -128,6 +142,15 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
         // Can't delete yourself
         if (id === currentUser.id) {
             return NextResponse.json({ error: "Cannot delete your own account" }, { status: 400 });
+        }
+
+        // Only ADMIN can delete other ADMIN accounts
+        const targetUser = await prisma.user.findUnique({ where: { id }, select: { role: true } });
+        if (!targetUser) {
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
+        }
+        if (targetUser.role === "ADMIN" && currentUser.role !== "ADMIN") {
+            return NextResponse.json({ error: "Only admins can delete admin accounts" }, { status: 403 });
         }
 
         await prisma.user.delete({ where: { id } });

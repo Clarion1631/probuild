@@ -15,6 +15,7 @@ type User = {
     hourlyRate: number;
     burdenRate: number;
     hasPin: boolean;
+    projectAccess?: { projectId: string }[];
 };
 
 export default function TeamPage() {
@@ -138,6 +139,7 @@ export default function TeamPage() {
                                     <th className="px-6 py-4 font-normal">Email</th>
                                     <th className="px-6 py-4 font-normal">Role</th>
                                     <th className="px-6 py-4 font-normal">Status</th>
+                                    <th className="px-6 py-4 font-normal hidden sm:table-cell">Projects</th>
                                     <th className="px-6 py-4 font-normal hidden sm:table-cell">Hourly Rate</th>
                                     <th className="px-6 py-4 font-normal text-right">Actions</th>
                                 </tr>
@@ -191,12 +193,17 @@ export default function TeamPage() {
                                                 </span>
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
+                                                {user.role === "ADMIN" || user.role === "MANAGER"
+                                                    ? "All"
+                                                    : user.projectAccess?.length ?? 0}
+                                            </td>
+                                            <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
                                                 {formatCurrency(user.hourlyRate ?? 0)}
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <Link
                                                     href={`/company/team-members/${user.id}`}
-                                                    className="text-blue-600 hover:text-blue-800 font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                                                    className="text-blue-600 hover:text-blue-800 font-medium opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition"
                                                 >
                                                     Edit
                                                 </Link>
