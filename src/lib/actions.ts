@@ -257,21 +257,25 @@ export async function createLead(data: { name: string; clientName: string; clien
 
     revalidatePath("/leads");
 
-    const settings = await getCompanySettings();
-    if (settings.notificationEmail && isNotificationEnabled(settings, "newLead")) {
-        await sendNotification(
-            settings.notificationEmail,
-            `New Lead: ${data.name}`,
-            `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
-                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 20px;">
-                    <h3 style="margin: 0 0 8px; color: #166534;">New Lead Created</h3>
-                    <p style="margin: 0 0 4px; color: #333;"><strong>${data.clientName}</strong> — ${data.name}</p>
-                    ${data.source ? `<p style="margin: 0 0 4px; color: #666; font-size: 13px;">Source: ${data.source}</p>` : ""}
-                    ${data.projectType ? `<p style="margin: 0 0 4px; color: #666; font-size: 13px;">Type: ${data.projectType}</p>` : ""}
-                    ${data.location ? `<p style="margin: 0; color: #666; font-size: 13px;">Location: ${data.location}</p>` : ""}
-                </div>
-            </div>`
-        );
+    try {
+        const settings = await getCompanySettings();
+        if (settings.notificationEmail && isNotificationEnabled(settings, "newLead")) {
+            await sendNotification(
+                settings.notificationEmail,
+                `New Lead: ${data.name}`,
+                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                    <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 20px;">
+                        <h3 style="margin: 0 0 8px; color: #166534;">New Lead Created</h3>
+                        <p style="margin: 0 0 4px; color: #333;"><strong>${data.clientName}</strong> — ${data.name}</p>
+                        ${data.source ? `<p style="margin: 0 0 4px; color: #666; font-size: 13px;">Source: ${data.source}</p>` : ""}
+                        ${data.projectType ? `<p style="margin: 0 0 4px; color: #666; font-size: 13px;">Type: ${data.projectType}</p>` : ""}
+                        ${data.location ? `<p style="margin: 0; color: #666; font-size: 13px;">Location: ${data.location}</p>` : ""}
+                    </div>
+                </div>`
+            );
+        }
+    } catch (e) {
+        console.error("Failed to send new lead notification:", e);
     }
 
     return { id: lead.id };
@@ -2028,12 +2032,24 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // Update estimate — try full update, fallback to safe fields if columns missing.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
+
+    // Preserve payment credits: subtract already-paid milestones from totalAmount
+    const paidMilestones = await prisma.estimatePaymentSchedule.findMany({
+        where: { estimateId, status: "Paid" },
+        select: { amount: true },
+    });
+    const paidSum = paidMilestones.reduce((sum, s) => sum + toNum(s.amount), 0);
+    const computedBalance = Math.max(0, (data.totalAmount || 0) - paidSum);
+    const computedStatus = paidSum > 0
+        ? (computedBalance <= 0 ? "Paid" : "Partially Paid")
+        : data.status;
+
     const safeData = {
         title: data.title,
         code: data.code,
-        status: data.status,
+        status: computedStatus,
         totalAmount: data.totalAmount,
-        balanceDue: data.totalAmount,
+        balanceDue: computedBalance,
         ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
         ...(data.targetMarginPercent !== undefined && {
             targetMarginPercent: Math.max(0, Math.min(70, parseFloat(data.targetMarginPercent) || 25)),
@@ -2458,16 +2474,17 @@ export async function recordPayment(
     invoiceId: string,
     input: {
         paymentDate: number | string;
-        method: "check" | "cash";
+        method: string;
         referenceNumber?: string | null;
         notes?: string | null;
     },
 ) {
     await assertInvoicePermission();
 
+    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "other"];
     const method = input.method;
-    if (method !== "check" && method !== "cash") {
-        return { success: false, error: "Payment method must be 'check' or 'cash'" as const };
+    if (!VALID_METHODS.includes(method)) {
+        return { success: false, error: "Invalid payment method" as const };
     }
     const referenceNumber = (input.referenceNumber || "").trim() || null;
     if (method === "check" && !referenceNumber) {
@@ -2532,7 +2549,7 @@ export async function recordEstimatePayment(
     estimateId: string,
     input: {
         paymentDate: number | string;
-        method: "check" | "cash";
+        method: string;
         referenceNumber?: string | null;
         notes?: string | null;
     },
@@ -2541,9 +2558,10 @@ export async function recordEstimatePayment(
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
 
+    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "other"];
     const method = input.method;
-    if (method !== "check" && method !== "cash") {
-        return { success: false, error: "Payment method must be 'check' or 'cash'" as const };
+    if (!VALID_METHODS.includes(method)) {
+        return { success: false, error: "Invalid payment method" as const };
     }
     const referenceNumber = (input.referenceNumber || "").trim() || null;
     if (method === "check" && !referenceNumber) {
@@ -2582,10 +2600,14 @@ export async function recordEstimatePayment(
             .filter((s) => s.status === "Paid")
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+        const newStatus =
+            newBalance <= 0 ? "Paid"
+            : totalPaid > 0 ? "Partially Paid"
+            : estimate.status;
 
         await t.estimate.update({
             where: { id: estimateId },
-            data: { balanceDue: newBalance },
+            data: { balanceDue: newBalance, status: newStatus },
         });
 
         return { success: true as const, projectId: estimate.projectId, leadId: estimate.leadId };
@@ -2669,12 +2691,19 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
             data: { status: "Pending", paymentDate: null, paidAt: null },
         });
 
-        const amount = toNum(payment.amount);
-        const cappedDelta = Math.min(amount, Math.max(0, toNum(estimate.totalAmount) - toNum(estimate.balanceDue)));
+        const allSchedules = await tx.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        const totalPaid = allSchedules
+            .filter((s) => s.status === "Paid")
+            .reduce((sum, s) => sum + toNum(s.amount), 0);
+        const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+        const newStatus =
+            newBalance <= 0 ? "Paid"
+            : totalPaid > 0 ? "Partially Paid"
+            : "Approved";
 
         await tx.estimate.update({
             where: { id: estimateId },
-            data: { balanceDue: { increment: cappedDelta } },
+            data: { balanceDue: newBalance, status: newStatus },
         });
 
         return { projectId: estimate.projectId, leadId: estimate.leadId };
