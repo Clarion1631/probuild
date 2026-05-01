@@ -100,23 +100,43 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         // Update project access AND crew assignments if provided
         if (projectIds !== undefined) {
-            // Sync ProjectAccess records
-            await prisma.projectAccess.deleteMany({ where: { userId: id } });
-            if (projectIds.length > 0) {
-                await prisma.projectAccess.createMany({
-                    data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
-                    skipDuplicates: true,
-                });
-            }
-            // Sync crew assignments (many-to-many) so Time Clock sees the same projects
-            await prisma.user.update({
+            const newIdSet = new Set(projectIds as string[]);
+
+            // Read current state to compute diffs
+            const currentUser = await prisma.user.findUnique({
                 where: { id },
-                data: {
-                    assignedProjects: {
-                        set: projectIds.map((pid: string) => ({ id: pid })),
-                    },
+                select: {
+                    projectAccess: { select: { projectId: true } },
+                    assignedProjects: { select: { id: true } },
                 },
             });
+            const oldAccessIds = new Set(currentUser?.projectAccess.map(pa => pa.projectId) || []);
+            const oldCrewIds = new Set(currentUser?.assignedProjects.map(p => p.id) || []);
+
+            // Compute crew diffs: only connect/disconnect what changed via Team Access
+            const toConnect = projectIds.filter((pid: string) => !oldCrewIds.has(pid));
+            const toDisconnect = [...oldAccessIds].filter(pid => !newIdSet.has(pid) && oldCrewIds.has(pid));
+
+            await prisma.$transaction([
+                prisma.projectAccess.deleteMany({ where: { userId: id } }),
+                ...(projectIds.length > 0
+                    ? [prisma.projectAccess.createMany({
+                        data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
+                        skipDuplicates: true,
+                    })]
+                    : []),
+                ...(toConnect.length > 0 || toDisconnect.length > 0
+                    ? [prisma.user.update({
+                        where: { id },
+                        data: {
+                            assignedProjects: {
+                                connect: toConnect.map((pid: string) => ({ id: pid })),
+                                disconnect: toDisconnect.map(pid => ({ id: pid })),
+                            },
+                        },
+                    })]
+                    : []),
+            ]);
         }
 
         // Fetch updated user

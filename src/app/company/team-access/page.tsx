@@ -18,6 +18,7 @@ interface UserSummary {
     status: string;
     permissions: { autoGrantNewProjects?: boolean } | null;
     projectAccess: { projectId: string }[];
+    assignedProjects?: { id: string }[];
 }
 
 interface UserDetail {
@@ -232,7 +233,7 @@ export default function TeamAccessPage() {
                                             ? "All"
                                             : new Set([
                                                 ...(u.projectAccess?.map(pa => pa.projectId) || []),
-                                                ...((u as any).assignedProjects?.map((p: any) => p.id) || []),
+                                                ...(u.assignedProjects?.map(p => p.id) || []),
                                             ]).size}
                                     </span>
                                 </div>
