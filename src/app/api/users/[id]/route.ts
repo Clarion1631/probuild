@@ -23,6 +23,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
                 projectAccess: {
                     include: { project: { select: { id: true, name: true, client: { select: { name: true } }, createdAt: true } } }
                 },
+                assignedProjects: {
+                    select: { id: true },
+                },
             },
         });
 
@@ -95,17 +98,25 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
-        // Update project access if provided
+        // Update project access AND crew assignments if provided
         if (projectIds !== undefined) {
-            // Delete all existing access
+            // Sync ProjectAccess records
             await prisma.projectAccess.deleteMany({ where: { userId: id } });
-            // Re-create with new list
             if (projectIds.length > 0) {
                 await prisma.projectAccess.createMany({
                     data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
                     skipDuplicates: true,
                 });
             }
+            // Sync crew assignments (many-to-many) so Time Clock sees the same projects
+            await prisma.user.update({
+                where: { id },
+                data: {
+                    assignedProjects: {
+                        set: projectIds.map((pid: string) => ({ id: pid })),
+                    },
+                },
+            });
         }
 
         // Fetch updated user
@@ -115,6 +126,9 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 permissions: true,
                 projectAccess: {
                     include: { project: { select: { id: true, name: true, client: { select: { name: true } }, createdAt: true } } }
+                },
+                assignedProjects: {
+                    select: { id: true },
                 },
             },
         });

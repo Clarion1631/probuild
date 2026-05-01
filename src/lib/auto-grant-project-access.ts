@@ -10,5 +10,14 @@ export async function autoGrantProjectAccessToEligibleUsers(projectId: string) {
             data: eligible.map((u) => ({ userId: u.userId, projectId })),
             skipDuplicates: true,
         });
+        // Also add to crew assignments so Time Clock sees the project
+        await prisma.project.update({
+            where: { id: projectId },
+            data: {
+                crew: {
+                    connect: eligible.map((u) => ({ id: u.userId })),
+                },
+            },
+        });
     }
 }

@@ -26,6 +26,7 @@ export async function GET(req: NextRequest) {
                 hourlyRate: true, burdenRate: true, pinCode: true, invitedAt: true,
                 permissions: true,
                 projectAccess: { select: { projectId: true } },
+                assignedProjects: { select: { id: true } },
             },
         });
 

@@ -195,7 +195,10 @@ export default function TeamPage() {
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
                                                 {user.role === "ADMIN" || user.role === "MANAGER"
                                                     ? "All"
-                                                    : user.projectAccess?.length ?? 0}
+                                                    : new Set([
+                                                        ...(user.projectAccess?.map(pa => pa.projectId) || []),
+                                                        ...((user as any).assignedProjects?.map((p: any) => p.id) || []),
+                                                    ]).size}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
                                                 {formatCurrency(user.hourlyRate ?? 0)}

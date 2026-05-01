@@ -317,7 +317,10 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                 <TeamMemberProjectAccess
                     userId={id}
                     userRole={role}
-                    initialProjectIds={user?.projectAccess?.map((pa: { project?: { id: string } | null; projectId?: string }) => pa.project?.id || pa.projectId).filter((id): id is string => !!id) || []}
+                    initialProjectIds={[...new Set([
+                        ...(user?.projectAccess?.map((pa: { project?: { id: string } | null; projectId?: string }) => pa.project?.id || pa.projectId).filter((id): id is string => !!id) || []),
+                        ...((user as any)?.assignedProjects?.map((p: { id: string }) => p.id) || []),
+                    ])]}
                     allProjects={allProjects}
                     autoGrantNewProjects={permissions.autoGrantNewProjects}
                 />

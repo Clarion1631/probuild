@@ -69,9 +69,9 @@ export default function TeamAccessPage() {
                 const { user, allProjects: projects } = await res.json();
                 setSelectedUser(user);
                 setAllProjects(projects || []);
-                setAssignedIds(
-                    user.projectAccess?.map((pa: any) => pa.project?.id || pa.projectId).filter(Boolean) || []
-                );
+                const accessIds = user.projectAccess?.map((pa: any) => pa.project?.id || pa.projectId).filter(Boolean) || [];
+                const crewIds = user.assignedProjects?.map((p: any) => p.id) || [];
+                setAssignedIds([...new Set([...accessIds, ...crewIds])]);
                 setAutoGrant(user.permissions?.autoGrantNewProjects ?? true);
             }
         } catch {
@@ -226,7 +226,10 @@ export default function TeamAccessPage() {
                                     <span className="text-xs text-slate-400 ml-2 shrink-0">
                                         {u.role === "ADMIN" || u.role === "MANAGER"
                                             ? "All"
-                                            : u.projectAccess?.length || 0}
+                                            : new Set([
+                                                ...(u.projectAccess?.map(pa => pa.projectId) || []),
+                                                ...((u as any).assignedProjects?.map((p: any) => p.id) || []),
+                                            ]).size}
                                     </span>
                                 </div>
                             </button>
