@@ -596,7 +596,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                     amount={recordingFor.amount}
                     onClose={() => setRecordingFor(null)}
                     onSubmit={async (input) => {
-                        const result = await recordPayment(recordingFor.id, initialInvoice.id, input);
+                        const result = await recordPayment(recordingFor.id, initialInvoice.id, { ...input, method: input.method as string });
                         if (result.success) router.refresh();
                         return { success: result.success, error: (result as any).error };
                     }}

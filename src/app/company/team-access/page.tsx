@@ -95,7 +95,11 @@ export default function TeamAccessPage() {
             setUsers((prev) =>
                 prev.map((u) =>
                     u.id === selectedUserId
-                        ? { ...u, projectAccess: newIds.map((pid) => ({ projectId: pid })) }
+                        ? {
+                              ...u,
+                              projectAccess: newIds.map((pid) => ({ projectId: pid })),
+                              assignedProjects: newIds.map((pid) => ({ id: pid })),
+                          }
                         : u
                 )
             );
