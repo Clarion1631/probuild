@@ -72,7 +72,7 @@ export default async function PaymentsReportPage({
                             <thead>
                                 <tr className="text-left text-xs text-hui-textMuted uppercase tracking-wide border-b border-hui-border">
                                     <th className="px-4 py-2">Payment</th>
-                                    <th className="px-4 py-2">Invoice</th>
+                                    <th className="px-4 py-2">Document</th>
                                     <th className="px-4 py-2">Project</th>
                                     <th className="px-4 py-2">Client</th>
                                     <th className="px-4 py-2">Date Paid</th>
@@ -85,12 +85,19 @@ export default async function PaymentsReportPage({
                                     <tr key={r.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
                                         <td className="px-4 py-3 text-hui-textMuted text-xs">{r.name}</td>
                                         <td className="px-4 py-3 font-mono text-xs">
-                                            <Link href={`/projects/${r.projectId}/invoices/${r.invoiceId}`} className="text-hui-primary hover:underline">
-                                                {r.invoiceCode}
+                                            <Link href={r.href} className="text-hui-primary hover:underline">
+                                                {r.documentCode}
                                             </Link>
+                                            {r.documentType === "estimate" && (
+                                                <span className="ml-1 text-[10px] uppercase text-hui-textMuted">est</span>
+                                            )}
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMain">
-                                            <Link href={`/projects/${r.projectId}`} className="hover:underline">{r.projectName}</Link>
+                                            {r.projectId ? (
+                                                <Link href={`/projects/${r.projectId}`} className="hover:underline">{r.projectName}</Link>
+                                            ) : (
+                                                <span className="text-hui-textMuted">—</span>
+                                            )}
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMuted">{r.clientName}</td>
                                         <td className="px-4 py-3 text-hui-textMuted">

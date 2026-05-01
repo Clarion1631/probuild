@@ -4,7 +4,7 @@
 const rm = (n: number) => Math.round(n * 100) / 100;
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -65,6 +65,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [showPaymentModal, setShowPaymentModal] = useState(false);
     const [recordingEstPayment, setRecordingEstPayment] = useState<{ id: string; name: string; amount: number } | null>(null);
     const [isSendingEstReceipt, setIsSendingEstReceipt] = useState<string | null>(null);
+    const [isUndoingEstPayment, setIsUndoingEstPayment] = useState<string | null>(null);
     const savedScheduleIds = useMemo(() => new Set((initialEstimate.paymentSchedules || []).map((s: any) => s.id)), [initialEstimate.paymentSchedules]);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
@@ -1976,6 +1977,26 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                             {isSendingEstReceipt === schedule.id
                                                                 ? "Sending..."
                                                                 : schedule.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
+                                                        </button>
+                                                        <button
+                                                            onClick={async () => {
+                                                                if (!schedule.id) return;
+                                                                setIsUndoingEstPayment(schedule.id);
+                                                                try {
+                                                                    const res = await unrecordEstimatePayment(schedule.id, initialEstimate.id);
+                                                                    if (!res?.success) { toast.error("Nothing to unrecord"); return; }
+                                                                    toast("Payment unrecorded");
+                                                                    router.refresh();
+                                                                } catch (e: any) {
+                                                                    toast.error(e?.message || "Failed to unrecord payment");
+                                                                } finally {
+                                                                    setIsUndoingEstPayment(null);
+                                                                }
+                                                            }}
+                                                            disabled={isUndoingEstPayment === schedule.id}
+                                                            className="text-[10px] text-slate-400 hover:text-red-600 underline underline-offset-2 disabled:opacity-50"
+                                                        >
+                                                            {isUndoingEstPayment === schedule.id ? "Undoing..." : "Undo"}
                                                         </button>
                                                     </div>
                                                 ) : isSavedSchedule ? (

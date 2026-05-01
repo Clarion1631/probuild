@@ -42,57 +42,119 @@ export type PaymentRow = {
     id: string;
     date: Date;
     name: string;
-    invoiceCode: string;
-    invoiceId: string;
-    projectName: string;
-    projectId: string;
+    documentCode: string;
+    documentId: string;
+    documentType: "invoice" | "estimate";
+    projectName: string | null;
+    projectId: string | null;
     clientName: string;
     paymentMethod: string | null;
     amount: number;
+    href: string;
 };
 
 export async function queryPaymentsData(filters: PaymentsFilters): Promise<{
     rows: PaymentRow[];
     summary: { total: number; count: number; avg: number };
 }> {
-    const payments = await prisma.paymentSchedule.findMany({
-        where: {
-            status: "Paid",
-            OR: [
-                { paidAt: { gte: filters.from, lt: filters.to } },
-                { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lt: filters.to } }] },
-            ],
-            ...(filters.methods.length ? { paymentMethod: { in: filters.methods } } : {}),
-            invoice: {
-                ...(filters.clientId ? { clientId: filters.clientId } : {}),
-                ...(filters.projectId ? { projectId: filters.projectId } : {}),
-            },
-        },
-        include: {
-            invoice: {
-                select: {
-                    id: true,
-                    code: true,
-                    project: { select: { id: true, name: true } },
-                    client: { select: { id: true, name: true } },
+    const dateFilter = {
+        OR: [
+            { paidAt: { gte: filters.from, lt: filters.to } },
+            { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lt: filters.to } }] },
+        ],
+    };
+    const methodFilter = filters.methods.length ? { paymentMethod: { in: filters.methods } } : {};
+
+    const [invoicePayments, estimatePayments] = await Promise.all([
+        prisma.paymentSchedule.findMany({
+            where: {
+                status: "Paid",
+                ...dateFilter,
+                ...methodFilter,
+                invoice: {
+                    ...(filters.clientId ? { clientId: filters.clientId } : {}),
+                    ...(filters.projectId ? { projectId: filters.projectId } : {}),
                 },
             },
-        },
-        orderBy: { paidAt: "desc" },
-    });
+            include: {
+                invoice: {
+                    select: {
+                        id: true,
+                        code: true,
+                        project: { select: { id: true, name: true } },
+                        client: { select: { id: true, name: true } },
+                    },
+                },
+            },
+        }),
+        prisma.estimatePaymentSchedule.findMany({
+            where: {
+                status: "Paid",
+                ...dateFilter,
+                ...methodFilter,
+                estimate: {
+                    ...(filters.projectId ? { projectId: filters.projectId } : {}),
+                    ...(filters.clientId ? {
+                        OR: [
+                            { project: { clientId: filters.clientId } },
+                            { lead: { clientId: filters.clientId } },
+                        ],
+                    } : {}),
+                },
+            },
+            include: {
+                estimate: {
+                    select: {
+                        id: true,
+                        code: true,
+                        project: { select: { id: true, name: true, client: { select: { id: true, name: true } } } },
+                        lead: { select: { id: true, name: true, client: { select: { id: true, name: true } } } },
+                    },
+                },
+            },
+        }),
+    ]);
 
-    const rows: PaymentRow[] = payments.map(p => ({
-        id: p.id,
-        date: p.paidAt ?? p.paymentDate ?? p.createdAt,
-        name: p.name,
-        invoiceCode: p.invoice.code,
-        invoiceId: p.invoice.id,
-        projectName: p.invoice.project.name,
-        projectId: p.invoice.project.id,
-        clientName: p.invoice.client.name,
-        paymentMethod: p.paymentMethod,
-        amount: Number(p.amount),
-    }));
+    const rows: PaymentRow[] = [];
+
+    for (const p of invoicePayments) {
+        rows.push({
+            id: p.id,
+            date: p.paidAt ?? p.paymentDate ?? p.createdAt,
+            name: p.name,
+            documentCode: p.invoice.code,
+            documentId: p.invoice.id,
+            documentType: "invoice",
+            projectName: p.invoice.project.name,
+            projectId: p.invoice.project.id,
+            clientName: p.invoice.client.name,
+            paymentMethod: p.paymentMethod,
+            amount: Number(p.amount),
+            href: `/projects/${p.invoice.project.id}/invoices/${p.invoice.id}`,
+        });
+    }
+
+    for (const p of estimatePayments) {
+        const est = p.estimate;
+        rows.push({
+            id: p.id,
+            date: p.paidAt ?? p.paymentDate ?? p.createdAt,
+            name: p.name,
+            documentCode: est.code,
+            documentId: est.id,
+            documentType: "estimate",
+            projectName: est.project?.name ?? null,
+            projectId: est.project?.id ?? null,
+            clientName: est.project?.client?.name ?? est.lead?.client?.name ?? est.lead?.name ?? "",
+            paymentMethod: p.paymentMethod,
+            amount: Number(p.amount),
+            href: est.project?.id
+                ? `/projects/${est.project.id}/estimates/${est.id}`
+                : est.lead?.id ? `/leads/${est.lead.id}/estimates/${est.id}` : `/estimates`,
+        });
+    }
+
+    rows.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
     const total = rows.reduce((s, r) => s + r.amount, 0);
     return {

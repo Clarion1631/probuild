@@ -58,7 +58,7 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
     rows: TransactionRow[];
     summary: { incoming: number; outgoing: number; net: number; count: number };
 }> {
-    const [paidPayments, expenses, purchaseOrders] = await Promise.all([
+    const [paidPayments, paidEstimatePayments, expenses, purchaseOrders] = await Promise.all([
         filters.type !== "expense"
             ? prisma.paymentSchedule.findMany({
                 where: {
@@ -74,6 +74,29 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
                         select: {
                             id: true, code: true,
                             project: { select: { id: true, name: true } },
+                        },
+                    },
+                },
+                orderBy: { paidAt: "desc" },
+            })
+            : Promise.resolve([]),
+
+        filters.type !== "expense"
+            ? prisma.estimatePaymentSchedule.findMany({
+                where: {
+                    status: "Paid",
+                    OR: [
+                        { paidAt: { gte: filters.from, lt: filters.to } },
+                        { AND: [{ paidAt: null }, { paymentDate: { gte: filters.from, lt: filters.to } }] },
+                    ],
+                    ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
+                },
+                include: {
+                    estimate: {
+                        select: {
+                            id: true, code: true,
+                            project: { select: { id: true, name: true } },
+                            lead: { select: { id: true, name: true } },
                         },
                     },
                 },
@@ -128,6 +151,19 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
             projectName: p.invoice.project.name,
             projectId: p.invoice.project.id,
             category: "Invoice Payment",
+        });
+    }
+
+    for (const p of paidEstimatePayments) {
+        rows.push({
+            id: `estpay-${p.id}`,
+            date: p.paidAt ?? p.paymentDate ?? p.createdAt,
+            description: `Deposit: ${p.name} (${p.estimate.code})`,
+            type: "Income",
+            amount: Number(p.amount),
+            projectName: p.estimate.project?.name ?? "No Project",
+            projectId: p.estimate.project?.id ?? null,
+            category: "Estimate Deposit",
         });
     }
 

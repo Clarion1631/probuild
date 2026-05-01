@@ -2487,6 +2487,8 @@ export async function recordPayment(
     revalidatePath(`/portal`);
     revalidatePath(`/reports/open-invoices`);
     revalidatePath(`/reports/sales-tax`);
+    revalidatePath(`/reports/payments`);
+    revalidatePath(`/reports/transactions`);
 
     return { success: true };
 }
@@ -2519,48 +2521,57 @@ export async function recordEstimatePayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const payment = await prisma.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
-    if (!payment) return { success: false, error: "Milestone not found" as const };
-    if (payment.status === "Paid") return { success: false, error: "Milestone already paid" as const };
-    if (payment.estimateId !== estimateId) return { success: false, error: "Milestone/estimate mismatch" as const };
+    const tx = await prisma.$transaction(async (t) => {
+        const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
+        if (!payment) return { success: false as const, error: "Milestone not found" as const };
+        if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
+        if (payment.estimateId !== estimateId) return { success: false as const, error: "Milestone/estimate mismatch" as const };
 
-    await prisma.estimatePaymentSchedule.update({
-        where: { id: paymentId },
-        data: {
-            status: "Paid",
-            paymentDate,
-            paidAt: new Date(),
-            paymentMethod: method,
-            referenceNumber,
-            notes,
-        },
+        const claim = await t.estimatePaymentSchedule.updateMany({
+            where: { id: paymentId, status: { not: "Paid" } },
+            data: {
+                status: "Paid",
+                paymentDate,
+                paidAt: new Date(),
+                paymentMethod: method,
+                referenceNumber,
+                notes,
+            },
+        });
+        if (claim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
+
+        const estimate = await t.estimate.findUnique({ where: { id: estimateId } });
+        if (!estimate) return { success: false as const, error: "Estimate not found" as const };
+
+        const allSchedules = await t.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        const totalPaid = allSchedules
+            .filter((s) => s.status === "Paid")
+            .reduce((sum, s) => sum + toNum(s.amount), 0);
+        const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+
+        await t.estimate.update({
+            where: { id: estimateId },
+            data: { balanceDue: newBalance },
+        });
+
+        return { success: true as const, projectId: estimate.projectId, leadId: estimate.leadId };
     });
 
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
-    if (!estimate) return { success: false, error: "Estimate not found" as const };
+    if (!tx.success) return tx;
 
-    const allSchedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
-    const totalPaid = allSchedules
-        .filter((s) => s.status === "Paid")
-        .reduce((sum, s) => sum + toNum(s.amount), 0);
-    const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
-
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: { balanceDue: newBalance },
-    });
-
-    if (estimate.projectId) {
-        revalidatePath(`/projects/${estimate.projectId}/estimates`);
-        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+    if (tx.projectId) {
+        revalidatePath(`/projects/${tx.projectId}/estimates`);
+        revalidatePath(`/projects/${tx.projectId}/estimates/${estimateId}`);
     }
-    if (estimate.leadId) {
-        revalidatePath(`/leads/${estimate.leadId}/estimates`);
-        revalidatePath(`/leads/${estimate.leadId}/estimates/${estimateId}`);
+    if (tx.leadId) {
+        revalidatePath(`/leads/${tx.leadId}/estimates`);
+        revalidatePath(`/leads/${tx.leadId}/estimates/${estimateId}`);
     }
     revalidatePath(`/estimates`);
     revalidatePath(`/portal`);
     revalidatePath(`/reports/sales-tax`);
+    revalidatePath(`/reports/payments`);
+    revalidatePath(`/reports/transactions`);
 
     return { success: true };
 }
@@ -2603,6 +2614,55 @@ export async function sendEstimatePaymentReceipt(paymentScheduleId: string) {
         }
     }
     return result;
+}
+
+export async function unrecordEstimatePayment(paymentId: string, estimateId: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+
+    const result = await prisma.$transaction(async (tx) => {
+        const payment = await tx.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
+        if (!payment) throw new Error("Payment not found");
+        if (payment.status !== "Paid") return null;
+
+        const estimate = await tx.estimate.findUnique({ where: { id: estimateId } });
+        if (!estimate) throw new Error("Estimate not found");
+        if (payment.estimateId !== estimateId) throw new Error("Payment/estimate mismatch");
+
+        await tx.estimatePaymentSchedule.update({
+            where: { id: paymentId },
+            data: { status: "Pending", paymentDate: null, paidAt: null },
+        });
+
+        const amount = toNum(payment.amount);
+        const cappedDelta = Math.min(amount, Math.max(0, toNum(estimate.totalAmount) - toNum(estimate.balanceDue)));
+
+        await tx.estimate.update({
+            where: { id: estimateId },
+            data: { balanceDue: { increment: cappedDelta } },
+        });
+
+        return { projectId: estimate.projectId, leadId: estimate.leadId };
+    });
+
+    if (!result) return { success: false };
+
+    if (result.projectId) {
+        revalidatePath(`/projects/${result.projectId}/estimates`);
+        revalidatePath(`/projects/${result.projectId}/estimates/${estimateId}`);
+    }
+    if (result.leadId) {
+        revalidatePath(`/leads/${result.leadId}/estimates`);
+        revalidatePath(`/leads/${result.leadId}/estimates/${estimateId}`);
+    }
+    revalidatePath(`/estimates`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/payments`);
+    revalidatePath(`/reports/transactions`);
+    revalidatePath(`/reports/sales-tax`);
+
+    return { success: true };
 }
 
 async function assertInvoicePermission() {
@@ -2764,6 +2824,9 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
     revalidatePath(`/reports/open-invoices`);
+    revalidatePath(`/reports/payments`);
+    revalidatePath(`/reports/transactions`);
+    revalidatePath(`/reports/sales-tax`);
 
     return { success: true };
 }
