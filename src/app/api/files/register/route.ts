@@ -12,6 +12,7 @@ type UploadedFile = {
     projectId?: string;
     leadId?: string;
     folderId?: string;
+    visibility?: string;
 };
 
 // POST: save DB records after the browser has uploaded files directly to Supabase.
@@ -66,6 +67,7 @@ export async function POST(req: NextRequest) {
                         url: f.url,
                         size: f.size,
                         mimeType: f.mimeType,
+                        ...(f.visibility && { visibility: f.visibility }),
                         ...(f.projectId && { projectId: f.projectId }),
                         ...(f.leadId && { leadId: f.leadId }),
                         ...(f.folderId && { folderId: f.folderId }),

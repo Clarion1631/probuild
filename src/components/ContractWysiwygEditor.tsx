@@ -5,57 +5,7 @@ import { Node } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Underline from "@tiptap/extension-underline";
 import { useState, useRef, useEffect } from "react";
-
-// ─── MERGE FIELDS ───
-export const MERGE_FIELDS = [
-    {
-        category: "Client", icon: "👤",
-        fields: [
-            { key: "client_name", label: "Name", example: "John Doe" },
-            { key: "client_email", label: "Email", example: "john@example.com" },
-            { key: "client_phone", label: "Phone", example: "(555) 123-4567" },
-            { key: "client_address", label: "Address", example: "123 Main St, Los Angeles, CA 90001" },
-        ]
-    },
-    {
-        category: "Company", icon: "🏢",
-        fields: [
-            { key: "company_name", label: "Name", example: "Golden Touch Remodeling" },
-            { key: "company_address", label: "Address", example: "456 Business Ave" },
-            { key: "company_phone", label: "Phone", example: "(555) 987-6543" },
-            { key: "company_email", label: "Email", example: "info@company.com" },
-        ]
-    },
-    {
-        category: "Project", icon: "📋",
-        fields: [
-            { key: "project_name", label: "Name", example: "Kitchen Remodel" },
-            { key: "location", label: "Location", example: "123 Main St, Los Angeles" },
-            { key: "estimate_total", label: "Estimate Total", example: "$45,000" },
-        ]
-    },
-    {
-        category: "Date", icon: "📅",
-        fields: [
-            { key: "date", label: "Today's Date", example: "March 10, 2026" },
-            { key: "year", label: "Year", example: "2026" },
-        ]
-    },
-    {
-        category: "Signing", icon: "✍️",
-        fields: [
-            { key: "SIGNATURE_BLOCK", label: "Client Signature", example: "[ Click to Sign ]" },
-            { key: "INITIAL_BLOCK", label: "Client Initials", example: "[ Click to Initial ]" },
-            { key: "DATE_BLOCK", label: "Signed Date", example: "3/27/2026" },
-            { key: "CONTRACTOR_SIGNATURE_BLOCK", label: "Contractor Signature", example: "[ Company Signs Here ]" },
-        ]
-    },
-];
-
-const FIELD_LABEL_MAP: Record<string, string> = {};
-MERGE_FIELDS.forEach(cat => cat.fields.forEach(f => { FIELD_LABEL_MAP[f.key] = f.label; }));
-
-const SIGNING_KEYS = new Set(["SIGNATURE_BLOCK", "INITIAL_BLOCK", "DATE_BLOCK", "CONTRACTOR_SIGNATURE_BLOCK"]);
+import { MERGE_FIELD_CATEGORIES, FIELD_LABEL_MAP, SIGNING_KEYS } from "@/lib/merge-fields";
 
 // ─── HTML CONVERSION ───
 // Before loading into Tiptap: wrap {{key}} in data-merge-field span so Tiptap can parse them
@@ -211,8 +161,8 @@ export function ContractWysiwygEditor({ value, onChange }: ContractWysiwygEditor
             .run();
     };
 
-    const dataCategories = MERGE_FIELDS.filter(c => c.category !== "Signing");
-    const signingCategory = MERGE_FIELDS.find(c => c.category === "Signing")!;
+    const dataCategories = MERGE_FIELD_CATEGORIES.filter(c => c.category !== "Signing");
+    const signingCategory = MERGE_FIELD_CATEGORIES.find(c => c.category === "Signing")!;
 
     return (
         <div className="flex flex-col flex-1 overflow-hidden">

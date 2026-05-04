@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { ReactNode } from "react";
 import DOMPurify from "dompurify";
+import { toast } from "sonner";
 import Avatar from "@/components/Avatar";
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
@@ -58,6 +59,8 @@ export default function ClientMessaging({
     const [sending, setSending] = useState(false);
     const [loading, setLoading] = useState(true);
     const [attachedEstimates, setAttachedEstimates] = useState<EstimateOption[]>([]);
+    const [pendingFiles, setPendingFiles] = useState<{name: string; url: string}[]>([]);
+    const [uploading, setUploading] = useState(false);
     const [showEstimatePicker, setShowEstimatePicker] = useState(false);
     const [aiSuggesting, setAiSuggesting] = useState(false);
     const [showAiMenu, setShowAiMenu] = useState(false);
@@ -73,6 +76,7 @@ export default function ClientMessaging({
     const pollRef = useRef<NodeJS.Timeout | null>(null);
     const aiMenuRef = useRef<HTMLDivElement>(null);
     const estimatePickerRef = useRef<HTMLDivElement>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     const editor = useEditor({
         extensions: [
@@ -151,7 +155,7 @@ export default function ClientMessaging({
 
     const handleSend = async () => {
         const text = messageText.trim();
-        if (!text || sending) return;
+        if (!text || sending || uploading) return;
         setSending(true);
         try {
             const entityKey = entityType === "lead" ? "leadId" : "projectId";
@@ -163,7 +167,10 @@ export default function ClientMessaging({
                     body: text,
                     subject: `Message from Golden Touch Remodeling LLC about ${clientName}'s project`,
                     channel: sendMode,
-                    attachments: attachedEstimates.map(e => ({ type: "estimate", id: e.id, name: e.code })),
+                    attachments: [
+                        ...attachedEstimates.map(e => ({ type: "estimate", id: e.id, name: e.code })),
+                        ...pendingFiles.map(f => ({ type: "file", id: "", name: f.name, url: f.url })),
+                    ],
                     scheduledFor: scheduledForDate ? new Date(scheduledForDate).toISOString() : undefined,
                     ccEmails: Array.from(new Set([...ccEmails, ...customCcInput.split(",").map(x => x.trim()).filter(Boolean)])),
                 }),
@@ -173,18 +180,48 @@ export default function ClientMessaging({
                 setMessages(prev => [...prev, msg]);
                 setMessageText("");
                 setAttachedEstimates([]);
+                setPendingFiles([]);
                 setScheduledForDate("");
                 setCcEmails([]);
                 setCustomCcInput("");
                 editor?.commands.setContent("");
+                if (msg.deliveryError) {
+                    toast.error(msg.deliveryError);
+                } else if (msg.warnings?.length) {
+                    for (const w of msg.warnings) toast.warning(w);
+                }
             } else {
                 const errData = await res.json().catch(() => ({}));
-                alert(`Failed to send: ${errData?.error || res.statusText}`);
+                toast.error(errData?.error || res.statusText || "Failed to send — check server logs");
             }
         } catch (err) {
-            alert("Failed to send message. Check your connection.");
+            toast.error("Failed to send message. Check your connection.");
         } finally {
             setSending(false);
+        }
+    };
+
+    const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const selected = Array.from(e.target.files ?? []);
+        if (!selected.length) return;
+        setUploading(true);
+        try {
+            const form = new FormData();
+            form.append(entityType === "lead" ? "leadId" : "projectId", entityId);
+            for (const f of selected) form.append("files", f);
+            const res = await fetch("/api/files", { method: "POST", body: form });
+            if (res.ok) {
+                const data = await res.json();
+                setPendingFiles(prev => [...prev, ...(data.files || []).map((f: any) => ({ name: f.name, url: f.url }))]);
+            } else {
+                const err = await res.json().catch(() => ({}));
+                toast.error(err.error || "File upload failed");
+            }
+        } catch {
+            toast.error("File upload failed. Check your connection.");
+        } finally {
+            setUploading(false);
+            e.target.value = "";
         }
     };
 
@@ -331,12 +368,13 @@ export default function ClientMessaging({
                                             <div className="whitespace-pre-wrap prose prose-sm max-w-none" style={{ overflowWrap: "anywhere", wordBreak: "break-word" }} dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.body ?? "") }} />
                                             {atts.length > 0 && (
                                                 <div className="mt-2 pt-2 border-t border-white/20 flex flex-wrap gap-2">
-                                                    {atts.map((a: any, i: number) => (
-                                                        <span key={i} className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-lg ${isOutbound ? "bg-green-700/50 text-green-50" : "bg-slate-100 text-slate-700"}`}>
-                                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
-                                                            {a.name}
-                                                        </span>
-                                                    ))}
+                                                    {atts.map((a: any, i: number) => {
+                                                        const cls = `inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-lg ${isOutbound ? "bg-green-700/50 text-green-50" : "bg-slate-100 text-slate-700"}`;
+                                                        const icon = <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>;
+                                                        return a.type === "file" && a.url
+                                                            ? <a key={i} href={a.url} target="_blank" rel="noopener noreferrer" className={`${cls} hover:opacity-80`}>{icon}{a.name}</a>
+                                                            : <span key={i} className={cls}>{icon}{a.name}</span>;
+                                                    })}
                                                 </div>
                                             )}
                                         </div>
@@ -386,8 +424,8 @@ export default function ClientMessaging({
                 )}
             </div>
 
-            {/* Attached Estimates Bar */}
-            {attachedEstimates.length > 0 && (
+            {/* Attached Estimates + Files Bar */}
+            {(attachedEstimates.length > 0 || pendingFiles.length > 0) && (
                 <div className="px-4 py-2 bg-green-50 border-t border-green-200 flex items-center gap-2 flex-wrap">
                     <span className="text-xs font-semibold text-green-700">Attachments:</span>
                     {attachedEstimates.map(est => (
@@ -395,6 +433,15 @@ export default function ClientMessaging({
                             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
                             {est.code} — {est.title}
                             <button onClick={() => toggleEstimate(est)} className="ml-0.5 text-green-600 hover:text-red-500 transition">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                            </button>
+                        </span>
+                    ))}
+                    {pendingFiles.map((f, i) => (
+                        <span key={`pf-${i}`} className="inline-flex items-center gap-1.5 bg-white border border-blue-300 rounded-full px-3 py-1 text-xs font-medium text-blue-800 shadow-sm">
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
+                            {f.name}
+                            <button onClick={() => setPendingFiles(prev => prev.filter((_, j) => j !== i))} className="ml-0.5 text-blue-600 hover:text-red-500 transition">
                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                             </button>
                         </span>
@@ -518,6 +565,29 @@ export default function ClientMessaging({
                                 </div>
                             )}
                         </div>
+
+                        {/* Attach File */}
+                        <input
+                            type="file"
+                            ref={fileInputRef}
+                            accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.xlsx,.csv"
+                            multiple
+                            className="hidden"
+                            onChange={handleFileSelect}
+                        />
+                        <button
+                            type="button"
+                            onClick={() => fileInputRef.current?.click()}
+                            disabled={uploading}
+                            className={`p-1.5 rounded flex items-center gap-1 text-xs font-medium transition ${pendingFiles.length > 0 ? "text-blue-700 bg-blue-50" : "text-slate-400 hover:text-slate-600"} disabled:opacity-40`}
+                            title="Attach File (PDF, Word, Image)"
+                        >
+                            {uploading
+                                ? <div className="w-3.5 h-3.5 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+                                : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                            }
+                            {pendingFiles.length > 0 && <span className="bg-blue-600 text-white w-4 h-4 rounded-full text-[9px] flex items-center justify-center font-bold">{pendingFiles.length}</span>}
+                        </button>
                     </div>
 
                     {/* AI Write for Me */}

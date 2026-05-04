@@ -258,20 +258,17 @@ export default function PortalContractClient({
                 const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
                 const pageW = pdf.internal.pageSize.getWidth();
                 const pageH = pdf.internal.pageSize.getHeight();
+                const margin = 20;
+                const usableH = pageH - margin;
                 const imgProps = pdf.getImageProperties(imgData);
-                // Unit note: pageW is in pt; imgProps.width/.height are in px. The ratio
-                // pageW/imgProps.width gives pt-per-px — applied to imgProps.height this yields
-                // the full image height in pt (unit-consistent).
                 const scaledTotalH = (imgProps.height * pageW) / imgProps.width;
 
                 let rendered = 0;
                 let pageIdx = 0;
-                // Safety cap: refuse to render more than 30 pages (signals something weird,
-                // prevents an infinite loop if pageH is ever misread as zero).
                 while (rendered < scaledTotalH && pageIdx < 30) {
                     if (pageIdx > 0) pdf.addPage();
                     pdf.addImage(imgData, "JPEG", 0, -rendered, pageW, scaledTotalH);
-                    rendered += pageH;
+                    rendered += usableH;
                     pageIdx++;
                 }
 
@@ -522,6 +519,33 @@ export default function PortalContractClient({
                             .prose .doc-block-btn img {
                                 margin: 0;
                                 display: inline;
+                            }
+
+                            /* Print & PDF page-break safety */
+                            .prose h2, .prose h3 {
+                                break-after: avoid;
+                                page-break-after: avoid;
+                            }
+                            .prose p, .prose li, .prose table, .prose tr {
+                                break-inside: avoid;
+                                page-break-inside: avoid;
+                            }
+                            .doc-block-btn {
+                                break-inside: avoid;
+                                page-break-inside: avoid;
+                            }
+                            .prose h2 + *, .prose h3 + * {
+                                break-before: avoid;
+                                page-break-before: avoid;
+                            }
+                            @media print {
+                                .no-print, .print\\:hidden { display: none !important; }
+                                body { font-size: 11pt; line-height: 1.6; color: #000; }
+                                .prose { max-width: 100%; }
+                                .prose h2 { font-size: 16pt; margin-top: 18pt; }
+                                .prose h3 { font-size: 13pt; margin-top: 14pt; }
+                                .prose p { margin-bottom: 6pt; orphans: 3; widows: 3; }
+                                .prose li { orphans: 2; widows: 2; }
                             }
                         `}} />
                         <div

@@ -18,11 +18,10 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
 
     const serializedEstimate = JSON.parse(JSON.stringify(estimate));
 
-    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
+    let salesTaxes: { id?: string; name: string; rate: number; isDefault: boolean }[] = [];
     try {
         salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
     } catch { /* ignore parse errors */ }
-    const defaultTax = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
 
     return (
         <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
@@ -37,7 +36,7 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
                         location: lead.location || undefined
                     }}
                     initialEstimate={serializedEstimate}
-                    defaultTax={defaultTax}
+                    salesTaxes={salesTaxes}
                 />
             </div>
         </div>

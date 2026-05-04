@@ -1097,6 +1097,7 @@ export async function getEstimate(id: string) {
                 id: true, number: true, title: true, projectId: true, leadId: true,
                 code: true, status: true, privacy: true, createdAt: true,
                 totalAmount: true, balanceDue: true, taxExempt: true,
+                taxRateName: true, taxRatePercent: true,
                 approvedBy: true, approvedAt: true,
                 approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                 items: {
@@ -1172,6 +1173,7 @@ export async function getEstimateForPortal(id: string) {
                         id: true, number: true, title: true, projectId: true, leadId: true,
                         code: true, status: true, privacy: true, createdAt: true,
                         totalAmount: true, balanceDue: true, taxExempt: true,
+                        taxRateName: true, taxRatePercent: true,
                         approvedBy: true, approvedAt: true,
                         approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                         project: { include: { client: true } },
@@ -1551,9 +1553,9 @@ export async function markContractViewed(contractId: string, accessToken?: strin
     });
 
     if (contract && !contract.viewedAt) {
-        await prisma.contract.update({
-            where: { id: contractId },
-            data: { viewedAt: new Date() },
+        await prisma.contract.updateMany({
+            where: { id: contractId, status: "Sent" },
+            data: { viewedAt: new Date(), status: "Viewed" },
         });
 
         const clientName = contract.project?.client?.name || contract.lead?.client?.name || "A client";
@@ -2066,6 +2068,8 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 ...(data.memo !== undefined && { memo: data.memo }),
                 ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
                 ...(data.taxExempt !== undefined && { taxExempt: !!data.taxExempt }),
+                ...(data.taxRateName !== undefined && { taxRateName: data.taxRateName }),
+                ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
             },
         });
     } catch {
@@ -2696,10 +2700,12 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
             .filter((s) => s.status === "Paid")
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+        const wasPaymentStatus = ["Paid", "Partially Paid"].includes(estimate.status);
         const newStatus =
             newBalance <= 0 ? "Paid"
             : totalPaid > 0 ? "Partially Paid"
-            : "Approved";
+            : wasPaymentStatus ? "Approved"
+            : estimate.status;
 
         await tx.estimate.update({
             where: { id: estimateId },
@@ -3074,38 +3080,38 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
     const copyCode = `EST-${String(newEstimate.number).padStart(5, "0")}`;
     await prisma.estimate.update({ where: { id: newEstimate.id }, data: { code: copyCode } });
 
-    // Build old-to-new ID mapping for parentId references
+    // Pre-generate new IDs so parentId can be mapped at creation time
     const idMap: Record<string, string> = {};
-
     for (const item of original.items) {
-        const newItem = await prisma.estimateItem.create({
-            data: {
-                estimateId: newEstimate.id,
-                name: item.name,
-                description: item.description || "",
-                type: item.type,
-                quantity: item.quantity,
-                baseCost: item.baseCost,
-                markupPercent: item.markupPercent,
-                unitCost: item.unitCost,
-                total: item.total,
-                order: item.order,
-                costCodeId: item.costCodeId,
-                costTypeId: item.costTypeId,
-                // parentId mapped below
-            },
-        });
-        idMap[item.id] = newItem.id;
+        idMap[item.id] = crypto.randomUUID();
     }
 
-    // Fix parentId references
-    for (const item of original.items) {
-        if (item.parentId && idMap[item.parentId]) {
-            await prisma.estimateItem.update({
-                where: { id: idMap[item.id] },
-                data: { parentId: idMap[item.parentId] },
-            });
-        }
+    const toItemData = (item: typeof original.items[number]) => ({
+        id: idMap[item.id],
+        estimateId: newEstimate.id,
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: item.quantity,
+        baseCost: item.baseCost,
+        markupPercent: item.markupPercent,
+        unitCost: item.unitCost,
+        total: item.total,
+        order: item.order,
+        costCodeId: item.costCodeId,
+        costTypeId: item.costTypeId,
+        parentId: item.parentId ? (idMap[item.parentId] || null) : null,
+    });
+
+    // Create parents first, then children — FK ordering respected (same pattern as saveEstimate)
+    const parentItems = original.items.filter(i => !i.parentId);
+    const childItems = original.items.filter(i => i.parentId);
+
+    if (parentItems.length > 0) {
+        await prisma.estimateItem.createMany({ data: parentItems.map(toItemData) });
+    }
+    if (childItems.length > 0) {
+        await prisma.estimateItem.createMany({ data: childItems.map(toItemData) });
     }
 
     for (const schedule of original.paymentSchedules) {
@@ -3681,38 +3687,63 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
         company_address: settings?.address || "",
         company_phone: settings?.phone || "",
         company_email: settings?.email || "",
+        company_license: settings?.licenseNumber || "",
+        company_website: settings?.website || "",
         date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
         year: new Date().getFullYear().toString(),
     };
 
+    const populateFromEntity = (
+        entity: { name: string; location?: string | null; number?: number; type?: string | null },
+        client: { name: string; email?: string | null; primaryPhone?: string | null; additionalEmail?: string | null; additionalPhone?: string | null; addressLine1?: string | null; city?: string | null; state?: string | null; zipCode?: string | null },
+        estimates: { code: string; totalAmount: any; balanceDue: any; paymentSchedules?: { name: string; percentage?: number | null; amount: any; order: number }[] }[]
+    ) => {
+        data.project_name = entity.name;
+        data.location = entity.location || "";
+        if (entity.number) data.project_number = `P-${entity.number}`;
+        if (entity.type) data.project_type = entity.type;
+
+        data.client_name = client.name;
+        data.client_email = client.email || "";
+        data.client_phone = client.primaryPhone || "";
+        data.client_address = [client.addressLine1, client.city, client.state, client.zipCode].filter(Boolean).join(", ");
+        data.client_additional_email = client.additionalEmail || "";
+        data.client_additional_phone = client.additionalPhone || "";
+
+        const est = estimates[0];
+        if (est) {
+            data.estimate_total = `$${Number(est.totalAmount).toLocaleString()}`;
+            data.estimate_number = est.code;
+            data.estimate_balance_due = `$${Number(est.balanceDue).toLocaleString()}`;
+            if (est.paymentSchedules && est.paymentSchedules.length > 0) {
+                const rows = est.paymentSchedules
+                    .sort((a, b) => a.order - b.order)
+                    .map((ps) => `<tr><td style="padding:4px 12px 4px 0;border-bottom:1px solid #e5e7eb;">${ps.name}</td><td style="padding:4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">${ps.percentage ? `${ps.percentage}%` : ""}</td><td style="padding:4px 0 4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">$${Number(ps.amount).toLocaleString()}</td></tr>`)
+                    .join("");
+                data.payment_schedule = `<table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="border-bottom:2px solid #333;"><th style="text-align:left;padding:4px 12px 4px 0;">Milestone</th><th style="text-align:right;padding:4px 12px;">%</th><th style="text-align:right;padding:4px 0 4px 12px;">Amount</th></tr></thead><tbody>${rows}</tbody></table>`;
+            }
+        }
+        if (!est) {
+            data.estimate_total = "$0.00";
+            data.estimate_number = "";
+            data.estimate_balance_due = "$0.00";
+        }
+    };
+
+    const estimateInclude = { orderBy: { createdAt: "desc" as const }, take: 1, include: { paymentSchedules: { orderBy: { order: "asc" as const } } } };
+
     if (projectId) {
         const project = await prisma.project.findUnique({
             where: { id: projectId },
-            include: { client: true, estimates: { orderBy: { createdAt: "desc" }, take: 1 } }
+            include: { client: true, estimates: estimateInclude },
         });
-        if (project) {
-            data.project_name = project.name;
-            data.client_name = project.client.name;
-            data.client_email = project.client.email || "";
-            data.client_phone = project.client.primaryPhone || "";
-            data.client_address = [project.client.addressLine1, project.client.city, project.client.state, project.client.zipCode].filter(Boolean).join(", ");
-            data.location = project.location || "";
-            data.estimate_total = project.estimates[0] ? `$${Number(project.estimates[0].totalAmount).toLocaleString()}` : "$0.00";
-        }
+        if (project) populateFromEntity(project, project.client, project.estimates);
     } else if (leadId) {
         const lead = await prisma.lead.findUnique({
             where: { id: leadId },
-            include: { client: true, estimates: { orderBy: { createdAt: "desc" }, take: 1 } }
+            include: { client: true, estimates: estimateInclude },
         });
-        if (lead) {
-            data.project_name = lead.name;
-            data.client_name = lead.client.name;
-            data.client_email = lead.client.email || "";
-            data.client_phone = lead.client.primaryPhone || "";
-            data.client_address = [lead.client.addressLine1, lead.client.city, lead.client.state, lead.client.zipCode].filter(Boolean).join(", ");
-            data.location = lead.location || "";
-            data.estimate_total = lead.estimates[0] ? `$${Number(lead.estimates[0].totalAmount).toLocaleString()}` : "$0.00";
-        }
+        if (lead) populateFromEntity(lead, lead.client, lead.estimates);
     }
 
     return data;

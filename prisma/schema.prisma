@@ -278,6 +278,8 @@ model Estimate {
   expirationDate      DateTime?
   archivedAt          DateTime?
   taxExempt           Boolean   @default(false)
+  taxRateName         String?
+  taxRatePercent      Decimal?
 
   // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
   targetMarginPercent Float     @default(25)
@@ -789,18 +791,19 @@ model SubTaskAssignment {
 }
 
 model FileFolder {
-  id        String        @id @default(cuid())
-  name      String
-  projectId String?
-  project   Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  leadId    String?
-  lead      Lead?         @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  parentId  String?
-  parent    FileFolder?   @relation("FolderHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
-  children  FileFolder[]  @relation("FolderHierarchy")
-  files     ProjectFile[]
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
+  id         String        @id @default(cuid())
+  name       String
+  visibility String        @default("team") // "team" | "shared" | "financial"
+  projectId  String?
+  project    Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId     String?
+  lead       Lead?         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  parentId   String?
+  parent     FileFolder?   @relation("FolderHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children   FileFolder[]  @relation("FolderHierarchy")
+  files      ProjectFile[]
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
 }
 
 model ProjectFile {
@@ -809,6 +812,7 @@ model ProjectFile {
   url          String
   size         Int         @default(0)
   mimeType     String      @default("application/octet-stream")
+  visibility   String?     // null = inherit from folder. Explicit: "team" | "shared" | "financial"
   projectId    String?
   project      Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   leadId       String?
@@ -822,6 +826,7 @@ model ProjectFile {
   @@index([projectId])
   @@index([leadId])
   @@index([folderId])
+  @@index([projectId, visibility])
 }
 
 model UserPermission {

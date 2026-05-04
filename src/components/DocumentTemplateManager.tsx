@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { getDocumentTemplates, createDocumentTemplate, updateDocumentTemplate, deleteDocumentTemplate, getCompanySettings } from "@/lib/actions";
 import { toast } from "sonner";
 import DOMPurify from "dompurify";
+import { MERGE_FIELD_CATEGORIES, CATEGORY_COLORS } from "@/lib/merge-fields";
 
 type Template = {
     id: string;
@@ -30,56 +31,7 @@ type Props = {
     description: string;
 };
 
-const MERGE_FIELDS = [
-    {
-        category: "Client",
-        icon: "👤",
-        color: "blue",
-        fields: [
-            { key: "client_name", label: "Name", example: "John Doe" },
-            { key: "client_email", label: "Email", example: "john@example.com" },
-            { key: "client_phone", label: "Phone", example: "(555) 123-4567" },
-            { key: "client_address", label: "Address", example: "123 Main St, Los Angeles, CA 90001" },
-        ]
-    },
-    {
-        category: "Company",
-        icon: "🏢",
-        color: "purple",
-        fields: [
-            { key: "company_name", label: "Name", example: "Golden Touch Remodeling" },
-            { key: "company_address", label: "Address", example: "456 Business Ave" },
-            { key: "company_phone", label: "Phone", example: "(555) 987-6543" },
-            { key: "company_email", label: "Email", example: "info@company.com" },
-        ]
-    },
-    {
-        category: "Project",
-        icon: "📋",
-        color: "green",
-        fields: [
-            { key: "project_name", label: "Name", example: "Kitchen Remodel" },
-            { key: "location", label: "Location", example: "123 Main St, Los Angeles" },
-            { key: "estimate_total", label: "Estimate Total", example: "$45,000" },
-        ]
-    },
-    {
-        category: "Date",
-        icon: "📅",
-        color: "amber",
-        fields: [
-            { key: "date", label: "Today's Date", example: "March 10, 2026" },
-            { key: "year", label: "Year", example: "2026" },
-        ]
-    }
-];
-
-const categoryColors: Record<string, { bg: string; text: string; border: string; pill: string }> = {
-    blue: { bg: "bg-blue-50", text: "text-blue-700", border: "border-blue-200", pill: "bg-blue-100 text-blue-700 hover:bg-blue-200" },
-    purple: { bg: "bg-purple-50", text: "text-purple-700", border: "border-purple-200", pill: "bg-purple-100 text-purple-700 hover:bg-purple-200" },
-    green: { bg: "bg-green-50", text: "text-green-700", border: "border-green-200", pill: "bg-green-100 text-green-700 hover:bg-green-200" },
-    amber: { bg: "bg-amber-50", text: "text-amber-700", border: "border-amber-200", pill: "bg-amber-100 text-amber-700 hover:bg-amber-200" },
-};
+const templateMergeFields = MERGE_FIELD_CATEGORIES.filter(c => c.category !== "Signing");
 
 const typeColors: Record<string, string> = {
     terms: "bg-blue-50 text-blue-700 border-blue-200",
@@ -111,7 +63,7 @@ function escapeHtml(s: string): string {
 
 function resolvePreview(html: string, company: CompanySettings): string {
     const data: Record<string, string> = {};
-    MERGE_FIELDS.forEach(cat => cat.fields.forEach(f => { data[f.key] = f.example; }));
+    MERGE_FIELD_CATEGORIES.forEach(cat => cat.fields.forEach(f => { data[f.key] = f.example; }));
     if (company.companyName) data.company_name = company.companyName;
     if (company.address) data.company_address = company.address;
     if (company.phone) data.company_phone = company.phone;
@@ -136,7 +88,9 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
     const [editingTemplate, setEditingTemplate] = useState<Template | null>(null);
     const [company, setCompany] = useState<CompanySettings>({ companyName: "Your Company" });
     const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
+    const [openDropdown, setOpenDropdown] = useState<string | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const mergeToolbarRef = useRef<HTMLDivElement>(null);
 
     const [form, setForm] = useState({ name: "", type: defaultType, body: "", isDefault: false });
 
@@ -144,6 +98,17 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
         loadTemplates();
         loadCompany();
     }, []);
+
+    useEffect(() => {
+        if (!openDropdown) return;
+        const handler = (e: MouseEvent) => {
+            if (mergeToolbarRef.current && !mergeToolbarRef.current.contains(e.target as globalThis.Node)) {
+                setOpenDropdown(null);
+            }
+        };
+        document.addEventListener("mousedown", handler);
+        return () => document.removeEventListener("mousedown", handler);
+    }, [openDropdown]);
 
     async function loadTemplates() {
         setLoading(true);
@@ -183,6 +148,7 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
     }
 
     function insertMergeField(key: string) {
+        setOpenDropdown(null);
         const ta = textareaRef.current;
         if (!ta) {
             setForm(prev => ({ ...prev, body: prev.body + `{{${key}}}` }));
@@ -330,26 +296,42 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                 </header>
 
                 {/* Merge Field Toolbar */}
-                <div className="bg-slate-50 border-b border-hui-border px-6 py-3 shrink-0">
-                    <div className="flex items-start gap-4 flex-wrap">
-                        <span className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider pt-1.5 shrink-0">Insert Field:</span>
-                        {MERGE_FIELDS.map(cat => (
-                            <div key={cat.category} className="flex items-center gap-1.5">
-                                <span className="text-xs font-semibold text-hui-textMuted">{cat.icon} {cat.category}:</span>
-                                <div className="flex gap-1 flex-wrap">
-                                    {cat.fields.map(f => (
-                                        <button
-                                            key={f.key}
-                                            onClick={() => insertMergeField(f.key)}
-                                            className={`px-2 py-0.5 rounded-full text-xs font-medium transition cursor-pointer ${categoryColors[cat.color].pill}`}
-                                            title={`Inserts {{${f.key}}} → "${f.example}"`}
-                                        >
-                                            {f.label}
-                                        </button>
-                                    ))}
+                <div ref={mergeToolbarRef} className="bg-slate-50 border-b border-hui-border px-6 py-2.5 shrink-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider shrink-0">Insert Field:</span>
+                        {templateMergeFields.map(cat => {
+                            const colors = CATEGORY_COLORS[cat.color] || CATEGORY_COLORS.blue;
+                            return (
+                                <div key={cat.category} className="relative">
+                                    <button
+                                        type="button"
+                                        onClick={() => setOpenDropdown(openDropdown === cat.category ? null : cat.category)}
+                                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 transition"
+                                    >
+                                        <span>{cat.icon}</span>
+                                        <span>{cat.category}</span>
+                                        <svg className="w-3 h-3 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                        </svg>
+                                    </button>
+                                    {openDropdown === cat.category && (
+                                        <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-20 min-w-[200px]">
+                                            {cat.fields.map(f => (
+                                                <button
+                                                    key={f.key}
+                                                    type="button"
+                                                    onClick={() => insertMergeField(f.key)}
+                                                    className="w-full text-left px-3 py-2 text-xs hover:bg-slate-50 flex items-center justify-between gap-4 first:rounded-t-lg last:rounded-b-lg"
+                                                >
+                                                    <span className="font-medium text-slate-700">{f.label}</span>
+                                                    <span className="text-slate-400 text-[10px] truncate max-w-[100px]">&ldquo;{f.example}&rdquo;</span>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
-                            </div>
-                        ))}
+                            );
+                        })}
                     </div>
                 </div>
 

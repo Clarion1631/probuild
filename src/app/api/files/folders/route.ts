@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { hasPermission } from "@/lib/permissions";
 
 // GET: list all folders for a project or lead
 export async function GET(req: NextRequest) {
@@ -38,7 +39,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { name, projectId, leadId, parentId } = body;
+    const { name, projectId, leadId, parentId, visibility } = body;
 
     if (!name?.trim()) {
         return NextResponse.json({ error: "Folder name required" }, { status: 400 });
@@ -51,6 +52,7 @@ export async function POST(req: NextRequest) {
     const folder = await prisma.fileFolder.create({
         data: {
             name: name.trim(),
+            ...(visibility && { visibility }),
             ...(projectId && { projectId }),
             ...(leadId && { leadId }),
             ...(parentId && { parentId }),
@@ -63,7 +65,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(folder, { status: 201 });
 }
 
-// PATCH: rename a folder
+// PATCH: rename a folder or change its visibility
 export async function PATCH(req: NextRequest) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
@@ -71,15 +73,30 @@ export async function PATCH(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { id, name } = body;
+    const { id, name, visibility } = body;
 
-    if (!id || !name?.trim()) {
-        return NextResponse.json({ error: "id and name required" }, { status: 400 });
+    if (!id) {
+        return NextResponse.json({ error: "id required" }, { status: 400 });
     }
+
+    if (visibility === "financial") {
+        const callerUser = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            include: { permissions: true },
+        });
+        if (!callerUser || !hasPermission(callerUser, "financialReports")) {
+            return NextResponse.json({ error: "No permission to set financial visibility" }, { status: 403 });
+        }
+    }
+
+    const updateData: any = {};
+    if (name?.trim()) updateData.name = name.trim();
+    if (visibility) updateData.visibility = visibility;
 
     const folder = await prisma.fileFolder.update({
         where: { id },
-        data: { name: name.trim() },
+        data: updateData,
+        include: { _count: { select: { files: true, children: true } } },
     });
 
     return NextResponse.json(folder);

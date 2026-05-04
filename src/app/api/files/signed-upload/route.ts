@@ -22,11 +22,12 @@ export async function POST(req: NextRequest) {
         }
 
         const body = await req.json();
-        const { projectId, leadId, folderId, files } = body as {
+        const { projectId, leadId, folderId, files, visibility } = body as {
             projectId?: string;
             leadId?: string;
             folderId?: string;
             files: FileInfo[];
+            visibility?: string;
         };
 
         if (!projectId && !leadId) {
@@ -92,6 +93,7 @@ export async function POST(req: NextRequest) {
                     projectId,
                     leadId,
                     folderId,
+                    visibility,
                 };
             })
         );

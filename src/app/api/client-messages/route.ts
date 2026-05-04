@@ -178,6 +178,8 @@ export async function POST(request: Request) {
                 console.error("[clientMessages] Failed to generate estimate PDF:", e);
                 resolvedAttachments.push({ type: "estimate", id: att.id, name: att.name || "Estimate", url: `${appUrl}/portal/estimates/${att.id}` });
             }
+        } else if (att.type === "file") {
+            resolvedAttachments.push({ type: "file", id: att.id || "", name: att.name || "File", url: att.url });
         }
     }
 
@@ -187,11 +189,16 @@ export async function POST(request: Request) {
     let sentViaEmail = false;
     let sentViaSms = false;
     let smsResult: SmsResult | null = null;
+    let smsSkippedReason: string | null = null;
 
     if (!isScheduled) {
         const estimateLinksHtml = resolvedAttachments
             .filter(a => a.type === "estimate")
             .map(a => `<a href="${a.url}" style="display:inline-block;background:#4c9a2a;color:#fff;text-decoration:none;padding:10px 24px;border-radius:8px;font-weight:600;font-size:14px;margin:4px 0;">View ${a.name}</a>`)
+            .join("<br/>");
+        const fileLinksHtml = resolvedAttachments
+            .filter(a => a.type === "file" && a.url)
+            .map(a => `<a href="${a.url}" style="display:inline-block;background:#2563eb;color:#fff;text-decoration:none;padding:8px 20px;border-radius:8px;font-weight:600;font-size:13px;margin:4px 0;">📎 Download ${a.name}</a>`)
             .join("<br/>");
 
         if ((channel === "email" || channel === "both") && clientEmail) {
@@ -209,6 +216,7 @@ export async function POST(request: Request) {
                                 <p style="margin:0;line-height:1.6;white-space:pre-wrap;">${messageBody}</p>
                             </div>
                             ${estimateLinksHtml ? `<div style="margin-top:20px;text-align:center;">${estimateLinksHtml}</div>` : ""}
+                            ${fileLinksHtml ? `<div style="margin-top:16px;text-align:center;">${fileLinksHtml}</div>` : ""}
                         </div>
                         <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
                     </body></html>`,
@@ -221,13 +229,20 @@ export async function POST(request: Request) {
             }
         }
 
-        if ((channel === "sms" || channel === "both") && clientPhone) {
-            const plainText = htmlToSmsText(messageBody);
-            const smsBody = resolvedAttachments.length > 0
-                ? `${plainText}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
-                : plainText;
-            smsResult = await sendSMS(clientPhone, smsBody);
-            sentViaSms = smsResult.ok === true;
+        if (channel === "sms" || channel === "both") {
+            if (!clientPhone) {
+                smsSkippedReason = "Client has no phone number on file";
+                if (channel === "sms") {
+                    smsResult = { ok: false, error: "no_phone" } as SmsResult;
+                }
+            } else {
+                const plainText = htmlToSmsText(messageBody);
+                const smsBody = resolvedAttachments.length > 0
+                    ? `${plainText}\n\nView your estimate: ${resolvedAttachments[0]?.url || appUrl}`
+                    : plainText;
+                smsResult = await sendSMS(clientPhone, smsBody);
+                sentViaSms = smsResult.ok === true;
+            }
         }
     }
 
@@ -266,5 +281,27 @@ export async function POST(request: Request) {
         },
     });
 
-    return NextResponse.json(message, { status: 201 });
+    const smsError = smsResult && !smsResult.ok ? smsResult.error : null;
+    const warnings: string[] = [];
+    if (smsSkippedReason && channel === "both") {
+        warnings.push(`SMS skipped: ${smsSkippedReason}`);
+    }
+
+    let deliveryError: string | null = null;
+    if (status === "FAILED") {
+        deliveryError = channel === "sms"
+            ? `SMS delivery failed: ${smsError || "unknown error"}`
+            : channel === "both"
+                ? `All channels failed${smsError ? ` (SMS: ${smsError})` : ""}`
+                : "Email delivery failed";
+    }
+
+    return NextResponse.json({
+        ...message,
+        emailDelivered: sentViaEmail,
+        smsDelivered: sentViaSms,
+        smsError,
+        warnings,
+        deliveryError,
+    }, { status: 201 });
 }

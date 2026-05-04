@@ -22,11 +22,10 @@ export default async function EstimatePage({
     }
 
     // Parse sales taxes from company settings
-    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
+    let salesTaxes: { id?: string; name: string; rate: number; isDefault: boolean }[] = [];
     try {
         salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
     } catch { /* ignore parse errors */ }
-    const defaultTax = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
 
     return (
         <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
@@ -41,7 +40,7 @@ export default async function EstimatePage({
                         location: project.location || undefined
                     }}
                     initialEstimate={JSON.parse(JSON.stringify(estimate))}
-                    defaultTax={defaultTax}
+                    salesTaxes={salesTaxes}
                 />
             </div>
         </div>

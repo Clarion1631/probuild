@@ -4,7 +4,7 @@
 const rm = (n: number) => Math.round(n * 100) / 100;
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -18,6 +18,11 @@ const EST_METHOD_LABELS: Record<string, string> = {
     ach: "ACH",
     check: "Check",
     cash: "Cash",
+    zelle: "Zelle",
+    venmo: "Venmo",
+    credit_card: "Credit Card",
+    wire: "Wire Transfer",
+    other: "Other",
 };
 function formatEstPaymentMethod(method: string | null | undefined, ref: string | null | undefined): string {
     if (!method) return "";
@@ -34,7 +39,7 @@ import BudgetStrip from "./BudgetStrip";
 import POQuickCreateModal from "./POQuickCreateModal";
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 
-export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
+export default function EstimateEditor({ context, initialEstimate, salesTaxes = [] }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[] }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -70,6 +75,10 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
+    const defaultTaxRate = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
+    const [selectedTaxName, setSelectedTaxName] = useState<string | null>(
+        initialEstimate.taxRateName ?? defaultTaxRate?.name ?? null
+    );
     const [isAiFilling, setIsAiFilling] = useState(false);
     const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
     const [overwriteExisting, setOverwriteExisting] = useState(false);
@@ -78,6 +87,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments" | "history">("overview");
     const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
     const [showTerms, setShowTerms] = useState(false);
+    const [termsTemplates, setTermsTemplates] = useState<{id: string; name: string; body: string; isDefault: boolean}[]>([]);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
     const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
     const [isUploadingFile, setIsUploadingFile] = useState(false);
@@ -225,6 +235,16 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
     useEffect(() => {
         getEstimateTemplates().then(setAssemblies).catch((err) => console.error("[EstimateEditor] Failed to load templates:", err));
+    }, []);
+
+    useEffect(() => {
+        getDocumentTemplates("terms").then((data: any[]) => {
+            setTermsTemplates(data);
+            if (!initialEstimate.termsAndConditions) {
+                const defaultT = data.find((t: any) => t.isDefault);
+                if (defaultT) setTermsAndConditions(defaultT.body);
+            }
+        });
     }, []);
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -450,8 +470,9 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
         return acc;
     }, 0);
-    const taxRate = taxExempt ? 0 : (defaultTax ? defaultTax.rate / 100 : 0.088);
-    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
+    const activeTax = salesTaxes.find(t => t.name === selectedTaxName) || defaultTaxRate;
+    const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
+    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${activeTax.rate}%)` : "Estimated Tax (8.8%)");
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
@@ -517,6 +538,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             signatureUrl: signatureUrl || null,
             targetMarginPercent: parseFloat(targetMargin) || 25,
             taxExempt,
+            taxRateName: taxExempt ? null : (activeTax?.name || null),
+            taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
         }, mappedItems);
         setIsSaving(false);
         toast.success("Estimate saved successfully");
@@ -1029,6 +1052,13 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             const pct = parseFloat(value) || 0;
             newSchedules[index].percentage = value;
             newSchedules[index].amount = String(rm(total * (pct / 100)));
+        } else if (field === "amount") {
+            newSchedules[index].amount = value;
+            if (total > 0) {
+                newSchedules[index].percentage = String(rm(((parseFloat(value) || 0) / total) * 100));
+            } else {
+                newSchedules[index].percentage = "";
+            }
         } else {
             newSchedules[index][field] = value;
         }
@@ -1924,14 +1954,19 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                 <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
                                             </div>
                                             <div className="w-32 px-4 relative">
-                                                <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
-                                                <input
-                                                    type="number"
-                                                    value={schedule.amount}
-                                                    onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
-                                                    disabled={isPaid}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800 disabled:cursor-default"
-                                                />
+                                                {isPaid ? (
+                                                    <span className="block px-3 py-1.5 text-sm font-medium text-slate-800">{formatCurrency(Number(schedule.amount) || 0)}</span>
+                                                ) : (
+                                                    <>
+                                                        <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
+                                                        <input
+                                                            type="number"
+                                                            value={schedule.amount}
+                                                            onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
+                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
+                                                        />
+                                                    </>
+                                                )}
                                             </div>
                                             <div className="w-40 px-4 text-right">
                                                 <input
@@ -2002,8 +2037,11 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                 ) : isSavedSchedule ? (
                                                     <button
                                                         onClick={() => setRecordingEstPayment({ id: schedule.id, name: schedule.name || "Milestone", amount: Number(schedule.amount) || 0 })}
-                                                        className="hui-btn hui-btn-primary py-1 px-2 text-[11px] h-7"
+                                                        className="hui-btn hui-btn-primary py-1.5 px-3 text-xs flex items-center gap-1.5"
                                                     >
+                                                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                        </svg>
                                                         Record Payment
                                                     </button>
                                                 ) : (
@@ -2037,7 +2075,29 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                             <span className="text-slate-800">{formatCurrency(tax)}</span>
                                         </div>
                                     )}
-                                    {viewMode === "internal" && (
+                                    {viewMode === "internal" && salesTaxes.length > 0 && (
+                                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                                            <select
+                                                value={taxExempt ? "__exempt__" : (selectedTaxName || "")}
+                                                onChange={(e) => {
+                                                    if (e.target.value === "__exempt__") {
+                                                        setTaxExempt(true);
+                                                        setSelectedTaxName(null);
+                                                    } else {
+                                                        setTaxExempt(false);
+                                                        setSelectedTaxName(e.target.value);
+                                                    }
+                                                }}
+                                                className="hui-input text-xs py-1 pl-2 pr-6 rounded"
+                                            >
+                                                {salesTaxes.map(t => (
+                                                    <option key={t.name} value={t.name}>{t.name} ({t.rate}%)</option>
+                                                ))}
+                                                <option value="__exempt__">Tax Exempt</option>
+                                            </select>
+                                        </div>
+                                    )}
+                                    {viewMode === "internal" && salesTaxes.length === 0 && (
                                         <div className="flex items-center gap-2 text-xs text-slate-500">
                                             <input
                                                 type="checkbox"
@@ -2193,10 +2253,25 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 {showTerms && (
                                     <div className="px-6 pb-5 border-t border-slate-100">
                                         <p className="text-xs text-slate-500 mt-3 mb-2">These terms will be included on the estimate sent to the client.</p>
+                                        {termsTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm mb-2"
+                                                value=""
+                                                onChange={e => {
+                                                    const t = termsTemplates.find(t => t.id === e.target.value);
+                                                    if (t) setTermsAndConditions(t.body);
+                                                }}
+                                            >
+                                                <option value="" disabled>Load a template...</option>
+                                                {termsTemplates.map(t => (
+                                                    <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>
+                                                ))}
+                                            </select>
+                                        )}
                                         <textarea
                                             value={termsAndConditions}
                                             onChange={e => setTermsAndConditions(e.target.value)}
-                                            placeholder="Enter your terms and conditions here. For example: Payment is due within 30 days of invoice. A 50% deposit is required before work begins..."
+                                            placeholder="Enter your terms and conditions here, or select a template above..."
                                             className="hui-input w-full h-32 resize-y text-sm"
                                         />
                                     </div>

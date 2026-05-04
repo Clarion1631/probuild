@@ -48,8 +48,8 @@ export async function POST(
                 OR: ownershipClauses,
             },
             include: {
-                project: { select: { id: true, name: true, client: { select: { name: true, email: true } } } },
-                lead: { select: { id: true, name: true, client: { select: { name: true, email: true } } } }
+                project: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
+                lead: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } } } }
             }
         });
 
@@ -207,7 +207,9 @@ export async function POST(
 
         // Resolve client/company details for email
         const clientEmail = contract.project?.client?.email || contract.lead?.client?.email;
+        const clientAdditionalEmail = contract.project?.client?.additionalEmail || contract.lead?.client?.additionalEmail;
         const clientName = contract.project?.client?.name || contract.lead?.client?.name || "Client";
+        const ccList = clientAdditionalEmail ? [clientAdditionalEmail] : undefined;
         const companySettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyEmail = companySettings?.notificationEmail || companySettings?.email;
         const companyName = companySettings?.companyName || "ProBuild";
@@ -216,7 +218,7 @@ export async function POST(
         const emailHtml = `
             <!DOCTYPE html>
             <html>
-            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333 text-align: center;">
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333; text-align: center;">
                 <div style="text-align: center; margin-bottom: 32px;">
                     <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
                 </div>
@@ -252,6 +254,7 @@ export async function POST(
                 {
                     fromName: companyName,
                     replyTo: companyEmail || undefined,
+                    cc: ccList,
                 }
             );
         }
