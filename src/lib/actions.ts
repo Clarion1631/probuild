@@ -3693,15 +3693,18 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
         year: new Date().getFullYear().toString(),
     };
 
+    const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
     const populateFromEntity = (
-        entity: { name: string; location?: string | null; number?: number; type?: string | null },
+        entity: { name: string; location?: string | null; number?: number; type?: string | null; projectType?: string | null },
         client: { name: string; email?: string | null; primaryPhone?: string | null; additionalEmail?: string | null; additionalPhone?: string | null; addressLine1?: string | null; city?: string | null; state?: string | null; zipCode?: string | null },
         estimates: { code: string; totalAmount: any; balanceDue: any; paymentSchedules?: { name: string; percentage?: number | null; amount: any; order: number }[] }[]
     ) => {
         data.project_name = entity.name;
         data.location = entity.location || "";
         if (entity.number) data.project_number = `P-${entity.number}`;
-        if (entity.type) data.project_type = entity.type;
+        const entityType = entity.type || entity.projectType || null;
+        if (entityType) data.project_type = entityType;
 
         data.client_name = client.name;
         data.client_email = client.email || "";
@@ -3712,13 +3715,13 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
 
         const est = estimates[0];
         if (est) {
-            data.estimate_total = `$${Number(est.totalAmount).toLocaleString()}`;
+            data.estimate_total = `$${Number(est.totalAmount).toLocaleString("en-US")}`;
             data.estimate_number = est.code;
-            data.estimate_balance_due = `$${Number(est.balanceDue).toLocaleString()}`;
+            data.estimate_balance_due = `$${Number(est.balanceDue).toLocaleString("en-US")}`;
             if (est.paymentSchedules && est.paymentSchedules.length > 0) {
                 const rows = est.paymentSchedules
                     .sort((a, b) => a.order - b.order)
-                    .map((ps) => `<tr><td style="padding:4px 12px 4px 0;border-bottom:1px solid #e5e7eb;">${ps.name}</td><td style="padding:4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">${ps.percentage ? `${ps.percentage}%` : ""}</td><td style="padding:4px 0 4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">$${Number(ps.amount).toLocaleString()}</td></tr>`)
+                    .map((ps) => `<tr><td style="padding:4px 12px 4px 0;border-bottom:1px solid #e5e7eb;">${escHtml(ps.name)}</td><td style="padding:4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">${ps.percentage ? `${ps.percentage}%` : ""}</td><td style="padding:4px 0 4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">$${Number(ps.amount).toLocaleString("en-US")}</td></tr>`)
                     .join("");
                 data.payment_schedule = `<table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="border-bottom:2px solid #333;"><th style="text-align:left;padding:4px 12px 4px 0;">Milestone</th><th style="text-align:right;padding:4px 12px;">%</th><th style="text-align:right;padding:4px 0 4px 12px;">Amount</th></tr></thead><tbody>${rows}</tbody></table>`;
             }
