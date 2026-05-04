@@ -16,13 +16,11 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "projectId required" }, { status: 400 });
         }
 
-        // Check if files are enabled in portal visibility
         const visibility = await getPortalVisibility(projectId);
         if (!visibility.isPortalEnabled || !visibility.showFiles) {
             return NextResponse.json({ error: "Not found" }, { status: 404 });
         }
 
-        // Staff preview: ADMIN/MANAGER bypass client ownership check
         const staffSession = await getServerSession(authOptions);
         const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
 
@@ -31,7 +29,6 @@ export async function GET(req: NextRequest) {
             if (!sessionClientId) {
                 return NextResponse.json({ error: "Not found" }, { status: 404 });
             }
-            // Verify client owns this project
             const project = await prisma.project.findFirst({
                 where: { id: projectId, clientId: sessionClientId },
                 select: { id: true },
@@ -41,7 +38,21 @@ export async function GET(req: NextRequest) {
             }
         }
 
-        // Only return "shared" folders
+        // If we're inside a folder, that folder MUST itself be "shared" — otherwise we
+        // refuse to list anything from it. This is the only way to enforce inheritance
+        // safely: a null-visibility file in a "team" folder must not leak out, even
+        // though the file query alone can't distinguish them.
+        if (folderId) {
+            const parentFolder = await prisma.fileFolder.findFirst({
+                where: { id: folderId, projectId, visibility: "shared" },
+                select: { id: true },
+            });
+            if (!parentFolder) {
+                return NextResponse.json({ error: "Not found" }, { status: 404 });
+            }
+        }
+
+        // Folders: only "shared" folders are listed, regardless of nesting level.
         const folders = await prisma.fileFolder.findMany({
             where: {
                 projectId,
@@ -52,25 +63,28 @@ export async function GET(req: NextRequest) {
             include: {
                 _count: {
                     select: {
-                        files: { where: { OR: [{ visibility: "shared" }, { visibility: null }] } },
+                        // Inside a shared folder, ALL files are effectively shared
+                        // (explicit "shared" + null inheriting from the folder). At the
+                        // root level we only count explicit shares.
+                        files: { where: { visibility: "shared" } },
                         children: true,
                     },
                 },
             },
         });
 
-        // Return files that are effectively "shared":
-        // 1. Explicitly shared files
-        // 2. Files with null visibility inside shared folders
+        // Files: at the root, only explicit "shared". Inside a folder (which we've
+        // already verified is shared above), include both explicit "shared" AND
+        // null-visibility files (they inherit from the parent).
+        const fileWhere: any = {
+            projectId,
+            folderId: folderId || null,
+            ...(folderId
+                ? { OR: [{ visibility: "shared" }, { visibility: null }] }
+                : { visibility: "shared" }),
+        };
         const files = await prisma.projectFile.findMany({
-            where: {
-                projectId,
-                folderId: folderId || null,
-                OR: [
-                    { visibility: "shared" },
-                    ...(folderId ? [{ visibility: null }] : []),
-                ],
-            },
+            where: fileWhere,
             orderBy: { createdAt: "desc" },
             select: {
                 id: true,

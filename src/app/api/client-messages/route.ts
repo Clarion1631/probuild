@@ -6,6 +6,10 @@ import { sendNotification } from "@/lib/email";
 import { sendSMS, htmlToSmsText, type SmsResult } from "@/lib/sms";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 // GET /api/client-messages?clientId=X  OR  ?leadId=X  OR  ?projectId=X  OR  ?unmatched=true
 export async function GET(request: Request) {
     const session = await getServerSession(authOptions);
@@ -164,6 +168,7 @@ export async function POST(request: Request) {
     // Resolve attachments
     const emailAttachments: { filename: string; content: Buffer }[] = [];
     const resolvedAttachments: { type: string; id: string; name: string; url?: string }[] = [];
+    const supabaseHost = (process.env.SUPABASE_URL || "").replace(/^https?:\/\//, "");
 
     for (const att of attachments) {
         if (att.type === "estimate") {
@@ -179,6 +184,16 @@ export async function POST(request: Request) {
                 resolvedAttachments.push({ type: "estimate", id: att.id, name: att.name || "Estimate", url: `${appUrl}/portal/estimates/${att.id}` });
             }
         } else if (att.type === "file") {
+            // Only accept URLs from our Supabase storage domain
+            try {
+                const fileUrl = new URL(att.url);
+                if (!supabaseHost || !fileUrl.hostname.endsWith(".supabase.co")) {
+                    console.warn("[clientMessages] Rejected non-Supabase file URL:", att.url);
+                    continue;
+                }
+            } catch {
+                continue;
+            }
             resolvedAttachments.push({ type: "file", id: att.id || "", name: att.name || "File", url: att.url });
         }
     }
@@ -211,12 +226,16 @@ export async function POST(request: Request) {
                     <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:40px 20px;color:#333;">
                         <div style="text-align:center;margin-bottom:32px;"><h1 style="font-size:24px;font-weight:700;margin:0;">${companyName}</h1></div>
                         <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:32px;">
-                            <p style="color:#666;margin:0 0 8px;">From: <strong>${senderName}</strong></p>
+                            <p style="color:#666;margin:0 0 8px;">From: <strong>${escapeHtml(senderName)}</strong></p>
                             <div style="background:#f3f4f6;border-radius:8px;padding:16px;margin:16px 0;">
-                                <p style="margin:0;line-height:1.6;white-space:pre-wrap;">${messageBody}</p>
+                                <p style="margin:0;line-height:1.6;white-space:pre-wrap;">${escapeHtml(messageBody)}</p>
                             </div>
                             ${estimateLinksHtml ? `<div style="margin-top:20px;text-align:center;">${estimateLinksHtml}</div>` : ""}
                             ${fileLinksHtml ? `<div style="margin-top:16px;text-align:center;">${fileLinksHtml}</div>` : ""}
+                            ${projectId && /^[a-z0-9_-]+$/i.test(projectId) ? `<div style="margin-top:24px;padding-top:20px;border-top:1px solid #e5e7eb;text-align:center;">
+                                <a href="${appUrl}/portal/projects/${projectId}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;padding:12px 32px;border-radius:8px;font-weight:600;font-size:14px;">View Your Project Portal</a>
+                                <p style="color:#94a3b8;font-size:11px;margin:8px 0 0;">Access your estimates, contracts, files, and project updates</p>
+                            </div>` : ""}
                         </div>
                         <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:16px;">${companyName}${settings?.address ? ` • ${settings.address}` : ""}</p>
                     </body></html>`,

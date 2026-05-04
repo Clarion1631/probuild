@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { hasPermission } from "@/lib/permissions";
 
 export const maxDuration = 30;
 
@@ -28,6 +29,20 @@ export async function POST(req: NextRequest) {
 
         if (!files?.length) {
             return NextResponse.json({ error: "files required" }, { status: 400 });
+        }
+
+        // If ANY file is being registered as financial, the caller must have the
+        // permission. Look up once; signed-upload also enforces this gate but a direct
+        // call to register would bypass it without this check.
+        const hasFinancial = files.some(f => f.visibility === "financial");
+        if (hasFinancial) {
+            const userWithPerms = await prisma.user.findUnique({
+                where: { id: user.id },
+                include: { permissions: true },
+            });
+            if (!userWithPerms || !hasPermission(userWithPerms, "financialReports")) {
+                return NextResponse.json({ error: "No permission to create financial files" }, { status: 403 });
+            }
         }
 
         // Authorize EVERY file. Without this, a caller with one valid `projectId` could

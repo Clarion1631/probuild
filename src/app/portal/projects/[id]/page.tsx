@@ -291,6 +291,28 @@ export default async function PortalProjectDetail(props: { params: Promise<{ id:
 
                 {/* Room Designer portal view is Stage 4 (client share links). Not rendered in Stage 0. */}
 
+                {/* Files & Documents Section */}
+                {visibility.showFiles && (
+                <div className="md:col-span-2 mt-4">
+                    <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-xl font-bold text-hui-textMain flex items-center gap-2">
+                            <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                            Files & Documents
+                        </h2>
+                        <Link href={`/portal/projects/${projectId}/files`} className="text-sm font-semibold text-blue-500 hover:text-blue-700 transition">
+                            View All Files →
+                        </Link>
+                    </div>
+                    <Link href={`/portal/projects/${projectId}/files`} className="block hui-card p-6 hover:border-blue-500 hover:shadow-md transition text-center border-dashed">
+                        <div className="w-12 h-12 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-3">
+                            <svg className="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                        </div>
+                        <h3 className="text-base font-bold text-slate-800">View Shared Files</h3>
+                        <p className="text-sm text-slate-500 mt-1">Access project documents, plans, and photos shared by your contractor.</p>
+                    </Link>
+                </div>
+                )}
+
                 {/* Daily Logs Section */}
                 {visibility.showDailyLogs && (
                 <div className="md:col-span-2 mt-4">

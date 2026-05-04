@@ -4,6 +4,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { hasPermission } from "@/lib/permissions";
+import { userCanAccessProject } from "@/lib/mobile-auth";
 
 export const maxDuration = 60;
 
@@ -16,6 +17,41 @@ type FileWithFolder = {
 
 function effectiveVisibility(file: FileWithFolder): string {
     return file.visibility ?? file.folder?.visibility ?? "team";
+}
+
+// Authorize the caller against either a project (via ProjectAccess/crew/admin)
+// or a lead (admin or assigned manager). Returns the user record on success
+// or a NextResponse on failure.
+async function authorizeFileScope(
+    email: string,
+    scope: { projectId?: string | null; leadId?: string | null }
+): Promise<{ user: any } | NextResponse> {
+    const user = await prisma.user.findUnique({
+        where: { email },
+        include: { permissions: true },
+    });
+    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+    if (scope.projectId) {
+        const ok = await userCanAccessProject(user, scope.projectId);
+        if (!ok) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+    if (scope.leadId) {
+        if (user.role !== "ADMIN") {
+            const lead = await prisma.lead.findFirst({
+                where: { id: scope.leadId, managerId: user.id },
+                select: { id: true },
+            });
+            if (!lead && user.role !== "MANAGER") {
+                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
+            // MANAGERs without lead assignment also blocked, mirroring register's stricter rule
+            if (!lead && user.role === "MANAGER") {
+                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
+        }
+    }
+    return { user };
 }
 
 // GET: list files and folders for a project or lead
@@ -36,46 +72,31 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
         }
 
-        const callerUser = await prisma.user.findUnique({
-            where: { email: session.user.email },
-            include: {
-                permissions: true,
-                ...(projectId ? { projectAccess: { where: { projectId }, select: { projectId: true } } } : {}),
-            },
-        });
+        const authResult = await authorizeFileScope(session.user.email, { projectId, leadId });
+        if (authResult instanceof NextResponse) return authResult;
+        const { user: callerUser } = authResult;
 
-        if (projectId) {
-            const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
-            if (!callerUser || (!isAdmin && (!callerUser.projectAccess || callerUser.projectAccess.length === 0))) {
-                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-            }
-        }
-
-        const canSeeFinancial = callerUser ? hasPermission(callerUser, "financialReports") : false;
+        const canSeeFinancial = hasPermission(callerUser, "financialReports");
 
         const where: any = {};
         if (projectId) where.projectId = projectId;
         if (leadId) where.leadId = leadId;
 
-        // Folders: filter by visibility if requested, always exclude financial for non-permitted users
-        const folderWhere: any = { ...where, parentId: folderId || null };
+        // Build folder visibility predicate as a single AND so future changes can't
+        // accidentally drop the financial exclusion.
+        const folderConditions: any[] = [{ ...where, parentId: folderId || null }];
         if (visibilityFilter) {
-            folderWhere.visibility = visibilityFilter;
+            folderConditions.push({ visibility: visibilityFilter });
         }
         if (!canSeeFinancial) {
-            folderWhere.visibility = { not: "financial" };
-            if (visibilityFilter && visibilityFilter !== "financial") {
-                folderWhere.visibility = visibilityFilter;
-            }
+            folderConditions.push({ visibility: { not: "financial" } });
         }
-
         const folders = await prisma.fileFolder.findMany({
-            where: folderWhere,
+            where: { AND: folderConditions },
             orderBy: { name: "asc" },
             include: { _count: { select: { files: true, children: true } } },
         });
 
-        // Files: include folder visibility for inheritance computation
         const fileWhere: any = { ...where, folderId: folderId || null };
         const files = await prisma.projectFile.findMany({
             where: fileWhere,
@@ -86,7 +107,6 @@ export async function GET(req: NextRequest) {
             },
         });
 
-        // Apply visibility filtering in JS (needed for inheritance logic)
         const filtered = files.filter((f: FileWithFolder) => {
             const eff = effectiveVisibility(f);
             if (!canSeeFinancial && eff === "financial") return false;
@@ -94,7 +114,6 @@ export async function GET(req: NextRequest) {
             return true;
         });
 
-        // Add effectiveVisibility to each file for the client
         const filesWithEffective = filtered.map((f: FileWithFolder) => ({
             ...f,
             effectiveVisibility: effectiveVisibility(f),
@@ -120,11 +139,6 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "Storage not configured. Contact admin to set SUPABASE_URL and SUPABASE_SERVICE_KEY." }, { status: 500 });
         }
 
-        const user = await prisma.user.findUnique({
-            where: { email: session.user.email },
-            include: { permissions: true },
-        });
-
         let formData;
         try {
             formData = await req.formData();
@@ -143,24 +157,28 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
         }
 
-        if (projectId) {
-            const callerUser = await prisma.user.findUnique({
-                where: { email: session.user.email },
-                select: { role: true, projectAccess: { where: { projectId }, select: { projectId: true } } }
-            });
-            const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
-            if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
-                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-            }
-        }
+        const authResult = await authorizeFileScope(session.user.email, { projectId, leadId });
+        if (authResult instanceof NextResponse) return authResult;
+        const { user } = authResult;
 
-        // Only users with financialReports permission can set financial visibility
-        if (visibility === "financial" && user && !hasPermission(user, "financialReports")) {
+        if (visibility === "financial" && !hasPermission(user, "financialReports")) {
             return NextResponse.json({ error: "No permission to create financial files" }, { status: 403 });
         }
 
         if (!files || files.length === 0) {
             return NextResponse.json({ error: "No files selected" }, { status: 400 });
+        }
+
+        const ALLOWED_EXTENSIONS = new Set([
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv",
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic",
+            ".txt", ".rtf", ".dwg", ".dxf",
+        ]);
+        for (const file of files) {
+            const ext = file.name.includes(".") ? `.${file.name.split(".").pop()!.toLowerCase()}` : "";
+            if (!ALLOWED_EXTENSIONS.has(ext)) {
+                return NextResponse.json({ error: `File type not allowed: ${ext || "(no extension)"}. Allowed: PDF, Word, Excel, images.` }, { status: 400 });
+            }
         }
 
         const created = [];
@@ -173,7 +191,7 @@ export async function POST(req: NextRequest) {
             const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
             const storagePath = `${prefix}/${Date.now()}_${safeName}`;
 
-            const { data: uploadData, error: uploadError } = await supabase.storage
+            const { error: uploadError } = await supabase.storage
                 .from(STORAGE_BUCKET)
                 .upload(storagePath, buffer, {
                     contentType: file.type || "application/octet-stream",
@@ -201,7 +219,7 @@ export async function POST(req: NextRequest) {
                     ...(projectId && { projectId }),
                     ...(leadId && { leadId }),
                     ...(folderId && { folderId }),
-                    ...(user && { uploadedById: user.id }),
+                    uploadedById: user.id,
                 },
                 include: { uploadedBy: { select: { id: true, name: true, email: true } } },
             });
@@ -231,15 +249,34 @@ export async function PATCH(req: NextRequest) {
             return NextResponse.json({ error: "fileId required" }, { status: 400 });
         }
 
-        // Permission check for financial visibility
-        if (visibility === "financial") {
-            const callerUser = await prisma.user.findUnique({
-                where: { email: session.user.email },
-                include: { permissions: true },
-            });
-            if (!callerUser || !hasPermission(callerUser, "financialReports")) {
-                return NextResponse.json({ error: "No permission to set financial visibility" }, { status: 403 });
-            }
+        // Load the existing file FIRST so we can authorize against its actual scope
+        // and current state. Without this, a caller could mutate any file by guessing IDs.
+        const existing = await prisma.projectFile.findUnique({
+            where: { id: fileId },
+            include: { folder: { select: { visibility: true } } },
+        });
+        if (!existing) {
+            return NextResponse.json({ error: "Not found" }, { status: 404 });
+        }
+
+        const authResult = await authorizeFileScope(session.user.email, {
+            projectId: existing.projectId,
+            leadId: existing.leadId,
+        });
+        if (authResult instanceof NextResponse) return authResult;
+        const { user } = authResult;
+
+        // Read protection: a financial file (by effective visibility) requires the
+        // permission to mutate at all. Otherwise an unprivileged caller could downgrade
+        // it to "shared" or "team" and bypass the gate.
+        const currentEff = effectiveVisibility(existing);
+        if (currentEff === "financial" && !hasPermission(user, "financialReports")) {
+            return NextResponse.json({ error: "No permission to modify financial files" }, { status: 403 });
+        }
+
+        // Setting financial requires the permission too.
+        if (visibility === "financial" && !hasPermission(user, "financialReports")) {
+            return NextResponse.json({ error: "No permission to set financial visibility" }, { status: 403 });
         }
 
         const updateData: any = {};
@@ -279,9 +316,29 @@ export async function DELETE(req: NextRequest) {
         const folderId = searchParams.get("folderId");
 
         if (fileId) {
-            const file = await prisma.projectFile.findUnique({ where: { id: fileId } });
+            const file = await prisma.projectFile.findUnique({
+                where: { id: fileId },
+                include: { folder: { select: { visibility: true } } },
+            });
+            if (!file) {
+                return NextResponse.json({ error: "Not found" }, { status: 404 });
+            }
+
+            const authResult = await authorizeFileScope(session.user.email, {
+                projectId: file.projectId,
+                leadId: file.leadId,
+            });
+            if (authResult instanceof NextResponse) return authResult;
+            const { user } = authResult;
+
+            // Financial files require the permission to delete (same protection as PATCH).
+            const currentEff = effectiveVisibility(file);
+            if (currentEff === "financial" && !hasPermission(user, "financialReports")) {
+                return NextResponse.json({ error: "No permission to delete financial files" }, { status: 403 });
+            }
+
             const supabase = getSupabase();
-            if (file && supabase) {
+            if (supabase) {
                 const url = file.url;
                 const bucketPrefix = `/storage/v1/object/public/${STORAGE_BUCKET}/`;
                 const pathIdx = url.indexOf(bucketPrefix);
@@ -295,6 +352,25 @@ export async function DELETE(req: NextRequest) {
         }
 
         if (folderId) {
+            const folder = await prisma.fileFolder.findUnique({
+                where: { id: folderId },
+                select: { id: true, projectId: true, leadId: true, visibility: true },
+            });
+            if (!folder) {
+                return NextResponse.json({ error: "Not found" }, { status: 404 });
+            }
+
+            const authResult = await authorizeFileScope(session.user.email, {
+                projectId: folder.projectId,
+                leadId: folder.leadId,
+            });
+            if (authResult instanceof NextResponse) return authResult;
+            const { user } = authResult;
+
+            if (folder.visibility === "financial" && !hasPermission(user, "financialReports")) {
+                return NextResponse.json({ error: "No permission to delete financial folders" }, { status: 403 });
+            }
+
             await prisma.fileFolder.delete({ where: { id: folderId } });
             return NextResponse.json({ success: true });
         }

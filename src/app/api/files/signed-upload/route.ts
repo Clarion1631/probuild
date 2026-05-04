@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { hasPermission } from "@/lib/permissions";
 
 export const maxDuration = 30;
 
@@ -35,6 +36,16 @@ export async function POST(req: NextRequest) {
         }
         if (!files?.length) {
             return NextResponse.json({ error: "files required" }, { status: 400 });
+        }
+
+        if (visibility === "financial") {
+            const userWithPerms = await prisma.user.findUnique({
+                where: { id: user.id },
+                include: { permissions: true },
+            });
+            if (!userWithPerms || !hasPermission(userWithPerms, "financialReports")) {
+                return NextResponse.json({ error: "No permission to create financial files" }, { status: 403 });
+            }
         }
 
         if (projectId) {
