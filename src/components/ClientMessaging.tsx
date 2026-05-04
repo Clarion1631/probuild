@@ -187,7 +187,8 @@ export default function ClientMessaging({
                 editor?.commands.setContent("");
                 if (msg.deliveryError) {
                     toast.error(msg.deliveryError);
-                } else if (msg.warnings?.length) {
+                }
+                if (msg.warnings?.length) {
                     for (const w of msg.warnings) toast.warning(w);
                 }
             } else {

@@ -305,6 +305,9 @@ export async function POST(request: Request) {
     if (smsSkippedReason && channel === "both") {
         warnings.push(`SMS skipped: ${smsSkippedReason}`);
     }
+    if (channel === "both" && sentViaEmail && !sentViaSms && smsError) {
+        warnings.push(`SMS delivery failed (${smsError}) — sent via email only`);
+    }
 
     let deliveryError: string | null = null;
     if (status === "FAILED") {
