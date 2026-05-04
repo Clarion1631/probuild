@@ -244,7 +244,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 const defaultT = data.find((t: any) => t.isDefault);
                 if (defaultT) setTermsAndConditions(defaultT.body);
             }
-        });
+        }).catch((err) => console.error("[EstimateEditor] Failed to load T&C templates:", err));
     }, []);
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
