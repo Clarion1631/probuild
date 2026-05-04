@@ -76,6 +76,16 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
     const defaultTaxRate = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
+    // Preserve the originally saved rate even if it was renamed/removed from settings,
+    // so we don't silently overwrite it with the default on next save.
+    const orphanedRate = useMemo(() => {
+        const savedName = initialEstimate.taxRateName;
+        const savedPct = initialEstimate.taxRatePercent;
+        if (!savedName || savedPct == null) return null;
+        if (salesTaxes.some(t => t.name === savedName && Number(t.rate) === Number(savedPct))) return null;
+        return { name: savedName, rate: Number(savedPct), isDefault: false, orphaned: true as const };
+    }, [initialEstimate.taxRateName, initialEstimate.taxRatePercent, salesTaxes]);
+    const taxOptions = orphanedRate ? [...salesTaxes, orphanedRate] : salesTaxes;
     const [selectedTaxName, setSelectedTaxName] = useState<string | null>(
         initialEstimate.taxRateName ?? defaultTaxRate?.name ?? null
     );
@@ -470,9 +480,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
         return acc;
     }, 0);
-    const activeTax = salesTaxes.find(t => t.name === selectedTaxName) || defaultTaxRate;
+    const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
     const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
-    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${activeTax.rate}%)` : "Estimated Tax (8.8%)");
+    const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
+    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
@@ -771,6 +782,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
                     await saveEstimate(initialEstimate.id, context.id, context.type, {
                         title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
+                        taxRateName: taxExempt ? null : (activeTax?.name || null),
+                        taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
                     }, mappedItems);
                     toast.success("Estimate auto-saved");
                     router.refresh();
@@ -2090,8 +2103,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                 }}
                                                 className="hui-input text-xs py-1 pl-2 pr-6 rounded"
                                             >
-                                                {salesTaxes.map(t => (
-                                                    <option key={t.name} value={t.name}>{t.name} ({t.rate}%)</option>
+                                                {taxOptions.map(t => (
+                                                    <option key={t.name} value={t.name}>
+                                                        {t.name} ({Number(parseFloat(String(t.rate)).toFixed(4))}%){("orphaned" in t && t.orphaned) ? " — not in settings" : ""}
+                                                    </option>
                                                 ))}
                                                 <option value="__exempt__">Tax Exempt</option>
                                             </select>

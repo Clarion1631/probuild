@@ -336,10 +336,11 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const savedRate = initialEstimate.taxRatePercent != null ? Number(initialEstimate.taxRatePercent) : null;
     const savedName = initialEstimate.taxRateName || null;
     const effectiveRate = savedRate ?? (defaultTax ? defaultTax.rate : 8.8);
+    const effectiveRateDisplay = Number(parseFloat(String(effectiveRate)).toFixed(4));
     const effectiveName = savedName ?? (defaultTax ? defaultTax.name : "Tax");
     const taxRate = taxExempt ? 0 : effectiveRate / 100;
-    const taxLabel = taxExempt ? null : `${effectiveName} (${effectiveRate}%)`;
-    const tax = subtotal * taxRate;
+    const taxLabel = taxExempt ? null : `${effectiveName} (${effectiveRateDisplay}%)`;
+    const tax = Math.round(subtotal * taxRate * 100) / 100;
     const total = subtotal + tax;
     // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update
     const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");

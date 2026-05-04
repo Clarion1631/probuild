@@ -2056,6 +2056,9 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         ...(data.targetMarginPercent !== undefined && {
             targetMarginPercent: Math.max(0, Math.min(70, parseFloat(data.targetMarginPercent) || 25)),
         }),
+        ...(data.taxExempt !== undefined && { taxExempt: !!data.taxExempt }),
+        ...(data.taxRateName !== undefined && { taxRateName: data.taxRateName }),
+        ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
     };
     try {
         await prisma.estimate.update({
@@ -2067,9 +2070,6 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                 ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
                 ...(data.memo !== undefined && { memo: data.memo }),
                 ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
-                ...(data.taxExempt !== undefined && { taxExempt: !!data.taxExempt }),
-                ...(data.taxRateName !== undefined && { taxRateName: data.taxRateName }),
-                ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
             },
         });
     } catch {
@@ -2257,7 +2257,9 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     if (!project) throw new Error("Project not found");
 
     const total = toNum(estimate.totalAmount || 0);
-    const rate = await getDefaultSalesTaxRate();
+    const rate = estimate.taxRatePercent != null
+        ? Number(estimate.taxRatePercent)
+        : await getDefaultSalesTaxRate();
     const tax = deriveInvoiceTaxFields(total, rate, !!estimate.taxExempt);
 
     const invoice = await prisma.invoice.create({
@@ -3073,6 +3075,9 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
             totalAmount: original.totalAmount,
             balanceDue: original.totalAmount,
             privacy: original.privacy,
+            taxExempt: original.taxExempt,
+            taxRateName: original.taxRateName,
+            taxRatePercent: original.taxRatePercent,
         },
     });
 
