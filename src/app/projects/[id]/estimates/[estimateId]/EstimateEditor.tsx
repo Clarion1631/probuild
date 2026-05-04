@@ -1054,7 +1054,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             newSchedules[index].amount = String(rm(total * (pct / 100)));
         } else if (field === "amount") {
             newSchedules[index].amount = value;
-            if (total > 0) {
+            if (total > 0 && value !== "") {
                 newSchedules[index].percentage = String(rm(((parseFloat(value) || 0) / total) * 100));
             } else {
                 newSchedules[index].percentage = "";
