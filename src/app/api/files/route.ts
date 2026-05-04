@@ -4,7 +4,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { hasPermission } from "@/lib/permissions";
-import { userCanAccessProject } from "@/lib/mobile-auth";
+import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
 
 export const maxDuration = 60;
 
@@ -17,41 +17,6 @@ type FileWithFolder = {
 
 function effectiveVisibility(file: FileWithFolder): string {
     return file.visibility ?? file.folder?.visibility ?? "team";
-}
-
-// Authorize the caller against either a project (via ProjectAccess/crew/admin)
-// or a lead (admin or assigned manager). Returns the user record on success
-// or a NextResponse on failure.
-async function authorizeFileScope(
-    email: string,
-    scope: { projectId?: string | null; leadId?: string | null }
-): Promise<{ user: any } | NextResponse> {
-    const user = await prisma.user.findUnique({
-        where: { email },
-        include: { permissions: true },
-    });
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-
-    if (scope.projectId) {
-        const ok = await userCanAccessProject(user, scope.projectId);
-        if (!ok) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-    }
-    if (scope.leadId) {
-        if (user.role !== "ADMIN") {
-            const lead = await prisma.lead.findFirst({
-                where: { id: scope.leadId, managerId: user.id },
-                select: { id: true },
-            });
-            if (!lead && user.role !== "MANAGER") {
-                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-            }
-            // MANAGERs without lead assignment also blocked, mirroring register's stricter rule
-            if (!lead && user.role === "MANAGER") {
-                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-            }
-        }
-    }
-    return { user };
 }
 
 // GET: list files and folders for a project or lead
@@ -77,6 +42,10 @@ export async function GET(req: NextRequest) {
         const { user: callerUser } = authResult;
 
         const canSeeFinancial = hasPermission(callerUser, "financialReports");
+
+        if (!canSeeFinancial && folderId && await isAncestorFinancial(folderId)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
 
         const where: any = {};
         if (projectId) where.projectId = projectId;
@@ -163,6 +132,10 @@ export async function POST(req: NextRequest) {
 
         if (visibility === "financial" && !hasPermission(user, "financialReports")) {
             return NextResponse.json({ error: "No permission to create financial files" }, { status: 403 });
+        }
+
+        if (!hasPermission(user, "financialReports") && folderId && await isAncestorFinancial(folderId)) {
+            return NextResponse.json({ error: "No permission to upload into financial folders" }, { status: 403 });
         }
 
         if (!files || files.length === 0) {
@@ -266,17 +239,21 @@ export async function PATCH(req: NextRequest) {
         if (authResult instanceof NextResponse) return authResult;
         const { user } = authResult;
 
-        // Read protection: a financial file (by effective visibility) requires the
-        // permission to mutate at all. Otherwise an unprivileged caller could downgrade
-        // it to "shared" or "team" and bypass the gate.
+        const canFinancial = hasPermission(user, "financialReports");
+
         const currentEff = effectiveVisibility(existing);
-        if (currentEff === "financial" && !hasPermission(user, "financialReports")) {
+        if (currentEff === "financial" && !canFinancial) {
+            return NextResponse.json({ error: "No permission to modify financial files" }, { status: 403 });
+        }
+        if (!canFinancial && existing.folderId && await isAncestorFinancial(existing.folderId)) {
             return NextResponse.json({ error: "No permission to modify financial files" }, { status: 403 });
         }
 
-        // Setting financial requires the permission too.
-        if (visibility === "financial" && !hasPermission(user, "financialReports")) {
+        if (visibility === "financial" && !canFinancial) {
             return NextResponse.json({ error: "No permission to set financial visibility" }, { status: 403 });
+        }
+        if (!canFinancial && folderId && await isAncestorFinancial(folderId)) {
+            return NextResponse.json({ error: "No permission to move files into financial folders" }, { status: 403 });
         }
 
         const updateData: any = {};
@@ -331,9 +308,11 @@ export async function DELETE(req: NextRequest) {
             if (authResult instanceof NextResponse) return authResult;
             const { user } = authResult;
 
-            // Financial files require the permission to delete (same protection as PATCH).
             const currentEff = effectiveVisibility(file);
             if (currentEff === "financial" && !hasPermission(user, "financialReports")) {
+                return NextResponse.json({ error: "No permission to delete financial files" }, { status: 403 });
+            }
+            if (!hasPermission(user, "financialReports") && file.folderId && await isAncestorFinancial(file.folderId)) {
                 return NextResponse.json({ error: "No permission to delete financial files" }, { status: 403 });
             }
 
@@ -368,6 +347,9 @@ export async function DELETE(req: NextRequest) {
             const { user } = authResult;
 
             if (folder.visibility === "financial" && !hasPermission(user, "financialReports")) {
+                return NextResponse.json({ error: "No permission to delete financial folders" }, { status: 403 });
+            }
+            if (!hasPermission(user, "financialReports") && folder.id && await isAncestorFinancial(folder.id)) {
                 return NextResponse.json({ error: "No permission to delete financial folders" }, { status: 403 });
             }
 

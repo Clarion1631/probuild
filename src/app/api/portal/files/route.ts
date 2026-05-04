@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { isAncestorChainShared } from "@/lib/file-auth";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
@@ -38,16 +39,9 @@ export async function GET(req: NextRequest) {
             }
         }
 
-        // If we're inside a folder, that folder MUST itself be "shared" — otherwise we
-        // refuse to list anything from it. This is the only way to enforce inheritance
-        // safely: a null-visibility file in a "team" folder must not leak out, even
-        // though the file query alone can't distinguish them.
         if (folderId) {
-            const parentFolder = await prisma.fileFolder.findFirst({
-                where: { id: folderId, projectId, visibility: "shared" },
-                select: { id: true },
-            });
-            if (!parentFolder) {
+            const allShared = await isAncestorChainShared(folderId, projectId);
+            if (!allShared) {
                 return NextResponse.json({ error: "Not found" }, { status: 404 });
             }
         }

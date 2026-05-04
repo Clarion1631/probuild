@@ -3,35 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { hasPermission } from "@/lib/permissions";
-import { userCanAccessProject } from "@/lib/mobile-auth";
-
-// Mirror of authorizeFileScope from /api/files/route.ts. Kept inline here so the
-// folders route is self-contained and can't drift out of sync silently.
-async function authorize(
-    email: string,
-    scope: { projectId?: string | null; leadId?: string | null }
-): Promise<{ user: any } | NextResponse> {
-    const user = await prisma.user.findUnique({
-        where: { email },
-        include: { permissions: true },
-    });
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-
-    if (scope.projectId) {
-        const ok = await userCanAccessProject(user, scope.projectId);
-        if (!ok) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-    }
-    if (scope.leadId) {
-        if (user.role !== "ADMIN") {
-            const lead = await prisma.lead.findFirst({
-                where: { id: scope.leadId, managerId: user.id },
-                select: { id: true },
-            });
-            if (!lead) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-        }
-    }
-    return { user };
-}
+import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
 
 // GET: list all folders for a project or lead
 export async function GET(req: NextRequest) {
@@ -48,7 +20,7 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
     }
 
-    const authResult = await authorize(session.user.email, { projectId, leadId });
+    const authResult = await authorizeFileScope(session.user.email, { projectId, leadId });
     if (authResult instanceof NextResponse) return authResult;
     const { user } = authResult;
     const canSeeFinancial = hasPermission(user, "financialReports");
@@ -85,12 +57,15 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "projectId or leadId required" }, { status: 400 });
     }
 
-    const authResult = await authorize(session.user.email, { projectId, leadId });
+    const authResult = await authorizeFileScope(session.user.email, { projectId, leadId });
     if (authResult instanceof NextResponse) return authResult;
     const { user } = authResult;
 
     if (visibility === "financial" && !hasPermission(user, "financialReports")) {
         return NextResponse.json({ error: "No permission to create financial folders" }, { status: 403 });
+    }
+    if (!hasPermission(user, "financialReports") && parentId && await isAncestorFinancial(parentId)) {
+        return NextResponse.json({ error: "No permission to create folders under financial folders" }, { status: 403 });
     }
 
     const folder = await prisma.fileFolder.create({
@@ -132,17 +107,17 @@ export async function PATCH(req: NextRequest) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
-    const authResult = await authorize(session.user.email, {
+    const authResult = await authorizeFileScope(session.user.email, {
         projectId: existing.projectId,
         leadId: existing.leadId,
     });
     if (authResult instanceof NextResponse) return authResult;
     const { user } = authResult;
 
-    // Modifying a financial folder requires the permission, regardless of target value.
-    // Otherwise a non-financial user could downgrade a folder to "team" and silently
-    // expose its inheriting children.
     if (existing.visibility === "financial" && !hasPermission(user, "financialReports")) {
+        return NextResponse.json({ error: "No permission to modify financial folders" }, { status: 403 });
+    }
+    if (!hasPermission(user, "financialReports") && id && await isAncestorFinancial(id)) {
         return NextResponse.json({ error: "No permission to modify financial folders" }, { status: 403 });
     }
     if (visibility === "financial" && !hasPermission(user, "financialReports")) {
