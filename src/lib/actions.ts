@@ -2610,10 +2610,15 @@ export async function recordEstimatePayment(
             newBalance <= 0 ? "Paid"
             : totalPaid > 0 ? "Partially Paid"
             : estimate.status;
+        const isFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
 
         await t.estimate.update({
             where: { id: estimateId },
-            data: { balanceDue: newBalance, status: newStatus },
+            data: {
+                balanceDue: newBalance,
+                status: newStatus,
+                ...(isFirstPayment && { statusBeforePayment: estimate.status }),
+            },
         });
 
         return { success: true as const, projectId: estimate.projectId, leadId: estimate.leadId };
@@ -2702,16 +2707,18 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
             .filter((s) => s.status === "Paid")
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
-        const wasPaymentStatus = ["Paid", "Partially Paid"].includes(estimate.status);
         const newStatus =
-            newBalance <= 0 ? "Paid"
-            : totalPaid > 0 ? "Partially Paid"
-            : wasPaymentStatus ? "Approved"
-            : estimate.status;
+            totalPaid === 0 ? estimate.statusBeforePayment ?? "Approved"
+            : newBalance <= 0 ? "Paid"
+            : "Partially Paid";
 
         await tx.estimate.update({
             where: { id: estimateId },
-            data: { balanceDue: newBalance, status: newStatus },
+            data: {
+                balanceDue: newBalance,
+                status: newStatus,
+                ...(totalPaid === 0 && { statusBeforePayment: null }),
+            },
         });
 
         return { projectId: estimate.projectId, leadId: estimate.leadId };
