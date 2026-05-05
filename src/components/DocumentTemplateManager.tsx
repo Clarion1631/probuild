@@ -1,10 +1,12 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { getDocumentTemplates, createDocumentTemplate, updateDocumentTemplate, deleteDocumentTemplate, getCompanySettings } from "@/lib/actions";
 import { toast } from "sonner";
 import DOMPurify from "dompurify";
-import { MERGE_FIELD_CATEGORIES, CATEGORY_COLORS } from "@/lib/merge-fields";
+import { MERGE_FIELD_CATEGORIES } from "@/lib/merge-fields";
+import { MergeFieldEditor, htmlToEditorContent, editorContentToHtml } from "./MergeFieldEditor";
+import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 
 type Template = {
     id: string;
@@ -25,8 +27,8 @@ type CompanySettings = {
 };
 
 type Props = {
-    allowedType?: string;      // e.g. "terms" — locks type, hides selector
-    showTypeSelector?: boolean; // default true
+    allowedType?: string;
+    showTypeSelector?: boolean;
     title: string;
     description: string;
 };
@@ -88,9 +90,6 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
     const [editingTemplate, setEditingTemplate] = useState<Template | null>(null);
     const [company, setCompany] = useState<CompanySettings>({ companyName: "Your Company" });
     const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
-    const [openDropdown, setOpenDropdown] = useState<string | null>(null);
-    const textareaRef = useRef<HTMLTextAreaElement>(null);
-    const mergeToolbarRef = useRef<HTMLDivElement>(null);
 
     const [form, setForm] = useState({ name: "", type: defaultType, body: "", isDefault: false });
 
@@ -98,17 +97,6 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
         loadTemplates();
         loadCompany();
     }, []);
-
-    useEffect(() => {
-        if (!openDropdown) return;
-        const handler = (e: MouseEvent) => {
-            if (mergeToolbarRef.current && !mergeToolbarRef.current.contains(e.target as globalThis.Node)) {
-                setOpenDropdown(null);
-            }
-        };
-        document.addEventListener("mousedown", handler);
-        return () => document.removeEventListener("mousedown", handler);
-    }, [openDropdown]);
 
     async function loadTemplates() {
         setLoading(true);
@@ -141,64 +129,14 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
     }
 
     function openEdit(t: Template) {
+        // Warn if the template has inline styles/attributes that Tiptap will normalize on save
+        if (t.body && /style\s*=\s*"/i.test(t.body)) {
+            toast.info("This template has custom formatting that will be standardized by the editor. Review before saving.", { duration: 6000 });
+        }
         setEditingTemplate(t);
         setForm({ name: t.name, type: t.type, body: t.body, isDefault: t.isDefault });
         setShowEditor(true);
         setActiveTab("edit");
-    }
-
-    function insertMergeField(key: string) {
-        setOpenDropdown(null);
-        const ta = textareaRef.current;
-        if (!ta) {
-            setForm(prev => ({ ...prev, body: prev.body + `{{${key}}}` }));
-            return;
-        }
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const text = form.body;
-        const before = text.substring(0, start);
-        const after = text.substring(end);
-        const newBody = before + `{{${key}}}` + after;
-        setForm(prev => ({ ...prev, body: newBody }));
-        setTimeout(() => {
-            ta.focus();
-            const pos = start + `{{${key}}}`.length;
-            ta.setSelectionRange(pos, pos);
-        }, 0);
-    }
-
-    function insertHtmlTag(tag: string, wrap?: string) {
-        const ta = textareaRef.current;
-        if (!ta) return;
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const selected = form.body.substring(start, end);
-        const text = form.body;
-        const openTag = `<${tag}>`;
-        const closeTag = `</${tag}>`;
-        const beforeSelection = text.substring(0, start);
-        const afterSelection = text.substring(end);
-
-        if (beforeSelection.endsWith(openTag) && afterSelection.startsWith(closeTag)) {
-            const newBody = text.substring(0, start - openTag.length) + selected + text.substring(end + closeTag.length);
-            setForm(prev => ({ ...prev, body: newBody }));
-            setTimeout(() => {
-                ta.focus();
-                ta.setSelectionRange(start - openTag.length, end - openTag.length);
-            }, 0);
-            return;
-        }
-
-        let insert: string;
-        if (wrap) {
-            insert = `${openTag}${selected || wrap}${closeTag}`;
-        } else {
-            insert = `${openTag}`;
-        }
-        const newBody = text.substring(0, start) + insert + text.substring(end);
-        setForm(prev => ({ ...prev, body: newBody }));
-        setTimeout(() => { ta.focus(); }, 0);
     }
 
     async function handleSave() {
@@ -295,86 +233,26 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                     </div>
                 </header>
 
-                {/* Merge Field Toolbar */}
-                <div ref={mergeToolbarRef} className="bg-slate-50 border-b border-hui-border px-6 py-2.5 shrink-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider shrink-0">Insert Field:</span>
-                        {templateMergeFields.map(cat => {
-                            const colors = CATEGORY_COLORS[cat.color] || CATEGORY_COLORS.blue;
-                            return (
-                                <div key={cat.category} className="relative">
-                                    <button
-                                        type="button"
-                                        onClick={() => setOpenDropdown(openDropdown === cat.category ? null : cat.category)}
-                                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 transition"
-                                    >
-                                        <span>{cat.icon}</span>
-                                        <span>{cat.category}</span>
-                                        <svg className="w-3 h-3 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                                        </svg>
-                                    </button>
-                                    {openDropdown === cat.category && (
-                                        <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-20 min-w-[200px]">
-                                            {cat.fields.map(f => (
-                                                <button
-                                                    key={f.key}
-                                                    type="button"
-                                                    onClick={() => insertMergeField(f.key)}
-                                                    className="w-full text-left px-3 py-2 text-xs hover:bg-slate-50 flex items-center justify-between gap-4 first:rounded-t-lg last:rounded-b-lg"
-                                                >
-                                                    <span className="font-medium text-slate-700">{f.label}</span>
-                                                    <span className="text-slate-400 text-[10px] truncate max-w-[100px]">&ldquo;{f.example}&rdquo;</span>
-                                                </button>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                            );
-                        })}
-                    </div>
-                </div>
-
-                {/* HTML Format Toolbar */}
-                <div className="bg-white border-b border-hui-border px-6 py-2 shrink-0 flex items-center gap-1">
-                    <span className="text-xs font-semibold text-hui-textMuted mr-2">Format:</span>
-                    <button onClick={() => insertHtmlTag("h2", "Heading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition" title="Heading 2">H2</button>
-                    <button onClick={() => insertHtmlTag("h3", "Subheading")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-semibold transition" title="Heading 3">H3</button>
-                    <button onClick={() => insertHtmlTag("strong", "bold text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 font-bold transition" title="Bold"><b>B</b></button>
-                    <button onClick={() => insertHtmlTag("em", "italic text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 italic transition" title="Italic"><em>I</em></button>
-                    <button onClick={() => insertHtmlTag("p", "Paragraph text")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition" title="Paragraph">¶</button>
-                    <button onClick={() => insertHtmlTag("ul")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition" title="Unordered List">• List</button>
-                    <button onClick={() => insertHtmlTag("li", "List item")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition" title="List Item">— Item</button>
-                    <div className="w-px h-5 bg-slate-200 mx-1"></div>
-                    <button onClick={() => insertHtmlTag("hr")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition" title="Horizontal Rule">― Line</button>
-                    <button onClick={() => insertHtmlTag("br")} className="px-2 py-1 text-xs rounded hover:bg-slate-100 transition" title="Line Break">↵ Break</button>
-                </div>
-
                 {/* Split Pane */}
                 <div className="flex-1 flex flex-col overflow-hidden">
                     {/* Mobile Tab Switcher */}
                     <div className="lg:hidden flex border-b border-hui-border shrink-0">
                         <button onClick={() => setActiveTab("edit")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "edit" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-hui-textMuted"}`}>
-                            ✏️ Editor
+                            Editor
                         </button>
                         <button onClick={() => setActiveTab("preview")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "preview" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-hui-textMuted"}`}>
-                            👁️ Preview
+                            Preview
                         </button>
                     </div>
 
                     <div className="flex-1 flex overflow-hidden">
-                        {/* Editor Pane */}
+                        {/* WYSIWYG Editor Pane */}
                         <div className={`flex-1 flex flex-col border-r border-hui-border ${activeTab === "preview" ? "hidden lg:flex" : ""}`}>
-                            <div className="px-4 py-2 bg-slate-50 text-xs font-semibold text-hui-textMuted uppercase tracking-wider border-b border-hui-border shrink-0">
-                                HTML Source
-                            </div>
-                            <textarea
-                                ref={textareaRef}
-                                className="flex-1 w-full p-4 font-mono text-sm text-slate-800 bg-white resize-none outline-none border-none leading-relaxed"
-                                placeholder="Start typing your template content here...&#10;&#10;Use the merge field buttons above to insert dynamic values like {{client_name}}.&#10;Use the format buttons to add HTML structure."
+                            <MergeFieldEditor
                                 value={form.body}
-                                onChange={e => setForm({ ...form, body: e.target.value })}
-                                spellCheck={false}
+                                onChange={(html) => setForm(prev => ({ ...prev, body: html }))}
+                                mergeFieldCategories={templateMergeFields}
+                                signingSection={false}
                             />
                         </div>
 
@@ -404,7 +282,7 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                                     <div className="p-8">
                                         {form.body ? (
                                             <div
-                                                className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-headings:font-semibold prose-p:text-slate-600 prose-p:leading-relaxed prose-strong:text-slate-800 prose-li:text-slate-600"
+                                                className={CONTRACT_PROSE_CLASSES}
                                                 dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(resolvePreview(form.body, company)) }}
                                             />
                                         ) : (
@@ -496,7 +374,7 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                                         <p className="text-sm text-hui-textMuted line-clamp-2">{t.body.replace(/<[^>]*>/g, '').slice(0, 150)}...</p>
                                         <p className="text-xs text-hui-textMuted mt-2">Last updated: {new Date(t.updatedAt).toLocaleDateString()}</p>
                                     </div>
-                                    <div className="flex items-center gap-2 shrink-0 opacity-0 group-hover:opacity-100 transition">
+                                    <div className="flex items-center gap-2 shrink-0 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition">
                                         <button onClick={() => handleSetDefault(t)} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${t.isDefault ? "bg-green-100 text-green-700 hover:bg-green-200" : "bg-slate-100 text-slate-600 hover:bg-slate-200"}`}>
                                             {t.isDefault ? "Remove Default" : "Set Default"}
                                         </button>

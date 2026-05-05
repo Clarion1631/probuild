@@ -7,6 +7,7 @@ import DocumentSignModal from "@/components/DocumentSignModal";
 import { toast } from "sonner";
 import { toJpeg } from "html-to-image";
 import { jsPDF } from "jspdf";
+import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 
 export default function PortalContractClient({
     initialContract,
@@ -550,7 +551,7 @@ export default function PortalContractClient({
                         `}} />
                         <div
                             ref={contractBodyRef}
-                            className="prose prose-sm max-w-none text-slate-700 prose-headings:text-slate-800 prose-headings:font-semibold prose-h2:text-lg prose-h3:text-base prose-p:leading-relaxed prose-p:text-sm prose-strong:text-slate-800 prose-li:text-sm"
+                            className={CONTRACT_PROSE_CLASSES}
                             dangerouslySetInnerHTML={{ __html: parsedBody }}
                         />
                     </div>
