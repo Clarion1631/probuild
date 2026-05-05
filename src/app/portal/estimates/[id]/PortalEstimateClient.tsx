@@ -8,6 +8,8 @@ import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalPayInFullButton from "@/components/PortalPayInFullButton";
 import { formatCurrency } from "@/lib/utils";
+import DocumentLetterhead from "@/components/DocumentLetterhead";
+import { buildLetterheadConfig } from "@/lib/letterhead";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -448,20 +450,9 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-lg shadow-sm overflow-hidden print:shadow-none print:rounded-none">
 
                     {/* Document Header */}
-                    <div className="px-10 pt-10 pb-8 border-b border-slate-200">
-                        <div className="flex justify-between items-start">
-                            <div>
-                                {companySettings?.logoUrl ? (
-                                    <img src={companySettings.logoUrl} alt={companyName} className="h-14 w-auto object-contain mb-3" />
-                                ) : (
-                                    <img src="/logo.png" alt={companyName} className="h-14 w-auto object-contain mb-3" />
-                                )}
-                                <h2 className="text-lg font-bold text-slate-800">{companyName}</h2>
-                                {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
-                                {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
-                                {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
-                                {companyLicense && <p className="text-sm text-slate-500">Lic# {companyLicense}</p>}
-                            </div>
+                    <DocumentLetterhead
+                        config={buildLetterheadConfig(companySettings)}
+                        rightContent={
                             <div className="text-right">
                                 <h1 className="text-2xl font-bold text-slate-800 tracking-tight">ESTIMATE</h1>
                                 <div className="mt-2 space-y-1 text-sm">
@@ -481,28 +472,28 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                     )}
                                 </div>
                             </div>
-                        </div>
+                        }
+                    />
 
-                        {/* Bill To */}
-                        <div className="mt-8 pt-6 border-t border-slate-100">
-                            <div className="grid grid-cols-3 gap-8">
-                                <div>
-                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Prepared For</p>
-                                    <p className="text-sm font-semibold text-slate-800">{initialEstimate.clientName || "Client"}</p>
-                                    {initialEstimate.clientEmail && <p className="text-sm text-slate-500">{initialEstimate.clientEmail}</p>}
-                                </div>
-                                <div>
-                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
-                                    <p className="text-sm font-semibold text-slate-800">{initialEstimate.title || "Project"}</p>
-                                    <p className="text-sm text-slate-500">{initialEstimate.projectName || initialEstimate.leadName || ""}</p>
-                                </div>
-                                {initialEstimate.jobsiteAddress && (
-                                    <div>
-                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Jobsite Address</p>
-                                        <p className="text-sm text-slate-700">{initialEstimate.jobsiteAddress}</p>
-                                    </div>
-                                )}
+                    {/* Bill To */}
+                    <div className="px-10 pt-6 pb-0">
+                        <div className="grid grid-cols-3 gap-8">
+                            <div>
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Prepared For</p>
+                                <p className="text-sm font-semibold text-slate-800">{initialEstimate.clientName || "Client"}</p>
+                                {initialEstimate.clientEmail && <p className="text-sm text-slate-500">{initialEstimate.clientEmail}</p>}
                             </div>
+                            <div>
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
+                                <p className="text-sm font-semibold text-slate-800">{initialEstimate.title || "Project"}</p>
+                                <p className="text-sm text-slate-500">{initialEstimate.projectName || initialEstimate.leadName || ""}</p>
+                            </div>
+                            {initialEstimate.jobsiteAddress && (
+                                <div>
+                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Jobsite Address</p>
+                                    <p className="text-sm text-slate-700">{initialEstimate.jobsiteAddress}</p>
+                                </div>
+                            )}
                         </div>
                     </div>
 

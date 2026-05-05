@@ -1,6 +1,7 @@
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, PDFPage, PDFFont, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
 import { toNum } from './prisma-helpers';
+import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 
 // Color helpers
 const colors = {
@@ -12,8 +13,101 @@ const colors = {
     white: rgb(1, 1, 1),
 };
 
+function hexToRgb(hex: string) {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.substring(0, 2), 16) / 255;
+    const g = parseInt(h.substring(2, 4), 16) / 255;
+    const b = parseInt(h.substring(4, 6), 16) / 255;
+    return rgb(r, g, b);
+}
+
 function formatCurrency(amount: number): string {
     return `$${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function drawLetterhead(
+    doc: PDFDocument,
+    page: PDFPage,
+    config: LetterheadConfig,
+    opts: { pageWidth: number; pageHeight: number; margin: number },
+    fonts: { regular: PDFFont; bold: PDFFont },
+): Promise<number> {
+    const { pageWidth, pageHeight, margin } = opts;
+    let y: number;
+
+    if (config.mode === 'custom_image' && config.customImageUrl) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            let res: Response;
+            try {
+                res = await fetch(config.customImageUrl, { signal: controller.signal });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+            const buf = new Uint8Array(await res.arrayBuffer());
+            const contentType = res.headers.get('content-type') || '';
+            const img = contentType.includes('png')
+                ? await doc.embedPng(buf)
+                : await doc.embedJpg(buf);
+            const scale = pageWidth / img.width;
+            const imgHeight = Math.min(img.height * scale, 150);
+            page.drawImage(img, { x: 0, y: pageHeight - imgHeight, width: pageWidth, height: imgHeight });
+            y = pageHeight - imgHeight - 20;
+        } catch {
+            // Fall back to built-in if image fetch fails
+            return drawBuiltInHeader(page, config, opts, fonts);
+        }
+        return y;
+    }
+
+    return drawBuiltInHeader(page, config, opts, fonts);
+}
+
+function drawBuiltInHeader(
+    page: PDFPage,
+    config: LetterheadConfig,
+    opts: { pageWidth: number; pageHeight: number; margin: number },
+    fonts: { regular: PDFFont; bold: PDFFont },
+): number {
+    const { pageWidth, pageHeight, margin } = opts;
+    let y: number;
+
+    if (config.showDivider) {
+        const barColor = hexToRgb(config.accentColor);
+        page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: barColor });
+    }
+    y = pageHeight - 40;
+
+    const fieldValues: string[] = [];
+    for (const f of config.fields) {
+        let v: string | null = null;
+        switch (f) {
+            case 'name': v = config.companyName; break;
+            case 'address': v = config.address; break;
+            case 'phone': v = config.phone; break;
+            case 'email': v = config.email; break;
+            case 'license': v = config.licenseNumber ? `Lic# ${config.licenseNumber}` : null; break;
+            case 'website': v = config.website; break;
+        }
+        if (v) fieldValues.push(v);
+    }
+
+    for (let i = 0; i < fieldValues.length; i++) {
+        if (i === 0) {
+            page.drawText(fieldValues[i].toUpperCase(), {
+                x: margin, y, size: 11, font: fonts.regular, color: colors.textMuted,
+            });
+        } else {
+            page.drawText(fieldValues[i], {
+                x: margin, y, size: 9, font: fonts.regular, color: colors.textMuted,
+            });
+        }
+        y -= 14;
+    }
+
+    y -= 6;
+    return y;
 }
 
 export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
@@ -54,22 +148,11 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         }
     }
 
-    // --- Header accent bar ---
-    page.drawRectangle({
-        x: 0, y: pageHeight - 6, width: pageWidth, height: 6,
-        color: colors.primary,
-    });
-    y = pageHeight - 40;
-
-    // --- Company Name ---
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), {
-            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
-        });
-    }
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
     // --- Title ---
-    y -= 30;
     page.drawText(estimate.title || 'Estimate', {
         x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
     });
@@ -400,22 +483,11 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         }
     }
 
-    // --- Header accent bar ---
-    page.drawRectangle({
-        x: 0, y: pageHeight - 6, width: pageWidth, height: 6,
-        color: colors.primary, // Using primary color for header bar
-    });
-    y -= 34;
-
-    // --- Company Name ---
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), {
-            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
-        });
-    }
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
     // --- Title ---
-    y -= 30;
     page.drawText('PURCHASE ORDER', {
         x: margin, y, size: 22, font: helveticaBold, color: colors.textMain,
     });
@@ -626,14 +698,10 @@ export async function generateInvoicePdf(invoiceId: string): Promise<Buffer> {
         }
     }
 
-    page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: colors.primary });
-    y = pageHeight - 40;
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
-    }
-
-    y -= 30;
     page.drawText('INVOICE', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
 
     y -= 30;
@@ -774,14 +842,10 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         }
     }
 
-    page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: colors.primary });
-    y = pageHeight - 40;
+    // --- Letterhead ---
+    const coLhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
-    }
-
-    y -= 30;
     page.drawText('CHANGE ORDER', { x: margin, y, size: 22, font: helveticaBold, color: colors.textMain });
 
     y -= 22;

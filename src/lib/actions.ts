@@ -2,7 +2,7 @@
 
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
-import { revalidatePath, unstable_cache } from "next/cache";
+import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
 import { authOptions } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum } from "./prisma-helpers";
@@ -2982,7 +2982,7 @@ export const getCompanySettings = unstable_cache(
         return JSON.parse(JSON.stringify(settings));
     },
     ["company-settings"],
-    { revalidate: 300 }
+    { revalidate: 300, tags: ["company-settings"] }
 );
 
 export async function saveCompanySettings(data: any) {
@@ -3012,13 +3012,20 @@ export async function saveCompanySettings(data: any) {
             workdayEnd: data.workdayEnd,
             salesTaxes: data.salesTaxes,
             ...(data.notificationToggles !== undefined ? { notificationToggles: data.notificationToggles } : {}),
+            ...(data.letterheadMode !== undefined ? { letterheadMode: data.letterheadMode } : {}),
+            ...(data.letterheadImageUrl !== undefined ? { letterheadImageUrl: data.letterheadImageUrl } : {}),
+            ...(data.letterheadLogoPosition !== undefined ? { letterheadLogoPosition: data.letterheadLogoPosition } : {}),
+            ...(data.letterheadFields !== undefined ? { letterheadFields: data.letterheadFields } : {}),
+            ...(data.letterheadAccentColor !== undefined ? { letterheadAccentColor: data.letterheadAccentColor } : {}),
+            ...(data.letterheadDivider !== undefined ? { letterheadDivider: data.letterheadDivider } : {}),
         },
     });
 
+    revalidateTag("company-settings", "max");
     revalidatePath("/settings/notifications");
     revalidatePath("/settings/company");
+    revalidatePath("/settings/letterhead");
     revalidatePath("/portal");
-    revalidatePath("/"); // bust company-settings cache
     return { success: true };
 }
 

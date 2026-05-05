@@ -644,6 +644,14 @@ model CompanySettings {
   // Sales taxes
   salesTaxes String? // JSON array: [{name, rate, isDefault}]
 
+  // Letterhead
+  letterheadMode         String?  @default("built_in") // 'built_in' | 'custom_image'
+  letterheadImageUrl     String?
+  letterheadLogoPosition String?  @default("left") // 'left' | 'center' | 'right'
+  letterheadFields       String?  @default("[\"name\",\"address\",\"phone\",\"email\",\"license\"]")
+  letterheadAccentColor  String?  @default("#4F46E5")
+  letterheadDivider      Boolean  @default(true)
+
   // Notification event toggles
   notificationToggles String? // JSON: {newLead, estimateViewed, estimateSigned, contractSigned, invoiceViewed, paymentReceived, messageReceived}
 

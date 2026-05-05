@@ -29,6 +29,7 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
                         <p className="text-[10px] font-semibold uppercase tracking-widest text-hui-textMuted mb-1.5 px-3">Account</p>
                         <ul className="space-y-0.5">
                             {navLink("/settings/company", "Company Info")}
+                            {navLink("/settings/letterhead", "Letterhead")}
                             {navLink("/settings/privacy", "Privacy & Security")}
                             {navLink("/settings/language", "Language")}
                         </ul>

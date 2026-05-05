@@ -8,6 +8,8 @@ import { toast } from "sonner";
 import { toJpeg } from "html-to-image";
 import { jsPDF } from "jspdf";
 import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
+import DocumentLetterhead from "@/components/DocumentLetterhead";
+import { buildLetterheadConfig } from "@/lib/letterhead";
 
 export default function PortalContractClient({
     initialContract,
@@ -385,20 +387,9 @@ export default function PortalContractClient({
                 <div id="contract-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
-                    <div className="px-10 pt-10 pb-8 border-b border-slate-200">
-                        <div className="flex justify-between items-start">
-                            <div>
-                                {companySettings?.logoUrl ? (
-                                    <img src={companySettings.logoUrl} alt={companyName} className="h-14 w-auto object-contain mb-3" />
-                                ) : (
-                                    <img src="/logo.png" alt={companyName} className="h-14 w-auto object-contain mb-3" />
-                                )}
-                                <h2 className="text-lg font-bold text-slate-800">{companyName}</h2>
-                                {companyLicense && <p className="text-sm text-slate-500">Lic# {companyLicense}</p>}
-                                {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
-                                {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
-                                {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
-                            </div>
+                    <DocumentLetterhead
+                        config={buildLetterheadConfig(companySettings)}
+                        rightContent={
                             <div className="text-right">
                                 <h1 className="text-2xl font-bold text-slate-800 tracking-tight">DOCUMENT</h1>
                                 <div className="mt-2 space-y-1 text-sm">
@@ -417,8 +408,8 @@ export default function PortalContractClient({
                                     )}
                                 </div>
                             </div>
-                        </div>
-                    </div>
+                        }
+                    />
 
                     {/* Signed Badge */}
                     {isSigned && initialContract.approvedBy && (
