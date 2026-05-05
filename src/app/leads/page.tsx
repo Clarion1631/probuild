@@ -314,60 +314,60 @@ export default function LeadsPage() {
                 </div>
             </div>
 
-            {/* Tabs + Search */}
-            <div className="flex items-end justify-between border-b border-hui-border mb-4">
-                <div className="flex gap-0 overflow-x-auto scrollbar-none" style={{ scrollbarWidth: "none" }}>
-                    {(["All", "New", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
-                        <TabButton
-                            key={tab}
-                            active={activeTab === tab}
-                            onClick={() => setActiveTab(tab)}
-                            count={tabCounts[tab]}
-                        >
-                            {tab}
-                        </TabButton>
-                    ))}
-                    <div className="w-px bg-slate-200 mx-1 my-2" />
-                    {(["Snoozed", "Archived"] as TabKey[]).map(tab => (
-                        <TabButton
-                            key={tab}
-                            active={activeTab === tab}
-                            onClick={() => setActiveTab(tab)}
-                            count={tabCounts[tab]}
-                        >
-                            {tab}
-                        </TabButton>
-                    ))}
-                </div>
-                <div className="flex items-center gap-2 pb-2">
-                    <input
-                        type="text"
-                        placeholder="Search leads..."
-                        value={searchTerm}
-                        onChange={e => setSearchTerm(e.target.value)}
-                        className="hui-input w-52"
-                    />
-                    {sources.length > 0 && (
-                        <select
-                            value={sourceFilter}
-                            onChange={e => setSourceFilter(e.target.value)}
-                            className="hui-input w-auto"
-                        >
-                            <option value="">All Sources</option>
-                            {sources.map(s => <option key={s} value={s}>{s}</option>)}
-                        </select>
-                    )}
-                    {types.length > 0 && (
-                        <select
-                            value={typeFilter}
-                            onChange={e => setTypeFilter(e.target.value)}
-                            className="hui-input w-auto"
-                        >
-                            <option value="">All Types</option>
-                            {types.map(t => <option key={t} value={t}>{t}</option>)}
-                        </select>
-                    )}
-                </div>
+            {/* Tabs */}
+            <div className="flex gap-0 overflow-x-auto scrollbar-none border-b border-hui-border" style={{ scrollbarWidth: "none" }}>
+                {(["All", "New", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
+                    <TabButton
+                        key={tab}
+                        active={activeTab === tab}
+                        onClick={() => setActiveTab(tab)}
+                        count={tabCounts[tab]}
+                    >
+                        {tab}
+                    </TabButton>
+                ))}
+                <div className="w-px bg-slate-200 mx-1 my-2" />
+                {(["Snoozed", "Archived"] as TabKey[]).map(tab => (
+                    <TabButton
+                        key={tab}
+                        active={activeTab === tab}
+                        onClick={() => setActiveTab(tab)}
+                        count={tabCounts[tab]}
+                    >
+                        {tab}
+                    </TabButton>
+                ))}
+            </div>
+
+            {/* Search + Filters */}
+            <div className="flex items-center gap-2 mt-3 mb-4">
+                <input
+                    type="text"
+                    placeholder="Search leads..."
+                    value={searchTerm}
+                    onChange={e => setSearchTerm(e.target.value)}
+                    className="hui-input w-52"
+                />
+                {sources.length > 0 && (
+                    <select
+                        value={sourceFilter}
+                        onChange={e => setSourceFilter(e.target.value)}
+                        className="hui-input w-auto"
+                    >
+                        <option value="">All Sources</option>
+                        {sources.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                )}
+                {types.length > 0 && (
+                    <select
+                        value={typeFilter}
+                        onChange={e => setTypeFilter(e.target.value)}
+                        className="hui-input w-auto"
+                    >
+                        <option value="">All Types</option>
+                        {types.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                )}
             </div>
 
             {/* Table */}
