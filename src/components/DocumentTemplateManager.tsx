@@ -1,12 +1,10 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { getDocumentTemplates, createDocumentTemplate, updateDocumentTemplate, deleteDocumentTemplate, getCompanySettings } from "@/lib/actions";
+import { getDocumentTemplates, createDocumentTemplate, updateDocumentTemplate, deleteDocumentTemplate } from "@/lib/actions";
 import { toast } from "sonner";
-import DOMPurify from "dompurify";
 import { MERGE_FIELD_CATEGORIES } from "@/lib/merge-fields";
-import { MergeFieldEditor, htmlToEditorContent, editorContentToHtml } from "./MergeFieldEditor";
-import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
+import { MergeFieldEditor } from "./MergeFieldEditor";
 
 type Template = {
     id: string;
@@ -15,15 +13,6 @@ type Template = {
     body: string;
     isDefault: boolean;
     updatedAt: Date;
-};
-
-type CompanySettings = {
-    companyName: string;
-    address?: string | null;
-    phone?: string | null;
-    email?: string | null;
-    website?: string | null;
-    logoUrl?: string | null;
 };
 
 type Props = {
@@ -59,27 +48,6 @@ const typeLabels: Record<string, string> = {
     addendum: "Addendum",
 };
 
-function escapeHtml(s: string): string {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-function resolvePreview(html: string, company: CompanySettings): string {
-    const data: Record<string, string> = {};
-    MERGE_FIELD_CATEGORIES.forEach(cat => cat.fields.forEach(f => { data[f.key] = f.example; }));
-    if (company.companyName) data.company_name = company.companyName;
-    if (company.address) data.company_address = company.address;
-    if (company.phone) data.company_phone = company.phone;
-    if (company.email) data.company_email = company.email;
-    data.date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
-    data.year = new Date().getFullYear().toString();
-
-    return html.replace(/\{\{(\w+)\}\}/g, (match, key) => {
-        const value = data[key];
-        if (value) return `<span style="background: #dbeafe; padding: 1px 4px; border-radius: 4px; font-weight: 600;">${escapeHtml(value)}</span>`;
-        return `<span style="background: #fef3c7; padding: 1px 4px; border-radius: 4px; color: #92400e;">${match}</span>`;
-    });
-}
-
 export default function DocumentTemplateManager({ allowedType, showTypeSelector = true, title, description }: Props) {
     const defaultType = allowedType ?? "terms";
 
@@ -88,14 +56,11 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
     const [loadError, setLoadError] = useState<string | null>(null);
     const [showEditor, setShowEditor] = useState(false);
     const [editingTemplate, setEditingTemplate] = useState<Template | null>(null);
-    const [company, setCompany] = useState<CompanySettings>({ companyName: "Your Company" });
-    const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
 
     const [form, setForm] = useState({ name: "", type: defaultType, body: "", isDefault: false });
 
     useEffect(() => {
         loadTemplates();
-        loadCompany();
     }, []);
 
     async function loadTemplates() {
@@ -112,20 +77,10 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
         }
     }
 
-    async function loadCompany() {
-        try {
-            const data = await getCompanySettings();
-            setCompany(data as CompanySettings);
-        } catch (e) {
-            console.error("Failed to load company settings:", e);
-        }
-    }
-
     function openCreate() {
         setEditingTemplate(null);
         setForm({ name: "", type: defaultType, body: "", isDefault: false });
         setShowEditor(true);
-        setActiveTab("edit");
     }
 
     function openEdit(t: Template) {
@@ -136,7 +91,6 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
         setEditingTemplate(t);
         setForm({ name: t.name, type: t.type, body: t.body, isDefault: t.isDefault });
         setShowEditor(true);
-        setActiveTab("edit");
     }
 
     async function handleSave() {
@@ -233,83 +187,14 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
                     </div>
                 </header>
 
-                {/* Split Pane */}
+                {/* WYSIWYG Editor */}
                 <div className="flex-1 flex flex-col overflow-hidden">
-                    {/* Mobile Tab Switcher */}
-                    <div className="lg:hidden flex border-b border-hui-border shrink-0">
-                        <button onClick={() => setActiveTab("edit")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "edit" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-hui-textMuted"}`}>
-                            Editor
-                        </button>
-                        <button onClick={() => setActiveTab("preview")} className={`flex-1 py-2 text-sm font-medium text-center transition ${activeTab === "preview" ? "bg-white border-b-2 border-blue-500 text-blue-600" : "bg-slate-50 text-hui-textMuted"}`}>
-                            Preview
-                        </button>
-                    </div>
-
-                    <div className="flex-1 flex overflow-hidden">
-                        {/* WYSIWYG Editor Pane */}
-                        <div className={`flex-1 flex flex-col border-r border-hui-border ${activeTab === "preview" ? "hidden lg:flex" : ""}`}>
-                            <MergeFieldEditor
-                                value={form.body}
-                                onChange={(html) => setForm(prev => ({ ...prev, body: html }))}
-                                mergeFieldCategories={templateMergeFields}
-                                signingSection={false}
-                            />
-                        </div>
-
-                        {/* Preview Pane */}
-                        <div className={`flex-1 flex flex-col bg-slate-100 ${activeTab === "edit" ? "hidden lg:flex" : ""}`}>
-                            <div className="px-4 py-2 bg-slate-50 text-xs font-semibold text-hui-textMuted uppercase tracking-wider border-b border-hui-border shrink-0 flex items-center justify-between">
-                                <span>Live Preview</span>
-                                <span className="text-[10px] font-normal normal-case">Merge fields shown with sample data</span>
-                            </div>
-                            <div className="flex-1 overflow-auto p-6">
-                                <div className="bg-white rounded-xl shadow-lg border border-slate-200 max-w-2xl mx-auto overflow-hidden">
-                                    <div className="bg-gradient-to-r from-slate-800 to-slate-700 px-8 py-6 text-white">
-                                        <div className="flex items-center gap-4">
-                                            {company.logoUrl ? (
-                                                <img src={company.logoUrl} alt="Logo" className="h-12 w-auto object-contain rounded bg-white p-1" />
-                                            ) : (
-                                                <div className="w-12 h-12 bg-white/20 rounded-lg flex items-center justify-center text-xl font-bold">
-                                                    {company.companyName?.charAt(0) || "C"}
-                                                </div>
-                                            )}
-                                            <div>
-                                                <h1 className="text-lg font-bold">{company.companyName || "Your Company"}</h1>
-                                                {company.phone && <p className="text-sm text-slate-300">{company.phone}</p>}
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div className="p-8">
-                                        {form.body ? (
-                                            <div
-                                                className={CONTRACT_PROSE_CLASSES}
-                                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(resolvePreview(form.body, company)) }}
-                                            />
-                                        ) : (
-                                            <div className="text-center py-16 text-slate-400">
-                                                <svg className="w-12 h-12 mx-auto mb-3 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                                <p className="text-sm">Start typing in the editor to see a live preview</p>
-                                            </div>
-                                        )}
-                                    </div>
-                                    <div className="px-8 pb-8">
-                                        <div className="border-t-2 border-dotted border-slate-300 pt-6 mt-4">
-                                            <div className="grid grid-cols-2 gap-8">
-                                                <div>
-                                                    <div className="border-b border-slate-300 pb-8 mb-2"></div>
-                                                    <p className="text-xs text-slate-400">Client Signature</p>
-                                                </div>
-                                                <div>
-                                                    <div className="border-b border-slate-300 pb-8 mb-2"></div>
-                                                    <p className="text-xs text-slate-400">Date</p>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+                    <MergeFieldEditor
+                        value={form.body}
+                        onChange={(html) => setForm(prev => ({ ...prev, body: html }))}
+                        mergeFieldCategories={templateMergeFields}
+                        signingSection={false}
+                    />
                 </div>
             </div>
         );
