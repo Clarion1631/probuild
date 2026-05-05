@@ -315,7 +315,18 @@ export function MergeFieldEditor({
 
             {/* WYSIWYG Editing Surface */}
             <div className="flex-1 overflow-auto bg-slate-50">
-                <div className="max-w-3xl mx-auto my-6 bg-white rounded-lg shadow-sm border border-slate-200 min-h-[600px]">
+                <style>{`
+                    .mfe-surface .tiptap table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+                    .mfe-surface .tiptap td,
+                    .mfe-surface .tiptap th { border: 1px solid #e2e8f0; padding: 10px 12px; vertical-align: top; }
+                    .mfe-surface .tiptap th { background: #f8fafc; font-weight: 600; }
+                    .mfe-surface .tiptap h2 { font-size: 1.125rem; font-weight: 700; color: #1e293b; margin-top: 1.5em; margin-bottom: 0.5em; }
+                    .mfe-surface .tiptap h3 { font-size: 1rem; font-weight: 600; color: #1e293b; margin-top: 1.25em; margin-bottom: 0.4em; }
+                    .mfe-surface .tiptap hr { border-color: #e2e8f0; margin: 1.5em 0; }
+                    .mfe-surface .tiptap p { margin-bottom: 0.5em; }
+                    .mfe-surface .tiptap .selectedCell { background: #dbeafe; }
+                `}</style>
+                <div className="mfe-surface max-w-3xl mx-auto my-6 bg-white rounded-lg shadow-sm border border-slate-200 min-h-[600px]">
                     <EditorContent editor={editor} className="h-full" />
                 </div>
             </div>
