@@ -48,9 +48,9 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
     }
 
     return (
-        <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
+        <div className="flex h-full overflow-hidden">
             <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-50 via-white to-slate-50/50">
-                <div className="p-8 max-w-5xl mx-auto">
+                <div className="p-8 max-w-6xl mx-auto">
                     {/* Header */}
                     <div className="flex items-center justify-between mb-8">
                         <div>

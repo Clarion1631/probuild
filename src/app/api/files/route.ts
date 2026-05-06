@@ -256,6 +256,11 @@ export async function PATCH(req: NextRequest) {
             return NextResponse.json({ error: "No permission to move files into financial folders" }, { status: 403 });
         }
 
+        const ALLOWED_VISIBILITY = new Set(["team", "shared", "financial"]);
+        if (visibility !== undefined && visibility !== null && !ALLOWED_VISIBILITY.has(visibility)) {
+            return NextResponse.json({ error: "Invalid visibility value" }, { status: 400 });
+        }
+
         const updateData: any = {};
         if (folderId !== undefined) updateData.folderId = folderId || null;
         if (name) updateData.name = name;

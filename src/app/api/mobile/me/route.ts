@@ -11,6 +11,19 @@ export async function GET(req: Request) {
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
 
+    const projectSelect = {
+        id: true,
+        number: true,
+        name: true,
+        status: true,
+        location: true,
+        locationLat: true,
+        locationLng: true,
+        geofenceRadiusMeters: true,
+        color: true,
+        clientId: true,
+    } as const;
+
     const fullUser = await prisma.user.findUnique({
         where: { id: user.id },
         include: {
@@ -18,18 +31,7 @@ export async function GET(req: Request) {
             projectAccess: { select: { projectId: true } },
             assignedProjects: {
                 where: { status: { not: "Closed" } },
-                select: {
-                    id: true,
-                    number: true,
-                    name: true,
-                    status: true,
-                    location: true,
-                    locationLat: true,
-                    locationLng: true,
-                    geofenceRadiusMeters: true,
-                    color: true,
-                    clientId: true,
-                },
+                select: projectSelect,
                 orderBy: { viewedAt: "desc" },
             },
         },
@@ -38,6 +40,32 @@ export async function GET(req: Request) {
     if (!fullUser) return NextResponse.json({ error: "User not found" }, { status: 404 });
 
     const permissions = getEffectivePermissions(fullUser);
+
+    let assignedProjects;
+
+    if (fullUser.role === "ADMIN" || fullUser.role === "MANAGER") {
+        assignedProjects = await prisma.project.findMany({
+            where: { status: { not: "Closed" } },
+            select: projectSelect,
+            orderBy: { viewedAt: "desc" },
+        });
+    } else {
+        const crewIds = new Set(fullUser.assignedProjects.map(p => p.id));
+        const accessOnlyIds = fullUser.projectAccess
+            .map(pa => pa.projectId)
+            .filter(id => !crewIds.has(id));
+
+        if (accessOnlyIds.length > 0) {
+            const accessProjects = await prisma.project.findMany({
+                where: { id: { in: accessOnlyIds }, status: { not: "Closed" } },
+                select: projectSelect,
+                orderBy: { viewedAt: "desc" },
+            });
+            assignedProjects = [...fullUser.assignedProjects, ...accessProjects];
+        } else {
+            assignedProjects = fullUser.assignedProjects;
+        }
+    }
 
     return NextResponse.json({
         user: {
@@ -50,6 +78,6 @@ export async function GET(req: Request) {
             burdenRate: toNum(fullUser.burdenRate),
         },
         permissions,
-        assignedProjects: fullUser.assignedProjects,
+        assignedProjects,
     });
 }

@@ -187,6 +187,15 @@ export default function ClientMessaging({
                 editor?.commands.setContent("");
                 if (msg.deliveryError) {
                     toast.error(msg.deliveryError);
+                } else {
+                    const parts: string[] = [];
+                    if (msg.emailDelivered) parts.push("email");
+                    if (msg.smsDelivered) parts.push("SMS");
+                    if (msg.status === "SCHEDULED") {
+                        toast.success("Message scheduled");
+                    } else if (parts.length) {
+                        toast.success(`Sent via ${parts.join(" & ")}`);
+                    }
                 }
                 if (msg.warnings?.length) {
                     for (const w of msg.warnings) toast.warning(w);
