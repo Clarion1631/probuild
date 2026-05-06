@@ -48,7 +48,7 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
     }
 
     return (
-        <div className="flex h-full overflow-hidden">
+        <div className="flex-1 flex h-full overflow-hidden">
             <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-50 via-white to-slate-50/50">
                 <div className="p-8 max-w-6xl mx-auto">
                     {/* Header */}

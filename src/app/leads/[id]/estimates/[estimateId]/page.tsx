@@ -24,7 +24,7 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
     } catch { /* ignore parse errors */ }
 
     return (
-        <div className="flex h-full overflow-hidden">
+        <div className="flex-1 flex h-full overflow-hidden">
             <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
                 <EstimateEditor
                     context={{
