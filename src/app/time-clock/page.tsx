@@ -1,7 +1,7 @@
 "use client";
 export const dynamic = "force-dynamic";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 
 export default function TimeClockPage() {
@@ -21,21 +21,30 @@ export default function TimeClockPage() {
     const [timeEntriesError, setTimeEntriesError] = useState<string>("");
     const [bucketsError, setBucketsError] = useState<string>("");
 
+    const activeProjectsController = useRef<AbortController | null>(null);
+
     const loadProjects = useCallback(() => {
-        fetch('/api/projects?assigned=true')
-            .then(res => res.json())
+        activeProjectsController.current?.abort();
+        const controller = new AbortController();
+        activeProjectsController.current = controller;
+
+        fetch('/api/projects?assigned=true', { signal: controller.signal })
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then(data => {
                 if (Array.isArray(data)) {
                     setProjects(data);
                     setProjectsError("");
                     setSelectedProject(prev => {
                         if (!prev) return prev;
-                        const stillExists = data.some((p: any) => p.id === prev);
-                        return stillExists ? prev : "";
+                        return data.some((p: any) => p.id === prev) ? prev : "";
                     });
                 }
             })
             .catch(e => {
+                if (e.name === "AbortError") return;
                 console.error("Could not fetch projects", e);
                 setProjectsError("Failed to load projects");
             });
