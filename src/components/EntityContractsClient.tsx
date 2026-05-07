@@ -116,10 +116,11 @@ export default function EntityContractsClient({
         if (!selectedTemplate) return;
         setIsCreating(true);
         try {
-            await createContractFromTemplate(selectedTemplate, context, undefined, isRecurring ? recurringDays : undefined);
+            const newContract = await createContractFromTemplate(selectedTemplate, context, undefined, isRecurring ? recurringDays : undefined);
             toast.success("Contract created!");
             setShowTemplateModal(false); setSelectedTemplate(""); setIsRecurring(false);
-            window.location.reload();
+            openEditor(newContract);
+            router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to create"); }
         finally { setIsCreating(false); }
     };
@@ -128,10 +129,11 @@ export default function EntityContractsClient({
         if (!blankTitle.trim()) { toast.error("Please enter a contract title"); return; }
         setSaving(true);
         try {
-            await createContractBlank(context, blankTitle, blankBody);
+            const newContract = await createContractBlank(context, blankTitle, blankBody);
             toast.success("Contract created!");
             setCreatingBlank(false);
-            window.location.reload();
+            openEditor(newContract);
+            router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to create"); }
         finally { setSaving(false); }
     };
@@ -146,10 +148,10 @@ export default function EntityContractsClient({
         if (!editingContract) return;
         setSaving(true);
         try {
-            await updateContract(editingContract.id, { title: editTitle, body: editBody });
+            const updated = await updateContract(editingContract.id, { title: editTitle, body: editBody });
             toast.success("Contract updated!");
-            setEditingContract(null);
-            window.location.reload();
+            setEditingContract(updated);
+            router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to update contract"); }
         finally { setSaving(false); }
     };
@@ -177,7 +179,8 @@ export default function EntityContractsClient({
         body.includes("{{CONTRACTOR_SIGNATURE_BLOCK}}") || body.includes('data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"');
 
     const handleSend = async (contractId: string) => {
-        const contract = initialContracts.find((c: any) => c.id === contractId);
+        const contract = (editingContract?.id === contractId ? editingContract : null)
+            ?? initialContracts.find((c: any) => c.id === contractId);
         if (contract && contractHasContractorBlock(contract.body || "") && !contract.contractorSignedBy) {
             setPendingSendContractId(contractId);
             setShowContractorSignPrompt(true);
@@ -193,7 +196,10 @@ export default function EntityContractsClient({
                 `Contract sent to ${result.clientName || entity.clientName} at ${result.sentTo}`,
                 { description: entity.name }
             );
-            window.location.reload();
+            if (editingContract && editingContract.id === contractId) {
+                setEditingContract({ ...editingContract, status: "Sent" });
+            }
+            router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to send"); }
     };
 
@@ -237,7 +243,7 @@ export default function EntityContractsClient({
 
     const handleDelete = async (contractId: string) => {
         if (!confirm("Delete this contract?")) return;
-        try { await deleteContract(contractId); toast.success("Deleted"); window.location.reload(); }
+        try { await deleteContract(contractId); toast.success("Deleted"); router.refresh(); }
         catch { toast.error("Failed to delete"); }
     };
 
@@ -258,7 +264,7 @@ export default function EntityContractsClient({
             await signContractAsContractor(contractorSignModal.id, name, dataUrl);
             toast.success("Contractor signature saved!");
             setContractorSignModal(null);
-            window.location.reload();
+            router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to save signature"); }
         finally { setSigningAsContractor(false); }
     };
