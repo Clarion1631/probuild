@@ -48,6 +48,7 @@ export default function PortalContractClient({
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
     const [isSuccess, setIsSuccess] = useState(false);
+    const [pdfDownloadUrl, setPdfDownloadUrl] = useState<string | null>(null);
 
     // Detect View. Pass the accessToken through so the server-side ownership
     // check accepts the magic-link path (no portal session required).
@@ -82,23 +83,33 @@ export default function PortalContractClient({
 
         html = html.replace(/\{\{DATE_BLOCK\}\}/g, `<strong>${dateStr}</strong>`);
 
+        // Contractor date block — resolves to the contractor's signing date
+        const contractorDateStr = initialContract.contractorSignedAt
+            ? new Date(initialContract.contractorSignedAt).toLocaleDateString()
+            : "";
+        const contractorDatePattern = /\{\{CONTRACTOR_DATE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_DATE_BLOCK"[^>]*>[^<]*<\/span>/g;
+        html = html.replace(contractorDatePattern, contractorDateStr ? `<strong>${contractorDateStr}</strong>` : "");
+
         // Replace Contractor Signature Block — show stored sig image or pending placeholder (read-only for client)
+        // Matches both raw {{CONTRACTOR_SIGNATURE_BLOCK}} and TipTap <span data-merge-field="CONTRACTOR_SIGNATURE_BLOCK">...</span>
         // contractorSignedBy is HTML-escaped before injection to prevent XSS (injected after DOMPurify runs)
         const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        const contractorBlockPattern = /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"[^>]*>[^<]*<\/span>/g;
         if (initialContract.contractorSignatureUrl && /^data:image\/(png|jpeg|webp);base64,/.test(initialContract.contractorSignatureUrl)) {
             const safeUrl = escapeHtml(initialContract.contractorSignatureUrl);
             const safeName = escapeHtml(initialContract.contractorSignedBy || "Signed");
-            html = html.replace(/\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}/g,
-                `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Contractor Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor — ${safeName}</span></span>`
+            const sigDateHtml = contractorDateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${contractorDateStr}</span>` : "";
+            html = html.replace(contractorBlockPattern,
+                `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Contractor Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor — ${safeName}</span>${sigDateHtml}</span>`
             );
         } else {
-            html = html.replace(/\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}/g,
+            html = html.replace(contractorBlockPattern,
                 `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:200px;height:40px;margin:4px 0;padding-bottom:4px;"><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor Signature — Pending</span></span>`
             );
         }
 
         return { parsedBody: html, totalRequiredBlocks: sigCount + initCount, totalSigBlocks: sigCount };
-    }, [initialContract.body, isSigned, initialContract.approvedAt]);
+    }, [initialContract.body, isSigned, initialContract.approvedAt, initialContract.contractorSignedAt, initialContract.contractorSignatureUrl, initialContract.contractorSignedBy]);
 
     // Attach Delegated Listeners
     useEffect(() => {
@@ -200,7 +211,11 @@ export default function PortalContractClient({
     };
 
     const isAllBlocksSigned = Object.keys(signatures).length + Object.keys(initials).length === totalRequiredBlocks;
-    const canSubmit = isAllBlocksSigned || totalRequiredBlocks === 0;
+    const hasContractorBlock = (initialContract.body || "").includes("{{CONTRACTOR_SIGNATURE_BLOCK}}")
+        || (initialContract.body || "").includes('data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"');
+    const contractorHasSigned = !!initialContract.contractorSignedAt;
+    const awaitingContractor = hasContractorBlock && !contractorHasSigned;
+    const canSubmit = (isAllBlocksSigned || totalRequiredBlocks === 0) && !awaitingContractor;
 
     const handleFinalSubmit = async () => {
         if (!canSubmit) {
@@ -212,28 +227,23 @@ export default function PortalContractClient({
         setError("");
 
         try {
-            // Stage 1: Mathematical Approval in DB
-            const primarySigData = Object.values(signatures)[0];
-            const primarySigUrl = primarySigData?.image || null;
-            const primarySigName = primarySigData?.name || "Accepted Digitally";
-            const userAgent = window.navigator.userAgent;
-            
-            await approveContract(initialContract.id, primarySigName, userAgent, primarySigUrl || undefined, accessToken || undefined);
-            
-            // Stage 2: Capture crisp DOM Snapshot
+            // Stage 1: Capture DOM BEFORE server action to avoid re-render race.
+            // Signatures are already injected into the DOM via the useEffect sync.
             const element = document.getElementById("contract-document-wrapper");
-            if (element) {
-                // Strip decoration that breaks A4 sizing, and temporarily ensure nothing clips
-                // the full document height before we capture it.
-                const prevShadow = element.style.boxShadow;
-                const prevBorder = element.style.border;
-                const prevOverflow = element.style.overflow;
+            if (!element) {
+                throw new Error("Could not locate the contract document for PDF capture. Please refresh and try again.");
+            }
+
+            const prevShadow = element.style.boxShadow;
+            const prevBorder = element.style.border;
+            const prevOverflow = element.style.overflow;
+            let pdfBlob: Blob;
+
+            try {
                 element.style.boxShadow = "none";
                 element.style.border = "none";
                 element.style.overflow = "visible";
 
-                // Sanity-check: warn if anything is still clipping. If scrollHeight > offsetHeight
-                // the captured image will be short — we need to hunt down the ancestor and fix.
                 if (element.scrollHeight > element.offsetHeight + 1) {
                     console.debug(
                         "[contract-pdf] wrapper is shorter than its content",
@@ -241,23 +251,8 @@ export default function PortalContractClient({
                     );
                 }
 
-                // Capture crisp DOM snapshot. JPEG (quality 0.92) drops file size vs PNG and
-                // stays well under Vercel's 4.5MB function payload cap.
-                // pixelRatio: 1.5 is a deliberate trade-off — crisp enough on retina but
-                // keeps the rasterised canvas well under browser memory limits for tall
-                // multi-page contracts (a 10-page contract at pixelRatio 2 can exceed
-                // Chrome's canvas byte cap).
                 const imgData = await toJpeg(element, { quality: 0.92, pixelRatio: 1.5 });
 
-                // Restore inline styles so the live page keeps looking right
-                element.style.boxShadow = prevShadow;
-                element.style.border = prevBorder;
-                element.style.overflow = prevOverflow;
-
-                // Build a multi-page A4 PDF. Rather than cropping the image to the page height
-                // (which requires canvas slicing and re-encoding), we draw the full image onto
-                // each page at a negative Y offset. jsPDF clips image draws to the page MediaBox
-                // so each page shows the correct slice without double-exposure.
                 const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
                 const pageW = pdf.internal.pageSize.getWidth();
                 const pageH = pdf.internal.pageSize.getHeight();
@@ -275,11 +270,25 @@ export default function PortalContractClient({
                     pageIdx++;
                 }
 
-                // Stage 3: Send blob to finalize server action (include token so the finalize
-                // route can verify ownership for lead-owned contracts with no portal session)
-                const blob = pdf.output('blob');
+                pdfBlob = pdf.output('blob');
+            } finally {
+                element.style.boxShadow = prevShadow;
+                element.style.border = prevBorder;
+                element.style.overflow = prevOverflow;
+            }
+
+            // Stage 2: Record approval in DB (after DOM is captured)
+            const primarySigData = Object.values(signatures)[0];
+            const primarySigUrl = primarySigData?.image || null;
+            const primarySigName = primarySigData?.name || "Accepted Digitally";
+            const userAgent = window.navigator.userAgent;
+
+            await approveContract(initialContract.id, primarySigName, userAgent, primarySigUrl || undefined, accessToken || undefined);
+
+            // Stage 3: Upload captured PDF to finalize
+            {
                 const formData = new FormData();
-                formData.append("pdf", blob);
+                formData.append("pdf", pdfBlob);
 
                 const finalizeUrl = accessToken
                     ? `/api/portal/contracts/${initialContract.id}/finalize?token=${encodeURIComponent(accessToken)}`
@@ -293,12 +302,11 @@ export default function PortalContractClient({
                     const errText = await response.text();
                     throw new Error(`Failed to upload PDF: ${errText}`);
                 }
+                const result = await response.json();
+                if (result?.file?.url) setPdfDownloadUrl(result.file.url);
             }
 
-            // Stop loading indicator
             setIsSubmitting(false);
-
-            // Show the success screen instead of reloading the page
             setIsSuccess(true);
 
         } catch (e: any) {
@@ -318,9 +326,22 @@ export default function PortalContractClient({
                         </svg>
                     </div>
                     <h2 className="text-2xl font-bold text-slate-800 mb-2">Document Executed</h2>
-                    <p className="text-slate-500 mb-8 leading-relaxed">
-                        Thank you! Your document has been signed successfully. A PDF receipt has been securely archived and emailed to you for your records.
+                    <p className="text-slate-500 mb-6 leading-relaxed">
+                        Thank you! Your signed document has been finalized. A copy has been emailed to you for your records.
                     </p>
+                    {pdfDownloadUrl && (
+                        <a
+                            href={pdfDownloadUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-2 px-6 py-3 bg-slate-800 hover:bg-slate-900 text-white text-sm font-semibold rounded-lg transition shadow-sm mb-6"
+                        >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V4" />
+                            </svg>
+                            Download Executed PDF
+                        </a>
+                    )}
                     <p className="text-sm font-medium text-slate-400">
                         You may now close this window.
                     </p>
@@ -551,13 +572,21 @@ export default function PortalContractClient({
                     {!isSigned && (
                         <div className="px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
+                                {awaitingContractor && (
+                                    <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl mb-4 flex items-center gap-3">
+                                        <svg className="w-5 h-5 text-amber-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                        <p className="text-sm text-amber-800">This document is awaiting the contractor&apos;s signature. You will be able to sign and submit once the contractor has signed.</p>
+                                    </div>
+                                )}
                                 <div className="bg-slate-50 border border-slate-200 p-6 rounded-xl flex items-center justify-between">
                                     <div>
                                         <h3 className="text-sm font-bold text-slate-800">Finalize & Submit</h3>
                                         <p className="text-xs text-slate-500 mt-1">
-                                            {totalRequiredBlocks > 0 
-                                                ? `Please fill out all ${totalRequiredBlocks} blocks above to finalize.`
-                                                : "No advanced signature blocks found. Click submit to legally agree."}
+                                            {awaitingContractor
+                                                ? "Awaiting contractor signature before you can submit."
+                                                : totalRequiredBlocks > 0
+                                                    ? `Please fill out all ${totalRequiredBlocks} blocks above to finalize.`
+                                                    : "No advanced signature blocks found. Click submit to legally agree."}
                                         </p>
                                         {error && <p className="text-red-600 text-xs font-medium mt-2">{error}</p>}
                                     </div>
@@ -565,8 +594,8 @@ export default function PortalContractClient({
                                         onClick={handleFinalSubmit}
                                         disabled={isSubmitting || !canSubmit}
                                         className={`px-8 py-3 rounded-lg font-semibold text-sm transition shadow-sm ${
-                                            canSubmit 
-                                                ? "bg-slate-800 text-white hover:bg-slate-900" 
+                                            canSubmit
+                                                ? "bg-slate-800 text-white hover:bg-slate-900"
                                                 : "bg-slate-200 text-slate-400 cursor-not-allowed"
                                         }`}
                                     >

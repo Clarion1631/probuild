@@ -3696,7 +3696,20 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
 // ────────────────────────────────────────────────
 
 function resolveMergeFields(template: string, data: Record<string, string>): string {
-    return template.replace(/\{\{(\w+)\}\}/g, (match, key) => data[key] || match);
+    // Handle TipTap <span data-merge-field="key">...</span> nodes first
+    let result = template.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g,
+        (match, key) => key in data ? data[key] : match);
+    // Then handle raw {{key}} placeholders
+    result = result.replace(/\{\{(\w+)\}\}/g, (match, key) => key in data ? data[key] : match);
+    return result;
+}
+
+function bodyHasContractorBlock(body: string): boolean {
+    return /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|data-merge-field=["']CONTRACTOR_SIGNATURE_BLOCK["']/i.test(body || "");
+}
+
+function escapeEmailHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 async function buildMergeData(projectId?: string | null, leadId?: string | null): Promise<Record<string, string>> {
@@ -3721,6 +3734,10 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
     ) => {
         data.project_name = entity.name;
         data.location = entity.location || "";
+        if (!data.location) {
+            const stateZip = [client.state, client.zipCode].filter(Boolean).join(" ");
+            data.location = [client.addressLine1, client.city, stateZip].filter(Boolean).join(", ");
+        }
         if (entity.number) data.project_number = `P-${entity.number}`;
         const entityType = entity.type || entity.projectType || null;
         if (entityType) data.project_type = entityType;
@@ -3728,7 +3745,8 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
         data.client_name = client.name;
         data.client_email = client.email || "";
         data.client_phone = client.primaryPhone || "";
-        data.client_address = [client.addressLine1, client.city, client.state, client.zipCode].filter(Boolean).join(", ");
+        const clientStateZip = [client.state, client.zipCode].filter(Boolean).join(" ");
+        data.client_address = [client.addressLine1, client.city, clientStateZip].filter(Boolean).join(", ");
         data.client_additional_email = client.additionalEmail || "";
         data.client_additional_phone = client.additionalPhone || "";
 
@@ -3771,6 +3789,28 @@ async function buildMergeData(projectId?: string | null, leadId?: string | null)
     return data;
 }
 
+async function resolveContractBody(
+    body: string,
+    projectId?: string | null,
+    leadId?: string | null
+): Promise<string> {
+    if (!/\{\{\w+\}\}/.test(body) && !/data-merge-field=/.test(body)) return body;
+    const data = await buildMergeData(projectId, leadId);
+    return resolveMergeFields(body, data);
+}
+
+export async function getResolvedMergePreview(
+    projectId?: string | null,
+    leadId?: string | null
+): Promise<Record<string, string>> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    return buildMergeData(projectId, leadId);
+}
+
 export async function getContracts(projectId?: string, leadId?: string) {
     return prisma.contract.findMany({
         where: {
@@ -3809,35 +3849,45 @@ export async function getContract(id: string) {
  * should use. Plain `getContract` has no ownership check and is admin-only.
  */
 export async function getContractForPortal(id: string, token?: string | null) {
+    let contract: any = null;
+
     // Try token first — it's the path the email link uses and needs no session.
     if (token) {
-        const byToken = await prisma.contract.findFirst({
+        contract = await prisma.contract.findFirst({
             where: { id, accessToken: token },
             include: {
                 project: { include: { client: true } },
                 lead: { include: { client: true } },
             },
         });
-        if (byToken) return byToken;
     }
 
     // Fall back to session-based access for logged-in clients browsing /portal.
-    const sessionClientId = await resolveSessionClientId();
-    if (!sessionClientId) return null;
+    if (!contract) {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
 
-    return prisma.contract.findFirst({
-        where: {
-            id,
-            OR: [
-                { lead: { clientId: sessionClientId } },
-                { project: { clientId: sessionClientId } },
-            ],
-        },
-        include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
-        },
-    });
+        contract = await prisma.contract.findFirst({
+            where: {
+                id,
+                OR: [
+                    { lead: { clientId: sessionClientId } },
+                    { project: { clientId: sessionClientId } },
+                ],
+            },
+            include: {
+                project: { include: { client: true } },
+                lead: { include: { client: true } },
+            },
+        });
+    }
+
+    if (!contract) return null;
+
+    // Re-resolve any remaining merge field placeholders against current data
+    contract.body = await resolveContractBody(contract.body, contract.projectId, contract.leadId);
+
+    return contract;
 }
 
 /**
@@ -3972,6 +4022,10 @@ export async function sendContractToClient(contractId: string) {
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
+    if (bodyHasContractorBlock(contract.body || "") && !contract.contractorSignedAt) {
+        throw new Error("Contractor must sign this contract before sending to the client.");
+    }
+
     // Atomic first-mint of accessToken. We cannot read-then-update because two
     // concurrent senders (e.g. a human resend racing with the recurring-docs cron)
     // could both read `null`, mint different UUIDs, and the later write would
@@ -4023,42 +4077,29 @@ export async function sendContractToClient(contractId: string) {
     const companyLogo = settings?.logoUrl || "";
     const companyLicense = settings?.licenseNumber || "";
 
-    // Brand header — logo if present, else just company name. License displayed under name.
-    const brandHeader = `
-        <div style="text-align: center; margin-bottom: 32px;">
-            ${companyLogo
-                ? `<img src="${companyLogo}" alt="${companyName}" style="max-height: 64px; width: auto; margin: 0 auto 12px; display: block;" />`
-                : ""}
-            <h1 style="font-size: 22px; font-weight: 700; margin: 0; color: #0f172a;">${companyName}</h1>
-            ${companyLicense
-                ? `<p style="font-size: 12px; color: #64748b; margin: 4px 0 0;">Lic# ${companyLicense}</p>`
-                : ""}
-        </div>`;
+    const safeCompany = escapeEmailHtml(companyName);
+    const safeClient = escapeEmailHtml(client.name);
+    const safeTitle = escapeEmailHtml(contract.title);
+    const safeLicense = escapeEmailHtml(companyLicense);
+    const logoHtml = companyLogo ? `<img src="${encodeURI(companyLogo)}" alt="${safeCompany}" style="max-height:56px;width:auto;margin:0 auto 8px;display:block;" />` : "";
+    const licenseHtml = safeLicense ? `<p style="font-size:12px;color:#64748b;margin:4px 0 0;">Lic# ${safeLicense}</p>` : "";
 
     const contractCc = buildCc(client.email, (client as any).additionalEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a contract to review`,
-        `<!DOCTYPE html>
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            ${brandHeader}
-            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                <h2 style="font-size: 20px; margin: 0 0 8px;">Contract Ready for Your Signature</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
-                <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you a contract titled "<strong>${contract.title}</strong>" for your review and signature.
-                    Click the button below to open your document portal, read the agreement, and sign electronically.
-                </p>
-                <div style="text-align: center; margin: 32px 0;">
-                    <a href="${portalUrl}" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        View in Portal
-                    </a>
-                </div>
-                <p style="color: #999; font-size: 13px; margin: 0;">If you have any questions, reply to this email or contact us directly.</p>
-            </div>
-        </body>
-        </html>`,
+        [
+            '<!DOCTYPE html><html><head><meta charset="utf-8"></head>',
+            '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#333;">',
+            `<div style="text-align:center;margin-bottom:24px;">${logoHtml}`,
+            `<h1 style="font-size:20px;font-weight:700;margin:0;color:#0f172a;">${safeCompany}</h1>${licenseHtml}</div>`,
+            '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;">',
+            `<p style="color:#666;margin:0 0 16px;">Hi ${safeClient},</p>`,
+            `<p style="color:#666;margin:0 0 20px;line-height:1.5;">${safeCompany} has sent you a contract titled "<strong>${safeTitle}</strong>" for your review and signature.</p>`,
+            `<div style="text-align:center;margin:0 0 20px;"><a href="${encodeURI(portalUrl)}" style="display:inline-block;background:#222;color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-weight:600;font-size:15px;">View &amp; Sign Contract</a></div>`,
+            '<p style="color:#999;font-size:13px;margin:0;">If you have any questions, reply to this email.</p>',
+            '</div></body></html>',
+        ].join(''),
         undefined,
         { fromName: companyName, replyTo: settings?.email || undefined, cc: contractCc }
     );
@@ -4143,6 +4184,10 @@ export async function approveContract(contractId: string, signatureName: string,
     });
     if (!contract) throw new Error("Contract not found");
 
+    if (bodyHasContractorBlock(contract.body || "") && !contract.contractorSignedAt) {
+        throw new Error("This contract requires the contractor's signature before it can be signed by the client.");
+    }
+
     const now = new Date();
     const isRecurring = !!(contract.recurringDays && contract.recurringDays > 0);
 
@@ -4188,7 +4233,11 @@ export async function approveContract(contractId: string, signatureName: string,
                 },
             });
             if (transition.count === 0) {
-                throw new Error("Contract is not in a signable state (already signed or finalized)");
+                // Already signed — allow finalize retry without overwriting audit data.
+                // If status is anything other than "Signed", the contract is finalized and immutable.
+                const current = await tx.contract.findUnique({ where: { id: contractId }, select: { status: true } });
+                if (current?.status === "Signed") return;
+                throw new Error("Contract is not in a signable state (already finalized)");
             }
         } else {
             const nextDue = new Date(now.getTime() + contract.recurringDays! * 86400000);

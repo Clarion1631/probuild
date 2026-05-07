@@ -173,6 +173,7 @@ export async function POST(
                     url: publicUrl,
                     size: buffer.length,
                     mimeType: "application/pdf",
+                    visibility: "shared",
                     ...(contract.projectId && { projectId: contract.projectId }),
                     ...(contract.leadId && { leadId: contract.leadId }),
                 }
@@ -214,32 +215,18 @@ export async function POST(
         const companyEmail = companySettings?.notificationEmail || companySettings?.email;
         const companyName = companySettings?.companyName || "ProBuild";
 
-        // Construct standard receipt HTML
-        const emailHtml = `
-            <!DOCTYPE html>
-            <html>
-            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333; text-align: center;">
-                <div style="text-align: center; margin-bottom: 32px;">
-                    <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
-                </div>
-                <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px; text-align: left;">
-                    <h2 style="font-size: 20px; margin: 0 0 8px; color: #16a34a;">✓ Document Executed</h2>
-                    <p style="color: #666; margin: 0 0 24px;">Hi ${clientName},</p>
-                    <p style="color: #666; line-height: 1.6;">
-                        Thank you! <strong>${contract.title}</strong> has been successfully electronically signed and finalized.
-                    </p>
-                    <p style="color: #666; line-height: 1.6;">
-                        A permanent PDF copy has been attached to this email and archived securely for your records.
-                    </p>
-                    <div style="text-align: center; margin: 32px 0;">
-                        <a href="${publicUrl}" target="_blank" style="display: inline-block; background: #222; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                            Download PDF Receipt
-                        </a>
-                    </div>
-                </div>
-            </body>
-            </html>
-        `;
+        const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        const emailHtml = [
+            '<!DOCTYPE html><html><head><meta charset="utf-8"></head>',
+            '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#333;">',
+            `<div style="text-align:center;margin-bottom:24px;"><h1 style="font-size:20px;font-weight:700;margin:0;">${esc(companyName)}</h1></div>`,
+            '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;">',
+            `<h2 style="font-size:18px;margin:0 0 8px;color:#16a34a;">&#10003; Document Executed</h2>`,
+            `<p style="color:#666;margin:0 0 16px;">Hi ${esc(clientName)},</p>`,
+            `<p style="color:#666;margin:0 0 16px;line-height:1.5;">Thank you! <strong>${esc(contract.title)}</strong> has been signed and finalized. A PDF copy is attached and archived for your records.</p>`,
+            `<div style="text-align:center;margin:0 0 16px;"><a href="${encodeURI(publicUrl)}" target="_blank" style="display:inline-block;background:#222;color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-weight:600;font-size:15px;">Download PDF</a></div>`,
+            '</div></body></html>',
+        ].join('');
 
         // Send Email to Client
         if (clientEmail) {

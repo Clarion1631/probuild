@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
     createContractFromTemplate, createContractBlank, sendContractToClient,
     deleteContract, getContractSigningHistory, updateContract, signContractAsContractor,
+    getResolvedMergePreview,
 } from "@/lib/actions";
 import { toast } from "sonner";
 import DOMPurify from "dompurify";
@@ -82,6 +83,13 @@ export default function EntityContractsClient({
     // ─── CONTRACTOR SIGNING ───
     const [contractorSignModal, setContractorSignModal] = useState<any>(null);
     const [signingAsContractor, setSigningAsContractor] = useState(false);
+    const [showContractorSignPrompt, setShowContractorSignPrompt] = useState(false);
+    const [pendingSendContractId, setPendingSendContractId] = useState<string | null>(null);
+
+    // ─── PREVIEW MODE ───
+    const [isPreview, setIsPreview] = useState(false);
+    const [previewHtml, setPreviewHtml] = useState("");
+    const [loadingPreview, setLoadingPreview] = useState(false);
 
     // Template helpers
     const filteredTemplates = templates.filter(t =>
@@ -165,7 +173,20 @@ export default function EntityContractsClient({
         finally { setIsDrafting(false); }
     }
 
+    const contractHasContractorBlock = (body: string) =>
+        body.includes("{{CONTRACTOR_SIGNATURE_BLOCK}}") || body.includes('data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"');
+
     const handleSend = async (contractId: string) => {
+        const contract = initialContracts.find((c: any) => c.id === contractId);
+        if (contract && contractHasContractorBlock(contract.body || "") && !contract.contractorSignedBy) {
+            setPendingSendContractId(contractId);
+            setShowContractorSignPrompt(true);
+            return;
+        }
+        await doSend(contractId);
+    };
+
+    const doSend = async (contractId: string) => {
         try {
             const result = await sendContractToClient(contractId);
             toast.success(
@@ -174,6 +195,44 @@ export default function EntityContractsClient({
             );
             window.location.reload();
         } catch (e: any) { toast.error(e.message || "Failed to send"); }
+    };
+
+    const handlePreviewToggle = async () => {
+        if (isPreview) {
+            setIsPreview(false);
+            return;
+        }
+        setLoadingPreview(true);
+        try {
+            const projectId = entity.type === "project" ? entity.id : null;
+            const leadId = entity.type === "lead" ? entity.id : null;
+            const mergeData = await getResolvedMergePreview(projectId, leadId);
+            let html = editBody;
+            const highlight = (key: string) => {
+                if (key in mergeData && mergeData[key]) {
+                    const escaped = mergeData[key].replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+                    return `<span style="background:#fef3c7;border-bottom:2px solid #f59e0b;padding:0 2px;">${escaped}</span>`;
+                }
+                if (key in mergeData) {
+                    return `<span style="background:#fee2e2;border-bottom:2px solid #ef4444;padding:0 2px;font-style:italic;color:#991b1b;">empty</span>`;
+                }
+                return null;
+            };
+            // Process TipTap span nodes first (they may contain raw {{key}} inside)
+            html = html.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g, (_match, key) => {
+                return highlight(key) ?? _match;
+            });
+            // Then handle any remaining raw placeholders
+            html = html.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+                return highlight(key) ?? match;
+            });
+            setPreviewHtml(html);
+            setIsPreview(true);
+        } catch (e: any) {
+            toast.error("Failed to load preview");
+        } finally {
+            setLoadingPreview(false);
+        }
     };
 
     const handleDelete = async (contractId: string) => {
@@ -266,18 +325,33 @@ export default function EntityContractsClient({
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${STATUS_COLORS[editingContract.status] || STATUS_COLORS.Draft}`}>
                             {editingContract.status}
                         </span>
+                        <button onClick={handlePreviewToggle} disabled={loadingPreview} className={`px-3 py-1.5 text-sm font-medium rounded-lg transition border ${isPreview ? "bg-amber-50 text-amber-700 border-amber-300" : "text-slate-600 border-slate-200 hover:bg-slate-50"}`}>
+                            {loadingPreview ? "Loading..." : isPreview ? "Back to Editor" : "Preview"}
+                        </button>
                         {(editingContract.status === "Draft" || editingContract.status === "Sent") && (
                             <button onClick={() => handleSend(editingContract.id)} className="px-4 py-1.5 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition shadow-sm">
                                 {editingContract.status === "Sent" ? "Resend" : "Send"}
                             </button>
                         )}
-                        <button onClick={() => setEditingContract(null)} className="px-3 py-1.5 text-sm text-slate-500 hover:text-slate-700 border border-slate-200 rounded-lg transition">Cancel</button>
-                        <button onClick={handleSaveEdit} disabled={saving} className="px-4 py-1.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition shadow-sm disabled:opacity-50">
+                        <button onClick={() => { setEditingContract(null); setIsPreview(false); }} className="px-3 py-1.5 text-sm text-slate-500 hover:text-slate-700 border border-slate-200 rounded-lg transition">Cancel</button>
+                        <button onClick={handleSaveEdit} disabled={saving || isPreview} className="px-4 py-1.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition shadow-sm disabled:opacity-50">
                             {saving ? "Saving..." : "Save Changes"}
                         </button>
                     </div>
                 </header>
-                <ContractWysiwygEditor value={editBody} onChange={setEditBody} />
+                {isPreview ? (
+                    <div className="flex-1 overflow-auto bg-slate-50 p-8">
+                        <div className="max-w-[816px] mx-auto bg-white shadow-sm rounded-lg p-12">
+                            <div className="mb-4 flex items-center gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                                <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                <span>Preview — merge fields are highlighted with their resolved values. Empty fields are shown in red.</span>
+                            </div>
+                            <div className={CONTRACT_PROSE_CLASSES} dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(previewHtml, { USE_PROFILES: { html: true } }) }} />
+                        </div>
+                    </div>
+                ) : (
+                    <ContractWysiwygEditor value={editBody} onChange={setEditBody} />
+                )}
             </div>
         );
     }
@@ -593,6 +667,38 @@ export default function EntityContractsClient({
                 mode="signature"
                 onSign={handleContractorSign}
             />
+
+            {/* ── CONTRACTOR-FIRST SIGNING PROMPT ── */}
+            {showContractorSignPrompt && pendingSendContractId && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
+                        <div className="w-12 h-12 mx-auto bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mb-4">
+                            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
+                        </div>
+                        <h3 className="text-lg font-bold text-slate-800 text-center mb-2">Contractor Signature Required</h3>
+                        <p className="text-sm text-slate-500 text-center mb-6">This contract includes a contractor signature block. You must sign as contractor before sending to the client.</p>
+                        <div className="flex flex-col gap-2">
+                            <button
+                                onClick={() => {
+                                    setShowContractorSignPrompt(false);
+                                    const contract = initialContracts.find((c: any) => c.id === pendingSendContractId);
+                                    setPendingSendContractId(null);
+                                    if (contract) setContractorSignModal(contract);
+                                }}
+                                className="w-full px-4 py-2.5 text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg transition"
+                            >
+                                Sign as Contractor Now
+                            </button>
+                            <button
+                                onClick={() => { setShowContractorSignPrompt(false); setPendingSendContractId(null); }}
+                                className="w-full px-4 py-2 text-sm text-slate-400 hover:text-slate-600 transition"
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Click-away to close create menu */}
             {showCreateMenu && <div className="fixed inset-0 z-20" onClick={() => setShowCreateMenu(false)} />}
