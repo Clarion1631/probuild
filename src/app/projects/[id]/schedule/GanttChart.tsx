@@ -684,6 +684,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             ))}
                         </div>
                         <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 300); }} className="hui-btn hui-btn-secondary text-xs py-1.5 px-3">Today</button>
+                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
+                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
+                            Milestone
+                        </button>
                         {/* Critical Path toggle */}
                         <button
                             onClick={() => setShowCriticalPath(v => !v)}
@@ -740,11 +745,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             )}
                         </div>
-                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
-                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
-                            Milestone
-                        </button>
                         {/* More menu */}
                         <div className="relative">
                             <button onClick={() => setShowMoreMenu(!showMoreMenu)} className="hui-btn hui-btn-secondary text-xs py-1.5 px-2">
@@ -833,7 +833,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                                         {getInitials(a.user.name, a.user.email)}
                                                     </div>
                                                 ))}
-                                                <button onClick={e => { if (!linkMode) { e.stopPropagation(); setEditingId(task.id); setEditName(task.name); }}} className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition">{task.name}</button>
+                                                <span className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition cursor-pointer">{task.name}</span>
                                                 {task.estimateItem && <span className="ml-1 text-[9px] text-blue-500 bg-blue-50 rounded px-1 shrink-0">$</span>}
                                             </div>
                                         )}
@@ -1029,6 +1029,18 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         <div className="flex-1 overflow-y-auto p-4">
                             {panelTab === "details" && (
                                 <div className="space-y-5">
+                                    <div>
+                                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Task Name</label>
+                                        <input
+                                            type="text"
+                                            value={editingId === selectedTask.id ? editName : selectedTask.name}
+                                            onFocus={() => { setEditingId(selectedTask.id); setEditName(selectedTask.name); }}
+                                            onChange={e => setEditName(e.target.value)}
+                                            onBlur={() => handleSaveName(selectedTask.id)}
+                                            onKeyDown={e => { if (e.key === "Enter") handleSaveName(selectedTask.id); }}
+                                            className="hui-input text-sm mt-1 w-full"
+                                        />
+                                    </div>
                                     <div>
                                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Status</label>
                                         <select value={selectedTask.status} onChange={e => handleStatusChange(selectedTask.id, e.target.value)} className="hui-input text-sm mt-1 w-full">
