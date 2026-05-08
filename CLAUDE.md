@@ -46,7 +46,7 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 2. Make changes
 3. npm run build          # must pass 0 errors
 4. git push origin main   # does NOT auto-deploy (auto-deploy is OFF)
-5. Deploy via CLI — see "Deploying to Vercel" section below
+5. /deploy-prod           # Codex review → ship to prod (see "Deploying to Vercel")
 6. Click through affected pages on prod to verify
 7. Mark items done in ProbuildTodo.md
 ```
@@ -62,9 +62,21 @@ stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
 stripe trigger payment_intent.succeeded
 ```
 
-## Deploying to Vercel (CLI only — auto-deploy is OFF)
+## Deploying to Vercel (CLI only — auto-deploy is OFF, Codex-gated)
 
-**One command — copy/paste exactly:**
+**Default path — use `/deploy-prod`:**
+
+In Claude Code, type `/deploy-prod`. This runs the safe-deploy workflow defined in `.claude/commands/deploy-prod.md`:
+1. Verifies clean working tree in main repo
+2. `npm run build` (must pass 0 errors locally first)
+3. Spawns the `codex-peer-review:codex-peer-reviewer` subagent on the diff
+4. **Aborts on BLOCKER findings**, asks before proceeding on MAJOR, proceeds clean on MINOR/NIT
+5. Runs Vercel CLI deploy
+6. Verifies production URL responds
+
+For a genuine emergency only (prod down, security hotfix), pass `--skip-review` to bypass step 3.
+
+**Manual fallback — direct Vercel CLI:**
 ```powershell
 vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
 ```
