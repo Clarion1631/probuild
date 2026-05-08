@@ -20,10 +20,7 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
     const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
     const lastAmount = rm(balanceDue - fixedUnpaidSum - allButLastSum);
 
-    if (lastAmount < 0) {
-        unpaidPct.forEach(s => { s.amount = String(rm(total * ((parseFloat(s.percentage) || 0) / 100))); });
-        return cloned;
-    }
+    if (lastAmount < 0) return cloned;
 
     allButLast.forEach((s, i) => { s.amount = String(allButLastAmounts[i]); });
     unpaidPct[unpaidPct.length - 1].amount = String(lastAmount);
