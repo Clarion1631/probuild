@@ -45,8 +45,8 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 1. Pick next session from ProbuildTodo.md
 2. Make changes
 3. npm run build          # must pass 0 errors
-4. git push origin main
-5. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
+4. git push origin main   # does NOT auto-deploy (auto-deploy is OFF)
+5. Deploy via CLI — see "Deploying to Vercel" section below
 6. Click through affected pages on prod to verify
 7. Mark items done in ProbuildTodo.md
 ```
@@ -63,15 +63,38 @@ stripe trigger payment_intent.succeeded
 ```
 
 ## Deploying to Vercel (CLI only — auto-deploy is OFF)
+
+**One command — copy/paste exactly:**
 ```powershell
-# Production deploy (from the main repo dir, not a worktree):
 vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
 ```
-- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
-- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
-- `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
-- Only deploy when changes are verified locally via `npm run build`
-- Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
+
+**Why these specific flags:**
+- `--prod` — deploys to production (no flag = preview deploy)
+- `--token $env:VERCEL_TOKEN` — auth via env var (already set in Windows)
+- `--yes` — skip interactive confirmation prompts
+- `--archive=tgz` — **required** because project has >15,000 files (Vercel API limit)
+- `--cwd "C:\..."` — **must point to the main repo**, NOT a worktree. Worktrees aren't linked to the Vercel project, so deploys from them create junk projects (e.g. the orphan `loving-snyder-*` projects).
+
+**Why auto-deploy is disabled:**
+- `vercel.json` has `"git": { "deploymentEnabled": false }` — set after a $250 Vercel bill from `git push` triggering builds on every commit
+- `git push origin main` no longer triggers a deploy. You MUST run the CLI command above.
+- Do NOT re-enable auto-deploy in `vercel.json` or the Vercel dashboard
+
+**Pre-deploy checklist:**
+1. `npm run build` passes locally with 0 errors
+2. Latest changes committed and pushed to `main`
+3. Run the deploy command above from any directory (the `--cwd` handles location)
+4. Wait ~3-5 minutes for typecheck + Next.js build + deploy
+5. Verify live: https://probuild.goldentouchremodeling.com
+
+**What's excluded from the upload:** see `.vercelignore` in the repo root. Excludes `.claude/` (20GB of worktrees), `node_modules`, `.next`, test artifacts. Without this, uploads are 1.2GB+; with it, ~25MB.
+
+**Troubleshooting:**
+- "missing_archive: files should NOT have more than 15000 items" — you forgot `--archive=tgz`
+- "missing_scope" — token works, but add `--scope justins-projects-a2347a8d` if it can't auto-detect
+- Deploy creates a new project named after the directory (e.g. `loving-snyder-740c8b`) — you ran from a worktree, not the main repo. Delete the junk project on Vercel and re-run with correct `--cwd`.
+- "NEXTAUTH_SECRET must be set" — same root cause as above; you deployed to a wrong project that lacks env vars
 
 ## Dev server — clean start
 ```bash
