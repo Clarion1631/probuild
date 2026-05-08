@@ -63,14 +63,13 @@ stripe trigger payment_intent.succeeded
 ```
 
 ## Deploying to Vercel (CLI only — auto-deploy is OFF)
-```bash
-# Preview deploy:
-vercel --token $env:VERCEL_TOKEN
-
-# Production deploy:
-vercel --prod --token $env:VERCEL_TOKEN
+```powershell
+# Production deploy (from the main repo dir, not a worktree):
+vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
 ```
-- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs
+- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
+- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
+- `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
 - Only deploy when changes are verified locally via `npm run build`
 - Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
 

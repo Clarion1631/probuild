@@ -1,0 +1,40 @@
+# .vercelignore — replaces .gitignore for Vercel CLI deploys
+# When this file exists, .gitignore is NOT used by Vercel.
+
+# Dependencies (installed on Vercel's build machines)
+node_modules
+
+# Build output (rebuilt on Vercel)
+.next
+out
+build
+
+# Claude Code artifacts (worktrees alone are 20+ GB)
+.claude
+
+# Test/QA artifacts
+test-results
+qa-report
+qa-screenshots
+.playwright-mcp
+e2e/.auth
+
+# Large non-source directories
+output
+estimatesamples
+graphify-out
+.remember
+scripts/vendor
+
+# Environment / secrets
+.env
+.env.*
+config.py
+__pycache__
+
+# Misc
+.DS_Store
+*.pem
+.vercel
+*.tsbuildinfo
+coverage
