@@ -3,6 +3,33 @@
 /** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
 const rm = (n: number) => Math.round(n * 100) / 100;
 
+/** Recalculate percentage-based milestone amounts with the last one absorbing rounding residual */
+function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
+    const cloned = schedules.map(s => ({ ...s }));
+    const unpaidPct = cloned.filter(s => (parseFloat(s.percentage) || 0) > 0 && s.status !== "Paid");
+    if (unpaidPct.length === 0) return cloned;
+
+    const paidSum = cloned.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const balanceDue = rm(total - paidSum);
+    const fixedUnpaidSum = cloned
+        .filter(s => (parseFloat(s.percentage) || 0) <= 0 && s.status !== "Paid")
+        .reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+
+    const allButLast = unpaidPct.slice(0, -1);
+    const allButLastAmounts = allButLast.map(s => rm(total * ((parseFloat(s.percentage) || 0) / 100)));
+    const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
+    const lastAmount = rm(balanceDue - fixedUnpaidSum - allButLastSum);
+
+    if (lastAmount < 0) {
+        unpaidPct.forEach(s => { s.amount = String(rm(total * ((parseFloat(s.percentage) || 0) / 100))); });
+        return cloned;
+    }
+
+    allButLast.forEach((s, i) => { s.amount = String(allButLastAmounts[i]); });
+    unpaidPct[unpaidPct.length - 1].amount = String(lastAmount);
+    return cloned;
+}
+
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates } from "@/lib/actions";
 import { useRouter } from "next/navigation";
@@ -488,17 +515,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
 
-    // Auto-recalculate percentage-based milestones when total changes
+    // Auto-recalculate percentage-based milestones when total changes (last absorbs rounding residual)
     useEffect(() => {
         setPaymentSchedules(prev => {
             if (prev.length === 0) return prev;
-            const updated = prev.map(s => {
-                const pct = parseFloat(s.percentage) || 0;
-                if (pct > 0 && s.status !== "Paid") {
-                    return { ...s, amount: String(rm(total * (pct / 100))) };
-                }
-                return s;
-            });
+            const updated = recalcMilestoneAmounts(prev, total);
             const changed = updated.some((s, i) => s.amount !== prev[i].amount);
             return changed ? updated : prev;
         });
@@ -1062,9 +1083,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     function updatePaymentSchedule(index: number, field: string, value: any) {
         const newSchedules = [...paymentSchedules];
         if (field === "percentage") {
-            const pct = parseFloat(value) || 0;
-            newSchedules[index].percentage = value;
-            newSchedules[index].amount = String(rm(total * (pct / 100)));
+            newSchedules[index] = { ...newSchedules[index], percentage: value };
+            const recalced = recalcMilestoneAmounts(newSchedules, total);
+            setPaymentSchedules(recalced);
+            return;
         } else if (field === "amount") {
             newSchedules[index].amount = value;
             if (total > 0 && value !== "") {
