@@ -10,6 +10,7 @@ import PortalPayInFullButton from "@/components/PortalPayInFullButton";
 import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
+import { buildPdf } from "@/lib/build-pdf";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -64,123 +65,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         }
     }, [initialEstimate.id, isCapture]);
 
-    // Shared helper: build a paginated jsPDF from an element
-    async function buildPdf(element: HTMLElement): Promise<import("jspdf").jsPDF> {
-        const { toJpeg } = await import("html-to-image");
-        const { jsPDF } = await import("jspdf");
-
-        const pdf = new jsPDF("p", "mm", "a4");
-        const pageW = pdf.internal.pageSize.getWidth();   // 210 mm
-        const pageH = pdf.internal.pageSize.getHeight();  // 297 mm
-        const marginTop = 0;
-        const marginBottom = 6;   // just enough for page number at bottom
-        const bannerH = 8;        // continuation banner height on pages 2+
-        const usableH = pageH - marginBottom; // ~291 mm per page
-        const effectiveH = usableH - bannerH; // 283 mm — accounts for banner on page 2+
-
-        // ── Step 1: Measure row positions BEFORE rendering ────────────────
-        // CSS px relative to the element's top-left — scroll-independent
-        const elTop = element.getBoundingClientRect().top + window.scrollY;
-        const cssToMm = pageW / element.offsetWidth;
-        const totalHeightMm = element.offsetHeight * cssToMm;
-
-        // Every element with data-pdf-row must not be cut through
-        const rowEls = Array.from(element.querySelectorAll("[data-pdf-row]"));
-        const rowsMm = rowEls.map(row => {
-            const r = row.getBoundingClientRect();
-            return {
-                top:    (r.top    + window.scrollY - elTop) * cssToMm,
-                bottom: (r.bottom + window.scrollY - elTop) * cssToMm,
-            };
-        });
-
-        // ── Step 2: Find safe page-break points (always between rows) ─────
-        const breaks: number[] = [0]; // start-mm of each page's content slice
-        let cursor = 0;
-        while (cursor < totalHeightMm) {
-            const limit = cursor + effectiveH;
-            if (limit >= totalHeightMm) break;
-
-            // Walk rows: track the bottom of the last row that fits entirely,
-            // then snap the break there (not to row.top-1, which can cut the previous row).
-            let safeBreak = limit;
-            let lastFitBottom = cursor;
-            for (const row of rowsMm) {
-                if (row.top <= cursor) continue; // already past
-                if (row.bottom <= limit) {
-                    lastFitBottom = row.bottom;  // this row fits — remember it
-                } else {
-                    // This row overflows — break after the last row that fit
-                    safeBreak = Math.max(cursor + 1, lastFitBottom);
-                    break;
-                }
-            }
-            // Guard: if no rows fit (single row taller than effectiveH), force a full-page
-            // advance so the while loop doesn't stall at cursor+1 indefinitely.
-            if (safeBreak <= cursor) safeBreak = limit;
-            breaks.push(safeBreak);
-            cursor = safeBreak;
-        }
-        breaks.push(totalHeightMm);
-
-        // ── Step 3: Render full element at 2× ────────────────────────────
-        const imgData = await toJpeg(element, { quality: 0.95, pixelRatio: 2 });
-
-        const img = new Image();
-        img.src = imgData;
-        await new Promise<void>((resolve, reject) => {
-            img.onload = () => resolve();
-            img.onerror = () => reject(new Error("img load failed"));
-        });
-
-        const pxPerMm = img.width / pageW; // rendered px per mm
-        const totalPages = breaks.length - 1;
-
-        // ── Step 4: Slice at safe break points and add pages ─────────────
-        for (let page = 0; page < totalPages; page++) {
-            if (page > 0) pdf.addPage();
-
-            const startMm = breaks[page];
-            const sliceHMm = breaks[page + 1] - startMm;
-            const srcY = Math.round(startMm * pxPerMm);
-            const srcH = Math.round(sliceHMm * pxPerMm);
-
-            const slice = document.createElement("canvas");
-            slice.width  = img.width;
-            slice.height = Math.max(1, srcH);
-            const ctx = slice.getContext("2d")!;
-            ctx.fillStyle = "#ffffff";
-            ctx.fillRect(0, 0, slice.width, slice.height);
-            ctx.drawImage(img, 0, srcY, img.width, srcH, 0, 0, img.width, srcH);
-
-            // Content starts below banner on pages 2+ so banner doesn't overlap it
-            const contentY = page > 0 ? bannerH : 0;
-            pdf.addImage(slice.toDataURL("image/jpeg", 0.92), "JPEG", 0, contentY, pageW, sliceHMm);
-
-            // Page number — small text in bottom margin strip
-            pdf.setFont("helvetica", "normal");
-            pdf.setFontSize(7);
-            pdf.setTextColor(180, 180, 180);
-            pdf.text(`Page ${page + 1} of ${totalPages}`, pageW / 2, pageH - 1.5, { align: "center" });
-
-            // Continuation banner on pages 2+ — overlaid on top of content
-            if (page > 0) {
-                pdf.setFillColor(248, 249, 250);
-                pdf.rect(0, 0, pageW, 8, "F");
-                pdf.setDrawColor(220, 220, 220);
-                pdf.line(0, 8, pageW, 8);
-                pdf.setFont("helvetica", "bold");
-                pdf.setFontSize(7);
-                pdf.setTextColor(110, 110, 110);
-                pdf.text(
-                    `${companyName}  •  Estimate ${initialEstimate.code}  (continued)`,
-                    pageW / 2, 5, { align: "center" }
-                );
-            }
-        }
-
-        return pdf;
-    }
+    const estimateBannerText = `${companySettings?.companyName || "Golden Touch Remodeling"}  •  Estimate ${initialEstimate.code}  (continued)`;
 
     // Capture mode: auto-capture DOM and postMessage PDF to parent
     // C6 — use document.fonts.ready + requestAnimationFrame instead of a hardcoded delay
@@ -214,7 +99,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 return;
             }
             try {
-                const pdf = await buildPdf(element);
+                const pdf = await buildPdf(element, { bannerText: estimateBannerText });
                 const dataUrl = pdf.output("datauristring");
                 // Include the upload token so the parent can authenticate the storage upload
                 window.parent.postMessage({ type: "estimate-capture-done", dataUrl, uploadToken: uploadTokenParam }, window.location.origin);
@@ -236,7 +121,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             const prevBorder = element.style.border;
             element.style.boxShadow = "none";
             element.style.border = "none";
-            const pdf = await buildPdf(element);
+            const pdf = await buildPdf(element, { bannerText: estimateBannerText });
             element.style.boxShadow = prevShadow;
             element.style.border = prevBorder;
             pdf.save(`Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);
@@ -280,7 +165,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
             const element = document.getElementById("estimate-document-wrapper");
             if (element) {
                 try {
-                    const pdf = await buildPdf(element);
+                    const pdf = await buildPdf(element, { bannerText: estimateBannerText });
                     const blob = pdf.output("blob");
                     const fd = new FormData();
                     fd.append("pdf", blob, `Signed_Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);

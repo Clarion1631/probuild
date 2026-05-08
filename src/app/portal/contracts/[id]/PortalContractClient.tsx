@@ -5,8 +5,7 @@ import DOMPurify from "dompurify";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
 import { toast } from "sonner";
-import { toJpeg } from "html-to-image";
-import { jsPDF } from "jspdf";
+import { buildPdf } from "@/lib/build-pdf";
 import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
@@ -177,6 +176,18 @@ export default function PortalContractClient({
         initBtns.forEach(btn => syncBtn(btn, initials, initDefaultHtml));
     }, [signatures, initials, error, isSigned]);
 
+    // Mark top-level block elements with data-pdf-row for smart pagination
+    useEffect(() => {
+        if (!contractBodyRef.current) return;
+        const children = Array.from(contractBodyRef.current.children) as HTMLElement[];
+        children.forEach(child => {
+            child.setAttribute("data-pdf-row", "true");
+        });
+        contractBodyRef.current.querySelectorAll(".doc-block-btn").forEach(el => {
+            (el as HTMLElement).setAttribute("data-pdf-row", "true");
+        });
+    }, [parsedBody, signatures, initials]);
+
     // Handle Modal Finish
     const handleSignBlock = (dataUrl: string, typedName: string) => {
         if (!activeBlockId) return;
@@ -244,32 +255,9 @@ export default function PortalContractClient({
                 element.style.border = "none";
                 element.style.overflow = "visible";
 
-                if (element.scrollHeight > element.offsetHeight + 1) {
-                    console.debug(
-                        "[contract-pdf] wrapper is shorter than its content",
-                        { offsetHeight: element.offsetHeight, scrollHeight: element.scrollHeight }
-                    );
-                }
-
-                const imgData = await toJpeg(element, { quality: 0.92, pixelRatio: 1.5 });
-
-                const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
-                const pageW = pdf.internal.pageSize.getWidth();
-                const pageH = pdf.internal.pageSize.getHeight();
-                const margin = 20;
-                const usableH = pageH - margin;
-                const imgProps = pdf.getImageProperties(imgData);
-                const scaledTotalH = (imgProps.height * pageW) / imgProps.width;
-
-                let rendered = 0;
-                let pageIdx = 0;
-                while (rendered < scaledTotalH && pageIdx < 30) {
-                    if (pageIdx > 0) pdf.addPage();
-                    pdf.addImage(imgData, "JPEG", 0, -rendered, pageW, scaledTotalH);
-                    rendered += usableH;
-                    pageIdx++;
-                }
-
+                const pdf = await buildPdf(element, {
+                    bannerText: `${companyName}  •  ${initialContract.title}  (continued)`,
+                });
                 pdfBlob = pdf.output('blob');
             } finally {
                 element.style.boxShadow = prevShadow;
@@ -434,7 +422,7 @@ export default function PortalContractClient({
 
                     {/* Signed Badge */}
                     {isSigned && initialContract.approvedBy && (
-                        <div className="mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
+                        <div data-pdf-row="true" className="mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
                             <div className="flex items-start gap-3">
                                 <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">
                                     <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
@@ -454,7 +442,7 @@ export default function PortalContractClient({
                     )}
 
                     {/* Contract Title */}
-                    <div className="px-10 pt-8 pb-2">
+                    <div data-pdf-row="true" className="px-10 pt-8 pb-2">
                         <h2 className="text-xl font-bold text-slate-800 text-center">{initialContract.title}</h2>
                         <div className="w-16 h-0.5 bg-slate-300 mx-auto mt-3"></div>
                     </div>
@@ -607,7 +595,7 @@ export default function PortalContractClient({
                     )}
 
                     {/* Footer */}
-                    <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
+                    <div data-pdf-row="true" className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This document was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
                         </p>
