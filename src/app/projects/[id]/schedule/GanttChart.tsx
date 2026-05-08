@@ -55,11 +55,11 @@ const STATUS_COLORS: Record<string, string> = {
 };
 const PRESET_COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
 
-function getDaysBetween(a: Date, b: Date) { return Math.ceil((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)); }
-function addDays(date: Date, days: number) { const d = new Date(date); d.setDate(d.getDate() + days); return d; }
+function getDaysBetween(a: Date, b: Date) { return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)); }
+function addDays(date: Date, days: number) { const d = new Date(date.getTime()); d.setUTCDate(d.getUTCDate() + days); return d; }
 function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
-function getMonday(d: Date) { const day = d.getDay(); const diff = d.getDate() - day + (day === 0 ? -6 : 1); return new Date(d.setDate(diff)); }
-function isWeekend(d: Date) { const day = d.getDay(); return day === 0 || day === 6; }
+function getMonday(d: Date) { const copy = new Date(d.getTime()); const day = copy.getUTCDay(); const diff = day === 0 ? -6 : 1 - day; copy.setUTCDate(copy.getUTCDate() + diff); return copy; }
+function isWeekend(d: Date) { const day = d.getUTCDay(); return day === 0 || day === 6; }
 function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
 function formatCurrency(n: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n); }
 
@@ -246,7 +246,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const allDates = tasks.flatMap(t => [new Date(t.startDate), new Date(t.endDate)]);
     const today = new Date();
     if (allDates.length === 0) { allDates.push(addDays(today, -14), addDays(today, 60)); }
-    const minDate = addDays(new Date(Math.min(...allDates.map(d => d.getTime()))), -14);
+    const rawMin = addDays(new Date(Math.min(...allDates.map(d => d.getTime()))), -14);
+    const minDate = getMonday(rawMin); // Snap to Monday so bars and week headers share the same origin
     const maxDate = addDays(new Date(Math.max(...allDates.map(d => d.getTime()))), 30);
     const totalDays = getDaysBetween(minDate, maxDate);
     const colWidth = zoom === "day" ? 40 : zoom === "week" ? 20 : 8;
@@ -256,23 +257,23 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     function getHeaders() {
         const headers: { label: string; span: number; key: string }[] = [];
         if (zoom === "month") {
-            let cursor = new Date(minDate);
+            let cursor = new Date(minDate.getTime());
             while (cursor < maxDate) {
-                const monthEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
+                const monthEnd = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0));
                 const end = monthEnd > maxDate ? maxDate : monthEnd;
-                headers.push({ label: cursor.toLocaleString("en", { month: "short" }), span: getDaysBetween(cursor, end) + 1, key: `m-${cursor.getMonth()}-${cursor.getFullYear()}` });
-                cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+                headers.push({ label: cursor.toLocaleString("en", { month: "short", timeZone: "UTC" }), span: getDaysBetween(cursor, end) + 1, key: `m-${cursor.getUTCMonth()}-${cursor.getUTCFullYear()}` });
+                cursor = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
             }
         } else if (zoom === "week") {
-            let cursor = getMonday(new Date(minDate));
+            let cursor = new Date(minDate.getTime()); // minDate is already snapped to Monday
             while (cursor < maxDate) {
-                headers.push({ label: cursor.toLocaleDateString("en", { month: "short", day: "numeric" }).toUpperCase(), span: 7, key: `w-${formatDate(cursor)}` });
+                headers.push({ label: cursor.toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }).toUpperCase(), span: 7, key: `w-${formatDate(cursor)}` });
                 cursor = addDays(cursor, 7);
             }
         } else {
-            let cursor = new Date(minDate);
+            let cursor = new Date(minDate.getTime());
             while (cursor < maxDate) {
-                headers.push({ label: cursor.getDate().toString(), span: 1, key: `d-${formatDate(cursor)}` });
+                headers.push({ label: cursor.getUTCDate().toString(), span: 1, key: `d-${formatDate(cursor)}` });
                 cursor = addDays(cursor, 1);
             }
         }
