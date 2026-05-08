@@ -4349,9 +4349,9 @@ export async function getScheduleTasks(projectId: string) {
 
 export async function getEstimateItemsForProject(projectId: string) {
     return prisma.estimateItem.findMany({
-        where: { estimate: { projectId }, parentId: null },
+        where: { estimate: { projectId }, type: { not: "Section" } },
         orderBy: { order: "asc" },
-        select: { id: true, name: true, type: true, total: true, estimateId: true },
+        select: { id: true, name: true, type: true, total: true, estimateId: true, parentId: true, parent: { select: { name: true } } },
     });
 }
 

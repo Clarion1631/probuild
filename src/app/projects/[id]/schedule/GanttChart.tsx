@@ -14,7 +14,7 @@ import {
 import { toast } from "sonner";
 
 type EstimateSummary = { id: string; title: string; status: string };
-type EstimateItemSummary = { id: string; name: string; type: string; total: number; estimateId: string };
+type EstimateItemSummary = { id: string; name: string; type: string; total: number; estimateId: string; parentId?: string | null; parent?: { name: string } | null };
 type Dependency = { id: string; predecessorId: string; dependentId: string };
 type TeamMember = { id: string; name: string | null; email: string };
 type PunchItem = { id: string; name: string; completed: boolean; order: number };
@@ -1074,14 +1074,32 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                                 <div className="relative">
                                                     <button onClick={() => setShowEstimateLinkMenu(v => !v)} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Link</button>
                                                     {showEstimateLinkMenu && (
-                                                        <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] max-h-60 overflow-y-auto py-1 animate-in fade-in">
-                                                            {estimateItems.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No estimate items found</div>}
-                                                            {estimateItems.map(item => (
-                                                                <button key={item.id} onClick={() => handleLinkEstimateItem(selectedTask.id, item)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs">
-                                                                    <div className="font-medium truncate">{item.name}</div>
-                                                                    <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
-                                                                </button>
-                                                            ))}
+                                                        <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] max-h-60 overflow-y-auto py-1 animate-in fade-in">
+                                                            {estimateItems.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No estimate line items found.<br /><span className="text-slate-300">Add items to an estimate first.</span></div>}
+                                                            {(() => {
+                                                                const grouped = new Map<string, EstimateItemSummary[]>();
+                                                                for (const item of estimateItems) {
+                                                                    const key = item.parent?.name ?? "";
+                                                                    if (!grouped.has(key)) grouped.set(key, []);
+                                                                    grouped.get(key)!.push(item);
+                                                                }
+                                                                const sections = Array.from(grouped.entries()).sort((a, b) => {
+                                                                    if (a[0] === "") return -1;
+                                                                    if (b[0] === "") return 1;
+                                                                    return a[0].localeCompare(b[0]);
+                                                                });
+                                                                return sections.map(([sectionName, sectionItems]) => (
+                                                                    <div key={sectionName || "__ungrouped"}>
+                                                                        {sectionName && <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 sticky top-0">{sectionName}</div>}
+                                                                        {sectionItems.map(item => (
+                                                                            <button key={item.id} onClick={() => handleLinkEstimateItem(selectedTask.id, item)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs">
+                                                                                <div className="font-medium truncate">{item.name}</div>
+                                                                                <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
+                                                                            </button>
+                                                                        ))}
+                                                                    </div>
+                                                                ));
+                                                            })()}
                                                         </div>
                                                     )}
                                                 </div>
