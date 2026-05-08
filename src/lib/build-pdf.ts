@@ -21,12 +21,25 @@ export async function buildPdf(
     const usableH = pageH - marginBottom;
     const effectiveH = usableH - bannerH;
 
-    // Step 1: Measure row positions BEFORE rendering
+    // Step 1: Measure row positions BEFORE rendering. Filter rules:
+    // - Skip elements with [data-pdf-skip] (e.g. action buttons not meant to be captured)
+    // - Skip elements whose ancestor is also marked as a row (prevents nested-row
+    //   shrinkage: a paragraph fits, then its child button shows a smaller bottom
+    //   and breaks land inside the paragraph)
     const elTop = element.getBoundingClientRect().top + window.scrollY;
     const cssToMm = pageW / element.offsetWidth;
     const totalHeightMm = element.offsetHeight * cssToMm;
 
-    const rowEls = Array.from(element.querySelectorAll("[data-pdf-row]"));
+    const allRowEls = Array.from(element.querySelectorAll("[data-pdf-row]")) as HTMLElement[];
+    const rowEls = allRowEls.filter(el => {
+        if (el.closest("[data-pdf-skip]")) return false;
+        let parent = el.parentElement;
+        while (parent && parent !== element) {
+            if (parent.hasAttribute("data-pdf-row")) return false;
+            parent = parent.parentElement;
+        }
+        return true;
+    });
     const rowsMm = rowEls.map(row => {
         const r = row.getBoundingClientRect();
         return {
@@ -44,12 +57,17 @@ export async function buildPdf(
 
         let safeBreak = limit;
         let lastFitBottom = cursor;
+        let anyRowFit = false;
         for (const row of rowsMm) {
             if (row.top <= cursor) continue;
             if (row.bottom <= limit) {
-                lastFitBottom = row.bottom;
+                lastFitBottom = Math.max(lastFitBottom, row.bottom);
+                anyRowFit = true;
             } else {
-                safeBreak = Math.max(cursor + 1, lastFitBottom);
+                // Row overflows. If any row fit on this page, break after the last
+                // one. If none fit (oversized first row), fall back to the fixed
+                // page advance to avoid 1mm-at-a-time pathological pagination.
+                safeBreak = anyRowFit ? lastFitBottom : limit;
                 break;
             }
         }
@@ -59,8 +77,14 @@ export async function buildPdf(
     }
     breaks.push(totalHeightMm);
 
-    // Step 3: Render full element at high resolution
-    const imgData = await toJpeg(element, { quality, pixelRatio });
+    // Step 3: Render full element at high resolution. Filter excludes
+    // [data-pdf-skip] subtrees from the captured image.
+    const imgData = await toJpeg(element, {
+        quality,
+        pixelRatio,
+        filter: (node: HTMLElement) =>
+            !(node.nodeType === 1 && node.hasAttribute && node.hasAttribute("data-pdf-skip")),
+    });
 
     const img = new Image();
     img.src = imgData;

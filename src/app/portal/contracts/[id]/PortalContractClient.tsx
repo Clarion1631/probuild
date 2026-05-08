@@ -176,15 +176,29 @@ export default function PortalContractClient({
         initBtns.forEach(btn => syncBtn(btn, initials, initDefaultHtml));
     }, [signatures, initials, error, isSigned]);
 
-    // Mark top-level block elements with data-pdf-row for smart pagination
+    // Mark elements with data-pdf-row for smart pagination. Lists and tables
+    // are marked at the row level (li/tr) instead of the container so a long
+    // list/table doesn't become one oversized row that forces pathological
+    // page advances. The buildPdf algorithm filters out nested rows, so it's
+    // safe to mark both a paragraph and a child element — but we don't mark
+    // doc-block-btn buttons since they're typically inline within paragraphs.
     useEffect(() => {
         if (!contractBodyRef.current) return;
-        const children = Array.from(contractBodyRef.current.children) as HTMLElement[];
+        const root = contractBodyRef.current;
+        const children = Array.from(root.children) as HTMLElement[];
         children.forEach(child => {
-            child.setAttribute("data-pdf-row", "true");
-        });
-        contractBodyRef.current.querySelectorAll(".doc-block-btn").forEach(el => {
-            (el as HTMLElement).setAttribute("data-pdf-row", "true");
+            const tag = child.tagName.toLowerCase();
+            if (tag === "ul" || tag === "ol") {
+                Array.from(child.children).forEach(li => {
+                    (li as HTMLElement).setAttribute("data-pdf-row", "true");
+                });
+            } else if (tag === "table") {
+                child.querySelectorAll("tr").forEach(tr => {
+                    (tr as HTMLElement).setAttribute("data-pdf-row", "true");
+                });
+            } else {
+                child.setAttribute("data-pdf-row", "true");
+            }
         });
     }, [parsedBody, signatures, initials]);
 
@@ -558,7 +572,7 @@ export default function PortalContractClient({
 
                     {/* Final Submission Block */}
                     {!isSigned && (
-                        <div className="px-10 pb-10 print:hidden">
+                        <div data-pdf-skip="true" className="px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 {awaitingContractor && (
                                     <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl mb-4 flex items-center gap-3">
