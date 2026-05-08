@@ -28,7 +28,7 @@
 ## Stack
 - Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
 - Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
-- Vercel auto-deploys on push to `main`
+- Auto-deploy is **disabled**. Deploy manually via `vercel --prod`
 
 ## Product Vision
 See **VISION.md** — AI-first remodeling platform. Every feature should ask: "What can AI do here so the human doesn't have to?"
@@ -45,9 +45,10 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 1. Pick next session from ProbuildTodo.md
 2. Make changes
 3. npm run build          # must pass 0 errors
-4. git push origin main   # triggers Vercel deploy
-5. Click through affected pages on prod to verify
-6. Mark items done in ProbuildTodo.md
+4. git push origin main
+5. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
+6. Click through affected pages on prod to verify
+7. Mark items done in ProbuildTodo.md
 ```
 
 **Error diagnosis (Sentry)**
@@ -60,6 +61,18 @@ sentry-cli issues list --org golden-touch-remodeling --project <project> --outpu
 stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
 stripe trigger payment_intent.succeeded
 ```
+
+## Deploying to Vercel (CLI only — auto-deploy is OFF)
+```bash
+# Preview deploy:
+vercel --token $env:VERCEL_TOKEN
+
+# Production deploy:
+vercel --prod --token $env:VERCEL_TOKEN
+```
+- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs
+- Only deploy when changes are verified locally via `npm run build`
+- Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
 
 ## Dev server — clean start
 ```bash
