@@ -54,6 +54,7 @@ const STATUS_COLORS: Record<string, string> = {
     "Blocked": "bg-red-100 text-red-700",
 };
 const PRESET_COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
+const DRAG_THRESHOLD_PX = 5;
 
 function getDaysBetween(a: Date, b: Date) { return Math.ceil((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)); }
 function addDays(date: Date, days: number) { const d = new Date(date); d.setDate(d.getDate() + days); return d; }
@@ -157,9 +158,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [isPublished, setIsPublished] = useState(false);
     const [isPublishing, setIsPublishing] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
-    const [dragState, setDragState] = useState<{
-        taskId: string; type: "move" | "resize-left" | "resize-right"; startX: number; origStart: Date; origEnd: Date;
-    } | null>(null);
+    const dragRef = useRef<{ cleanup: () => void } | null>(null);
+    const tasksRef = useRef<Task[]>([]);
 
     const selectedTask = tasks.find(t => t.id === selectedTaskId);
 
@@ -306,67 +306,10 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const headers = getHeaders();
     const weekendCols = getWeekendColumns();
 
-    // --- Drag handlers (mouse) ---
-    const handleMouseDown = useCallback((e: React.MouseEvent, taskId: string, type: "move" | "resize-left" | "resize-right") => {
-        e.preventDefault();
-        const task = tasks.find(t => t.id === taskId);
-        if (!task) return;
-        setDragState({ taskId, type, startX: e.clientX, origStart: new Date(task.startDate), origEnd: new Date(task.endDate) });
-    }, [tasks]);
-
-    // --- Touch drag handlers ---
-    const handleTouchStart = useCallback((e: React.TouchEvent, taskId: string, type: "move" | "resize-left" | "resize-right") => {
-        e.preventDefault();
-        const task = tasks.find(t => t.id === taskId);
-        if (!task) return;
-        setDragState({ taskId, type, startX: e.touches[0].clientX, origStart: new Date(task.startDate), origEnd: new Date(task.endDate) });
-    }, [tasks]);
-
-    const applyDrag = useCallback((clientX: number) => {
-        if (!dragState) return;
-        const dayDelta = Math.round((clientX - dragState.startX) / colWidth);
-        if (dayDelta === 0) return;
-        setTasks(prev => prev.map(t => {
-            if (t.id !== dragState.taskId) return t;
-            const isMilestone = t.type === "milestone";
-            if (dragState.type === "move") {
-                const newStart = formatDate(addDays(dragState.origStart, dayDelta));
-                const newEnd = isMilestone ? newStart : formatDate(addDays(dragState.origEnd, dayDelta));
-                return { ...t, startDate: newStart, endDate: newEnd };
-            }
-            if (dragState.type === "resize-right" && !isMilestone) {
-                const ne = addDays(dragState.origEnd, dayDelta);
-                return ne <= new Date(t.startDate) ? t : { ...t, endDate: formatDate(ne) };
-            }
-            if (dragState.type === "resize-left" && !isMilestone) {
-                const ns = addDays(dragState.origStart, dayDelta);
-                return ns >= new Date(t.endDate) ? t : { ...t, startDate: formatDate(ns) };
-            }
-            return t;
-        }));
-    }, [dragState, colWidth]);
-
-    const handleMouseMove = useCallback((e: MouseEvent) => applyDrag(e.clientX), [applyDrag]);
-    const handleTouchMove = useCallback((e: TouchEvent) => { e.preventDefault(); applyDrag(e.touches[0].clientX); }, [applyDrag]);
-
-    const finishDrag = useCallback(async () => {
-        if (!dragState) return;
-        const task = tasks.find(t => t.id === dragState.taskId);
-        if (task) {
-            await updateScheduleTask(dragState.taskId, { startDate: task.startDate, endDate: task.endDate });
-            if (dragState.type === "move") {
-                const dayDelta = getDaysBetween(dragState.origStart, new Date(task.startDate));
-                if (dayDelta !== 0) await cascadeDependents(dragState.taskId, dayDelta);
-            }
-        }
-        setDragState(null);
-    }, [dragState, tasks]);
-
-    const handleMouseUp = useCallback(() => finishDrag(), [finishDrag]);
-    const handleTouchEnd = useCallback(() => finishDrag(), [finishDrag]);
+    useEffect(() => { tasksRef.current = tasks; });
 
     async function cascadeDependents(taskId: string, dayDelta: number) {
-        const deps = tasks.filter(t => t.dependencies.some(d => d.predecessorId === taskId));
+        const deps = tasksRef.current.filter(t => t.dependencies.some(d => d.predecessorId === taskId));
         for (const dep of deps) {
             const ns = formatDate(addDays(new Date(dep.startDate), dayDelta));
             const ne = dep.type === "milestone" ? ns : formatDate(addDays(new Date(dep.endDate), dayDelta));
@@ -376,20 +319,101 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         }
     }
 
-    useEffect(() => {
-        if (dragState) {
-            window.addEventListener("mousemove", handleMouseMove);
-            window.addEventListener("mouseup", handleMouseUp);
-            window.addEventListener("touchmove", handleTouchMove, { passive: false });
-            window.addEventListener("touchend", handleTouchEnd);
-            return () => {
-                window.removeEventListener("mousemove", handleMouseMove);
-                window.removeEventListener("mouseup", handleMouseUp);
-                window.removeEventListener("touchmove", handleTouchMove);
-                window.removeEventListener("touchend", handleTouchEnd);
-            };
+    // Single-flow drag: one set of listeners handles pending (pre-threshold), active (post-threshold),
+    // and finalize (mouseup). 5px threshold prevents accidental drag on click.
+    const startDrag = useCallback((taskId: string, type: "move" | "resize-left" | "resize-right", startX: number, startY: number, isTouch: boolean) => {
+        const task = tasksRef.current.find(t => t.id === taskId);
+        if (!task) return;
+        dragRef.current?.cleanup();
+
+        const origStart = new Date(task.startDate);
+        const origEnd = new Date(task.endDate);
+        const isMilestone = task.type === "milestone";
+        let active = false;
+        let lastDayDelta = 0;
+
+        const apply = (clientX: number) => {
+            const dayDelta = Math.round((clientX - startX) / colWidth);
+            if (dayDelta === lastDayDelta) return;
+            lastDayDelta = dayDelta;
+            setTasks(prev => prev.map(t => {
+                if (t.id !== taskId) return t;
+                if (type === "move") {
+                    const newStart = formatDate(addDays(origStart, dayDelta));
+                    const newEnd = isMilestone ? newStart : formatDate(addDays(origEnd, dayDelta));
+                    return { ...t, startDate: newStart, endDate: newEnd };
+                }
+                if (type === "resize-right" && !isMilestone) {
+                    const ne = addDays(origEnd, dayDelta);
+                    return ne <= new Date(t.startDate) ? t : { ...t, endDate: formatDate(ne) };
+                }
+                if (type === "resize-left" && !isMilestone) {
+                    const ns = addDays(origStart, dayDelta);
+                    return ns >= new Date(t.endDate) ? t : { ...t, startDate: formatDate(ns) };
+                }
+                return t;
+            }));
+        };
+
+        const onMouseMove = (ev: MouseEvent) => {
+            if (!active) {
+                if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) < DRAG_THRESHOLD_PX) return;
+                active = true;
+            }
+            apply(ev.clientX);
+        };
+        const onTouchMove = (ev: TouchEvent) => {
+            if (ev.touches.length !== 1) return;
+            if (!active) {
+                if (Math.abs(ev.touches[0].clientX - startX) + Math.abs(ev.touches[0].clientY - startY) < DRAG_THRESHOLD_PX) return;
+                active = true;
+            }
+            ev.preventDefault();
+            apply(ev.touches[0].clientX);
+        };
+        const onEnd = async () => {
+            cleanup();
+            if (!active) return;
+            const currentTask = tasksRef.current.find(t => t.id === taskId);
+            if (!currentTask) return;
+            await updateScheduleTask(taskId, { startDate: currentTask.startDate, endDate: currentTask.endDate });
+            if (type === "move" && lastDayDelta !== 0) await cascadeDependents(taskId, lastDayDelta);
+        };
+        const cleanup = () => {
+            dragRef.current = null;
+            if (isTouch) {
+                window.removeEventListener("touchmove", onTouchMove);
+                window.removeEventListener("touchend", onEnd);
+                window.removeEventListener("touchcancel", onEnd);
+            } else {
+                window.removeEventListener("mousemove", onMouseMove);
+                window.removeEventListener("mouseup", onEnd);
+            }
+        };
+
+        dragRef.current = { cleanup };
+        if (isTouch) {
+            window.addEventListener("touchmove", onTouchMove, { passive: false });
+            window.addEventListener("touchend", onEnd);
+            window.addEventListener("touchcancel", onEnd);
+        } else {
+            window.addEventListener("mousemove", onMouseMove);
+            window.addEventListener("mouseup", onEnd);
         }
-    }, [dragState, handleMouseMove, handleMouseUp, handleTouchMove, handleTouchEnd]);
+    }, [colWidth]);
+
+    const handleMouseDown = useCallback((e: React.MouseEvent, taskId: string, type: "move" | "resize-left" | "resize-right") => {
+        e.preventDefault();
+        startDrag(taskId, type, e.clientX, e.clientY, false);
+    }, [startDrag]);
+
+    const handleTouchStart = useCallback((e: React.TouchEvent, taskId: string, type: "move" | "resize-left" | "resize-right") => {
+        if (e.touches.length !== 1) return;
+        e.preventDefault();
+        startDrag(taskId, type, e.touches[0].clientX, e.touches[0].clientY, true);
+    }, [startDrag]);
+
+    useEffect(() => { return () => { dragRef.current?.cleanup(); }; }, []);
 
     // Pinch-to-zoom
     const pinchRef = useRef<{ dist: number; zoomed: boolean } | null>(null);
