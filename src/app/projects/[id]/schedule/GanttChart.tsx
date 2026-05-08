@@ -12,105 +12,13 @@ import {
     toggleSchedulePublished, getPortalVisibility,
 } from "@/lib/actions";
 import { toast } from "sonner";
+import type { Task, ZoomLevel, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment } from "./schedule-types";
+import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
+import TaskDetailPanel from "./TaskDetailPanel";
 
-type EstimateSummary = { id: string; title: string; status: string };
-type EstimateItemSummary = { id: string; name: string; type: string; total: number; estimateId: string; parentId?: string | null; parent?: { name: string } | null };
-type Dependency = { id: string; predecessorId: string; dependentId: string };
-type TeamMember = { id: string; name: string | null; email: string };
-type PunchItem = { id: string; name: string; completed: boolean; order: number };
-type Comment = { id: string; text: string; createdAt: string; user: { id: string; name: string | null; email: string } };
-type Assignment = { id: string; userId: string; user: TeamMember };
-type Subcontractor = { id: string; companyName: string; email: string; trade: string | null };
-type SubAssignment = { id: string; subcontractorId: string; subcontractor: Subcontractor };
-
-type Task = {
-    id: string;
-    name: string;
-    startDate: string;
-    endDate: string;
-    color: string;
-    progress: number;
-    status: string;
-    type: "task" | "milestone";
-    assignee: string | null;
-    order: number;
-    estimatedHours: number | null;
-    actualHours: number;
-    dependencies: Dependency[];
-    dependents: Dependency[];
-    assignments?: Assignment[];
-    subAssignments?: SubAssignment[];
-    estimateItemId?: string | null;
-    estimateItem?: EstimateItemSummary | null;
-};
-
-type ZoomLevel = "day" | "week" | "month";
-
-const STATUS_OPTIONS = ["Not Started", "In Progress", "Complete", "Blocked"];
-const STATUS_COLORS: Record<string, string> = {
-    "Not Started": "bg-slate-100 text-slate-700",
-    "In Progress": "bg-blue-100 text-blue-700",
-    "Complete": "bg-green-100 text-green-700",
-    "Blocked": "bg-red-100 text-red-700",
-};
-const PRESET_COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
 const DRAG_THRESHOLD_PX = 5;
 
-function getDaysBetween(a: Date, b: Date) { return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)); }
-function addDays(date: Date, days: number) { const d = new Date(date.getTime()); d.setUTCDate(d.getUTCDate() + days); return d; }
-function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
-function getMonday(d: Date) { const copy = new Date(d.getTime()); const day = copy.getUTCDay(); const diff = day === 0 ? -6 : 1 - day; copy.setUTCDate(copy.getUTCDate() + diff); return copy; }
-function isWeekend(d: Date) { const day = d.getUTCDay(); return day === 0 || day === 6; }
-function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
-function formatCurrency(n: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n); }
-
-// --- Critical Path Algorithm ---
-function computeCriticalPath(tasks: Task[]): Set<string> {
-    if (tasks.length === 0) return new Set();
-    // Build duration map (days) and dependency graph
-    const dur: Record<string, number> = {};
-    const deps: Record<string, string[]> = {}; // task -> its predecessors
-    const successors: Record<string, string[]> = {}; // task -> its dependents
-    for (const t of tasks) {
-        dur[t.id] = Math.max(1, getDaysBetween(new Date(t.startDate), new Date(t.endDate)));
-        deps[t.id] = t.dependencies.map(d => d.predecessorId);
-        successors[t.id] = t.dependents.map(d => d.dependentId);
-    }
-    // Forward pass: earliest finish
-    const ef: Record<string, number> = {};
-    const topoOrder: string[] = [];
-    const visited = new Set<string>();
-    function visit(id: string, stack = new Set<string>()) {
-        if (visited.has(id)) return;
-        if (stack.has(id)) return; // cycle guard
-        stack.add(id);
-        for (const pred of (deps[id] || [])) visit(pred, stack);
-        visited.add(id);
-        topoOrder.push(id);
-    }
-    for (const t of tasks) visit(t.id);
-    for (const id of topoOrder) {
-        const predMaxEF = (deps[id] || []).reduce((m, pid) => Math.max(m, ef[pid] ?? 0), 0);
-        ef[id] = predMaxEF + dur[id];
-    }
-    // Backward pass: latest start
-    const projectEnd = Math.max(...Object.values(ef));
-    const ls: Record<string, number> = {};
-    for (const id of [...topoOrder].reverse()) {
-        const succMinLS = (successors[id] || []).reduce((m, sid) => Math.min(m, ls[sid] ?? Infinity), Infinity);
-        const lf = succMinLS === Infinity ? projectEnd : succMinLS;
-        ls[id] = lf - dur[id];
-    }
-    // Float = ls - (ef - dur) = ls - es
-    const critical = new Set<string>();
-    for (const id of topoOrder) {
-        const es = ef[id] - dur[id];
-        if (ls[id] - es <= 0) critical.add(id);
-    }
-    return critical;
-}
-
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system" }: {
+export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
@@ -118,6 +26,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
     currentUserId?: string;
+    viewMode?: "gantt" | "table";
+    onViewModeChange?: (mode: "gantt" | "table") => void;
 }) {
     const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [zoom, setZoom] = useState<ZoomLevel>("week");
@@ -149,12 +59,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [panelTab, setPanelTab] = useState<"details" | "punch" | "conversation">("details");
     const [punchItems, setPunchItems] = useState<PunchItem[]>([]);
     const [comments, setComments] = useState<Comment[]>([]);
-    const [newPunchName, setNewPunchName] = useState("");
-    const [newComment, setNewComment] = useState("");
     const [isAiPunching, setIsAiPunching] = useState(false);
-    const [showAssignMenu, setShowAssignMenu] = useState(false);
     const [estimateItems, setEstimateItems] = useState<EstimateItemSummary[]>([]);
-    const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
     const [isPublished, setIsPublished] = useState(false);
     const [isPublishing, setIsPublishing] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -235,19 +141,12 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         }
     }, [selectedTaskId]);
 
-    // Load estimate items for linking (lazy)
-    useEffect(() => {
-        if (showEstimateLinkMenu && estimateItems.length === 0) {
-            getEstimateItemsForProject(projectId).then(items => setEstimateItems(items as any));
-        }
-    }, [showEstimateLinkMenu]);
 
     // Timeline range
     const allDates = tasks.flatMap(t => [new Date(t.startDate), new Date(t.endDate)]);
     const today = new Date();
     if (allDates.length === 0) { allDates.push(addDays(today, -14), addDays(today, 60)); }
-    const rawMin = addDays(new Date(Math.min(...allDates.map(d => d.getTime()))), -14);
-    const minDate = getMonday(rawMin); // Snap to Monday so bars and week headers share the same origin
+    const minDate = addDays(new Date(Math.min(...allDates.map(d => d.getTime()))), -14);
     const maxDate = addDays(new Date(Math.max(...allDates.map(d => d.getTime()))), 30);
     const totalDays = getDaysBetween(minDate, maxDate);
     const colWidth = zoom === "day" ? 40 : zoom === "week" ? 20 : 8;
@@ -257,23 +156,23 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     function getHeaders() {
         const headers: { label: string; span: number; key: string }[] = [];
         if (zoom === "month") {
-            let cursor = new Date(minDate.getTime());
+            let cursor = new Date(minDate);
             while (cursor < maxDate) {
-                const monthEnd = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0));
+                const monthEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
                 const end = monthEnd > maxDate ? maxDate : monthEnd;
-                headers.push({ label: cursor.toLocaleString("en", { month: "short", timeZone: "UTC" }), span: getDaysBetween(cursor, end) + 1, key: `m-${cursor.getUTCMonth()}-${cursor.getUTCFullYear()}` });
-                cursor = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
+                headers.push({ label: cursor.toLocaleString("en", { month: "short" }), span: getDaysBetween(cursor, end) + 1, key: `m-${cursor.getMonth()}-${cursor.getFullYear()}` });
+                cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
             }
         } else if (zoom === "week") {
-            let cursor = new Date(minDate.getTime()); // minDate is already snapped to Monday
+            let cursor = getMonday(new Date(minDate));
             while (cursor < maxDate) {
-                headers.push({ label: cursor.toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }).toUpperCase(), span: 7, key: `w-${formatDate(cursor)}` });
+                headers.push({ label: cursor.toLocaleDateString("en", { month: "short", day: "numeric" }).toUpperCase(), span: 7, key: `w-${formatDate(cursor)}` });
                 cursor = addDays(cursor, 7);
             }
         } else {
-            let cursor = new Date(minDate.getTime());
+            let cursor = new Date(minDate);
             while (cursor < maxDate) {
-                headers.push({ label: cursor.getUTCDate().toString(), span: 1, key: `d-${formatDate(cursor)}` });
+                headers.push({ label: cursor.getDate().toString(), span: 1, key: `d-${formatDate(cursor)}` });
                 cursor = addDays(cursor, 1);
             }
         }
@@ -374,10 +273,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         };
         const onEnd = async () => {
             cleanup();
-            if (!active) {
-                if (type === "move") { setSelectedTaskId(taskId); setPanelTab("details"); }
-                return;
-            }
+            if (!active) return;
             const currentTask = tasksRef.current.find(t => t.id === taskId);
             if (!currentTask) return;
             await updateScheduleTask(taskId, { startDate: currentTask.startDate, endDate: currentTask.endDate });
@@ -510,7 +406,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
 
     async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item } : t));
-        setShowEstimateLinkMenu(false);
         await updateScheduleTask(taskId, { estimateItemId: item.id });
         toast.success("Linked to estimate item");
     }
@@ -551,11 +446,10 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     }
 
     // --- Detail Panel ---
-    async function handleAddPunch() {
-        if (!newPunchName.trim() || !selectedTaskId) return;
-        const item = await addTaskPunchItem(selectedTaskId, newPunchName.trim());
+    async function handleAddPunch(name: string) {
+        if (!name || !selectedTaskId) return;
+        const item = await addTaskPunchItem(selectedTaskId, name);
         setPunchItems(prev => [...prev, item as any]);
-        setNewPunchName("");
     }
     async function handleTogglePunch(id: string) { await togglePunchItem(id); setPunchItems(prev => prev.map(p => p.id === id ? { ...p, completed: !p.completed } : p)); }
     async function handleDeletePunch(id: string) { await deletePunchItem(id); setPunchItems(prev => prev.filter(p => p.id !== id)); }
@@ -568,12 +462,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
             toast.success(`✨ AI generated ${items.length} punch items`);
         } catch { toast.error("AI punchlist failed"); } finally { setIsAiPunching(false); }
     }
-    async function handleAddComment() {
-        if (!newComment.trim() || !selectedTaskId) return;
+    async function handleAddComment(text: string) {
+        if (!text || !selectedTaskId) return;
         try {
-            const comment = await addTaskComment(selectedTaskId, currentUserId, newComment.trim());
+            const comment = await addTaskComment(selectedTaskId, currentUserId, text);
             setComments(prev => [...prev, { ...(comment as any), createdAt: new Date().toISOString() }]);
-            setNewComment("");
         } catch { toast.error("Failed to add comment"); }
     }
     async function handleAssign(userId: string) {
@@ -581,7 +474,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         try {
             const assignment = await assignUserToTask(selectedTaskId, userId);
             setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: [...(t.assignments || []), assignment as any] } : t));
-            setShowAssignMenu(false);
             toast.success("Member assigned");
         } catch { toast.error("Already assigned"); }
     }
@@ -595,7 +487,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         try {
             const assignment = await assignSubToTask(selectedTaskId, subcontractorId);
             setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, subAssignments: [...(t.subAssignments || []), assignment as any] } : t));
-            setShowAssignMenu(false);
             toast.success("Subcontractor assigned");
         } catch { toast.error("Already assigned"); }
     }
@@ -613,6 +504,12 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     if (tasks.length === 0) {
         return (
             <div className="flex-1 flex flex-col items-center justify-center bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 gap-6 py-20">
+                {onViewModeChange && (
+                    <div className="flex items-center bg-slate-100 rounded-lg p-0.5">
+                        <button onClick={() => onViewModeChange("gantt")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Gantt</button>
+                        <button onClick={() => onViewModeChange("table")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Table</button>
+                    </div>
+                )}
                 <div className="relative">
                     <div className="w-20 h-20 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-100/50">
                         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="url(#grad)" strokeWidth="1.5">
@@ -682,17 +579,24 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         </div>
                     </div>
                     <div className="flex items-center gap-2 flex-wrap">
+                        {onViewModeChange && (
+                            <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                                <button onClick={() => onViewModeChange("gantt")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="6" y="10" width="12" height="4" rx="1"/><rect x="3" y="16" width="15" height="4" rx="1"/></svg>
+                                    Gantt
+                                </button>
+                                <button onClick={() => onViewModeChange("table")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M9 6v12"/></svg>
+                                    Table
+                                </button>
+                            </div>
+                        )}
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                             {(["day", "week", "month"] as ZoomLevel[]).map(z => (
                                 <button key={z} onClick={() => setZoom(z)} className={`px-3 py-1.5 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>{z}</button>
                             ))}
                         </div>
                         <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 300); }} className="hui-btn hui-btn-secondary text-xs py-1.5 px-3">Today</button>
-                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
-                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
-                            Milestone
-                        </button>
                         {/* Critical Path toggle */}
                         <button
                             onClick={() => setShowCriticalPath(v => !v)}
@@ -749,6 +653,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             )}
                         </div>
+                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
+                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
+                            Milestone
+                        </button>
                         {/* More menu */}
                         <div className="relative">
                             <button onClick={() => setShowMoreMenu(!showMoreMenu)} className="hui-btn hui-btn-secondary text-xs py-1.5 px-2">
@@ -837,7 +746,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                                         {getInitials(a.user.name, a.user.email)}
                                                     </div>
                                                 ))}
-                                                <span className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition cursor-pointer">{task.name}</span>
+                                                <button onClick={e => { if (!linkMode) { e.stopPropagation(); setEditingId(task.id); setEditName(task.name); }}} className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition">{task.name}</button>
                                                 {task.estimateItem && <span className="ml-1 text-[9px] text-blue-500 bg-blue-50 rounded px-1 shrink-0">$</span>}
                                             </div>
                                         )}
@@ -937,6 +846,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         {/* Task Bars / Milestone Diamonds */}
                         {tasks.map((task, idx) => {
                             const bar = getBarStyle(task);
+                            const ap = getAutoProgress(task);
                             const isCritical = showCriticalPath && criticalPathIds.has(task.id);
                             const topY = 44 + idx * ROW_HEIGHT;
 
@@ -980,15 +890,21 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                         onMouseMove={e => { if (task.estimateItem) setTooltipPos({ x: e.clientX, y: e.clientY }); }}
                                         onMouseLeave={() => setHoveredTaskId(null)}
                                     >
+                                        <div className="absolute inset-0 rounded-lg transition-all" style={{ width: `${ap}%`, background: `linear-gradient(135deg, ${task.color}cc, ${task.color}99)` }} />
                                         <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-lg" style={{ backgroundColor: task.color }} />
                                         <div className="relative z-[2] flex items-center justify-between h-full px-2.5 pl-3">
-                                            <span className="text-[10px] font-bold truncate" style={{ color: task.color }}>{task.name}</span>
+                                            <span className="text-[10px] font-bold truncate" style={{ color: ap > 50 ? "#fff" : task.color, textShadow: ap > 50 ? '0 1px 2px rgba(0,0,0,0.15)' : 'none' }}>{task.name}</span>
                                             {(task.assignments || []).length > 0 && bar.width > 80 && (
                                                 <div className="flex -space-x-1.5 ml-1">{(task.assignments || []).slice(0,3).map(a => (
                                                     <div key={a.userId} className="w-5 h-5 rounded-full bg-white text-[7px] font-bold flex items-center justify-center border-2 border-white shadow-sm" style={{ color: task.color }}>{getInitials(a.user.name, a.user.email)}</div>
                                                 ))}</div>
                                             )}
                                         </div>
+                                        {!(task.actualHours > 0 && task.estimatedHours) && (
+                                            <div className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition z-10" title={`${task.progress}%`}>
+                                                <input type="range" min={0} max={100} value={task.progress} onChange={e => handleProgressChange(task.id, parseInt(e.target.value))} onMouseDown={e => e.stopPropagation()} className="w-14 h-1 accent-current cursor-pointer" style={{ accentColor: task.color }} />
+                                            </div>
+                                        )}
                                     </div>
                                     <div className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize z-10 hover:bg-black/10 rounded-r-lg" onMouseDown={e => handleMouseDown(e, task.id, "resize-right")} onTouchStart={e => handleTouchStart(e, task.id, "resize-right")} />
                                 </div>
@@ -1001,225 +917,36 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
 
                 {/* Right Panel — Task Detail */}
                 {selectedTask && (
-                    <div className="w-96 shrink-0 bg-white border-l border-hui-border flex flex-col z-10 shadow-lg animate-in slide-in-from-right-5">
-                        {/* Panel Header */}
-                        <div className="flex items-center justify-between px-4 py-3 border-b border-hui-border bg-slate-50">
-                            <div className="flex items-center gap-2 flex-1 min-w-0">
-                                {selectedTask.type === "milestone" && (
-                                    <div className="w-3 h-3 rotate-45 shrink-0" style={{ backgroundColor: selectedTask.color }} />
-                                )}
-                                <h3 className="text-sm font-bold text-hui-textMain truncate">{selectedTask.name}</h3>
-                            </div>
-                            <button onClick={() => setSelectedTaskId(null)} className="text-slate-400 hover:text-slate-700 p-1 rounded-md hover:bg-slate-100 transition">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                            </button>
-                        </div>
-                        {/* Tabs */}
-                        <div className="flex border-b border-hui-border bg-white">
-                            {(["details", "punch", "conversation"] as const).map(tab => (
-                                <button key={tab} onClick={() => setPanelTab(tab)} className={`flex-1 py-2.5 text-xs font-semibold uppercase tracking-wider transition ${panelTab === tab ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-400 hover:text-slate-600"}`}>
-                                    {tab === "punch" ? "Punch List" : tab === "conversation" ? "Comments" : "Details"}
-                                </button>
-                            ))}
-                        </div>
-                        {/* Tab Content */}
-                        <div className="flex-1 overflow-y-auto p-4">
-                            {panelTab === "details" && (
-                                <div className="space-y-5">
-                                    <div>
-                                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Task Name</label>
-                                        <input
-                                            type="text"
-                                            value={editingId === selectedTask.id ? editName : selectedTask.name}
-                                            onFocus={() => { setEditingId(selectedTask.id); setEditName(selectedTask.name); }}
-                                            onChange={e => setEditName(e.target.value)}
-                                            onBlur={() => handleSaveName(selectedTask.id)}
-                                            onKeyDown={e => { if (e.key === "Enter") handleSaveName(selectedTask.id); }}
-                                            className="hui-input text-sm mt-1 w-full"
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Status</label>
-                                        <select value={selectedTask.status} onChange={e => handleStatusChange(selectedTask.id, e.target.value)} className="hui-input text-sm mt-1 w-full">
-                                            {STATUS_OPTIONS.map(s => (<option key={s} value={s}>{s}</option>))}
-                                        </select>
-                                    </div>
-                                    {selectedTask.type === "milestone" ? (
-                                        <div>
-                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Date</label>
-                                            <input type="date" value={selectedTask.startDate} onChange={e => handleDateChange(selectedTask.id, "startDate", e.target.value)} className="hui-input text-sm mt-1 w-full" />
-                                        </div>
-                                    ) : (
-                                        <>
-                                            <div className="grid grid-cols-2 gap-3">
-                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Start</label><input type="date" value={selectedTask.startDate} onChange={e => handleDateChange(selectedTask.id, "startDate", e.target.value)} className="hui-input text-sm mt-1 w-full" /></div>
-                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">End</label><input type="date" value={selectedTask.endDate} onChange={e => handleDateChange(selectedTask.id, "endDate", e.target.value)} className="hui-input text-sm mt-1 w-full" /></div>
-                                            </div>
-                                            <div>
-                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Estimated Hours</label>
-                                                <input type="number" value={selectedTask.estimatedHours ?? ""} onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) { setTasks(prev => prev.map(t => t.id === selectedTask.id ? { ...t, estimatedHours: v } : t)); updateScheduleTask(selectedTask.id, { estimatedHours: v }); }}} className="hui-input text-sm mt-1 w-full" placeholder="e.g. 40" />
-                                            </div>
-                                        </>
-                                    )}
-                                    {/* Estimate Item Link */}
-                                    <div>
-                                        <div className="flex items-center justify-between mb-2">
-                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Estimate Link</label>
-                                            {selectedTask.estimateItem ? (
-                                                <button onClick={() => handleUnlinkEstimateItem(selectedTask.id)} className="text-[10px] text-red-500 hover:text-red-700 font-semibold transition">Remove</button>
-                                            ) : (
-                                                <div className="relative">
-                                                    <button onClick={() => setShowEstimateLinkMenu(v => !v)} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Link</button>
-                                                    {showEstimateLinkMenu && (
-                                                        <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] max-h-60 overflow-y-auto py-1 animate-in fade-in">
-                                                            {estimateItems.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No estimate line items found.<br /><span className="text-slate-300">Add items to an estimate first.</span></div>}
-                                                            {(() => {
-                                                                const grouped = new Map<string, EstimateItemSummary[]>();
-                                                                for (const item of estimateItems) {
-                                                                    const key = item.parent?.name ?? "";
-                                                                    if (!grouped.has(key)) grouped.set(key, []);
-                                                                    grouped.get(key)!.push(item);
-                                                                }
-                                                                const sections = Array.from(grouped.entries()).sort((a, b) => {
-                                                                    if (a[0] === "") return -1;
-                                                                    if (b[0] === "") return 1;
-                                                                    return a[0].localeCompare(b[0]);
-                                                                });
-                                                                return sections.map(([sectionName, sectionItems]) => (
-                                                                    <div key={sectionName || "__ungrouped"}>
-                                                                        {sectionName && <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 sticky top-0">{sectionName}</div>}
-                                                                        {sectionItems.map(item => (
-                                                                            <button key={item.id} onClick={() => handleLinkEstimateItem(selectedTask.id, item)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs">
-                                                                                <div className="font-medium truncate">{item.name}</div>
-                                                                                <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
-                                                                            </button>
-                                                                        ))}
-                                                                    </div>
-                                                                ));
-                                                            })()}
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            )}
-                                        </div>
-                                        {selectedTask.estimateItem ? (
-                                            <div className="bg-blue-50 rounded-lg px-3 py-2 border border-blue-100">
-                                                <div className="text-xs font-semibold text-blue-800 truncate">{selectedTask.estimateItem.name}</div>
-                                                <div className="flex items-center gap-3 mt-1">
-                                                    <span className="text-[10px] text-blue-600 capitalize">{selectedTask.estimateItem.type}</span>
-                                                    <span className="text-[10px] font-semibold text-blue-700">{formatCurrency(selectedTask.estimateItem.total)} budget</span>
-                                                    {selectedTask.estimatedHours && <span className="text-[10px] text-blue-500">{selectedTask.estimatedHours}h est.</span>}
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            <p className="text-xs text-slate-400 italic">Not linked to an estimate item</p>
-                                        )}
-                                    </div>
-                                    {/* Critical Path indicator */}
-                                    {showCriticalPath && criticalPathIds.has(selectedTask.id) && (
-                                        <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
-                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                                            <span className="text-xs font-semibold text-red-700">On critical path</span>
-                                        </div>
-                                    )}
-                                    {/* Assigned Members */}
-                                    <div>
-                                        <div className="flex items-center justify-between mb-2">
-                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Assigned</label>
-                                            <div className="relative">
-                                                <button onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
-                                                {showAssignMenu && (
-                                                    <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[220px] py-1 animate-in fade-in max-h-60 overflow-y-auto">
-                                                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50">Team Members</div>
-                                                        {teamMembers.filter(m => !(selectedTask.assignments || []).some(a => a.userId === m.id)).map(m => (
-                                                            <button key={m.id} onClick={() => handleAssign(m.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition flex items-center gap-2 text-xs">
-                                                                <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-[9px] font-bold flex items-center justify-center shrink-0">{getInitials(m.name, m.email)}</div>
-                                                                <span className="truncate">{m.name || m.email}</span>
-                                                            </button>
-                                                        ))}
-                                                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 mt-1 border-t border-hui-border">Subcontractors</div>
-                                                        {subcontractors.filter(s => !(selectedTask.subAssignments || []).some(a => a.subcontractorId === s.id)).map(s => (
-                                                            <button key={s.id} onClick={() => handleAssignSub(s.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition flex items-center gap-2 text-xs">
-                                                                <div className="w-6 h-6 rounded-full bg-purple-100 text-purple-700 text-[9px] font-bold flex items-center justify-center shrink-0">{s.companyName.substring(0,2).toUpperCase()}</div>
-                                                                <span className="truncate flex-1">{s.companyName}</span>
-                                                            </button>
-                                                        ))}
-                                                        {teamMembers.length === 0 && subcontractors.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No options found</div>}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
-                                        <div className="space-y-1.5">
-                                            {(selectedTask.assignments || []).map(a => (
-                                                <div key={a.userId} className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2">
-                                                    <div className="w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-bold flex items-center justify-center shrink-0">{getInitials(a.user.name, a.user.email)}</div>
-                                                    <span className="text-xs font-medium text-hui-textMain flex-1 truncate">{a.user.name || a.user.email}</span>
-                                                    <button onClick={() => handleUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition shrink-0">
-                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                    </button>
-                                                </div>
-                                            ))}
-                                            {(selectedTask.subAssignments || []).map(a => (
-                                                <div key={a.subcontractorId} className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2 border-l-2 border-purple-400">
-                                                    <div className="w-7 h-7 rounded-full bg-purple-100 text-purple-700 text-[10px] font-bold flex items-center justify-center shrink-0">{a.subcontractor.companyName.substring(0, 2).toUpperCase()}</div>
-                                                    <span className="text-xs font-medium text-hui-textMain flex-1 truncate">{a.subcontractor.companyName} <span className="text-purple-600/70 ml-1 text-[10px]">(Sub)</span></span>
-                                                    <button onClick={() => handleUnassignSub(a.subcontractorId)} className="text-slate-300 hover:text-red-500 transition shrink-0">
-                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                    </button>
-                                                </div>
-                                            ))}
-                                            {(selectedTask.assignments || []).length === 0 && (selectedTask.subAssignments || []).length === 0 && <p className="text-xs text-slate-400 italic">No one assigned</p>}
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-
-                            {panelTab === "punch" && (
-                                <div className="space-y-3">
-                                    <div className="flex items-center gap-2">
-                                        <button onClick={handleAiPunchlist} disabled={isAiPunching} className={`text-xs flex items-center gap-1 px-2.5 py-1.5 rounded-lg font-medium transition border ${isAiPunching ? "bg-purple-100 text-purple-700 border-purple-300 animate-pulse" : "bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"}`}>
-                                            ✨ {isAiPunching ? "Generating..." : "AI Punchlist"}
-                                        </button>
-                                        <span className="text-[10px] text-slate-400">{punchItems.filter(p => p.completed).length}/{punchItems.length} done</span>
-                                    </div>
-                                    {punchItems.map(item => (
-                                        <div key={item.id} className="flex items-start gap-2 group">
-                                            <button onClick={() => handleTogglePunch(item.id)} className={`mt-0.5 w-4 h-4 rounded border-2 flex items-center justify-center transition shrink-0 ${item.completed ? "bg-green-500 border-green-500 text-white" : "border-slate-300 hover:border-green-400"}`}>
-                                                {item.completed && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M20 6L9 17l-5-5" /></svg>}
-                                            </button>
-                                            <span className={`text-xs flex-1 ${item.completed ? "line-through text-slate-400" : "text-hui-textMain"}`}>{item.name}</span>
-                                            <button onClick={() => handleDeletePunch(item.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition">
-                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                            </button>
-                                        </div>
-                                    ))}
-                                    <div className="flex gap-2 mt-2">
-                                        <input value={newPunchName} onChange={e => setNewPunchName(e.target.value)} onKeyDown={e => { if (e.key === "Enter") handleAddPunch(); }} className="hui-input text-xs flex-1" placeholder="Add punch item..." />
-                                        <button onClick={handleAddPunch} className="hui-btn hui-btn-primary text-xs px-2">+</button>
-                                    </div>
-                                </div>
-                            )}
-
-                            {panelTab === "conversation" && (
-                                <div className="space-y-3">
-                                    {comments.length === 0 && <p className="text-xs text-slate-400 italic text-center py-4">No comments yet</p>}
-                                    {comments.map(c => (
-                                        <div key={c.id} className="flex gap-2">
-                                            <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-[8px] font-bold flex items-center justify-center shrink-0 mt-0.5">{getInitials(c.user.name, c.user.email)}</div>
-                                            <div className="flex-1 min-w-0">
-                                                <div className="flex items-center gap-2"><span className="text-xs font-semibold text-hui-textMain">{c.user.name || c.user.email}</span><span className="text-[9px] text-slate-400">{new Date(c.createdAt).toLocaleDateString()}</span></div>
-                                                <p className="text-xs text-hui-textMuted mt-0.5">{c.text}</p>
-                                            </div>
-                                        </div>
-                                    ))}
-                                    <div className="flex gap-2 mt-3 pt-3 border-t border-hui-border">
-                                        <input value={newComment} onChange={e => setNewComment(e.target.value)} onKeyDown={e => { if (e.key === "Enter") handleAddComment(); }} className="hui-input text-xs flex-1" placeholder="Add a comment..." />
-                                        <button onClick={handleAddComment} className="hui-btn hui-btn-primary text-xs px-3">Send</button>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    </div>
+                    <TaskDetailPanel
+                        task={selectedTask}
+                        onClose={() => setSelectedTaskId(null)}
+                        panelTab={panelTab}
+                        setPanelTab={setPanelTab}
+                        onStatusChange={handleStatusChange}
+                        onDateChange={handleDateChange}
+                        onEstimatedHoursChange={(taskId, hours) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t)); updateScheduleTask(taskId, { estimatedHours: hours }); }}
+                        onDelete={handleDelete}
+                        estimateItems={estimateItems}
+                        onLinkEstimateItem={handleLinkEstimateItem}
+                        onUnlinkEstimateItem={handleUnlinkEstimateItem}
+                        onFetchEstimateItems={() => { if (estimateItems.length === 0) getEstimateItemsForProject(projectId).then(items => setEstimateItems(items as any)); }}
+                        teamMembers={teamMembers}
+                        subcontractors={subcontractors}
+                        onAssign={handleAssign}
+                        onUnassign={handleUnassign}
+                        onAssignSub={handleAssignSub}
+                        onUnassignSub={handleUnassignSub}
+                        punchItems={punchItems}
+                        onAddPunch={handleAddPunch}
+                        onTogglePunch={handleTogglePunch}
+                        onDeletePunch={handleDeletePunch}
+                        onAiPunchlist={handleAiPunchlist}
+                        isAiPunching={isAiPunching}
+                        comments={comments}
+                        onAddComment={handleAddComment}
+                        showCriticalPath={showCriticalPath}
+                        criticalPathIds={criticalPathIds}
+                    />
                 )}
             </div>
 
