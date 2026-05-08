@@ -8,8 +8,9 @@ export async function authorizeFileScope(
     email: string,
     scope: { projectId?: string | null; leadId?: string | null }
 ): Promise<{ user: any } | NextResponse> {
+    if (!email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     const user = await prisma.user.findUnique({
-        where: { email },
+        where: { email: email.toLowerCase() },
         include: { permissions: true },
     });
     if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

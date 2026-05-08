@@ -7,6 +7,7 @@ import { hasPermission } from "@/lib/permissions";
 import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
 
 export const maxDuration = 60;
+export const dynamic = "force-dynamic";
 
 type FileWithFolder = {
     id: string;

@@ -106,11 +106,23 @@ export default function FileBrowser({
         if (folderId) params.set("folderId", folderId);
         if (activeTab !== "all") params.set("visibility", activeTab);
 
-        const res = await fetch(`/api/files?${params}`);
-        const data = await res.json();
-        setFolders(data.folders || []);
-        setFiles(data.files || []);
-        setLoaded(true);
+        try {
+            const res = await fetch(`/api/files?${params}`);
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                console.error("fetchFiles failed:", res.status, err);
+                toast.error(err.error || `Failed to load files (${res.status})`);
+                return;
+            }
+            const data = await res.json();
+            setFolders(data.folders || []);
+            setFiles(data.files || []);
+        } catch (err) {
+            console.error("fetchFiles network error:", err);
+            toast.error("Unable to load files — check your connection");
+        } finally {
+            setLoaded(true);
+        }
     }, [projectId, leadId, currentFolder, activeTab]);
 
     useEffect(() => { fetchFiles(null); }, []);
