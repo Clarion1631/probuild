@@ -124,6 +124,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [editName, setEditName] = useState("");
     const [colorPickerId, setColorPickerId] = useState<string | null>(null);
     const [isAdding, setIsAdding] = useState(false);
+    const [showNewTaskForm, setShowNewTaskForm] = useState(false);
+    const [newTaskType, setNewTaskType] = useState<"task" | "milestone">("task");
+    const [newTaskName, setNewTaskName] = useState("");
+    const [newTaskStart, setNewTaskStart] = useState("");
+    const [newTaskEnd, setNewTaskEnd] = useState("");
     const [isImporting, setIsImporting] = useState(false);
     const [showImportMenu, setShowImportMenu] = useState(false);
     const [isAiGenerating, setIsAiGenerating] = useState(false);
@@ -419,15 +424,48 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     }, []);
 
     // --- Task CRUD ---
-    async function handleAddTask(type: "task" | "milestone" = "task") {
+    function openNewTaskForm(type: "task" | "milestone") {
+        setNewTaskType(type);
+        setNewTaskName(type === "milestone" ? "New Milestone" : "New Task");
+        setNewTaskStart(formatDate(today));
+        setNewTaskEnd(type === "milestone" ? formatDate(today) : formatDate(addDays(today, 5)));
+        setShowNewTaskForm(true);
+    }
+
+    async function handleAddTask() {
+        if (!newTaskName.trim()) { toast.error("Name is required"); return; }
+        if (newTaskType !== "milestone" && newTaskStart > newTaskEnd) {
+            toast.error("End date must be on or after start date"); return;
+        }
         setIsAdding(true);
         try {
-            const start = formatDate(today);
-            const end = type === "milestone" ? start : formatDate(addDays(today, 5));
-            const task = await createScheduleTask(projectId, { name: type === "milestone" ? "New Milestone" : "New Task", startDate: start, endDate: end, type });
-            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
-            toast.success(type === "milestone" ? "Milestone added" : "Task added");
+            const start = newTaskStart;
+            const end = newTaskType === "milestone" ? start : newTaskEnd;
+            const task = await createScheduleTask(projectId, { name: newTaskName.trim(), startDate: start, endDate: end, type: newTaskType });
+            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
+            toast.success(newTaskType === "milestone" ? "Milestone added" : "Task added");
+            setShowNewTaskForm(false);
         } finally { setIsAdding(false); }
+    }
+
+    async function handleDateChange(taskId: string, field: "startDate" | "endDate", value: string) {
+        if (!value) return;
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return;
+        if (task.type === "milestone") {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: value, endDate: value } : t));
+            await updateScheduleTask(taskId, { startDate: value, endDate: value });
+            return;
+        }
+        if (field === "startDate" && value > task.endDate) { toast.error("Start date must be on or before end date"); return; }
+        if (field === "endDate" && value < task.startDate) { toast.error("End date must be on or after start date"); return; }
+        const oldStart = task.startDate;
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, [field]: value } : t));
+        await updateScheduleTask(taskId, { [field]: value });
+        if (field === "startDate" && value !== oldStart) {
+            const dayDelta = getDaysBetween(new Date(oldStart), new Date(value));
+            if (dayDelta !== 0) await cascadeDependents(taskId, dayDelta);
+        }
     }
     async function handleSaveName(taskId: string) { if (editName.trim()) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name: editName.trim() } : t)); await updateScheduleTask(taskId, { name: editName.trim() }); } setEditingId(null); }
     async function handleColorChange(taskId: string, color: string) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color } : t)); setColorPickerId(null); await updateScheduleTask(taskId, { color }); }
@@ -555,7 +593,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     <p className="text-sm text-hui-textMuted mt-2 max-w-md">Add tasks manually, import from an estimate, or let AI generate a smart schedule with dependencies.</p>
                 </div>
                 <div className="flex items-center gap-3 flex-wrap justify-center">
-                    <button onClick={() => handleAddTask("task")} className="hui-btn hui-btn-primary" disabled={isAdding}>+ Add First Task</button>
+                    <button onClick={() => openNewTaskForm("task")} className="hui-btn hui-btn-primary" disabled={isAdding}>+ Add First Task</button>
                     <div className="relative">
                         <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
                             className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
@@ -672,8 +710,8 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             )}
                         </div>
-                        <button onClick={() => handleAddTask("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
-                        <button onClick={() => handleAddTask("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
+                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
+                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
                             <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
                             Milestone
                         </button>
@@ -792,10 +830,32 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             );
                         })}
-                        <button onClick={() => handleAddTask("task")} className="flex items-center px-3 w-full hover:bg-slate-50 transition text-xs text-indigo-500 font-medium gap-2" style={{ height: ROW_HEIGHT }} disabled={isAdding}>
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
-                            {isAdding ? "Adding..." : "Add Task"}
-                        </button>
+                        {showNewTaskForm ? (
+                            <div className="px-3 py-3 border-b border-slate-200 bg-indigo-50/30 space-y-2">
+                                <input autoFocus type="text" value={newTaskName} onChange={e => setNewTaskName(e.target.value)} className="hui-input text-xs w-full" placeholder="Task name" onKeyDown={e => { if (e.key === "Enter") handleAddTask(); if (e.key === "Escape") setShowNewTaskForm(false); }} />
+                                <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label className="text-[9px] font-bold text-slate-400 uppercase">Start</label>
+                                        <input type="date" value={newTaskStart} onChange={e => setNewTaskStart(e.target.value)} className="hui-input text-xs w-full mt-0.5" />
+                                    </div>
+                                    {newTaskType !== "milestone" && (
+                                        <div>
+                                            <label className="text-[9px] font-bold text-slate-400 uppercase">End</label>
+                                            <input type="date" value={newTaskEnd} onChange={e => setNewTaskEnd(e.target.value)} className="hui-input text-xs w-full mt-0.5" />
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex gap-2">
+                                    <button onClick={handleAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-xs flex-1">{isAdding ? "Creating..." : "Create"}</button>
+                                    <button onClick={() => setShowNewTaskForm(false)} className="hui-btn hui-btn-secondary text-xs">Cancel</button>
+                                </div>
+                            </div>
+                        ) : (
+                            <button onClick={() => openNewTaskForm("task")} className="flex items-center px-3 w-full hover:bg-slate-50 transition text-xs text-indigo-500 font-medium gap-2" style={{ height: ROW_HEIGHT }} disabled={isAdding}>
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>
+                                Add Task
+                            </button>
+                        )}
                     </div>
                 </div>
 
@@ -948,13 +1008,13 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                     {selectedTask.type === "milestone" ? (
                                         <div>
                                             <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Date</label>
-                                            <div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.startDate}</div>
+                                            <input type="date" value={selectedTask.startDate} onChange={e => handleDateChange(selectedTask.id, "startDate", e.target.value)} className="hui-input text-sm mt-1 w-full" />
                                         </div>
                                     ) : (
                                         <>
                                             <div className="grid grid-cols-2 gap-3">
-                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Start</label><div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.startDate}</div></div>
-                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">End</label><div className="text-sm font-medium text-hui-textMain mt-1">{selectedTask.endDate}</div></div>
+                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Start</label><input type="date" value={selectedTask.startDate} onChange={e => handleDateChange(selectedTask.id, "startDate", e.target.value)} className="hui-input text-sm mt-1 w-full" /></div>
+                                                <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">End</label><input type="date" value={selectedTask.endDate} onChange={e => handleDateChange(selectedTask.id, "endDate", e.target.value)} className="hui-input text-sm mt-1 w-full" /></div>
                                             </div>
                                             <div>
                                                 <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Estimated Hours</label>
