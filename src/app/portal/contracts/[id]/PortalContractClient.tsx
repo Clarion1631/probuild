@@ -253,7 +253,6 @@ export default function PortalContractClient({
 
         try {
             // Stage 1: Capture DOM BEFORE server action to avoid re-render race.
-            // Signatures are already injected into the DOM via the useEffect sync.
             const element = document.getElementById("contract-document-wrapper");
             if (!element) {
                 throw new Error("Could not locate the contract document for PDF capture. Please refresh and try again.");
@@ -263,6 +262,43 @@ export default function PortalContractClient({
             const prevBorder = element.style.border;
             const prevOverflow = element.style.overflow;
             let pdfBlob: Blob;
+
+            // Pre-capture: replace interactive <button> signature blocks with
+            // inline-styled <img> elements. html-to-image's toJpeg has trouble
+            // rendering dynamically-modified <button> content through its SVG
+            // foreignObject pipeline — the useEffect-injected signature images
+            // don't survive the clone+serialize step. Using inline styles on the
+            // img (not Tailwind classes) ensures reliable capture.
+            const savedBlockHtml = new Map<HTMLElement, { html: string; tag: string }>();
+            if (contractBodyRef.current) {
+                const replaceBlocksForCapture = (
+                    selector: string,
+                    stateMap: Record<string, { image: string; name: string }>,
+                    imgHeight: string,
+                    label: string,
+                ) => {
+                    contractBodyRef.current!.querySelectorAll(selector).forEach(btn => {
+                        const el = btn as HTMLElement;
+                        const id = el.dataset.id;
+                        if (!id || !stateMap[id]) return;
+
+                        // Save original HTML for restoration after capture
+                        savedBlockHtml.set(el, { html: el.innerHTML, tag: el.tagName });
+
+                        // Replace innerHTML with inline-styled img (no Tailwind classes)
+                        el.innerHTML = `<img src="${stateMap[id].image}" alt="${label}" style="height:${imgHeight};object-fit:contain;display:block;margin:4px 0;" />`;
+                        // Override button-specific styling that might interfere
+                        el.style.cursor = "default";
+                        el.style.border = "none";
+                        el.style.background = "transparent";
+                        el.style.padding = "0";
+                        el.style.display = "block";
+                    });
+                };
+
+                replaceBlocksForCapture(".sig-block", signatures, "48px", "Signature");
+                replaceBlocksForCapture(".init-block", initials, "32px", "Initials");
+            }
 
             try {
                 element.style.boxShadow = "none";
@@ -277,6 +313,16 @@ export default function PortalContractClient({
                 element.style.boxShadow = prevShadow;
                 element.style.border = prevBorder;
                 element.style.overflow = prevOverflow;
+
+                // Restore original button HTML after capture
+                savedBlockHtml.forEach(({ html }, el) => {
+                    el.innerHTML = html;
+                    el.style.cursor = "";
+                    el.style.border = "";
+                    el.style.background = "";
+                    el.style.padding = "";
+                    el.style.display = "";
+                });
             }
 
             // Stage 2: Record approval in DB (after DOM is captured)
