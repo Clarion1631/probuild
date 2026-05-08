@@ -434,6 +434,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
 
     async function handleAddTask() {
         if (!newTaskName.trim()) { toast.error("Name is required"); return; }
+        if (!newTaskStart || (newTaskType !== "milestone" && !newTaskEnd)) { toast.error("Dates are required"); return; }
         if (newTaskType !== "milestone" && newTaskStart > newTaskEnd) {
             toast.error("End date must be on or after start date"); return;
         }
@@ -453,8 +454,13 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         const task = tasks.find(t => t.id === taskId);
         if (!task) return;
         if (task.type === "milestone") {
+            const oldStart = task.startDate;
             setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: value, endDate: value } : t));
             await updateScheduleTask(taskId, { startDate: value, endDate: value });
+            if (value !== oldStart) {
+                const dayDelta = getDaysBetween(new Date(oldStart), new Date(value));
+                if (dayDelta !== 0) await cascadeDependents(taskId, dayDelta);
+            }
             return;
         }
         if (field === "startDate" && value > task.endDate) { toast.error("Start date must be on or before end date"); return; }
