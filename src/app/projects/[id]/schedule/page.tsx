@@ -1,6 +1,6 @@
 import { getProject, getScheduleTasks, getTeamMembers, getActiveSubcontractors, getPortalVisibility } from "@/lib/actions";
 import { getSessionOrDev } from "@/lib/auth";
-import GanttChart from "./GanttChart";
+import ScheduleView from "./ScheduleView";
 import SchedulePublishButton from "./SchedulePublishButton";
 
 export const dynamic = "force-dynamic";
@@ -57,7 +57,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
                 />
             </div>
             <div className="flex-1 overflow-hidden">
-                <GanttChart
+                <ScheduleView
                     projectId={id}
                     projectName={project.name}
                     initialTasks={tasks}
