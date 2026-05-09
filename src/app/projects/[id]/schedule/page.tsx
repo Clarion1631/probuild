@@ -44,7 +44,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
     const estimates = (project.estimates || []).map((e: any) => ({ id: e.id, title: e.title, status: e.status }));
 
     return (
-        <div className="flex flex-col h-[calc(100vh-64px)] -m-6 overflow-hidden bg-hui-background">
+        <div className="flex flex-col h-[calc(100%+48px)] -m-6 overflow-hidden bg-hui-background">
             <ScheduleView
                 projectId={id}
                 projectName={project.name}
