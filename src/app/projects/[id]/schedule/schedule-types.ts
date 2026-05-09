@@ -41,4 +41,5 @@ export type ScheduleViewProps = {
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
     currentUserId?: string;
+    initialPublished: boolean;
 };
