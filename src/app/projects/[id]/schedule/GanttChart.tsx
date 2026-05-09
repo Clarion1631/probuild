@@ -597,6 +597,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             ))}
                         </div>
                         <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 300); }} className="hui-btn hui-btn-secondary text-xs py-1.5 px-3">Today</button>
+                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
+                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
+                            Milestone
+                        </button>
                         {/* Critical Path toggle */}
                         <button
                             onClick={() => setShowCriticalPath(v => !v)}
@@ -653,11 +658,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 </div>
                             )}
                         </div>
-                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
-                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
-                            Milestone
-                        </button>
                         {/* More menu */}
                         <div className="relative">
                             <button onClick={() => setShowMoreMenu(!showMoreMenu)} className="hui-btn hui-btn-secondary text-xs py-1.5 px-2">
@@ -746,7 +746,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                                         {getInitials(a.user.name, a.user.email)}
                                                     </div>
                                                 ))}
-                                                <button onClick={e => { if (!linkMode) { e.stopPropagation(); setEditingId(task.id); setEditName(task.name); }}} className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition">{task.name}</button>
+                                                <span className="text-xs font-medium text-hui-textMain truncate text-left hover:text-hui-primary transition cursor-pointer">{task.name}</span>
                                                 {task.estimateItem && <span className="ml-1 text-[9px] text-blue-500 bg-blue-50 rounded px-1 shrink-0">$</span>}
                                             </div>
                                         )}
@@ -923,6 +923,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         panelTab={panelTab}
                         setPanelTab={setPanelTab}
                         onStatusChange={handleStatusChange}
+                        onNameChange={(taskId, name) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t)); updateScheduleTask(taskId, { name }); }}
                         onDateChange={handleDateChange}
                         onEstimatedHoursChange={(taskId, hours) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t)); updateScheduleTask(taskId, { estimatedHours: hours }); }}
                         onDelete={handleDelete}

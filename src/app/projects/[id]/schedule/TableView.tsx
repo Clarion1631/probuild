@@ -648,6 +648,7 @@ export default function TableView({ projectId, projectName, initialTasks, estima
                         panelTab={panelTab}
                         setPanelTab={setPanelTab}
                         onStatusChange={handleStatusChange}
+                        onNameChange={(taskId, name) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t)); updateScheduleTask(taskId, { name }); }}
                         onDateChange={handleDateChange}
                         onEstimatedHoursChange={(taskId, hours) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t)); updateScheduleTask(taskId, { estimatedHours: hours }); }}
                         onDelete={handleDelete}
