@@ -9,17 +9,17 @@ import {
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
     assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
     getEstimateItemsForProject,
-    toggleSchedulePublished, getPortalVisibility,
 } from "@/lib/actions";
 import { toast } from "sonner";
 import type { Task, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment } from "./schedule-types";
 import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
 import TaskDetailPanel from "./TaskDetailPanel";
 import DependencyPicker from "./DependencyPicker";
+import SchedulePublishButton from "./SchedulePublishButton";
 
 type SortKey = "name" | "type" | "startDate" | "endDate" | "duration" | "status" | "progress" | "estimatedHours" | "actualHours";
 
-export default function TableView({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", viewMode, onViewModeChange }: {
+export default function TableView({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
@@ -27,6 +27,7 @@ export default function TableView({ projectId, projectName, initialTasks, estima
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
     currentUserId?: string;
+    initialPublished: boolean;
     viewMode?: "gantt" | "table";
     onViewModeChange?: (mode: "gantt" | "table") => void;
 }) {
@@ -37,8 +38,6 @@ export default function TableView({ projectId, projectName, initialTasks, estima
     const [comments, setComments] = useState<Comment[]>([]);
     const [isAiPunching, setIsAiPunching] = useState(false);
     const [estimateItems, setEstimateItems] = useState<EstimateItemSummary[]>([]);
-    const [isPublished, setIsPublished] = useState(false);
-    const [isPublishing, setIsPublishing] = useState(false);
     const [isAiGenerating, setIsAiGenerating] = useState(false);
     const [showAiMenu, setShowAiMenu] = useState(false);
     const [isAiRisk, setIsAiRisk] = useState(false);
@@ -69,8 +68,6 @@ export default function TableView({ projectId, projectName, initialTasks, estima
     const selectedTask = tasks.find(t => t.id === selectedTaskId);
     const criticalPathIds = useMemo(() => computeCriticalPath(tasks), [tasks]);
     const today = new Date();
-
-    useEffect(() => { getPortalVisibility(projectId).then(v => setIsPublished(v.showSchedule)); }, [projectId]);
 
     useEffect(() => {
         if (selectedTaskId) {
@@ -104,18 +101,6 @@ export default function TableView({ projectId, projectName, initialTasks, estima
             return sortDir === "asc" ? cmp : -cmp;
         });
     }, [tasks, sortKey, sortDir]);
-
-    // --- Toolbar handlers (same as GanttChart) ---
-    async function handleTogglePublish() {
-        setIsPublishing(true);
-        try {
-            const next = !isPublished;
-            await toggleSchedulePublished(projectId, next);
-            setIsPublished(next);
-            toast.success(next ? "Schedule published to client portal" : "Schedule hidden from client portal");
-        } catch { toast.error("Failed to update publish status"); }
-        finally { setIsPublishing(false); }
-    }
 
     async function handleAiSchedule(estimateId?: string) {
         setIsAiGenerating(true); setShowAiMenu(false);
@@ -475,10 +460,7 @@ export default function TableView({ projectId, projectName, initialTasks, estima
                         <button onClick={handleAiRisk} disabled={isAiRisk || tasks.length === 0} className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiRisk ? "bg-amber-500 text-white border-amber-600 animate-pulse" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`} title="AI schedule risk analysis">
                             ⚠️ {isAiRisk ? "Analyzing…" : "AI Risk"}
                         </button>
-                        <button onClick={handleTogglePublish} disabled={isPublishing} className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isPublished ? "bg-green-50 text-green-700 border-green-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`} title={isPublished ? "Schedule is visible to client — click to hide" : "Publish schedule to client portal"}>
-                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={isPublished ? "M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" : "M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M3 3l18 18"} /></svg>
-                            {isPublishing ? "Updating…" : isPublished ? "Published" : "Publish to Client"}
-                        </button>
+                        <SchedulePublishButton projectId={projectId} initialPublished={initialPublished} />
                         <button onClick={() => { if (tasks.length === 0) { toast.error("No tasks to sync"); return; } const a = document.createElement("a"); a.href = `/api/calendar/sync?projectId=${projectId}`; a.download = "schedule.ics"; a.click(); toast.success("Calendar file downloaded"); }} disabled={tasks.length === 0} className="text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 disabled:opacity-40" title="Download .ics file">
                             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>Sync
                         </button>
@@ -528,8 +510,8 @@ export default function TableView({ projectId, projectName, initialTasks, estima
             )}
 
             {/* Table + Detail panel */}
-            <div className="flex flex-1 overflow-hidden">
-                <div className="flex-1 overflow-auto">
+            <div className="flex flex-1 min-h-0 overflow-hidden">
+                <div className="flex-1 min-h-0 min-w-0 overflow-auto">
                     <table className="w-full text-xs border-collapse min-w-[900px]">
                         <thead className="sticky top-0 bg-slate-50 z-10 border-b border-hui-border">
                             <tr>
