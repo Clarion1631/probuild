@@ -207,7 +207,7 @@ export default function TaskDetailPanel({
                                                 return a[0].localeCompare(b[0]);
                                             });
                                             return (
-                                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 w-72 max-h-72 flex flex-col animate-in fade-in">
+                                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 w-72 max-w-[calc(24rem-2rem)] max-h-72 flex flex-col animate-in fade-in">
                                                     <div className="p-2 border-b border-hui-border" onClick={e => e.stopPropagation()}>
                                                         <input
                                                             type="text"
