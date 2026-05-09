@@ -10,6 +10,7 @@ export type TaskDetailPanelProps = {
     panelTab: "details" | "punch" | "conversation";
     setPanelTab: (tab: "details" | "punch" | "conversation") => void;
     onStatusChange: (taskId: string, status: string) => void;
+    onNameChange: (taskId: string, name: string) => void;
     onDateChange: (taskId: string, field: "startDate" | "endDate", value: string) => void;
     onEstimatedHoursChange: (taskId: string, hours: number) => void;
     onDelete: (taskId: string) => void;
@@ -37,7 +38,7 @@ export type TaskDetailPanelProps = {
 
 export default function TaskDetailPanel({
     task, onClose, panelTab, setPanelTab,
-    onStatusChange, onDateChange, onEstimatedHoursChange, onDelete,
+    onStatusChange, onNameChange, onDateChange, onEstimatedHoursChange, onDelete,
     estimateItems, onLinkEstimateItem, onUnlinkEstimateItem, onFetchEstimateItems,
     teamMembers, subcontractors, onAssign, onUnassign, onAssignSub, onUnassignSub,
     punchItems, onAddPunch, onTogglePunch, onDeletePunch, onAiPunchlist, isAiPunching,
@@ -48,6 +49,15 @@ export default function TaskDetailPanel({
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
     const [newPunchName, setNewPunchName] = useState("");
     const [newComment, setNewComment] = useState("");
+    const [nameDraft, setNameDraft] = useState(task.name);
+    const [nameDirty, setNameDirty] = useState(false);
+
+    function handleNameSave() {
+        const next = nameDraft.trim();
+        if (!nameDirty || !next || next === task.name) { setNameDirty(false); setNameDraft(task.name); return; }
+        onNameChange(task.id, next);
+        setNameDirty(false);
+    }
 
     function handleAddPunchLocal() {
         if (!newPunchName.trim()) return;
@@ -90,6 +100,17 @@ export default function TaskDetailPanel({
             <div className="flex-1 overflow-y-auto p-4">
                 {panelTab === "details" && (
                     <div className="space-y-5">
+                        <div>
+                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Task Name</label>
+                            <input
+                                type="text"
+                                value={nameDirty ? nameDraft : task.name}
+                                onChange={e => { setNameDraft(e.target.value); setNameDirty(true); }}
+                                onBlur={handleNameSave}
+                                onKeyDown={e => { if (e.key === "Enter") { (e.target as HTMLInputElement).blur(); } else if (e.key === "Escape") { setNameDraft(task.name); setNameDirty(false); (e.target as HTMLInputElement).blur(); } }}
+                                className="hui-input text-sm mt-1 w-full"
+                            />
+                        </div>
                         <div>
                             <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Status</label>
                             <select value={task.status} onChange={e => onStatusChange(task.id, e.target.value)} className="hui-input text-sm mt-1 w-full">
