@@ -1,0 +1,271 @@
+# Codex-gated production deploy
+#
+# WHAT THIS DOES
+#   1. Runs an AI code review (gpt-5-codex via OpenAI API) on the diff
+#   2. If verdict is PASS, deploys to Vercel production via CLI
+#   3. If verdict is FAIL, blocks the deploy and surfaces the blockers
+#
+# REQUIRED GITHUB SECRETS
+#   OPENAI_API_KEY    — for the Codex review
+#   VERCEL_TOKEN      — already in the repo for other workflows? confirm in Settings → Secrets
+#   VERCEL_ORG_ID     — set to: team_ncLyFAIeSMFmfr3FS9L9vlMt
+#   VERCEL_PROJECT_ID — set to: prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL
+#
+# HOW TO ENABLE
+#   Step 1: Add the four secrets above at https://github.com/Clarion1631/probuild/settings/secrets/actions
+#   Step 2: Test by clicking "Run workflow" at https://github.com/Clarion1631/probuild/actions/workflows/deploy-prod.yml
+#           (defaults to manual-only — workflow_dispatch — so this is safe)
+#   Step 3: When confident, uncomment the `push:` trigger below to deploy automatically on every push to main
+#
+# COST NOTES
+#   - Codex review: ~$0.50–$2 per run depending on diff size (gpt-5-codex)
+#   - Vercel build: same as before, only fires when review passes
+#   - GitHub Actions: well within the 2,000 free min/mo
+#   - Auto-deploy on Vercel side stays OFF (vercel.json: deploymentEnabled: false). Do not re-enable it.
+
+name: Codex Review + Production Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip-review:
+        description: "Skip Codex review (emergencies only — prod down, security hotfix)"
+        type: boolean
+        default: false
+  # Uncomment the block below once you've tested manually and trust the gate.
+  # Auto-deploy on every push to main, gated by Codex review:
+  #
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - 'docs/**'
+  #     - '.gitignore'
+  #     - '.vercelignore'
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false  # never kill an in-flight deploy
+
+jobs:
+  codex-review:
+    name: Codex review
+    runs-on: ubuntu-latest
+    # Skip the review job entirely if user passed --skip-review on a manual run
+    if: ${{ inputs.skip-review != true }}
+    outputs:
+      verdict: ${{ steps.review.outputs.verdict }}
+
+    steps:
+      - name: Checkout (full history for diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Compute diff to review
+        id: diff
+        run: |
+          set -e
+
+          # Determine the diff range:
+          #   push event:    diff between commits in this push
+          #   manual run:    diff between HEAD~1 and HEAD (last commit only)
+          if [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.event.after }}"
+          else
+            BASE="HEAD~1"
+            HEAD="HEAD"
+          fi
+
+          echo "Reviewing $BASE..$HEAD"
+          git log --oneline "$BASE..$HEAD" | head -20
+
+          # Capture full diff
+          git diff "$BASE..$HEAD" > /tmp/full.diff
+          DIFF_SIZE=$(wc -c < /tmp/full.diff)
+          echo "Diff size: $DIFF_SIZE bytes"
+
+          # If diff is empty (e.g. merge commit only), bail early — nothing to review
+          if [ "$DIFF_SIZE" -eq 0 ]; then
+            echo "Empty diff — nothing to review."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Truncate to 120k chars so we stay under model context window
+          # (gpt-5-codex handles ~200k tokens but we want headroom for system+output)
+          MAX_CHARS=120000
+          if [ "$DIFF_SIZE" -gt "$MAX_CHARS" ]; then
+            head -c "$MAX_CHARS" /tmp/full.diff > /tmp/truncated.diff
+            echo "" >> /tmp/truncated.diff
+            echo "[... DIFF TRUNCATED at $MAX_CHARS chars / $DIFF_SIZE total ...]" >> /tmp/truncated.diff
+            mv /tmp/truncated.diff /tmp/full.diff
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Codex review (gpt-5-codex)
+        id: review
+        if: steps.diff.outputs.skip != 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -e
+
+          # Build JSON request body. jq handles all the escaping.
+          jq -n \
+            --rawfile diff /tmp/full.diff \
+            '{
+              model: "gpt-5-codex",
+              response_format: { type: "json_object" },
+              messages: [
+                {
+                  role: "system",
+                  content: "You are a strict senior code reviewer gating production deploys for a Next.js 16 + Prisma 5 + Supabase + Stripe + Twilio app. Your output schema is fixed:\n\n{\"verdict\": \"PASS\" | \"FAIL\", \"blockers\": string[], \"majors\": string[], \"minors\": string[], \"summary\": string}\n\nVerdict rules:\n- FAIL if there is at least one item in `blockers`.\n- PASS otherwise (majors and minors do not block).\n\nFlag as BLOCKER only:\n- Bugs that break functionality on the deployed routes\n- Security issues (auth, leaked secrets, SQL injection, RLS bypass)\n- Data integrity bugs (money math, date math, currency, timezone, rounding)\n- Race conditions or deadlocks in critical flows\n- Missing/incorrect Prisma migrations for schema changes\n- Hardcoded production secrets or PII in code\n- Auth role checks missing on sensitive endpoints\n- Stripe/payment integration bugs\n\nFlag as MAJOR (do not block):\n- Missing error handling that could degrade UX but not break things\n- Performance regressions in non-critical paths\n- TypeScript escape hatches (`any`, `as`) on important data\n- Missing tests on new logic\n\nFlag as MINOR (mention only):\n- Style, naming, dead code, refactor opportunities\n\nBe terse — one sentence per finding, with file:line where possible. Do NOT include code suggestions in findings — those go in `summary` if useful."
+                },
+                {
+                  role: "user",
+                  content: ("Review this diff for production deploy:\n\n```diff\n" + $diff + "\n```")
+                }
+              ]
+            }' > /tmp/request.json
+
+          # Call OpenAI API
+          HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            -X POST https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/request.json)
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::OpenAI API returned HTTP $HTTP_CODE"
+            cat /tmp/response.json
+            exit 1
+          fi
+
+          # Extract the assistant's JSON response
+          jq -r '.choices[0].message.content' /tmp/response.json > /tmp/review.json
+
+          # Validate it parses as JSON
+          if ! jq empty /tmp/review.json 2>/dev/null; then
+            echo "::error::Codex returned non-JSON output:"
+            cat /tmp/review.json
+            exit 1
+          fi
+
+          VERDICT=$(jq -r .verdict /tmp/review.json)
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+
+          # Build the workflow summary
+          {
+            echo "## 🤖 Codex Review (gpt-5-codex)"
+            echo ""
+            echo "**Range:** \`${{ steps.diff.outputs.base }}..${{ steps.diff.outputs.head }}\`"
+            echo ""
+            if [ "$VERDICT" = "PASS" ]; then
+              echo "**Verdict:** ✅ PASS — safe to deploy"
+            else
+              echo "**Verdict:** 🚫 FAIL — deploy blocked"
+            fi
+            echo ""
+
+            BLOCKER_COUNT=$(jq -r '.blockers | length' /tmp/review.json)
+            MAJOR_COUNT=$(jq -r '.majors | length' /tmp/review.json)
+            MINOR_COUNT=$(jq -r '.minors | length' /tmp/review.json)
+
+            if [ "$BLOCKER_COUNT" -gt 0 ]; then
+              echo "### 🚫 Blockers ($BLOCKER_COUNT)"
+              jq -r '.blockers[] | "- " + .' /tmp/review.json
+              echo ""
+            fi
+
+            if [ "$MAJOR_COUNT" -gt 0 ]; then
+              echo "### ⚠️ Majors ($MAJOR_COUNT) — deploy proceeds, fix soon"
+              jq -r '.majors[] | "- " + .' /tmp/review.json
+              echo ""
+            fi
+
+            if [ "$MINOR_COUNT" -gt 0 ]; then
+              echo "### 💡 Minors ($MINOR_COUNT)"
+              jq -r '.minors[] | "- " + .' /tmp/review.json
+              echo ""
+            fi
+
+            echo "### Summary"
+            jq -r .summary /tmp/review.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the job if Codex blocked the deploy
+        if: steps.review.outputs.verdict == 'FAIL'
+        run: |
+          echo "::error::Codex review found blockers — see workflow summary"
+          exit 1
+
+  deploy:
+    name: Deploy to Vercel production
+    needs: codex-review
+    # Run if Codex passed OR was skipped (--skip-review emergency path)
+    if: |
+      always() &&
+      (needs.codex-review.result == 'success' || needs.codex-review.result == 'skipped')
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Pull Vercel production config
+        run: vercel pull --yes --environment=production --token=$VERCEL_TOKEN
+
+      - name: Build for Vercel
+        run: vercel build --prod --token=$VERCEL_TOKEN
+
+      - name: Deploy prebuilt artifact to production
+        id: deploy
+        run: |
+          URL=$(vercel deploy --prebuilt --prod --token=$VERCEL_TOKEN)
+          echo "Deployment URL: $URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Verify production responds
+        run: |
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://probuild.goldentouchremodeling.com || echo "000")
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ] || [ "$STATUS" = "307" ]; then
+              echo "✅ Production responds with HTTP $STATUS"
+              exit 0
+            fi
+            echo "Attempt $i: got HTTP $STATUS — retrying in 15s"
+            sleep 15
+          done
+          echo "::error::Production did not respond with 2xx/3xx after 5 attempts"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 🚀 Deploy summary"
+            echo ""
+            echo "- Deployment URL: ${{ steps.deploy.outputs.url }}"
+            echo "- Production alias: https://probuild.goldentouchremodeling.com"
+            echo "- Preview alias: https://probuild-amber.vercel.app"
+            if [ "${{ inputs.skip-review }}" = "true" ]; then
+              echo ""
+              echo "> ⚠️ Codex review was **skipped** for this deploy"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -76,7 +76,17 @@ In Claude Code, type `/deploy-prod`. This runs the safe-deploy workflow defined 
 
 For a genuine emergency only (prod down, security hotfix), pass `--skip-review` to bypass step 3.
 
-**Manual fallback — direct Vercel CLI:**
+**Automated path (CI) — `.github/workflows/deploy-prod.yml`:**
+
+GitHub Actions workflow that runs Codex review + Vercel deploy on demand or on push to main. Disabled by default until you add the secrets and uncomment the `push:` trigger.
+
+- Trigger manually: https://github.com/Clarion1631/probuild/actions/workflows/deploy-prod.yml → "Run workflow"
+- Required GitHub secrets: `OPENAI_API_KEY`, `VERCEL_TOKEN`, `VERCEL_ORG_ID` (= `team_ncLyFAIeSMFmfr3FS9L9vlMt`), `VERCEL_PROJECT_ID` (= `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL`)
+- To enable auto-deploy on push to main: uncomment the `push:` block at the top of the workflow file
+- Uses `gpt-5-codex` model via OpenAI API for review (~$0.50–$2 per run); blocks deploy if any BLOCKER findings
+- Uses `vercel pull → vercel build → vercel deploy --prebuilt` so no `--archive=tgz` workaround needed in CI
+
+**Manual fallback — direct Vercel CLI from your machine:**
 ```powershell
 vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
 ```
