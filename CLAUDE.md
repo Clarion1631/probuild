@@ -62,6 +62,27 @@ stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
 stripe trigger payment_intent.succeeded
 ```
 
+## End-of-session workflow (the standing rule)
+
+When the user signals work is ready to ship — phrases like "deploy", "ship it", "ship", "done", "review and deploy", "we're good", "let's ship this", or you've completed every task in the current request and the user has stopped giving new instructions — run **`/deploy-prod`**.
+
+`/deploy-prod` runs this fixed chain:
+1. **Codex peer review** on the diff vs `origin/main` — abort on any BLOCKER, ask before proceeding on MAJOR, proceed on MINOR/NIT
+2. **Vercel CLI deploy** if review is clean
+3. **Production URL verification** — confirm `https://probuild.goldentouchremodeling.com` responds
+4. **Session report** with these exact sections:
+   - **What you asked for** — restatement of the user's original ask from this session
+   - **What shipped** — commits, files changed, deploy URL, Codex verdict
+   - **How to test (do this now)** — numbered, concrete steps with real URLs/buttons/expected results
+   - **Notes / follow-ups** — known limitations, gotchas, things to watch
+
+Skip `/deploy-prod` when:
+- Changes are docs-only (`*.md`, `CLAUDE.md`, comments) or test-only
+- The session is mid-feature and the user is iterating
+- Build is failing locally — fix that first, then run /deploy-prod
+
+Never run `/deploy-prod` between sub-tasks of an in-progress feature. Wait for an explicit "done" signal or task completion.
+
 ## Deploying to Vercel (CLI only — auto-deploy is OFF, Codex-gated)
 
 **Default path — use `/deploy-prod`:**

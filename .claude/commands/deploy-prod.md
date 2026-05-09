@@ -68,13 +68,31 @@ After the deploy reports READY:
 - WebFetch `https://probuild.goldentouchremodeling.com` — confirm it loads (login page expected)
 - Check the latest deploy in `vercel ls probuild --token $env:VERCEL_TOKEN --scope justins-projects-a2347a8d`
 
-## Step 7 — Final summary
+## Step 7 — Session report
 
-Print:
-- Commits deployed (the SHA list from step 3)
+Output a clear, structured summary the user can read and act on. Use these exact section headers:
+
+### What you asked for
+One short paragraph restating the user's original request from the start of this session. Pull from the user's first/anchoring messages — what problem were they solving, what feature/fix did they want? Be specific, not generic ("you asked me to add a Table view alongside the Gantt chart on the schedule page" — not "you asked me to add a feature").
+
+### What shipped
+- Commits deployed (SHA list from step 3, with commit subject lines)
+- Top-level files changed (just paths, not full diff — e.g. `src/app/projects/[id]/schedule/TableView.tsx (new), src/app/projects/[id]/schedule/page.tsx`)
 - Deploy URL (`probuild-{hash}-justins-projects-a2347a8d.vercel.app`)
-- Codex review summary (PASS / number of MAJOR issues acknowledged / any skipped)
-- Production verification result
-- Any new gotchas worth saving to memory
+- Production alias: https://probuild.goldentouchremodeling.com
+- Codex review: PASS / X BLOCKER / X MAJOR (acknowledged) / X MINOR
 
-If a new deploy-related gotcha emerged, save it to memory as a `feedback` type.
+### How to test (do this now)
+Concrete, numbered steps the user can follow to verify the change. Be specific:
+1. Exact URL to navigate to, e.g. `https://probuild.goldentouchremodeling.com/projects/<some-real-project-id>/schedule`
+2. The action to take, e.g. "Click the **Table** button in the top-right of the schedule view"
+3. The expected result, e.g. "Tasks appear as rows with columns: Name, Owner, Start, End, Duration, Status"
+4. One edge case to try, e.g. "Switch back to **Gantt** — verify task bars still render correctly"
+5. If applicable: a destructive/data-changing test, e.g. "Drag a task to change its date — refresh the page, verify it persisted"
+
+If the change touches money/dates/auth/data, give one extra test that exercises that risky path specifically.
+
+### Notes / follow-ups
+- Known limitations or open questions
+- Any deploy-time gotchas — if persistent, save to memory as a `feedback` type doc
+- Anything the user should keep an eye on for the next 24 hours
