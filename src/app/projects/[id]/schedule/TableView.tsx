@@ -15,6 +15,7 @@ import { toast } from "sonner";
 import type { Task, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment } from "./schedule-types";
 import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
 import TaskDetailPanel from "./TaskDetailPanel";
+import DependencyPicker from "./DependencyPicker";
 
 type SortKey = "name" | "type" | "startDate" | "endDate" | "duration" | "status" | "progress" | "estimatedHours" | "actualHours";
 
@@ -59,6 +60,8 @@ export default function TableView({ projectId, projectName, initialTasks, estima
     const [editingCell, setEditingCell] = useState<{ taskId: string; field: string } | null>(null);
     const [editValue, setEditValue] = useState("");
     const [colorPickerId, setColorPickerId] = useState<string | null>(null);
+    const [depsPopoverId, setDepsPopoverId] = useState<string | null>(null);
+    const [depsPickerId, setDepsPickerId] = useState<string | null>(null);
     const editRef = useRef<HTMLInputElement | HTMLSelectElement>(null);
     const tasksRef = useRef(tasks);
     useEffect(() => { tasksRef.current = tasks; });
@@ -252,6 +255,27 @@ export default function TableView({ projectId, projectName, initialTasks, estima
         setLinkMode(null);
     }
 
+    async function addPredecessor(dependentId: string, predecessorId: string) {
+        try {
+            const dep = await linkTasks(predecessorId, dependentId);
+            setTasks(prev => prev.map(t => {
+                if (t.id === dependentId) return { ...t, dependencies: [...t.dependencies, { id: dep.id, predecessorId, dependentId }] };
+                if (t.id === predecessorId) return { ...t, dependents: [...t.dependents, { id: dep.id, predecessorId, dependentId }] };
+                return t;
+            }));
+            toast.success("Predecessor added");
+        } catch { toast.error("Already linked or invalid"); }
+    }
+    async function removePredecessor(dependentId: string, predecessorId: string) {
+        await unlinkTasks(predecessorId, dependentId);
+        setTasks(prev => prev.map(t => ({
+            ...t,
+            dependencies: t.dependencies.filter(d => !(d.predecessorId === predecessorId && d.dependentId === dependentId)),
+            dependents: t.dependents.filter(d => !(d.predecessorId === predecessorId && d.dependentId === dependentId)),
+        })));
+        toast.success("Predecessor removed");
+    }
+
     // --- Estimate linking ---
     async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item } : t));
@@ -440,6 +464,14 @@ export default function TableView({ projectId, projectName, initialTasks, estima
                         <button onClick={() => setShowCriticalPath(v => !v)} className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${showCriticalPath ? "bg-red-50 text-red-700 border-red-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`} title="Highlight critical path">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Critical Path
                         </button>
+                        <button
+                            onClick={() => setLinkMode(linkMode ? null : "__awaiting__")}
+                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${linkMode ? "bg-amber-100 text-amber-800 border-amber-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
+                            title={linkMode ? "Cancel linking" : "Click two tasks to create a Finish-to-Start dependency"}
+                        >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                            {linkMode ? "Cancel Link" : "Link Tasks"}
+                        </button>
                         <button onClick={handleAiRisk} disabled={isAiRisk || tasks.length === 0} className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiRisk ? "bg-amber-500 text-white border-amber-600 animate-pulse" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`} title="AI schedule risk analysis">
                             ⚠️ {isAiRisk ? "Analyzing…" : "AI Risk"}
                         </button>
@@ -472,18 +504,13 @@ export default function TableView({ projectId, projectName, initialTasks, estima
                             </button>
                             {showMoreMenu && (
                                 <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[200px] py-1 animate-in fade-in">
-                                    <button onClick={() => { setLinkMode(linkMode ? null : "__awaiting__"); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                                        {linkMode ? "Cancel Linking" : "Link Tasks"}
-                                    </button>
                                     {estimates.length > 0 && (
                                         <>
-                                            <div className="border-t border-slate-100 my-1" />
                                             <div className="px-3 py-1 text-[10px] text-slate-400 uppercase font-semibold">Import from Estimate</div>
                                             {estimates.map(est => (<button key={est.id} onClick={() => { handleImportEstimate(est.id); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">📋 {est.title}</button>))}
+                                            <div className="border-t border-slate-100 my-1" />
                                         </>
                                     )}
-                                    <div className="border-t border-slate-100 my-1" />
                                     <button onClick={async () => { if (confirm('Delete ALL tasks from this schedule? This cannot be undone.')) { setShowMoreMenu(false); await clearAllTasks(projectId); setTasks([]); setSelectedTaskId(null); toast.success('Schedule cleared'); } }} className="w-full text-left px-3 py-2 hover:bg-red-50 transition text-sm flex items-center gap-2 text-red-600">🗑️ Clear All Tasks</button>
                                 </div>
                             )}
@@ -621,11 +648,65 @@ export default function TableView({ projectId, projectName, initialTasks, estima
                                         <td className="px-3 py-2 text-right text-hui-textMuted">{task.actualHours > 0 ? `${task.actualHours.toFixed(1)}h` : "—"}</td>
                                         {/* Dependencies */}
                                         <td className="px-3 py-2">
-                                            {task.dependencies.length > 0 ? (
-                                                <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded font-medium">{task.dependencies.length} dep{task.dependencies.length !== 1 ? "s" : ""}</span>
-                                            ) : (
-                                                <span className="text-slate-300">—</span>
-                                            )}
+                                            <div className="relative inline-block" onClick={e => e.stopPropagation()}>
+                                                <button
+                                                    onClick={() => { setDepsPopoverId(depsPopoverId === task.id ? null : task.id); setDepsPickerId(null); }}
+                                                    className={`text-[10px] px-1.5 py-0.5 rounded font-medium transition ${task.dependencies.length > 0 ? "bg-slate-100 text-slate-600 hover:bg-indigo-100 hover:text-indigo-700" : "text-slate-300 hover:text-indigo-600 hover:bg-indigo-50"}`}
+                                                    title={task.dependencies.length > 0 ? "View / edit predecessors" : "Add a predecessor"}
+                                                >
+                                                    {task.dependencies.length > 0 ? `${task.dependencies.length} dep${task.dependencies.length !== 1 ? "s" : ""}` : "+ Link"}
+                                                </button>
+                                                {depsPopoverId === task.id && (
+                                                    <div className="absolute left-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
+                                                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 flex items-center justify-between">
+                                                            <span>Predecessors</span>
+                                                            <button onClick={() => setDepsPopoverId(null)} className="text-slate-400 hover:text-slate-700">
+                                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                            </button>
+                                                        </div>
+                                                        {task.dependencies.length === 0 ? (
+                                                            <div className="px-3 py-2 text-xs text-slate-400 italic">No predecessors yet.</div>
+                                                        ) : (
+                                                            task.dependencies.map(d => {
+                                                                const pred = tasks.find(t => t.id === d.predecessorId);
+                                                                if (!pred) return null;
+                                                                return (
+                                                                    <div key={d.id} className="px-3 py-1.5 hover:bg-slate-50 flex items-center gap-2 text-xs group/dep">
+                                                                        {pred.type === "milestone" ? (
+                                                                            <div className="w-2 h-2 rotate-45 shrink-0" style={{ backgroundColor: pred.color }} />
+                                                                        ) : (
+                                                                            <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: pred.color }} />
+                                                                        )}
+                                                                        <span className="font-medium truncate flex-1">{pred.name}</span>
+                                                                        <span className="text-[9px] text-slate-400 font-semibold">FS</span>
+                                                                        <button onClick={() => removePredecessor(task.id, pred.id)} className="text-slate-300 hover:text-red-500 transition shrink-0" title="Remove">
+                                                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                );
+                                                            })
+                                                        )}
+                                                        <div className="border-t border-slate-100 my-1" />
+                                                        <div className="px-1 relative">
+                                                            <button
+                                                                onClick={() => setDepsPickerId(depsPickerId === task.id ? null : task.id)}
+                                                                className="w-full text-left px-2 py-1.5 hover:bg-indigo-50 transition text-xs text-indigo-600 font-semibold rounded"
+                                                            >
+                                                                + Add predecessor
+                                                            </button>
+                                                            {depsPickerId === task.id && (
+                                                                <DependencyPicker
+                                                                    task={task}
+                                                                    allTasks={tasks}
+                                                                    onPick={(predId) => addPredecessor(task.id, predId)}
+                                                                    onClose={() => setDepsPickerId(null)}
+                                                                    align="left"
+                                                                />
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
                                         </td>
                                         {/* Actions */}
                                         <td className="px-2 py-2">
@@ -672,6 +753,14 @@ export default function TableView({ projectId, projectName, initialTasks, estima
                         onAddComment={handleAddComment}
                         showCriticalPath={showCriticalPath}
                         criticalPathIds={criticalPathIds}
+                        allTasks={tasks}
+                        onLinkPredecessor={async (predId) => {
+                            if (selectedTaskId) await addPredecessor(selectedTaskId, predId);
+                        }}
+                        onUnlinkPredecessor={async (predId) => {
+                            if (selectedTaskId) await removePredecessor(selectedTaskId, predId);
+                        }}
+                        onSelectTask={(taskId) => { setSelectedTaskId(taskId); setPanelTab("details"); }}
                     />
                 )}
             </div>
