@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback, type Dispatch, type SetStateAction } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { DragDropContext, Droppable, Draggable, type DropResult } from "@hello-pangea/dnd";
 import {
@@ -38,10 +38,11 @@ const SORT_OPTIONS: { key: SortKey; dir: SortDir; label: string }[] = [
     { key: "name", dir: "desc", label: "Name (Z → A)" },
 ];
 
-export default function TableView({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
+export default function TableView({ projectId, projectName, tasks, setTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
-    initialTasks: Task[];
+    tasks: Task[];
+    setTasks: Dispatch<SetStateAction<Task[]>>;
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
@@ -50,7 +51,6 @@ export default function TableView({ projectId, projectName, initialTasks, estima
     viewMode?: "gantt" | "table";
     onViewModeChange?: (mode: "gantt" | "table") => void;
 }) {
-    const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
     const [panelTab, setPanelTab] = useState<"details" | "punch" | "conversation">("details");
     const [punchItems, setPunchItems] = useState<PunchItem[]>([]);

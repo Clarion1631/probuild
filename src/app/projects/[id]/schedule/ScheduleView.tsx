@@ -1,16 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import GanttChart from "./GanttChart";
 import TableView from "./TableView";
-import type { ScheduleViewProps } from "./schedule-types";
+import type { ScheduleViewProps, Task } from "./schedule-types";
 
-export default function ScheduleView(props: ScheduleViewProps) {
+export default function ScheduleView({ initialTasks, ...rest }: ScheduleViewProps) {
     const [viewMode, setViewMode] = useState<"gantt" | "table">("gantt");
+    const [tasks, setTasks] = useState<Task[]>(initialTasks);
 
-    return viewMode === "gantt" ? (
-        <GanttChart {...props} viewMode={viewMode} onViewModeChange={setViewMode} />
-    ) : (
-        <TableView {...props} viewMode={viewMode} onViewModeChange={setViewMode} />
-    );
+    // Re-sync when the server passes new initialTasks (router.refresh / page revisit).
+    useEffect(() => { setTasks(initialTasks); }, [initialTasks]);
+
+    const shared = { ...rest, tasks, setTasks, viewMode, onViewModeChange: setViewMode };
+    return viewMode === "gantt" ? <GanttChart {...shared} /> : <TableView {...shared} />;
 }
