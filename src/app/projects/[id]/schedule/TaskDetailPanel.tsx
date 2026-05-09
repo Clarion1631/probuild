@@ -4,6 +4,11 @@ import { useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
 
+const ESTIMATE_LINK_STOPWORDS = new Set(["and", "or", "the", "a", "to", "of", "with", "for", "in", "on", "at", "&"]);
+function tokenizeForMatch(s: string): string[] {
+    return s.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 2 && !ESTIMATE_LINK_STOPWORDS.has(t));
+}
+
 export type TaskDetailPanelProps = {
     task: Task;
     onClose: () => void;
@@ -47,6 +52,7 @@ export default function TaskDetailPanel({
 }: TaskDetailPanelProps) {
     const [showAssignMenu, setShowAssignMenu] = useState(false);
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
+    const [estimateQuery, setEstimateQuery] = useState("");
     const [newPunchName, setNewPunchName] = useState("");
     const [newComment, setNewComment] = useState("");
     const [nameDraft, setNameDraft] = useState(task.name);
@@ -70,8 +76,12 @@ export default function TaskDetailPanel({
         setNewComment("");
     }
     function handleShowEstimateLink() {
-        setShowEstimateLinkMenu(v => !v);
-        onFetchEstimateItems();
+        setShowEstimateLinkMenu(v => {
+            const next = !v;
+            if (!next) setEstimateQuery("");
+            else onFetchEstimateItems();
+            return next;
+        });
     }
 
     return (
@@ -143,35 +153,85 @@ export default function TaskDetailPanel({
                                 ) : (
                                     <div className="relative">
                                         <button onClick={handleShowEstimateLink} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Link</button>
-                                        {showEstimateLinkMenu && (
-                                            <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] max-h-60 overflow-y-auto py-1 animate-in fade-in">
-                                                {estimateItems.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No estimate line items found.<br /><span className="text-slate-300">Add items to an estimate first.</span></div>}
-                                                {(() => {
-                                                    const grouped = new Map<string, EstimateItemSummary[]>();
-                                                    for (const item of estimateItems) {
-                                                        const key = item.parent?.name ?? "";
-                                                        if (!grouped.has(key)) grouped.set(key, []);
-                                                        grouped.get(key)!.push(item);
-                                                    }
-                                                    const sections = Array.from(grouped.entries()).sort((a, b) => {
-                                                        if (a[0] === "") return -1;
-                                                        if (b[0] === "") return 1;
-                                                        return a[0].localeCompare(b[0]);
-                                                    });
-                                                    return sections.map(([sectionName, sectionItems]) => (
-                                                        <div key={sectionName || "__ungrouped"}>
-                                                            {sectionName && <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 sticky top-0">{sectionName}</div>}
-                                                            {sectionItems.map(item => (
-                                                                <button key={item.id} onClick={() => { onLinkEstimateItem(task.id, item); setShowEstimateLinkMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs">
-                                                                    <div className="font-medium truncate">{item.name}</div>
-                                                                    <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
-                                                                </button>
-                                                            ))}
-                                                        </div>
-                                                    ));
-                                                })()}
-                                            </div>
-                                        )}
+                                        {showEstimateLinkMenu && (() => {
+                                            const taskTokens = tokenizeForMatch(task.name);
+                                            const query = estimateQuery.trim().toLowerCase();
+                                            const suggested = query ? [] : estimateItems
+                                                .map(item => {
+                                                    const itemTokens = new Set(tokenizeForMatch(item.name + " " + (item.parent?.name ?? "")));
+                                                    const score = taskTokens.reduce((n, t) => n + (itemTokens.has(t) ? 1 : 0), 0);
+                                                    return { item, score };
+                                                })
+                                                .filter(x => x.score > 0)
+                                                .sort((a, b) => b.score - a.score)
+                                                .slice(0, 5)
+                                                .map(x => x.item);
+                                            const filtered = query ? estimateItems.filter(item =>
+                                                item.name.toLowerCase().includes(query) ||
+                                                (item.parent?.name ?? "").toLowerCase().includes(query)
+                                            ) : [];
+                                            const renderItem = (item: EstimateItemSummary, keyPrefix = "") => (
+                                                <button
+                                                    key={`${keyPrefix}${item.id}`}
+                                                    onClick={() => { onLinkEstimateItem(task.id, item); setShowEstimateLinkMenu(false); setEstimateQuery(""); }}
+                                                    className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs"
+                                                >
+                                                    <div className="font-medium truncate">{item.name}</div>
+                                                    <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
+                                                </button>
+                                            );
+                                            const grouped = new Map<string, EstimateItemSummary[]>();
+                                            for (const item of estimateItems) {
+                                                const key = item.parent?.name ?? "";
+                                                if (!grouped.has(key)) grouped.set(key, []);
+                                                grouped.get(key)!.push(item);
+                                            }
+                                            const sections = Array.from(grouped.entries()).sort((a, b) => {
+                                                if (a[0] === "") return -1;
+                                                if (b[0] === "") return 1;
+                                                return a[0].localeCompare(b[0]);
+                                            });
+                                            return (
+                                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 w-72 max-h-72 flex flex-col animate-in fade-in">
+                                                    <div className="p-2 border-b border-hui-border" onClick={e => e.stopPropagation()}>
+                                                        <input
+                                                            type="text"
+                                                            value={estimateQuery}
+                                                            onChange={e => setEstimateQuery(e.target.value)}
+                                                            placeholder="Search items..."
+                                                            autoFocus
+                                                            className="hui-input text-xs w-full"
+                                                        />
+                                                    </div>
+                                                    <div className="flex-1 overflow-y-auto py-1">
+                                                        {estimateItems.length === 0 ? (
+                                                            <div className="px-3 py-2 text-xs text-slate-400">No estimate line items found.<br /><span className="text-slate-300">Add items to an estimate first.</span></div>
+                                                        ) : query ? (
+                                                            filtered.length === 0 ? (
+                                                                <div className="px-3 py-2 text-xs text-slate-400">No items match &ldquo;{query}&rdquo;</div>
+                                                            ) : (
+                                                                filtered.map(item => renderItem(item))
+                                                            )
+                                                        ) : (
+                                                            <>
+                                                                {suggested.length > 0 && (
+                                                                    <div>
+                                                                        <div className="px-3 py-1.5 text-[10px] font-bold text-indigo-500 uppercase tracking-wider bg-indigo-50 sticky top-0">Suggested</div>
+                                                                        {suggested.map(item => renderItem(item, "sug-"))}
+                                                                    </div>
+                                                                )}
+                                                                {sections.map(([sectionName, sectionItems]) => (
+                                                                    <div key={sectionName || "__ungrouped"}>
+                                                                        {sectionName && <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 sticky top-0">{sectionName}</div>}
+                                                                        {sectionItems.map(item => renderItem(item))}
+                                                                    </div>
+                                                                ))}
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
                                     </div>
                                 )}
                             </div>
