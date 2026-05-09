@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
+import DependencyPicker from "./DependencyPicker";
 
 const ESTIMATE_LINK_STOPWORDS = new Set(["and", "or", "the", "a", "to", "of", "with", "for", "in", "on", "at", "&"]);
 function tokenizeForMatch(s: string): string[] {
@@ -39,6 +40,10 @@ export type TaskDetailPanelProps = {
     onAddComment: (text: string) => void;
     showCriticalPath: boolean;
     criticalPathIds: Set<string>;
+    allTasks: Task[];
+    onLinkPredecessor: (predecessorId: string) => void;
+    onUnlinkPredecessor: (predecessorId: string) => void;
+    onSelectTask?: (taskId: string) => void;
 };
 
 export default function TaskDetailPanel({
@@ -49,14 +54,24 @@ export default function TaskDetailPanel({
     punchItems, onAddPunch, onTogglePunch, onDeletePunch, onAiPunchlist, isAiPunching,
     comments, onAddComment,
     showCriticalPath, criticalPathIds,
+    allTasks, onLinkPredecessor, onUnlinkPredecessor, onSelectTask,
 }: TaskDetailPanelProps) {
     const [showAssignMenu, setShowAssignMenu] = useState(false);
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
     const [estimateQuery, setEstimateQuery] = useState("");
+    const [showPredecessorMenu, setShowPredecessorMenu] = useState(false);
     const [newPunchName, setNewPunchName] = useState("");
     const [newComment, setNewComment] = useState("");
     const [nameDraft, setNameDraft] = useState(task.name);
     const [nameDirty, setNameDirty] = useState(false);
+
+    const taskMap = new Map(allTasks.map(t => [t.id, t] as const));
+    const predecessors = task.dependencies
+        .map(d => ({ depId: d.id, predId: d.predecessorId, task: taskMap.get(d.predecessorId) }))
+        .filter(p => p.task);
+    const successors = task.dependents
+        .map(d => ({ depId: d.id, succId: d.dependentId, task: taskMap.get(d.dependentId) }))
+        .filter(s => s.task);
 
     function handleNameSave() {
         const next = nameDraft.trim();
@@ -246,6 +261,74 @@ export default function TaskDetailPanel({
                                 </div>
                             ) : (
                                 <p className="text-xs text-slate-400 italic">Not linked to an estimate item</p>
+                            )}
+                        </div>
+                        {/* Dependencies */}
+                        <div>
+                            <div className="flex items-center justify-between mb-2">
+                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Predecessors</label>
+                                <div className="relative">
+                                    <button onClick={() => setShowPredecessorMenu(v => !v)} className="text-[10px] text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
+                                    {showPredecessorMenu && (
+                                        <DependencyPicker
+                                            task={task}
+                                            allTasks={allTasks}
+                                            onPick={(predId) => onLinkPredecessor(predId)}
+                                            onClose={() => setShowPredecessorMenu(false)}
+                                        />
+                                    )}
+                                </div>
+                            </div>
+                            <div className="space-y-1.5">
+                                {predecessors.length === 0 ? (
+                                    <p className="text-xs text-slate-400 italic">No predecessors. Add one to make this task wait for another to finish.</p>
+                                ) : (
+                                    predecessors.map(p => (
+                                        <div key={p.depId} className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2 group/dep">
+                                            {p.task!.type === "milestone" ? (
+                                                <div className="w-2.5 h-2.5 rotate-45 shrink-0" style={{ backgroundColor: p.task!.color }} />
+                                            ) : (
+                                                <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: p.task!.color }} />
+                                            )}
+                                            <button
+                                                type="button"
+                                                onClick={() => onSelectTask?.(p.predId)}
+                                                className="text-xs font-medium text-hui-textMain flex-1 truncate text-left hover:text-indigo-600 transition cursor-pointer"
+                                                title="Open this task"
+                                            >
+                                                {p.task!.name}
+                                            </button>
+                                            <span className="text-[9px] text-slate-400 font-semibold uppercase tracking-wide" title="Finish-to-Start: this task starts after the predecessor finishes">FS</span>
+                                            <button onClick={() => onUnlinkPredecessor(p.predId)} className="text-slate-300 hover:text-red-500 transition shrink-0" title="Remove dependency">
+                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                            </button>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                            {successors.length > 0 && (
+                                <div className="mt-3">
+                                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Successors</label>
+                                    <div className="space-y-1 mt-1.5">
+                                        {successors.map(s => (
+                                            <button
+                                                key={s.depId}
+                                                type="button"
+                                                onClick={() => onSelectTask?.(s.succId)}
+                                                className="flex items-center gap-2 px-3 py-1.5 text-[11px] text-slate-500 hover:bg-slate-50 rounded transition w-full text-left"
+                                                title="Open this task to manage its predecessors"
+                                            >
+                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-300 shrink-0"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                                                {s.task!.type === "milestone" ? (
+                                                    <div className="w-2 h-2 rotate-45 shrink-0" style={{ backgroundColor: s.task!.color }} />
+                                                ) : (
+                                                    <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: s.task!.color }} />
+                                                )}
+                                                <span className="truncate">{s.task!.name}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
                             )}
                         </div>
                         {/* Critical Path indicator */}
