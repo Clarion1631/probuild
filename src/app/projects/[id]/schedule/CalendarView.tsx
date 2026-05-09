@@ -81,8 +81,6 @@ export default function CalendarView({ projectId, initialTasks, viewMode, onView
         const name = quickAddName.trim();
         const target = quickAdd?.date;
         if (!name || !target) { setQuickAdd(null); setQuickAddName(""); return; }
-        setQuickAdd(null);
-        setQuickAddName("");
         const dateStr = formatDate(target);
         try {
             await createScheduleTask(projectId, {
@@ -92,6 +90,8 @@ export default function CalendarView({ projectId, initialTasks, viewMode, onView
                 color: PRESET_COLORS[0],
                 status: "Not Started",
             });
+            setQuickAdd(null);
+            setQuickAddName("");
             toast.success("Task added");
             startTransition(() => router.refresh());
         } catch {
@@ -115,16 +115,19 @@ export default function CalendarView({ projectId, initialTasks, viewMode, onView
     }
 
     async function patchTask(taskId: string, patch: Partial<Pick<Task, "name" | "status" | "color" | "startDate" | "endDate">>) {
+        const before = tasks.find(t => t.id === taskId);
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...patch } : t));
         try {
             await updateScheduleTask(taskId, patch);
             startTransition(() => router.refresh());
         } catch {
+            if (before) setTasks(prev => prev.map(t => t.id === taskId ? before : t));
             toast.error("Failed to save");
         }
     }
 
     async function removeTask(taskId: string) {
+        const before = tasks;
         setTasks(prev => prev.filter(t => t.id !== taskId));
         setEditing(null);
         try {
@@ -132,6 +135,7 @@ export default function CalendarView({ projectId, initialTasks, viewMode, onView
             toast.success("Task deleted");
             startTransition(() => router.refresh());
         } catch {
+            setTasks(before);
             toast.error("Failed to delete");
         }
     }
