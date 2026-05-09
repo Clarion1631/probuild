@@ -14,6 +14,24 @@ export function addDays(date: Date, days: number) { const d = new Date(date.getT
 export function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
 export function getMonday(d: Date) { const c = new Date(d.getTime()); const day = c.getUTCDay(); const diff = day === 0 ? -6 : 1 - day; c.setUTCDate(c.getUTCDate() + diff); return c; }
 export function isWeekend(d: Date) { const day = d.getUTCDay(); return day === 0 || day === 6; }
+export function getWeekDays(anchor: Date): Date[] {
+    const monday = getMonday(anchor);
+    return Array.from({ length: 7 }, (_, i) => addDays(monday, i));
+}
+export function getMonthGrid(anchor: Date): Date[] {
+    const first = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1));
+    const start = getMonday(first);
+    return Array.from({ length: 42 }, (_, i) => addDays(start, i));
+}
+export function isSameUTCDay(a: Date, b: Date) { return a.getUTCFullYear() === b.getUTCFullYear() && a.getUTCMonth() === b.getUTCMonth() && a.getUTCDate() === b.getUTCDate(); }
+export function parseUTCDate(yyyyMmDd: string): Date {
+    const [y, m, d] = yyyyMmDd.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d));
+}
+export function todayUTC(): Date {
+    const now = new Date();
+    return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+}
 export function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
 export function formatCurrency(n: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n); }
 
