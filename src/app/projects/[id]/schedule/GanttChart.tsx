@@ -185,13 +185,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         return { left: getDaysBetween(minDate, start) * colWidth, width: Math.max(getDaysBetween(start, end) * colWidth, colWidth) };
     }
 
-    function getAutoProgress(task: Task): number {
-        if (task.estimatedHours && task.estimatedHours > 0 && task.actualHours > 0) {
-            return Math.min(100, Math.round((task.actualHours / task.estimatedHours) * 100));
-        }
-        return task.progress;
-    }
-
     function getWeekendColumns() {
         const cols: { left: number; width: number }[] = [];
         let cursor = new Date(minDate);
@@ -273,7 +266,10 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
         };
         const onEnd = async () => {
             cleanup();
-            if (!active) return;
+            if (!active) {
+                if (type === "move") { setSelectedTaskId(taskId); setPanelTab("details"); }
+                return;
+            }
             const currentTask = tasksRef.current.find(t => t.id === taskId);
             if (!currentTask) return;
             await updateScheduleTask(taskId, { startDate: currentTask.startDate, endDate: currentTask.endDate });
@@ -401,7 +397,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     async function handleColorChange(taskId: string, color: string) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color } : t)); setColorPickerId(null); await updateScheduleTask(taskId, { color }); }
     async function handleStatusChange(taskId: string, status: string) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status } : t)); await updateScheduleTask(taskId, { status }); }
     async function handleDelete(taskId: string) { setTasks(prev => prev.filter(t => t.id !== taskId)); if (selectedTaskId === taskId) setSelectedTaskId(null); await deleteScheduleTask(taskId); toast.success("Task deleted"); }
-    async function handleProgressChange(taskId: string, progress: number) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress } : t)); await updateScheduleTask(taskId, { progress }); }
     async function handleEstimatedHoursSave(taskId: string) { const h = parseFloat(editHoursVal); if (!isNaN(h) && h >= 0) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: h } : t)); await updateScheduleTask(taskId, { estimatedHours: h }); } setEditingHoursId(null); }
 
     async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
@@ -846,7 +841,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         {/* Task Bars / Milestone Diamonds */}
                         {tasks.map((task, idx) => {
                             const bar = getBarStyle(task);
-                            const ap = getAutoProgress(task);
                             const isCritical = showCriticalPath && criticalPathIds.has(task.id);
                             const topY = 44 + idx * ROW_HEIGHT;
 
@@ -890,21 +884,15 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                         onMouseMove={e => { if (task.estimateItem) setTooltipPos({ x: e.clientX, y: e.clientY }); }}
                                         onMouseLeave={() => setHoveredTaskId(null)}
                                     >
-                                        <div className="absolute inset-0 rounded-lg transition-all" style={{ width: `${ap}%`, background: `linear-gradient(135deg, ${task.color}cc, ${task.color}99)` }} />
                                         <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-lg" style={{ backgroundColor: task.color }} />
                                         <div className="relative z-[2] flex items-center justify-between h-full px-2.5 pl-3">
-                                            <span className="text-[10px] font-bold truncate" style={{ color: ap > 50 ? "#fff" : task.color, textShadow: ap > 50 ? '0 1px 2px rgba(0,0,0,0.15)' : 'none' }}>{task.name}</span>
+                                            <span className="text-[10px] font-bold truncate" style={{ color: task.color }}>{task.name}</span>
                                             {(task.assignments || []).length > 0 && bar.width > 80 && (
                                                 <div className="flex -space-x-1.5 ml-1">{(task.assignments || []).slice(0,3).map(a => (
                                                     <div key={a.userId} className="w-5 h-5 rounded-full bg-white text-[7px] font-bold flex items-center justify-center border-2 border-white shadow-sm" style={{ color: task.color }}>{getInitials(a.user.name, a.user.email)}</div>
                                                 ))}</div>
                                             )}
                                         </div>
-                                        {!(task.actualHours > 0 && task.estimatedHours) && (
-                                            <div className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition z-10" title={`${task.progress}%`}>
-                                                <input type="range" min={0} max={100} value={task.progress} onChange={e => handleProgressChange(task.id, parseInt(e.target.value))} onMouseDown={e => e.stopPropagation()} className="w-14 h-1 accent-current cursor-pointer" style={{ accentColor: task.color }} />
-                                            </div>
-                                        )}
                                     </div>
                                     <div className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize z-10 hover:bg-black/10 rounded-r-lg" onMouseDown={e => handleMouseDown(e, task.id, "resize-right")} onTouchStart={e => handleTouchStart(e, task.id, "resize-right")} />
                                 </div>
