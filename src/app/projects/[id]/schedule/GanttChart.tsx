@@ -606,6 +606,15 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
                             Critical Path
                         </button>
+                        {/* Link Tasks toggle */}
+                        <button
+                            onClick={() => setLinkMode(linkMode ? null : "__awaiting__")}
+                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${linkMode ? "bg-amber-100 text-amber-800 border-amber-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
+                            title={linkMode ? "Cancel linking" : "Click two tasks to create a Finish-to-Start dependency"}
+                        >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                            {linkMode ? "Cancel Link" : "Link Tasks"}
+                        </button>
                         <button
                             onClick={handleAiRisk}
                             disabled={isAiRisk || tasks.length === 0}
@@ -660,22 +669,17 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                             </button>
                             {showMoreMenu && (
                                 <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[200px] py-1 animate-in fade-in">
-                                    <button onClick={() => { setLinkMode(linkMode ? null : "__awaiting__"); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                                        {linkMode ? "Cancel Linking" : "Link Tasks"}
-                                    </button>
                                     {estimates.length > 0 && (
                                         <>
-                                            <div className="border-t border-slate-100 my-1" />
                                             <div className="px-3 py-1 text-[10px] text-slate-400 uppercase font-semibold">Import from Estimate</div>
                                             {estimates.map(est => (
                                                 <button key={est.id} onClick={() => { handleImportEstimate(est.id); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
                                                     📋 {est.title}
                                                 </button>
                                             ))}
+                                            <div className="border-t border-slate-100 my-1" />
                                         </>
                                     )}
-                                    <div className="border-t border-slate-100 my-1" />
                                     <button onClick={async () => { if (confirm('Delete ALL tasks from this schedule? This cannot be undone.')) { setShowMoreMenu(false); await clearAllTasks(projectId); setTasks([]); setSelectedTaskId(null); toast.success('Schedule cleared'); } }} className="w-full text-left px-3 py-2 hover:bg-red-50 transition text-sm flex items-center gap-2 text-red-600">
                                         🗑️ Clear All Tasks
                                     </button>
@@ -935,6 +939,30 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         onAddComment={handleAddComment}
                         showCriticalPath={showCriticalPath}
                         criticalPathIds={criticalPathIds}
+                        allTasks={tasks}
+                        onLinkPredecessor={async (predId) => {
+                            if (!selectedTaskId) return;
+                            try {
+                                const dep = await linkTasks(predId, selectedTaskId);
+                                setTasks(prev => prev.map(t => {
+                                    if (t.id === selectedTaskId) return { ...t, dependencies: [...t.dependencies, { id: dep.id, predecessorId: predId, dependentId: selectedTaskId }] };
+                                    if (t.id === predId) return { ...t, dependents: [...t.dependents, { id: dep.id, predecessorId: predId, dependentId: selectedTaskId }] };
+                                    return t;
+                                }));
+                                toast.success("Predecessor added");
+                            } catch { toast.error("Already linked or invalid"); }
+                        }}
+                        onUnlinkPredecessor={async (predId) => {
+                            if (!selectedTaskId) return;
+                            await unlinkTasks(predId, selectedTaskId);
+                            setTasks(prev => prev.map(t => ({
+                                ...t,
+                                dependencies: t.dependencies.filter(d => !(d.predecessorId === predId && d.dependentId === selectedTaskId)),
+                                dependents: t.dependents.filter(d => !(d.predecessorId === predId && d.dependentId === selectedTaskId)),
+                            })));
+                            toast.success("Predecessor removed");
+                        }}
+                        onSelectTask={(taskId) => { setSelectedTaskId(taskId); setPanelTab("details"); }}
                     />
                 )}
             </div>
