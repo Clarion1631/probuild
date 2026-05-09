@@ -4475,6 +4475,32 @@ export async function deleteScheduleTask(taskId: string) {
     return task;
 }
 
+export async function reorderScheduleTasks(projectId: string, orderedIds: string[]) {
+    if (new Set(orderedIds).size !== orderedIds.length) {
+        throw new Error("Duplicate task IDs in reorder request");
+    }
+    await prisma.$transaction(async (tx) => {
+        const projectTasks = await tx.scheduleTask.findMany({
+            where: { projectId },
+            select: { id: true },
+        });
+        const projectIdSet = new Set(projectTasks.map(t => t.id));
+        if (projectIdSet.size !== orderedIds.length) {
+            throw new Error("Reorder must include the full set of project tasks");
+        }
+        for (const id of orderedIds) {
+            if (!projectIdSet.has(id)) throw new Error(`Task ${id} does not belong to project`);
+        }
+        await Promise.all(
+            orderedIds.map((id, idx) =>
+                tx.scheduleTask.update({ where: { id }, data: { order: idx } })
+            )
+        );
+    });
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return { ok: true };
+}
+
 export async function linkTasks(predecessorId: string, dependentId: string) {
     const dep = await prisma.taskDependency.create({
         data: { predecessorId, dependentId },
