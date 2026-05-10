@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import GanttChart from "./GanttChart";
 import TableView from "./TableView";
 import CalendarView from "./CalendarView";
-import type { ScheduleViewProps } from "./schedule-types";
+import type { ScheduleViewProps, Task } from "./schedule-types";
 
 type ViewMode = "gantt" | "table" | "calendar";
 type CalendarSubMode = "month" | "week";
@@ -12,10 +12,13 @@ type CalendarSubMode = "month" | "week";
 const VIEW_KEY = "probuild:schedule:viewMode";
 const SUB_KEY = "probuild:schedule:calendarSubMode";
 
-export default function ScheduleView(props: ScheduleViewProps) {
+export default function ScheduleView({ initialTasks, ...rest }: ScheduleViewProps) {
     const [viewMode, setViewMode] = useState<ViewMode>("gantt");
     const [calendarSubMode, setCalendarSubMode] = useState<CalendarSubMode>("week");
     const [hydrated, setHydrated] = useState(false);
+    const [tasks, setTasks] = useState<Task[]>(initialTasks);
+
+    useEffect(() => { setTasks(initialTasks); }, [initialTasks]);
 
     useEffect(() => {
         try {
@@ -36,11 +39,14 @@ export default function ScheduleView(props: ScheduleViewProps) {
         if (hydrated) { try { localStorage.setItem(SUB_KEY, m); } catch { /* ignore */ } }
     }
 
+    const shared = { ...rest, tasks, setTasks, viewMode, onViewModeChange: changeViewMode };
+
     if (viewMode === "calendar") {
         return (
             <CalendarView
-                projectId={props.projectId}
-                initialTasks={props.initialTasks}
+                projectId={rest.projectId}
+                tasks={tasks}
+                setTasks={setTasks}
                 viewMode={viewMode}
                 onViewModeChange={changeViewMode}
                 subMode={calendarSubMode}
@@ -49,7 +55,7 @@ export default function ScheduleView(props: ScheduleViewProps) {
         );
     }
     if (viewMode === "table") {
-        return <TableView {...props} viewMode={viewMode} onViewModeChange={changeViewMode} />;
+        return <TableView {...shared} />;
     }
-    return <GanttChart {...props} viewMode={viewMode} onViewModeChange={changeViewMode} />;
+    return <GanttChart {...shared} />;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type Dispatch, type SetStateAction } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { Task } from "./schedule-types";
@@ -25,7 +25,8 @@ type SubMode = "month" | "week";
 
 type Props = {
     projectId: string;
-    initialTasks: Task[];
+    tasks: Task[];
+    setTasks: Dispatch<SetStateAction<Task[]>>;
     viewMode?: ViewMode;
     onViewModeChange?: (m: ViewMode) => void;
     subMode: SubMode;
@@ -49,10 +50,8 @@ function dayBucket(task: Task, day: Date): boolean {
     return day.getTime() >= start.getTime() && day.getTime() <= end.getTime();
 }
 
-export default function CalendarView({ projectId, initialTasks, viewMode, onViewModeChange, subMode, onSubModeChange }: Props) {
+export default function CalendarView({ projectId, tasks, setTasks, viewMode, onViewModeChange, subMode, onSubModeChange }: Props) {
     const router = useRouter();
-    const [tasks, setTasks] = useState<Task[]>(initialTasks);
-    useEffect(() => { setTasks(initialTasks); }, [initialTasks]);
 
     const [anchor, setAnchor] = useState<Date>(() => todayUTC());
     const [isPending, startTransition] = useTransition();
