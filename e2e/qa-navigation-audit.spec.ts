@@ -5,11 +5,16 @@ import {
   setupConsoleErrorCollector,
   capture,
 } from "./helpers/fail-loud";
+import { getFirstProjectId } from "./helpers/test-data";
 
-const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
+let PROJECT_ID: string;
 let consoleErrors: string[] = [];
 
 test.describe("Workflow 9: Navigation Audit", () => {
+  test.beforeAll(async ({ browser }) => {
+    PROJECT_ID = await getFirstProjectId(browser);
+  });
+
   test.beforeEach(async ({ page }) => {
     consoleErrors = setupConsoleErrorCollector(page);
   });
