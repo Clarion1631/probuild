@@ -641,7 +641,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
             </div>
 
             {/* Secondary toolbar: search + filter + sort */}
-            <div className="bg-white border-b border-hui-border shrink-0 z-10 px-6 py-2 flex items-center gap-2 flex-wrap">
+            <div className="bg-white border-b border-hui-border shrink-0 relative z-20 px-6 py-2 flex items-center gap-2 flex-wrap">
                 {/* Search */}
                 <div className="relative flex-1 min-w-[200px] max-w-md">
                     <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
@@ -711,9 +711,18 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                 <div className="mb-3">
                                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Start date range</label>
                                     <div className="mt-1.5 grid grid-cols-2 gap-2">
-                                        <input type="date" value={filters.startFrom || ""} onChange={e => updateUrl({ from: e.target.value || null })} className="hui-input text-xs" placeholder="From" />
-                                        <input type="date" value={filters.startTo || ""} onChange={e => updateUrl({ to: e.target.value || null })} className="hui-input text-xs" placeholder="To" />
+                                        <div>
+                                            <span className="text-[9px] font-semibold text-slate-500 block mb-0.5">From (on or after)</span>
+                                            <input type="date" value={filters.startFrom || ""} max={filters.startTo || undefined} onChange={e => updateUrl({ from: e.target.value || null })} className="hui-input text-xs w-full" />
+                                        </div>
+                                        <div>
+                                            <span className="text-[9px] font-semibold text-slate-500 block mb-0.5">To (on or before)</span>
+                                            <input type="date" value={filters.startTo || ""} min={filters.startFrom || undefined} onChange={e => updateUrl({ to: e.target.value || null })} className="hui-input text-xs w-full" />
+                                        </div>
                                     </div>
+                                    {(filters.startFrom || filters.startTo) && (
+                                        <button onClick={() => updateUrl({ from: null, to: null })} className="text-[10px] text-indigo-600 hover:text-indigo-800 font-medium mt-1.5 transition">Clear dates</button>
+                                    )}
                                 </div>
                                 {filtersActive && (
                                     <button onClick={() => { clearAllFilters(); setShowFilterPopover(false); }} className="w-full text-xs text-indigo-600 hover:text-indigo-800 font-medium py-1.5 mt-1 border-t border-slate-100 pt-3 transition">
