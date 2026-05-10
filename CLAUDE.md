@@ -65,10 +65,11 @@ stripe trigger payment_intent.succeeded
 ## Deploying to Vercel (CLI only — auto-deploy is OFF)
 ```powershell
 # Production deploy (from the main repo dir, not a worktree):
-vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
+vercel --prod --token $env:VERCEL_TOKEN --yes --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
 ```
 - Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
-- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
+- **Do NOT use `--archive=tgz`** — it triggered a 50-min outage on 2026-05-09. Vercel CLI ran `vercel build` locally with Turbopack (Next.js 16 default), which emits chunks with bracket characters in filenames (`[root-of-the-server]__<hash>._.js`, `[turbopack]_runtime.js`). Those got dropped during Lambda packaging server-side, leaving every page with a `ChunkLoadError: MODULE_NOT_FOUND`. Source files (~922) are well under Vercel's 15K limit with `.vercelignore`, so the archive flag is unnecessary.
+- The build script also pins `--webpack` (see `package.json` `build:next`) as a defense-in-depth so future deploys cannot regress to bracket-named chunks even if `--archive=tgz` slips back in.
 - `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
 - Only deploy when changes are verified locally via `npm run build`
 - Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard

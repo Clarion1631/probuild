@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "typecheck": "tsc --noEmit",
-    "build:next": "next build",
+    "build:next": "next build --webpack",
     "build": "npm run typecheck && npm run build:next",
     "start": "next start",
     "lint": "eslint",
