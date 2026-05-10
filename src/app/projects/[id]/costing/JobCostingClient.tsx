@@ -81,7 +81,7 @@ export default function JobCostingClient({
         estimates.forEach(est => {
             est.items.forEach((item: any) => {
                 const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
-                const total = (item.quantity * item.unitCost);
+                const total = Number(item.quantity || 0) * Number(item.unitCost || 0);
                 const itemCategory = (item.costType?.name || item.type || "").toLowerCase();
                 if (itemCategory.includes("labor")) group.budgetLabor += total;
                 else group.budgetMaterial += total;
@@ -89,22 +89,22 @@ export default function JobCostingClient({
         });
         timeEntries.forEach(te => {
             const group = getGroup(te.costCodeId, te.costCode?.name, te.costCode?.code);
-            group.actualLabor += (te.laborCost || 0);
+            group.actualLabor += Number(te.laborCost || 0);
         });
         expenses.forEach(ex => {
             const group = getGroup(ex.costCodeId, ex.costCode?.name, ex.costCode?.code);
-            group.actualMaterial += (ex.amount || 0);
+            group.actualMaterial += Number(ex.amount || 0);
             if (ex.purchaseOrderId) {
-                group.committedMaterial -= (ex.amount || 0);
+                group.committedMaterial -= Number(ex.amount || 0);
             }
         });
         purchaseOrders.forEach(po => {
-            // Only count approved POs maybe? Or all POs. Usually committed means Approved. Wait, if status exists, let's check it. 
+            // Only count approved POs maybe? Or all POs. Usually committed means Approved. Wait, if status exists, let's check it.
             // In ProBuild, we want to see it but let's assume all POs fetched here are committed.
             if (po.status !== "Draft") {
                 po.items?.forEach((item: any) => {
                     const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
-                    group.committedMaterial += (item.total || 0);
+                    group.committedMaterial += Number(item.total || 0);
                 });
             }
         });
