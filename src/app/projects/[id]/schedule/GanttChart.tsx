@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, type Dispatch, type SetStateAction } from "react";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
     importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
@@ -18,10 +18,11 @@ import SchedulePublishButton from "./SchedulePublishButton";
 
 const DRAG_THRESHOLD_PX = 5;
 
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
+export default function GanttChart({ projectId, projectName, tasks, setTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
-    initialTasks: Task[];
+    tasks: Task[];
+    setTasks: Dispatch<SetStateAction<Task[]>>;
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
@@ -30,7 +31,6 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     viewMode?: "gantt" | "table";
     onViewModeChange?: (mode: "gantt" | "table") => void;
 }) {
-    const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [zoom, setZoom] = useState<ZoomLevel>("week");
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editName, setEditName] = useState("");
