@@ -48,8 +48,8 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
     subcontractors?: Subcontractor[];
     currentUserId?: string;
     initialPublished: boolean;
-    viewMode?: "gantt" | "table";
-    onViewModeChange?: (mode: "gantt" | "table") => void;
+    viewMode?: "gantt" | "table" | "calendar";
+    onViewModeChange?: (mode: "gantt" | "table" | "calendar") => void;
 }) {
     const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
     const [panelTab, setPanelTab] = useState<"details" | "punch" | "conversation">("details");
@@ -480,6 +480,9 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                 <button onClick={() => onViewModeChange("table")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M9 6v12"/></svg>Table
                                 </button>
+                                <button onClick={() => onViewModeChange("calendar")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>Calendar
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -582,6 +585,9 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                 </button>
                                 <button onClick={() => onViewModeChange("table")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M9 6v12"/></svg>Table
+                                </button>
+                                <button onClick={() => onViewModeChange("calendar")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>Calendar
                                 </button>
                             </div>
                         )}
