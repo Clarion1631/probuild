@@ -12,9 +12,10 @@ import {
 } from "@/lib/actions";
 import { toast } from "sonner";
 import type { Task, ZoomLevel, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment } from "./schedule-types";
-import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
+import { STATUS_OPTIONS, STATUS_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
 import TaskDetailPanel from "./TaskDetailPanel";
 import SchedulePublishButton from "./SchedulePublishButton";
+import ColorPicker from "./ColorPicker";
 
 const DRAG_THRESHOLD_PX = 5;
 
@@ -709,12 +710,15 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                                                 <div className="w-3 h-3 rotate-45 border-2" style={{ backgroundColor: task.color, borderColor: task.color }} />
                                             </button>
                                         ) : (
-                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ring-slate-200" style={{ backgroundColor: task.color }} />
+                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
                                         )}
                                         {colorPickerId === task.id && (
-                                            <div className="absolute top-5 left-0 z-50 bg-white border border-hui-border rounded-lg shadow-xl p-1.5 flex gap-1 animate-in fade-in">
-                                                {PRESET_COLORS.map(c => (<button key={c} onClick={e => { e.stopPropagation(); handleColorChange(task.id, c); }} className="w-5 h-5 rounded-full hover:scale-125 transition" style={{ backgroundColor: c }} />))}
-                                            </div>
+                                            <ColorPicker
+                                                selected={task.color}
+                                                onPick={c => handleColorChange(task.id, c)}
+                                                onClose={() => setColorPickerId(null)}
+                                                className="absolute top-5 left-0 z-50 min-w-[200px]"
+                                            />
                                         )}
                                     </div>
                                     <div className="flex-1 min-w-0">
@@ -900,6 +904,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                         onNameChange={(taskId, name) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t)); updateScheduleTask(taskId, { name }); }}
                         onDateChange={handleDateChange}
                         onEstimatedHoursChange={(taskId, hours) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t)); updateScheduleTask(taskId, { estimatedHours: hours }); }}
+                        onColorChange={handleColorChange}
                         onDelete={handleDelete}
                         estimateItems={estimateItems}
                         onLinkEstimateItem={handleLinkEstimateItem}

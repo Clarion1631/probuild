@@ -7,7 +7,27 @@ export const STATUS_COLORS: Record<string, string> = {
     "Complete": "bg-green-100 text-green-700",
     "Blocked": "bg-red-100 text-red-700",
 };
-export const PRESET_COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
+export const PRESET_COLORS = [
+    "#ef4444", "#f97316", "#f59e0b", "#eab308", "#4c9a2a", "#10b981", "#14b8a6", "#06b6d4",
+    "#0ea5e9", "#3b82f6", "#6366f1", "#8b5cf6", "#ec4899", "#92400e", "#64748b", "#ffffff",
+];
+
+// Keyword → default color for new tasks. Matched case-insensitively against the task name (substring).
+// First match wins. Returns undefined if no keyword matches.
+const TASK_NAME_COLOR_DEFAULTS: Array<[RegExp, string]> = [
+    [/\bdemo/i,     "#f97316"], // orange
+    [/\bfram/i,     "#92400e"], // brown — framing/lumber
+    [/\bplumb/i,    "#3b82f6"], // blue
+    [/\belectri/i,  "#ef4444"], // red
+    [/\bcounter/i,  "#ffffff"], // white — countertops
+];
+
+export function getDefaultColorForTaskName(name: string): string | undefined {
+    for (const [pattern, color] of TASK_NAME_COLOR_DEFAULTS) {
+        if (pattern.test(name)) return color;
+    }
+    return undefined;
+}
 
 export function getDaysBetween(a: Date, b: Date) { return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)); }
 export function addDays(date: Date, days: number) { const d = new Date(date.getTime()); d.setUTCDate(d.getUTCDate() + days); return d; }

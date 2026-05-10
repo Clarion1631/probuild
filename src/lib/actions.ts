@@ -12,6 +12,7 @@ import { resolveSessionClientId } from "./portal-auth";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
 import { normalizeE164 } from "./phone";
+import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -4419,7 +4420,7 @@ export async function createScheduleTask(projectId: string, data: {
             name: data.name,
             startDate: new Date(data.startDate),
             endDate: isMilestone ? new Date(data.startDate) : new Date(data.endDate),
-            color: data.color || "#4c9a2a",
+            color: data.color || getDefaultColorForTaskName(data.name) || "#4c9a2a",
             status: data.status || "Not Started",
             assignee: data.assignee || null,
             parentId: data.parentId || null,
@@ -4574,7 +4575,7 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
                 name: item.name,
                 startDate,
                 endDate,
-                color: TYPE_COLORS[item.type] || "#4c9a2a",
+                color: getDefaultColorForTaskName(item.name) || TYPE_COLORS[item.type] || "#4c9a2a",
                 order: order++,
                 status: "Not Started",
                 estimatedHours,
@@ -4813,7 +4814,7 @@ Rules:
                 name: t.name,
                 startDate,
                 endDate,
-                color: COLORS[i % COLORS.length],
+                color: getDefaultColorForTaskName(t.name) || COLORS[i % COLORS.length],
                 order: order++,
                 status: "Not Started",
                 estimatedHours: t.estimatedHours || null,
