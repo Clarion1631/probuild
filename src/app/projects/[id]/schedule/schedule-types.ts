@@ -33,6 +33,18 @@ export type Task = {
 
 export type ZoomLevel = "day" | "week" | "month";
 
+export type SortKey = "manual" | "name" | "type" | "startDate" | "endDate" | "duration" | "status" | "progress" | "estimatedHours" | "actualHours";
+export type SortDir = "asc" | "desc";
+
+export type FilterState = {
+    q: string;
+    statuses: string[];
+    type: "all" | "task" | "milestone";
+    assignee: string | null;
+    startFrom: string | null;
+    startTo: string | null;
+};
+
 export type ScheduleViewProps = {
     projectId: string;
     projectName: string;
@@ -41,4 +53,5 @@ export type ScheduleViewProps = {
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
     currentUserId?: string;
+    initialPublished: boolean;
 };

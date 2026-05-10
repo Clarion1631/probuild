@@ -9,16 +9,16 @@ import {
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
     assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
     getEstimateItemsForProject,
-    toggleSchedulePublished, getPortalVisibility,
 } from "@/lib/actions";
 import { toast } from "sonner";
 import type { Task, ZoomLevel, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment } from "./schedule-types";
 import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
 import TaskDetailPanel from "./TaskDetailPanel";
+import SchedulePublishButton from "./SchedulePublishButton";
 
 const DRAG_THRESHOLD_PX = 5;
 
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", viewMode, onViewModeChange }: {
+export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
@@ -26,6 +26,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
     currentUserId?: string;
+    initialPublished: boolean;
     viewMode?: "gantt" | "table" | "calendar";
     onViewModeChange?: (mode: "gantt" | "table" | "calendar") => void;
 }) {
@@ -61,28 +62,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     const [comments, setComments] = useState<Comment[]>([]);
     const [isAiPunching, setIsAiPunching] = useState(false);
     const [estimateItems, setEstimateItems] = useState<EstimateItemSummary[]>([]);
-    const [isPublished, setIsPublished] = useState(false);
-    const [isPublishing, setIsPublishing] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const dragRef = useRef<{ cleanup: () => void } | null>(null);
     const tasksRef = useRef<Task[]>([]);
 
     const selectedTask = tasks.find(t => t.id === selectedTaskId);
-
-    useEffect(() => {
-        getPortalVisibility(projectId).then(v => setIsPublished(v.showSchedule));
-    }, [projectId]);
-
-    async function handleTogglePublish() {
-        setIsPublishing(true);
-        try {
-            const next = !isPublished;
-            await toggleSchedulePublished(projectId, next);
-            setIsPublished(next);
-            toast.success(next ? "Schedule published to client portal" : "Schedule hidden from client portal");
-        } catch { toast.error("Failed to update publish status"); }
-        finally { setIsPublishing(false); }
-    }
 
     // Critical path computation
     const criticalPathIds = useMemo(() => computeCriticalPath(tasks), [tasks]);
@@ -629,15 +613,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         >
                             ⚠️ {isAiRisk ? "Analyzing…" : "AI Risk"}
                         </button>
-                        <button
-                            onClick={handleTogglePublish}
-                            disabled={isPublishing}
-                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isPublished ? "bg-green-50 text-green-700 border-green-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
-                            title={isPublished ? "Schedule is visible to client — click to hide" : "Publish schedule to client portal"}
-                        >
-                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={isPublished ? "M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" : "M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M3 3l18 18"} /></svg>
-                            {isPublishing ? "Updating…" : isPublished ? "Published" : "Publish to Client"}
-                        </button>
+                        <SchedulePublishButton projectId={projectId} initialPublished={initialPublished} />
                         <button
                             onClick={() => {
                                 if (tasks.length === 0) { toast.error("No tasks to sync"); return; }
@@ -704,7 +680,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                 </div>
             )}
 
-            <div className="flex flex-1 overflow-hidden">
+            <div className="flex flex-1 min-h-0 overflow-hidden">
                 {/* Left Panel — Task List */}
                 <div className="w-80 shrink-0 bg-white border-r border-hui-border flex flex-col z-10 shadow-[2px_0_8px_rgba(0,0,0,0.03)]">
                     <div className="flex items-center px-3 py-3 bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-hui-border text-[10px] font-bold text-slate-400 uppercase tracking-wider h-[44px]">
@@ -713,7 +689,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                         <div className="w-20 text-center">Status</div>
                         <div className="w-8"></div>
                     </div>
-                    <div className="flex-1 overflow-y-auto">
+                    <div className="flex-1 min-h-0 overflow-y-auto">
                         {tasks.map(task => {
                             const hasTimeData = task.actualHours > 0 && task.estimatedHours;
                             const isCritical = showCriticalPath && criticalPathIds.has(task.id);
@@ -808,7 +784,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                 </div>
 
                 {/* Middle — Timeline */}
-                <div ref={scrollRef} className="flex-1 overflow-auto bg-slate-50/50 relative">
+                <div ref={scrollRef} className="flex-1 min-h-0 min-w-0 overflow-auto bg-slate-50/50 relative">
                     <div style={{ width: timelineWidth, minHeight: "100%" }} className="relative">
                         <div className="sticky top-0 z-10 flex bg-slate-50 border-b border-hui-border h-[44px]">
                             {headers.map(h => (<div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>{h.label}</div>))}
