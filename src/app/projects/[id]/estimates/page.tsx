@@ -45,7 +45,7 @@ export default async function EstimatesPage({ params }: { params: Promise<{ id: 
     }
 
     return (
-        <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
+        <div className="flex -m-6 h-[calc(100%+48px)] overflow-hidden">
             <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-50 via-white to-slate-50/50">
                 <div className="p-8 max-w-6xl mx-auto">
                     {/* Header */}
