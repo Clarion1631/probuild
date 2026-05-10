@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState, useTransition, type Dispatch, type SetStateAction } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import type { Task } from "./schedule-types";
+import type { Task, PunchItem } from "./schedule-types";
 import {
     STATUS_OPTIONS,
     STATUS_COLORS,
@@ -18,7 +18,10 @@ import {
     parseUTCDate,
     todayUTC,
 } from "./schedule-utils";
-import { createScheduleTask, updateScheduleTask, deleteScheduleTask } from "@/lib/actions";
+import {
+    createScheduleTask, updateScheduleTask, deleteScheduleTask,
+    addTaskPunchItem, togglePunchItem, deletePunchItem, getTaskPunchItems,
+} from "@/lib/actions";
 
 type ViewMode = "gantt" | "table" | "calendar";
 type SubMode = "month" | "week";
@@ -394,8 +397,59 @@ function QuickEditPopover({
     const [nameDraft, setNameDraft] = useState(task.name);
     useEffect(() => { setNameDraft(task.name); }, [task.id, task.name]);
 
+    const [punchItems, setPunchItems] = useState<PunchItem[]>([]);
+    const [punchLoading, setPunchLoading] = useState(true);
+    const [newPunch, setNewPunch] = useState("");
+
+    useEffect(() => {
+        let cancelled = false;
+        setPunchLoading(true);
+        getTaskPunchItems(task.id)
+            .then(items => { if (!cancelled) { setPunchItems(items as PunchItem[]); setPunchLoading(false); } })
+            .catch(() => { if (!cancelled) setPunchLoading(false); });
+        return () => { cancelled = true; };
+    }, [task.id]);
+
+    async function handleAddPunch() {
+        const name = newPunch.trim();
+        if (!name) return;
+        const tempId = `temp-${Date.now()}`;
+        const optimistic: PunchItem = { id: tempId, name, completed: false, order: punchItems.length };
+        setPunchItems(prev => [...prev, optimistic]);
+        setNewPunch("");
+        try {
+            const created = await addTaskPunchItem(task.id, name);
+            setPunchItems(prev => prev.map(p => p.id === tempId ? (created as PunchItem) : p));
+        } catch {
+            setPunchItems(prev => prev.filter(p => p.id !== tempId));
+            toast.error("Failed to add item");
+        }
+    }
+
+    async function handleTogglePunch(id: string) {
+        const before = punchItems;
+        setPunchItems(prev => prev.map(p => p.id === id ? { ...p, completed: !p.completed } : p));
+        try {
+            await togglePunchItem(id);
+        } catch {
+            setPunchItems(before);
+            toast.error("Failed to update item");
+        }
+    }
+
+    async function handleDeletePunch(id: string) {
+        const before = punchItems;
+        setPunchItems(prev => prev.filter(p => p.id !== id));
+        try {
+            await deletePunchItem(id);
+        } catch {
+            setPunchItems(before);
+            toast.error("Failed to delete item");
+        }
+    }
+
     const left = clamp(x - 160, 8, typeof window !== "undefined" ? window.innerWidth - 328 : 0);
-    const top = clamp(y, 8, typeof window !== "undefined" ? window.innerHeight - 320 : 0);
+    const top = clamp(y, 8, typeof window !== "undefined" ? window.innerHeight - 480 : 0);
 
     return (
         <div
@@ -469,9 +523,62 @@ function QuickEditPopover({
                 </div>
             </div>
 
+            <div className="mt-3 pt-2 border-t border-slate-100">
+                <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Punch list</span>
+                    {punchItems.length > 0 && (
+                        <span className="text-[10px] text-slate-400">
+                            {punchItems.filter(p => p.completed).length} / {punchItems.length} done
+                        </span>
+                    )}
+                </div>
+                <div className="max-h-32 overflow-y-auto -mx-1 px-1">
+                    {punchLoading && punchItems.length === 0 ? (
+                        <div className="text-[11px] text-slate-400 italic py-1">Loading…</div>
+                    ) : punchItems.length === 0 ? (
+                        <div className="text-[11px] text-slate-400 italic py-1">No items yet</div>
+                    ) : (
+                        <ul className="space-y-0.5">
+                            {punchItems.map(item => (
+                                <li key={item.id} className="group flex items-center gap-2 py-0.5">
+                                    <input
+                                        type="checkbox"
+                                        checked={item.completed}
+                                        onChange={() => handleTogglePunch(item.id)}
+                                        className="w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-400"
+                                    />
+                                    <span className={`flex-1 text-xs ${item.completed ? "line-through text-slate-400" : "text-slate-700"}`}>
+                                        {item.name}
+                                    </span>
+                                    <button
+                                        onClick={() => handleDeletePunch(item.id)}
+                                        aria-label="Delete item"
+                                        className="text-slate-400 hover:text-red-600 text-xs leading-none px-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition"
+                                    >×</button>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+                <div className="mt-1.5 flex items-center gap-1">
+                    <input
+                        value={newPunch}
+                        onChange={e => setNewPunch(e.target.value)}
+                        onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); handleAddPunch(); } }}
+                        placeholder="Add item…"
+                        className="flex-1 hui-input text-xs py-1"
+                    />
+                    <button
+                        onClick={handleAddPunch}
+                        disabled={!newPunch.trim()}
+                        className="text-xs px-2 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                    >Add</button>
+                </div>
+            </div>
+
             <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between">
                 <button onClick={onDelete} className="text-xs text-red-600 hover:text-red-700">Delete</button>
-                <span className="text-[10px] text-slate-400">For dependencies, comments, punch list — switch to Gantt or Table</span>
+                <span className="text-[10px] text-slate-400">For dependencies and comments, switch to Gantt or Table</span>
             </div>
         </div>
     );
