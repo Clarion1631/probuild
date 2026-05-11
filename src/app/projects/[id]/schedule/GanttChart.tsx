@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, type Dispatch, type SetStateAction } from "react";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
     importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
@@ -18,18 +18,18 @@ import SchedulePublishButton from "./SchedulePublishButton";
 
 const DRAG_THRESHOLD_PX = 5;
 
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], initialPublished, viewMode, onViewModeChange }: {
+export default function GanttChart({ projectId, projectName, tasks, setTasks, estimates = [], teamMembers = [], subcontractors = [], initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
-    initialTasks: Task[];
+    tasks: Task[];
+    setTasks: Dispatch<SetStateAction<Task[]>>;
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
     initialPublished: boolean;
-    viewMode?: "gantt" | "table";
-    onViewModeChange?: (mode: "gantt" | "table") => void;
+    viewMode?: "gantt" | "table" | "calendar";
+    onViewModeChange?: (mode: "gantt" | "table" | "calendar") => void;
 }) {
-    const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [zoom, setZoom] = useState<ZoomLevel>("week");
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editName, setEditName] = useState("");
@@ -489,6 +489,7 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                     <div className="flex items-center bg-slate-100 rounded-lg p-0.5">
                         <button onClick={() => onViewModeChange("gantt")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Gantt</button>
                         <button onClick={() => onViewModeChange("table")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Table</button>
+                        <button onClick={() => onViewModeChange("calendar")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Calendar</button>
                     </div>
                 )}
                 <div className="relative">
@@ -569,6 +570,10 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
                                 <button onClick={() => onViewModeChange("table")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M9 6v12"/></svg>
                                     Table
+                                </button>
+                                <button onClick={() => onViewModeChange("calendar")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                                    Calendar
                                 </button>
                             </div>
                         )}
