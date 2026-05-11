@@ -10,6 +10,7 @@ import {
     PRESET_COLORS,
     addDays,
     formatDate,
+    getDaysBetween,
     getMonday,
     isWeekend,
     getWeekDays,
@@ -66,6 +67,9 @@ export default function CalendarView({ projectId, tasks, setTasks, viewMode, onV
 
     const [editing, setEditing] = useState<{ taskId: string; x: number; y: number } | null>(null);
     const editingTask = useMemo(() => editing ? tasks.find(t => t.id === editing.taskId) ?? null : null, [editing, tasks]);
+
+    const [dragTaskId, setDragTaskId] = useState<string | null>(null);
+    const [dragOverKey, setDragOverKey] = useState<string | null>(null);
 
     const today = todayUTC();
 
@@ -144,6 +148,46 @@ export default function CalendarView({ projectId, tasks, setTasks, viewMode, onV
 
     const tasksForDay = (day: Date) => tasks.filter(t => dayBucket(t, day));
 
+    function handleTaskDragStart(task: Task, e: React.DragEvent) {
+        e.stopPropagation();
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", task.id);
+        setDragTaskId(task.id);
+        setQuickAdd(null);
+        setEditing(null);
+    }
+    function handleTaskDragEnd() {
+        setDragTaskId(null);
+        setDragOverKey(null);
+    }
+    function handleDayDragOver(day: Date, e: React.DragEvent) {
+        if (!dragTaskId) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        const k = formatDate(day);
+        if (k !== dragOverKey) setDragOverKey(k);
+    }
+    function handleDayDragLeave(day: Date) {
+        const k = formatDate(day);
+        setDragOverKey(prev => prev === k ? null : prev);
+    }
+    function handleDayDrop(day: Date, e: React.DragEvent) {
+        e.preventDefault();
+        e.stopPropagation();
+        const taskId = e.dataTransfer.getData("text/plain") || dragTaskId;
+        setDragTaskId(null);
+        setDragOverKey(null);
+        if (!taskId) return;
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return;
+        const oldStart = parseUTCDate(task.startDate);
+        if (isSameUTCDay(oldStart, day)) return;
+        const duration = Math.max(0, getDaysBetween(oldStart, parseUTCDate(task.endDate)));
+        const newStart = day;
+        const newEnd = addDays(day, duration);
+        patchTask(task.id, { startDate: formatDate(newStart), endDate: formatDate(newEnd) });
+    }
+
     return (
         <div className="flex flex-col h-full bg-hui-background" onClick={() => { setQuickAdd(null); setEditing(null); }}>
             {/* Top toolbar with view toggle + calendar header */}
@@ -194,6 +238,13 @@ export default function CalendarView({ projectId, tasks, setTasks, viewMode, onV
                         tasksForDay={tasksForDay}
                         onCellClick={handleCellClick}
                         onTaskClick={handleTaskClick}
+                        onTaskDragStart={handleTaskDragStart}
+                        onTaskDragEnd={handleTaskDragEnd}
+                        onDayDragOver={handleDayDragOver}
+                        onDayDragLeave={handleDayDragLeave}
+                        onDayDrop={handleDayDrop}
+                        dragTaskId={dragTaskId}
+                        dragOverKey={dragOverKey}
                     />
                 ) : (
                     <MonthGrid
@@ -203,6 +254,13 @@ export default function CalendarView({ projectId, tasks, setTasks, viewMode, onV
                         onCellClick={handleCellClick}
                         onTaskClick={handleTaskClick}
                         onSwitchToWeek={(d) => { setAnchor(d); onSubModeChange("week"); }}
+                        onTaskDragStart={handleTaskDragStart}
+                        onTaskDragEnd={handleTaskDragEnd}
+                        onDayDragOver={handleDayDragOver}
+                        onDayDragLeave={handleDayDragLeave}
+                        onDayDrop={handleDayDrop}
+                        dragTaskId={dragTaskId}
+                        dragOverKey={dragOverKey}
                     />
                 )}
             </div>
@@ -259,12 +317,21 @@ function clamp(v: number, min: number, max: number) { return Math.min(Math.max(v
 
 function WeekGrid({
     anchor, today, tasksForDay, onCellClick, onTaskClick,
+    onTaskDragStart, onTaskDragEnd, onDayDragOver, onDayDragLeave, onDayDrop,
+    dragTaskId, dragOverKey,
 }: {
     anchor: Date;
     today: Date;
     tasksForDay: (d: Date) => Task[];
     onCellClick: (d: Date, e: React.MouseEvent) => void;
     onTaskClick: (t: Task, e: React.MouseEvent) => void;
+    onTaskDragStart: (t: Task, e: React.DragEvent) => void;
+    onTaskDragEnd: () => void;
+    onDayDragOver: (d: Date, e: React.DragEvent) => void;
+    onDayDragLeave: (d: Date) => void;
+    onDayDrop: (d: Date, e: React.DragEvent) => void;
+    dragTaskId: string | null;
+    dragOverKey: string | null;
 }) {
     const days = getWeekDays(anchor);
     return (
@@ -273,10 +340,12 @@ function WeekGrid({
                 const isToday = isSameUTCDay(day, today);
                 const weekend = isWeekend(day);
                 const dayTasks = tasksForDay(day);
+                const dayKey = formatDate(day);
+                const isDropTarget = dragOverKey === dayKey;
                 return (
                     <div
                         key={idx}
-                        className={`flex flex-col border-r last:border-r-0 border-hui-border ${weekend ? "bg-slate-50/60" : "bg-white"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""}`}
+                        className={`flex flex-col border-r last:border-r-0 border-hui-border ${weekend ? "bg-slate-50/60" : "bg-white"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""} ${isDropTarget ? "ring-2 ring-inset ring-indigo-500 bg-indigo-50/40" : ""}`}
                     >
                         <div className={`sticky top-0 px-3 py-2 border-b border-hui-border bg-white/95 backdrop-blur z-10 ${isToday ? "text-indigo-700" : "text-hui-textMain"}`}>
                             <div className={`text-[10px] font-semibold uppercase tracking-wide ${isToday ? "text-indigo-600" : "text-slate-400"}`}>{WEEKDAY_LABELS[idx]}</div>
@@ -288,13 +357,19 @@ function WeekGrid({
                         <div
                             className="flex-1 min-h-[420px] p-2 cursor-pointer"
                             onClick={e => onCellClick(day, e)}
+                            onDragOver={e => onDayDragOver(day, e)}
+                            onDragLeave={() => onDayDragLeave(day)}
+                            onDrop={e => onDayDrop(day, e)}
                         >
                             <div className="flex flex-col gap-1.5">
                                 {dayTasks.map(t => (
                                     <button
                                         key={t.id}
+                                        draggable
+                                        onDragStart={e => onTaskDragStart(t, e)}
+                                        onDragEnd={onTaskDragEnd}
                                         onClick={e => onTaskClick(t, e)}
-                                        className="text-left px-2 py-1.5 rounded-md text-xs font-medium shadow-sm hover:shadow transition border border-black/5"
+                                        className={`text-left px-2 py-1.5 rounded-md text-xs font-medium shadow-sm hover:shadow transition border border-black/5 cursor-grab active:cursor-grabbing ${dragTaskId === t.id ? "opacity-40" : ""}`}
                                         style={{ backgroundColor: hexWithAlpha(t.color, 0.15), color: t.color, borderLeftColor: t.color, borderLeftWidth: 3 }}
                                     >
                                         <div className="truncate text-slate-800">{t.name}</div>
@@ -305,7 +380,7 @@ function WeekGrid({
                                     </button>
                                 ))}
                                 {dayTasks.length === 0 && (
-                                    <div className="text-[10px] text-slate-300 italic select-none">Click to add</div>
+                                    <div className="text-[10px] text-slate-300 italic select-none">{isDropTarget ? "Drop to move here" : "Click to add"}</div>
                                 )}
                             </div>
                         </div>
@@ -320,6 +395,8 @@ function WeekGrid({
 
 function MonthGrid({
     anchor, today, tasksForDay, onCellClick, onTaskClick, onSwitchToWeek,
+    onTaskDragStart, onTaskDragEnd, onDayDragOver, onDayDragLeave, onDayDrop,
+    dragTaskId, dragOverKey,
 }: {
     anchor: Date;
     today: Date;
@@ -327,6 +404,13 @@ function MonthGrid({
     onCellClick: (d: Date, e: React.MouseEvent) => void;
     onTaskClick: (t: Task, e: React.MouseEvent) => void;
     onSwitchToWeek: (d: Date) => void;
+    onTaskDragStart: (t: Task, e: React.DragEvent) => void;
+    onTaskDragEnd: () => void;
+    onDayDragOver: (d: Date, e: React.DragEvent) => void;
+    onDayDragLeave: (d: Date) => void;
+    onDayDrop: (d: Date, e: React.DragEvent) => void;
+    dragTaskId: string | null;
+    dragOverKey: string | null;
 }) {
     const days = getMonthGrid(anchor);
     const currentMonth = anchor.getUTCMonth();
@@ -346,11 +430,16 @@ function MonthGrid({
                     const dayTasks = tasksForDay(day);
                     const visible = dayTasks.slice(0, MAX_PER_CELL);
                     const overflow = dayTasks.length - visible.length;
+                    const dayKey = formatDate(day);
+                    const isDropTarget = dragOverKey === dayKey;
                     return (
                         <div
                             key={idx}
                             onClick={e => onCellClick(day, e)}
-                            className={`relative border-r border-b border-hui-border last:border-r-0 p-1.5 cursor-pointer min-h-[110px] ${isCurrentMonth ? (weekend ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""}`}
+                            onDragOver={e => onDayDragOver(day, e)}
+                            onDragLeave={() => onDayDragLeave(day)}
+                            onDrop={e => onDayDrop(day, e)}
+                            className={`relative border-r border-b border-hui-border last:border-r-0 p-1.5 cursor-pointer min-h-[110px] ${isCurrentMonth ? (weekend ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""} ${isDropTarget ? "ring-2 ring-inset ring-indigo-500 bg-indigo-50/40" : ""}`}
                         >
                             <div className="flex items-center justify-between">
                                 <span className={`text-xs font-semibold ${isToday ? "inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-600 text-white" : isCurrentMonth ? "text-hui-textMain" : "text-slate-400"}`}>
@@ -361,8 +450,11 @@ function MonthGrid({
                                 {visible.map(t => (
                                     <button
                                         key={t.id}
+                                        draggable
+                                        onDragStart={e => onTaskDragStart(t, e)}
+                                        onDragEnd={onTaskDragEnd}
                                         onClick={e => onTaskClick(t, e)}
-                                        className="text-left text-[11px] px-1.5 py-0.5 rounded truncate hover:opacity-90 transition"
+                                        className={`text-left text-[11px] px-1.5 py-0.5 rounded truncate hover:opacity-90 transition cursor-grab active:cursor-grabbing ${dragTaskId === t.id ? "opacity-40" : ""}`}
                                         style={{ backgroundColor: hexWithAlpha(t.color, 0.15), color: t.color, borderLeft: `3px solid ${t.color}` }}
                                     >
                                         <span className="truncate text-slate-800">{t.name}</span>
