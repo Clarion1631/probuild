@@ -10,9 +10,12 @@ const SENTINEL_PATH = resolve(__dirname, ".anthropic-status");
 setup("seed test data + probe anthropic", async () => {
     setup.setTimeout(60_000);
 
+    console.log("[data.setup] DATABASE_URL set:", !!process.env.DATABASE_URL);
+    console.log("[data.setup] DATABASE_URL host:", (process.env.DATABASE_URL || "").match(/@([^:/?]+)/)?.[1] ?? "(none)");
+
     const prisma = new PrismaClient();
     try {
-        await prisma.client.upsert({
+        const client = await prisma.client.upsert({
             where: { id: TEST_CLIENT_ID },
             update: {},
             create: {
@@ -22,8 +25,9 @@ setup("seed test data + probe anthropic", async () => {
                 email: "test-client@goldentouchremodeling.com",
             },
         });
+        console.log("[data.setup] client upserted:", { id: client.id, name: client.name });
 
-        await prisma.project.upsert({
+        const project = await prisma.project.upsert({
             where: { id: PROJECT_ID },
             update: {},
             create: {
@@ -33,6 +37,13 @@ setup("seed test data + probe anthropic", async () => {
                 status: "In Progress",
             },
         });
+        console.log("[data.setup] project upserted:", { id: project.id, name: project.name, clientId: project.clientId });
+
+        const verify = await prisma.project.findUnique({ where: { id: PROJECT_ID }, select: { id: true, name: true } });
+        console.log("[data.setup] verify project exists:", verify);
+    } catch (e) {
+        console.error("[data.setup] DB upsert failed:", (e as Error).message);
+        throw e;
     } finally {
         await prisma.$disconnect();
     }
