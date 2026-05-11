@@ -18,14 +18,13 @@ import SchedulePublishButton from "./SchedulePublishButton";
 
 const DRAG_THRESHOLD_PX = 5;
 
-export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
+export default function GanttChart({ projectId, projectName, initialTasks, estimates = [], teamMembers = [], subcontractors = [], initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
     initialTasks: Task[];
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
-    currentUserId?: string;
     initialPublished: boolean;
     viewMode?: "gantt" | "table";
     onViewModeChange?: (mode: "gantt" | "table") => void;
@@ -445,9 +444,11 @@ export default function GanttChart({ projectId, projectName, initialTasks, estim
     async function handleAddComment(text: string) {
         if (!text || !selectedTaskId) return;
         try {
-            const comment = await addTaskComment(selectedTaskId, currentUserId, text);
+            const comment = await addTaskComment(selectedTaskId, text);
             setComments(prev => [...prev, { ...(comment as any), createdAt: new Date().toISOString() }]);
-        } catch { toast.error("Failed to add comment"); }
+        } catch (e) {
+            toast.error(e instanceof Error ? e.message : "Failed to add comment");
+        }
     }
     async function handleAssign(userId: string) {
         if (!selectedTaskId) return;

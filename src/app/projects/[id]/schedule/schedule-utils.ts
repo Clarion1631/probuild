@@ -14,7 +14,7 @@ export function addDays(date: Date, days: number) { const d = new Date(date.getT
 export function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
 export function getMonday(d: Date) { const c = new Date(d.getTime()); const day = c.getUTCDay(); const diff = day === 0 ? -6 : 1 - day; c.setUTCDate(c.getUTCDate() + diff); return c; }
 export function isWeekend(d: Date) { const day = d.getUTCDay(); return day === 0 || day === 6; }
-export function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
+export function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0]?.toUpperCase() ?? "?"; }
 export function formatCurrency(n: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n); }
 
 export function computeCriticalPath(tasks: Task[]): Set<string> {
