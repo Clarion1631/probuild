@@ -1,22 +1,18 @@
 import { getProject, getScheduleTasks, getTeamMembers, getActiveSubcontractors, getPortalVisibility } from "@/lib/actions";
-import { getSessionOrDev } from "@/lib/auth";
 import ScheduleView from "./ScheduleView";
 
 export const dynamic = "force-dynamic";
 
 export default async function SchedulePage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
-    const [project, rawTasks, teamMembers, subcontractors, session, portalVisibility] = await Promise.all([
+    const [project, rawTasks, teamMembers, subcontractors, portalVisibility] = await Promise.all([
         getProject(id),
         getScheduleTasks(id),
         getTeamMembers(),
         getActiveSubcontractors(),
-        getSessionOrDev(),
         getPortalVisibility(id),
     ]);
     if (!project) return <div className="p-6 text-hui-textMuted">Project not found</div>;
-
-    const currentUserId = (session?.user as any)?.id || "system";
 
     const tasks = rawTasks.map((t: any) => ({
         id: t.id,
@@ -52,7 +48,6 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
                 estimates={estimates}
                 teamMembers={teamMembers as any}
                 subcontractors={subcontractors as any}
-                currentUserId={currentUserId}
                 initialPublished={portalVisibility.showSchedule}
             />
         </div>

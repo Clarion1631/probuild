@@ -31,6 +31,7 @@ model User {
   dailyLogs        DailyLog[]
   documentComments DocumentComment[]
   teamMessages     TeamMessage[]
+  fieldUpdatesSeenAt DateTime?
 }
 
 model Client {
@@ -726,6 +727,17 @@ model TaskComment {
   subcontractorName String?      // display name for sub-portal comments
   text              String
   createdAt         DateTime     @default(now())
+  photos            TaskCommentPhoto[]
+}
+
+model TaskCommentPhoto {
+  id        String      @id @default(cuid())
+  commentId String
+  comment   TaskComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  url       String
+  createdAt DateTime    @default(now())
+
+  @@index([commentId])
 }
 
 model TaskPunchItem {

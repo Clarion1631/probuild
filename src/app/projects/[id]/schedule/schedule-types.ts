@@ -3,7 +3,8 @@ export type EstimateItemSummary = { id: string; name: string; type: string; tota
 export type Dependency = { id: string; predecessorId: string; dependentId: string };
 export type TeamMember = { id: string; name: string | null; email: string };
 export type PunchItem = { id: string; name: string; completed: boolean; order: number };
-export type Comment = { id: string; text: string; createdAt: string; user: { id: string; name: string | null; email: string } };
+export type CommentPhoto = { id: string; url: string };
+export type Comment = { id: string; text: string; createdAt: string; subcontractorName?: string | null; user: { id: string; name: string | null; email: string } | null; photos?: CommentPhoto[] };
 export type Assignment = { id: string; userId: string; user: TeamMember };
 export type Subcontractor = { id: string; companyName: string; email: string; trade: string | null };
 export type SubAssignment = { id: string; subcontractorId: string; subcontractor: Subcontractor };
@@ -52,6 +53,5 @@ export type ScheduleViewProps = {
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
-    currentUserId?: string;
     initialPublished: boolean;
 };
