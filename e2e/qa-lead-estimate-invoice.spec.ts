@@ -31,12 +31,7 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
     await assertCurrencyValues(page, "leads-page");
   });
 
-  // SKIPPED: AddLeadModal was refactored — `input[name="location"]` no longer
-  // exists (replaced by separate jobSiteCity / jobSiteState / jobSiteZip fields
-  // without name attributes). Test needs to be rewritten against the new form
-  // structure before it can be unskipped. Tracked separately from the CI gate
-  // restoration in PR #90.
-  test.skip("W1.2: Create a new lead with full details — lead form refactored, test needs rewrite", async ({
+  test("W1.2: Create a new lead with full details", async ({
     page,
   }, testInfo) => {
     await page.goto("/leads", { waitUntil: "networkidle" });
@@ -67,7 +62,8 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
     // Fill remaining fields
     await page.locator('input[name="clientEmail"]').fill("mike.henderson@gmail.com");
     await page.locator('input[name="clientPhone"]').fill("360-412-8837");
-    await page.locator('input[name="location"]').fill("14502 NE 28th St, Vancouver, WA 98684");
+    // Job site address is optional and uses a Google Maps autocomplete + structured
+    // city/state/zip fields without name attributes; leave it empty for this test.
 
     const sourceSelect = page.locator('select[name="source"]');
     if (await sourceSelect.isVisible()) {
