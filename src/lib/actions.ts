@@ -3,7 +3,7 @@
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
-import { authOptions } from "./auth";
+import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
@@ -4591,10 +4591,35 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
 
 // ========== TASK COMMENTS ==========
 
-export async function addTaskComment(taskId: string, userId: string, text: string) {
+export async function addTaskComment(taskId: string, text: string, photoUrls?: string[]) {
+    // Derive identity from the session — never trust a client-supplied userId.
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionName = (session?.user?.name as string | null) ?? null;
+    const sessionEmail = (session?.user?.email as string | null) ?? null;
+
+    let resolvedUser: { id: string; name: string | null; email: string } | null = null;
+    if (sessionUserId) {
+        resolvedUser = await prisma.user.findUnique({
+            where: { id: sessionUserId },
+            select: { id: true, name: true, email: true },
+        });
+    }
+    const fallbackLabel = sessionName ?? sessionEmail ?? "Unknown";
+    const cleanPhotoUrls = (photoUrls ?? []).filter(u => typeof u === "string" && u.length > 0).slice(0, 10);
+
     const comment = await prisma.taskComment.create({
-        data: { taskId, userId, text },
-        include: { user: { select: { id: true, name: true, email: true } } },
+        data: {
+            taskId,
+            text,
+            userId: resolvedUser?.id ?? null,
+            subcontractorName: resolvedUser ? null : fallbackLabel,
+            photos: cleanPhotoUrls.length > 0 ? { create: cleanPhotoUrls.map(url => ({ url })) } : undefined,
+        },
+        include: {
+            user: { select: { id: true, name: true, email: true } },
+            photos: { orderBy: { createdAt: "asc" } },
+        },
     });
     return comment;
 }
@@ -4603,8 +4628,114 @@ export async function getTaskComments(taskId: string) {
     return prisma.taskComment.findMany({
         where: { taskId },
         orderBy: { createdAt: "asc" },
-        include: { user: { select: { id: true, name: true, email: true } } },
+        include: {
+            user: { select: { id: true, name: true, email: true } },
+            photos: { orderBy: { createdAt: "asc" } },
+        },
     });
+}
+
+// ========== FIELD UPDATES FEED ==========
+// Cross-project comment stream for managers. Filtered to projects the
+// caller can access (ADMIN/MANAGER see all; others see only ProjectAccess + crew-assigned).
+
+async function getAccessibleProjectIds(userId: string, role: string | null): Promise<string[] | "ALL"> {
+    if (role === "ADMIN" || role === "MANAGER") return "ALL";
+    const access = await prisma.projectAccess.findMany({ where: { userId }, select: { projectId: true } });
+    const crew = await prisma.project.findMany({
+        where: { crew: { some: { id: userId } } },
+        select: { id: true },
+    });
+    return Array.from(new Set([...access.map(a => a.projectId), ...crew.map(c => c.id)]));
+}
+
+export async function getFieldUpdatesFeed(opts?: { limit?: number; sinceDays?: number }) {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionRole = ((session?.user as any)?.role as string | null) ?? null;
+    const isFullAccess = sessionRole === "ADMIN" || sessionRole === "MANAGER";
+    if (!sessionUserId && !isFullAccess) return { comments: [], scope: "none" as const };
+
+    const accessible: string[] | "ALL" = isFullAccess
+        ? "ALL"
+        : await getAccessibleProjectIds(sessionUserId!, sessionRole);
+    const limit = Math.min(opts?.limit ?? 50, 200);
+    const sinceDays = opts?.sinceDays ?? 14;
+    const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000);
+
+    const where: any = { createdAt: { gte: since } };
+    if (accessible !== "ALL") {
+        if (accessible.length === 0) return { comments: [], scope: "scoped" as const };
+        where.task = { projectId: { in: accessible } };
+    }
+
+    const comments = await prisma.taskComment.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        include: {
+            user: { select: { id: true, name: true, email: true } },
+            photos: { orderBy: { createdAt: "asc" }, select: { id: true, url: true } },
+            task: {
+                select: {
+                    id: true,
+                    name: true,
+                    projectId: true,
+                    project: { select: { id: true, name: true } },
+                },
+            },
+        },
+    });
+    return { comments, scope: accessible === "ALL" ? ("all" as const) : ("scoped" as const) };
+}
+
+export async function getUnreadFieldUpdatesCount(): Promise<number> {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionRole = ((session?.user as any)?.role as string | null) ?? null;
+    const isFullAccess = sessionRole === "ADMIN" || sessionRole === "MANAGER";
+    if (!sessionUserId && !isFullAccess) return 0;
+
+    let since: Date;
+    if (sessionUserId) {
+        const user = await prisma.user.findUnique({
+            where: { id: sessionUserId },
+            select: { fieldUpdatesSeenAt: true },
+        });
+        since = user?.fieldUpdatesSeenAt ?? new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+    } else {
+        // No DB user (e.g. dev session without seed user): use a 14d window so the page
+        // still shows a non-zero badge for testing.
+        since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+    }
+
+    const accessible: string[] | "ALL" = isFullAccess
+        ? "ALL"
+        : await getAccessibleProjectIds(sessionUserId!, sessionRole);
+    const where: any = {
+        createdAt: { gt: since },
+    };
+    if (sessionUserId) {
+        // Don't count the viewer's own comments as unread to themselves.
+        where.NOT = { userId: sessionUserId };
+    }
+    if (accessible !== "ALL") {
+        if (accessible.length === 0) return 0;
+        where.task = { projectId: { in: accessible } };
+    }
+    return prisma.taskComment.count({ where });
+}
+
+export async function markFieldUpdatesSeen() {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    if (!sessionUserId) return { ok: true, note: "no-op (no user session)" };
+    await prisma.user.update({
+        where: { id: sessionUserId },
+        data: { fieldUpdatesSeenAt: new Date() },
+    });
+    revalidatePath("/manager/field-updates");
+    return { ok: true };
 }
 
 // ========== PUNCH LIST ==========

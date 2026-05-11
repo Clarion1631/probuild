@@ -32,7 +32,7 @@ export function todayUTC(): Date {
     const now = new Date();
     return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 }
-export function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0].toUpperCase(); }
+export function getInitials(name: string | null, email: string) { if (name) { const parts = name.split(" "); return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); } return email[0]?.toUpperCase() ?? "?"; }
 export function formatCurrency(n: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n); }
 
 export function computeCriticalPath(tasks: Task[]): Set<string> {
