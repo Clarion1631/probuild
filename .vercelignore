@@ -18,13 +18,17 @@ qa-report
 qa-screenshots
 .playwright-mcp
 e2e/.auth
+playwright-report
 
 # Large non-source directories
 output
 estimatesamples
 graphify-out
+.graphify_*
+.graphify_python
 .remember
 scripts/vendor
+ast_extract.py
 
 # Environment / secrets
 .env

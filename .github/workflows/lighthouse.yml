@@ -1,8 +1,16 @@
 name: Lighthouse CI
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Production or preview URL to audit
+        required: true
+        default: https://probuild.goldentouchremodeling.com
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.base_url || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lighthouse:
@@ -12,20 +20,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Wait for Vercel deployment
-        uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
-        id: wait-for-vercel
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          max_timeout: 120
-        continue-on-error: true
-
       - name: Run Lighthouse on production
         uses: treosh/lighthouse-ci-action@v11
         with:
           urls: |
-            https://probuild-amber.vercel.app
-            https://probuild-amber.vercel.app/dashboard
+            ${{ inputs.base_url }}
+            ${{ inputs.base_url }}/login
           budgetPath: .github/lighthouse-budget.json
           uploadArtifacts: true
           temporaryPublicStorage: true

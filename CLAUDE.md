@@ -43,13 +43,77 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 ## Development workflow
 ```
 1. Pick next session from ProbuildTodo.md
-2. Make changes
+2. Make changes on a focused branch or local working tree
 3. npm run build          # must pass 0 errors
-4. git push origin main
-5. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
-6. Click through affected pages on prod to verify
-7. Mark items done in ProbuildTodo.md
+4. Run the Playwright smoke gate when auth/app flow is touched
+5. Ask before pushing, opening/merging PRs, or deploying production
+6. Deploy production with the staged deploy script only after user approval
+7. Click through affected pages on prod to verify
+8. Mark items done in ProbuildTodo.md
 ```
+
+## AI agent operating rules
+AI can automate local diagnosis and repair without a separate push from the user:
+- Inspect GitHub/Vercel logs, local `git status`, build output, and downloaded artifacts
+- Edit code, tests, docs, and workflow files in the current workspace
+- Run local verification: `npm run typecheck`, `npm run build`, and the Playwright smoke suite
+- Prepare a commit message, PR description, deploy checklist, or rollback checklist
+- Keep generated local artifacts out of git when they are clearly tool output
+- Perform a final self-review of its own diff before asking to publish
+
+AI must ask first before actions that create cost, publish code, or touch production state:
+- `git push`, opening/updating/merging/closing PRs, rebasing shared branches, or force pushes
+- `vercel --prod`, `vercel promote`, `vercel rollback`, or re-enabling Vercel Git auto-deploy
+- Database migrations, seed scripts against production data, or destructive file cleanup
+- Running the full Playwright suite (`npm run test:e2e`) unless the user explicitly wants it
+
+Default branch strategy:
+- Do not push directly to `main`
+- Use one branch/PR per concern: CI/deploy workflow, schedule UI, mobile app, schema changes, etc.
+- If an old PR conflicts with current work, inspect it and recommend close/supersede/cherry-pick instead of merging blindly
+- Preserve user/other-agent edits already in the worktree; separate them in the final summary
+
+## AI session handoff checklist
+At the end of every coding session, the AI should report:
+- Files changed, separated into "AI changed" and "pre-existing/user changes"
+- Verification run and exact pass/fail result
+- Remaining untracked files and whether they should be committed, ignored, or left alone
+- Whether the work is ready for PR, ready for staged production deploy, or still local-only
+
+Recommended user prompt when a feature feels done:
+```text
+Run the ProBuild handoff checklist: review your diff, run the local deploy gate, tell me what changed, and ask before pushing or deploying.
+```
+
+Recommended user prompt when you want an independent review:
+```text
+Do a Codex-style peer review before we push: focus on bugs, regressions, missing tests, production risks, and deploy safety.
+```
+
+Do not claim peer review happened unless a separate review pass was explicitly performed. A normal implementation pass includes self-review only.
+
+## Cost-safe verification gate
+Use this before any production deploy:
+```powershell
+npm run build
+$secret = (Get-Content .env.local | Where-Object { $_ -match '^PLAYWRIGHT_TEST_SECRET=' } | Select-Object -First 1) -replace '^PLAYWRIGHT_TEST_SECRET=', ''
+$env:PLAYWRIGHT_TEST_SECRET=$secret
+$env:CI='true'
+npm run test:e2e:smoke
+```
+
+The smoke suite is the normal PR gate. Full E2E, Lighthouse, and visual comparison are manual/targeted tools, not every-push automation.
+
+## Production deploy gate
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-prod.ps1
+```
+This is the only blessed production deploy path after local verification. It:
+1. Creates a staged production Vercel deployment with `--skip-domain`
+2. Runs the Playwright smoke gate against the staged deployment URL
+3. Promotes that staged deployment to production only if the staged smoke gate passes
+
+Do not run raw `vercel --prod`, `vercel deploy --prod`, or `vercel promote` unless the user explicitly asks to bypass the gate. On this Windows workspace, keep `npm run build` as a top-level terminal command; nested build wrappers can trigger `spawn EPERM`.
 
 **Error diagnosis (Sentry)**
 ```bash
@@ -65,10 +129,11 @@ stripe trigger payment_intent.succeeded
 ## Deploying to Vercel (CLI only — auto-deploy is OFF)
 ```powershell
 # Production deploy (from the main repo dir, not a worktree):
-vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-prod.ps1
 ```
 - Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
-- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
+- **Do NOT use `--archive=tgz`** — it triggered a 50-min outage on 2026-05-09. Vercel CLI ran `vercel build` locally with Turbopack (Next.js 16 default), which emits chunks with bracket characters in filenames (`[root-of-the-server]__<hash>._.js`, `[turbopack]_runtime.js`). Those got dropped during Lambda packaging server-side, leaving every page with a `ChunkLoadError: MODULE_NOT_FOUND`. Source files are under Vercel's 15K limit with `.vercelignore`, so the archive flag is unnecessary.
+- The build script pins `--webpack` (see `package.json` `build:next`) as a defense-in-depth so future deploys cannot regress to bracket-named chunks.
 - `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
 - Only deploy when changes are verified locally via `npm run build`
 - Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard

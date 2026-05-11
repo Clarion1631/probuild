@@ -75,9 +75,19 @@ scripts/vendor/*
 
 # Per-machine Claude Code + Supabase CLI artifacts (not source)
 .claude/settings.local.json
+.claude/settings.json
+.claude/scheduled_tasks.lock
 .claude/skills/
+.claude/worktrees/
 docs/superpowers/
 supabase/.temp/
+
+# Local analysis/browser automation artifacts
+.graphify_*
+.graphify_python
+.playwright-mcp/
+graphify-out/
+ast_extract.py
 
 # Template backup files produced by scripts/seed-residential-templates.mjs
 scripts/.template-backup-*.json

@@ -6,12 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
@@ -69,7 +74,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
   playwright:
-    name: Playwright E2E Tests
+    name: Playwright Smoke Tests
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     env:
@@ -120,8 +125,8 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
-      - name: Run Playwright tests
-        run: npx playwright test
+      - name: Run Playwright smoke tests
+        run: npm run test:e2e:smoke
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -134,6 +139,6 @@ jobs:
       - name: Post results summary
         if: always()
         run: |
-          echo "## Playwright E2E Results" >> $GITHUB_STEP_SUMMARY
+          echo "## Playwright Smoke Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Server:** localhost:3000 (production build)" >> $GITHUB_STEP_SUMMARY
