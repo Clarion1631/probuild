@@ -62,7 +62,8 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
     // Fill remaining fields
     await page.locator('input[name="clientEmail"]').fill("mike.henderson@gmail.com");
     await page.locator('input[name="clientPhone"]').fill("360-412-8837");
-    await page.locator('input[name="location"]').fill("14502 NE 28th St, Vancouver, WA 98684");
+    // Job site address is optional and uses a Google Maps autocomplete + structured
+    // city/state/zip fields without name attributes; leave it empty for this test.
 
     const sourceSelect = page.locator('select[name="source"]');
     if (await sourceSelect.isVisible()) {
