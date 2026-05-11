@@ -495,6 +495,8 @@ function QuickEditPopover({
 
     useEffect(() => {
         let cancelled = false;
+        setPunchItems([]);
+        setNewPunch("");
         setPunchLoading(true);
         getTaskPunchItems(task.id)
             .then(items => { if (!cancelled) { setPunchItems(items as PunchItem[]); setPunchLoading(false); } })
@@ -519,23 +521,24 @@ function QuickEditPopover({
     }
 
     async function handleTogglePunch(id: string) {
-        const before = punchItems;
+        if (id.startsWith("temp-")) return;
         setPunchItems(prev => prev.map(p => p.id === id ? { ...p, completed: !p.completed } : p));
         try {
             await togglePunchItem(id);
         } catch {
-            setPunchItems(before);
+            setPunchItems(prev => prev.map(p => p.id === id ? { ...p, completed: !p.completed } : p));
             toast.error("Failed to update item");
         }
     }
 
     async function handleDeletePunch(id: string) {
-        const before = punchItems;
+        if (id.startsWith("temp-")) return;
+        const removed = punchItems.find(p => p.id === id);
         setPunchItems(prev => prev.filter(p => p.id !== id));
         try {
             await deletePunchItem(id);
         } catch {
-            setPunchItems(before);
+            if (removed) setPunchItems(prev => [...prev, removed].sort((a, b) => a.order - b.order));
             toast.error("Failed to delete item");
         }
     }
@@ -631,24 +634,29 @@ function QuickEditPopover({
                         <div className="text-[11px] text-slate-400 italic py-1">No items yet</div>
                     ) : (
                         <ul className="space-y-0.5">
-                            {punchItems.map(item => (
-                                <li key={item.id} className="group flex items-center gap-2 py-0.5">
-                                    <input
-                                        type="checkbox"
-                                        checked={item.completed}
-                                        onChange={() => handleTogglePunch(item.id)}
-                                        className="w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-400"
-                                    />
-                                    <span className={`flex-1 text-xs ${item.completed ? "line-through text-slate-400" : "text-slate-700"}`}>
-                                        {item.name}
-                                    </span>
-                                    <button
-                                        onClick={() => handleDeletePunch(item.id)}
-                                        aria-label="Delete item"
-                                        className="text-slate-400 hover:text-red-600 text-xs leading-none px-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition"
-                                    >×</button>
-                                </li>
-                            ))}
+                            {punchItems.map(item => {
+                                const isTemp = item.id.startsWith("temp-");
+                                return (
+                                    <li key={item.id} className={`group flex items-center gap-2 py-0.5 ${isTemp ? "opacity-60" : ""}`}>
+                                        <input
+                                            type="checkbox"
+                                            checked={item.completed}
+                                            onChange={() => handleTogglePunch(item.id)}
+                                            disabled={isTemp}
+                                            className="w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-400 disabled:cursor-wait"
+                                        />
+                                        <span className={`flex-1 text-xs ${item.completed ? "line-through text-slate-400" : "text-slate-700"}`}>
+                                            {item.name}
+                                        </span>
+                                        <button
+                                            onClick={() => handleDeletePunch(item.id)}
+                                            disabled={isTemp}
+                                            aria-label="Delete item"
+                                            className="text-slate-400 hover:text-red-600 text-xs leading-none px-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition disabled:cursor-wait"
+                                        >×</button>
+                                    </li>
+                                );
+                            })}
                         </ul>
                     )}
                 </div>
