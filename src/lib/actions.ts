@@ -4374,6 +4374,13 @@ export async function getScheduleTasksForSub(projectId: string, subcontractorId:
 }
 
 export async function addTaskCommentAsSub(taskId: string, subcontractorId: string, text: string) {
+    const { getSubPortalSession } = await import("@/lib/sub-portal-auth");
+    const session = await getSubPortalSession();
+    if (!session || session.id !== subcontractorId) throw new Error("Unauthorized");
+    const assignment = await prisma.subTaskAssignment.findUnique({
+        where: { subcontractorId_taskId: { subcontractorId, taskId } },
+    });
+    if (!assignment) throw new Error("Not assigned to this task");
     const sub = await prisma.subcontractor.findUnique({ where: { id: subcontractorId }, select: { companyName: true, contactName: true } });
     const displayName = sub?.contactName || sub?.companyName || "Subcontractor";
     const comment = await prisma.taskComment.create({
@@ -4384,6 +4391,9 @@ export async function addTaskCommentAsSub(taskId: string, subcontractorId: strin
 }
 
 export async function updateTaskStatusAsSub(taskId: string, subcontractorId: string, status: string) {
+    const { getSubPortalSession } = await import("@/lib/sub-portal-auth");
+    const session = await getSubPortalSession();
+    if (!session || session.id !== subcontractorId) throw new Error("Unauthorized");
     const allowed = ["In Progress", "Complete"];
     if (!allowed.includes(status)) throw new Error("Invalid status");
     const assignment = await prisma.subTaskAssignment.findUnique({

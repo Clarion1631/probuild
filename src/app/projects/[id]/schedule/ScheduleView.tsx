@@ -13,7 +13,7 @@ const VIEW_KEY = "probuild:schedule:viewMode";
 const SUB_KEY = "probuild:schedule:calendarSubMode";
 
 export default function ScheduleView({ initialTasks, ...rest }: ScheduleViewProps) {
-    const [viewMode, setViewMode] = useState<ViewMode>("gantt");
+    const [viewMode, setViewMode] = useState<ViewMode>("calendar");
     const [calendarSubMode, setCalendarSubMode] = useState<CalendarSubMode>("week");
     const [hydrated, setHydrated] = useState(false);
     const [tasks, setTasks] = useState<Task[]>(initialTasks);
