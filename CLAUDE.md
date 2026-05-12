@@ -60,6 +60,7 @@ AI can automate local diagnosis and repair without a separate push from the user
 - Prepare a commit message, PR description, deploy checklist, or rollback checklist
 - Keep generated local artifacts out of git when they are clearly tool output
 - Perform a final self-review of its own diff before asking to publish
+- Perform a Codex-style peer review before any push, PR-ready state, merge recommendation, or production deploy
 
 AI must ask first before actions that create cost, publish code, or touch production state:
 - `git push`, opening/updating/merging/closing PRs, rebasing shared branches, or force pushes
@@ -85,12 +86,19 @@ Recommended user prompt when a feature feels done:
 Run the ProBuild handoff checklist: review your diff, run the local deploy gate, tell me what changed, and ask before pushing or deploying.
 ```
 
-Recommended user prompt when you want an independent review:
+Codex-style review is mandatory for ProBuild before publishing or deploying. Review stance:
+- Lead with bugs, regressions, missing tests, production risks, deploy safety, and data/security issues
+- Cite concrete files/lines when possible
+- Keep summaries secondary to findings
+- If no issues are found, say so clearly and name residual risk
+- Do not proceed to push, mark ready for review, merge, or deploy until review findings are resolved or the user explicitly accepts the risk
+
+Recommended user prompt when you want an extra independent review at any time:
 ```text
 Do a Codex-style peer review before we push: focus on bugs, regressions, missing tests, production risks, and deploy safety.
 ```
 
-Do not claim peer review happened unless a separate review pass was explicitly performed. A normal implementation pass includes self-review only.
+Do not claim peer review happened unless a distinct review pass was explicitly performed. For ProBuild, that review pass is part of the default handoff.
 
 ## Cost-safe verification gate
 Use this before any production deploy:
