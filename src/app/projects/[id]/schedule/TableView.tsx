@@ -38,7 +38,7 @@ const SORT_OPTIONS: { key: SortKey; dir: SortDir; label: string }[] = [
     { key: "name", dir: "desc", label: "Name (Z → A)" },
 ];
 
-export default function TableView({ projectId, projectName, tasks, setTasks, estimates = [], teamMembers = [], subcontractors = [], currentUserId = "system", initialPublished, viewMode, onViewModeChange }: {
+export default function TableView({ projectId, projectName, tasks, setTasks, estimates = [], teamMembers = [], subcontractors = [], initialPublished, viewMode, onViewModeChange }: {
     projectId: string;
     projectName: string;
     tasks: Task[];
@@ -46,7 +46,6 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
     estimates?: EstimateSummary[];
     teamMembers?: TeamMember[];
     subcontractors?: Subcontractor[];
-    currentUserId?: string;
     initialPublished: boolean;
     viewMode?: "gantt" | "table" | "calendar";
     onViewModeChange?: (mode: "gantt" | "table" | "calendar") => void;
@@ -426,8 +425,12 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
     }
     async function handleAddComment(text: string) {
         if (!text || !selectedTaskId) return;
-        try { const comment = await addTaskComment(selectedTaskId, currentUserId, text); setComments(prev => [...prev, { ...(comment as any), createdAt: new Date().toISOString() }]); }
-        catch { toast.error("Failed to add comment"); }
+        try {
+            const comment = await addTaskComment(selectedTaskId, text);
+            setComments(prev => [...prev, { ...(comment as any), createdAt: new Date().toISOString() }]);
+        } catch (e) {
+            toast.error(e instanceof Error ? e.message : "Failed to add comment");
+        }
     }
     async function handleAssign(userId: string) {
         if (!selectedTaskId) return;

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import { usePermissions } from "@/components/PermissionsProvider";
+import FieldUpdatesNavItem from "@/components/FieldUpdatesNavItem";
 
 export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
     const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -43,6 +44,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                                         <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
                                         <ul className="space-y-2 text-sm">
                                             {can("schedules") && <li><Link href="/manager/schedule" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>}
+                                            {can("schedules") && <li><Link href="/manager/field-updates" className="hover:text-hui-primary block transition">Field Updates</Link></li>}
                                             {can("dailyLogs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>}
                                             {can("timeClock") && <li><Link href="/time-clock" className="hover:text-hui-primary block transition">Time &amp; Expenses</Link></li>}
                                             {can("clientCommunication") && <li><Link href="/manager/inbox" className="hover:text-hui-primary block transition">Unmatched Inbox</Link></li>}
@@ -122,6 +124,9 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                                 <span className="text-[10px] uppercase font-semibold text-center leading-tight">Reports</span>
                             </Link>
                         )}
+
+                        {/* Field Updates — gated by schedules (manager-facing comment feed) */}
+                        {can("schedules") && <FieldUpdatesNavItem />}
 
                         {/* Time Clock — gated by timeClock */}
                         {can("timeClock") && (

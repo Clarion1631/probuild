@@ -16,6 +16,10 @@ export default defineConfig({
   },
   projects: [
     {
+      name: "data",
+      testMatch: /data\.setup\.ts/,
+    },
+    {
       name: "setup",
       testMatch: /auth\.setup\.ts/,
     },
@@ -25,7 +29,7 @@ export default defineConfig({
         ...devices["Desktop Chrome"],
         storageState: "e2e/.auth/user.json",
       },
-      dependencies: ["setup"],
+      dependencies: ["data", "setup"],
     },
   ],
   webServer: {

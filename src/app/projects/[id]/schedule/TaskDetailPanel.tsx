@@ -423,15 +423,31 @@ export default function TaskDetailPanel({
                 {panelTab === "conversation" && (
                     <div className="space-y-3">
                         {comments.length === 0 && <p className="text-xs text-slate-400 italic text-center py-4">No comments yet</p>}
-                        {comments.map(c => (
-                            <div key={c.id} className="flex gap-2">
-                                <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-[8px] font-bold flex items-center justify-center shrink-0 mt-0.5">{getInitials(c.user.name, c.user.email)}</div>
-                                <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2"><span className="text-xs font-semibold text-hui-textMain">{c.user.name || c.user.email}</span><span className="text-[9px] text-slate-400">{new Date(c.createdAt).toLocaleDateString()}</span></div>
-                                    <p className="text-xs text-hui-textMuted mt-0.5">{c.text}</p>
+                        {comments.map(c => {
+                            const authorName = c.user?.name || c.user?.email || c.subcontractorName || "Unknown";
+                            const initialsName = c.user?.name ?? c.subcontractorName ?? null;
+                            const initialsEmail = c.user?.email ?? "";
+                            const photos = c.photos ?? [];
+                            return (
+                                <div key={c.id} className="flex gap-2">
+                                    <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-[8px] font-bold flex items-center justify-center shrink-0 mt-0.5">{getInitials(initialsName, initialsEmail)}</div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-center gap-2"><span className="text-xs font-semibold text-hui-textMain">{authorName}</span><span className="text-[9px] text-slate-400">{new Date(c.createdAt).toLocaleDateString()}</span></div>
+                                        <p className="text-xs text-hui-textMuted mt-0.5">{c.text}</p>
+                                        {photos.length > 0 && (
+                                            <div className="mt-1.5 flex gap-1.5 flex-wrap">
+                                                {photos.map(p => (
+                                                    <a key={p.id} href={p.url} target="_blank" rel="noopener noreferrer" className="block">
+                                                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                                                        <img src={p.url} alt="" className="w-16 h-16 object-cover rounded-md border border-hui-border hover:opacity-90 transition" />
+                                                    </a>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
                                 </div>
-                            </div>
-                        ))}
+                            );
+                        })}
                         <div className="flex gap-2 mt-3 pt-3 border-t border-hui-border">
                             <input value={newComment} onChange={e => setNewComment(e.target.value)} onKeyDown={e => { if (e.key === "Enter") handleAddCommentLocal(); }} className="hui-input text-xs flex-1" placeholder="Add a comment..." />
                             <button onClick={handleAddCommentLocal} className="hui-btn hui-btn-primary text-xs px-3">Send</button>
