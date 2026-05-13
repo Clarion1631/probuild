@@ -2559,6 +2559,7 @@ export async function recordEstimatePayment(
         method: string;
         referenceNumber?: string | null;
         notes?: string | null;
+        amount?: number;
     },
 ) {
     const user = await getCurrentUserWithPermissions();
@@ -2595,6 +2596,7 @@ export async function recordEstimatePayment(
                 paymentMethod: method,
                 referenceNumber,
                 notes,
+                ...(input.amount != null && { amount: input.amount }),
             },
         });
         if (claim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
