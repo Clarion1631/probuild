@@ -1086,11 +1086,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             return;
         } else if (field === "amount") {
             newSchedules[index].amount = value;
-            if (total > 0 && value !== "") {
-                newSchedules[index].percentage = String(rm(((parseFloat(value) || 0) / total) * 100));
-            } else {
-                newSchedules[index].percentage = "";
-            }
+            newSchedules[index].percentage = "";
         } else {
             newSchedules[index][field] = value;
         }
@@ -1977,11 +1973,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                             <div className="w-32 px-4 relative">
                                                 <input
                                                     type="number"
-                                                    value={schedule.percentage}
+                                                    value={schedule.percentage || (total > 0 && schedule.amount ? String(rm(((parseFloat(schedule.amount) || 0) / total) * 100)) : "")}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
                                                     disabled={isPaid}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium text-slate-600 disabled:cursor-default"
+                                                    className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium disabled:cursor-default ${!schedule.percentage && schedule.amount ? 'text-slate-300 italic' : 'text-slate-600'}`}
                                                 />
                                                 <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
                                             </div>
