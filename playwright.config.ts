@@ -21,7 +21,7 @@ export default defineConfig({
     },
     {
       name: "setup",
-      testMatch: /auth\.setup\.ts/,
+      testMatch: /(^|[\\/])auth\.setup\.ts$/,
     },
     {
       name: "chromium",

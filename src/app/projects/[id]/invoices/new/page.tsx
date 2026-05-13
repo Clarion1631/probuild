@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import NewInvoiceClient from "./NewInvoiceClient";
 
-export default async function NewInvoicePage({ params }: { params: { id: string } }) {
+export default async function NewInvoicePage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
     const project = await getProject(id);
     

@@ -179,10 +179,12 @@ export default function PortalGanttChart({
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                             <button
                                 onClick={() => onViewModeChange("calendar")}
+                                aria-pressed={viewMode === "calendar"}
                                 className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
                             >Calendar</button>
                             <button
                                 onClick={() => onViewModeChange("gantt")}
+                                aria-pressed={viewMode === "gantt"}
                                 className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
                             >Gantt</button>
                         </div>
@@ -225,7 +227,12 @@ export default function PortalGanttChart({
                 <div className="flex items-center gap-2 flex-wrap">
                     <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg">
                         {(["day", "week", "month"] as ZoomLevel[]).map(z => (
-                            <button key={z} onClick={() => setZoom(z)} className={`px-3 py-1 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>{z}</button>
+                            <button
+                                key={z}
+                                onClick={() => setZoom(z)}
+                                aria-pressed={zoom === z}
+                                className={`px-3 py-1 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            >{z}</button>
                         ))}
                     </div>
                     <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 200); }} className="px-3 py-1 text-xs font-medium bg-white border border-slate-200 rounded-md hover:bg-slate-50">Today</button>
@@ -233,10 +240,12 @@ export default function PortalGanttChart({
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                             <button
                                 onClick={() => onViewModeChange("calendar")}
+                                aria-pressed={viewMode === "calendar"}
                                 className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
                             >Calendar</button>
                             <button
                                 onClick={() => onViewModeChange("gantt")}
+                                aria-pressed={viewMode === "gantt"}
                                 className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
                             >Gantt</button>
                         </div>
