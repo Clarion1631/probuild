@@ -3,27 +3,37 @@
 /** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
 const rm = (n: number) => Math.round(n * 100) / 100;
 
-/** Recalculate percentage-based milestone amounts with the last one absorbing rounding residual */
+/** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
 function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
     const cloned = schedules.map(s => ({ ...s }));
-    const unpaidPct = cloned.filter(s => (parseFloat(s.percentage) || 0) > 0 && s.status !== "Paid");
-    if (unpaidPct.length === 0) return cloned;
+    const unpaid = cloned.filter(s => s.status !== "Paid");
+    if (unpaid.length === 0) return cloned;
 
     const paidSum = cloned.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
-    const balanceDue = rm(total - paidSum);
-    const fixedUnpaidSum = cloned
-        .filter(s => (parseFloat(s.percentage) || 0) <= 0 && s.status !== "Paid")
-        .reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const available = rm(total - paidSum);
+    const lastUnpaid = unpaid[unpaid.length - 1];
 
-    const allButLast = unpaidPct.slice(0, -1);
-    const allButLastAmounts = allButLast.map(s => rm(total * ((parseFloat(s.percentage) || 0) / 100)));
-    const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
-    const lastAmount = rm(balanceDue - fixedUnpaidSum - allButLastSum);
+    if (unpaid.length === 1) {
+        const pct = parseFloat(lastUnpaid.percentage) || 0;
+        if (pct > 0) lastUnpaid.amount = String(rm(total * (pct / 100)));
+        return cloned;
+    }
 
-    if (lastAmount < 0) return cloned;
+    for (const s of unpaid) {
+        if (s === lastUnpaid) continue;
+        const pct = parseFloat(s.percentage) || 0;
+        if (pct > 0) s.amount = String(rm(total * (pct / 100)));
+    }
 
-    allButLast.forEach((s, i) => { s.amount = String(allButLastAmounts[i]); });
-    unpaidPct[unpaidPct.length - 1].amount = String(lastAmount);
+    const othersSum = unpaid.filter(s => s !== lastUnpaid).reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const residual = rm(available - othersSum);
+    lastUnpaid.amount = String(Math.max(0, residual));
+
+    const lastPct = parseFloat(lastUnpaid.percentage) || 0;
+    if (lastPct > 0 && Math.abs(residual - rm(total * (lastPct / 100))) > 0.01) {
+        lastUnpaid.percentage = "";
+    }
+
     return cloned;
 }
 
@@ -1095,6 +1105,14 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         setPaymentSchedules(newSchedules);
     }
 
+    function handleAmountBlur() {
+        setPaymentSchedules(prev => {
+            const recalced = recalcMilestoneAmounts(prev, total);
+            const changed = recalced.some((s, i) => s.amount !== prev[i].amount);
+            return changed ? recalced : prev;
+        });
+    }
+
     function removePaymentSchedule(index: number) {
         const newSchedules = [...paymentSchedules];
         newSchedules.splice(index, 1);
@@ -1993,6 +2011,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                             type="number"
                                                             value={schedule.amount}
                                                             onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
+                                                            onBlur={handleAmountBlur}
                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
                                                         />
                                                     </>
@@ -2075,6 +2094,33 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                         );
                                     })}
                                 </div>
+                                {/* Schedule total validation */}
+                                {(() => {
+                                    const scheduleSum = rm(paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0));
+                                    const diff = rm(total - scheduleSum);
+                                    const balanced = Math.abs(diff) < 0.01;
+                                    return (
+                                        <div className={`flex items-center justify-between px-8 py-3 border-t ${balanced ? 'bg-green-50/50 border-green-100' : 'bg-amber-50/50 border-amber-200'}`}>
+                                            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Schedule Total</span>
+                                            <div className="flex items-center gap-2.5">
+                                                <span className={`text-sm font-bold ${balanced ? 'text-green-700' : 'text-amber-700'}`}>
+                                                    {formatCurrency(scheduleSum)}
+                                                </span>
+                                                <span className="text-xs text-slate-400">of</span>
+                                                <span className="text-sm font-medium text-slate-600">{formatCurrency(total)}</span>
+                                                {balanced ? (
+                                                    <svg className="w-4 h-4 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                                                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                                    </svg>
+                                                ) : (
+                                                    <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${diff > 0 ? 'text-amber-700 bg-amber-100' : 'text-red-700 bg-red-100'}`}>
+                                                        {diff > 0 ? `${formatCurrency(diff)} under` : `${formatCurrency(Math.abs(diff))} over`}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </div>
+                                    );
+                                })()}
                             </div>
                         )}
 
