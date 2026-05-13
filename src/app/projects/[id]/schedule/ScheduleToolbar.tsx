@@ -146,7 +146,7 @@ export default function ScheduleToolbar({
 
     return (
         <>
-            <div className="bg-white border-b border-hui-border shrink-0 z-20 relative">
+            <div className="bg-white border-b border-hui-border shrink-0 z-30 relative">
                 <div className="h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500" />
                 <div className="px-6 py-3 flex items-center justify-between flex-wrap gap-2">
                     {/* Left: title + progress */}
