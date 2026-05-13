@@ -116,26 +116,28 @@ export default function ScheduleToolbar({
         <>
             <div className="bg-white border-b border-hui-border shrink-0 z-20 relative">
                 <div className="h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500" />
-                <div className="px-6 py-3 flex items-center justify-between flex-wrap gap-2">
-                    {/* Left: title + stats + view toggle */}
-                    <div className="flex items-center gap-4">
-                        <div>
-                            <h1 className="text-lg font-bold text-hui-textMain">Schedule</h1>
-                            <div className="flex items-center gap-3 mt-0.5">
-                                <span className="text-xs text-hui-textMuted">
-                                    {filteredCount !== undefined && filteredCount !== taskCount
-                                        ? `${filteredCount} of ${taskCount}`
-                                        : taskCount} task{taskCount !== 1 ? "s" : ""}
-                                </span>
-                                <span className="text-xs text-hui-textMuted">&middot;</span>
-                                <span className="text-xs text-green-600 font-medium">{completedCount} done</span>
-                                <div className="w-16 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                                    <div className="h-full bg-gradient-to-r from-green-400 to-emerald-500 rounded-full transition-all" style={{ width: `${progressPct}%` }} />
-                                </div>
-                                <span className="text-[10px] text-slate-400 font-medium">{progressPct}%</span>
+                <div className="px-6 py-3 flex items-center gap-2">
+                    {/* Left: title + stats */}
+                    <div className="shrink-0">
+                        <h1 className="text-lg font-bold text-hui-textMain">Schedule</h1>
+                        <div className="flex items-center gap-3 mt-0.5">
+                            <span className="text-xs text-hui-textMuted">
+                                {filteredCount !== undefined && filteredCount !== taskCount
+                                    ? `${filteredCount} of ${taskCount}`
+                                    : taskCount} task{taskCount !== 1 ? "s" : ""}
+                            </span>
+                            <span className="text-xs text-hui-textMuted">&middot;</span>
+                            <span className="text-xs text-green-600 font-medium">{completedCount} done</span>
+                            <div className="w-16 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                <div className="h-full bg-gradient-to-r from-green-400 to-emerald-500 rounded-full transition-all" style={{ width: `${progressPct}%` }} />
                             </div>
+                            <span className="text-[10px] text-slate-400 font-medium">{progressPct}%</span>
                         </div>
-                        {onViewModeChange && (
+                    </div>
+
+                    {/* Center: view toggle — flex-1 keeps it stable when right-side buttons change */}
+                    {onViewModeChange && (
+                        <div className="flex-1 flex justify-center">
                             <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                                 {(["gantt", "table", "calendar"] as ViewMode[]).map(m => (
                                     <button key={m} onClick={() => onViewModeChange(m)} className={`px-3 py-1.5 text-xs font-medium rounded-md transition flex items-center gap-1 capitalize ${viewMode === m ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
@@ -144,11 +146,11 @@ export default function ScheduleToolbar({
                                     </button>
                                 ))}
                             </div>
-                        )}
-                    </div>
+                        </div>
+                    )}
 
                     {/* Right: controls */}
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 shrink-0">
                         {/* Zoom (Gantt only) */}
                         {onZoomChange && zoom && (
                             <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
