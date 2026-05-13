@@ -330,12 +330,23 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
     async function handleEstimatedHoursSave(taskId: string) { const h = parseFloat(editHoursVal); if (!isNaN(h) && h >= 0) { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: h } : t)); await updateScheduleTask(taskId, { estimatedHours: h }); } setEditingHoursId(null); }
 
     async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item } : t));
-        await updateScheduleTask(taskId, { estimateItemId: item.id });
-        toast.success("Linked to estimate item");
+        const autoHours = (item.type === "Labor" || item.budgetUnit === "hours") ? (item.quantity ?? null) : null;
+        const taskName = tasks.find(t => t.id === taskId)?.name ?? "";
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item, ...(autoHours != null ? { estimatedHours: autoHours } : {}) } : t));
+        setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: taskId, linkedTaskName: taskName } : ei));
+        try {
+            await updateScheduleTask(taskId, { estimateItemId: item.id });
+            toast.success(autoHours != null ? `Linked — ${autoHours}h estimated` : "Linked to estimate item");
+        } catch (e: any) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
+            setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
+            toast.error(e.message || "Failed to link estimate item");
+        }
     }
     async function handleUnlinkEstimateItem(taskId: string) {
+        const itemId = tasks.find(t => t.id === taskId)?.estimateItemId;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
+        if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
         await updateScheduleTask(taskId, { estimateItemId: null });
         toast.success("Estimate link removed");
     }
@@ -705,7 +716,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                         estimateItems={estimateItems}
                         onLinkEstimateItem={handleLinkEstimateItem}
                         onUnlinkEstimateItem={handleUnlinkEstimateItem}
-                        onFetchEstimateItems={() => { if (estimateItems.length === 0) getEstimateItemsForProject(projectId).then(items => setEstimateItems(items as any)); }}
+                        onFetchEstimateItems={() => { getEstimateItemsForProject(projectId).then(items => setEstimateItems(items as any)); }}
                         teamMembers={teamMembers}
                         subcontractors={subcontractors}
                         onAssign={handleAssign}

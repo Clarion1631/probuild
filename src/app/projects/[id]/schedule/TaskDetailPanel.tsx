@@ -212,16 +212,23 @@ export default function TaskDetailPanel({
                                                 item.name.toLowerCase().includes(query) ||
                                                 (item.parent?.name ?? "").toLowerCase().includes(query)
                                             ) : [];
-                                            const renderItem = (item: EstimateItemSummary, keyPrefix = "") => (
-                                                <button
-                                                    key={`${keyPrefix}${item.id}`}
-                                                    onClick={() => { onLinkEstimateItem(task.id, item); setShowEstimateLinkMenu(false); setEstimateQuery(""); }}
-                                                    className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-xs"
-                                                >
-                                                    <div className="font-medium truncate">{item.name}</div>
-                                                    <div className="text-slate-400">{item.type} · {formatCurrency(item.total)}</div>
-                                                </button>
-                                            );
+                                            const renderItem = (item: EstimateItemSummary, keyPrefix = "") => {
+                                                const isTaken = !!(item.linkedTaskId && item.linkedTaskId !== task.id);
+                                                return (
+                                                    <button
+                                                        key={`${keyPrefix}${item.id}`}
+                                                        onClick={() => { if (!isTaken) { onLinkEstimateItem(task.id, item); setShowEstimateLinkMenu(false); setEstimateQuery(""); } }}
+                                                        disabled={isTaken}
+                                                        className={`w-full text-left px-3 py-2 transition text-xs ${isTaken ? "opacity-50 cursor-not-allowed bg-slate-50" : "hover:bg-slate-50"}`}
+                                                    >
+                                                        <div className="font-medium truncate">{item.name}</div>
+                                                        <div className="text-slate-400">
+                                                            {item.type} · {formatCurrency(item.total)}
+                                                            {isTaken && <span className="ml-2 text-amber-600 font-semibold">Linked to: {item.linkedTaskName}</span>}
+                                                        </div>
+                                                    </button>
+                                                );
+                                            };
                                             const grouped = new Map<string, EstimateItemSummary[]>();
                                             for (const item of estimateItems) {
                                                 const key = item.parent?.name ?? "";

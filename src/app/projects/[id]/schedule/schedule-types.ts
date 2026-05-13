@@ -1,5 +1,5 @@
 export type EstimateSummary = { id: string; title: string; status: string };
-export type EstimateItemSummary = { id: string; name: string; type: string; total: number; estimateId: string; parentId?: string | null; parent?: { name: string } | null };
+export type EstimateItemSummary = { id: string; name: string; type: string; total: number; estimateId: string; parentId?: string | null; parent?: { name: string } | null; quantity?: number; budgetUnit?: string | null; linkedTaskId?: string | null; linkedTaskName?: string | null };
 export type Dependency = { id: string; predecessorId: string; dependentId: string };
 export type TeamMember = { id: string; name: string | null; email: string };
 export type PunchItem = { id: string; name: string; completed: boolean; order: number };
