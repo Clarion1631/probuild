@@ -96,6 +96,9 @@ export default function MasterGantt({ initialTasks, teamMembers }: {
     const colWidth = zoom === "day" ? 36 : zoom === "week" ? 18 : 7;
     const timelineWidth = totalDays * colWidth;
     const todayOffset = getDaysBetween(minDate, today) * colWidth;
+    const BASE_HEADER_HEIGHT = 40;
+    const DAY_SUB_ROW_HEIGHT = 18;
+    const headerHeight = zoom === "week" ? BASE_HEADER_HEIGHT + DAY_SUB_ROW_HEIGHT : BASE_HEADER_HEIGHT;
 
     function getHeaders() {
         const headers: { label: string; span: number; key: string }[] = [];
@@ -186,7 +189,7 @@ export default function MasterGantt({ initialTasks, teamMembers }: {
             <div className="flex flex-1 overflow-hidden">
                 {/* Left Panel */}
                 <div className="w-80 shrink-0 bg-white border-r border-hui-border flex flex-col z-10">
-                    <div className="flex items-center px-4 py-2 bg-slate-50 border-b border-hui-border text-[10px] font-bold text-slate-400 uppercase tracking-wider h-[40px]">
+                    <div className="flex items-center px-4 py-2 bg-slate-50 border-b border-hui-border text-[10px] font-bold text-slate-400 uppercase tracking-wider" style={{ height: headerHeight }}>
                         <div className="flex-1">{viewMode === "project" ? "Project / Task" : "Member / Task"}</div>
                         <div className="w-16 text-center">Status</div>
                         <div className="w-20 text-center">Crew</div>
@@ -232,12 +235,34 @@ export default function MasterGantt({ initialTasks, teamMembers }: {
                 <div ref={scrollRef} className="flex-1 overflow-auto bg-slate-50/50 relative">
                     <div style={{ width: timelineWidth, minHeight: "100%" }} className="relative">
                         {/* Header */}
-                        <div className="sticky top-0 z-10 flex bg-slate-50 border-b border-hui-border h-[40px]">
-                            {headers.map(h => (<div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>{h.label}</div>))}
+                        <div className="sticky top-0 z-10 bg-slate-50 border-b border-hui-border" style={{ height: headerHeight }}>
+                            <div className="flex" style={{ height: BASE_HEADER_HEIGHT }}>
+                                {headers.map(h => (<div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>{h.label}</div>))}
+                            </div>
+                            {zoom === "week" && (
+                                <div className="flex border-t border-slate-200/40" style={{ height: DAY_SUB_ROW_HEIGHT }}>
+                                    {headers.flatMap(h => {
+                                        const dateStr = h.key.slice(2);
+                                        const [y, m, d] = dateStr.split("-").map(Number);
+                                        const monday = new Date(y, m - 1, d);
+                                        return Array.from({ length: 7 }, (_, i) => {
+                                            const day = addDays(monday, i);
+                                            const dayNum = day.getDate();
+                                            const isWknd = day.getDay() === 0 || day.getDay() === 6;
+                                            const isToday = day.getFullYear() === today.getFullYear() && day.getMonth() === today.getMonth() && day.getDate() === today.getDate();
+                                            return (
+                                                <div key={`ds-${h.key}-${i}`} className={`flex items-center justify-center shrink-0 text-[9px] ${isWknd ? "text-slate-300" : isToday ? "text-red-500 font-bold" : "text-slate-400"}`} style={{ width: colWidth }}>
+                                                    {dayNum}
+                                                </div>
+                                            );
+                                        });
+                                    })}
+                                </div>
+                            )}
                         </div>
 
                         {/* Weekend shading */}
-                        {weekendCols.map((wc, i) => (<div key={`wk-${i}`} className="absolute top-[40px] bottom-0 bg-slate-200/25 pointer-events-none z-[1]" style={{ left: wc.left, width: wc.width }} />))}
+                        {weekendCols.map((wc, i) => (<div key={`wk-${i}`} className="absolute bottom-0 bg-slate-200/25 pointer-events-none z-[1]" style={{ top: headerHeight, left: wc.left, width: wc.width }} />))}
 
                         {/* Today line */}
                         <div className="absolute top-0 bottom-0 w-px z-[5] pointer-events-none" style={{ left: todayOffset, background: "repeating-linear-gradient(to bottom, #ef4444 0, #ef4444 4px, transparent 4px, transparent 8px)" }}>
@@ -248,14 +273,14 @@ export default function MasterGantt({ initialTasks, teamMembers }: {
                         {rowMap.map((row, i) => {
                             if (row.type === "group") {
                                 return (
-                                    <div key={`gbar-${row.group!.key}`} className="absolute w-full border-b border-slate-200 bg-slate-50/60" style={{ top: 40 + row.yOffset, height: GROUP_HEADER_HEIGHT }} />
+                                    <div key={`gbar-${row.group!.key}`} className="absolute w-full border-b border-slate-200 bg-slate-50/60" style={{ top: headerHeight + row.yOffset, height: GROUP_HEADER_HEIGHT }} />
                                 );
                             }
                             const task = row.task!;
                             const bar = getBarStyle(task);
                             const ap = task.estimatedHours && task.actualHours > 0 ? Math.min(100, Math.round((task.actualHours / task.estimatedHours) * 100)) : task.progress;
                             return (
-                                <div key={task.id} className="absolute flex items-center" style={{ top: 40 + row.yOffset + 8, left: bar.left, width: bar.width, height: ROW_HEIGHT - 16 }}>
+                                <div key={task.id} className="absolute flex items-center" style={{ top: headerHeight + row.yOffset + 8, left: bar.left, width: bar.width, height: ROW_HEIGHT - 16 }}>
                                     <div className="w-full h-full rounded-md shadow-sm relative overflow-hidden border border-black/5" style={{ backgroundColor: (row.groupColor || task.color) + "22" }}>
                                         <div className="absolute inset-0 rounded-md" style={{ width: `${ap}%`, backgroundColor: row.groupColor || task.color, opacity: 0.6 }} />
                                         <div className="relative z-[2] flex items-center justify-between h-full px-1.5">
@@ -272,7 +297,7 @@ export default function MasterGantt({ initialTasks, teamMembers }: {
                         })}
 
                         {/* Grid lines */}
-                        {headers.map((h, i) => { let x = 0; for (let j = 0; j < i; j++) x += headers[j].span * colWidth; return (<div key={`g-${h.key}`} className="absolute top-[40px] bottom-0 border-r border-slate-200/40 pointer-events-none" style={{ left: x }} />); })}
+                        {headers.map((h, i) => { let x = 0; for (let j = 0; j < i; j++) x += headers[j].span * colWidth; return (<div key={`g-${h.key}`} className="absolute bottom-0 border-r border-slate-200/40 pointer-events-none" style={{ top: headerHeight, left: x }} />); })}
                     </div>
                 </div>
             </div>
