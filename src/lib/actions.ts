@@ -4646,6 +4646,25 @@ export async function getTaskComments(taskId: string) {
     });
 }
 
+export async function getTaskTimeEntries(taskId: string) {
+    const [entries, total] = await Promise.all([
+        prisma.timeEntry.findMany({
+            where: { scheduleTaskId: taskId },
+            orderBy: { startTime: "desc" },
+            take: 50,
+            select: {
+                id: true,
+                startTime: true,
+                durationHours: true,
+                user: { select: { id: true, name: true, email: true } },
+                costCode: { select: { id: true, code: true, name: true } },
+            },
+        }),
+        prisma.timeEntry.count({ where: { scheduleTaskId: taskId } }),
+    ]);
+    return { entries, total };
+}
+
 // ========== FIELD UPDATES FEED ==========
 // Cross-project comment stream for managers. Filtered to projects the
 // caller can access (ADMIN/MANAGER see all; others see only ProjectAccess + crew-assigned).

@@ -19,6 +19,7 @@ import TaskDetailPanel from "./TaskDetailPanel";
 import DependencyPicker from "./DependencyPicker";
 import ScheduleToolbar from "./ScheduleToolbar";
 import ColorPicker from "./ColorPicker";
+import ProgressPopover from "./ProgressPopover";
 
 // 14-column grid: drag handle | color | name | type | start | end | dur | status | progress | assigned | est hrs | act hrs | deps | actions
 const GRID_COLS = "24px 32px minmax(200px,1fr) 70px 120px 120px 70px 110px 100px 130px 80px 80px 90px 40px";
@@ -89,6 +90,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
     const [editValue, setEditValue] = useState("");
     const [colorPickerId, setColorPickerId] = useState<string | null>(null);
     const [depsPopoverId, setDepsPopoverId] = useState<string | null>(null);
+    const [progressPopoverId, setProgressPopoverId] = useState<string | null>(null);
     const [depsPickerId, setDepsPickerId] = useState<string | null>(null);
     const editRef = useRef<HTMLInputElement | HTMLSelectElement>(null);
     const tasksRef = useRef(tasks);
@@ -673,7 +675,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             {/* Color dot */}
                                                             <div className="px-2 py-2 flex items-center">
                                                                 <div className="relative">
-                                                                    <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-4 h-4 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
+                                                                    <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); setProgressPopoverId(null); }} className={`w-4 h-4 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
                                                                     {colorPickerId === task.id && (
                                                                         <ColorPicker
                                                                             selected={task.color}
@@ -724,11 +726,33 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             </div>
                                                             {/* Progress */}
                                                             <div className="px-3 py-2">
-                                                                <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
-                                                                    <div className="w-14 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                                                                        <div className="h-full rounded-full transition-all" style={{ width: `${progress}%`, backgroundColor: task.color + "cc" }} />
-                                                                    </div>
-                                                                    <span className="text-[10px] text-slate-500 w-7 text-right">{progress}%</span>
+                                                                <div className="relative inline-block" onClick={e => e.stopPropagation()}>
+                                                                    <button
+                                                                        onClick={() => {
+                                                                            setProgressPopoverId(progressPopoverId === task.id ? null : task.id);
+                                                                            setDepsPopoverId(null);
+                                                                            setDepsPickerId(null);
+                                                                            setColorPickerId(null);
+                                                                        }}
+                                                                        className="flex items-center gap-2 group/progress cursor-pointer"
+                                                                        title="View time entries"
+                                                                    >
+                                                                        <div className="w-14 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                                                            <div className="h-full rounded-full transition-all" style={{ width: `${progress}%`, backgroundColor: task.color + "cc" }} />
+                                                                        </div>
+                                                                        <span className="text-[10px] text-slate-500 w-7 text-right group-hover/progress:text-indigo-600 transition">{progress}%</span>
+                                                                    </button>
+                                                                    {progressPopoverId === task.id && (
+                                                                        <ProgressPopover
+                                                                            taskId={task.id}
+                                                                            taskColor={task.color}
+                                                                            progress={progress}
+                                                                            estimatedHours={task.estimatedHours}
+                                                                            actualHours={task.actualHours}
+                                                                            projectId={projectId}
+                                                                            onClose={() => setProgressPopoverId(null)}
+                                                                        />
+                                                                    )}
                                                                 </div>
                                                             </div>
                                                             {/* Assigned */}
@@ -761,7 +785,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             <div className="px-3 py-2">
                                                                 <div className="relative inline-block" onClick={e => e.stopPropagation()}>
                                                                     <button
-                                                                        onClick={() => { setDepsPopoverId(depsPopoverId === task.id ? null : task.id); setDepsPickerId(null); }}
+                                                                        onClick={() => { setDepsPopoverId(depsPopoverId === task.id ? null : task.id); setDepsPickerId(null); setProgressPopoverId(null); }}
                                                                         className={`text-[10px] px-1.5 py-0.5 rounded font-medium transition ${task.dependencies.length > 0 ? "bg-slate-100 text-slate-600 hover:bg-indigo-100 hover:text-indigo-700" : "text-slate-300 hover:text-indigo-600 hover:bg-indigo-50"}`}
                                                                         title={task.dependencies.length > 0 ? "View / edit predecessors" : "Add a predecessor"}
                                                                     >
