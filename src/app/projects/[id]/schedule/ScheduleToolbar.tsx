@@ -1,6 +1,6 @@
 "use client";
 
-import { type ReactNode } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import type { EstimateSummary } from "./schedule-types";
 import SchedulePublishButton from "./SchedulePublishButton";
 
@@ -67,6 +67,8 @@ export default function ScheduleToolbar({
 }: ScheduleToolbarProps) {
     const progressPct = taskCount > 0 ? Math.round((completedCount / taskCount) * 100) : 0;
     const hasEstimates = estimates.length > 0;
+    const moreBtnRef = useRef<HTMLButtonElement>(null);
+    const [moreMenuPos, setMoreMenuPos] = useState({ top: 0, right: 0 });
 
     return (
         <>
@@ -155,13 +157,13 @@ export default function ScheduleToolbar({
 
                         {/* Tools overflow menu */}
                         <div className="relative">
-                            <button onClick={onToggleToolsMenu} className={`hui-btn hui-btn-secondary text-xs py-1.5 px-2 ${showToolsMenu ? "bg-slate-200" : ""}`} title="Tools">
+                            <button ref={moreBtnRef} onClick={() => { if (!showToolsMenu && moreBtnRef.current) { const rect = moreBtnRef.current.getBoundingClientRect(); setMoreMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right }); } onToggleToolsMenu(); }} className={`hui-btn hui-btn-secondary text-xs py-1.5 px-2 ${showToolsMenu ? "bg-slate-200" : ""}`} title="Tools">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
                             </button>
                             {showToolsMenu && (
                                 <>
                                     <div className="fixed inset-0 z-40" onClick={onToggleToolsMenu} />
-                                    <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[220px] py-1 animate-in fade-in">
+                                    <div className="fixed bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[220px] py-1 animate-in fade-in" style={{ top: moreMenuPos.top, right: moreMenuPos.right }}>
                                         {/* View section */}
                                         <div className="px-3 py-1 text-[10px] text-slate-400 uppercase font-semibold tracking-wider">View</div>
                                         <button onClick={() => { onToggleCriticalPath(); onToggleToolsMenu(); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">

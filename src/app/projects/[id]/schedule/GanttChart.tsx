@@ -51,6 +51,9 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
     const colWidth = zoom === "day" ? 40 : zoom === "week" ? 20 : 8;
     const timelineWidth = totalDays * colWidth;
     const ROW_HEIGHT = 52;
+    const BASE_HEADER_HEIGHT = 44;
+    const DAY_SUB_ROW_HEIGHT = 18;
+    const headerHeight = zoom === "week" ? BASE_HEADER_HEIGHT + DAY_SUB_ROW_HEIGHT : BASE_HEADER_HEIGHT;
 
     function getHeaders() {
         const headers: { label: string; span: number; key: string }[] = [];
@@ -327,7 +330,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
             <div className="flex flex-1 min-h-0 overflow-hidden">
                 {/* Left Panel — Task List */}
                 <div className="w-80 shrink-0 bg-white border-r border-hui-border flex flex-col z-10 shadow-[2px_0_8px_rgba(0,0,0,0.03)]">
-                    <div className="flex items-center px-3 py-3 bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-hui-border text-[10px] font-bold text-slate-400 uppercase tracking-wider h-[44px]">
+                    <div className="flex items-center px-3 py-3 bg-gradient-to-r from-slate-50 to-slate-100/50 border-b border-hui-border text-[10px] font-bold text-slate-400 uppercase tracking-wider" style={{ height: headerHeight }}>
                         <div className="flex-1">Task Name</div>
                         <div className="w-16 text-center">Hours</div>
                         <div className="w-20 text-center">Status</div>
@@ -424,19 +427,40 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                 {/* Middle — Timeline */}
                 <div ref={scrollRef} className="flex-1 min-h-0 min-w-0 overflow-auto bg-slate-50/50 relative">
                     <div style={{ width: timelineWidth, minHeight: "100%" }} className="relative">
-                        <div className="sticky top-0 z-10 flex bg-slate-50 border-b border-hui-border h-[44px]">
-                            {headers.map(h => (<div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>{h.label}</div>))}
+                        <div className="sticky top-0 z-10 bg-slate-50 border-b border-hui-border" style={{ height: headerHeight }}>
+                            <div className="flex" style={{ height: BASE_HEADER_HEIGHT }}>
+                                {headers.map(h => (<div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>{h.label}</div>))}
+                            </div>
+                            {zoom === "week" && (
+                                <div className="flex border-t border-slate-200/40" style={{ height: DAY_SUB_ROW_HEIGHT }}>
+                                    {headers.flatMap(h => {
+                                        const dateStr = h.key.slice(2);
+                                        const monday = new Date(dateStr + "T00:00:00Z");
+                                        return Array.from({ length: 7 }, (_, i) => {
+                                            const d = addDays(monday, i);
+                                            const dayNum = d.getUTCDate();
+                                            const isWknd = d.getUTCDay() === 0 || d.getUTCDay() === 6;
+                                            const isToday = d.getUTCFullYear() === today.getUTCFullYear() && d.getUTCMonth() === today.getUTCMonth() && d.getUTCDate() === today.getUTCDate();
+                                            return (
+                                                <div key={`ds-${h.key}-${i}`} className={`flex items-center justify-center shrink-0 text-[9px] ${isWknd ? "text-slate-300" : isToday ? "text-red-500 font-bold" : "text-slate-400"}`} style={{ width: colWidth }}>
+                                                    {dayNum}
+                                                </div>
+                                            );
+                                        });
+                                    })}
+                                </div>
+                            )}
                         </div>
 
                         {weekendCols.map((wc, i) => (
-                            <div key={`wk-${i}`} className="absolute top-[44px] bottom-0 bg-slate-200/25 pointer-events-none z-[1]" style={{ left: wc.left, width: wc.width }} />
+                            <div key={`wk-${i}`} className="absolute bottom-0 bg-slate-200/25 pointer-events-none z-[1]" style={{ top: headerHeight, left: wc.left, width: wc.width }} />
                         ))}
 
                         <div className="absolute top-0 bottom-0 w-px z-[5] pointer-events-none" style={{ left: todayOffset, background: "repeating-linear-gradient(to bottom, #ef4444 0, #ef4444 4px, transparent 4px, transparent 8px)" }}>
                             <div className="absolute -top-0 -translate-x-1/2 bg-red-500 text-white text-[8px] font-bold px-1 py-0.5 rounded-b-md shadow">TODAY</div>
                         </div>
 
-                        <svg className="absolute top-0 left-0 pointer-events-none z-[4]" style={{ width: timelineWidth, height: 44 + tasks.length * ROW_HEIGHT }}>
+                        <svg className="absolute top-0 left-0 pointer-events-none z-[4]" style={{ width: timelineWidth, height: headerHeight + tasks.length * ROW_HEIGHT }}>
                             <defs><marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#94a3b8" /></marker></defs>
                             {arrows.map((arrow, i) => {
                                 const ft = tasks.find(t => t.id === arrow.fromId), tt = tasks.find(t => t.id === arrow.toId);
@@ -506,7 +530,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                             );
                         })}
 
-                        {headers.map((h, i) => { let x = 0; for (let j = 0; j < i; j++) x += headers[j].span * colWidth; return (<div key={`g-${h.key}`} className="absolute top-[44px] bottom-0 border-r border-slate-200/40 pointer-events-none" style={{ left: x }} />); })}
+                        {headers.map((h, i) => { let x = 0; for (let j = 0; j < i; j++) x += headers[j].span * colWidth; return (<div key={`g-${h.key}`} className="absolute bottom-0 border-r border-slate-200/40 pointer-events-none" style={{ top: headerHeight, left: x }} />); })}
                     </div>
                 </div>
 

@@ -132,6 +132,13 @@ export default function ColorPicker({ selected, onPick, onClose, className }: Co
                 aria-label="Custom color"
                 tabIndex={-1}
             />
+            <button
+                type="button"
+                onClick={onClose}
+                className="w-full mt-2.5 py-1.5 text-[11px] font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded transition"
+            >
+                Done
+            </button>
         </div>
     );
 }

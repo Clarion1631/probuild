@@ -61,6 +61,7 @@ import ReusableSignaturePad from "@/components/ReusableSignaturePad";
 import DocumentComments from "@/components/DocumentComments";
 import BudgetStrip from "./BudgetStrip";
 import POQuickCreateModal from "./POQuickCreateModal";
+import UndoPaymentModal from "@/components/UndoPaymentModal";
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 
 export default function EstimateEditor({ context, initialEstimate, salesTaxes = [] }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[] }) {
@@ -95,6 +96,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [recordingEstPayment, setRecordingEstPayment] = useState<{ id: string; name: string; amount: number } | null>(null);
     const [isSendingEstReceipt, setIsSendingEstReceipt] = useState<string | null>(null);
     const [isUndoingEstPayment, setIsUndoingEstPayment] = useState<string | null>(null);
+    const [undoPaymentTarget, setUndoPaymentTarget] = useState<any | null>(null);
     const savedScheduleIds = useMemo(() => new Set((initialEstimate.paymentSchedules || []).map((s: any) => s.id)), [initialEstimate.paymentSchedules]);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
@@ -1086,11 +1088,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             return;
         } else if (field === "amount") {
             newSchedules[index].amount = value;
-            if (total > 0 && value !== "") {
-                newSchedules[index].percentage = String(rm(((parseFloat(value) || 0) / total) * 100));
-            } else {
-                newSchedules[index].percentage = "";
-            }
+            newSchedules[index].percentage = "";
         } else {
             newSchedules[index][field] = value;
         }
@@ -1977,11 +1975,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                             <div className="w-32 px-4 relative">
                                                 <input
                                                     type="number"
-                                                    value={schedule.percentage}
+                                                    value={schedule.percentage || (total > 0 && schedule.amount ? String(rm(((parseFloat(schedule.amount) || 0) / total) * 100)) : "")}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
                                                     disabled={isPaid}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium text-slate-600 disabled:cursor-default"
+                                                    className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium disabled:cursor-default ${!schedule.percentage && schedule.amount ? 'text-slate-300 italic' : 'text-slate-600'}`}
                                                 />
                                                 <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
                                             </div>
@@ -2046,24 +2044,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                 : schedule.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
                                                         </button>
                                                         <button
-                                                            onClick={async () => {
-                                                                if (!schedule.id) return;
-                                                                setIsUndoingEstPayment(schedule.id);
-                                                                try {
-                                                                    const res = await unrecordEstimatePayment(schedule.id, initialEstimate.id);
-                                                                    if (!res?.success) { toast.error("Nothing to unrecord"); return; }
-                                                                    toast("Payment unrecorded");
-                                                                    router.refresh();
-                                                                } catch (e: any) {
-                                                                    toast.error(e?.message || "Failed to unrecord payment");
-                                                                } finally {
-                                                                    setIsUndoingEstPayment(null);
-                                                                }
-                                                            }}
-                                                            disabled={isUndoingEstPayment === schedule.id}
-                                                            className="text-[10px] text-slate-400 hover:text-red-600 underline underline-offset-2 disabled:opacity-50"
+                                                            onClick={() => setUndoPaymentTarget(schedule)}
+                                                            className="text-[10px] text-slate-400 hover:text-red-600 underline underline-offset-2"
                                                         >
-                                                            {isUndoingEstPayment === schedule.id ? "Undoing..." : "Undo"}
+                                                            Undo
                                                         </button>
                                                     </div>
                                                 ) : isSavedSchedule ? (
@@ -2848,6 +2832,40 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     }}
                 />
             )}
+
+            {undoPaymentTarget && (() => {
+                const paidSchedules = paymentSchedules.filter(s => s.status === "Paid");
+                const paidSum = paidSchedules.reduce((sum: number, s: any) => sum + (parseFloat(s.amount) || 0), 0);
+                const currentBalance = Math.max(0, total - paidSum);
+                return (
+                    <UndoPaymentModal
+                        milestoneName={undoPaymentTarget.name || "Payment"}
+                        amount={Number(undoPaymentTarget.amount) || 0}
+                        paymentMethod={undoPaymentTarget.paymentMethod || null}
+                        referenceNumber={undoPaymentTarget.referenceNumber || null}
+                        paidAt={undoPaymentTarget.paidAt || null}
+                        paymentDate={undoPaymentTarget.paymentDate || null}
+                        hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
+                        currentBalance={currentBalance}
+                        estimateTotal={total}
+                        currentStatus={status}
+                        otherPaidCount={paidSchedules.filter((s: any) => s.id !== undoPaymentTarget.id).length}
+                        statusBeforePayment={initialEstimate.statusBeforePayment || null}
+                        onClose={() => setUndoPaymentTarget(null)}
+                        onConfirm={async () => {
+                            try {
+                                const res = await unrecordEstimatePayment(undoPaymentTarget.id, initialEstimate.id);
+                                if (!res?.success) { toast.error("Nothing to unrecord"); return; }
+                                toast("Payment unrecorded");
+                                setUndoPaymentTarget(null);
+                                router.refresh();
+                            } catch (e: any) {
+                                toast.error(e?.message || "Failed to unrecord payment");
+                            }
+                        }}
+                    />
+                );
+            })()}
 
             {poCreateItemId && context.type === "project" && (
                 <POQuickCreateModal
