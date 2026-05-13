@@ -1,0 +1,427 @@
+"use client";
+
+import { useState, useRef, useEffect, useMemo, type Dispatch, type SetStateAction } from "react";
+import {
+    createScheduleTask, updateScheduleTask, deleteScheduleTask,
+    importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
+    aiGenerateSchedule,
+    addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
+    deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
+    assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
+    getEstimateItemsForProject,
+} from "@/lib/actions";
+import { toast } from "sonner";
+import type { Task, EstimateItemSummary, PunchItem, Comment } from "./schedule-types";
+import { getDaysBetween, addDays, formatDate, computeCriticalPath } from "./schedule-utils";
+
+export function useScheduleActions(
+    projectId: string,
+    tasks: Task[],
+    setTasks: Dispatch<SetStateAction<Task[]>>,
+) {
+    // --- Detail panel state ---
+    const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+    const [panelTab, setPanelTab] = useState<"details" | "punch" | "conversation">("details");
+    const [punchItems, setPunchItems] = useState<PunchItem[]>([]);
+    const [comments, setComments] = useState<Comment[]>([]);
+    const [isAiPunching, setIsAiPunching] = useState(false);
+    const [estimateItems, setEstimateItems] = useState<EstimateItemSummary[]>([]);
+
+    // --- New task form state ---
+    const [isAdding, setIsAdding] = useState(false);
+    const [showNewTaskForm, setShowNewTaskForm] = useState(false);
+    const [newTaskType, setNewTaskType] = useState<"task" | "milestone">("task");
+    const [newTaskName, setNewTaskName] = useState("");
+    const [newTaskStart, setNewTaskStart] = useState("");
+    const [newTaskEnd, setNewTaskEnd] = useState("");
+
+    // --- Toolbar toggle state ---
+    const [linkMode, setLinkMode] = useState<string | null>(null);
+    const [showCriticalPath, setShowCriticalPath] = useState(false);
+    const [showMoreMenu, setShowMoreMenu] = useState(false);
+
+    // --- AI + Import state ---
+    const [isAiGenerating, setIsAiGenerating] = useState(false);
+    const [showAiMenu, setShowAiMenu] = useState(false);
+    const [isAiRisk, setIsAiRisk] = useState(false);
+    const [showRiskPanel, setShowRiskPanel] = useState(false);
+    const [riskAnalysis, setRiskAnalysis] = useState<string | null>(null);
+    const [isImporting, setIsImporting] = useState(false);
+    const [showImportMenu, setShowImportMenu] = useState(false);
+
+    // --- Refs ---
+    const tasksRef = useRef<Task[]>(tasks);
+    useEffect(() => { tasksRef.current = tasks; });
+
+    const selectedTask = tasks.find(t => t.id === selectedTaskId);
+    const criticalPathIds = useMemo(() => computeCriticalPath(tasks), [tasks]);
+    const today = new Date();
+
+    // Load detail data when task selected
+    useEffect(() => {
+        if (selectedTaskId) {
+            getTaskPunchItems(selectedTaskId).then(items => setPunchItems(items as any));
+            getTaskComments(selectedTaskId).then(c => setComments(c.map((x: any) => ({ ...x, createdAt: x.createdAt.toISOString?.() || x.createdAt }))));
+        }
+    }, [selectedTaskId]);
+
+    // --- Cascade dependents (recursive) ---
+    async function cascadeDependents(taskId: string, dayDelta: number) {
+        const deps = tasksRef.current.filter(t => t.dependencies.some(d => d.predecessorId === taskId));
+        for (const dep of deps) {
+            const ns = formatDate(addDays(new Date(dep.startDate), dayDelta));
+            const ne = dep.type === "milestone" ? ns : formatDate(addDays(new Date(dep.endDate), dayDelta));
+            setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, startDate: ns, endDate: ne } : t));
+            await updateScheduleTask(dep.id, { startDate: ns, endDate: ne });
+            await cascadeDependents(dep.id, dayDelta);
+        }
+    }
+
+    // --- New task form ---
+    function openNewTaskForm(type: "task" | "milestone") {
+        setNewTaskType(type);
+        setNewTaskName(type === "milestone" ? "New Milestone" : "New Task");
+        setNewTaskStart(formatDate(today));
+        setNewTaskEnd(type === "milestone" ? formatDate(today) : formatDate(addDays(today, 5)));
+        setShowNewTaskForm(true);
+    }
+
+    async function handleAddTask() {
+        if (!newTaskName.trim()) { toast.error("Name is required"); return; }
+        if (!newTaskStart || (newTaskType !== "milestone" && !newTaskEnd)) { toast.error("Dates are required"); return; }
+        if (newTaskType !== "milestone" && newTaskStart > newTaskEnd) { toast.error("End date must be on or after start date"); return; }
+        setIsAdding(true);
+        try {
+            const start = newTaskStart;
+            const end = newTaskType === "milestone" ? start : newTaskEnd;
+            const task = await createScheduleTask(projectId, { name: newTaskName.trim(), startDate: start, endDate: end, type: newTaskType });
+            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
+            toast.success(newTaskType === "milestone" ? "Milestone added" : "Task added");
+            setShowNewTaskForm(false);
+        } finally { setIsAdding(false); }
+    }
+
+    // --- Task CRUD ---
+    async function handleDateChange(taskId: string, field: "startDate" | "endDate", value: string) {
+        if (!value) return;
+        const task = tasksRef.current.find(t => t.id === taskId);
+        if (!task) return;
+        if (task.type === "milestone") {
+            const oldStart = task.startDate;
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: value, endDate: value } : t));
+            await updateScheduleTask(taskId, { startDate: value, endDate: value });
+            if (value !== oldStart) {
+                const dayDelta = getDaysBetween(new Date(oldStart), new Date(value));
+                if (dayDelta !== 0) await cascadeDependents(taskId, dayDelta);
+            }
+            return;
+        }
+        if (field === "startDate" && value > task.endDate) { toast.error("Start date must be on or before end date"); return; }
+        if (field === "endDate" && value < task.startDate) { toast.error("End date must be on or after start date"); return; }
+        const oldStart = task.startDate;
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, [field]: value } : t));
+        await updateScheduleTask(taskId, { [field]: value });
+        if (field === "startDate" && value !== oldStart) {
+            const dayDelta = getDaysBetween(new Date(oldStart), new Date(value));
+            if (dayDelta !== 0) await cascadeDependents(taskId, dayDelta);
+        }
+    }
+
+    async function handleStatusChange(taskId: string, status: string) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status } : t));
+        await updateScheduleTask(taskId, { status });
+    }
+
+    async function handleColorChange(taskId: string, color: string) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color } : t));
+        await updateScheduleTask(taskId, { color });
+    }
+
+    async function handleDelete(taskId: string) {
+        setTasks(prev => prev.filter(t => t.id !== taskId));
+        if (selectedTaskId === taskId) setSelectedTaskId(null);
+        await deleteScheduleTask(taskId);
+        toast.success("Task deleted");
+    }
+
+    async function handleNameSave(taskId: string, name: string) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t));
+        await updateScheduleTask(taskId, { name });
+    }
+
+    async function handleEstimatedHoursSave(taskId: string, hours: number) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t));
+        await updateScheduleTask(taskId, { estimatedHours: hours });
+    }
+
+    async function handleProgressChange(taskId: string, progress: number) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress } : t));
+        await updateScheduleTask(taskId, { progress });
+    }
+
+    // --- Linking ---
+    async function handleTaskClick(taskId: string) {
+        if (!linkMode) return;
+        if (linkMode === taskId) { setLinkMode(null); return; }
+        try {
+            const dep = await linkTasks(linkMode, taskId);
+            setTasks(prev => prev.map(t => {
+                if (t.id === taskId) return { ...t, dependencies: [...t.dependencies, { id: dep.id, predecessorId: linkMode, dependentId: taskId }] };
+                if (t.id === linkMode) return { ...t, dependents: [...t.dependents, { id: dep.id, predecessorId: linkMode, dependentId: taskId }] };
+                return t;
+            }));
+            toast.success("Tasks linked");
+        } catch { toast.error("Already linked or invalid"); }
+        setLinkMode(null);
+    }
+
+    async function handleLinkPredecessor(predId: string) {
+        if (!selectedTaskId) return;
+        try {
+            const dep = await linkTasks(predId, selectedTaskId);
+            setTasks(prev => prev.map(t => {
+                if (t.id === selectedTaskId) return { ...t, dependencies: [...t.dependencies, { id: dep.id, predecessorId: predId, dependentId: selectedTaskId }] };
+                if (t.id === predId) return { ...t, dependents: [...t.dependents, { id: dep.id, predecessorId: predId, dependentId: selectedTaskId }] };
+                return t;
+            }));
+            toast.success("Predecessor added");
+        } catch { toast.error("Already linked or invalid"); }
+    }
+
+    async function handleUnlinkPredecessor(predId: string) {
+        if (!selectedTaskId) return;
+        await unlinkTasks(predId, selectedTaskId);
+        setTasks(prev => prev.map(t => ({
+            ...t,
+            dependencies: t.dependencies.filter(d => !(d.predecessorId === predId && d.dependentId === selectedTaskId)),
+            dependents: t.dependents.filter(d => !(d.predecessorId === predId && d.dependentId === selectedTaskId)),
+        })));
+        toast.success("Predecessor removed");
+    }
+
+    async function handleUnlink(pid: string, did: string) {
+        await unlinkTasks(pid, did);
+        setTasks(prev => prev.map(t => ({
+            ...t,
+            dependencies: t.dependencies.filter(d => !(d.predecessorId === pid && d.dependentId === did)),
+            dependents: t.dependents.filter(d => !(d.predecessorId === pid && d.dependentId === did)),
+        })));
+        toast.success("Link removed");
+    }
+
+    // --- AI + Import ---
+    async function handleAiSchedule(estimateId?: string) {
+        setIsAiGenerating(true);
+        setShowAiMenu(false);
+        try {
+            const created = await aiGenerateSchedule(projectId, estimateId);
+            const newTasks: Task[] = created.map((t: any) => ({
+                id: t.id, name: t.name,
+                startDate: new Date(t.startDate).toISOString().split("T")[0],
+                endDate: new Date(t.endDate).toISOString().split("T")[0],
+                color: t.color, progress: 0, status: t.status,
+                type: "task",
+                assignee: null, order: t.order,
+                estimatedHours: t.estimatedHours, actualHours: 0,
+                dependencies: [], dependents: [], assignments: [],
+                estimateItemId: null, estimateItem: null,
+            }));
+            setTasks(prev => [...prev, ...newTasks]);
+            toast.success(`AI generated ${newTasks.length} tasks`);
+        } catch (e: any) {
+            toast.error(e.message || "AI schedule generation failed");
+        } finally {
+            setIsAiGenerating(false);
+        }
+    }
+
+    async function handleAiRisk() {
+        setIsAiRisk(true);
+        try {
+            const res = await fetch("/api/ai/schedule-risk", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId, tasks }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Risk analysis failed");
+            setRiskAnalysis(data.analysis);
+            setShowRiskPanel(true);
+        } catch (e: any) {
+            toast.error(e.message || "Schedule risk analysis failed");
+        } finally {
+            setIsAiRisk(false);
+        }
+    }
+
+    async function handleImportEstimate(estimateId: string) {
+        setIsImporting(true);
+        setShowImportMenu(false);
+        try {
+            const newTasks = await importEstimateToSchedule(projectId, estimateId);
+            setTasks(prev => [...prev, ...newTasks.map((t: any) => ({
+                ...t,
+                startDate: formatDate(new Date(t.startDate)),
+                endDate: formatDate(new Date(t.endDate)),
+                type: "task" as const,
+                actualHours: 0, estimatedHours: null,
+                dependencies: [], dependents: [], assignments: [],
+                estimateItemId: t.estimateItemId || null, estimateItem: null,
+            }))]);
+            toast.success(`Imported ${newTasks.length} tasks`);
+        } catch { toast.error("Import failed"); }
+        finally { setIsImporting(false); }
+    }
+
+    async function handleClearAll() {
+        if (!confirm("Delete ALL tasks from this schedule? This cannot be undone.")) return;
+        setShowMoreMenu(false);
+        await clearAllTasks(projectId);
+        setTasks([]);
+        setSelectedTaskId(null);
+        toast.success("Schedule cleared");
+    }
+
+    function handleSyncCalendar() {
+        if (tasks.length === 0) { toast.error("No tasks to sync"); return; }
+        const a = document.createElement("a");
+        a.href = `/api/calendar/sync?projectId=${projectId}`;
+        a.download = "schedule.ics";
+        a.click();
+        toast.success("Calendar file downloaded — import into Google Calendar, Apple Calendar, or Outlook");
+    }
+
+    // --- Estimate linking ---
+    async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item } : t));
+        await updateScheduleTask(taskId, { estimateItemId: item.id });
+        toast.success("Linked to estimate item");
+    }
+
+    async function handleUnlinkEstimateItem(taskId: string) {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
+        await updateScheduleTask(taskId, { estimateItemId: null });
+        toast.success("Estimate link removed");
+    }
+
+    function fetchEstimateItems() {
+        if (estimateItems.length === 0) {
+            getEstimateItemsForProject(projectId).then(items => setEstimateItems(items as any));
+        }
+    }
+
+    // --- Detail panel: punch, comments, assignments ---
+    async function handleAddPunch(name: string) {
+        if (!name || !selectedTaskId) return;
+        const item = await addTaskPunchItem(selectedTaskId, name);
+        setPunchItems(prev => [...prev, item as any]);
+    }
+
+    async function handleTogglePunch(id: string) {
+        await togglePunchItem(id);
+        setPunchItems(prev => prev.map(p => p.id === id ? { ...p, completed: !p.completed } : p));
+    }
+
+    async function handleDeletePunch(id: string) {
+        await deletePunchItem(id);
+        setPunchItems(prev => prev.filter(p => p.id !== id));
+    }
+
+    async function handleAiPunchlist() {
+        if (!selectedTaskId) return;
+        setIsAiPunching(true);
+        try {
+            const items = await aiGeneratePunchlist(selectedTaskId);
+            setPunchItems(prev => [...prev, ...(items as any)]);
+            toast.success(`AI generated ${items.length} punch items`);
+        } catch { toast.error("AI punchlist failed"); }
+        finally { setIsAiPunching(false); }
+    }
+
+    async function handleAddComment(text: string) {
+        if (!text || !selectedTaskId) return;
+        try {
+            const comment = await addTaskComment(selectedTaskId, text);
+            setComments(prev => [...prev, { ...(comment as any), createdAt: new Date().toISOString() }]);
+        } catch (e) {
+            toast.error(e instanceof Error ? e.message : "Failed to add comment");
+        }
+    }
+
+    async function handleAssign(userId: string) {
+        if (!selectedTaskId) return;
+        try {
+            const a = await assignUserToTask(selectedTaskId, userId);
+            setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: [...(t.assignments || []), a as any] } : t));
+            toast.success("Member assigned");
+        } catch { toast.error("Already assigned"); }
+    }
+
+    async function handleUnassign(userId: string) {
+        if (!selectedTaskId) return;
+        await unassignUserFromTask(selectedTaskId, userId);
+        setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: (t.assignments || []).filter(a => a.userId !== userId) } : t));
+    }
+
+    async function handleAssignSub(subId: string) {
+        if (!selectedTaskId) return;
+        try {
+            const a = await assignSubToTask(selectedTaskId, subId);
+            setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, subAssignments: [...(t.subAssignments || []), a as any] } : t));
+            toast.success("Subcontractor assigned");
+        } catch { toast.error("Already assigned"); }
+    }
+
+    async function handleUnassignSub(subId: string) {
+        if (!selectedTaskId) return;
+        await unassignSubFromTask(selectedTaskId, subId);
+        setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, subAssignments: (t.subAssignments || []).filter(a => a.subcontractorId !== subId) } : t));
+    }
+
+    function selectTask(taskId: string) {
+        setSelectedTaskId(taskId);
+        setPanelTab("details");
+    }
+
+    return {
+        // Selected task + panel
+        selectedTaskId, setSelectedTaskId, selectedTask,
+        panelTab, setPanelTab,
+
+        // New task form
+        isAdding, showNewTaskForm, setShowNewTaskForm,
+        newTaskType, newTaskName, newTaskStart, newTaskEnd,
+        setNewTaskName, setNewTaskStart, setNewTaskEnd,
+        openNewTaskForm, handleAddTask,
+
+        // Task CRUD
+        handleDateChange, handleStatusChange, handleColorChange,
+        handleDelete, handleNameSave, handleEstimatedHoursSave,
+        handleProgressChange, cascadeDependents,
+
+        // Linking
+        linkMode, setLinkMode,
+        handleTaskClick, handleLinkPredecessor, handleUnlinkPredecessor, handleUnlink,
+
+        // AI + Import
+        handleAiSchedule, isAiGenerating, showAiMenu, setShowAiMenu,
+        handleAiRisk, isAiRisk, showRiskPanel, setShowRiskPanel, riskAnalysis,
+        handleImportEstimate, isImporting, showImportMenu, setShowImportMenu,
+        handleClearAll, handleSyncCalendar,
+
+        // Toolbar toggles
+        showCriticalPath, setShowCriticalPath,
+        showMoreMenu, setShowMoreMenu,
+        criticalPathIds,
+
+        // Estimate linking
+        estimateItems, handleLinkEstimateItem, handleUnlinkEstimateItem, fetchEstimateItems,
+
+        // Detail panel
+        punchItems, handleAddPunch, handleTogglePunch, handleDeletePunch,
+        handleAiPunchlist, isAiPunching,
+        comments, handleAddComment,
+        handleAssign, handleUnassign, handleAssignSub, handleUnassignSub,
+        selectTask,
+    };
+}
