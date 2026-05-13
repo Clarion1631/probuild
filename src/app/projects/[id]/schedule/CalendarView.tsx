@@ -616,7 +616,7 @@ function QuickEditPopover({
                         {showColorPicker && (
                             <ColorPicker
                                 selected={task.color}
-                                onPick={c => { onPatch({ color: c }); setShowColorPicker(false); }}
+                                onPick={c => onPatch({ color: c })}
                                 onClose={() => setShowColorPicker(false)}
                                 className="absolute left-0 top-7 z-50 min-w-[200px]"
                             />

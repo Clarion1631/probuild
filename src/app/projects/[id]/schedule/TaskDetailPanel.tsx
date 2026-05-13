@@ -128,7 +128,7 @@ export default function TaskDetailPanel({
                         {showColorPicker && (
                             <ColorPicker
                                 selected={task.color}
-                                onPick={c => { onColorChange(task.id, c); setShowColorPicker(false); }}
+                                onPick={c => onColorChange(task.id, c)}
                                 onClose={() => setShowColorPicker(false)}
                                 className="absolute left-0 top-6 z-50 min-w-[200px]"
                             />
