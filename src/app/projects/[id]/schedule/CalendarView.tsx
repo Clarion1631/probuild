@@ -73,8 +73,11 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
 
     const [dragTaskId, setDragTaskId] = useState<string | null>(null);
     const [dragOverKey, setDragOverKey] = useState<string | null>(null);
+    const [showToolsMenu, setShowToolsMenu] = useState(false);
 
     const today = todayUTC();
+    const taskCount = tasks.length;
+    const completedCount = tasks.filter(t => t.status === "done").length;
 
     function navPrev() {
         if (subMode === "week") setAnchor(prev => addDays(prev, -7));
@@ -195,18 +198,33 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         <div className="flex flex-col h-full bg-hui-background" onClick={() => { setQuickAdd(null); setEditing(null); }}>
             <ScheduleToolbar
                 projectId={projectId}
-                tasks={tasks}
-                setTasks={setTasks}
-                estimates={estimates}
                 initialPublished={initialPublished}
+                taskCount={taskCount}
+                completedCount={completedCount}
+                estimates={estimates}
                 viewMode={viewMode ?? "calendar"}
                 onViewModeChange={onViewModeChange ?? (() => {})}
+                isAdding={false}
+                onAddTask={() => {}}
+                onAddMilestone={() => {}}
+                isAiGenerating={false}
+                showAiMenu={false}
+                onToggleAiMenu={() => {}}
+                onAiSchedule={() => {}}
+                showToolsMenu={showToolsMenu}
+                onToggleToolsMenu={() => setShowToolsMenu(v => !v)}
                 showCriticalPath={false}
                 onToggleCriticalPath={() => {}}
                 linkMode={null}
                 onToggleLinkMode={() => {}}
-                viewControls={
-                    <>
+                onSyncCalendar={() => {}}
+                isAiRisk={false}
+                onAiRisk={() => {}}
+                isImporting={false}
+                onImportEstimate={() => {}}
+                onClearAll={() => {}}
+                secondaryContent={
+                    <div className="bg-white border-b border-hui-border px-6 py-2 flex items-center gap-2 shrink-0">
                         <button onClick={navPrev} className="px-2 py-1.5 text-slate-600 hover:bg-slate-100 rounded-md transition" aria-label="Previous">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg>
                         </button>
@@ -219,7 +237,7 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
                             <button onClick={() => onSubModeChange("month")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${subMode === "month" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>Month</button>
                             <button onClick={() => onSubModeChange("week")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${subMode === "week" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>Week</button>
                         </div>
-                    </>
+                    </div>
                 }
             />
 
