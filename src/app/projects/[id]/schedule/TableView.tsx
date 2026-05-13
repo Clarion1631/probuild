@@ -15,10 +15,11 @@ import {
 } from "@/lib/actions";
 import { toast } from "sonner";
 import type { Task, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment, SortKey, SortDir, FilterState } from "./schedule-types";
-import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
+import { STATUS_OPTIONS, STATUS_COLORS, getDaysBetween, addDays, formatDate, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
 import TaskDetailPanel from "./TaskDetailPanel";
 import DependencyPicker from "./DependencyPicker";
 import SchedulePublishButton from "./SchedulePublishButton";
+import ColorPicker from "./ColorPicker";
 
 // 14-column grid: drag handle | color | name | type | start | end | dur | status | progress | assigned | est hrs | act hrs | deps | actions
 const GRID_COLS = "24px 32px minmax(200px,1fr) 70px 120px 120px 70px 110px 100px 130px 80px 80px 90px 40px";
@@ -891,11 +892,14 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             {/* Color dot */}
                                                             <div className="px-2 py-2 flex items-center">
                                                                 <div className="relative">
-                                                                    <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-4 h-4 rounded-full border border-white shadow-sm" style={{ backgroundColor: task.color }} />
+                                                                    <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-4 h-4 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
                                                                     {colorPickerId === task.id && (
-                                                                        <div className="absolute left-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 p-2 flex gap-1 animate-in fade-in" onClick={e => e.stopPropagation()}>
-                                                                            {PRESET_COLORS.map(c => (<button key={c} onClick={() => handleColorChange(task.id, c)} className="w-5 h-5 rounded-full border-2 transition hover:scale-110" style={{ backgroundColor: c, borderColor: c === task.color ? "#1e293b" : "transparent" }} />))}
-                                                                        </div>
+                                                                        <ColorPicker
+                                                                            selected={task.color}
+                                                                            onPick={c => handleColorChange(task.id, c)}
+                                                                            onClose={() => setColorPickerId(null)}
+                                                                            className="absolute left-0 top-full mt-1 z-50 min-w-[200px]"
+                                                                        />
                                                                     )}
                                                                 </div>
                                                             </div>
@@ -1064,6 +1068,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                         onNameChange={(taskId, name) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t)); updateScheduleTask(taskId, { name }); }}
                         onDateChange={handleDateChange}
                         onEstimatedHoursChange={(taskId, hours) => { setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t)); updateScheduleTask(taskId, { estimatedHours: hours }); }}
+                        onColorChange={handleColorChange}
                         onDelete={handleDelete}
                         estimateItems={estimateItems}
                         onLinkEstimateItem={handleLinkEstimateItem}

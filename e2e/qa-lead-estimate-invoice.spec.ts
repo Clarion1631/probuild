@@ -37,15 +37,18 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
     await page.goto("/leads", { waitUntil: "networkidle" });
     await capture(page, testInfo, 1, 2, "before-add-lead");
 
-    // Click Add Lead
-    const addBtn = page.locator('button:has-text("Add Lead")');
+    // Click Add Lead — there can be both a header button and an empty-state
+    // button matching :has-text("Add Lead"); use .first() to pick the visible one
+    // and waitFor the modal's name input rather than a fixed sleep.
+    const addBtn = page.locator('button:has-text("Add Lead")').first();
     await expect(addBtn, "Add Lead button not found").toBeVisible();
     await addBtn.click();
-    await page.waitForTimeout(1000);
+    const nameInput = page.locator('input[name="name"]');
+    await nameInput.waitFor({ state: "visible", timeout: 10_000 });
     await capture(page, testInfo, 1, 2, "add-lead-modal");
 
     // Fill form
-    await page.locator('input[name="name"]').fill("Master Bath Renovation - Henderson");
+    await nameInput.fill("Master Bath Renovation - Henderson");
 
     // Client name — combobox: type and pick or create
     const clientInput = page.locator('input[name="clientName"]');

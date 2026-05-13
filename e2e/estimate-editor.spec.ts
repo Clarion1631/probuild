@@ -1,10 +1,17 @@
 import { test, expect } from "@playwright/test";
+import { getFirstProjectId, getFirstEstimateId } from "./helpers/test-data";
 
-const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
-const ESTIMATE_ID = "cmml6vtx7001dpwrh8n65xzy6";
+let PROJECT_ID: string;
+let ESTIMATE_ID: string | null;
 
 test.describe("Estimate Editor", () => {
+  test.beforeAll(async ({ browser }) => {
+    PROJECT_ID = await getFirstProjectId(browser);
+    ESTIMATE_ID = await getFirstEstimateId(browser, PROJECT_ID);
+  });
+
   test("loads without crashing", async ({ page }) => {
+    test.skip(!ESTIMATE_ID, `No estimate found in project ${PROJECT_ID}`);
     const path = `/projects/${PROJECT_ID}/estimates/${ESTIMATE_ID}`;
     const res = await page.goto(path, { waitUntil: "networkidle" });
 
@@ -26,6 +33,7 @@ test.describe("Estimate Editor", () => {
   });
 
   test("renders item approval status without errors", async ({ page }) => {
+    test.skip(!ESTIMATE_ID, `No estimate found in project ${PROJECT_ID}`);
     const path = `/projects/${PROJECT_ID}/estimates/${ESTIMATE_ID}`;
     await page.goto(path, { waitUntil: "networkidle" });
 
