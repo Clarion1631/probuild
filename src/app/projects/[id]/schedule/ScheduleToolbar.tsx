@@ -46,6 +46,8 @@ export default function ScheduleToolbar({
     const [newTaskStart, setNewTaskStart] = useState("");
     const [newTaskEnd, setNewTaskEnd] = useState("");
     const menuRef = useRef<HTMLDivElement>(null);
+    const moreBtnRef = useRef<HTMLButtonElement>(null);
+    const [moreMenuPos, setMoreMenuPos] = useState({ top: 0, right: 0 });
 
     useEffect(() => {
         if (!showMoreMenu) setExpandedSection(null);
@@ -201,7 +203,14 @@ export default function ScheduleToolbar({
                         {/* More menu */}
                         <div className="relative" ref={menuRef}>
                             <button
-                                onClick={() => setShowMoreMenu(!showMoreMenu)}
+                                ref={moreBtnRef}
+                                onClick={() => {
+                                    if (!showMoreMenu && moreBtnRef.current) {
+                                        const rect = moreBtnRef.current.getBoundingClientRect();
+                                        setMoreMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+                                    }
+                                    setShowMoreMenu(!showMoreMenu);
+                                }}
                                 className={`hui-btn hui-btn-secondary text-xs py-1.5 px-2 relative ${hasActiveFeature ? "ring-2 ring-indigo-300" : ""}`}
                                 title="More actions"
                             >
@@ -211,7 +220,7 @@ export default function ScheduleToolbar({
                                 )}
                             </button>
                             {showMoreMenu && (
-                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
+                                <div className="fixed bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in" style={{ top: moreMenuPos.top, right: moreMenuPos.right }}>
                                     {/* TOOLS section */}
                                     <div className="px-3 py-1.5 text-[10px] text-slate-400 uppercase font-semibold tracking-wider">Tools</div>
                                     <button
