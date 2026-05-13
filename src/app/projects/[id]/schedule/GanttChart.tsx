@@ -3,8 +3,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo, type Dispatch, type SetStateAction } from "react";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
-    importEstimateToSchedule, linkTasks, unlinkTasks, clearAllTasks,
-    aiGenerateSchedule,
+    linkTasks, unlinkTasks,
     addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
     assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
@@ -14,7 +13,7 @@ import { toast } from "sonner";
 import type { Task, ZoomLevel, EstimateSummary, EstimateItemSummary, TeamMember, Subcontractor, PunchItem, Comment } from "./schedule-types";
 import { STATUS_OPTIONS, STATUS_COLORS, PRESET_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency, computeCriticalPath } from "./schedule-utils";
 import TaskDetailPanel from "./TaskDetailPanel";
-import SchedulePublishButton from "./SchedulePublishButton";
+import ScheduleToolbar from "./ScheduleToolbar";
 
 const DRAG_THRESHOLD_PX = 5;
 
@@ -34,26 +33,18 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editName, setEditName] = useState("");
     const [colorPickerId, setColorPickerId] = useState<string | null>(null);
+    const [linkMode, setLinkMode] = useState<string | null>(null);
+    const [editingHoursId, setEditingHoursId] = useState<string | null>(null);
+    const [editHoursVal, setEditHoursVal] = useState("");
+    const [showCriticalPath, setShowCriticalPath] = useState(false);
+    const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
+    const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
     const [isAdding, setIsAdding] = useState(false);
     const [showNewTaskForm, setShowNewTaskForm] = useState(false);
     const [newTaskType, setNewTaskType] = useState<"task" | "milestone">("task");
     const [newTaskName, setNewTaskName] = useState("");
     const [newTaskStart, setNewTaskStart] = useState("");
     const [newTaskEnd, setNewTaskEnd] = useState("");
-    const [isImporting, setIsImporting] = useState(false);
-    const [showImportMenu, setShowImportMenu] = useState(false);
-    const [isAiGenerating, setIsAiGenerating] = useState(false);
-    const [showAiMenu, setShowAiMenu] = useState(false);
-    const [isAiRisk, setIsAiRisk] = useState(false);
-    const [showRiskPanel, setShowRiskPanel] = useState(false);
-    const [riskAnalysis, setRiskAnalysis] = useState<string | null>(null);
-    const [linkMode, setLinkMode] = useState<string | null>(null);
-    const [showMoreMenu, setShowMoreMenu] = useState(false);
-    const [editingHoursId, setEditingHoursId] = useState<string | null>(null);
-    const [editHoursVal, setEditHoursVal] = useState("");
-    const [showCriticalPath, setShowCriticalPath] = useState(false);
-    const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
-    const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
     // Detail panel state
     const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
     const [panelTab, setPanelTab] = useState<"details" | "punch" | "conversation">("details");
@@ -69,52 +60,6 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
 
     // Critical path computation
     const criticalPathIds = useMemo(() => computeCriticalPath(tasks), [tasks]);
-
-    // AI Schedule handler
-    async function handleAiSchedule(estimateId?: string) {
-        setIsAiGenerating(true);
-        setShowAiMenu(false);
-        try {
-            const created = await aiGenerateSchedule(projectId, estimateId);
-            const newTasks: Task[] = created.map((t: any) => ({
-                id: t.id, name: t.name,
-                startDate: new Date(t.startDate).toISOString().split("T")[0],
-                endDate: new Date(t.endDate).toISOString().split("T")[0],
-                color: t.color, progress: 0, status: t.status,
-                type: "task",
-                assignee: null, order: t.order,
-                estimatedHours: t.estimatedHours, actualHours: 0,
-                dependencies: [], dependents: [], assignments: [],
-                estimateItemId: null, estimateItem: null,
-            }));
-            setTasks(prev => [...prev, ...newTasks]);
-            toast.success(`AI generated ${newTasks.length} tasks`);
-        } catch (e: any) {
-            toast.error(e.message || "AI schedule generation failed");
-        } finally {
-            setIsAiGenerating(false);
-        }
-    }
-
-    // AI Risk Analysis handler
-    async function handleAiRisk() {
-        setIsAiRisk(true);
-        try {
-            const res = await fetch("/api/ai/schedule-risk", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ projectId, tasks }),
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || "Risk analysis failed");
-            setRiskAnalysis(data.analysis);
-            setShowRiskPanel(true);
-        } catch (e: any) {
-            toast.error(e.message || "Schedule risk analysis failed");
-        } finally {
-            setIsAiRisk(false);
-        }
-    }
 
     // Load detail data when task selected
     useEffect(() => {
@@ -394,15 +339,6 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
         toast.success("Estimate link removed");
     }
 
-    async function handleImportEstimate(estimateId: string) {
-        setIsImporting(true); setShowImportMenu(false);
-        try {
-            const newTasks = await importEstimateToSchedule(projectId, estimateId);
-            setTasks(prev => [...prev, ...newTasks.map((t: any) => ({ ...t, startDate: formatDate(new Date(t.startDate)), endDate: formatDate(new Date(t.endDate)), type: "task", actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: t.estimateItemId || null, estimateItem: null }))]);
-            toast.success(`Imported ${newTasks.length} tasks`);
-        } catch { toast.error("Import failed"); } finally { setIsImporting(false); }
-    }
-
     // --- Linking ---
     async function handleTaskClick(taskId: string) {
         if (!linkMode) return;
@@ -484,194 +420,53 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
     // --- EMPTY STATE ---
     if (tasks.length === 0) {
         return (
-            <div className="flex-1 flex flex-col items-center justify-center bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 gap-6 py-20">
-                {onViewModeChange && (
-                    <div className="flex items-center bg-slate-100 rounded-lg p-0.5">
-                        <button onClick={() => onViewModeChange("gantt")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Gantt</button>
-                        <button onClick={() => onViewModeChange("table")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Table</button>
-                        <button onClick={() => onViewModeChange("calendar")} className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-hui-textMain shadow-sm" : "text-hui-textMuted hover:text-hui-textMain"}`}>Calendar</button>
-                    </div>
-                )}
-                <div className="relative">
-                    <div className="w-20 h-20 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-100/50">
-                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="url(#grad)" strokeWidth="1.5">
-                            <defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stopColor="#6366f1"/><stop offset="100%" stopColor="#8b5cf6"/></linearGradient></defs>
-                            <rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4M8 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01" />
-                        </svg>
-                    </div>
-                    <div className="absolute -right-1 -top-1 w-6 h-6 bg-amber-400 rounded-full flex items-center justify-center shadow-md"><span className="text-[10px]">📋</span></div>
-                </div>
-                <div className="text-center">
-                    <h2 className="text-xl font-bold text-hui-textMain">Build your schedule</h2>
-                    <p className="text-sm text-hui-textMuted mt-2 max-w-md">Add tasks manually, import from an estimate, or let AI generate a smart schedule with dependencies.</p>
-                </div>
-                <div className="flex items-center gap-3 flex-wrap justify-center">
-                    <button onClick={() => openNewTaskForm("task")} className="hui-btn hui-btn-primary" disabled={isAdding}>+ Add First Task</button>
+            <div className="flex flex-col h-full">
+                <ScheduleToolbar
+                    projectId={projectId} tasks={tasks} setTasks={setTasks}
+                    estimates={estimates} initialPublished={initialPublished}
+                    viewMode={viewMode} onViewModeChange={onViewModeChange}
+                    showCriticalPath={showCriticalPath} onToggleCriticalPath={() => setShowCriticalPath(v => !v)}
+                    linkMode={linkMode} onToggleLinkMode={() => setLinkMode(linkMode ? null : "__awaiting__")}
+                />
+                <div className="flex-1 flex flex-col items-center justify-center bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 gap-6 py-20">
                     <div className="relative">
-                        <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
-                            className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
-                        >✨ {isAiGenerating ? "Generating..." : "AI Schedule"}</button>
-                        {showAiMenu && estimates.length > 0 && (
-                            <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] py-1 animate-in fade-in">
-                                <button onClick={() => handleAiSchedule()} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>🧠</span> General Schedule</button>
-                                {estimates.map(est => (
-                                    <button key={est.id} onClick={() => handleAiSchedule(est.id)} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>📋</span> {est.title}</button>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                    {estimates.length > 0 && (
-                        <div className="relative">
-                            <button onClick={() => setShowImportMenu(!showImportMenu)} disabled={isImporting} className="hui-btn hui-btn-secondary flex items-center gap-2">{isImporting ? "Importing..." : "📋 Import"}</button>
-                            {showImportMenu && (
-                                <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
-                                    {estimates.map(est => (
-                                        <button key={est.id} onClick={() => handleImportEstimate(est.id)} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm">{est.title}</button>
-                                    ))}
-                                </div>
-                            )}
+                        <div className="w-20 h-20 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-100/50">
+                            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="url(#grad)" strokeWidth="1.5">
+                                <defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stopColor="#6366f1"/><stop offset="100%" stopColor="#8b5cf6"/></linearGradient></defs>
+                                <rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4M8 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01" />
+                            </svg>
                         </div>
-                    )}
+                        <div className="absolute -right-1 -top-1 w-6 h-6 bg-amber-400 rounded-full flex items-center justify-center shadow-md"><span className="text-[10px]">📋</span></div>
+                    </div>
+                    <div className="text-center">
+                        <h2 className="text-xl font-bold text-hui-textMain">Build your schedule</h2>
+                        <p className="text-sm text-hui-textMuted mt-2 max-w-md">Add tasks manually, import from an estimate, or let AI generate a smart schedule. Use the toolbar above to get started.</p>
+                    </div>
                 </div>
             </div>
         );
     }
 
-    const completedCount = tasks.filter(t => t.status === "Complete").length;
-    const progressPct = tasks.length > 0 ? Math.round((completedCount / tasks.length) * 100) : 0;
 
     return (
         <div className="flex flex-col h-full">
-            {/* Toolbar */}
-            <div className="bg-white border-b border-hui-border shrink-0 z-20 relative">
-                <div className="h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500" />
-                <div className="px-6 py-3 flex items-center justify-between flex-wrap gap-2">
-                    <div className="flex items-center gap-4">
-                        <div>
-                            <h1 className="text-lg font-bold text-hui-textMain">Schedule</h1>
-                            <div className="flex items-center gap-3 mt-0.5">
-                                <span className="text-xs text-hui-textMuted">{tasks.length} task{tasks.length !== 1 ? "s" : ""}</span>
-                                <span className="text-xs text-hui-textMuted">·</span>
-                                <span className="text-xs text-green-600 font-medium">{completedCount} done</span>
-                                <div className="w-16 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                                    <div className="h-full bg-gradient-to-r from-green-400 to-emerald-500 rounded-full transition-all" style={{ width: `${progressPct}%` }} />
-                                </div>
-                                <span className="text-[10px] text-slate-400 font-medium">{progressPct}%</span>
-                            </div>
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                        {onViewModeChange && (
-                            <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                                <button onClick={() => onViewModeChange("gantt")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="6" y="10" width="12" height="4" rx="1"/><rect x="3" y="16" width="15" height="4" rx="1"/></svg>
-                                    Gantt
-                                </button>
-                                <button onClick={() => onViewModeChange("table")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "table" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M9 6v12"/></svg>
-                                    Table
-                                </button>
-                                <button onClick={() => onViewModeChange("calendar")} className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline mr-1"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-                                    Calendar
-                                </button>
-                            </div>
-                        )}
+            <ScheduleToolbar
+                projectId={projectId} tasks={tasks} setTasks={setTasks}
+                estimates={estimates} initialPublished={initialPublished}
+                viewMode={viewMode} onViewModeChange={onViewModeChange}
+                showCriticalPath={showCriticalPath} onToggleCriticalPath={() => setShowCriticalPath(v => !v)}
+                linkMode={linkMode} onToggleLinkMode={() => setLinkMode(linkMode ? null : "__awaiting__")}
+                viewControls={
+                    <>
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                             {(["day", "week", "month"] as ZoomLevel[]).map(z => (
                                 <button key={z} onClick={() => setZoom(z)} className={`px-3 py-1.5 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>{z}</button>
                             ))}
                         </div>
                         <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 300); }} className="hui-btn hui-btn-secondary text-xs py-1.5 px-3">Today</button>
-                        <button onClick={() => openNewTaskForm("task")} disabled={isAdding} className="hui-btn hui-btn-primary text-xs">+ Task</button>
-                        <button onClick={() => openNewTaskForm("milestone")} disabled={isAdding} className="hui-btn hui-btn-secondary text-xs flex items-center gap-1">
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
-                            Milestone
-                        </button>
-                        {/* Critical Path toggle */}
-                        <button
-                            onClick={() => setShowCriticalPath(v => !v)}
-                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${showCriticalPath ? "bg-red-50 text-red-700 border-red-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
-                            title="Highlight critical path"
-                        >
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                            Critical Path
-                        </button>
-                        {/* Link Tasks toggle */}
-                        <button
-                            onClick={() => setLinkMode(linkMode ? null : "__awaiting__")}
-                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${linkMode ? "bg-amber-100 text-amber-800 border-amber-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}
-                            title={linkMode ? "Cancel linking" : "Click two tasks to create a Finish-to-Start dependency"}
-                        >
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                            {linkMode ? "Cancel Link" : "Link Tasks"}
-                        </button>
-                        <button
-                            onClick={handleAiRisk}
-                            disabled={isAiRisk || tasks.length === 0}
-                            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiRisk ? "bg-amber-500 text-white border-amber-600 animate-pulse" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
-                            title="AI schedule risk analysis"
-                        >
-                            ⚠️ {isAiRisk ? "Analyzing…" : "AI Risk"}
-                        </button>
-                        <SchedulePublishButton projectId={projectId} initialPublished={initialPublished} />
-                        <button
-                            onClick={() => {
-                                if (tasks.length === 0) { toast.error("No tasks to sync"); return; }
-                                const a = document.createElement("a");
-                                a.href = `/api/calendar/sync?projectId=${projectId}`;
-                                a.download = "schedule.ics";
-                                a.click();
-                                toast.success("Calendar file downloaded — import into Google Calendar, Apple Calendar, or Outlook");
-                            }}
-                            disabled={tasks.length === 0}
-                            className="text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 disabled:opacity-40"
-                            title="Download .ics file to sync with your calendar"
-                        >
-                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-                            Sync to Calendar
-                        </button>
-                        <div className="relative">
-                            <button onClick={() => estimates.length > 0 ? setShowAiMenu(!showAiMenu) : handleAiSchedule()} disabled={isAiGenerating}
-                                className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiGenerating ? "bg-gradient-to-r from-purple-500 to-indigo-500 text-white border-purple-600 animate-pulse" : "bg-gradient-to-r from-purple-50 to-indigo-50 text-purple-700 border-purple-200 hover:shadow-md hover:from-purple-100 hover:to-indigo-100"}`}>
-                                ✨ {isAiGenerating ? "AI thinking..." : "AI Schedule"}
-                            </button>
-                            {showAiMenu && estimates.length > 0 && (
-                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] py-1 animate-in fade-in">
-                                    <button onClick={() => handleAiSchedule()} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>🧠</span> General Schedule</button>
-                                    {estimates.map(est => (
-                                        <button key={est.id} onClick={() => handleAiSchedule(est.id)} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>📋</span> {est.title}</button>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                        {/* More menu */}
-                        <div className="relative">
-                            <button onClick={() => setShowMoreMenu(!showMoreMenu)} className="hui-btn hui-btn-secondary text-xs py-1.5 px-2">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
-                            </button>
-                            {showMoreMenu && (
-                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[200px] py-1 animate-in fade-in">
-                                    {estimates.length > 0 && (
-                                        <>
-                                            <div className="px-3 py-1 text-[10px] text-slate-400 uppercase font-semibold">Import from Estimate</div>
-                                            {estimates.map(est => (
-                                                <button key={est.id} onClick={() => { handleImportEstimate(est.id); setShowMoreMenu(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
-                                                    📋 {est.title}
-                                                </button>
-                                            ))}
-                                            <div className="border-t border-slate-100 my-1" />
-                                        </>
-                                    )}
-                                    <button onClick={async () => { if (confirm('Delete ALL tasks from this schedule? This cannot be undone.')) { setShowMoreMenu(false); await clearAllTasks(projectId); setTasks([]); setSelectedTaskId(null); toast.success('Schedule cleared'); } }} className="w-full text-left px-3 py-2 hover:bg-red-50 transition text-sm flex items-center gap-2 text-red-600">
-                                        🗑️ Clear All Tasks
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                </div>
-            </div>
+                    </>
+                }
+            />
 
             {linkMode && (
                 <div className="bg-amber-50 border-b border-amber-200 px-6 py-2 flex items-center gap-3 text-xs text-amber-800">
@@ -969,31 +764,6 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                 );
             })()}
 
-            {/* AI Risk Analysis panel */}
-            {showRiskPanel && riskAnalysis && (
-                <div className="fixed inset-0 z-[200] flex items-center justify-center">
-                    <div className="fixed inset-0 bg-black/40" onClick={() => setShowRiskPanel(false)} />
-                    <div className="relative bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col">
-                        <div className="flex items-center justify-between p-5 border-b border-hui-border">
-                            <div className="flex items-center gap-2">
-                                <span className="text-xl">⚠️</span>
-                                <h2 className="font-bold text-hui-textMain text-lg">Schedule Risk Analysis</h2>
-                            </div>
-                            <button onClick={() => setShowRiskPanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
-                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                            </button>
-                        </div>
-                        <div className="p-5 overflow-y-auto flex-1">
-                            <div className="prose prose-sm max-w-none text-hui-textMain whitespace-pre-wrap text-sm leading-relaxed">
-                                {riskAnalysis}
-                            </div>
-                        </div>
-                        <div className="p-4 border-t border-hui-border">
-                            <button onClick={() => setShowRiskPanel(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
-                        </div>
-                    </div>
-                </div>
-            )}
         </div>
     );
 }
