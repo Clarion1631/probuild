@@ -47,6 +47,8 @@ export default function ScheduleView({ initialTasks, ...rest }: ScheduleViewProp
                 projectId={rest.projectId}
                 tasks={tasks}
                 setTasks={setTasks}
+                estimates={rest.estimates}
+                initialPublished={rest.initialPublished}
                 viewMode={viewMode}
                 onViewModeChange={changeViewMode}
                 subMode={calendarSubMode}
