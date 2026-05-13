@@ -59,8 +59,8 @@ function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: bo
     const [pos, setPos] = useState({ top: 0, right: 0 });
     return (
         <div className="relative">
-            <div className="flex items-center">
-                <button onClick={onAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-xs rounded-r-none">+ Task</button>
+            <div className="inline-flex items-center rounded-md shadow-sm">
+                <button onClick={onAddTask} disabled={isAdding} className="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 transition-colors rounded-l-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-900 focus:z-10">+ Task</button>
                 <button
                     ref={btnRef}
                     onClick={() => {
@@ -71,7 +71,7 @@ function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: bo
                         setOpen(v => !v);
                     }}
                     disabled={isAdding}
-                    className="hui-btn hui-btn-primary text-xs rounded-l-none border-l border-indigo-400/40 px-2"
+                    className="inline-flex items-center justify-center px-2 py-1.5 text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 transition-colors rounded-r-md border-l border-indigo-400/40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-900 focus:z-10"
                 >
                     <svg width="8" height="8" viewBox="0 0 12 12" fill="currentColor"><path d="M6 8.5L1.5 4h9z"/></svg>
                 </button>
@@ -116,7 +116,7 @@ export default function ScheduleToolbar({
         <>
             <div className="bg-white border-b border-hui-border shrink-0 z-20 relative">
                 <div className="h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500" />
-                <div className="px-6 py-3 flex items-center gap-2">
+                <div className="px-6 py-3 flex items-center gap-2 flex-wrap">
                     {/* Left: title + stats */}
                     <div className="shrink-0">
                         <h1 className="text-lg font-bold text-hui-textMain">Schedule</h1>
