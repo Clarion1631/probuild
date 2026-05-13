@@ -53,6 +53,48 @@ const VIEW_ICONS: Record<ViewMode, ReactNode> = {
     calendar: <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>,
 };
 
+function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: boolean; onAddTask: () => void; onAddMilestone: () => void }) {
+    const [open, setOpen] = useState(false);
+    const btnRef = useRef<HTMLButtonElement>(null);
+    const [pos, setPos] = useState({ top: 0, right: 0 });
+    return (
+        <div className="relative">
+            <div className="flex items-center">
+                <button onClick={onAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-xs rounded-r-none">+ Task</button>
+                <button
+                    ref={btnRef}
+                    onClick={() => {
+                        if (!open && btnRef.current) {
+                            const rect = btnRef.current.getBoundingClientRect();
+                            setPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+                        }
+                        setOpen(v => !v);
+                    }}
+                    disabled={isAdding}
+                    className="hui-btn hui-btn-primary text-xs rounded-l-none border-l border-indigo-400/40 px-2"
+                >
+                    <svg width="8" height="8" viewBox="0 0 12 12" fill="currentColor"><path d="M6 8.5L1.5 4h9z"/></svg>
+                </button>
+            </div>
+            {open && (
+                <>
+                    <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+                    <div className="fixed bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[160px] py-1 animate-in fade-in" style={{ top: pos.top, right: pos.right }}>
+                        <button onClick={() => { onAddTask(); setOpen(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                            Task
+                        </button>
+                        <button onClick={() => { onAddMilestone(); setOpen(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1L10 6L15 8L10 10L8 15L6 10L1 8L6 6Z"/></svg>
+                            Milestone
+                        </button>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
 export default function ScheduleToolbar({
     projectId, initialPublished, taskCount, completedCount, filteredCount, estimates,
     viewMode, onViewModeChange,
@@ -75,7 +117,7 @@ export default function ScheduleToolbar({
             <div className="bg-white border-b border-hui-border shrink-0 z-20 relative">
                 <div className="h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500" />
                 <div className="px-6 py-3 flex items-center justify-between flex-wrap gap-2">
-                    {/* Left: title + stats */}
+                    {/* Left: title + stats + view toggle */}
                     <div className="flex items-center gap-4">
                         <div>
                             <h1 className="text-lg font-bold text-hui-textMain">Schedule</h1>
@@ -93,11 +135,6 @@ export default function ScheduleToolbar({
                                 <span className="text-[10px] text-slate-400 font-medium">{progressPct}%</span>
                             </div>
                         </div>
-                    </div>
-
-                    {/* Right: controls */}
-                    <div className="flex items-center gap-2 flex-wrap">
-                        {/* View toggle */}
                         {onViewModeChange && (
                             <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                                 {(["gantt", "table", "calendar"] as ViewMode[]).map(m => (
@@ -108,7 +145,10 @@ export default function ScheduleToolbar({
                                 ))}
                             </div>
                         )}
+                    </div>
 
+                    {/* Right: controls */}
+                    <div className="flex items-center gap-2 flex-wrap">
                         {/* Zoom (Gantt only) */}
                         {onZoomChange && zoom && (
                             <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
@@ -145,15 +185,8 @@ export default function ScheduleToolbar({
                         {/* Published toggle */}
                         <SchedulePublishButton projectId={projectId} initialPublished={initialPublished} />
 
-                        {/* + Task dropdown */}
-                        <div className="relative group">
-                            <div className="flex items-center">
-                                <button onClick={onAddTask} disabled={isAdding} className="hui-btn hui-btn-primary text-xs rounded-r-none">+ Task</button>
-                                <button onClick={onAddMilestone} disabled={isAdding} className="hui-btn hui-btn-primary text-xs rounded-l-none border-l border-indigo-400/40 px-1.5" title="Add Milestone">
-                                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0L10.5 5.5L16 8L10.5 10.5L8 16L5.5 10.5L0 8L5.5 5.5Z"/></svg>
-                                </button>
-                            </div>
-                        </div>
+                        {/* + Task with dropdown */}
+                        <AddTaskDropdown isAdding={isAdding} onAddTask={onAddTask} onAddMilestone={onAddMilestone} />
 
                         {/* Tools overflow menu */}
                         <div className="relative">
