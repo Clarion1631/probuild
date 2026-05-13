@@ -2872,8 +2872,18 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     amount={recordingEstPayment.amount}
                     onClose={() => setRecordingEstPayment(null)}
                     onSubmit={async (input) => {
-                        const result = await recordEstimatePayment(recordingEstPayment.id, initialEstimate.id, input);
-                        if (result.success) router.refresh();
+                        const result = await recordEstimatePayment(recordingEstPayment.id, initialEstimate.id, {
+                            ...input,
+                            amount: recordingEstPayment.amount,
+                        });
+                        if (result.success) {
+                            setPaymentSchedules(prev => prev.map(s =>
+                                s.id === recordingEstPayment.id
+                                    ? { ...s, status: "Paid", amount: String(recordingEstPayment.amount), paymentMethod: input.method, referenceNumber: input.referenceNumber || null, paymentDate: input.paymentDate, paidAt: new Date().toISOString(), notes: input.notes || null }
+                                    : s
+                            ));
+                            router.refresh();
+                        }
                         return { success: result.success, error: (result as any).error };
                     }}
                 />
@@ -2902,6 +2912,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             try {
                                 const res = await unrecordEstimatePayment(undoPaymentTarget.id, initialEstimate.id);
                                 if (!res?.success) { toast.error("Nothing to unrecord"); return; }
+                                setPaymentSchedules(prev => prev.map(s =>
+                                    s.id === undoPaymentTarget.id
+                                        ? { ...s, status: "Pending", paymentMethod: null, referenceNumber: null, paymentDate: null, paidAt: null, notes: null }
+                                        : s
+                                ));
                                 toast("Payment unrecorded");
                                 setUndoPaymentTarget(null);
                                 router.refresh();
