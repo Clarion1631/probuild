@@ -32,6 +32,14 @@ export type Task = {
     baselineEndDate?: string | null;
 };
 
+export type TimeEntryDetail = {
+    id: string;
+    startTime: string;
+    durationHours: number | null;
+    user: { id: string; name: string | null; email: string };
+    costCode: { id: string; code: string; name: string } | null;
+};
+
 export type ZoomLevel = "day" | "week" | "month";
 
 export type SortKey = "manual" | "name" | "type" | "startDate" | "endDate" | "duration" | "status" | "progress" | "estimatedHours" | "actualHours";
