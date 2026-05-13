@@ -4345,17 +4345,23 @@ export async function getScheduleTasks(projectId: string) {
             timeEntries: { select: { durationHours: true } },
             assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
             subAssignments: { include: { subcontractor: true } },
-            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true } },
+            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
         },
     });
 }
 
 export async function getEstimateItemsForProject(projectId: string) {
-    return prisma.estimateItem.findMany({
+    const items = await prisma.estimateItem.findMany({
         where: { estimate: { projectId }, type: { not: "Section" } },
         orderBy: { order: "asc" },
-        select: { id: true, name: true, type: true, total: true, estimateId: true, parentId: true, parent: { select: { name: true } } },
+        select: { id: true, name: true, type: true, total: true, estimateId: true, parentId: true, parent: { select: { name: true } }, quantity: true, budgetUnit: true, scheduleTask: { select: { id: true, name: true } } },
     });
+    return items.map(({ scheduleTask, ...rest }) => ({
+        ...rest,
+        total: Number(rest.total),
+        linkedTaskId: scheduleTask?.id ?? null,
+        linkedTaskName: scheduleTask?.name ?? null,
+    }));
 }
 
 export async function getScheduleTasksForSub(projectId: string, subcontractorId: string) {
@@ -4371,7 +4377,7 @@ export async function getScheduleTasksForSub(projectId: string, subcontractorId:
             timeEntries: { select: { durationHours: true } },
             assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
             subAssignments: { include: { subcontractor: true } },
-            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true } },
+            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
         },
     });
 }
@@ -4468,7 +4474,23 @@ export async function updateScheduleTask(taskId: string, data: {
     if (data.order !== undefined) updateData.order = data.order;
     if (data.estimatedHours !== undefined) updateData.estimatedHours = data.estimatedHours;
     if (data.type !== undefined) updateData.type = data.type;
-    if (data.estimateItemId !== undefined) updateData.estimateItemId = data.estimateItemId;
+    if (data.estimateItemId !== undefined) {
+        updateData.estimateItemId = data.estimateItemId;
+        if (data.estimateItemId) {
+            const existing = await prisma.scheduleTask.findFirst({
+                where: { estimateItemId: data.estimateItemId, id: { not: taskId } },
+                select: { id: true, name: true },
+            });
+            if (existing) throw new Error(`Already linked to "${existing.name}"`);
+            const item = await prisma.estimateItem.findUnique({
+                where: { id: data.estimateItemId },
+                select: { type: true, quantity: true, budgetUnit: true },
+            });
+            if (item && (item.type === "Labor" || item.budgetUnit === "hours")) {
+                updateData.estimatedHours = item.quantity || null;
+            }
+        }
+    }
     // Milestones always have same start and end date
     if (data.type === "milestone" && updateData.startDate) {
         updateData.endDate = updateData.startDate;
@@ -4581,6 +4603,9 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
         const endDate = new Date(today.getTime() + (dayOffset + duration) * 86400000);
         dayOffset += Math.ceil(duration * 0.7);
 
+        const alreadyLinked = await prisma.scheduleTask.findFirst({
+            where: { estimateItemId: item.id }, select: { id: true },
+        });
         const task = await prisma.scheduleTask.create({
             data: {
                 projectId,
@@ -4591,7 +4616,7 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
                 order: order++,
                 status: "Not Started",
                 estimatedHours,
-                estimateItemId: item.id,
+                estimateItemId: alreadyLinked ? null : item.id,
             },
         });
         created.push(task);

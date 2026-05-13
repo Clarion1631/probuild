@@ -376,7 +376,7 @@ model EstimateItem {
   budgetUnit       String?
   budgetRate       Decimal?
   timeEntries    TimeEntry[]
-  scheduleTasks  ScheduleTask[]
+  scheduleTask   ScheduleTask?
   createdAt      DateTime       @default(now())
 
   @@index([estimateId])
@@ -688,7 +688,7 @@ model ScheduleTask {
   order          Int            @default(0)
   status         String         @default("Not Started")
   type           String         @default("task") // "task" | "milestone"
-  estimateItemId String?
+  estimateItemId String?        @unique
   estimateItem   EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
