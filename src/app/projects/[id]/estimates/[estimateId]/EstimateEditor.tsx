@@ -548,9 +548,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
-    async function handleSave() {
+    async function handleSave({ silent = false } = {}) {
         captureHistory(new Date().toLocaleString());
-        setIsSaving(true);
+        if (!silent) setIsSaving(true);
         // Recompute section header totals from children before saving
         const childTotals = new Map<string, number>();
         for (const item of items) {
@@ -582,8 +582,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             taxRateName: taxExempt ? null : (activeTax?.name || null),
             taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
         }, mappedItems);
-        setIsSaving(false);
-        toast.success("Estimate saved successfully");
+        if (!silent) {
+            setIsSaving(false);
+            toast.success("Estimate saved successfully");
+        }
         router.refresh();
     }
 
@@ -1401,7 +1403,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         {initialEstimate.sentAt ? "Resend" : "Send"}
                     </button>
                     <button
-                        onClick={handleSave}
+                        onClick={() => handleSave()}
                         disabled={isSaving}
                         className="hui-btn hui-btn-primary disabled:opacity-50"
                     >
@@ -2872,6 +2874,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     amount={recordingEstPayment.amount}
                     onClose={() => setRecordingEstPayment(null)}
                     onSubmit={async (input) => {
+                        await handleSave({ silent: true });
                         const result = await recordEstimatePayment(recordingEstPayment.id, initialEstimate.id, {
                             ...input,
                             amount: recordingEstPayment.amount,
