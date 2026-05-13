@@ -7,7 +7,6 @@ import type { Task, PunchItem } from "./schedule-types";
 import {
     STATUS_OPTIONS,
     STATUS_COLORS,
-    PRESET_COLORS,
     addDays,
     formatDate,
     getDaysBetween,
@@ -19,6 +18,7 @@ import {
     parseUTCDate,
     todayUTC,
 } from "./schedule-utils";
+import ColorPicker from "./ColorPicker";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
     addTaskPunchItem, togglePunchItem, deletePunchItem, getTaskPunchItems,
@@ -93,7 +93,7 @@ export default function CalendarView({ projectId, tasks, setTasks, viewMode, onV
                 name,
                 startDate: dateStr,
                 endDate: dateStr,
-                color: PRESET_COLORS[0],
+                color: "",
                 status: "Not Started",
             });
             setQuickAdd(null);
@@ -489,6 +489,7 @@ function QuickEditPopover({
     const [nameDraft, setNameDraft] = useState(task.name);
     useEffect(() => { setNameDraft(task.name); }, [task.id, task.name]);
 
+    const [showColorPicker, setShowColorPicker] = useState(false);
     const [punchItems, setPunchItems] = useState<PunchItem[]>([]);
     const [punchLoading, setPunchLoading] = useState(true);
     const [newPunch, setNewPunch] = useState("");
@@ -604,16 +605,22 @@ function QuickEditPopover({
                 </div>
                 <div className="flex items-center gap-2">
                     <label className="text-slate-500 w-16">Color</label>
-                    <div className="flex items-center gap-1.5">
-                        {PRESET_COLORS.map(c => (
-                            <button
-                                key={c}
-                                onClick={() => onPatch({ color: c })}
-                                aria-label={`Color ${c}`}
-                                className={`w-5 h-5 rounded-full border ${task.color === c ? "ring-2 ring-offset-1 ring-indigo-400 border-white" : "border-slate-200"}`}
-                                style={{ backgroundColor: c }}
+                    <div className="relative">
+                        <button
+                            type="button"
+                            onClick={() => setShowColorPicker(v => !v)}
+                            className={`w-5 h-5 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"} hover:scale-110 transition`}
+                            style={{ backgroundColor: task.color }}
+                            aria-label="Change color"
+                        />
+                        {showColorPicker && (
+                            <ColorPicker
+                                selected={task.color}
+                                onPick={c => { onPatch({ color: c }); setShowColorPicker(false); }}
+                                onClose={() => setShowColorPicker(false)}
+                                className="absolute left-0 top-7 z-50 min-w-[200px]"
                             />
-                        ))}
+                        )}
                     </div>
                 </div>
             </div>

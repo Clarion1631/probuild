@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
 import DependencyPicker from "./DependencyPicker";
+import ColorPicker from "./ColorPicker";
 
 const ESTIMATE_LINK_STOPWORDS = new Set(["and", "or", "the", "a", "to", "of", "with", "for", "in", "on", "at", "&"]);
 function tokenizeForMatch(s: string): string[] {
@@ -19,6 +20,7 @@ export type TaskDetailPanelProps = {
     onNameChange: (taskId: string, name: string) => void;
     onDateChange: (taskId: string, field: "startDate" | "endDate", value: string) => void;
     onEstimatedHoursChange: (taskId: string, hours: number) => void;
+    onColorChange: (taskId: string, color: string) => void;
     onDelete: (taskId: string) => void;
     estimateItems: EstimateItemSummary[];
     onLinkEstimateItem: (taskId: string, item: EstimateItemSummary) => void;
@@ -48,7 +50,7 @@ export type TaskDetailPanelProps = {
 
 export default function TaskDetailPanel({
     task, onClose, panelTab, setPanelTab,
-    onStatusChange, onNameChange, onDateChange, onEstimatedHoursChange, onDelete,
+    onStatusChange, onNameChange, onDateChange, onEstimatedHoursChange, onColorChange, onDelete,
     estimateItems, onLinkEstimateItem, onUnlinkEstimateItem, onFetchEstimateItems,
     teamMembers, subcontractors, onAssign, onUnassign, onAssignSub, onUnassignSub,
     punchItems, onAddPunch, onTogglePunch, onDeletePunch, onAiPunchlist, isAiPunching,
@@ -60,6 +62,7 @@ export default function TaskDetailPanel({
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
     const [estimateQuery, setEstimateQuery] = useState("");
     const [showPredecessorMenu, setShowPredecessorMenu] = useState(false);
+    const [showColorPicker, setShowColorPicker] = useState(false);
     const [newPunchName, setNewPunchName] = useState("");
     const [newComment, setNewComment] = useState("");
     const [nameDraft, setNameDraft] = useState(task.name);
@@ -104,9 +107,33 @@ export default function TaskDetailPanel({
             {/* Panel Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-hui-border bg-slate-50">
                 <div className="flex items-center gap-2 flex-1 min-w-0">
-                    {task.type === "milestone" && (
-                        <div className="w-3 h-3 rotate-45 shrink-0" style={{ backgroundColor: task.color }} />
-                    )}
+                    <div className="relative shrink-0">
+                        <button
+                            type="button"
+                            onClick={() => setShowColorPicker(v => !v)}
+                            title="Change color"
+                            className="block hover:scale-110 transition"
+                            aria-label="Change task color"
+                        >
+                            {(() => {
+                                const isWhite = task.color?.toLowerCase() === "#ffffff";
+                                const ringClass = isWhite ? "ring-slate-500" : "ring-slate-300";
+                                return task.type === "milestone" ? (
+                                    <div className={`w-3.5 h-3.5 rotate-45 border border-white shadow-sm ring-1 ${ringClass}`} style={{ backgroundColor: task.color }} />
+                                ) : (
+                                    <div className={`w-3.5 h-3.5 rounded-full border border-white shadow-sm ring-1 ${ringClass}`} style={{ backgroundColor: task.color }} />
+                                );
+                            })()}
+                        </button>
+                        {showColorPicker && (
+                            <ColorPicker
+                                selected={task.color}
+                                onPick={c => { onColorChange(task.id, c); setShowColorPicker(false); }}
+                                onClose={() => setShowColorPicker(false)}
+                                className="absolute left-0 top-6 z-50 min-w-[200px]"
+                            />
+                        )}
+                    </div>
                     <h3 className="text-sm font-bold text-hui-textMain truncate">{task.name}</h3>
                 </div>
                 <button onClick={onClose} className="text-slate-400 hover:text-slate-700 p-1 rounded-md hover:bg-slate-100 transition">
