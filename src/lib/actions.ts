@@ -782,11 +782,31 @@ export async function getProjects() {
         client: p.client || { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" }
     }))));
 }
-
 export const getProject = cache(async function getProject(id: string) {
     const include = {
         client: true,
-        estimates: safeEstimateInclude,
+        estimates: {
+            select: {
+                id: true,
+                number: true,
+                title: true,
+                projectId: true,
+                leadId: true,
+                code: true,
+                status: true,
+                privacy: true,
+                createdAt: true,
+                totalAmount: true,
+                balanceDue: true,
+                approvedBy: true,
+                approvedAt: true,
+                approvalIp: true,
+                approvalUserAgent: true,
+                signatureUrl: true,
+                contractId: true,
+                viewedAt: true,
+            }
+        },
     } as const;
 
     // Support both CUID and friendly numeric ID in URL params
