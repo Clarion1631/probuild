@@ -235,29 +235,16 @@ function SelectedPanel({
             {category === "cabinet" && <CabinetConfigurator placed={placed} />}
             {category === "appliance" && <ApplianceProperties placed={placed} />}
             {category === "fixture" && <FixtureProperties placed={placed} />}
-            {(category === "window" || category === "door") && (
-                <div className="rounded-md border border-dashed border-slate-200 p-2 text-xs text-slate-500">
-                    No finish options for {category}s yet.
-                </div>
-            )}
 
-            {/* Replace (Stage 3 stub) + Delete */}
-            <div className="flex gap-2 pt-1">
-                <button
-                    type="button"
-                    disabled
-                    title="Coming in Stage 3"
-                    className="hui-btn flex-1 border-slate-200 bg-slate-50 text-xs font-medium text-slate-400"
-                >
-                    Replace
-                </button>
+            {/* Action buttons */}
+            <div className="pt-1">
                 <button
                     type="button"
                     onClick={onDelete}
                     disabled={locked}
-                    className="hui-btn flex-1 border-red-200 bg-red-50 text-xs font-medium text-red-700 hover:border-red-300 hover:bg-red-100 disabled:opacity-40"
+                    className="hui-btn w-full border-red-200 bg-red-50 text-xs font-semibold text-red-700 hover:border-red-300 hover:bg-red-100 disabled:opacity-40 transition-colors"
                 >
-                    Delete
+                    Delete Selected Item
                 </button>
             </div>
         </div>

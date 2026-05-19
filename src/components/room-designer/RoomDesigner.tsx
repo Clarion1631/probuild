@@ -16,9 +16,7 @@ import { RoomCanvas } from "./canvas/RoomCanvas";
 import { RoomToolbar } from "./RoomToolbar";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { LayersPanel } from "./LayersPanel";
-import { AlignmentToolbar } from "./AlignmentToolbar";
-import { MeasurementInputBar } from "./MeasurementInputBar";
-import { ViewPresetToolbar } from "./ViewPresetToolbar";
+import { UnifiedCadToolbar } from "./UnifiedCadToolbar";
 import { AssetContextMenu } from "./AssetContextMenu";
 import { OnboardingCoach } from "./OnboardingCoach";
 import { ShortcutLegend } from "./ShortcutLegend";
@@ -39,6 +37,8 @@ interface RoomDesignerProps {
 
 export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareState }: RoomDesignerProps) {
     const loadSnapshot = useRoomStore((s) => s.loadSnapshot);
+    const showLayers = useRoomStore((s) => s.showLayers);
+    const showProperties = useRoomStore((s) => s.showProperties);
 
     // Hydrate the store once on mount — re-run only when the roomId changes.
     useEffect(() => {
@@ -72,17 +72,15 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
                 initialShareState={initialShareState}
             />
             <div className="flex min-h-0 flex-1">
-                <LayersPanel />
+                {showLayers && <LayersPanel />}
                 <div className="relative flex-1 bg-slate-200">
                     <div className="absolute inset-0">
                         <RoomCanvas />
                     </div>
-                    {/* DOM overlays — pointer-events-auto only on their own surfaces */}
-                    <ViewPresetToolbar />
-                    <AlignmentToolbar />
-                    <MeasurementInputBar />
+                    {/* Unified Floating CAD Bar Overlay */}
+                    <UnifiedCadToolbar />
                 </div>
-                <PropertiesPanel />
+                {showProperties && <PropertiesPanel />}
             </div>
             {/* Portals to document.body — outside the flex tree. */}
             <AssetContextMenu />

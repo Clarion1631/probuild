@@ -79,6 +79,11 @@ export function useAssetSelection() {
                 store.setShowLayers(!store.showLayers);
                 return;
             }
+            if (e.key === "p" || e.key === "P") {
+                e.preventDefault();
+                store.setShowProperties(!store.showProperties);
+                return;
+            }
             if (e.key === "m" || e.key === "M") {
                 e.preventDefault();
                 store.setShowMeasurements(!store.showMeasurements);

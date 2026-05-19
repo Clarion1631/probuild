@@ -68,6 +68,7 @@ export interface RoomStoreState {
 
     // Stage 3: panel visibility (L / M keys).
     showLayers: boolean;
+    showProperties: boolean;
     showMeasurements: boolean;
 
     // Stage 3: camera preset ("orbit" = free-look 3D; presets animate on change).
@@ -138,6 +139,7 @@ export interface RoomStoreState {
     openContextMenu: (id: string, x: number, y: number) => void;
     closeContextMenu: () => void;
     setShowLayers: (v: boolean) => void;
+    setShowProperties: (v: boolean) => void;
     setShowMeasurements: (v: boolean) => void;
     setCameraPreset: (p: CameraPreset | "orbit") => void;
 
@@ -206,6 +208,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
     toolMode: "translate",
     contextMenu: null,
     showLayers: false,
+    showProperties: true,
     showMeasurements: false,
     cameraPreset: "orbit",
 
@@ -432,6 +435,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
     openContextMenu: (id, x, y) => set({ contextMenu: { id, x, y } }),
     closeContextMenu: () => set({ contextMenu: null }),
     setShowLayers: (showLayers) => set({ showLayers }),
+    setShowProperties: (showProperties) => set({ showProperties }),
     setShowMeasurements: (showMeasurements) => set({ showMeasurements }),
     setCameraPreset: (cameraPreset) => set({ cameraPreset }),
 

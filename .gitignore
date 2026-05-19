@@ -97,3 +97,5 @@ scripts/.template-backup-*.json
 *.sqlite
 *.log
 
+
+.env.vercel
