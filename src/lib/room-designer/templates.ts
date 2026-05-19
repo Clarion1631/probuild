@@ -167,7 +167,9 @@ function buildLayoutFromFt(widthFt: number, lengthFt: number, heightFt = 8): Roo
             },
         ],
         camera: { position: [W, H * 1.5, L], target: [0, H / 2, 0] },
-        surfaces: { floor: null, ceiling: null },
+        // Default new-room floor: dark walnut. Existing rooms keep their
+        // saved surface — only freshly-built layouts pick this up.
+        surfaces: { floor: "hardwood-walnut-dark", ceiling: null },
     };
 }
 

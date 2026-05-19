@@ -166,6 +166,8 @@ export function buildDefaultLayout(): RoomLayout {
             { id: "wall-w", start: { x: -halfW, z: halfL }, end: { x: -halfW, z: -halfL }, height: H, thickness, surface: "wall-west" },
         ],
         camera: { position: [W, H * 1.5, L], target: [0, H / 2, 0] },
-        surfaces: { floor: null, ceiling: null },
+        // Default new-room floor: dark walnut. Existing rooms keep their
+        // saved surface — only freshly-built layouts pick this up.
+        surfaces: { floor: "hardwood-walnut-dark", ceiling: null },
     };
 }
