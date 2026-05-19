@@ -1,12 +1,16 @@
-// Single asset tile in the left-sidebar grid. Shows a colored block (Stage 0
-// placeholder — Stage 1 swaps in thumbnailPath rendering), the asset name,
-// and a hover tooltip with imperial dimensions.
+// Single asset tile in the left-sidebar grid. Shows a thumbnail (or fallback
+// category icon while Stage 0 paths are null), a derived display SKU, the asset
+// name, and three W/H/D dimension pills. The drag-handle in the top-right is
+// purely decorative — clicking anywhere on the card starts placement — but it
+// stays visible on touch devices per the project's hover-none mandate.
 
 import type { Asset } from "@/lib/room-designer/asset-registry";
 import { CATEGORY_COLORS } from "@/lib/room-designer/asset-registry";
 import { isProxyAsset, useManifestReady } from "@/lib/room-designer/asset-manifest";
+import { deriveSku } from "@/lib/room-designer/sku";
+import { DimensionPill } from "./ui/DimensionPill";
 import type { AssetCategory } from "./types";
-import { Component } from "lucide-react";
+import { GripVertical } from "lucide-react";
 
 const CATEGORY_ICONS: Record<AssetCategory, string> = {
     cabinet: "▦",
@@ -45,13 +49,14 @@ export function AssetCard({ asset, active, onSelect }: AssetCardProps) {
     const wIn = getInchesInt(asset.dimensions.width);
     const hIn = getInchesInt(asset.dimensions.height);
     const dIn = getInchesInt(asset.dimensions.depth);
+    const sku = deriveSku(asset);
 
     return (
         <button
             type="button"
             onClick={() => onSelect(asset)}
             title={title}
-            className={`group relative flex flex-col items-stretch overflow-hidden rounded-xl border bg-white text-left transition-all hover:shadow-md ${
+            className={`group relative flex flex-col items-stretch overflow-hidden rounded-xl border bg-white text-left transition-all hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-[#531b7e] focus-visible:ring-offset-1 ${
                 active
                     ? "border-[#531b7e] ring-1 ring-[#531b7e] shadow-md"
                     : "border-slate-100 hover:border-purple-200"
@@ -75,27 +80,32 @@ export function AssetCard({ asset, active, onSelect }: AssetCardProps) {
                         {CATEGORY_ICONS[asset.category]}
                     </div>
                 )}
-                {/* Top right icon */}
-                <div className="absolute right-2 top-2 text-[#7c3aed]/40">
-                    <Component className="h-4 w-4" />
-                </div>
+                {/* Drag-handle affordance. Visible on hover for pointer devices;
+                  * always visible on touch devices (CLAUDE.md hover-none rule). */}
+                <span
+                    aria-hidden
+                    className="absolute right-1.5 top-1.5 inline-flex h-5 w-5 items-center justify-center rounded text-slate-400 opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+                >
+                    <GripVertical className="h-3.5 w-3.5" />
+                </span>
             </div>
-            
-            <div className="flex flex-col gap-2 p-3">
-                <div className="line-clamp-2 text-[11px] font-semibold leading-tight text-slate-700 group-hover:text-[#531b7e] transition-colors">
+
+            <div className="flex flex-col gap-1.5 p-3">
+                <div className="font-mono text-[9px] uppercase tracking-wide text-slate-400">
+                    {sku}
+                </div>
+                <div className="line-clamp-2 text-[11px] font-semibold leading-tight text-slate-700 transition-colors group-hover:text-[#531b7e]">
                     {asset.name}
                 </div>
-                
-                <div className="flex items-center gap-1.5 mt-auto">
-                    <span className="flex items-center justify-center rounded bg-purple-50 px-1.5 py-0.5 text-[9px] font-bold text-purple-600 border border-purple-100/50">
-                        W <span className="ml-1 text-purple-400">{wIn}</span>
+                <div className="mt-auto flex flex-col gap-1">
+                    <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-400">
+                        Dimensions:
                     </span>
-                    <span className="flex items-center justify-center rounded bg-purple-50 px-1.5 py-0.5 text-[9px] font-bold text-purple-600 border border-purple-100/50">
-                        H <span className="ml-1 text-purple-400">{hIn}</span>
-                    </span>
-                    <span className="flex items-center justify-center rounded bg-purple-50 px-1.5 py-0.5 text-[9px] font-bold text-purple-600 border border-purple-100/50">
-                        D <span className="ml-1 text-purple-400">{dIn}</span>
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                        <DimensionPill axis="W" inches={wIn} />
+                        <DimensionPill axis="H" inches={hIn} />
+                        <DimensionPill axis="D" inches={dIn} />
+                    </div>
                 </div>
             </div>
         </button>
