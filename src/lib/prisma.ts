@@ -7,7 +7,7 @@ const globalForPrisma = globalThis as unknown as {
 function buildPrismaClient(): PrismaClient {
     let dbUrl = process.env.DATABASE_URL;
     if (dbUrl && !dbUrl.includes("connection_limit")) {
-        dbUrl += (dbUrl.includes("?") ? "&" : "?") + "connection_limit=1";
+        dbUrl += (dbUrl.includes("?") ? "&" : "?") + "connection_limit=5";
     }
     if (dbUrl) {
         return new PrismaClient({
