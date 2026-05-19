@@ -550,6 +550,10 @@ model TimeEntry {
 
   @@index([projectId])
   @@index([userId])
+  @@index([costCodeId])
+  @@index([costTypeId])
+  @@index([estimateItemId])
+  @@index([scheduleTaskId])
 }
 
 model Contract {
@@ -593,6 +597,9 @@ model Contract {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model ContractSigningRecord {
@@ -612,6 +619,8 @@ model ContractSigningRecord {
   notes String? // Optional notes (e.g. payment amount)
 
   createdAt DateTime @default(now())
+
+  @@index([contractId])
 }
 
 model CompanySettings {
@@ -828,6 +837,10 @@ model FileFolder {
   files      ProjectFile[]
   createdAt  DateTime      @default(now())
   updatedAt  DateTime      @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
+  @@index([parentId])
 }
 
 model ProjectFile {
@@ -1200,6 +1213,9 @@ model PurchaseOrder {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([vendorId])
 }
 
 model PurchaseOrderMessage {
@@ -1248,6 +1264,8 @@ model PurchaseOrderItem {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([purchaseOrderId])
 }
 
 model SelectionBoard {
@@ -1259,6 +1277,8 @@ model SelectionBoard {
   categories SelectionCategory[]
   createdAt  DateTime            @default(now())
   updatedAt  DateTime            @updatedAt
+
+  @@index([projectId])
 }
 
 model SelectionCategory {
@@ -1293,6 +1313,8 @@ model MoodBoard {
   items     MoodBoardItem[]
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
+
+  @@index([projectId])
 }
 
 model MoodBoardItem {
@@ -1355,6 +1377,9 @@ model Retainer {
   sentAt      DateTime?
   viewedAt    DateTime?
   createdAt   DateTime @default(now())
+
+  @@index([projectId])
+  @@index([clientId])
 }
 
 
@@ -1385,6 +1410,8 @@ model BidPackage {
   updatedAt   DateTime     @updatedAt
   scopes      BidScope[]
   invitations BidInvitation[]
+
+  @@index([projectId])
 }
 
 model BidScope {
