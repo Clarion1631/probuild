@@ -26,27 +26,52 @@ function fileExt(name: string) {
 export default async function ProjectDashboardPage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
 
-    const [project, tasks, portalVisibility, subList, recentActivity, recentFiles] = await Promise.all([
-        getProject(id),
-        getScheduleTasks(id),
-        getPortalVisibility(id),
-        getProjectSubcontractors(id),
-        Promise.all([
-            prisma.dailyLog.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, date: true, workPerformed: true, createdAt: true } }),
-            prisma.changeOrder.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, title: true, status: true, createdAt: true } }),
-            prisma.invoice.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, code: true, status: true, totalAmount: true, createdAt: true } }),
-        ]).then(([logs, cos, invs]) => [
+    const t0 = Date.now();
+    
+    console.time("[DASHBOARD] getProject");
+    const projectPromise = getProject(id).then(r => { console.timeEnd("[DASHBOARD] getProject"); return r; });
+
+    console.time("[DASHBOARD] getScheduleTasks");
+    const tasksPromise = getScheduleTasks(id).then(r => { console.timeEnd("[DASHBOARD] getScheduleTasks"); return r; });
+
+    console.time("[DASHBOARD] getPortalVisibility");
+    const portalVisibilityPromise = getPortalVisibility(id).then(r => { console.timeEnd("[DASHBOARD] getPortalVisibility"); return r; });
+
+    console.time("[DASHBOARD] getProjectSubcontractors");
+    const subcontractorsPromise = getProjectSubcontractors(id).then(r => { console.timeEnd("[DASHBOARD] getProjectSubcontractors"); return r; });
+
+    console.time("[DASHBOARD] recentActivity");
+    const recentActivityPromise = Promise.all([
+        prisma.dailyLog.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, date: true, workPerformed: true, createdAt: true } }),
+        prisma.changeOrder.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, title: true, status: true, createdAt: true } }),
+        prisma.invoice.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, code: true, status: true, totalAmount: true, createdAt: true } }),
+    ]).then(([logs, cos, invs]) => {
+        console.timeEnd("[DASHBOARD] recentActivity");
+        return [
             ...logs.map(l => ({ type: "dailylog" as const, id: l.id, label: `Daily log · ${new Date(l.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`, sub: l.workPerformed.slice(0, 60), date: new Date(l.createdAt), href: `/projects/${id}/dailylogs` })),
             ...cos.map(c => ({ type: "changeorder" as const, id: c.id, label: `Change order · ${c.title}`, sub: c.status, date: new Date(c.createdAt), href: `/projects/${id}/change-orders/${c.id}` })),
             ...invs.map(i => ({ type: "invoice" as const, id: i.id, label: `Invoice ${i.code}`, sub: `${i.status} · ${formatCurrency(Number(i.totalAmount))}`, date: new Date(i.createdAt), href: `/projects/${id}/invoices/${i.id}` })),
-        ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 10)),
-        prisma.projectFile.findMany({
-            where: { projectId: id },
-            orderBy: { createdAt: "desc" },
-            take: 8,
-            select: { id: true, name: true, url: true, mimeType: true, size: true, createdAt: true },
-        }),
+        ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 10);
+    });
+
+    console.time("[DASHBOARD] recentFiles");
+    const filesPromise = prisma.projectFile.findMany({
+        where: { projectId: id },
+        orderBy: { createdAt: "desc" },
+        take: 8,
+        select: { id: true, name: true, url: true, mimeType: true, size: true, createdAt: true },
+    }).then(r => { console.timeEnd("[DASHBOARD] recentFiles"); return r; });
+
+    const [project, tasks, portalVisibility, subList, recentActivity, recentFiles] = await Promise.all([
+        projectPromise,
+        tasksPromise,
+        portalVisibilityPromise,
+        subcontractorsPromise,
+        recentActivityPromise,
+        filesPromise
     ]);
+
+    console.log(`[DASHBOARD] TOTAL QUERY RESOLUTION TIME: ${Date.now() - t0}ms`);
 
     if (!project) notFound();
     const estimates = project.estimates || [];
