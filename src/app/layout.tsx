@@ -6,7 +6,7 @@ import AppLayout from "@/components/AppLayout";
 import { Toaster } from "sonner";
 import { getCompanySettings } from "@/lib/actions";
 import { getSessionOrDev } from "@/lib/auth";
-import HelpChatWidget from "@/components/HelpChatWidget";
+import HelpChatWidgetWrapper from "@/components/HelpChatWidgetWrapper";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -44,7 +44,7 @@ export default async function RootLayout({
           <AppLayout logoUrl={settings?.logoUrl ?? undefined}>
             {children}
           </AppLayout>
-          <HelpChatWidget
+          <HelpChatWidgetWrapper
             userId={session?.user?.id}
             userRole={session?.user?.role}
           />

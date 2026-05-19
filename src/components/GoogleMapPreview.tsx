@@ -16,6 +16,7 @@ export default function GoogleMapPreview({ address }: { address: string }) {
                 style={{ border: 0 }}
                 src={embedUrl}
                 allowFullScreen
+                loading="lazy"
             ></iframe>
         </div>
     );

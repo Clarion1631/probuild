@@ -3,6 +3,7 @@
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
+import { cache } from "react";
 import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum } from "./prisma-helpers";
@@ -138,7 +139,7 @@ export async function getLeads() {
     }))));
 }
 
-export async function getLead(id: string) {
+export const getLead = cache(async function getLead(id: string) {
     const lead = await prisma.lead.findUnique({
         where: { id },
         include: {
@@ -181,7 +182,7 @@ export async function getLead(id: string) {
         }
     }
     return lead ? JSON.parse(JSON.stringify(lead)) : null;
-}
+});
 
 export async function updateLeadStage(id: string, stage: string) {
     await prisma.lead.update({
@@ -782,7 +783,7 @@ export async function getProjects() {
     }))));
 }
 
-export async function getProject(id: string) {
+export const getProject = cache(async function getProject(id: string) {
     const include = {
         client: true,
         estimates: safeEstimateInclude,
@@ -800,7 +801,7 @@ export async function getProject(id: string) {
         (project as any).client = { id: "unassigned", name: "No Client", email: "", primaryPhone: "", addressLine1: "", city: "", state: "", zipCode: "" };
     }
     return project ? JSON.parse(JSON.stringify(project)) : null;
-}
+});
 
 export async function convertLeadToProject(leadId: string) {
     const lead = await prisma.lead.findUnique({ where: { id: leadId } });

@@ -1,30 +1,21 @@
-import { getLead, getDocumentTemplates } from "@/lib/actions";
+import { getLead } from "@/lib/actions";
 import ClientMessaging from "@/components/ClientMessaging";
 import LeadMessagingHeader from "./LeadMessagingHeader";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
-import { prisma } from "@/lib/prisma";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
     const leadRaw = await getLead(resolvedParams.id);
     if (!leadRaw) return <div className="p-6">Lead not found</div>;
+    
     const lead = {
         ...leadRaw,
         targetRevenue: leadRaw.targetRevenue != null ? Number(leadRaw.targetRevenue) : null,
         expectedProfit: leadRaw.expectedProfit != null ? Number(leadRaw.expectedProfit) : null,
     };
 
-    const [estimates, leadFull] = await Promise.all([
-        prisma.estimate.findMany({
-            where: { leadId: lead.id },
-            select: { id: true, code: true, title: true, status: true },
-            orderBy: { createdAt: "desc" },
-        }),
-        prisma.lead.findUnique({
-            where: { id: lead.id },
-            select: { message: true },
-        }),
-    ]);
+    const estimates = lead.estimates || [];
+    const initialMessage = lead.message || null;
 
     return (
         <>
@@ -39,7 +30,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 leadSource={lead.source}
                 createdAt={typeof lead.createdAt === "string" ? lead.createdAt : lead.createdAt.toISOString()}
                 location={lead.location}
-                initialMessage={leadFull?.message || null}
+                initialMessage={initialMessage}
                 headerContent={
                     <LeadMessagingHeader
                         leadId={lead.id}
@@ -66,10 +57,11 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientCity={(lead.client as any)?.city || null}
                 clientState={(lead.client as any)?.state || null}
                 clientZip={(lead.client as any)?.zipCode || null}
-                initialMessage={leadFull?.message || null}
+                initialMessage={initialMessage}
                 managerId={(lead as any).manager?.id || null}
                 managerName={(lead as any).manager?.name || null}
             />
         </>
     );
 }
+

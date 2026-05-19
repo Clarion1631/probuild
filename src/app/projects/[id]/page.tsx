@@ -25,10 +25,9 @@ function fileExt(name: string) {
 
 export default async function ProjectDashboardPage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
-    const project = await getProject(id);
-    if (!project) notFound();
 
-    const [tasks, portalVisibility, subList, recentActivity, recentFiles] = await Promise.all([
+    const [project, tasks, portalVisibility, subList, recentActivity, recentFiles] = await Promise.all([
+        getProject(id),
         getScheduleTasks(id),
         getPortalVisibility(id),
         getProjectSubcontractors(id),
@@ -48,6 +47,8 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
             select: { id: true, name: true, url: true, mimeType: true, size: true, createdAt: true },
         }),
     ]);
+
+    if (!project) notFound();
     const estimates = project.estimates || [];
 
     // Real stats

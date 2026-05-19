@@ -82,3 +82,18 @@ supabase/.temp/
 
 # Template backup files produced by scripts/seed-residential-templates.mjs
 scripts/.template-backup-*.json
+
+# Graphify / AI tool temporary & AST files
+.graphify_*
+/graphify-out/
+/.playwright-mcp/
+/.remember/
+/.codex/
+/.claude/worktrees/
+
+# Database and Log files
+*.db
+*.db-journal
+*.sqlite
+*.log
+
