@@ -1,10 +1,26 @@
 import { getEstimateForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import PortalEstimateClient from "./PortalEstimateClient";
 import Link from "next/link";
+import { prisma } from "@/lib/prisma";
 
 export default async function PortalEstimatePage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
+    
+    // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
+    const isNumeric = (str: string) => /^\d+$/.test(str);
+    if (isNumeric(resolvedParams.id)) {
+        const est = await prisma.estimate.findFirst({
+            where: { number: parseInt(resolvedParams.id, 10) },
+            select: { id: true }
+        });
+        if (est) {
+            redirect(`/portal/estimates/${est.id}`);
+        } else {
+            return notFound();
+        }
+    }
+
     const estimate = await getEstimateForPortal(resolvedParams.id);
     const settings = await getCompanySettings();
 

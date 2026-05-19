@@ -1,5 +1,5 @@
 import { getInvoiceForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import PortalInvoiceClient from "./PortalInvoiceClient";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
@@ -71,6 +71,21 @@ export default async function PortalInvoicePage({
 }) {
     const resolvedParams = await params;
     const resolvedSearch = await searchParams;
+
+    // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
+    const isNumeric = (str: string) => /^\d+$/.test(str);
+    if (isNumeric(resolvedParams.id)) {
+        const inv = await prisma.invoice.findFirst({
+            where: { number: parseInt(resolvedParams.id, 10) },
+            select: { id: true }
+        });
+        if (inv) {
+            const queryParams = resolvedSearch.session_id ? `?session_id=${resolvedSearch.session_id}` : '';
+            redirect(`/portal/invoices/${inv.id}${queryParams}`);
+        } else {
+            return notFound();
+        }
+    }
 
     if (resolvedSearch.session_id) {
         await verifyStripeSession(resolvedSearch.session_id, resolvedParams.id);

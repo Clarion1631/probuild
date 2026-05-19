@@ -15,6 +15,22 @@ export default async function LeadLayout({
 }) {
     const { id } = await params;
 
+    // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
+    const isNumeric = (str: string) => /^\d+$/.test(str);
+    let resolvedId = id;
+
+    if (isNumeric(id)) {
+        const lead = await prisma.lead.findFirst({
+            where: { number: parseInt(id, 10) },
+            select: { id: true }
+        });
+        if (lead) {
+            redirect(`/leads/${lead.id}`);
+        } else {
+            redirect("/projects");
+        }
+    }
+
     const session = await getSessionOrDev();
     if (!session?.user?.email) redirect("/login");
 
@@ -31,7 +47,7 @@ export default async function LeadLayout({
     }
 
     const lead = await prisma.lead.findUnique({
-        where: { id },
+        where: { id: resolvedId },
         select: {
             id: true,
             name: true,
@@ -43,7 +59,7 @@ export default async function LeadLayout({
 
     async function handleConvert() {
         "use server";
-        await convertLeadToProject(id);
+        await convertLeadToProject(resolvedId);
         redirect("/projects");
     }
 
@@ -54,7 +70,7 @@ export default async function LeadLayout({
     return (
         <div className="flex h-full -mx-6 -my-6 bg-hui-background overflow-hidden">
             <EntitySidebar
-                entity={{ type: "lead", id, name: lead.name, clientName: lead.client?.name }}
+                entity={{ type: "lead", id: resolvedId, name: lead.name, clientName: lead.client?.name }}
                 linkedEntity={linkedEntity}
                 onConvertToProject={handleConvert}
             />

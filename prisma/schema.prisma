@@ -1510,3 +1510,21 @@ model ActivityLog {
 
   @@index([projectId, createdAt])
 }
+
+model Integration {
+  id        String   @id
+  settings  String
+  updatedAt DateTime @updatedAt
+}
+
+model StripeEvent {
+  id          String    @id
+  type        String
+  payload     String
+  status      String    @default("PENDING")
+  error       String?
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([status])
+}

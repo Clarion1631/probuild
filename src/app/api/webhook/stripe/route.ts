@@ -1,4 +1,5 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
+import { after } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
@@ -9,25 +10,25 @@ import {
     sendEstimatePaymentReceivedEmails,
 } from "@/lib/payment-notifications";
 
-export async function POST(req: Request) {
-    const payload = await req.text();
-    const sig = req.headers.get("Stripe-Signature");
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-    if (!sig || !webhookSecret) {
-        return new NextResponse("Missing Stripe Signature or Webhook Secret", { status: 400 });
-    }
-
-    let event;
-
+// Helper function to process a single event by eventId asynchronously
+async function processEvent(eventId: string) {
     try {
-        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
-    } catch (err: any) {
-        console.error("Webhook signature verification failed:", err.message);
-        return new NextResponse(`Webhook Error: ${err.message}`, { status: 400 });
-    }
+        const stripeEvent = await prisma.stripeEvent.findUnique({
+            where: { id: eventId }
+        });
+        
+        if (!stripeEvent) {
+            console.error(`StripeEvent not found for ID: ${eventId}`);
+            return;
+        }
 
-    try {
+        // If it's already processed, skip
+        if (stripeEvent.status === "PROCESSED") {
+            return;
+        }
+
+        const event = JSON.parse(stripeEvent.payload);
+
         switch (event.type) {
             case "checkout.session.completed":
             case "checkout.session.async_payment_succeeded": {
@@ -351,9 +352,74 @@ export async function POST(req: Request) {
                 // Intentionally unhandled — Stripe sends many event types
                 break;
         }
-    } catch (error) {
-        console.error("Error processing webhook:", error);
-        return new NextResponse("Webhook Handler Error", { status: 500 });
+
+        // Mark as successfully processed
+        await prisma.stripeEvent.update({
+            where: { id: eventId },
+            data: {
+                status: "PROCESSED",
+                processedAt: new Date(),
+                error: null
+            }
+        });
+    } catch (err: any) {
+        console.error(`Error processing StripeEvent ${eventId}:`, err);
+        // Mark as failed and store error
+        await prisma.stripeEvent.update({
+            where: { id: eventId },
+            data: {
+                status: "FAILED",
+                error: err.message || String(err)
+            }
+        });
+    }
+}
+
+export async function POST(req: Request) {
+    const payload = await req.text();
+    const sig = req.headers.get("Stripe-Signature");
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!sig || !webhookSecret) {
+        return new NextResponse("Missing Stripe Signature or Webhook Secret", { status: 400 });
+    }
+
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
+    } catch (err: any) {
+        console.error("Webhook signature verification failed:", err.message);
+        return new NextResponse(`Webhook Error: ${err.message}`, { status: 400 });
+    }
+
+    try {
+        // Record raw verified event into the StripeEvent table for idempotency and durability
+        const stripeEvent = await prisma.stripeEvent.upsert({
+            where: { id: event.id },
+            create: {
+                id: event.id,
+                type: event.type,
+                payload: JSON.stringify(event),
+                status: "PENDING"
+            },
+            update: {} // If it already exists, don't change its state
+        });
+
+        // If the event has already been successfully processed, just return immediately
+        if (stripeEvent.status === "PROCESSED") {
+            return new NextResponse(JSON.stringify({ received: true, alreadyProcessed: true }), { status: 200 });
+        }
+
+        // Schedule background processing of the event using Next.js after() to immediately release the webhook thread
+        after(async () => {
+            await processEvent(event.id);
+        });
+
+    } catch (error: any) {
+        console.error("Error storing StripeEvent:", error);
+        // If we fail to even store the event (e.g. database connection issue), we return 500 so Stripe retries it
+        return new NextResponse("Webhook Database Queueing Error", { status: 500 });
     }
 
     return new NextResponse(JSON.stringify({ received: true }), { status: 200 });
