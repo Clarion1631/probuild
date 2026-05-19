@@ -1,6 +1,13 @@
 // Shared export handlers (PNG / PDF / CSV) for the room designer. Pulled out
 // of RoomToolbar so the bottom dock and overflow menu can both trigger them
 // without duplicating the canvas-ref / branding plumbing.
+//
+// The hook is consumed by *two* mounted components (RoomToolbar overflow +
+// BottomDock screenshot), so each call site has its own `exportingPng/Pdf`
+// state. To prevent concurrent runs from clobbering the shared WebGL
+// renderer state mid-await (renderRoomPng/Pdf save/restore around an
+// async `toBlob` boundary), the actual PNG/PDF entry points sit behind
+// module-scope re-entry guards.
 
 import { useState } from "react";
 import { toast } from "sonner";
@@ -14,6 +21,9 @@ import { buildMaterialsCsv } from "@/lib/room-designer/export-csv";
 import type { OwnerContext } from "@/lib/room-designer/owner-context";
 import { useRoomStore } from "./useRoomStore";
 
+let pngBusy = false;
+let pdfBusy = false;
+
 interface UseRoomExportsArgs {
     ownerContext: OwnerContext;
     roomName: string;
@@ -24,11 +34,16 @@ export function useRoomExports({ ownerContext, roomName }: UseRoomExportsArgs) {
     const [exportingPdf, setExportingPdf] = useState(false);
 
     async function exportPng() {
+        if (pngBusy) {
+            toast.message("An image export is already running");
+            return;
+        }
         const refs = useRoomStore.getState().canvasRefs;
         if (!refs) {
             toast.error("Canvas isn't ready yet — try again in a moment.");
             return;
         }
+        pngBusy = true;
         setExportingPng(true);
         try {
             const blob = await renderRoomPng(refs.gl, refs.scene, refs.camera, {
@@ -47,17 +62,23 @@ export function useRoomExports({ ownerContext, roomName }: UseRoomExportsArgs) {
             // eslint-disable-next-line no-console
             console.error(err);
         } finally {
+            pngBusy = false;
             setExportingPng(false);
         }
     }
 
     async function exportPdf() {
+        if (pdfBusy) {
+            toast.message("A PDF export is already running");
+            return;
+        }
         const state = useRoomStore.getState();
         const refs = state.canvasRefs;
         if (!refs) {
             toast.error("Canvas isn't ready yet — try again in a moment.");
             return;
         }
+        pdfBusy = true;
         setExportingPdf(true);
         try {
             const blob = await renderRoomPdf(
@@ -85,6 +106,7 @@ export function useRoomExports({ ownerContext, roomName }: UseRoomExportsArgs) {
             // eslint-disable-next-line no-console
             console.error(err);
         } finally {
+            pdfBusy = false;
             setExportingPdf(false);
         }
     }
