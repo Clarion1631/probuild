@@ -4,8 +4,8 @@ import { prisma } from '@/lib/prisma';
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: Request) {
-    if (process.env.NODE_ENV !== 'development') {
-        return new Response(null, { status: 404 });
+    if (process.env.ALLOW_SEEDING !== 'true') {
+        return new Response('Seeding is disabled. Set ALLOW_SEEDING=true to enable.', { status: 403 });
     }
 
     try {
