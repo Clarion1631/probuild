@@ -60,6 +60,7 @@ function WallBox({
 
     const handleClick = surface
         ? (e: { stopPropagation: () => void }) => {
+            if (useRoomStore.getState().placingAsset) return;
             e.stopPropagation();
             setActiveSurface(surface);
         }

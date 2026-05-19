@@ -206,9 +206,10 @@ export function UnifiedCadToolbar() {
     };
 
     return (
-        <div className="pointer-events-auto absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-slate-200 bg-white/95 px-3 py-2.5 shadow-md backdrop-blur transition-all">
-            
-            {/* Drawer Shortcut Toggles */}
+        <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center justify-center z-10 w-full max-w-[800px]">
+            <div className="pointer-events-auto flex items-center gap-3 rounded-lg border border-slate-200 bg-white/95 px-3 py-2.5 shadow-md backdrop-blur transition-all">
+                
+                {/* Drawer Shortcut Toggles */}
             <div className="flex items-center gap-1">
                 <button
                     type="button"
@@ -335,6 +336,7 @@ export function UnifiedCadToolbar() {
                 </>
             )}
 
+            </div>
         </div>
     );
 }

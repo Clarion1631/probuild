@@ -119,12 +119,13 @@ export default function EntitySidebar({
         <>
         <div
             style={{
+                display: isRoomEditor ? "none" : "flex",
                 flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
                 maxWidth: sidebarCollapsed ? "48px" : "224px",
                 minWidth: 0,
                 position: "relative",
             }}
-            className="h-full"
+            className="h-full flex-col"
         >
         <button
             onClick={toggleSidebar}

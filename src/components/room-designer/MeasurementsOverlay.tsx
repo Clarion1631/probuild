@@ -118,10 +118,11 @@ export function MeasurementsOverlay() {
     );
 }
 
-// ─────────────── Selected asset W×H×D readout ───────────────
+// ─────────────── Selected asset W×H×D readout and Wall Clearances ───────────────
 function SelectedAssetDims() {
     const selectedId = useSelectedAssetId();
     const asset = useRoomStore((s) => s.assets.find((a) => a.id === selectedId) ?? null);
+    const layout = useRoomStore((s) => s.layout);
 
     if (!asset) return null;
 
@@ -138,11 +139,93 @@ function SelectedAssetDims() {
         asset.position.z - depth / 2,
     ];
 
+    // Room bounds
+    const b = roomBounds(layout);
+    const Y = 0.02; // slightly above floor
+
+    // Wall distances (in meters). We assume rotation is cardinal for simple AABB here,
+    // which matches standard layout tools.
+    const distWest = (asset.position.x - width / 2) - b.minX;
+    const distEast = b.maxX - (asset.position.x + width / 2);
+    const distNorth = (asset.position.z - depth / 2) - b.minZ;
+    const distSouth = b.maxZ - (asset.position.z + depth / 2);
+
+    // Line start/end points
+    const westStart: [number, number, number] = [asset.position.x - width / 2, Y, asset.position.z];
+    const westEnd: [number, number, number] = [b.minX, Y, asset.position.z];
+    const westMid: [number, number, number] = [(asset.position.x - width / 2 + b.minX) / 2, Y, asset.position.z];
+
+    const eastStart: [number, number, number] = [asset.position.x + width / 2, Y, asset.position.z];
+    const eastEnd: [number, number, number] = [b.maxX, Y, asset.position.z];
+    const eastMid: [number, number, number] = [(asset.position.x + width / 2 + b.maxX) / 2, Y, asset.position.z];
+
+    const northStart: [number, number, number] = [asset.position.x, Y, asset.position.z - depth / 2];
+    const northEnd: [number, number, number] = [asset.position.x, Y, b.minZ];
+    const northMid: [number, number, number] = [asset.position.x, Y, (asset.position.z - depth / 2 + b.minZ) / 2];
+
+    const southStart: [number, number, number] = [asset.position.x, Y, asset.position.z + depth / 2];
+    const southEnd: [number, number, number] = [asset.position.x, Y, b.maxZ];
+    const southMid: [number, number, number] = [asset.position.x, Y, (asset.position.z + depth / 2 + b.maxZ) / 2];
+
+    const formatIn = (m: number) => `${Math.round(m * 39.3701)}in`;
+    const lineColor = "#7c3aed"; // Violet-600
+
     return (
-        <Html position={pos} style={{ pointerEvents: "none" }}>
-            <div className="rounded bg-slate-900/90 px-1.5 py-0.5 text-[10px] font-semibold text-white shadow">
-                {label}
-            </div>
-        </Html>
+        <group>
+            {/* Asset size tag */}
+            <Html position={pos} style={{ pointerEvents: "none" }}>
+                <div className="rounded bg-slate-900/90 px-1.5 py-0.5 text-[10px] font-semibold text-white shadow">
+                    {label}
+                </div>
+            </Html>
+
+            {/* West Wall Distance */}
+            {distWest > 0.05 && (
+                <group>
+                    <Line points={[westStart, westEnd]} color={lineColor} lineWidth={1.5} />
+                    <Html position={westMid} center style={{ pointerEvents: "none" }}>
+                        <div className="rounded-sm bg-white px-1.5 py-0.5 text-[9px] font-bold text-violet-700 shadow-sm border border-violet-100">
+                            {formatIn(distWest)}
+                        </div>
+                    </Html>
+                </group>
+            )}
+
+            {/* East Wall Distance */}
+            {distEast > 0.05 && (
+                <group>
+                    <Line points={[eastStart, eastEnd]} color={lineColor} lineWidth={1.5} />
+                    <Html position={eastMid} center style={{ pointerEvents: "none" }}>
+                        <div className="rounded-sm bg-white px-1.5 py-0.5 text-[9px] font-bold text-violet-700 shadow-sm border border-violet-100">
+                            {formatIn(distEast)}
+                        </div>
+                    </Html>
+                </group>
+            )}
+
+            {/* North Wall Distance */}
+            {distNorth > 0.05 && (
+                <group>
+                    <Line points={[northStart, northEnd]} color={lineColor} lineWidth={1.5} />
+                    <Html position={northMid} center style={{ pointerEvents: "none" }}>
+                        <div className="rounded-sm bg-white px-1.5 py-0.5 text-[9px] font-bold text-violet-700 shadow-sm border border-violet-100">
+                            {formatIn(distNorth)}
+                        </div>
+                    </Html>
+                </group>
+            )}
+
+            {/* South Wall Distance */}
+            {distSouth > 0.05 && (
+                <group>
+                    <Line points={[southStart, southEnd]} color={lineColor} lineWidth={1.5} />
+                    <Html position={southMid} center style={{ pointerEvents: "none" }}>
+                        <div className="rounded-sm bg-white px-1.5 py-0.5 text-[9px] font-bold text-violet-700 shadow-sm border border-violet-100">
+                            {formatIn(distSouth)}
+                        </div>
+                    </Html>
+                </group>
+            )}
+        </group>
     );
 }

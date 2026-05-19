@@ -17,6 +17,7 @@ import { RoomToolbar } from "./RoomToolbar";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { LayersPanel } from "./LayersPanel";
 import { UnifiedCadToolbar } from "./UnifiedCadToolbar";
+import { AssetPanel } from "./AssetPanel";
 import { AssetContextMenu } from "./AssetContextMenu";
 import { OnboardingCoach } from "./OnboardingCoach";
 import { ShortcutLegend } from "./ShortcutLegend";
@@ -71,7 +72,10 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
                 ownerContext={ownerContext}
                 initialShareState={initialShareState}
             />
-            <div className="flex min-h-0 flex-1">
+            <div className="flex min-h-0 flex-1 relative overflow-hidden">
+                {/* Premium RTA-style dual navigation sidebar */}
+                <AssetPanel />
+                
                 {showLayers && <LayersPanel />}
                 <div className="relative flex-1 bg-slate-200">
                     <div className="absolute inset-0">

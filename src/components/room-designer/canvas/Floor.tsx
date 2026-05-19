@@ -38,6 +38,7 @@ export function Floor({ layout }: FloorProps) {
                 rotation={[-Math.PI / 2, 0, 0]}
                 receiveShadow
                 onClick={(e) => {
+                    if (useRoomStore.getState().placingAsset) return;
                     e.stopPropagation();
                     setActiveSurface("floor");
                 }}

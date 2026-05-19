@@ -12,9 +12,15 @@ import {
 } from "@/lib/room-designer/asset-registry";
 import type { AssetCategory } from "@/components/room-designer/types";
 
-export function useAssetLibrary(category: AssetCategory, query: string): Asset[] {
+export function useAssetLibrary(category: AssetCategory | "doors-windows", query: string): Asset[] {
     return useMemo(() => {
-        const base = ASSETS_BY_CATEGORY[category];
+        let base: Asset[] = [];
+        if (category === "doors-windows") {
+            base = [...(ASSETS_BY_CATEGORY["door"] || []), ...(ASSETS_BY_CATEGORY["window"] || [])];
+        } else {
+            base = ASSETS_BY_CATEGORY[category] || [];
+        }
+        
         const q = query.trim().toLowerCase();
         if (!q) return base;
         return base.filter(
@@ -25,3 +31,4 @@ export function useAssetLibrary(category: AssetCategory, query: string): Asset[]
         );
     }, [category, query]);
 }
+
