@@ -151,7 +151,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [aiSubitemSuggestions, setAiSubitemSuggestions] = useState<any[]>([]);
     const [showSubitemSuggestions, setShowSubitemSuggestions] = useState<string | null>(null);
     const [selectedSuggestionIndices, setSelectedSuggestionIndices] = useState<Set<number>>(new Set());
-    const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+    const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => {
+        const initialItems = initialEstimate.items || [];
+        const parentIds = initialItems.filter((i: any) => i.parentId).map((i: any) => i.parentId);
+        return new Set(parentIds);
+    });
     const [history, setHistory] = useState<Array<{ ts: number; label: string; snapshot: any[] }>>([]);
     const [showHistory, setShowHistory] = useState(false);
     const [expandedHistoryTs, setExpandedHistoryTs] = useState<number | null>(null);
@@ -548,7 +552,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
-    async function handleSave({ silent = false } = {}) {
+    async function handleSave({ silent = false, skipRefresh = false } = {}) {
         captureHistory(new Date().toLocaleString());
         if (!silent) setIsSaving(true);
         // Recompute section header totals from children before saving
@@ -586,7 +590,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             setIsSaving(false);
             toast.success("Estimate saved successfully");
         }
-        router.refresh();
+        if (!skipRefresh) {
+            router.refresh();
+        }
     }
 
     async function handleCreateInvoice() {
@@ -2874,7 +2880,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     amount={recordingEstPayment.amount}
                     onClose={() => setRecordingEstPayment(null)}
                     onSubmit={async (input) => {
-                        await handleSave({ silent: true });
+                        await handleSave({ silent: true, skipRefresh: true });
                         const result = await recordEstimatePayment(recordingEstPayment.id, initialEstimate.id, {
                             ...input,
                             amount: recordingEstPayment.amount,

@@ -2051,110 +2051,132 @@ export async function markInvoiceViewed(invoiceId: string) {
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
-    // Update estimate — try full update, fallback to safe fields if columns missing.
+    // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
-
-    // Preserve payment credits: subtract already-paid milestones from totalAmount
-    const paidMilestones = await prisma.estimatePaymentSchedule.findMany({
-        where: { estimateId, status: "Paid" },
-        select: { amount: true },
-    });
-    const paidSum = paidMilestones.reduce((sum, s) => sum + toNum(s.amount), 0);
-    const computedBalance = Math.max(0, (data.totalAmount || 0) - paidSum);
-    const computedStatus = paidSum > 0
-        ? (computedBalance <= 0 ? "Paid" : "Partially Paid")
-        : data.status;
-
-    const safeData = {
-        title: data.title,
-        code: data.code,
-        status: computedStatus,
-        totalAmount: data.totalAmount,
-        balanceDue: computedBalance,
-        ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
-        ...(data.targetMarginPercent !== undefined && {
-            targetMarginPercent: Math.max(0, Math.min(70, parseFloat(data.targetMarginPercent) || 25)),
-        }),
-        ...(data.taxExempt !== undefined && { taxExempt: !!data.taxExempt }),
-        ...(data.taxRateName !== undefined && { taxRateName: data.taxRateName }),
-        ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
-    };
-    try {
-        await prisma.estimate.update({
-            where: { id: estimateId },
-            data: {
-                ...safeData,
-                ...(data.processingFeeMarkup !== undefined && { processingFeeMarkup: data.processingFeeMarkup }),
-                ...(data.hideProcessingFee !== undefined && { hideProcessingFee: data.hideProcessingFee }),
-                ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
-                ...(data.memo !== undefined && { memo: data.memo }),
-                ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
-            },
+    const result = await prisma.$transaction(async (tx) => {
+        // Preserve payment credits: subtract already-paid milestones from totalAmount
+        const paidMilestones = await tx.estimatePaymentSchedule.findMany({
+            where: { estimateId, status: "Paid" },
+            select: { amount: true },
         });
-    } catch {
-        await prisma.estimate.update({ where: { id: estimateId }, data: safeData });
-    }
+        const paidSum = paidMilestones.reduce((sum, s) => sum + toNum(s.amount), 0);
+        const computedBalance = Math.max(0, (data.totalAmount || 0) - paidSum);
+        const computedStatus = paidSum > 0
+            ? (computedBalance <= 0 ? "Paid" : "Partially Paid")
+            : data.status;
 
-    // Delete existing items and NON-PAID schedules, then batch-insert replacements
-    // Preserve Paid schedules so payment history survives estimate edits
-    await prisma.estimateItem.deleteMany({ where: { estimateId } });
-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId, status: { not: "Paid" } } });
+        const safeData = {
+            title: data.title,
+            code: data.code,
+            status: computedStatus,
+            totalAmount: data.totalAmount,
+            balanceDue: computedBalance,
+            ...(data.signatureUrl !== undefined && { signatureUrl: data.signatureUrl }),
+            ...(data.targetMarginPercent !== undefined && {
+                targetMarginPercent: Math.max(0, Math.min(70, parseFloat(data.targetMarginPercent) || 25)),
+            }),
+            ...(data.taxExempt !== undefined && { taxExempt: !!data.taxExempt }),
+            ...(data.taxRateName !== undefined && { taxRateName: data.taxRateName }),
+            ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
+        };
 
-    // Build item data — split parents/children so FK ordering is respected
-    const toItemData = (item: any, fallbackOrder: number) => ({
-        ...(item.id ? { id: item.id } : {}),
-        estimateId,
-        name: item.name,
-        description: item.description || "",
-        type: item.type,
-        quantity: parseFloat(item.quantity) || 0,
-        baseCost: item.baseCost != null ? (parseFloat(item.baseCost) || 0) : null,
-        markupPercent: parseFloat(item.markupPercent) || 25,
-        unitCost: parseFloat(item.unitCost) || 0,
-        total: parseFloat(item.total) || 0,
-        order: item.order ?? fallbackOrder,
-        parentId: item.parentId || null,
-        costCodeId: item.costCodeId || null,
-        costTypeId: item.costTypeId || null,
-        purchaseOrderId: item.purchaseOrderId || null,
-        budgetQuantity: item.budgetQuantity != null ? (parseFloat(item.budgetQuantity) || null) : null,
-        budgetUnit: item.budgetUnit || null,
-        budgetRate: item.budgetRate != null ? (parseFloat(item.budgetRate) || null) : null,
-    });
-
-    const parentItems = items.filter((i: any) => !i.parentId);
-    const childItems  = items.filter((i: any) =>  i.parentId);
-
-    if (parentItems.length > 0) {
-        await prisma.estimateItem.createMany({ data: parentItems.map(toItemData) });
-    }
-    if (childItems.length > 0) {
-        await prisma.estimateItem.createMany({ data: childItems.map(toItemData) });
-    }
-
-    // Batch-insert payment schedules (skip Paid ones — they were preserved above)
-    const schedules = (data.paymentSchedules || []).filter((s: any) => s.status !== "Paid");
-    if (schedules.length > 0) {
-        await prisma.estimatePaymentSchedule.createMany({
-            data: schedules.map((schedule: any, idx: number) => ({
-                ...(schedule.id ? { id: schedule.id } : {}),
-                estimateId,
-                name: schedule.name,
-                percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
-                amount: parseFloat(schedule.amount) || 0,
-                dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
-                order: schedule.order ?? idx,
-            })),
-        });
-    }
-
-    if (data.status === 'Approved' && contextType === 'project') {
-        const existingBudget = await prisma.budget.findUnique({ where: { estimateId } });
-        if (!existingBudget) {
-            await generateBudgetForEstimate(estimateId, contextId);
+        try {
+            await tx.estimate.update({
+                where: { id: estimateId },
+                data: {
+                    ...safeData,
+                    ...(data.processingFeeMarkup !== undefined && { processingFeeMarkup: data.processingFeeMarkup }),
+                    ...(data.hideProcessingFee !== undefined && { hideProcessingFee: data.hideProcessingFee }),
+                    ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
+                    ...(data.memo !== undefined && { memo: data.memo }),
+                    ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+                },
+            });
+        } catch {
+            await tx.estimate.update({ where: { id: estimateId }, data: safeData });
         }
-    }
+
+        // Delete existing items and NON-PAID schedules, then batch-insert replacements
+        // Preserve Paid schedules so payment history survives estimate edits
+        await tx.estimateItem.deleteMany({ where: { estimateId } });
+        await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId, status: { not: "Paid" } } });
+
+        // Build item data — split parents/children so FK ordering is respected
+        const toItemData = (item: any, fallbackOrder: number) => ({
+            ...(item.id ? { id: item.id } : {}),
+            estimateId,
+            name: item.name,
+            description: item.description || "",
+            type: item.type,
+            quantity: parseFloat(item.quantity) || 0,
+            baseCost: item.baseCost != null ? (parseFloat(item.baseCost) || 0) : null,
+            markupPercent: parseFloat(item.markupPercent) || 25,
+            unitCost: parseFloat(item.unitCost) || 0,
+            total: parseFloat(item.total) || 0,
+            order: item.order ?? fallbackOrder,
+            parentId: item.parentId || null,
+            costCodeId: item.costCodeId || null,
+            costTypeId: item.costTypeId || null,
+            purchaseOrderId: item.purchaseOrderId || null,
+            budgetQuantity: item.budgetQuantity != null ? (parseFloat(item.budgetQuantity) || null) : null,
+            budgetUnit: item.budgetUnit || null,
+            budgetRate: item.budgetRate != null ? (parseFloat(item.budgetRate) || null) : null,
+        });
+
+        const parentItems = items.filter((i: any) => !i.parentId);
+        const childItems  = items.filter((i: any) =>  i.parentId);
+
+        if (parentItems.length > 0) {
+            await tx.estimateItem.createMany({ data: parentItems.map(toItemData) });
+        }
+        if (childItems.length > 0) {
+            await tx.estimateItem.createMany({ data: childItems.map(toItemData) });
+        }
+
+        // Batch-insert payment schedules (skip Paid ones — they were preserved above)
+        const schedules = (data.paymentSchedules || []).filter((s: any) => s.status !== "Paid");
+        if (schedules.length > 0) {
+            await tx.estimatePaymentSchedule.createMany({
+                data: schedules.map((schedule: any, idx: number) => ({
+                    ...(schedule.id ? { id: schedule.id } : {}),
+                    estimateId,
+                    name: schedule.name,
+                    percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
+                    amount: parseFloat(schedule.amount) || 0,
+                    dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
+                    order: schedule.order ?? idx,
+                })),
+            });
+        }
+
+        if (data.status === 'Approved' && contextType === 'project') {
+            const existingBudget = await tx.budget.findUnique({ where: { estimateId } });
+            if (!existingBudget) {
+                // Inline generation inside the transaction to reuse tx client and secure execution
+                const itemsList = await tx.estimateItem.findMany({ where: { estimateId } });
+                let totalLaborBudget = 0;
+                let totalMaterialBudget = 0;
+                for (const item of itemsList) {
+                    if (item.type === "Labor") {
+                        totalLaborBudget += toNum(item.total);
+                    } else {
+                        totalMaterialBudget += toNum(item.total);
+                    }
+                }
+                await tx.budget.create({
+                    data: {
+                        projectId: contextId,
+                        estimateId,
+                        totalLaborBudget,
+                        totalMaterialBudget,
+                    },
+                });
+            }
+        }
+
+        return { success: true };
+    });
 
     if (contextType === "project") {
         revalidatePath(`/projects/${contextId}/estimates`);
@@ -2163,7 +2185,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         revalidatePath(`/leads/${contextId}`);
         revalidatePath(`/leads/${contextId}/estimates/${estimateId}`);
     }
-    return { success: true };
+    return result;
 }
 
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
@@ -2522,44 +2544,51 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const payment = await prisma.paymentSchedule.findUnique({ where: { id: paymentId } });
-    if (!payment) return { success: false, error: "Milestone not found" as const };
-    if (payment.status === "Paid") return { success: false, error: "Milestone already paid" as const };
-    if (payment.invoiceId !== invoiceId) return { success: false, error: "Milestone/invoice mismatch" as const };
+    const tx = await prisma.$transaction(async (t) => {
+        const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
+        if (!payment) return { success: false as const, error: "Milestone not found" as const };
+        if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
+        if (payment.invoiceId !== invoiceId) return { success: false as const, error: "Milestone/invoice mismatch" as const };
 
-    await prisma.paymentSchedule.update({
-        where: { id: paymentId },
-        data: {
-            status: "Paid",
-            paymentDate,
-            paidAt: new Date(),
-            paymentMethod: method,
-            referenceNumber,
-            notes,
-        },
+        const claim = await t.paymentSchedule.updateMany({
+            where: { id: paymentId, status: { not: "Paid" } },
+            data: {
+                status: "Paid",
+                paymentDate,
+                paidAt: new Date(),
+                paymentMethod: method,
+                referenceNumber,
+                notes,
+            },
+        });
+        if (claim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
+
+        // Recalculate from scratch (matches Stripe webhook) to avoid drift.
+        const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) return { success: false as const, error: "Invoice not found" as const };
+
+        const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
+        const totalPaid = allSchedules
+            .filter((s) => s.status === "Paid")
+            .reduce((sum, s) => sum + toNum(s.amount), 0);
+        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+        const newStatus =
+            newBalance <= 0 ? "Paid"
+            : totalPaid > 0 ? "Partially Paid"
+            : invoice.status;
+
+        await t.invoice.update({
+            where: { id: invoiceId },
+            data: { balanceDue: newBalance, status: newStatus },
+        });
+
+        return { success: true as const, projectId: invoice.projectId };
     });
 
-    // Recalculate from scratch (matches Stripe webhook) to avoid drift.
-    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    if (!invoice) return { success: false, error: "Invoice not found" as const };
+    if (!tx.success) return tx;
 
-    const allSchedules = await prisma.paymentSchedule.findMany({ where: { invoiceId } });
-    const totalPaid = allSchedules
-        .filter((s) => s.status === "Paid")
-        .reduce((sum, s) => sum + toNum(s.amount), 0);
-    const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-    const newStatus =
-        newBalance <= 0 ? "Paid"
-        : totalPaid > 0 ? "Partially Paid"
-        : invoice.status;
-
-    await prisma.invoice.update({
-        where: { id: invoiceId },
-        data: { balanceDue: newBalance, status: newStatus },
-    });
-
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/projects/${tx.projectId}/invoices`);
+    revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
     revalidatePath(`/reports/open-invoices`);
@@ -2721,7 +2750,14 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
 
         await tx.estimatePaymentSchedule.update({
             where: { id: paymentId },
-            data: { status: "Pending", paymentDate: null, paidAt: null },
+            data: {
+                status: "Pending",
+                paymentDate: null,
+                paidAt: null,
+                paymentMethod: null,
+                referenceNumber: null,
+                notes: null,
+            },
         });
 
         const allSchedules = await tx.estimatePaymentSchedule.findMany({ where: { estimateId } });
@@ -2880,38 +2916,41 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
         if (!payment) throw new Error("Payment not found");
         if (payment.status !== "Paid") return null;
 
-        const invoice = await tx.invoice.findUnique({
-            where: { id: invoiceId },
-            include: { payments: true },
-        });
-        if (!invoice) throw new Error("Invoice not found");
-
         await tx.paymentSchedule.update({
             where: { id: paymentId },
-            data: { status: "Pending", paymentDate: null, paidAt: null },
+            data: {
+                status: "Pending",
+                paymentDate: null,
+                paidAt: null,
+                paymentMethod: null,
+                referenceNumber: null,
+                notes: null,
+            },
         });
 
-        const amount = toNum(payment.amount);
-        const cappedDelta = Math.min(amount, Math.max(0, toNum(invoice.totalAmount) - toNum(invoice.balanceDue)));
+        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) throw new Error("Invoice not found");
 
-        const otherPaidExists = invoice.payments.some(
-            (p) => p.id !== paymentId && p.status === "Paid",
-        );
-        const projectedBalance = toNum(invoice.balanceDue) + cappedDelta;
-        let newStatus: string;
-        if (projectedBalance <= 0) {
+        const allSchedules = await tx.paymentSchedule.findMany({ where: { invoiceId } });
+        const totalPaid = allSchedules
+            .filter((s) => s.status === "Paid")
+            .reduce((sum, s) => sum + toNum(s.amount), 0);
+        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+        
+        let newStatus = invoice.status;
+        if (newBalance <= 0) {
             newStatus = "Paid";
-        } else if (otherPaidExists) {
+        } else if (totalPaid > 0) {
             newStatus = "Partially Paid";
         } else if (invoice.status === "Overdue") {
             newStatus = "Overdue";
         } else {
-            newStatus = "Issued";
+            newStatus = "Issued"; // default state for issued invoices with no payments
         }
 
         await tx.invoice.update({
             where: { id: invoiceId },
-            data: { balanceDue: { increment: cappedDelta }, status: newStatus },
+            data: { balanceDue: newBalance, status: newStatus },
         });
 
         return invoice.projectId;
