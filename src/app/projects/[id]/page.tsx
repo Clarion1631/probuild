@@ -1,5 +1,4 @@
 import { getProject, getScheduleTasks, getPortalVisibility } from "@/lib/actions";
-import { getProjectSubcontractors } from "@/lib/subcontractor-actions";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -37,9 +36,6 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     console.time("[DASHBOARD] getPortalVisibility");
     const portalVisibilityPromise = getPortalVisibility(id).then(r => { console.timeEnd("[DASHBOARD] getPortalVisibility"); return r; });
 
-    console.time("[DASHBOARD] getProjectSubcontractors");
-    const subcontractorsPromise = getProjectSubcontractors(id).then(r => { console.timeEnd("[DASHBOARD] getProjectSubcontractors"); return r; });
-
     console.time("[DASHBOARD] recentActivity");
     const recentActivityPromise = Promise.all([
         prisma.dailyLog.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 5, select: { id: true, date: true, workPerformed: true, createdAt: true } }),
@@ -62,11 +58,10 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         select: { id: true, name: true, url: true, mimeType: true, size: true, createdAt: true },
     }).then(r => { console.timeEnd("[DASHBOARD] recentFiles"); return r; });
 
-    const [project, tasks, portalVisibility, subList, recentActivity, recentFiles] = await Promise.all([
+    const [project, tasks, portalVisibility, recentActivity, recentFiles] = await Promise.all([
         projectPromise,
         tasksPromise,
         portalVisibilityPromise,
-        subcontractorsPromise,
         recentActivityPromise,
         filesPromise
     ]);
@@ -266,7 +261,6 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                     <ProjectDashboardsWidget
                         projectId={id}
                         initialPortalVisibility={portalVisibility}
-                        initialSubcontractors={subList}
                     />
 
                     {/* Recent Files & Photos — compact right-rail card */}

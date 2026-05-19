@@ -7,11 +7,9 @@ import SubcontractorAssignmentModal from "./SubcontractorAssignmentModal";
 export default function ProjectDashboardsWidget({
     projectId,
     initialPortalVisibility,
-    initialSubcontractors,
 }: {
     projectId: string;
     initialPortalVisibility: any;
-    initialSubcontractors: any[];
 }) {
     const [showClientModal, setShowClientModal] = useState(false);
     const [showSubModal, setShowSubModal] = useState(false);
@@ -97,7 +95,6 @@ export default function ProjectDashboardsWidget({
             {showSubModal && (
                 <SubcontractorAssignmentModal
                     projectId={projectId}
-                    initialSubcontractors={initialSubcontractors}
                     onClose={() => setShowSubModal(false)}
                 />
             )}
