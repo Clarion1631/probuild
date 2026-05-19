@@ -787,8 +787,6 @@ export const getProject = cache(async function getProject(id: string) {
     const include = {
         client: true,
         estimates: safeEstimateInclude,
-        roomDesigns: true,
-        contracts: { include: { signingRecords: true }, orderBy: { createdAt: "desc" } },
     } as const;
 
     // Support both CUID and friendly numeric ID in URL params
