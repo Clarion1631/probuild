@@ -1,3 +1,8 @@
+// Selection-only floating bar. Sits above the BottomDock and shows up only
+// when something is selected: single-asset position/rotation inputs OR the
+// multi-asset alignment toolbar. Camera presets, layers, and properties
+// toggles moved out to BottomDock and RightRail.
+
 import { useState, useEffect, useMemo } from "react";
 import { useRoomStore, useSelectedAssetId } from "./hooks/useRoomStore";
 import { getAsset } from "@/lib/room-designer/asset-registry";
@@ -5,43 +10,21 @@ import { resolveDimensions } from "@/lib/room-designer/asset-resolve";
 import { isLocked } from "@/lib/room-designer/asset-view";
 import {
     M_TO_IN,
-    IN_TO_M,
     fmtInches,
     radToDeg,
     degToRad,
     parseFeetInches,
 } from "@/lib/room-designer/units";
-import type { CameraPreset, PlacedAsset } from "./types";
-import { 
-    Maximize2, 
-    Layers, 
-    Settings, 
-    AlignLeft, 
-    AlignCenter, 
-    AlignRight, 
-    AlignStartVertical, 
-    AlignEndVertical, 
-    Grid3X3,
+import type { PlacedAsset } from "./types";
+import {
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignStartVertical,
+    AlignEndVertical,
     Lock,
-    Compass
 } from "lucide-react";
 
-// Camera Presets config
-interface PresetBtn {
-    key: CameraPreset | "fit";
-    label: string;
-    title: string;
-}
-
-const PRESETS: PresetBtn[] = [
-    { key: "fit", label: "Fit", title: "Fit room to view" },
-    { key: "top", label: "Top", title: "Top (plan) view" },
-    { key: "front", label: "Front", title: "Front elevation" },
-    { key: "right", label: "Side", title: "Right-side elevation" },
-    { key: "iso", label: "3D", title: "3D perspective" },
-];
-
-// Alignment computation structures
 interface AlignCandidate {
     asset: PlacedAsset;
     minX: number; maxX: number; cx: number;
@@ -141,47 +124,25 @@ function distributePatches(cands: AlignCandidate[], axis: DistributeAxis) {
     }));
 }
 
-export function UnifiedCadToolbar() {
+export function SelectionCadBar() {
     const selectedAssetId = useSelectedAssetId();
     const selectionCount = useRoomStore((s) => s.selectedAssetIds.length);
     const selectedIds = useRoomStore((s) => s.selectedAssetIds);
     const assets = useRoomStore((s) => s.assets);
     const updateAsset = useRoomStore((s) => s.updateAsset);
     const updateAssets = useRoomStore((s) => s.updateAssets);
-    
-    // Sidebar drawer states
-    const showLayers = useRoomStore((s) => s.showLayers);
-    const setShowLayers = useRoomStore((s) => s.setShowLayers);
-    const showProperties = useRoomStore((s) => s.showProperties);
-    const setShowProperties = useRoomStore((s) => s.setShowProperties);
-
-    // Camera preset states
-    const currentPreset = useRoomStore((s) => s.cameraPreset);
-    const setCameraPreset = useRoomStore((s) => s.setCameraPreset);
-    const viewMode = useRoomStore((s) => s.viewMode);
 
     const asset = selectedAssetId ? assets.find((a) => a.id === selectedAssetId) ?? null : null;
     const locked = asset ? isLocked(asset) : false;
 
-    // Precompute alignment candidates
     const candidates = useMemo(() => {
         const selectedSet = new Set(selectedIds);
         const picked = assets.filter((a) => selectedSet.has(a.id));
         return computeCandidates(picked);
     }, [assets, selectedIds]);
 
-    // Handle camera preset trigger
-    const onPresetClick = (key: PresetBtn["key"]) => {
-        if (key === "fit") {
-            const target: CameraPreset = viewMode === "2d" ? "top" : "iso";
-            setCameraPreset("orbit");
-            setTimeout(() => setCameraPreset(target), 0);
-            return;
-        }
-        setCameraPreset(key);
-    };
+    if (selectionCount === 0) return null;
 
-    // Commit single-asset updates
     const commitPosition = (axis: "x" | "y" | "z", input: string) => {
         if (!asset) return;
         const meters = parseFeetInches(input);
@@ -198,7 +159,6 @@ export function UnifiedCadToolbar() {
         updateAsset(asset.id, { rotationY: degToRad(deg) });
     };
 
-    // Apply alignment
     const applyAlign = (axis: AlignAxis) => updateAssets(alignPatches(candidates, axis));
     const applyDistribute = (axis: DistributeAxis) => {
         const patches = distributePatches(candidates, axis);
@@ -206,98 +166,24 @@ export function UnifiedCadToolbar() {
     };
 
     return (
-        <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center justify-center z-10 w-full max-w-[800px]">
-            <div className="pointer-events-auto flex items-center gap-3 rounded-lg border border-slate-200 bg-white/95 px-3 py-2.5 shadow-md backdrop-blur transition-all">
-                
-                {/* Drawer Shortcut Toggles */}
-            <div className="flex items-center gap-1">
-                <button
-                    type="button"
-                    title="Toggle Layers sidebar (L)"
-                    onClick={() => setShowLayers(!showLayers)}
-                    className={`rounded p-1.5 transition ${showLayers ? "bg-slate-100 text-blue-600" : "text-slate-500 hover:bg-slate-50"}`}
-                >
-                    <Layers className="h-4 w-4" />
-                </button>
-                <button
-                    type="button"
-                    title="Toggle Properties sidebar (P)"
-                    onClick={() => setShowProperties(!showProperties)}
-                    className={`rounded p-1.5 transition ${showProperties ? "bg-slate-100 text-blue-600" : "text-slate-500 hover:bg-slate-50"}`}
-                >
-                    <Settings className="h-4 w-4" />
-                </button>
-            </div>
-
-            <Divider />
-
-            {/* Section 1: Camera Presets (Always Visible) */}
-            <div className="flex items-center gap-0.5">
-                {PRESETS.map((p) => {
-                    const active = p.key !== "fit" && currentPreset === p.key;
-                    return (
-                        <button
-                            key={p.key}
-                            type="button"
-                            title={p.title}
-                            onClick={() => onPresetClick(p.key)}
-                            className={
-                                "rounded px-2.5 py-1 text-xs font-semibold transition " +
-                                (active
-                                    ? "bg-slate-900 text-white shadow-sm"
-                                    : "bg-transparent text-slate-600 hover:bg-slate-100")
-                            }
-                        >
-                            {p.key === "fit" ? (
-                                <span className="flex items-center gap-1"><Maximize2 className="h-3 w-3" /> Fit</span>
-                            ) : p.label}
-                        </button>
-                    );
-                })}
-            </div>
-
-            {/* Section 2: Single Selection Dimensional Inputs (Visible only when selectionCount === 1) */}
-            {selectionCount === 1 && asset && (
-                <>
-                    <Divider />
-                    <div className="flex items-center gap-1.5 animate-in fade-in slide-in-from-top-1 duration-150">
-                        <DimField
-                            label="X"
-                            value={asset.position.x}
-                            disabled={locked}
-                            onCommit={(v) => commitPosition("x", v)}
-                        />
-                        <DimField
-                            label="Y"
-                            value={asset.position.y}
-                            disabled={locked}
-                            onCommit={(v) => commitPosition("y", v)}
-                        />
-                        <DimField
-                            label="Z"
-                            value={asset.position.z}
-                            disabled={locked}
-                            onCommit={(v) => commitPosition("z", v)}
-                        />
-                        <RotField
-                            value={asset.rotationY}
-                            disabled={locked}
-                            onCommit={commitRotation}
-                        />
+        <div className="pointer-events-none absolute bottom-20 left-1/2 z-10 flex w-full max-w-[800px] -translate-x-1/2 items-center justify-center">
+            <div className="pointer-events-auto flex items-center gap-3 rounded-lg border border-slate-200 bg-white/95 px-3 py-2 shadow-md backdrop-blur transition-all">
+                {selectionCount === 1 && asset && (
+                    <div className="flex items-center gap-1.5 animate-in fade-in slide-in-from-bottom-1 duration-150">
+                        <DimField label="X" value={asset.position.x} disabled={locked} onCommit={(v) => commitPosition("x", v)} />
+                        <DimField label="Y" value={asset.position.y} disabled={locked} onCommit={(v) => commitPosition("y", v)} />
+                        <DimField label="Z" value={asset.position.z} disabled={locked} onCommit={(v) => commitPosition("z", v)} />
+                        <RotField value={asset.rotationY} disabled={locked} onCommit={commitRotation} />
                         {locked && (
                             <span className="flex items-center gap-0.5 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
                                 <Lock className="h-2.5 w-2.5" /> Locked
                             </span>
                         )}
                     </div>
-                </>
-            )}
+                )}
 
-            {/* Section 3: Multi-Selection Alignment Toolbar (Visible only when selectionCount >= 2) */}
-            {selectionCount >= 2 && (
-                <>
-                    <Divider />
-                    <div className="flex items-center gap-2 animate-in fade-in slide-in-from-top-1 duration-150 text-xs">
+                {selectionCount >= 2 && (
+                    <div className="flex items-center gap-2 text-xs animate-in fade-in slide-in-from-bottom-1 duration-150">
                         <div className="flex items-center gap-0.5">
                             <Btn title="Align Left" onClick={() => applyAlign("left")}><AlignLeft className="h-3.5 w-3.5" /></Btn>
                             <Btn title="Center Horizontally" onClick={() => applyAlign("centerX")}><AlignCenter className="h-3.5 w-3.5 rotate-90" /></Btn>
@@ -333,19 +219,12 @@ export function UnifiedCadToolbar() {
                             {selectedIds.length} Selected
                         </span>
                     </div>
-                </>
-            )}
-
+                )}
             </div>
         </div>
     );
 }
 
-function Divider() {
-    return <div className="h-5 w-px bg-slate-200" />;
-}
-
-// Compact DimField implementation
 interface DimFieldProps {
     label: string;
     value: number;
@@ -364,7 +243,7 @@ function DimField({ label, value, disabled, onCommit }: DimFieldProps) {
     const display = focused ? draft : fmtInches(value);
 
     return (
-        <label className="flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] focus-within:border-slate-400 focus-within:bg-white transition-all">
+        <label className="flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] transition-all focus-within:border-slate-400 focus-within:bg-white">
             <span className="font-semibold text-slate-400">{label}</span>
             <input
                 type="text"
@@ -391,7 +270,6 @@ function DimField({ label, value, disabled, onCommit }: DimFieldProps) {
     );
 }
 
-// Compact RotField implementation
 interface RotFieldProps {
     value: number;
     disabled?: boolean;
@@ -408,7 +286,7 @@ function RotField({ value, disabled, onCommit }: RotFieldProps) {
     }, [degStr, focused]);
 
     return (
-        <label className="flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] focus-within:border-slate-400 focus-within:bg-white transition-all">
+        <label className="flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] transition-all focus-within:border-slate-400 focus-within:bg-white">
             <span className="font-semibold text-slate-400">Rot°</span>
             <input
                 type="number"
@@ -430,7 +308,6 @@ function RotField({ value, disabled, onCommit }: RotFieldProps) {
     );
 }
 
-// Icon helper button
 function Btn({
     title, onClick, disabled, children, className = ""
 }: {
@@ -446,7 +323,7 @@ function Btn({
             title={title}
             disabled={disabled}
             onClick={onClick}
-            className={`rounded p-1 font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-800 transition disabled:cursor-not-allowed disabled:opacity-40 ${className}`}
+            className={`rounded p-1 font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-40 ${className}`}
         >
             {children}
         </button>

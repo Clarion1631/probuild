@@ -1,22 +1,26 @@
 // Root layout shell for a single room editing session. Mounts the canvas,
-// toolbar, and side panels; loads the initial snapshot into the store; wires
-// up autosave, undo/redo keyboard, and the Stage 2 asset-selection keyboard
-// shortcuts (arrows/R/G/Ctrl+D/Delete/Escape/L/M/1/2/3).
+// toolbar, side panels, bottom dock, and right-rail icon affordances; loads
+// the initial snapshot into the store; wires up autosave, undo/redo
+// keyboard, and the Stage 2 asset-selection keyboard shortcuts
+// (arrows/R/G/Ctrl+D/Delete/Escape/L/M/1/2/3).
 //
 // This component is rendered inside <next/dynamic { ssr: false }> at the page
 // level — R3F's <Canvas> needs `window` and WebGL, which don't exist in Node.
 //
 // Stage 3 panel layout: LayersPanel is a DOM sibling of the canvas (not a
-// canvas overlay) so HTML5 events aren't swallowed by WebGL. Alignment /
-// measurement / preset toolbars are absolute overlays INSIDE the canvas
-// wrapper with `pointer-events-auto` so they only consume their own clicks.
+// canvas overlay) so HTML5 events aren't swallowed by WebGL. SelectionCadBar
+// (selection-only) and BottomDock (always) are absolute overlays INSIDE the
+// canvas wrapper with `pointer-events-auto` so they only consume their own
+// clicks.
 
 import { useEffect } from "react";
 import { RoomCanvas } from "./canvas/RoomCanvas";
 import { RoomToolbar } from "./RoomToolbar";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { LayersPanel } from "./LayersPanel";
-import { UnifiedCadToolbar } from "./UnifiedCadToolbar";
+import { SelectionCadBar } from "./SelectionCadBar";
+import { BottomDock } from "./BottomDock";
+import { RightRail } from "./RightRail";
 import { AssetPanel } from "./AssetPanel";
 import { AssetContextMenu } from "./AssetContextMenu";
 import { OnboardingCoach } from "./OnboardingCoach";
@@ -72,19 +76,21 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
                 ownerContext={ownerContext}
                 initialShareState={initialShareState}
             />
-            <div className="flex min-h-0 flex-1 relative overflow-hidden">
-                {/* Premium RTA-style dual navigation sidebar */}
+            <div className="relative flex min-h-0 flex-1 overflow-hidden">
                 <AssetPanel />
-                
+
                 {showLayers && <LayersPanel />}
                 <div className="relative flex-1 bg-slate-200">
                     <div className="absolute inset-0">
                         <RoomCanvas />
                     </div>
-                    {/* Unified Floating CAD Bar Overlay */}
-                    <UnifiedCadToolbar />
+                    {/* Selection-only CAD bar (stacks above BottomDock) */}
+                    <SelectionCadBar />
+                    {/* Always-visible view dock */}
+                    <BottomDock ownerContext={ownerContext} roomName={roomName} />
                 </div>
                 {showProperties && <PropertiesPanel />}
+                <RightRail />
             </div>
             {/* Portals to document.body — outside the flex tree. */}
             <AssetContextMenu />

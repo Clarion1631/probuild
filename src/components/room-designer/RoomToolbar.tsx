@@ -1,28 +1,37 @@
-// Top toolbar — undo/redo, 2D/3D toggle, manual save, export (Stage 4 stub).
-// All wiring runs through the Zustand store so the toolbar stays pure.
+// Top bar — slim: left logo + room name + saved-label · center Save pill ·
+// right Add-to-Estimate, Designer-Assistance, and an overflow menu carrying
+// the lower-frequency actions (PNG/PDF/CSV/Share, Lighting, FX, Before/After).
+// View controls (undo/redo, 2D/3D, presets, measure, screenshot) live in
+// BottomDock now; Layers/Properties live in RightRail.
 
 import { useRoomStore } from "./hooks/useRoomStore";
 import { toast } from "sonner";
 import { exportToProBuild } from "@/lib/room-designer/blueprint3d-adapter";
 import { useEffect, useRef, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import {
     DEFAULT_PRESET,
     HDRI_PRESETS,
     HDRI_PRESET_ORDER,
     type HdriPreset,
 } from "@/lib/room-designer/hdri-presets";
-import {
-    downloadBlob,
-    renderRoomPng,
-    slugifyForFilename,
-} from "@/lib/room-designer/export-png";
-import { renderRoomPdf } from "@/lib/room-designer/export-pdf";
-import { buildMaterialsCsv } from "@/lib/room-designer/export-csv";
 import type { OwnerContext } from "@/lib/room-designer/owner-context";
 import { buildShareUrl } from "@/lib/room-designer/share-url";
 import type { RoomDesignerInitialShareState } from "./RoomDesignerClient";
 import { ShareModal } from "./ShareModal";
 import { PreviewModeToggle } from "./PreviewModeToggle";
+import { useRoomExports } from "./hooks/useRoomExports";
+import {
+    Calculator,
+    Cloud,
+    Image as ImageIcon,
+    FileText,
+    FileSpreadsheet,
+    Share2,
+    Sparkles,
+    MoreVertical,
+    Sun,
+} from "lucide-react";
 
 interface RoomToolbarProps {
     roomName: string;
@@ -31,113 +40,29 @@ interface RoomToolbarProps {
 }
 
 export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomToolbarProps) {
-    const viewMode = useRoomStore((s) => s.viewMode);
-    const setViewMode = useRoomStore((s) => s.setViewMode);
-    const undo = useRoomStore((s) => s.undo);
-    const redo = useRoomStore((s) => s.redo);
-    const past = useRoomStore((s) => s.past);
-    const future = useRoomStore((s) => s.future);
     const dirty = useRoomStore((s) => s.dirty);
     const lastSavedAt = useRoomStore((s) => s.lastSavedAt);
     const getSnapshot = useRoomStore((s) => s.getSnapshot);
     const markSaved = useRoomStore((s) => s.markSaved);
     const roomId = useRoomStore((s) => s.roomId);
-    const showLayers = useRoomStore((s) => s.showLayers);
-    const setShowLayers = useRoomStore((s) => s.setShowLayers);
-    const showMeasurements = useRoomStore((s) => s.showMeasurements);
-    const setShowMeasurements = useRoomStore((s) => s.setShowMeasurements);
 
     const [saving, setSaving] = useState(false);
-    const [exportingPng, setExportingPng] = useState(false);
-    const [exportingPdf, setExportingPdf] = useState(false);
     const [shareEnabled, setShareEnabled] = useState(initialShareState.enabled);
     const [shareUrl, setShareUrl] = useState<string | null>(
         initialShareState.token ? buildShareUrl(initialShareState.token) : null,
     );
     const [shareOpen, setShareOpen] = useState(false);
     const shareBtnRef = useRef<HTMLButtonElement | null>(null);
+    const [menuOpen, setMenuOpen] = useState(false);
+    const menuRef = useRef<HTMLDivElement>(null);
 
-    function exportCsv() {
-        const state = useRoomStore.getState();
-        try {
-            const csv = buildMaterialsCsv(state.assets);
-            // Prepend UTF-8 BOM so Excel opens accented characters correctly.
-            const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" });
-            const filename = `${slugifyForFilename(ownerContext.ownerName)}-${slugifyForFilename(roomName)}-materials.csv`;
-            downloadBlob(blob, filename);
-            toast.success("Materials list exported");
-        } catch (err) {
-            toast.error("CSV export failed");
-            // eslint-disable-next-line no-console
-            console.error(err);
-        }
-    }
+    const router = useRouter();
+    const pathname = usePathname();
 
-    async function exportPdf() {
-        const state = useRoomStore.getState();
-        const refs = state.canvasRefs;
-        if (!refs) {
-            toast.error("Canvas isn't ready yet — try again in a moment.");
-            return;
-        }
-        setExportingPdf(true);
-        try {
-            const blob = await renderRoomPdf(
-                {
-                    gl: refs.gl,
-                    scene: refs.scene,
-                    liveCamera: refs.camera,
-                    layout: state.layout,
-                },
-                {
-                    contractorName: ownerContext.contractorName,
-                    contractorLogoUrl: ownerContext.contractorLogoUrl,
-                    contractorAddress: ownerContext.contractorAddress,
-                    ownerName: ownerContext.ownerName,
-                    ownerAddress: ownerContext.ownerAddress,
-                },
-                { roomName },
-                state.assets,
-            );
-            const filename = `${slugifyForFilename(ownerContext.ownerName)}-${slugifyForFilename(roomName)}.pdf`;
-            downloadBlob(blob, filename);
-            toast.success("PDF exported");
-        } catch (err) {
-            toast.error("PDF export failed");
-            // eslint-disable-next-line no-console
-            console.error(err);
-        } finally {
-            setExportingPdf(false);
-        }
-    }
-
-    async function exportPng() {
-        const refs = useRoomStore.getState().canvasRefs;
-        if (!refs) {
-            toast.error("Canvas isn't ready yet — try again in a moment.");
-            return;
-        }
-        setExportingPng(true);
-        try {
-            const blob = await renderRoomPng(refs.gl, refs.scene, refs.camera, {
-                width: 2048,
-                height: 2048,
-                watermark: {
-                    contractor: ownerContext.contractorName,
-                    project: ownerContext.ownerName,
-                },
-            });
-            const filename = `${slugifyForFilename(ownerContext.ownerName)}-${slugifyForFilename(roomName)}.png`;
-            downloadBlob(blob, filename);
-            toast.success("Image exported");
-        } catch (err) {
-            toast.error("Image export failed");
-            // eslint-disable-next-line no-console
-            console.error(err);
-        } finally {
-            setExportingPng(false);
-        }
-    }
+    const { exportPng, exportPdf, exportCsv, exportingPng, exportingPdf } = useRoomExports({
+        ownerContext,
+        roomName,
+    });
 
     async function saveNow() {
         if (!roomId) return;
@@ -161,19 +86,51 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
         }
     }
 
-    // Ctrl+S force-save bridge — useAssetSelection dispatches this so the
-    // key handler doesn't need to reach into the toolbar's local state.
+    // Ctrl+S force-save bridge — useAssetSelection dispatches this so the key
+    // handler doesn't need to reach into the toolbar's local state.
     useEffect(() => {
         function onForceSave() {
             saveNow();
         }
         window.addEventListener("room-designer:force-save", onForceSave);
         return () => window.removeEventListener("room-designer:force-save", onForceSave);
-        // saveNow is a stable-enough closure for the room's lifecycle; deps
-        // kept empty intentionally so the listener isn't re-attached on every
-        // render (roomId never changes within a mounted toolbar).
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Close overflow menu on outside-click or Escape.
+    useEffect(() => {
+        if (!menuOpen) return;
+        function onDown(e: MouseEvent) {
+            if (!menuRef.current) return;
+            if (!menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+        }
+        function onKey(e: KeyboardEvent) {
+            if (e.key === "Escape") setMenuOpen(false);
+        }
+        document.addEventListener("mousedown", onDown);
+        document.addEventListener("keydown", onKey);
+        return () => {
+            document.removeEventListener("mousedown", onDown);
+            document.removeEventListener("keydown", onKey);
+        };
+    }, [menuOpen]);
+
+    function gotoEstimate() {
+        // pathname looks like /projects/:id/room-designer/:roomId or
+        // /leads/:id/room-designer/:roomId. Rebuild the estimates landing.
+        const parts = (pathname ?? "").split("/").filter(Boolean);
+        if (parts.length >= 2 && (parts[0] === "projects" || parts[0] === "leads")) {
+            router.push(`/${parts[0]}/${parts[1]}/estimates`);
+        } else {
+            toast.message("Open this room from a project or lead to add it to an estimate.");
+        }
+    }
+
+    function showAssistanceStub() {
+        toast.message("Designer Assistance coming soon", {
+            description: "Conversational design help is on the roadmap.",
+        });
+    }
 
     const savedLabel = dirty
         ? "Unsaved changes"
@@ -183,117 +140,109 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
 
     return (
         <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-2">
+            {/* Left — brand + room context */}
             <div className="flex items-center gap-3">
-                <h1 className="truncate text-sm font-semibold text-slate-900">{roomName}</h1>
-                <span className={`text-xs ${dirty ? "text-amber-600" : "text-slate-400"}`}>{savedLabel}</span>
+                <span className="flex h-7 w-7 items-center justify-center rounded-md bg-[#531b7e] text-sm font-bold text-white">
+                    P
+                </span>
+                <div className="flex flex-col leading-tight">
+                    <h1 className="truncate text-sm font-semibold text-slate-900">{roomName}</h1>
+                    <span className={`text-[10px] ${dirty ? "text-amber-600" : "text-slate-400"}`}>{savedLabel}</span>
+                </div>
             </div>
 
-            <div className="flex items-center gap-1">
+            {/* Center — Save pill */}
+            <div className="flex items-center">
                 <button
-                    onClick={undo}
-                    disabled={past.length === 0}
-                    className="hui-btn hui-btn-secondary px-2 py-1 text-xs disabled:opacity-40"
-                    title="Undo (Ctrl+Z)"
-                >
-                    ↶ Undo
-                </button>
-                <button
-                    onClick={redo}
-                    disabled={future.length === 0}
-                    className="hui-btn hui-btn-secondary px-2 py-1 text-xs disabled:opacity-40"
-                    title="Redo (Ctrl+Y)"
-                >
-                    ↷ Redo
-                </button>
-
-                <ToolModeIndicator />
-
-                <div className="mx-2 h-5 w-px bg-slate-200" />
-
-                <button
-                    onClick={() => setShowLayers(!showLayers)}
-                    className={`hui-btn px-2 py-1 text-xs ${showLayers ? "hui-btn-green" : "hui-btn-secondary"}`}
-                    title="Layers (L)"
-                >
-                    Layers
-                </button>
-                <button
-                    onClick={() => setShowMeasurements(!showMeasurements)}
-                    className={`hui-btn px-2 py-1 text-xs ${showMeasurements ? "hui-btn-green" : "hui-btn-secondary"}`}
-                    title="Measurements (M)"
-                >
-                    Measure
-                </button>
-
-                <HdriPicker />
-                <FxToggle />
-
-                <div className="mx-2 h-5 w-px bg-slate-200" />
-
-                <div className="flex overflow-hidden rounded-md border border-slate-200">
-                    <button
-                        onClick={() => setViewMode("2d")}
-                        className={`px-3 py-1 text-xs font-medium transition ${
-                            viewMode === "2d" ? "bg-slate-900 text-white" : "bg-white text-slate-700 hover:bg-slate-50"
-                        }`}
-                    >
-                        2D
-                    </button>
-                    <button
-                        onClick={() => setViewMode("3d")}
-                        className={`px-3 py-1 text-xs font-medium transition ${
-                            viewMode === "3d" ? "bg-slate-900 text-white" : "bg-white text-slate-700 hover:bg-slate-50"
-                        }`}
-                    >
-                        3D
-                    </button>
-                </div>
-
-                <PreviewModeToggle />
-
-                <div className="mx-2 h-5 w-px bg-slate-200" />
-
-                <button
+                    type="button"
                     onClick={saveNow}
                     disabled={saving || !dirty}
-                    className="hui-btn hui-btn-green px-3 py-1 text-xs disabled:opacity-50"
+                    className="hui-btn hui-btn-green rounded-full px-4 py-1.5 text-xs disabled:opacity-50"
                 >
-                    {saving ? "Saving…" : "Save"}
+                    <Cloud className="mr-1.5 h-3.5 w-3.5" />
+                    {saving ? "Saving…" : dirty ? "Save" : "All changes saved"}
+                </button>
+            </div>
+
+            {/* Right — Estimate / Assistance / overflow */}
+            <div className="flex items-center gap-2">
+                <button
+                    type="button"
+                    onClick={gotoEstimate}
+                    className="hui-btn hui-btn-purple rounded-full px-3 py-1.5 text-xs"
+                >
+                    <Calculator className="mr-1.5 h-3.5 w-3.5" />
+                    Add to Estimate
                 </button>
                 <button
-                    onClick={exportPng}
-                    disabled={exportingPng}
-                    className="hui-btn hui-btn-secondary px-2 py-1 text-xs disabled:opacity-50"
-                    title="Export as PNG image (2048×2048, watermarked)"
+                    type="button"
+                    onClick={showAssistanceStub}
+                    className="hui-btn hui-btn-secondary rounded-full px-3 py-1.5 text-xs"
                 >
-                    {exportingPng ? "Exporting…" : "Export Image"}
-                </button>
-                <button
-                    onClick={exportPdf}
-                    disabled={exportingPdf}
-                    className="hui-btn hui-btn-secondary px-2 py-1 text-xs disabled:opacity-50"
-                    title="Export 3-page PDF (perspective, top-down, materials list)"
-                >
-                    {exportingPdf ? "Exporting…" : "Export PDF"}
-                </button>
-                <button
-                    onClick={exportCsv}
-                    className="hui-btn hui-btn-secondary px-2 py-1 text-xs"
-                    title="Download materials list as CSV"
-                >
-                    Materials CSV
+                    <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                    Designer Assistance
                 </button>
 
-                <div className="relative">
+                <div ref={menuRef} className="relative">
                     <button
                         ref={shareBtnRef}
-                        onClick={() => setShareOpen((v) => !v)}
-                        className={`hui-btn px-2 py-1 text-xs ${shareEnabled ? "hui-btn-green" : "hui-btn-secondary"}`}
-                        title={shareEnabled ? "Share link enabled" : "Share with a client"}
+                        type="button"
+                        onClick={() => setMenuOpen((v) => !v)}
+                        aria-label="More actions"
+                        aria-haspopup="menu"
+                        aria-expanded={menuOpen}
+                        className="hui-btn hui-btn-secondary rounded-full p-1.5"
                     >
-                        Share
-                        {shareEnabled && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-300" aria-hidden />}
+                        <MoreVertical className="h-4 w-4" />
                     </button>
+                    {menuOpen && (
+                        <div
+                            role="menu"
+                            className="absolute right-0 top-full z-30 mt-1 w-56 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-lg"
+                        >
+                            <MenuButton
+                                icon={<ImageIcon className="h-3.5 w-3.5" />}
+                                label={exportingPng ? "Exporting…" : "Export image (PNG)"}
+                                disabled={exportingPng}
+                                onClick={() => { exportPng(); setMenuOpen(false); }}
+                            />
+                            <MenuButton
+                                icon={<FileText className="h-3.5 w-3.5" />}
+                                label={exportingPdf ? "Exporting…" : "Export PDF"}
+                                disabled={exportingPdf}
+                                onClick={() => { exportPdf(); setMenuOpen(false); }}
+                            />
+                            <MenuButton
+                                icon={<FileSpreadsheet className="h-3.5 w-3.5" />}
+                                label="Materials list (CSV)"
+                                onClick={() => { exportCsv(); setMenuOpen(false); }}
+                            />
+                            <MenuButton
+                                icon={<Share2 className="h-3.5 w-3.5" />}
+                                label={shareEnabled ? "Share link (enabled)" : "Share with a client"}
+                                onClick={() => {
+                                    setShareOpen(true);
+                                    setMenuOpen(false);
+                                }}
+                                trailing={
+                                    shareEnabled ? (
+                                        <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400" aria-hidden />
+                                    ) : null
+                                }
+                            />
+                            <div className="my-1 border-t border-slate-100" />
+                            <div className="px-3 py-2">
+                                <HdriPicker />
+                            </div>
+                            <div className="px-3 py-2">
+                                <FxToggle />
+                            </div>
+                            <div className="px-3 py-2">
+                                <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">Preview</span>
+                                <PreviewModeToggle />
+                            </div>
+                        </div>
+                    )}
                     {shareOpen && roomId && (
                         <ShareModal
                             roomId={roomId}
@@ -323,104 +272,92 @@ function timeAgo(ts: number): string {
     return `${h}h ago`;
 }
 
-// ─────────────── Tool mode indicator ───────────────
-function ToolModeIndicator() {
-    const toolMode = useRoomStore((s) => s.toolMode);
-    const hasSelection = useRoomStore((s) => s.selectedAssetIds.length > 0);
-    if (!hasSelection) return null;
+interface MenuButtonProps {
+    icon: React.ReactNode;
+    label: string;
+    disabled?: boolean;
+    onClick: () => void;
+    trailing?: React.ReactNode;
+}
 
-    const labels: Record<string, string> = {
-        translate: "Move (1)",
-        rotate: "Rotate (2)",
-        scale: "Scale (3)",
-    };
-
+function MenuButton({ icon, label, disabled, onClick, trailing }: MenuButtonProps) {
     return (
-        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">
-            {labels[toolMode] ?? toolMode}
-        </span>
+        <button
+            type="button"
+            role="menuitem"
+            disabled={disabled}
+            onClick={onClick}
+            className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-xs text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+            <span className="flex items-center gap-2">
+                <span className="text-slate-500">{icon}</span>
+                {label}
+            </span>
+            {trailing}
+        </button>
     );
 }
 
-// ─────────────── FX toggle (Stage 4 — SSAO + Bloom) ───────────────
 function FxToggle() {
     const effectsEnabled = useRoomStore((s) => s.effectsEnabled);
     const toggleEffects = useRoomStore((s) => s.toggleEffects);
     return (
         <button
+            type="button"
             onClick={toggleEffects}
-            className={`hui-btn px-2 py-1 text-xs ${effectsEnabled ? "hui-btn-green" : "hui-btn-secondary"}`}
-            title="Post-effects (ambient occlusion + bloom)"
+            className="flex w-full items-center justify-between text-xs text-slate-700"
         >
-            FX
-            {effectsEnabled && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-300" aria-hidden />}
+            <span className="flex items-center gap-2">
+                <Sparkles className="h-3.5 w-3.5 text-slate-500" />
+                Post-effects (SSAO + Bloom)
+            </span>
+            <span
+                className={`inline-flex h-4 w-7 items-center rounded-full px-0.5 transition-colors ${
+                    effectsEnabled ? "bg-[#531b7e]" : "bg-slate-300"
+                }`}
+                aria-hidden
+            >
+                <span
+                    className={`h-3 w-3 rounded-full bg-white transition-transform ${
+                        effectsEnabled ? "translate-x-3" : "translate-x-0"
+                    }`}
+                />
+            </span>
         </button>
     );
 }
 
-// ─────────────── HDRI picker (Stage 4 — lighting preset) ───────────────
-// Reads from layout.lighting.hdriPreset and writes via setHdriPreset (which
-// rides through setLayout → history → dirty → autosave). Closes on outside
-// click, Escape, or selection.
 function HdriPicker() {
     const layout = useRoomStore((s) => s.layout);
     const setHdriPreset = useRoomStore((s) => s.setHdriPreset);
     const preset: HdriPreset = layout.lighting?.hdriPreset ?? DEFAULT_PRESET;
-    const currentLabel = HDRI_PRESETS[preset].label;
-
-    const [open, setOpen] = useState(false);
-    const wrapRef = useRef<HTMLDivElement>(null);
-
-    useEffect(() => {
-        if (!open) return;
-        function onDown(e: MouseEvent) {
-            if (!wrapRef.current) return;
-            if (!wrapRef.current.contains(e.target as Node)) setOpen(false);
-        }
-        function onKey(e: KeyboardEvent) {
-            if (e.key === "Escape") setOpen(false);
-        }
-        document.addEventListener("mousedown", onDown);
-        document.addEventListener("keydown", onKey);
-        return () => {
-            document.removeEventListener("mousedown", onDown);
-            document.removeEventListener("keydown", onKey);
-        };
-    }, [open]);
 
     return (
-        <div ref={wrapRef} className="relative">
-            <button
-                onClick={() => setOpen((v) => !v)}
-                className="hui-btn hui-btn-secondary px-2 py-1 text-xs"
-                title="Lighting preset"
-            >
-                Lighting: <span className="font-medium">{currentLabel}</span>{" "}
-                <span className="ml-0.5 text-slate-400">▾</span>
-            </button>
-            {open && (
-                <div className="absolute left-0 top-full z-20 mt-1 w-44 overflow-hidden rounded-md border border-slate-200 bg-white shadow-lg">
-                    {HDRI_PRESET_ORDER.map((k) => {
-                        const meta = HDRI_PRESETS[k];
-                        const active = k === preset;
-                        return (
-                            <button
-                                key={k}
-                                onClick={() => {
-                                    setHdriPreset(k);
-                                    setOpen(false);
-                                }}
-                                className={`flex w-full items-center justify-between px-3 py-1.5 text-left text-xs transition ${
-                                    active ? "bg-slate-900 text-white" : "bg-white text-slate-700 hover:bg-slate-50"
-                                }`}
-                            >
-                                <span>{meta.label}</span>
-                                {active && <span aria-hidden>✓</span>}
-                            </button>
-                        );
-                    })}
-                </div>
-            )}
+        <div className="flex flex-col gap-1">
+            <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                <Sun className="h-3 w-3" /> Lighting
+            </span>
+            <div className="grid grid-cols-2 gap-1">
+                {HDRI_PRESET_ORDER.map((k) => {
+                    const meta = HDRI_PRESETS[k];
+                    const active = k === preset;
+                    return (
+                        <button
+                            key={k}
+                            type="button"
+                            onClick={() => setHdriPreset(k)}
+                            className={
+                                "rounded border px-2 py-1 text-left text-[10px] font-medium transition " +
+                                (active
+                                    ? "border-[#531b7e] bg-purple-50 text-[#531b7e]"
+                                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50")
+                            }
+                        >
+                            {meta.label}
+                        </button>
+                    );
+                })}
+            </div>
         </div>
     );
 }
