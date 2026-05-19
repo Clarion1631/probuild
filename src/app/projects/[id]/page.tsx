@@ -1,4 +1,4 @@
-import { getProject, getScheduleTasks, getPortalVisibility } from "@/lib/actions";
+import { getProject, getDashboardTasks, getPortalVisibility } from "@/lib/actions";
 import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -30,8 +30,8 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
     console.time("[DASHBOARD] getProject");
     const projectPromise = getProject(id).then(r => { console.timeEnd("[DASHBOARD] getProject"); return r; });
 
-    console.time("[DASHBOARD] getScheduleTasks");
-    const tasksPromise = getScheduleTasks(id).then(r => { console.timeEnd("[DASHBOARD] getScheduleTasks"); return r; });
+    console.time("[DASHBOARD] getDashboardTasks");
+    const tasksPromise = getDashboardTasks(id).then(r => { console.timeEnd("[DASHBOARD] getDashboardTasks"); return r; });
 
     console.time("[DASHBOARD] getPortalVisibility");
     const portalVisibilityPromise = getPortalVisibility(id).then(r => { console.timeEnd("[DASHBOARD] getPortalVisibility"); return r; });

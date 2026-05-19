@@ -4369,6 +4369,21 @@ export async function getScheduleTasks(projectId: string) {
     });
 }
 
+export async function getDashboardTasks(projectId: string) {
+    return prisma.scheduleTask.findMany({
+        where: { projectId },
+        orderBy: { order: "asc" },
+        select: {
+            id: true,
+            status: true,
+            endDate: true,
+            color: true,
+            name: true,
+            progress: true,
+        }
+    });
+}
+
 export async function getEstimateItemsForProject(projectId: string) {
     const items = await prisma.estimateItem.findMany({
         where: { estimate: { projectId }, type: { not: "Section" } },

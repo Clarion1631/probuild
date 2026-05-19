@@ -705,6 +705,9 @@ model ScheduleTask {
   punchItems     TaskPunchItem[]
   assignments    TaskAssignment[]
   subAssignments SubTaskAssignment[]
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model TaskDependency {
@@ -1084,6 +1087,8 @@ model ChangeOrder {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
 }
 
 model ChangeOrderItem {
@@ -1320,6 +1325,8 @@ model DailyLog {
   photos             DailyLogPhoto[]
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
+
+  @@index([projectId])
 }
 
 model DailyLogPhoto {
