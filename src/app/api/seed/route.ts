@@ -51,7 +51,7 @@ export async function GET(req: Request) {
             }
         });
 
-        const project2 = await prisma.project.create({
+        const projectAdkinsKitchen = await prisma.project.create({
             data: {
                 name: 'Adkins Kitchen',
                 clientId: client3.id,
@@ -66,7 +66,7 @@ export async function GET(req: Request) {
         await prisma.estimate.create({
             data: {
                 title: 'Adkins Kitchen Renovation',
-                projectId: project2.id,
+                projectId: projectAdkinsKitchen.id,
                 code: 'EST-103',
                 status: 'Approved',
                 totalAmount: 10000,
