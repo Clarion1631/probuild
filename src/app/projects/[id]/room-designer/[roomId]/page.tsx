@@ -25,7 +25,7 @@ export default async function ProjectRoomEditorPage(
     // Matches the estimate editor's pattern — keeps the inner project sidebar
     // visible while the designer takes the remaining space.
     return (
-        <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
+        <div className="flex flex-grow flex-1 w-full h-[calc(100%+48px)] -m-6 overflow-hidden">
             <RoomDesignerClient
                 snapshot={snapshot}
                 roomName={room.name}

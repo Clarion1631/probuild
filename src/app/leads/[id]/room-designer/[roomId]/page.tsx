@@ -24,7 +24,7 @@ export default async function LeadRoomEditorPage(
     // to RoomDesignerNavContent on isRoomEditor. So we just fill the main
     // page content here.
     return (
-        <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
+        <div className="flex flex-grow flex-1 w-full h-[calc(100%+48px)] -m-6 overflow-hidden">
             <RoomDesignerClient
                 snapshot={snapshot}
                 roomName={room.name}

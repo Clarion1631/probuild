@@ -127,7 +127,7 @@ export default function EntitySidebar({
         <>
         <div
             style={{
-                display: isRoomEditor ? "none" : "flex",
+                display: "flex",
                 flex: sidebarCollapsed ? "0 0 48px" : "0 0 224px",
                 maxWidth: sidebarCollapsed ? "48px" : "224px",
                 minWidth: 0,
@@ -276,7 +276,7 @@ export default function EntitySidebar({
                 </div>
             </div>
 
-            {entity.type === "lead" && onConvertToProject && (
+            {!isRoomEditor && entity.type === "lead" && onConvertToProject && (
                 <div className="px-4 py-3 border-t border-hui-border shrink-0">
                     <button
                         onClick={onConvertToProject}
