@@ -21,7 +21,6 @@ import { LayersPanel } from "./LayersPanel";
 import { SelectionCadBar } from "./SelectionCadBar";
 import { BottomDock } from "./BottomDock";
 import { RightRail } from "./RightRail";
-import { AssetPanel } from "./AssetPanel";
 import { AssetContextMenu } from "./AssetContextMenu";
 import { OnboardingCoach } from "./OnboardingCoach";
 import { ShortcutLegend } from "./ShortcutLegend";
@@ -79,7 +78,6 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
                 initialShareState={initialShareState}
             />
             <div className="relative flex min-h-0 flex-1 overflow-hidden">
-                <AssetPanel />
 
                 {showLayers && <LayersPanel />}
                 <div className="relative flex-1 bg-gradient-to-tr from-[#f0f2fd] to-[#ffffff]">

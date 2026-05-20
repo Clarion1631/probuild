@@ -38,6 +38,14 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
     // instead of a left sidebar AND a second right panel.
     const isRoomEditor = /^\/projects\/[^/]+\/room-designer\/[^/]+$/.test(pathname || "");
 
+    // Force sidebar to be expanded when entering the Room Designer session
+    // so editing tools are visible on mount (even if collapsed in other pages)
+    useEffect(() => {
+        if (isRoomEditor) {
+            setSidebarCollapsed(false);
+        }
+    }, [isRoomEditor]);
+
     const toggleSidebar = () => {
         setSidebarCollapsed(prev => {
             const next = !prev;

@@ -40,6 +40,14 @@ export default function EntitySidebar({
         /^\/projects\/[^/]+\/room-designer\/[^/]+$/.test(pathname || "") ||
         /^\/leads\/[^/]+\/room-designer\/[^/]+$/.test(pathname || "");
 
+    // Force sidebar to be expanded when entering the Room Designer session
+    // so editing tools are visible on mount (even if collapsed in other pages)
+    useEffect(() => {
+        if (isRoomEditor) {
+            setSidebarCollapsed(false);
+        }
+    }, [isRoomEditor]);
+
     const toggleSidebar = () => {
         setSidebarCollapsed(prev => {
             const next = !prev;
