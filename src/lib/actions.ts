@@ -1088,7 +1088,7 @@ export async function listRoomsForLead(leadId: string) {
     return JSON.parse(JSON.stringify(rooms));
 }
 
-export async function getEstimate(id: string) {
+export const getEstimate = cache(async function getEstimate(id: string) {
     try {
         // Full query — works when all schema columns exist in DB
         return await prisma.estimate.findUnique({
@@ -1139,7 +1139,7 @@ export async function getEstimate(id: string) {
             },
         });
     }
-}
+});
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
     await prisma.estimate.update({
@@ -1152,7 +1152,7 @@ export async function updateEstimateStatus(id: string, status: string, leadId?: 
     revalidatePath(`/projects/${projectId}/estimates/${id}`);
 }
 
-export async function getEstimateForPortal(id: string) {
+export const getEstimateForPortal = cache(async function getEstimateForPortal(id: string) {
     // Staff members (any user with a role on their session) can preview any estimate.
     // Portal clients must pass the IDOR ownership check below.
     const staffSession = await getServerSession(authOptions);
@@ -1279,7 +1279,7 @@ export async function getEstimateForPortal(id: string) {
         clientEmail: estimate.project?.client?.email || estimate.lead?.client?.email || null,
         jobsiteAddress: estimate.project?.location || estimate.lead?.location || null,
     }));
-}
+});
 
 /** Returns the id of the "Payment in Full" schedule for an estimate, creating one if none exist.
  *  Amount is always derived server-side from balanceDue to prevent client-side manipulation.
@@ -1327,7 +1327,7 @@ export async function ensureEstimatePayInFullSchedule(estimateId: string): Promi
     }
 }
 
-export async function getAllEstimates() {
+export const getAllEstimates = cache(async function getAllEstimates() {
     return await prisma.estimate.findMany({
         orderBy: { createdAt: "desc" },
         select: {
@@ -1350,7 +1350,7 @@ export async function getAllEstimates() {
             },
         },
     });
-}
+});
 
 // Race-safe find-or-create for the client MessageThread (subcontractorId IS NULL).
 // Exported for use in API route handlers that can't import server actions directly.
@@ -1825,6 +1825,31 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     }
 
     if (estimate?.projectId) {
+        const existingBudget = await prisma.budget.findUnique({ where: { estimateId } });
+        if (!existingBudget) {
+            const itemsList = await prisma.estimateItem.findMany({ where: { estimateId } });
+            const parentIds = new Set(itemsList.map(item => item.parentId).filter(Boolean));
+            const leafItems = itemsList.filter(item => !parentIds.has(item.id) && item.type !== "Section");
+
+            let totalLaborBudget = 0;
+            let totalMaterialBudget = 0;
+            for (const item of leafItems) {
+                if (item.type === "Labor") {
+                    totalLaborBudget += toNum(item.total);
+                } else {
+                    totalMaterialBudget += toNum(item.total);
+                }
+            }
+            await prisma.budget.create({
+                data: {
+                    projectId: estimate.projectId,
+                    estimateId,
+                    totalLaborBudget,
+                    totalMaterialBudget,
+                },
+            });
+        }
+
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
         revalidatePath(`/projects/${estimate.projectId}/files`);
     }
@@ -2097,14 +2122,46 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             await tx.estimate.update({ where: { id: estimateId }, data: safeData });
         }
 
-        // Delete existing items and NON-PAID schedules, then batch-insert replacements
-        // Preserve Paid schedules so payment history survives estimate edits
-        await tx.estimateItem.deleteMany({ where: { estimateId } });
-        await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId, status: { not: "Paid" } } });
+        // 1. Differential Item Upsert
+        const existingItems = await tx.estimateItem.findMany({ where: { estimateId } });
+        const existingItemsMap = new Map(existingItems.map(item => [item.id, item]));
 
-        // Build item data — split parents/children so FK ordering is respected
+        const incomingItemIds = new Set(items.map(item => item.id).filter(Boolean));
+        const deletedItems = existingItems.filter(item => !incomingItemIds.has(item.id));
+
+        if (deletedItems.length > 0) {
+            const deletedItemIds = deletedItems.map(item => item.id);
+            // Check for linked expenses/time entries first to throw descriptive error before cascading delete
+            const linkedExpensesCount = await tx.expense.count({
+                where: { itemId: { in: deletedItemIds } }
+            });
+            const linkedTimeEntriesCount = await tx.timeEntry.count({
+                where: { estimateItemId: { in: deletedItemIds } }
+            });
+            if (linkedExpensesCount > 0 || linkedTimeEntriesCount > 0) {
+                const parts = [];
+                if (linkedExpensesCount > 0) parts.push(`${linkedExpensesCount} expense(s)`);
+                if (linkedTimeEntriesCount > 0) parts.push(`${linkedTimeEntriesCount} time entry/entries`);
+                throw new Error(`Cannot delete estimate item(s) because they have linked ${parts.join(" and ")}. Please delete or re-assign these entries first.`);
+            }
+
+            // Delete child items first, then parent items to respect FK reference order
+            await tx.estimateItem.deleteMany({
+                where: {
+                    id: { in: deletedItemIds },
+                    parentId: { not: null }
+                }
+            });
+            await tx.estimateItem.deleteMany({
+                where: {
+                    id: { in: deletedItemIds },
+                    parentId: null
+                }
+            });
+        }
+
         const toItemData = (item: any, fallbackOrder: number) => ({
-            ...(item.id ? { id: item.id } : {}),
+            id: item.id,
             estimateId,
             name: item.name,
             description: item.description || "",
@@ -2127,37 +2184,117 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         const parentItems = items.filter((i: any) => !i.parentId);
         const childItems  = items.filter((i: any) =>  i.parentId);
 
-        if (parentItems.length > 0) {
-            await tx.estimateItem.createMany({ data: parentItems.map(toItemData) });
-        }
-        if (childItems.length > 0) {
-            await tx.estimateItem.createMany({ data: childItems.map(toItemData) });
+        // Upsert Parents
+        for (let idx = 0; idx < parentItems.length; idx++) {
+            const item = parentItems[idx];
+            const itemData = toItemData(item, idx);
+            if (item.id && existingItemsMap.has(item.id)) {
+                await tx.estimateItem.update({
+                    where: { id: item.id },
+                    data: itemData,
+                });
+            } else {
+                await tx.estimateItem.create({
+                    data: itemData,
+                });
+            }
         }
 
-        // Batch-insert payment schedules (skip Paid ones — they were preserved above)
-        const schedules = (data.paymentSchedules || []).filter((s: any) => s.status !== "Paid");
-        if (schedules.length > 0) {
-            await tx.estimatePaymentSchedule.createMany({
-                data: schedules.map((schedule: any, idx: number) => ({
-                    ...(schedule.id ? { id: schedule.id } : {}),
-                    estimateId,
-                    name: schedule.name,
-                    percentage: schedule.percentage ? parseFloat(schedule.percentage) : null,
-                    amount: parseFloat(schedule.amount) || 0,
-                    dueDate: schedule.dueDate ? new Date(schedule.dueDate) : null,
-                    order: schedule.order ?? idx,
-                })),
+        // Upsert Children
+        for (let idx = 0; idx < childItems.length; idx++) {
+            const item = childItems[idx];
+            const itemData = toItemData(item, idx);
+            if (item.id && existingItemsMap.has(item.id)) {
+                await tx.estimateItem.update({
+                    where: { id: item.id },
+                    data: itemData,
+                });
+            } else {
+                await tx.estimateItem.create({
+                    data: itemData,
+                });
+            }
+        }
+
+        // 2. Differential Payment Schedule Upsert
+        const existingSchedules = await tx.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        const existingSchedulesMap = new Map(existingSchedules.map(s => [s.id, s]));
+
+        const incomingSchedules = data.paymentSchedules || [];
+        const incomingScheduleIds = new Set(incomingSchedules.map((s: any) => s.id).filter(Boolean));
+
+        // Delete schedules that are not in incoming payload AND are not Paid and have no active Stripe session/intent
+        const schedulesToDelete = existingSchedules.filter(s => 
+            !incomingScheduleIds.has(s.id) &&
+            s.status !== "Paid" &&
+            !s.stripeSessionId &&
+            !s.stripePaymentIntentId
+        );
+
+        if (schedulesToDelete.length > 0) {
+            await tx.estimatePaymentSchedule.deleteMany({
+                where: { id: { in: schedulesToDelete.map(s => s.id) } }
             });
         }
 
+        // Update or insert incoming schedules
+        for (let idx = 0; idx < incomingSchedules.length; idx++) {
+            const s = incomingSchedules[idx];
+            const dueDateParsed = s.dueDate ? new Date(s.dueDate) : null;
+            const amountParsed = parseFloat(s.amount) || 0;
+            const pctParsed = s.percentage ? parseFloat(s.percentage) : null;
+
+            if (s.id && existingSchedulesMap.has(s.id)) {
+                const existing = existingSchedulesMap.get(s.id)!;
+                if (existing.status === "Paid") {
+                    // Paid schedules preserve status and amount but update name/order/dueDate
+                    await tx.estimatePaymentSchedule.update({
+                        where: { id: s.id },
+                        data: {
+                            name: s.name,
+                            dueDate: dueDateParsed,
+                            order: s.order ?? idx,
+                        }
+                    });
+                } else {
+                    await tx.estimatePaymentSchedule.update({
+                        where: { id: s.id },
+                        data: {
+                            name: s.name,
+                            percentage: pctParsed,
+                            amount: amountParsed,
+                            dueDate: dueDateParsed,
+                            order: s.order ?? idx,
+                        }
+                    });
+                }
+            } else {
+                await tx.estimatePaymentSchedule.create({
+                    data: {
+                        ...(s.id ? { id: s.id } : {}),
+                        estimateId,
+                        name: s.name,
+                        percentage: pctParsed,
+                        amount: amountParsed,
+                        dueDate: dueDateParsed,
+                        order: s.order ?? idx,
+                        status: s.status || "Pending",
+                    }
+                });
+            }
+        }
+
+        // 3. Project Budget Generation (Leaf items only to avoid double-counting)
         if (data.status === 'Approved' && contextType === 'project') {
             const existingBudget = await tx.budget.findUnique({ where: { estimateId } });
             if (!existingBudget) {
-                // Inline generation inside the transaction to reuse tx client and secure execution
                 const itemsList = await tx.estimateItem.findMany({ where: { estimateId } });
+                const parentIds = new Set(itemsList.map(item => item.parentId).filter(Boolean));
+                const leafItems = itemsList.filter(item => !parentIds.has(item.id) && item.type !== "Section");
+
                 let totalLaborBudget = 0;
                 let totalMaterialBudget = 0;
-                for (const item of itemsList) {
+                for (const item of leafItems) {
                     if (item.type === "Labor") {
                         totalLaborBudget += toNum(item.total);
                     } else {
@@ -2196,30 +2333,40 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
     const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
     const scheduleCount = await prisma.estimatePaymentSchedule.count({ where: { estimateId } });
 
-    await prisma.estimatePaymentSchedule.create({
+    const createdSchedule = await prisma.estimatePaymentSchedule.create({
         data: {
             estimateId,
             name: `Payment — ${data.paymentMethod} (${refNum})`,
             amount: data.amount,
             dueDate: new Date(data.date),
             order: scheduleCount,
+            status: "Paid",
+            paidAt: new Date(),
+            paymentDate: new Date(data.date),
+            paymentMethod: data.paymentMethod.toLowerCase(),
+            referenceNumber: refNum,
         },
     });
 
     // Update balance — round to 2 decimal places to avoid floating-point drift
     const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
+    const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
+    const isFirstPayment = !estimate.statusBeforePayment;
+    const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
+
     await prisma.estimate.update({
         where: { id: estimateId },
         data: {
             balanceDue: newBalance,
-            ...(newBalance === 0 ? { status: "Paid" } : {}),
+            status: newStatus,
+            statusBeforePayment,
         },
     });
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
     }
-    return { success: true };
+    return { success: true, schedule: createdSchedule, newStatus, newBalance };
 }
 
 export async function archiveEstimate(estimateId: string) {
@@ -2327,15 +2474,27 @@ export async function createInvoiceFromEstimate(estimateId: string) {
         orderBy: { order: "asc" },
     });
 
+    let paidAmount = 0;
     if (schedules.length > 0) {
         for (const schedule of schedules) {
+            const isPaid = schedule.status === "Paid";
+            if (isPaid) {
+                paidAmount += toNum(schedule.amount);
+            }
             await prisma.paymentSchedule.create({
                 data: {
                     invoiceId: invoice.id,
                     name: schedule.name,
                     amount: schedule.amount,
-                    status: "Pending",
+                    status: schedule.status,
                     dueDate: schedule.dueDate || null,
+                    paymentDate: schedule.paymentDate || null,
+                    paidAt: schedule.paidAt || null,
+                    stripeSessionId: schedule.stripeSessionId || null,
+                    stripePaymentIntentId: schedule.stripePaymentIntentId || null,
+                    paymentMethod: schedule.paymentMethod || null,
+                    referenceNumber: schedule.referenceNumber || null,
+                    notes: schedule.notes || null,
                 },
             });
         }
@@ -2349,6 +2508,21 @@ export async function createInvoiceFromEstimate(estimateId: string) {
             },
         });
     }
+
+    const newBalanceDue = Math.max(0, total - paidAmount);
+    let invoiceStatus = "Draft";
+    if (paidAmount > 0) {
+        invoiceStatus = newBalanceDue <= 0 ? "Paid" : "Partially Paid";
+    }
+
+    await prisma.invoice.update({
+        where: { id: invoice.id },
+        data: {
+            code: invoiceCode,
+            balanceDue: newBalanceDue,
+            status: invoiceStatus,
+        }
+    });
 
     revalidatePath(`/projects/${estimate.projectId}/invoices`);
     return { id: invoice.id, projectId: estimate.projectId };
@@ -3096,8 +3270,30 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
         select: { projectId: true, leadId: true, status: true },
     });
     if (!estimate) return { success: false, error: "Estimate not found" };
-    const PROTECTED_STATUSES = new Set(["Approved", "Invoiced", "Partially Paid"]);
+    const PROTECTED_STATUSES = new Set(["Approved", "Invoiced", "Partially Paid", "Paid"]);
     if (PROTECTED_STATUSES.has(estimate.status)) return { success: false, error: `${estimate.status} estimates cannot be deleted` };
+
+    // Check if there are any linked Expenses or TimeEntries
+    const expenseCount = await prisma.expense.count({
+        where: { estimateId }
+    });
+    const timeEntryCount = await prisma.timeEntry.count({
+        where: {
+            estimateItem: {
+                estimateId
+            }
+        }
+    });
+
+    if (expenseCount > 0 || timeEntryCount > 0) {
+        const parts = [];
+        if (expenseCount > 0) parts.push(`${expenseCount} expense(s)`);
+        if (timeEntryCount > 0) parts.push(`${timeEntryCount} time entry/entries`);
+        return {
+            success: false,
+            error: `Cannot delete estimate because it has linked ${parts.join(" and ")}. Please delete these entries first.`
+        };
+    }
 
     // Delete related Budget
     const budget = await prisma.budget.findUnique({ where: { estimateId } });
@@ -3487,39 +3683,19 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
         const balanceDue = rc(estimateTotal - paidSum);
 
-        // Recalculate percentage-based unpaid milestones so stale DB values (from edits
-        // made without clicking Save) don't block sending. The LAST percentage milestone
-        // (by order) absorbs any rounding residual, guaranteeing the total sums exactly to
-        // balanceDue. If the computed lastAmount would be negative (inconsistent user data)
-        // we skip auto-correction and let the manual validation error fire instead.
-        const pctUnpaid = unpaidSchedules.filter(s => (s.percentage != null ? Number(s.percentage) : 0) > 0);
-        if (pctUnpaid.length > 0) {
-            const allButLast = pctUnpaid.slice(0, -1);
-            const allButLastAmounts = allButLast.map(s => rc(estimateTotal * (Number(s.percentage!) / 100)));
-            const allButLastSum = allButLastAmounts.reduce((a, b) => a + b, 0);
-            const fixedUnpaidSum = unpaidSchedules
-                .filter(s => (s.percentage != null ? Number(s.percentage) : 0) <= 0)
-                .reduce((sum, s) => sum + toNum(s.amount), 0);
-            const lastMilestone = pctUnpaid[pctUnpaid.length - 1];
-            const lastAmount = rc(balanceDue - fixedUnpaidSum - allButLastSum);
+        const otherUnpaidSum = unpaidSchedules.slice(0, -1).reduce((sum, s) => sum + toNum(s.amount), 0);
+        const lastMilestone = unpaidSchedules[unpaidSchedules.length - 1];
+        const correctLastAmount = rc(balanceDue - otherUnpaidSum);
 
-            if (lastAmount >= 0) {
-                const updates: { id: string; amount: number }[] = [];
-                allButLast.forEach((s, i) => {
-                    if (Math.abs(allButLastAmounts[i] - toNum(s.amount)) > 0.001)
-                        updates.push({ id: s.id, amount: allButLastAmounts[i] });
-                });
-                if (Math.abs(lastAmount - toNum(lastMilestone.amount)) > 0.001)
-                    updates.push({ id: lastMilestone.id, amount: lastAmount });
-
-                if (updates.length > 0) {
-                    await Promise.all(updates.map(u =>
-                        prisma.estimatePaymentSchedule.update({ where: { id: u.id }, data: { amount: u.amount } })
-                    ));
-                    const refreshed = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
-                    schedules.splice(0, schedules.length, ...refreshed);
-                }
-            }
+        if (correctLastAmount >= 0 && Math.abs(correctLastAmount - toNum(lastMilestone.amount)) > 0.001) {
+            await prisma.$transaction([
+                prisma.estimatePaymentSchedule.update({
+                    where: { id: lastMilestone.id },
+                    data: { amount: correctLastAmount }
+                })
+            ]);
+            const refreshed = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
+            schedules.splice(0, schedules.length, ...refreshed);
         }
 
         const unpaidSum = schedules.reduce((sum, s) => sum + toNum(s.amount), 0) - paidSum;
@@ -3670,10 +3846,10 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         return { success: false, error: "Failed to send estimate email. Please check the recipient address and try again." };
     }
 
-    // Mark as Sent only after confirmed delivery
+    const updatedStatus = ["Draft", "Sent", "Viewed"].includes(estimate.status) ? "Sent" : estimate.status;
     await prisma.estimate.update({
         where: { id: estimateId },
-        data: { sentAt: new Date(), status: "Sent" },
+        data: { sentAt: new Date(), status: updatedStatus },
     });
 
     // Store as message in the appropriate thread
@@ -7270,3 +7446,202 @@ export async function getProjectPurchaseOrdersForLinking(projectId: string) {
         orderBy: { createdAt: "desc" },
     });
 }
+
+export async function createEstimateFromRoomDesign(roomId: string) {
+    "use server";
+    const session = await getServerSession(authOptions);
+    if (!session) throw new Error("Unauthorized");
+
+    const room = await prisma.roomDesign.findUnique({
+        where: { id: roomId },
+        include: { assets: true },
+    });
+    if (!room) throw new Error("Room Design not found");
+
+    const isProject = !!room.projectId;
+    const ownerId = isProject ? room.projectId : room.leadId;
+    if (!ownerId) throw new Error("Room Design is not associated with any Lead or Project");
+
+    // Dynamic import to avoid circular dependency
+    const { ASSET_REGISTRY } = await import("@/lib/room-designer/asset-registry");
+
+    const items: Array<{
+        name: string;
+        description: string;
+        type: string;
+        quantity: number;
+        baseCost: number;
+        markupPercent: number;
+        unitCost: number;
+        total: number;
+    }> = [];
+
+    let totalEstimate = 0;
+
+    for (let idx = 0; idx < room.assets.length; idx++) {
+        const asset = room.assets[idx];
+        const reg = ASSET_REGISTRY.find((a) => a.id === asset.assetId);
+
+        let baseCost = 250; // fallback base cost
+        const markupPercent = 25;
+        const name = reg?.name || `${asset.assetType.charAt(0).toUpperCase() + asset.assetType.slice(1)}`;
+
+        const metadata = (asset.metadata ?? {}) as Record<string, any>;
+        const cabinet = (metadata.cabinet ?? {}) as Record<string, any>;
+        const appliance = (metadata.appliance ?? {}) as Record<string, any>;
+        const fixture = (metadata.fixture ?? {}) as Record<string, any>;
+
+        const detailsArray: string[] = [];
+
+        if (asset.assetType === "cabinet") {
+            // pricing based on cabinet subcategory
+            if (reg?.subcategory === "wall") baseCost = 280;
+            else if (reg?.subcategory === "tall") baseCost = 650;
+            else if (reg?.subcategory === "corner") baseCost = 480;
+            else if (reg?.subcategory === "island") baseCost = 750;
+            else baseCost = 350; // base base cabinet
+
+            // Adjust based on custom overrides (width, height, depth) if provided
+            const wVal = cabinet.width ? Math.round(cabinet.width * 39.3701) : Math.round((reg?.dimensions?.width ?? 0.6) * 39.3701);
+            const hVal = cabinet.height ? Math.round(cabinet.height * 39.3701) : Math.round((reg?.dimensions?.height ?? 0.8) * 39.3701);
+            const dVal = cabinet.depth ? Math.round(cabinet.depth * 39.3701) : Math.round((reg?.dimensions?.depth ?? 0.6) * 39.3701);
+
+            detailsArray.push(`Size: ${wVal}"W x ${hVal}"H x ${dVal}"D`);
+
+            if (cabinet.doorStyle) {
+                detailsArray.push(`Door Style: ${cabinet.doorStyle.charAt(0).toUpperCase() + cabinet.doorStyle.slice(1)}`);
+                if (cabinet.doorStyle === "glass") baseCost += 75;
+                if (cabinet.doorStyle === "raised") baseCost += 40;
+            }
+            if (cabinet.finish) {
+                detailsArray.push(`Finish: ${cabinet.finish.charAt(0).toUpperCase() + cabinet.finish.slice(1)}`);
+                if (["navy", "green", "wood", "walnut"].includes(cabinet.finish)) {
+                    baseCost += 50;
+                }
+            }
+            if (cabinet.hardware) {
+                detailsArray.push(`Hardware: ${cabinet.hardware.charAt(0).toUpperCase() + cabinet.hardware.slice(1)}`);
+                if (cabinet.hardware !== "none") baseCost += 15;
+            }
+            if (cabinet.interior) {
+                detailsArray.push(`Interior: ${cabinet.interior.charAt(0).toUpperCase() + cabinet.interior.slice(1)}`);
+                if (cabinet.interior === "lazy-susan") baseCost += 150;
+                if (cabinet.interior === "drawer-org") baseCost += 80;
+                if (cabinet.interior === "pullout") baseCost += 95;
+                if (cabinet.interior === "trash") baseCost += 60;
+            }
+
+            // Generate SKU
+            const finishCode = String(cabinet.finish || "std").substring(0, 3).toUpperCase();
+            const styleCode = String(cabinet.doorStyle || "std").substring(0, 3).toUpperCase();
+            const sku = `RTA-CAB-${styleCode}-${finishCode}-${wVal}${hVal}${dVal}`;
+            detailsArray.unshift(`SKU: ${sku}`);
+
+        } else if (asset.assetType === "appliance") {
+            if (asset.assetId.includes("refrigerator")) baseCost = 1599;
+            else if (asset.assetId.includes("range") || asset.assetId.includes("stove")) baseCost = 1299;
+            else if (asset.assetId.includes("dishwasher")) baseCost = 799;
+            else if (asset.assetId.includes("microwave")) baseCost = 399;
+            else baseCost = 699;
+
+            if (appliance.brand) detailsArray.push(`Brand: ${appliance.brand}`);
+            if (appliance.finish) {
+                detailsArray.push(`Finish: ${appliance.finish.charAt(0).toUpperCase() + appliance.finish.slice(1)}`);
+                if (["stainless", "black-ss"].includes(appliance.finish)) baseCost += 100;
+            }
+
+            const brandCode = String(appliance.brand || "GEN").substring(0, 3).toUpperCase();
+            const finishCode = String(appliance.finish || "SS").substring(0, 3).toUpperCase();
+            const sku = `APP-${brandCode}-${finishCode}-${idx + 100}`;
+            detailsArray.unshift(`SKU: ${sku}`);
+
+        } else if (asset.assetType === "fixture") {
+            if (asset.assetId.includes("faucet")) baseCost = 199;
+            else if (asset.assetId.includes("sink")) baseCost = 450;
+            else baseCost = 150;
+
+            if (fixture.finish) {
+                detailsArray.push(`Finish: ${fixture.finish.charAt(0).toUpperCase() + fixture.finish.slice(1)}`);
+                if (["matte-black", "brass"].includes(fixture.finish)) baseCost += 40;
+            }
+
+            const finishCode = String(fixture.finish || "CH").substring(0, 2).toUpperCase();
+            const sku = `FIX-${finishCode}-${idx + 100}`;
+            detailsArray.unshift(`SKU: ${sku}`);
+
+        } else {
+            if (asset.assetType === "window") baseCost = 250;
+            else if (asset.assetType === "door") baseCost = 300;
+            else if (asset.assetType === "lighting") baseCost = 120;
+            else baseCost = 45;
+        }
+
+        const unitCost = Math.round(baseCost * (1 + markupPercent / 100));
+        const total = unitCost * 1;
+        totalEstimate += total;
+
+        items.push({
+            name,
+            description: detailsArray.join(" | "),
+            type: "Material",
+            quantity: 1,
+            baseCost,
+            markupPercent,
+            unitCost,
+            total,
+        });
+    }
+
+    // Create the Estimate
+    const estimate = await prisma.estimate.create({
+        data: {
+            title: `${room.name} — Material Takeoff Estimate`,
+            projectId: isProject ? room.projectId : null,
+            leadId: !isProject ? room.leadId : null,
+            code: "EST-TEMP",
+            status: "Draft",
+            totalAmount: totalEstimate,
+            balanceDue: totalEstimate,
+            privacy: "Shared",
+        },
+    });
+
+    const code = `EST-${String(estimate.number).padStart(5, "0")}`;
+    await prisma.estimate.update({ where: { id: estimate.id }, data: { code } });
+
+    // Create items
+    for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
+        await prisma.estimateItem.create({
+            data: {
+                estimateId: estimate.id,
+                name: item.name,
+                description: item.description,
+                type: item.type,
+                quantity: item.quantity,
+                baseCost: item.baseCost,
+                markupPercent: item.markupPercent,
+                unitCost: item.unitCost,
+                total: item.total,
+                order: idx,
+            },
+        });
+    }
+
+    const redirectUrl = isProject
+        ? `/projects/${room.projectId}/estimates/${estimate.id}`
+        : `/leads/${room.leadId}/estimates/${estimate.id}`;
+
+    if (isProject) {
+        revalidatePath(`/projects/${room.projectId}/estimates`);
+    } else {
+        revalidatePath(`/leads/${room.leadId}`);
+    }
+
+    return {
+        success: true,
+        estimateId: estimate.id,
+        redirectUrl,
+    };
+}
+

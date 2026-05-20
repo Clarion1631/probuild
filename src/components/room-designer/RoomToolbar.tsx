@@ -7,6 +7,7 @@
 import { useRoomStore } from "./hooks/useRoomStore";
 import { toast } from "sonner";
 import { exportToProBuild } from "@/lib/room-designer/blueprint3d-adapter";
+import { createEstimateFromRoomDesign } from "@/lib/actions";
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import {
@@ -45,6 +46,8 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
     const getSnapshot = useRoomStore((s) => s.getSnapshot);
     const markSaved = useRoomStore((s) => s.markSaved);
     const roomId = useRoomStore((s) => s.roomId);
+    const showAssistant = useRoomStore((s) => s.showAssistant);
+    const setShowAssistant = useRoomStore((s) => s.setShowAssistant);
 
     const [saving, setSaving] = useState(false);
     const [shareEnabled, setShareEnabled] = useState(initialShareState.enabled);
@@ -115,15 +118,26 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
         };
     }, [menuOpen]);
 
-    function gotoEstimate() {
-        // pathname looks like /projects/:id/room-designer/:roomId or
-        // /leads/:id/room-designer/:roomId. Rebuild the estimates landing.
-        const parts = (pathname ?? "").split("/").filter(Boolean);
-        if (parts.length >= 2 && (parts[0] === "projects" || parts[0] === "leads")) {
-            router.push(`/${parts[0]}/${parts[1]}/estimates`);
-        } else {
-            toast.message("Open this room from a project or lead to add it to an estimate.");
+    async function gotoEstimate() {
+        if (!roomId) {
+            toast.error("No active room found.");
+            return;
         }
+
+        const promise = (async () => {
+            const result = await createEstimateFromRoomDesign(roomId);
+            if (!result || !result.success || !result.redirectUrl) {
+                throw new Error("Failed to create estimate");
+            }
+            router.push(result.redirectUrl);
+            return result;
+        })();
+
+        toast.promise(promise, {
+            loading: "Generating detailed takeoff & creating draft estimate...",
+            success: "Takeoff successful! Redirecting to estimate...",
+            error: "Failed to generate material estimate takeoff.",
+        });
     }
 
     function showAssistanceStub() {
@@ -157,7 +171,11 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
                     type="button"
                     onClick={saveNow}
                     disabled={saving || !dirty}
-                    className="hui-btn hui-btn-green rounded-full px-4 py-1.5 text-xs disabled:opacity-50"
+                    className={`rounded-full px-4 py-1.5 text-xs font-bold transition flex items-center shadow-sm duration-200 ${
+                        dirty 
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 hover:border-emerald-300"
+                            : "bg-slate-50 text-slate-400 border border-slate-200 cursor-not-allowed"
+                    }`}
                 >
                     <Cloud className="mr-1.5 h-3.5 w-3.5" />
                     {saving ? "Saving…" : dirty ? "Save" : "All changes saved"}
@@ -169,15 +187,19 @@ export function RoomToolbar({ roomName, ownerContext, initialShareState }: RoomT
                 <button
                     type="button"
                     onClick={gotoEstimate}
-                    className="hui-btn hui-btn-purple rounded-full px-3 py-1.5 text-xs"
+                    className="bg-[#531b7e] text-white hover:bg-[#431466] active:scale-95 rounded-full px-5 py-2 text-xs font-bold transition-all duration-200 flex items-center shadow-sm"
                 >
                     <Calculator className="mr-1.5 h-3.5 w-3.5" />
                     Add to Estimate
                 </button>
                 <button
                     type="button"
-                    onClick={showAssistanceStub}
-                    className="hui-btn hui-btn-secondary rounded-full px-3 py-1.5 text-xs"
+                    onClick={() => setShowAssistant(!showAssistant)}
+                    className={`border transition-all duration-200 flex items-center shadow-sm rounded-full px-5 py-2 text-xs font-bold active:scale-95 ${
+                        showAssistant
+                            ? "bg-[#531b7e] text-white border-transparent hover:bg-[#431466]"
+                            : "border-[#531b7e] text-[#531b7e] hover:bg-purple-50"
+                    }`}
                 >
                     <Sparkles className="mr-1.5 h-3.5 w-3.5" />
                     Designer Assistance

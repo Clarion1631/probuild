@@ -19,7 +19,7 @@ export function FloatingDock({ children, className = "", bottom = "bottom-4" }: 
             className={`pointer-events-none absolute ${bottom} left-1/2 z-10 flex w-full max-w-[800px] -translate-x-1/2 items-center justify-center`}
         >
             <div
-                className={`pointer-events-auto flex items-center gap-3 rounded-lg border border-slate-200 bg-white/95 px-3 py-2 shadow-md backdrop-blur ${className}`}
+                className={`pointer-events-auto flex items-center gap-3 rounded-full border border-slate-200 bg-white/95 px-5 py-1.5 shadow-lg backdrop-blur-md transition-shadow duration-300 ${className}`}
             >
                 {children}
             </div>

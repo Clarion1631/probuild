@@ -83,13 +83,15 @@ export function BottomDock({ ownerContext, roomName }: BottomDockProps) {
 
             <FloatingDockDivider />
 
-            {/* View mode 2D / 3D */}
-            <div className="flex overflow-hidden rounded-md border border-slate-200">
+            {/* View mode 2D / 3D switcher */}
+            <div className="flex bg-slate-100 p-0.5 rounded-full border border-slate-200">
                 <button
                     type="button"
                     onClick={() => setViewMode("2d")}
-                    className={`px-2.5 py-1 text-[11px] font-semibold transition ${
-                        viewMode === "2d" ? "bg-slate-900 text-white" : "bg-white text-slate-700 hover:bg-slate-50"
+                    className={`px-3 py-1 rounded-full text-[11px] font-bold transition-all duration-200 ${
+                        viewMode === "2d" 
+                            ? "bg-[#531b7e] text-white shadow-sm" 
+                            : "text-slate-600 hover:text-slate-950"
                     }`}
                 >
                     2D
@@ -97,8 +99,10 @@ export function BottomDock({ ownerContext, roomName }: BottomDockProps) {
                 <button
                     type="button"
                     onClick={() => setViewMode("3d")}
-                    className={`px-2.5 py-1 text-[11px] font-semibold transition ${
-                        viewMode === "3d" ? "bg-slate-900 text-white" : "bg-white text-slate-700 hover:bg-slate-50"
+                    className={`px-3 py-1 rounded-full text-[11px] font-bold transition-all duration-200 ${
+                        viewMode === "3d" 
+                            ? "bg-[#531b7e] text-white shadow-sm" 
+                            : "text-slate-600 hover:text-slate-950"
                     }`}
                 >
                     3D
@@ -108,7 +112,7 @@ export function BottomDock({ ownerContext, roomName }: BottomDockProps) {
             <FloatingDockDivider />
 
             {/* Camera presets */}
-            <div className="flex items-center gap-0.5">
+            <div className="flex items-center gap-1">
                 {PRESETS.map((p) => {
                     const active = p.key !== "fit" && currentPreset === p.key;
                     return (
@@ -117,12 +121,11 @@ export function BottomDock({ ownerContext, roomName }: BottomDockProps) {
                             type="button"
                             title={p.title}
                             onClick={() => onPresetClick(p.key)}
-                            className={
-                                "rounded px-2 py-1 text-[11px] font-semibold transition " +
-                                (active
-                                    ? "bg-slate-900 text-white shadow-sm"
-                                    : "bg-transparent text-slate-600 hover:bg-slate-100")
-                            }
+                            className={`rounded-full px-3 py-1 text-[11px] font-bold transition-all duration-200 ${
+                                active
+                                    ? "bg-[#531b7e] text-white shadow-sm"
+                                    : "bg-transparent text-slate-600 hover:bg-slate-100 hover:text-slate-950"
+                            }`}
                         >
                             {p.key === "fit" ? (
                                 <span className="flex items-center gap-1"><Maximize2 className="h-3 w-3" /> Fit</span>

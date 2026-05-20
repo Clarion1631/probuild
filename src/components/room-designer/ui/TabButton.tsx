@@ -12,25 +12,33 @@ interface TabButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 export function TabButton({ icon, label, active = false, className = "", ...rest }: TabButtonProps) {
     const base =
-        "group relative flex w-full flex-col items-center justify-center gap-1 px-1 py-2.5 text-[10px] font-semibold uppercase tracking-wide transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#531b7e]";
-    const state = active
-        ? "bg-purple-50 text-[#531b7e]"
-        : "text-slate-500 hover:bg-slate-50 hover:text-slate-900";
+        "group relative flex w-full flex-col items-center justify-center gap-1.5 px-1 py-3 text-[10px] tracking-wide transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#531b7e]";
+    
     return (
         <button
             type="button"
             aria-pressed={active}
-            className={`${base} ${state} ${className}`}
+            className={`${base} bg-transparent ${className}`}
             {...rest}
         >
-            {active && (
-                <span
-                    aria-hidden
-                    className="absolute inset-y-0 left-0 w-0.5 bg-[#531b7e]"
-                />
-            )}
-            <span className="[&_svg]:h-5 [&_svg]:w-5">{icon}</span>
-            <span className="leading-tight">{label}</span>
+            <span 
+                className={`flex h-11 w-11 items-center justify-center rounded-full transition-all duration-200 [&_svg]:h-5 [&_svg]:w-5 ${
+                    active 
+                        ? "bg-[#531b7e] text-white shadow-sm" 
+                        : "text-slate-400 bg-transparent group-hover:bg-slate-100 group-hover:text-slate-700"
+                }`}
+            >
+                {icon}
+            </span>
+            <span 
+                className={`leading-tight text-center px-1 font-semibold transition-colors duration-200 ${
+                    active 
+                        ? "text-[#2e103f] font-bold" 
+                        : "text-slate-500 group-hover:text-slate-800"
+                }`}
+            >
+                {label}
+            </span>
         </button>
     );
 }

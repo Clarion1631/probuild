@@ -41,6 +41,7 @@ export default async function EstimatePage({
                     }}
                     initialEstimate={JSON.parse(JSON.stringify(estimate))}
                     salesTaxes={salesTaxes}
+                    settings={settings}
                 />
             </div>
         </div>

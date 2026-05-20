@@ -1,4 +1,4 @@
-﻿import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { after } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
@@ -140,9 +140,21 @@ async function processEvent(eventId: string) {
                         const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                         const estimateTotal = toNum(updatedSchedule.estimate.totalAmount);
                         const newBalance = Math.max(0, estimateTotal - totalPaid);
+                        
+                        // If this is the first payment being logged, track statusBeforePayment
+                        const isFirstPayment = !updatedSchedule.estimate.statusBeforePayment;
+                        const newStatus = newBalance <= 0
+                            ? "Paid"
+                            : totalPaid > 0 ? "Partially Paid"
+                            : updatedSchedule.estimate.status;
+
                         await t.estimate.update({
                             where: { id: estimateId },
-                            data: { balanceDue: newBalance },
+                            data: {
+                                balanceDue: newBalance,
+                                status: newStatus,
+                                ...(isFirstPayment && { statusBeforePayment: updatedSchedule.estimate.status }),
+                            },
                         });
                         return { alreadyPaid, updatedSchedule, newBalance };
                     });
@@ -284,9 +296,18 @@ async function processEvent(eventId: string) {
                             });
                             const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                             const newBalance = Math.max(0, toNum(estSchedule.estimate.totalAmount) - totalPaid);
+                            const newStatus =
+                                totalPaid === 0 ? estSchedule.estimate.statusBeforePayment ?? "Approved"
+                                : newBalance <= 0 ? "Paid"
+                                : "Partially Paid";
+
                             await t.estimate.update({
                                 where: { id: estSchedule.estimateId },
-                                data: { balanceDue: newBalance },
+                                data: {
+                                    balanceDue: newBalance,
+                                    status: newStatus,
+                                    ...(totalPaid === 0 && { statusBeforePayment: null }),
+                                },
                             });
                         });
                     }

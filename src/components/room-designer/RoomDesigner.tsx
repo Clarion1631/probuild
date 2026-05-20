@@ -27,6 +27,7 @@ import { OnboardingCoach } from "./OnboardingCoach";
 import { ShortcutLegend } from "./ShortcutLegend";
 import { useRoomStore } from "./hooks/useRoomStore";
 import { useRoomSave } from "./hooks/useRoomSave";
+import { DesignerAssistantPanel } from "./DesignerAssistantPanel";
 import { useUndoRedoKeyboard } from "./hooks/useUndoRedo";
 import { useAssetSelection } from "./hooks/useAssetSelection";
 import type { RoomSnapshot } from "./types";
@@ -44,6 +45,7 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
     const loadSnapshot = useRoomStore((s) => s.loadSnapshot);
     const showLayers = useRoomStore((s) => s.showLayers);
     const showProperties = useRoomStore((s) => s.showProperties);
+    const showAssistant = useRoomStore((s) => s.showAssistant);
 
     // Hydrate the store once on mount — re-run only when the roomId changes.
     useEffect(() => {
@@ -80,7 +82,7 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
                 <AssetPanel />
 
                 {showLayers && <LayersPanel />}
-                <div className="relative flex-1 bg-slate-200">
+                <div className="relative flex-1 bg-gradient-to-tr from-[#f0f2fd] to-[#ffffff]">
                     <div className="absolute inset-0">
                         <RoomCanvas />
                     </div>
@@ -90,6 +92,7 @@ export function RoomDesigner({ snapshot, roomName, ownerContext, initialShareSta
                     <BottomDock ownerContext={ownerContext} roomName={roomName} />
                 </div>
                 {showProperties && <PropertiesPanel />}
+                {showAssistant && <DesignerAssistantPanel />}
                 <RightRail />
             </div>
             {/* Portals to document.body — outside the flex tree. */}

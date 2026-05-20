@@ -88,9 +88,29 @@ function ExposureFade({ targetExposure }: { targetExposure: number }) {
 function FallbackLights() {
     return (
         <>
-            <ambientLight intensity={0.55} />
-            <directionalLight position={[4, 8, 4]} intensity={0.85} castShadow />
-            <hemisphereLight args={["#ffffff", "#cccccc", 0.25]} />
+            <ambientLight intensity={0.25} />
+            <hemisphereLight args={["#ffffff", "#eae6df", 0.15]} />
+            <directionalLight
+                position={[8, 12, 6]}
+                intensity={0.95}
+                castShadow
+                shadow-mapSize-width={2048}
+                shadow-mapSize-height={2048}
+                shadow-bias={-0.0005}
+                shadow-camera-near={0.5}
+                shadow-camera-far={30}
+                shadow-camera-left={-8}
+                shadow-camera-right={8}
+                shadow-camera-top={8}
+                shadow-camera-bottom={-8}
+            />
+            {/* Soft warm counter-light to fill in dark back faces with a gorgeous glow */}
+            <directionalLight
+                position={[-8, 6, -6]}
+                intensity={0.3}
+                castShadow={false}
+                color="#ffefe0"
+            />
         </>
     );
 }

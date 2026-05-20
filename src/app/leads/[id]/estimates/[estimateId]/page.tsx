@@ -37,6 +37,7 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
                     }}
                     initialEstimate={serializedEstimate}
                     salesTaxes={salesTaxes}
+                    settings={settings}
                 />
             </div>
         </div>

@@ -129,8 +129,8 @@ export function AssetPanel() {
         <div className="z-20 flex h-full min-h-0 shrink-0 select-none">
 
             {/* 1. Slim vertical stage rail */}
-            <div className="flex w-[88px] shrink-0 flex-col items-stretch justify-between border-r border-slate-200 bg-white py-2">
-                <div className="flex flex-col items-stretch">
+            <div className="flex w-[88px] shrink-0 flex-col items-stretch justify-between border-r border-slate-200 bg-white py-4">
+                <div className="flex flex-col items-stretch gap-2.5">
                     <TabButton
                         active={expanded && activeTab === "styling"}
                         label="Room Styling"

@@ -72,9 +72,12 @@ export async function POST(req: NextRequest) {
     const targetBudgetTotal = grandSellTotal * (1 - target / 100);
     const neededFromAi = Math.max(0, targetBudgetTotal - lockedBudget);
 
-    const itemsList = items.map((item, i) =>
-        `${i + 1}. ID:"${item.id}" | ${item.name} | type=${item.type} | qty=${item.quantity} | sell=$${(item.unitCost || 0).toFixed(2)}/unit (line=$${(item.lineTotal || 0).toFixed(2)}) | desc="${item.description || ""}"`
-    ).join("\n");
+    const itemsList = items.map((item, i) => {
+        const name = (item.name || "").trim().slice(0, 80);
+        const desc = (item.description || "").trim();
+        const cleanDesc = desc && desc !== name ? desc.slice(0, 100) : "";
+        return `${i + 1}. ID:"${item.id}" | ${name} | type=${item.type} | qty=${item.quantity} | sell=$${(item.unitCost || 0).toFixed(2)}/unit${cleanDesc ? ` | desc="${cleanDesc}"` : ""}`;
+    }).join("\n");
 
     const prompt = `You are an expert residential remodeling cost estimator in ${location || "Vancouver, WA"} (Pacific Northwest). Your job: choose an internal cost (budgetRate) for each line item so the WEIGHTED OVERALL MARGIN of the whole estimate lands on a target.
 
@@ -133,7 +136,7 @@ OUTPUT — return ONLY valid JSON in this exact shape:
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
             model: "claude-sonnet-4-6",
-            max_tokens: 16000,
+            max_tokens: 8000,
             messages: [{ role: "user", content: prompt }],
         });
 

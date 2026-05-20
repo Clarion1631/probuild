@@ -143,8 +143,8 @@ export function CabinetConfigurator({ placed, refForFocus }: CabinetConfigurator
                                 onClick={() => writeCab({ finish: f })}
                                 title={cap(f)}
                                 aria-label={f}
-                                className={`h-8 rounded border-2 transition ${
-                                    selected ? "border-blue-500 ring-1 ring-blue-200" : "border-slate-200 hover:border-slate-400"
+                                className={`h-8 rounded-lg border-2 transition ${
+                                    selected ? "border-[#531b7e] ring-2 ring-[#531b7e]/20 shadow" : "border-slate-200 hover:border-slate-400"
                                 }`}
                                 style={{ backgroundColor: hex }}
                             />
@@ -152,8 +152,8 @@ export function CabinetConfigurator({ placed, refForFocus }: CabinetConfigurator
                     })}
                     <label
                         title="Custom color"
-                        className={`relative flex h-8 items-center justify-center rounded border-2 text-[10px] font-medium transition ${
-                            isCustomFinish ? "border-blue-500 ring-1 ring-blue-200" : "border-slate-200 hover:border-slate-400"
+                        className={`relative flex h-8 items-center justify-center rounded-lg border-2 text-[10px] font-medium transition ${
+                            isCustomFinish ? "border-[#531b7e] ring-2 ring-[#531b7e]/20 shadow" : "border-slate-200 hover:border-slate-400"
                         }`}
                         style={
                             isCustomFinish
@@ -236,10 +236,10 @@ function Chip({
             type="button"
             ref={innerRef}
             onClick={onClick}
-            className={`rounded border px-1.5 py-0.5 text-[11px] transition ${
+            className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium transition shadow-sm ${
                 selected
-                    ? "border-slate-900 bg-slate-900 text-white"
-                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"
+                    ? "border-[#531b7e] bg-[#531b7e] text-white"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-[#531b7e]/50 hover:bg-purple-50/30 hover:text-[#531b7e]"
             }`}
         >
             {children}

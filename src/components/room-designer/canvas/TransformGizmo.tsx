@@ -45,11 +45,6 @@ export function TransformGizmo() {
             controls.attach(obj as Object3D);
             controls.traverse((child) => {
                 child.renderOrder = 9999;
-                const mesh = child as Mesh;
-                const mat = mesh.material as Material | undefined;
-                if (mat && "depthTest" in mat) {
-                    (mat as Material & { depthTest: boolean }).depthTest = false;
-                }
             });
         } else {
             controls.detach();
@@ -80,7 +75,7 @@ export function TransformGizmo() {
                 transformRef.current = (ref ?? null) as TransformControlsImpl | null;
             }}
             mode={toolMode}
-            size={2.5}
+            size={1.1}
             translationSnap={snapOn ? gridSize : null}
             rotationSnap={snapOn ? Math.PI / 12 : null}
             scaleSnap={snapOn ? 0.1 : null}

@@ -70,6 +70,7 @@ export interface RoomStoreState {
     showLayers: boolean;
     showProperties: boolean;
     showMeasurements: boolean;
+    showAssistant: boolean;
 
     // Stage 3: camera preset ("orbit" = free-look 3D; presets animate on change).
     cameraPreset: CameraPreset | "orbit";
@@ -141,6 +142,7 @@ export interface RoomStoreState {
     setShowLayers: (v: boolean) => void;
     setShowProperties: (v: boolean) => void;
     setShowMeasurements: (v: boolean) => void;
+    setShowAssistant: (v: boolean) => void;
     setCameraPreset: (p: CameraPreset | "orbit") => void;
 
     // actions — placement (transient)
@@ -210,6 +212,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
     showLayers: false,
     showProperties: true,
     showMeasurements: false,
+    showAssistant: false,
     cameraPreset: "orbit",
 
     effectsEnabled: true,
@@ -437,6 +440,7 @@ export const useRoomStore = create<RoomStoreState>((set, get) => ({
     setShowLayers: (showLayers) => set({ showLayers }),
     setShowProperties: (showProperties) => set({ showProperties }),
     setShowMeasurements: (showMeasurements) => set({ showMeasurements }),
+    setShowAssistant: (showAssistant) => set({ showAssistant }),
     setCameraPreset: (cameraPreset) => set({ cameraPreset }),
 
     // Transient placement actions — never touch history or mark dirty.

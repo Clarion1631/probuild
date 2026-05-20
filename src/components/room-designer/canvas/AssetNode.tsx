@@ -157,8 +157,11 @@ export function AssetNode({ asset, selected, isPrimary, onSelect }: AssetNodePro
                 onSelect(asset.id, e.nativeEvent.shiftKey);
             }}
             onPointerDown={(e: ThreeEvent<PointerEvent>) => {
-                if (!selected || locked || toolMode !== "translate") return;
+                if (locked) return;
                 e.stopPropagation();
+                if (!selected) {
+                    onSelect(asset.id, e.nativeEvent.shiftKey);
+                }
                 const orbit = orbitRef.current;
                 if (orbit) orbit.enabled = false;
                 startDraggingAsset(asset.id);

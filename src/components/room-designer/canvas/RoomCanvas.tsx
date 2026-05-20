@@ -19,8 +19,9 @@
 import * as THREE from "three";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Grid } from "@react-three/drei";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useMemo } from "react";
 import type { Group, Material, Mesh } from "three";
+import { CanvasTexture, RepeatWrapping } from "three";
 import { Walls } from "./Walls";
 import { Floor } from "./Floor";
 import { Ceiling } from "./Ceiling";
@@ -54,6 +55,28 @@ export function RoomCanvas() {
 
     const is2D = viewMode === "2d";
     const hdriPreset = layout.lighting?.hdriPreset ?? DEFAULT_PRESET;
+
+    // Premium Slate dot texture memoized for rendering in 3D mode
+    const dotTexture = useMemo(() => {
+        if (typeof window === "undefined") return null;
+        const canvas = document.createElement("canvas");
+        canvas.width = 64;
+        canvas.height = 64;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+            ctx.clearRect(0, 0, 64, 64);
+            ctx.fillStyle = "rgba(148, 163, 184, 0.15)"; // Soft Slate-400 dot
+            ctx.beginPath();
+            ctx.arc(32, 32, 1.5, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+        const texture = new CanvasTexture(canvas);
+        texture.wrapS = RepeatWrapping;
+        texture.wrapT = RepeatWrapping;
+        // 0.3048m (1 foot) spacing over a 100m plane means repeat 100 / 0.3048 ≈ 328
+        texture.repeat.set(328, 328);
+        return texture;
+    }, []);
 
     return (
         <Canvas
@@ -94,20 +117,37 @@ export function RoomCanvas() {
                     castShadow={false}
                 />
 
-                {/* Grid for visual reference — brighter in 2D, subtle in 3D */}
-                <Grid
-                    position={[0, 0.001, 0]}
-                    args={[40, 40]}
-                    cellSize={0.3048 /* 1 ft */}
-                    cellThickness={0.5}
-                    cellColor="#c9c5bc"
-                    sectionSize={3.048 /* 10 ft */}
-                    sectionThickness={1}
-                    sectionColor="#8a8f97"
-                    fadeDistance={30}
-                    fadeStrength={is2D ? 0 : 1}
-                    infiniteGrid
-                />
+                {/* Grid for visual reference — blueprint grid in 2D, premium dot pattern in 3D */}
+                {is2D ? (
+                    <Grid
+                        position={[0, 0.001, 0]}
+                        args={[40, 40]}
+                        cellSize={0.3048 /* 1 ft */}
+                        cellThickness={0.3}
+                        cellColor="#cbd5e1"
+                        sectionSize={3.048 /* 10 ft */}
+                        sectionThickness={0.6}
+                        sectionColor="#94a3b8"
+                        fadeDistance={20}
+                        fadeStrength={0}
+                        infiniteGrid
+                    />
+                ) : (
+                    dotTexture && (
+                        <mesh
+                            position={[0, 0.0015, 0]}
+                            rotation={[-Math.PI / 2, 0, 0]}
+                            raycast={() => null}
+                        >
+                            <planeGeometry args={[100, 100]} />
+                            <meshBasicMaterial
+                                map={dotTexture}
+                                transparent
+                                depthWrite={false}
+                            />
+                        </mesh>
+                    )
+                )}
 
                 <Floor layout={layout} />
                 <Walls layout={layout} />
@@ -116,8 +156,8 @@ export function RoomCanvas() {
 
                 <AssetsLayer />
 
-                {/* Stage 3 canvas overlays */}
-                <TransformGizmo />
+                {/* Stage 3 canvas overlays (TransformGizmo commented out to hide coordinate arrows/axis lines) */}
+                {/* <TransformGizmo /> */}
                 <DragPlane />
                 <TransformSnapIndicators />
                 <NavigationCube />

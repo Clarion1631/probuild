@@ -36,8 +36,8 @@ export function FixtureProperties({ placed }: FixtureProps) {
                             onClick={() => write({ finish: f.key })}
                             title={f.label}
                             aria-label={f.label}
-                            className={`h-8 rounded border-2 transition ${
-                                selected ? "border-blue-500 ring-1 ring-blue-200" : "border-slate-200 hover:border-slate-400"
+                            className={`h-8 rounded-lg border-2 transition shadow-sm ${
+                                selected ? "border-[#531b7e] ring-2 ring-[#531b7e]/20" : "border-slate-200 hover:border-slate-400"
                             }`}
                             style={{ backgroundColor: FIXTURE_FINISH_COLORS[f.key] }}
                         />

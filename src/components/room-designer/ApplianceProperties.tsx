@@ -36,7 +36,7 @@ export function ApplianceProperties({ placed, refForFocus }: ApplianceProps) {
                     value={meta.brand ?? ""}
                     onChange={(e) => write({ brand: e.target.value })}
                     placeholder="e.g. Bosch, GE Monogram"
-                    className="hui-input w-full py-1 text-sm"
+                    className="w-full rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-1.5 text-xs font-bold text-slate-800 outline-none transition focus:border-[#531b7e] focus:bg-white focus:ring-1 focus:ring-[#531b7e]/20 disabled:opacity-50"
                 />
             </section>
 
@@ -51,15 +51,15 @@ export function ApplianceProperties({ placed, refForFocus }: ApplianceProps) {
                                 type="button"
                                 onClick={() => write({ finish: f.key })}
                                 title={f.label}
-                                className={`flex flex-col items-stretch overflow-hidden rounded border-2 transition ${
-                                    selected ? "border-blue-500 ring-1 ring-blue-200" : "border-slate-200 hover:border-slate-400"
+                                className={`flex flex-col items-stretch overflow-hidden rounded-lg border-2 transition shadow-sm ${
+                                    selected ? "border-[#531b7e] ring-2 ring-[#531b7e]/20" : "border-slate-200 hover:border-slate-400"
                                 }`}
                             >
                                 <div
                                     className="h-6"
                                     style={{ backgroundColor: APPLIANCE_FINISH_COLORS[f.key] }}
                                 />
-                                <div className="bg-white py-0.5 text-[9px] text-slate-700">{f.label}</div>
+                                <div className="bg-white py-1 text-[9px] font-semibold text-slate-600">{f.label}</div>
                             </button>
                         );
                     })}

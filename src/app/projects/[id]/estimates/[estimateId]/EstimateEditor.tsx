@@ -14,8 +14,11 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
     const lastUnpaid = unpaid[unpaid.length - 1];
 
     if (unpaid.length === 1) {
+        lastUnpaid.amount = String(Math.max(0, available));
         const pct = parseFloat(lastUnpaid.percentage) || 0;
-        if (pct > 0) lastUnpaid.amount = String(rm(total * (pct / 100)));
+        if (pct > 0 && Math.abs(available - rm(total * (pct / 100))) > 0.01) {
+            lastUnpaid.percentage = "";
+        }
         return cloned;
     }
 
@@ -38,14 +41,16 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
 }
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import dynamic from "next/dynamic";
 import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
-import SendEstimateModal from "@/components/SendEstimateModal";
-import SelectVendorModal from "./SelectVendorModal";
-import LogPaymentModal from "./LogPaymentModal";
-import RecordPaymentModal from "@/components/RecordPaymentModal";
+
+const SendEstimateModal = dynamic(() => import("@/components/SendEstimateModal"), { ssr: false });
+const SelectVendorModal = dynamic(() => import("./SelectVendorModal"), { ssr: false });
+const LogPaymentModal = dynamic(() => import("./LogPaymentModal"), { ssr: false });
+const RecordPaymentModal = dynamic(() => import("@/components/RecordPaymentModal"), { ssr: false });
 
 const EST_METHOD_LABELS: Record<string, string> = {
     card: "Card",
@@ -67,14 +72,18 @@ function formatEstPaymentMethod(method: string | null | undefined, ref: string |
 }
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import ReusableSignaturePad from "@/components/ReusableSignaturePad";
+
+const ReusableSignaturePad = dynamic(() => import("@/components/ReusableSignaturePad"), { ssr: false });
+
 import DocumentComments from "@/components/DocumentComments";
 import BudgetStrip from "./BudgetStrip";
-import POQuickCreateModal from "./POQuickCreateModal";
-import UndoPaymentModal from "@/components/UndoPaymentModal";
+
+const POQuickCreateModal = dynamic(() => import("./POQuickCreateModal"), { ssr: false });
+const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), { ssr: false });
+
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 
-export default function EstimateEditor({ context, initialEstimate, salesTaxes = [] }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[] }) {
+export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -527,6 +536,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
+    const paidMilestonesSum = paymentSchedules
+        .filter(s => s.status === "Paid")
+        .reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const dynamicBalanceDue = rm(total - paidMilestonesSum);
 
     // Auto-recalculate percentage-based milestones when total changes (last absorbs rounding residual)
     useEffect(() => {
@@ -555,43 +568,53 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     async function handleSave({ silent = false, skipRefresh = false } = {}) {
         captureHistory(new Date().toLocaleString());
         if (!silent) setIsSaving(true);
-        // Recompute section header totals from children before saving
-        const childTotals = new Map<string, number>();
-        for (const item of items) {
-            if (item.parentId) {
-                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+        try {
+            // Recompute section header totals from children before saving
+            const childTotals = new Map<string, number>();
+            for (const item of items) {
+                if (item.parentId) {
+                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                }
             }
-        }
-        const mappedItems = items.map((item, index) => {
-            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
-            const computedTotal = isSection
-                ? (childTotals.get(item.id) || 0)
-                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-            return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
-        });
-        const mappedSchedules = paymentSchedules.map((schedule, index) => ({
-            ...schedule,
-            order: index
-        }));
+            const mappedItems = items.map((item, index) => {
+                const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+                const computedTotal = isSection
+                    ? (childTotals.get(item.id) || 0)
+                    : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
+            });
+            const mappedSchedules = paymentSchedules.map((schedule, index) => ({
+                ...schedule,
+                order: index
+            }));
 
-        await saveEstimate(initialEstimate.id, context.id, context.type, {
-            title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
-            processingFeeMarkup, hideProcessingFee,
-            expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
-            memo: memo || null,
-            termsAndConditions: termsAndConditions || null,
-            signatureUrl: signatureUrl || null,
-            targetMarginPercent: parseFloat(targetMargin) || 25,
-            taxExempt,
-            taxRateName: taxExempt ? null : (activeTax?.name || null),
-            taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-        }, mappedItems);
-        if (!silent) {
-            setIsSaving(false);
-            toast.success("Estimate saved successfully");
-        }
-        if (!skipRefresh) {
-            router.refresh();
+            await saveEstimate(initialEstimate.id, context.id, context.type, {
+                title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
+                processingFeeMarkup, hideProcessingFee,
+                expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
+                memo: memo || null,
+                termsAndConditions: termsAndConditions || null,
+                signatureUrl: signatureUrl || null,
+                targetMarginPercent: parseFloat(targetMargin) || 25,
+                taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            }, mappedItems);
+
+            if (!silent) {
+                toast.success("Estimate saved successfully");
+            }
+            if (!skipRefresh) {
+                router.refresh();
+            }
+        } catch (e: any) {
+            console.error("[EstimateEditor] Failed to save estimate:", e);
+            if (!silent) {
+                toast.error(e?.message || "Failed to save estimate. Please try again.");
+            }
+            throw e;
+        } finally {
+            if (!silent) setIsSaving(false);
         }
     }
 
@@ -844,7 +867,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     function updateItem(index: number, field: string, value: any) {
         const newItems = [...items];
-        newItems[index][field] = value;
+        newItems[index] = { ...newItems[index], [field]: value };
         setItems(newItems);
     }
 
@@ -1105,10 +1128,16 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             setPaymentSchedules(recalced);
             return;
         } else if (field === "amount") {
-            newSchedules[index].amount = value;
-            newSchedules[index].percentage = "";
+            newSchedules[index] = {
+                ...newSchedules[index],
+                amount: value,
+                percentage: ""
+            };
         } else {
-            newSchedules[index][field] = value;
+            newSchedules[index] = {
+                ...newSchedules[index],
+                [field]: value
+            };
         }
         setPaymentSchedules(newSchedules);
     }
@@ -2029,7 +2058,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                 <input
                                                     type="date"
                                                     value={schedule.dueDate ? new Date(schedule.dueDate).toISOString().split('T')[0] : ''}
-                                                    onChange={e => updatePaymentSchedule(index, "dueDate", new Date(e.target.value).toISOString())}
+                                                    onChange={e => updatePaymentSchedule(index, "dueDate", e.target.value ? new Date(e.target.value).toISOString() : null)}
                                                     disabled={isPaid}
                                                     className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500 disabled:cursor-default"
                                                 />
@@ -2133,8 +2162,52 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         )}
 
                         {/* Footer Totals */}
-                            <div className="bg-slate-50 p-10 flex justify-end border-t border-slate-200">
-                                <div className="w-80 space-y-4 text-sm">
+                            <div className="bg-slate-50 p-10 flex justify-between items-start border-t border-slate-200 gap-8">
+                                <div className="flex-1 max-w-lg">
+                                    {/* Stripe Fee Pass-Through Cost Savings Banner */}
+                                    {viewMode === "internal" && (
+                                        <div className="border rounded-xl p-4 transition-all duration-200 shadow-sm bg-white border-slate-200">
+                                            <div className="flex items-start gap-3">
+                                                <div className={`p-2 rounded-lg flex-shrink-0 ${settings?.passProcessingFee ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50/75 text-amber-600'}`}>
+                                                    {settings?.passProcessingFee ? (
+                                                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                                                        </svg>
+                                                    ) : (
+                                                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                        </svg>
+                                                    )}
+                                                </div>
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="flex items-center gap-2">
+                                                        <h5 className="font-bold text-slate-800 text-xs tracking-tight">
+                                                            {settings?.passProcessingFee ? "Stripe Fee Pass-Through Active" : "Stripe Fees Absorbed by Contractor"}
+                                                        </h5>
+                                                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${settings?.passProcessingFee ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+                                                            {settings?.passProcessingFee ? "Saving Money" : "Cost Overhead"}
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                                                        {settings?.passProcessingFee ? (
+                                                            <>
+                                                                Client covers the Stripe card transaction processing fee ({settings?.cardProcessingRate || 2.9}% + ${Number(settings?.cardProcessingFlat || 0.30).toFixed(2)}) at checkout. 
+                                                                This preserves your margins, saving you approximately <span className="font-bold text-emerald-600">{formatCurrency(subtotal * (Number(settings?.cardProcessingRate || 2.9) / 100) + Number(settings?.cardProcessingFlat || 0.30))}</span> on this document.
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                You currently absorb the online transaction processing fee ({settings?.cardProcessingRate || 2.9}% + ${Number(settings?.cardProcessingFlat || 0.30).toFixed(2)}). 
+                                                                If the client pays online, it will cost you roughly <span className="font-bold text-amber-600">{formatCurrency(subtotal * (Number(settings?.cardProcessingRate || 2.9) / 100) + Number(settings?.cardProcessingFlat || 0.30))}</span>. 
+                                                                To pass card fees to the client and save this cost, toggle fee pass-through in <a href="/settings/payment-methods" className="text-indigo-600 hover:text-indigo-800 underline font-medium transition">Settings</a>.
+                                                            </>
+                                                        )}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="w-80 space-y-4 text-sm flex-shrink-0">
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>Subtotal</span>
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
@@ -2868,9 +2941,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             {showPaymentModal && (
                 <LogPaymentModal
                     estimateId={initialEstimate.id}
-                    balanceDue={Number(initialEstimate.balanceDue) || 0}
+                    balanceDue={dynamicBalanceDue}
                     onClose={() => setShowPaymentModal(false)}
-                    onSaved={() => router.refresh()}
+                    onSaved={(result) => {
+                        setPaymentSchedules(prev => [...prev, result.schedule]);
+                        setStatus(result.newStatus);
+                        router.refresh();
+                    }}
                 />
             )}
 
