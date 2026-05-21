@@ -173,6 +173,78 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [projectPOs, setProjectPOs] = useState<any[]>([]);
     const [loadingPOs, setLoadingPOs] = useState(false);
 
+    const lastSavedStateRef = useRef<string>("");
+
+    const getEstimateSnapshot = useCallback(() => {
+        const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
+
+        const childTotals = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        const mappedItems = items.map((item, index) => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            const computedTotal = isSection
+                ? (childTotals.get(item.id) || 0)
+                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+            return {
+                id: item.id || null,
+                parentId: item.parentId || null,
+                name: item.name || "",
+                description: item.description || "",
+                quantity: String(item.quantity || "0"),
+                unitCost: String(item.unitCost || "0"),
+                costCodeId: item.costCodeId || null,
+                costTypeId: item.costTypeId || null,
+                vendorId: item.vendorId || null,
+                approvalStatus: item.approvalStatus || null,
+                order: index,
+                total: computedTotal,
+            };
+        });
+
+        const mappedSchedules = paymentSchedules.map((schedule, index) => ({
+            id: schedule.id || null,
+            name: schedule.name || "",
+            amount: String(schedule.amount || "0"),
+            dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
+            status: schedule.status || "Pending",
+            paymentMethod: schedule.paymentMethod || null,
+            paymentReference: schedule.paymentReference || null,
+            percentage: String(schedule.percentage || "0"),
+            type: schedule.type || null,
+            order: index
+        }));
+
+        return {
+            title: title || "",
+            code: code || "",
+            status: status || "Draft",
+            processingFeeMarkup: Number(processingFeeMarkup) || 0,
+            hideProcessingFee: !!hideProcessingFee,
+            expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
+            memo: memo || null,
+            termsAndConditions: termsAndConditions || null,
+            signatureUrl: signatureUrl || null,
+            targetMarginPercent: parseFloat(targetMargin) || 25,
+            taxExempt: !!taxExempt,
+            taxRateName: taxExempt ? null : (activeTax?.name || null),
+            taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            items: mappedItems,
+            paymentSchedules: mappedSchedules,
+        };
+    }, [
+        title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
+        memo, termsAndConditions, signatureUrl, targetMargin, taxExempt, selectedTaxName,
+        taxOptions, defaultTaxRate, items, paymentSchedules
+    ]);
+
+    useEffect(() => {
+        lastSavedStateRef.current = JSON.stringify(getEstimateSnapshot());
+    }, []);
+
     // Derived: sum of children totals per section header
     const sectionTotals = useMemo(() => {
         const map = new Map<string, number>();
@@ -567,6 +639,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     async function handleSave({ silent = false, skipRefresh = false } = {}) {
         captureHistory(new Date().toLocaleString());
+
+        // Check if there are actual changes before saving
+        const currentSnapshot = getEstimateSnapshot();
+        const currentSnapshotStr = JSON.stringify(currentSnapshot);
+        if (currentSnapshotStr === lastSavedStateRef.current) {
+            if (!silent) {
+                toast.success("Estimate saved successfully");
+            }
+            return;
+        }
+
         if (!silent) setIsSaving(true);
         try {
             // Recompute section header totals from children before saving
@@ -600,6 +683,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 taxRateName: taxExempt ? null : (activeTax?.name || null),
                 taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
             }, mappedItems);
+
+            // Update the last saved state ref to the new state
+            lastSavedStateRef.current = currentSnapshotStr;
 
             if (!silent) {
                 toast.success("Estimate saved successfully");
@@ -847,6 +933,51 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
                     }, mappedItems);
                     toast.success("Estimate auto-saved");
+
+                    // Update lastSavedStateRef so subsequent blur saves are skipped
+                    const aiSnapshot = {
+                        title: title || "",
+                        code: code || "",
+                        status: status || "Draft",
+                        processingFeeMarkup: Number(processingFeeMarkup) || 0,
+                        hideProcessingFee: !!hideProcessingFee,
+                        expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
+                        memo: memo || null,
+                        termsAndConditions: termsAndConditions || null,
+                        signatureUrl: signatureUrl || null,
+                        targetMarginPercent: parseFloat(targetMargin) || 25,
+                        taxExempt: !!taxExempt,
+                        taxRateName: taxExempt ? null : (activeTax?.name || null),
+                        taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+                        items: mappedItems.map((item: any, index: number) => ({
+                            id: item.id || null,
+                            parentId: item.parentId || null,
+                            name: item.name || "",
+                            description: item.description || "",
+                            quantity: String(item.quantity || "0"),
+                            unitCost: String(item.unitCost || "0"),
+                            costCodeId: item.costCodeId || null,
+                            costTypeId: item.costTypeId || null,
+                            vendorId: item.vendorId || null,
+                            approvalStatus: item.approvalStatus || null,
+                            order: index,
+                            total: item.total,
+                        })),
+                        paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
+                            id: schedule.id || null,
+                            name: schedule.name || "",
+                            amount: String(schedule.amount || "0"),
+                            dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
+                            status: schedule.status || "Pending",
+                            paymentMethod: schedule.paymentMethod || null,
+                            paymentReference: schedule.paymentReference || null,
+                            percentage: String(schedule.percentage || "0"),
+                            type: schedule.type || null,
+                            order: index
+                        })),
+                    };
+                    lastSavedStateRef.current = JSON.stringify(aiSnapshot);
+
                     router.refresh();
                 } catch (saveErr) {
                     console.error("Auto-save after AI generate failed:", saveErr);
