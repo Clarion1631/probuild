@@ -822,7 +822,10 @@ export const getProject = cache(async function getProject(id: string) {
 });
 
 export async function convertLeadToProject(leadId: string) {
-    const lead = await prisma.lead.findUnique({ where: { id: leadId } });
+    const lead = await prisma.lead.findUnique({ 
+        where: { id: leadId },
+        include: { client: true }
+    });
     if (!lead) throw new Error("Lead not found");
 
     // Idempotency: if this lead was already converted, return existing project
@@ -869,6 +872,26 @@ export async function convertLeadToProject(leadId: string) {
     // Auto-grant access to eligible team members
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
     await autoGrantProjectAccessToEligibleUsers(project.id);
+
+    // Provision Google Drive Folders in the background/async after project creation
+    try {
+        const { createProjectDriveFolder } = await import("./google-drive");
+        const driveResult = await createProjectDriveFolder(project.name, lead.client?.email);
+        
+        if (driveResult.success) {
+            // Create a FileFolder record in ProBuild representing this Google Drive folder
+            await prisma.fileFolder.create({
+                data: {
+                    name: `📁 Google Drive - Client Shared Folder`,
+                    projectId: project.id,
+                    visibility: "shared", // Shared with client
+                }
+            });
+            console.log(`[Google Drive] Successfully provisioned Google Drive for project: ${project.id}`);
+        }
+    } catch (driveErr) {
+        console.error("[Google Drive] Failed to provision Google Drive folder during conversion:", driveErr);
+    }
 
     revalidatePath("/leads");
     revalidatePath("/projects");
@@ -2079,7 +2102,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await (async (tx) => {
         // Preserve payment credits: subtract already-paid milestones from totalAmount
         const paidMilestones = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId, status: "Paid" },
@@ -2313,7 +2336,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         }
 
         return { success: true };
-    });
+    })(prisma);
 
     if (contextType === "project") {
         revalidatePath(`/projects/${contextId}/estimates`);
@@ -7644,4 +7667,53 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         redirectUrl,
     };
 }
+
+export async function addVoiceEstimateItem(projectId: string, name: string, quantity: number, unitCost: number) {
+    const estimate = await prisma.estimate.findFirst({
+        where: { projectId },
+        orderBy: { createdAt: "desc" }
+    });
+
+    if (!estimate) {
+        throw new Error("No active estimate found for this project. Please create an estimate first.");
+    }
+
+    const lastItem = await prisma.estimateItem.findFirst({
+        where: { estimateId: estimate.id },
+        orderBy: { order: "desc" },
+        select: { order: true }
+    });
+    const nextOrder = lastItem ? lastItem.order + 1 : 0;
+
+    const item = await prisma.estimateItem.create({
+        data: {
+            estimateId: estimate.id,
+            name,
+            type: "Material",
+            quantity,
+            baseCost: unitCost,
+            markupPercent: 0,
+            unitCost,
+            total: quantity * unitCost,
+            order: nextOrder
+        }
+    });
+
+    const allItems = await prisma.estimateItem.findMany({
+        where: { estimateId: estimate.id },
+        select: { total: true }
+    });
+    const totalAmount = allItems.reduce((sum, it) => sum + Number(it.total), 0);
+
+    await prisma.estimate.update({
+        where: { id: estimate.id },
+        data: { totalAmount }
+    });
+
+    revalidatePath(`/projects/${projectId}/estimates/${estimate.id}`);
+    revalidatePath(`/projects/${projectId}/estimates`);
+
+    return item;
+}
+
 

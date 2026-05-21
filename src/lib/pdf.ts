@@ -251,9 +251,21 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     for (const item of estimate.items) {
         checkNewPage(100);
 
+        const isSection = !item.parentId && estimate.items.some(i => i.parentId === item.id);
         const isSubItem = !!item.parentId;
         const nameX = isSubItem ? cols.name + 16 : cols.name;
-        const nameFont = isSubItem ? helvetica : helveticaBold;
+        const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
+
+        if (isSection) {
+            // Draw a subtle slate background banner for the section header
+            page.drawRectangle({
+                x: margin - 6,
+                y: y - 4,
+                width: contentWidth + 12,
+                height: 18,
+                color: colors.bgLight,
+            });
+        }
 
         // Truncate long names
         let displayName = item.name || '';
@@ -266,25 +278,27 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             x: nameX, y, size: 10, font: nameFont, color: colors.textMain,
         });
 
-        // Qty
-        const qtyStr = String(item.quantity || 0);
-        const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
-        page.drawText(qtyStr, {
-            x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
-        });
+        if (!isSection) {
+            // Qty
+            const qtyStr = String(item.quantity || 0);
+            const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
+            page.drawText(qtyStr, {
+                x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+            });
 
-        // Unit cost
-        const ucStr = formatCurrency(toNum(item.unitCost));
-        const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
-        page.drawText(ucStr, {
-            x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
-        });
+            // Unit cost
+            const ucStr = formatCurrency(toNum(item.unitCost));
+            const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
+            page.drawText(ucStr, {
+                x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+            });
+        }
 
         // Total
         const totalStr = formatCurrency(toNum(item.total));
         const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
-            x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
+            x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: isSection ? colors.primary : colors.textMain,
         });
 
         y -= 20;
@@ -300,9 +314,27 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((sum, item) => sum + toNum(item.total), 0);
-    const tax = subtotal * 0.087;
-    const total = subtotal + tax;
+    const subtotal = estimate.items.reduce((acc, item) => {
+        if (item.parentId) return acc + toNum(item.total);
+        if (!estimate.items.some(i => i.parentId === item.id)) return acc + toNum(item.total);
+        return acc;
+    }, 0);
+
+    const taxRatePercent = toNum(estimate.taxRatePercent);
+    const taxExempt = !!estimate.taxExempt;
+    const taxRate = taxExempt ? 0 : taxRatePercent / 100;
+    const tax = Math.round(subtotal * taxRate * 100) / 100;
+
+    const taxRateDisplay = Number(taxRatePercent.toFixed(4));
+    const taxName = taxExempt
+        ? "Tax Exempt"
+        : (estimate.taxRateName ? `${estimate.taxRateName} (${taxRateDisplay}%)` : `Estimated Tax (${taxRateDisplay}%)`);
+
+    const processingFeeMarkup = toNum(estimate.processingFeeMarkup);
+    const hideProcessingFee = estimate.hideProcessingFee ?? true;
+    const processingFee = processingFeeMarkup > 0 ? Math.round(subtotal * (processingFeeMarkup / 100) * 100) / 100 : 0;
+
+    const total = Math.round((subtotal + tax + processingFee) * 100) / 100;
 
     // Subtotal
     const labelX = cols.unitCost - 60;
@@ -317,7 +349,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     y -= 18;
 
     // Tax
-    page.drawText('Estimated Tax (8.7%)', {
+    page.drawText(taxName, {
         x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
     });
     const taxStr = formatCurrency(tax);
@@ -325,7 +357,20 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     page.drawText(taxStr, {
         x: cols.total - taxWidth, y, size: 10, font: helvetica, color: colors.textMain,
     });
-    y -= 22;
+    y -= 18;
+
+    // Processing Fee (only if not hidden)
+    if (!hideProcessingFee && processingFee > 0) {
+        page.drawText(`Processing Fee (${processingFeeMarkup}%)`, {
+            x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
+        });
+        const feeStr = formatCurrency(processingFee);
+        const feeWidth = helvetica.widthOfTextAtSize(feeStr, 10);
+        page.drawText(feeStr, {
+            x: cols.total - feeWidth, y, size: 10, font: helvetica, color: colors.textMain,
+        });
+        y -= 18;
+    }
 
     // Total line
     page.drawLine({
