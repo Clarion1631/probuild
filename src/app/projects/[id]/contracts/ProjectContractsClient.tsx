@@ -5,6 +5,7 @@ import { createContractFromTemplate, sendContractToClient, deleteContract, getCo
 import { toast } from "sonner";
 import { ContractWysiwygEditor } from "@/components/ContractWysiwygEditor";
 import DocumentSignModal from "@/components/DocumentSignModal";
+import DOMPurify from "dompurify";
 
 interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
@@ -240,7 +241,7 @@ export default function ProjectContractsClient({ projectId, projectName, clientN
                             </div>
                             <div
                                 className="prose prose-sm max-w-none"
-                                dangerouslySetInnerHTML={{ __html: draftedHtml }}
+                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(draftedHtml) }}
                             />
                         </div>
                         <div className="p-4 border-t border-hui-border flex gap-2">
