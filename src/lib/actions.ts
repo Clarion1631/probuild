@@ -873,25 +873,6 @@ export async function convertLeadToProject(leadId: string) {
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
     await autoGrantProjectAccessToEligibleUsers(project.id);
 
-    // Provision Google Drive Folders in the background/async after project creation
-    try {
-        const { createProjectDriveFolder } = await import("./google-drive");
-        const driveResult = await createProjectDriveFolder(project.name, lead.client?.email);
-        
-        if (driveResult.success) {
-            // Create a FileFolder record in ProBuild representing this Google Drive folder
-            await prisma.fileFolder.create({
-                data: {
-                    name: `📁 Google Drive - Client Shared Folder`,
-                    projectId: project.id,
-                    visibility: "shared", // Shared with client
-                }
-            });
-            console.log(`[Google Drive] Successfully provisioned Google Drive for project: ${project.id}`);
-        }
-    } catch (driveErr) {
-        console.error("[Google Drive] Failed to provision Google Drive folder during conversion:", driveErr);
-    }
 
     revalidatePath("/leads");
     revalidatePath("/projects");
@@ -5176,7 +5157,7 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
 
-    let items: string[] = JSON.parse(rawText);
+    const items: string[] = JSON.parse(rawText);
     if (!Array.isArray(items)) throw new Error("Invalid AI response");
 
     const maxOrder = await prisma.taskPunchItem.aggregate({
@@ -6279,7 +6260,7 @@ export async function updatePurchaseOrder(id: string, data: any) {
     "use server";
     const { items, vendorId, ...poData } = data;
     
-    let updateData: any = { ...poData };
+    const updateData: any = { ...poData };
     if (vendorId) updateData.vendorId = vendorId;
 
     const po = await prisma.purchaseOrder.update({
