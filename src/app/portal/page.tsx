@@ -16,28 +16,31 @@ export default async function PortalDashboard() {
     let clientName = "Team";
 
     if (isStaff) {
-        const allProjects = await prisma.project.findMany({
-            orderBy: { createdAt: 'desc' },
-            take: 50,
-            include: {
-                client: { select: { name: true } },
-                invoices: {
-                    where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                    select: { id: true, balanceDue: true }
+        const [allProjects, contracts] = await Promise.all([
+            prisma.project.findMany({
+                orderBy: { createdAt: 'desc' },
+                take: 50,
+                include: {
+                    client: { select: { name: true } },
+                    invoices: {
+                        where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
+                        select: { id: true, balanceDue: true }
+                    }
                 }
-            }
-        });
-        projects = allProjects;
+            }),
+            prisma.contract.findMany({
+                where: { status: { in: ["Sent", "Viewed", "Signed", "Finalized"] } },
+                select: {
+                    id: true, title: true, status: true, sentAt: true, approvedAt: true,
+                    lead: { select: { name: true } }, project: { select: { name: true } },
+                },
+                orderBy: { sentAt: "desc" },
+                take: 20,
+            })
+        ]);
 
-        clientContracts = await prisma.contract.findMany({
-            where: { status: { in: ["Sent", "Viewed", "Signed", "Finalized"] } },
-            select: {
-                id: true, title: true, status: true, sentAt: true, approvedAt: true,
-                lead: { select: { name: true } }, project: { select: { name: true } },
-            },
-            orderBy: { sentAt: "desc" },
-            take: 20,
-        });
+        projects = allProjects;
+        clientContracts = contracts;
     } else {
         const sessionClientId = await resolveSessionClientId();
 
@@ -60,35 +63,38 @@ export default async function PortalDashboard() {
             );
         }
 
-        const client = await prisma.client.findUnique({
-            where: { id: sessionClientId },
-            include: {
-                projects: {
-                    orderBy: { createdAt: 'desc' },
-                    include: {
-                        invoices: {
-                            where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                            select: { id: true, balanceDue: true }
+        const [client, contracts] = await Promise.all([
+            prisma.client.findUnique({
+                where: { id: sessionClientId },
+                include: {
+                    projects: {
+                        orderBy: { createdAt: 'desc' },
+                        include: {
+                            invoices: {
+                                where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
+                                select: { id: true, balanceDue: true }
+                            }
                         }
                     }
                 }
-            }
-        });
+            }),
+            prisma.contract.findMany({
+                where: {
+                    status: { in: ["Sent", "Viewed", "Signed", "Finalized"] },
+                    OR: [
+                        { lead: { clientId: sessionClientId } },
+                        { project: { clientId: sessionClientId } },
+                    ],
+                },
+                select: {
+                    id: true, title: true, status: true, sentAt: true, approvedAt: true,
+                    accessToken: true, lead: { select: { name: true } }, project: { select: { name: true } },
+                },
+                orderBy: { sentAt: "desc" },
+            })
+        ]);
 
-        clientContracts = await prisma.contract.findMany({
-            where: {
-                status: { in: ["Sent", "Viewed", "Signed", "Finalized"] },
-                OR: [
-                    { lead: { clientId: sessionClientId } },
-                    { project: { clientId: sessionClientId } },
-                ],
-            },
-            select: {
-                id: true, title: true, status: true, sentAt: true, approvedAt: true,
-                accessToken: true, lead: { select: { name: true } }, project: { select: { name: true } },
-            },
-            orderBy: { sentAt: "desc" },
-        });
+        clientContracts = contracts;
 
         if (!client) {
             return (
@@ -128,7 +134,7 @@ export default async function PortalDashboard() {
 
             {projects.length === 0 && clientContracts.length === 0 ? (
                 <div className="hui-card p-8 text-center flex flex-col items-center">
-                    <p className="text-hui-textMuted">You don't have any projects yet. They will appear here once created by your team.</p>
+                    <p className="text-hui-textMuted">You don&apos;t have any projects yet. They will appear here once created by your team.</p>
                 </div>
             ) : projects.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
