@@ -61,7 +61,7 @@ export default function ProjectsKanbanBoard({ projects: initialProjects, statuse
                                     {status.label}
                                     <span className="text-slate-400 font-medium ml-1">({colProjects.length})</span>
                                 </h3>
-                                <button onClick={onCustomizeClick} className="text-slate-400 hover:text-slate-700 transition">
+                                <button onClick={onCustomizeClick} aria-label="Customize status" title="Customize status" className="text-slate-400 hover:text-slate-700 transition">
                                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
                                 </button>
                             </div>
@@ -94,6 +94,8 @@ export default function ProjectsKanbanBoard({ projects: initialProjects, statuse
                                                                 </div>
                                                                 <button 
                                                                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); /* Future menu logic */ }}
+                                                                    aria-label="Project actions"
+                                                                    title="Project actions"
                                                                     className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition-opacity p-1 -mt-1 -mr-1 rounded shrink-0"
                                                                 >
                                                                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>

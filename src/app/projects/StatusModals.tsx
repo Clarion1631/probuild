@@ -42,7 +42,7 @@ export function CustomizeStatusModal({ statuses, onClose, onSave, onManageClick 
             <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm overflow-hidden flex flex-col">
                 <div className="flex items-center justify-between p-4 border-b border-slate-100">
                     <h2 className="text-xl font-bold text-slate-800">Customize</h2>
-                    <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+                    <button onClick={onClose} aria-label="Close" title="Close" className="text-slate-400 hover:text-slate-600">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
                     </button>
                 </div>
@@ -142,7 +142,7 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
             <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm overflow-hidden flex flex-col">
                 <div className="flex items-center justify-between p-4 border-b border-slate-100">
                     <h2 className="text-xl font-bold text-slate-800">Manage Project Status</h2>
-                    <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+                    <button onClick={onClose} aria-label="Close" title="Close" className="text-slate-400 hover:text-slate-600">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
                     </button>
                 </div>
@@ -158,12 +158,13 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
                                         value={editLabel}
                                         onChange={e => setEditLabel(e.target.value)}
                                         className="hui-input flex-1 py-1 text-sm bg-white" 
+                                        aria-label="Edit status name"
                                         onKeyDown={e => {
                                             if (e.key === 'Enter') handleEditSave(status.value);
                                             if (e.key === 'Escape') setEditingValue(null);
                                         }}
                                     />
-                                    <button onClick={() => handleEditSave(status.value)} className="text-sm font-semibold text-indigo-600 hover:text-indigo-800 shrink-0">Save</button>
+                                    <button onClick={() => handleEditSave(status.value)} aria-label="Save status" title="Save status" className="text-sm font-semibold text-indigo-600 hover:text-indigo-800 shrink-0">Save</button>
                                 </div>
                             ) : (
                                 <>
@@ -172,10 +173,10 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
                                         <span className="text-sm text-slate-700 truncate">{status.label}</span>
                                     </div>
                                     <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity pl-2">
-                                        <button onClick={() => { setEditingValue(status.value); setEditLabel(status.label); }} className="text-slate-400 hover:text-indigo-600 p-1">
+                                        <button onClick={() => { setEditingValue(status.value); setEditLabel(status.label); }} aria-label="Edit status" title="Edit status" className="text-slate-400 hover:text-indigo-600 p-1">
                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
                                         </button>
-                                        <button onClick={() => handleDelete(status.value)} className="text-slate-400 hover:text-red-500 p-1">
+                                        <button onClick={() => handleDelete(status.value)} aria-label="Delete status" title="Delete status" className="text-slate-400 hover:text-red-500 p-1">
                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
                                         </button>
                                     </div>
@@ -195,6 +196,7 @@ export function ManageStatusModal({ statuses, onClose, onSave }: ManageStatusMod
                                 onChange={e => setNewStatusName(e.target.value)}
                                 className="hui-input flex-1 py-1.5 text-sm" 
                                 placeholder="Status name"
+                                aria-label="New status name"
                                 onKeyDown={e => e.key === 'Enter' && handleAdd()}
                             />
                             <button onClick={handleAdd} className="text-sm font-semibold text-indigo-600 hover:text-indigo-800">Add</button>
