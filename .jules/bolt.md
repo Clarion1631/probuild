@@ -1,0 +1,3 @@
+## 2024-05-28 - Code-splitting Heavy Client-Side Charts
+**Learning:** Recharts relies on massive SVG and computation layers that are client-side only. Importing it statically blocks the paint loop of pages containing charts (like the financial dashboard), causing noticeable initial load delays (TBT & FCP spikes).
+**Action:** Use Next.js `next/dynamic` with `ssr: false` to asynchronously load heavy chart components. Provide a fast-loading skeleton/pulse state to let the page shell render instantly. Always apply this to `<Recharts>`, `@tiptap/*`, or large mapping libraries to preserve sub-100ms shell paints.
