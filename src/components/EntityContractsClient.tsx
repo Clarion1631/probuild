@@ -441,12 +441,12 @@ export default function EntityContractsClient({
                                 <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-xs text-amber-800">
                                     ⚠️ Review this AI draft carefully before use. Add it to a contract template for client signing.
                                 </div>
-                                <div className={CONTRACT_PROSE_CLASSES} dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(draftedHtml) }} />
+                                <div className={CONTRACT_PROSE_CLASSES} dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(draftedHtml, { USE_PROFILES: { html: true } }) }} />
                             </div>
                             <div className="p-4 border-t border-hui-border flex gap-2">
                                 <button onClick={() => setShowDraftPanel(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>
                                 <button
-                                    onClick={() => { navigator.clipboard.writeText(draftedHtml); toast.success("Contract HTML copied to clipboard"); }}
+                                    onClick={() => { navigator.clipboard.writeText(DOMPurify.sanitize(draftedHtml, { USE_PROFILES: { html: true } })); toast.success("Contract HTML copied to clipboard"); }}
                                     className="hui-btn text-sm"
                                 >
                                     Copy HTML
