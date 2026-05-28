@@ -82,8 +82,8 @@ export async function POST(req: NextRequest) {
     const imageFiles = takeoff.files.filter(f => f.mimeType.startsWith("image/"));
     const pdfFiles = takeoff.files.filter(f => f.mimeType === "application/pdf");
 
-    // For image files, fetch and include as inline data
-    for (const img of imageFiles.slice(0, 4)) {
+    // For image files, fetch and include as inline data concurrently
+    const imagePromises = imageFiles.slice(0, 4).map(async (img) => {
         try {
             const imgResp = await fetch(img.url);
             if (imgResp.ok) {
@@ -93,31 +93,43 @@ export async function POST(req: NextRequest) {
                 const safeMime = (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(rawMime)
                     ? rawMime
                     : "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
-                contentBlocks.push({
-                    type: "image",
-                    source: { type: "base64", media_type: safeMime, data: base64 },
-                });
+                return {
+                    type: "image" as const,
+                    source: { type: "base64" as const, media_type: safeMime, data: base64 },
+                };
             }
         } catch (err) {
             console.warn(`Could not fetch image ${img.name}:`, err);
         }
+        return null;
+    });
+
+    const imageResults = await Promise.all(imagePromises);
+    for (const result of imageResults) {
+        if (result) contentBlocks.push(result);
     }
 
-    // For PDF files, fetch and include as document blocks
-    for (const pdf of pdfFiles.slice(0, 3)) {
+    // For PDF files, fetch and include as document blocks concurrently
+    const pdfPromises = pdfFiles.slice(0, 3).map(async (pdf) => {
         try {
             const pdfResp = await fetch(pdf.url);
             if (pdfResp.ok) {
                 const buffer = await pdfResp.arrayBuffer();
                 const base64 = Buffer.from(buffer).toString("base64");
-                contentBlocks.push({
-                    type: "document",
-                    source: { type: "base64", media_type: "application/pdf", data: base64 },
-                });
+                return {
+                    type: "document" as const,
+                    source: { type: "base64" as const, media_type: "application/pdf" as const, data: base64 },
+                };
             }
         } catch (err) {
             console.warn(`Could not fetch PDF ${pdf.name}:`, err);
         }
+        return null;
+    });
+
+    const pdfResults = await Promise.all(pdfPromises);
+    for (const result of pdfResults) {
+        if (result) contentBlocks.push(result);
     }
 
     const textPrompt = `You are an expert residential remodeling estimator and takeoff specialist based in Clark County, Washington (Vancouver, WA metro area). You work for Golden Touch Remodeling. You are analyzing construction/architect plans to generate a detailed, accurate estimate.

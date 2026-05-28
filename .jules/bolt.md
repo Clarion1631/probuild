@@ -1,0 +1,3 @@
+## 2024-05-28 - Next.js App Router Route Handler Concurrency Optimization
+**Learning:** Sequential network calls inside route handlers (`app/api/**/route.ts`) represent a massive bottleneck, especially when orchestrating calls to external AI APIs or file storage. The `/api/takeoffs/ai-estimate/route.ts` was sequentially blocking on image/pdf buffering.
+**Action:** Always scan loop blocks for independent async operations. Refactor `for...of` loops performing isolated fetches into `Array.map` wrapping `Promise.all` to achieve theoretical N-times speedup based on array length, being careful to maintain array order constraints if required by downstream AI prompting.
