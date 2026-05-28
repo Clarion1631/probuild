@@ -1112,56 +1112,23 @@ export async function listRoomsForLead(leadId: string) {
 }
 
 export const getEstimate = cache(async function getEstimate(id: string) {
-    try {
-        // Full query — works when all schema columns exist in DB
-        return await prisma.estimate.findUnique({
-            where: { id },
-            include: {
-                items: {
-                    orderBy: { order: "asc" },
-                    include: {
-                        expenses: true,
-                        costCode: true,
-                        costType: true,
-                        purchaseOrder: { include: { vendor: true } },
-                    },
+    return await prisma.estimate.findUnique({
+        where: { id },
+        include: {
+            items: {
+                orderBy: { order: "asc" },
+                include: {
+                    expenses: true,
+                    costCode: true,
+                    costType: true,
+                    purchaseOrder: { include: { vendor: true } },
                 },
-                paymentSchedules: { orderBy: { order: "asc" } },
-                expenses: true,
-                files: { orderBy: { createdAt: "desc" } },
             },
-        });
-    } catch {
-        // Safe fallback — omit columns not yet migrated to DB
-        // TODO: remove after running: gh workflow run db-push.yml --repo Clarion1631/probuild
-        return await prisma.estimate.findUnique({
-            where: { id },
-            select: {
-                id: true, number: true, title: true, projectId: true, leadId: true,
-                code: true, status: true, privacy: true, createdAt: true,
-                totalAmount: true, balanceDue: true, taxExempt: true,
-                taxRateName: true, taxRatePercent: true,
-                approvedBy: true, approvedAt: true,
-                approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
-                items: {
-                    orderBy: { order: "asc" },
-                    select: {
-                        id: true, estimateId: true, name: true, description: true, type: true,
-                        quantity: true, baseCost: true, markupPercent: true, unitCost: true,
-                        total: true, order: true, parentId: true,
-                        costCodeId: true, costTypeId: true, createdAt: true,
-                        expenses: true, costCode: true, costType: true,
-                        approvalStatus: true, approvalNote: true,
-                        purchaseOrderId: true,
-                        budgetQuantity: true, budgetUnit: true, budgetRate: true,
-                        purchaseOrder: { select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } } },
-                    },
-                },
-                paymentSchedules: { orderBy: { order: "asc" } },
-                expenses: true,
-            },
-        });
-    }
+            paymentSchedules: { orderBy: { order: "asc" } },
+            expenses: true,
+            files: { orderBy: { createdAt: "desc" } },
+        },
+    });
 });
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
@@ -1196,48 +1163,15 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
             ],
         };
 
-        let estimate: any;
-        try {
-            estimate = await prisma.estimate.findFirst({
-                where: ownershipFilter,
-                include: {
-                    project: { include: { client: true } },
-                    lead: { include: { client: true } },
-                    items: { orderBy: { order: "asc" } },
-                    paymentSchedules: { orderBy: { order: "asc" } },
-                },
-            });
-        } catch (err) {
-            console.error("[getEstimateForPortal] Primary query failed:", err);
-            try {
-                estimate = await prisma.estimate.findFirst({
-                    where: ownershipFilter,
-                    select: {
-                        id: true, number: true, title: true, projectId: true, leadId: true,
-                        code: true, status: true, privacy: true, createdAt: true,
-                        totalAmount: true, balanceDue: true, taxExempt: true,
-                        taxRateName: true, taxRatePercent: true,
-                        approvedBy: true, approvedAt: true,
-                        approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
-                        project: { include: { client: true } },
-                        lead: { include: { client: true } },
-                        items: {
-                            orderBy: { order: "asc" },
-                            select: {
-                                id: true, estimateId: true, name: true, description: true, type: true,
-                                quantity: true, baseCost: true, markupPercent: true, unitCost: true,
-                                total: true, order: true, parentId: true,
-                                costCodeId: true, costTypeId: true, createdAt: true,
-                            },
-                        },
-                        paymentSchedules: { orderBy: { order: "asc" } },
-                    },
-                });
-            } catch (fallbackErr) {
-                console.error("[getEstimateForPortal] Fallback query also failed:", fallbackErr);
-                return null;
-            }
-        }
+        const estimate = await prisma.estimate.findFirst({
+            where: ownershipFilter,
+            include: {
+                project: { include: { client: true } },
+                lead: { include: { client: true } },
+                items: { orderBy: { order: "asc" } },
+                paymentSchedules: { orderBy: { order: "asc" } },
+            },
+        });
 
         if (!estimate) return null;
 
@@ -1251,47 +1185,15 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
     }
 
     // Staff path: no ownership restriction — just fetch by id
-    let estimate: any;
-    try {
-        estimate = await prisma.estimate.findFirst({
-            where: { id },
-            include: {
-                project: { include: { client: true } },
-                lead: { include: { client: true } },
-                items: { orderBy: { order: "asc" } },
-                paymentSchedules: { orderBy: { order: "asc" } },
-            },
-        });
-    } catch (err) {
-        console.error("[getEstimateForPortal] Primary query failed:", err);
-        try {
-            estimate = await prisma.estimate.findFirst({
-                where: { id },
-                select: {
-                    id: true, number: true, title: true, projectId: true, leadId: true,
-                    code: true, status: true, privacy: true, createdAt: true,
-                    totalAmount: true, balanceDue: true, taxExempt: true,
-                    approvedBy: true, approvedAt: true,
-                    approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
-                    project: { include: { client: true } },
-                    lead: { include: { client: true } },
-                    items: {
-                        orderBy: { order: "asc" },
-                        select: {
-                            id: true, estimateId: true, name: true, description: true, type: true,
-                            quantity: true, baseCost: true, markupPercent: true, unitCost: true,
-                            total: true, order: true, parentId: true,
-                            costCodeId: true, costTypeId: true, createdAt: true,
-                        },
-                    },
-                    paymentSchedules: { orderBy: { order: "asc" } },
-                },
-            });
-        } catch (fallbackErr) {
-            console.error("[getEstimateForPortal] Fallback query also failed:", fallbackErr);
-            return null;
-        }
-    }
+    const estimate = await prisma.estimate.findFirst({
+        where: { id },
+        include: {
+            project: { include: { client: true } },
+            lead: { include: { client: true } },
+            items: { orderBy: { order: "asc" } },
+            paymentSchedules: { orderBy: { order: "asc" } },
+        },
+    });
 
     if (!estimate) return null;
 
