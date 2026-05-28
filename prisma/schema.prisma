@@ -1222,16 +1222,16 @@ model PurchaseOrderMessage {
   id              String        @id @default(cuid())
   purchaseOrderId String
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  
+
   gmailMessageId  String?       @unique
   body            String        @db.Text
   senderEmail     String
   senderName      String?
   senderType      String        @default("VENDOR") // TEAM, VENDOR, AI
-  
+
   isAttachment    Boolean       @default(false)
   attachmentUrl   String?
-  
+
   createdAt       DateTime      @default(now())
 }
 
@@ -1455,6 +1455,27 @@ model DocumentComment {
 }
 
 // ── Help Chat ────────────────────────────────────────────────────
+
+model HelpRequest {
+  id                String    @id @default(dbgenerated("gen_random_uuid()::text"))
+  userId            String
+  type              String    @default("help")
+  question          String
+  response          String?
+  currentPage       String?
+  status            String?   @default("open")
+  slackMessageTs    String?
+  completedAt       DateTime? @db.Timestamptz
+  verifiedAt        DateTime? @db.Timestamptz
+  changeDescription String?
+  changeLocation    String?
+  externalIssueRef  String?
+  conversationId    String?
+  createdAt         DateTime? @default(now()) @db.Timestamptz
+
+  @@index([conversationId])
+  @@index([externalIssueRef])
+}
 
 model ChatConversation {
   id         String    @id @default(cuid())
