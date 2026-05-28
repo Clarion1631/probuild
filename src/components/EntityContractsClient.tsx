@@ -433,7 +433,7 @@ export default function EntityContractsClient({
                                     <span className="text-xl">✨</span>
                                     <h2 className="font-bold text-hui-textMain text-lg">AI Drafted Contract</h2>
                                 </div>
-                                <button onClick={() => setShowDraftPanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <button onClick={() => setShowDraftPanel(false)} className="text-hui-textMuted hover:text-hui-textMain" aria-label="Close">
                                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                 </button>
                             </div>
@@ -549,7 +549,7 @@ export default function EntityContractsClient({
                     <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[80vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
                         <div className="px-6 pt-6 pb-4 border-b border-slate-200 flex items-center justify-between">
                             <h2 className="text-xl font-bold text-slate-800">Choose Template</h2>
-                            <button onClick={() => setShowTemplateModal(false)} className="text-slate-400 hover:text-slate-600 transition text-xl leading-none">×</button>
+                            <button onClick={() => setShowTemplateModal(false)} className="text-slate-400 hover:text-slate-600 transition text-xl leading-none" aria-label="Close">×</button>
                         </div>
                         <div className="px-6 py-4 flex items-center justify-between gap-4 border-b border-slate-100">
                             <div>
