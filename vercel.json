@@ -5,7 +5,6 @@
       "main": true
     }
   },
-  "ignoreCommand": "[ -z \"$VERCEL_GIT_PREVIOUS_SHA\" ] && exit 1; git diff --quiet $VERCEL_GIT_PREVIOUS_SHA HEAD -- ':(exclude)*.md' ':(exclude)docs/**' ':(exclude)qa-screenshots/**' ':(exclude)*.png' ':(exclude).gitignore'",
   "crons": [
     {
       "path": "/api/cron/send-scheduled-messages",
