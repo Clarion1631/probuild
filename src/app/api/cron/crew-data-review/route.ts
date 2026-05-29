@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { notifyReview } from "@/lib/notify";
+import { startOfWeek } from "date-fns";
 
 export const dynamic = "force-dynamic";
 
@@ -60,10 +61,41 @@ export async function GET(request: Request) {
         if (!("deduped" in r) || !r.deduped) alerts++;
     }
 
+    // Overtime detection (FLSA/WA weekly OT): flag workers over 40 PAYABLE hours in the
+    // current workweek so a human applies the correct premium before payroll. We DETECT and
+    // notify rather than auto-apply 1.5× — the premium depends on workweek start + exempt
+    // classification, which are payroll-policy decisions, not something to guess here.
+    const weekStart = startOfWeek(new Date()); // Sunday-based; adjust if the workweek differs
+    const weekKey = weekStart.toISOString().slice(0, 10);
+    const weekAgg = await prisma.timeEntry.groupBy({
+        by: ["userId"],
+        where: { startTime: { gte: weekStart }, endTime: { not: null }, durationHours: { not: null } },
+        _sum: { durationHours: true },
+    });
+    let overtimeFlagged = 0;
+    for (const w of weekAgg) {
+        const hrs = w._sum.durationHours ?? 0;
+        if (hrs > 40) {
+            const r = await notifyReview({
+                type: "overtime",
+                severity: "warning",
+                title: "Worker over 40 hours this week",
+                body: `${hrs.toFixed(1)} payable hrs so far this workweek — review for an overtime premium before payroll.`,
+                actorId: w.userId,
+                dedupeKey: `ot:${w.userId}:${weekKey}`,
+            }).catch(() => ({ deduped: true }));
+            if (!("deduped" in r) || !r.deduped) {
+                alerts++;
+                overtimeFlagged++;
+            }
+        }
+    }
+
     return NextResponse.json({
         ok: true,
         staleOpen: staleOpen.length,
         offsiteOpen: offsiteOpen.length,
+        overtimeFlagged,
         newAlerts: alerts,
     });
 }
