@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import { resolveCostCode } from "@/lib/cost-coding";
+import { notifyReview } from "@/lib/notify";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
 // chose the estimate) OR `projectId` (mobile flow — server picks the project's first
@@ -115,6 +116,20 @@ export async function POST(req: NextRequest) {
                 status: "Pending",
             },
         });
+
+        // Flag expenses that need a manager's eyes — a missing receipt is the common case.
+        if (!receiptUrl) {
+            await notifyReview({
+                type: "expense_needs_review",
+                severity: "warning",
+                title: "Expense submitted without a receipt",
+                body: `$${numericAmount.toFixed(2)}${vendor ? ` to ${vendor}` : ""} — no receipt attached; verify and attach one.`,
+                projectId: projectId ?? null,
+                expenseId: newExpense.id,
+                actorId: user.id,
+                dedupeKey: `expense_no_receipt:${newExpense.id}`,
+            }).catch(() => {});
+        }
 
         return NextResponse.json(newExpense);
     } catch (error: any) {

@@ -12,6 +12,8 @@
  */
 import { prisma } from "@/lib/prisma";
 import { resolveCostCode } from "@/lib/cost-coding";
+import { computeLaborCost, roundMoney } from "@/lib/labor-cost";
+import { notifyReview } from "@/lib/notify";
 
 const TAG = "__P0_VERIFY__";
 let pass = 0;
@@ -28,6 +30,7 @@ function check(name: string, ok: boolean, detail = "") {
 
 // Idempotent teardown by tag — removes any leftover test rows (dependents first).
 async function cleanupByTag() {
+    await prisma.notification.deleteMany({ where: { dedupeKey: { startsWith: TAG } } });
     await prisma.timeEntry.deleteMany({ where: { project: { name: { startsWith: TAG } } } });
     await prisma.expense.deleteMany({ where: { estimate: { title: { startsWith: TAG } } } });
     await prisma.estimateItem.deleteMany({ where: { estimate: { title: { startsWith: TAG } } } });
@@ -144,6 +147,59 @@ async function main() {
         });
         createdExpenseIds.push(expense.id);
         check("expense stored a cost code", !!expense.costCodeId, expense.costCodeId ?? "null");
+
+        console.log("\n── Money rounding (half-cent, half-up) ──");
+        check("roundMoney(10.075) = 10.08", roundMoney(10.075) === 10.08, String(roundMoney(10.075)));
+        check("roundMoney(1.005) = 1.01", roundMoney(1.005) === 1.01, String(roundMoney(1.005)));
+        check("roundMoney(2.675) = 2.68", roundMoney(2.675) === 2.68, String(roundMoney(2.675)));
+        check("roundMoney(300) = 300", roundMoney(300) === 300, String(roundMoney(300)));
+        check("roundMoney(0) = 0", roundMoney(0) === 0, String(roundMoney(0)));
+
+        console.log("\n── WA meal-break compliance (computeLaborCost) ──");
+        const base = { hourlyRate: 40, burdenRate: 10 };
+        const mk = (hours: number, mealSkipped = false) => {
+            const s = new Date("2026-01-01T08:00:00Z");
+            const e = new Date(s.getTime() + hours * 3_600_000);
+            return computeLaborCost({ start: s, end: e, ...base, mealSkipped });
+        };
+        const c5 = mk(5);
+        check("5h shift: no meal deduction", c5.mealDeductionHours === 0 && c5.payableHours === 5);
+        const c55 = mk(5.5);
+        check("5.5h shift: 0.5h meal deducted → 5.0 payable", c55.mealDeductionHours === 0.5 && c55.payableHours === 5);
+        const c8 = mk(8);
+        check(
+            "8h shift: 7.5 payable, $300 labour",
+            c8.payableHours === 7.5 && c8.laborCost === 300 && c8.burdenCost === 75,
+            `$${c8.laborCost} labour, $${c8.burdenCost} burden`
+        );
+        const c8skip = mk(8, true);
+        check(
+            "8h meal-SKIPPED: 8.0 payable + flagged",
+            c8skip.payableHours === 8 && c8skip.laborCost === 320 && c8skip.needsReview === true,
+            c8skip.reviewReason ?? ""
+        );
+
+        console.log("\n── Notifications (in-app only; no email/chat side effects) ──");
+        const dk = `${TAG}-notif-1`;
+        const n1 = await notifyReview({
+            type: "meal_skipped",
+            severity: "warning",
+            title: `${TAG} test alert`,
+            body: "verification",
+            timeEntryId: entry.id,
+            dedupeKey: dk,
+            emailRecipients: [], // no email
+            chatSpace: null, // no chat
+        });
+        check("notification persisted in-app", n1.id !== null && n1.channels.includes("inapp"));
+        const n2 = await notifyReview({
+            type: "meal_skipped",
+            title: `${TAG} test alert dup`,
+            dedupeKey: dk,
+            emailRecipients: [],
+            chatSpace: null,
+        });
+        check("duplicate dedupeKey is a no-op", n2.deduped === true && n2.id === null);
     } finally {
         // ── Teardown ────────────────────────────────────────────────────────
         void createdExpenseIds;

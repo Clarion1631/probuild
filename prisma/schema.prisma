@@ -545,6 +545,14 @@ model TimeEntry {
   isOffsite         Boolean   @default(false)
   lastLocationCheck DateTime?
 
+  // WA L&I meal-break compliance (P1). durationHours stores PAYABLE hours (meal deducted);
+  // gross = durationHours + mealDeductionHours. mealSkipped = worker attested no meal taken
+  // (time is paid + flagged). needsReview surfaces the entry for a manager.
+  mealSkipped        Boolean  @default(false)
+  mealDeductionHours Float?
+  needsReview        Boolean  @default(false)
+  reviewReason       String?
+
   // Invoice linkage — set when pulled into a cost-plus invoice
   invoicedAt DateTime?
 
@@ -554,6 +562,29 @@ model TimeEntry {
   @@index([costTypeId])
   @@index([estimateItemId])
   @@index([scheduleTaskId])
+}
+
+// Durable manager notifications for crew data that needs review/edit (P1). Replaces the
+// previous read-synthesized, same-day-only dashboard feed so an alert survives a missed day.
+// Plain projectId/timeEntryId/expenseId columns (no FK relations) keep this an append log.
+model Notification {
+  id          String    @id @default(cuid())
+  type        String    // time_entry_edited | expense_needs_review | uncoded_labor | open_clockout | offsite | daily_log | meal_skipped
+  severity    String    @default("info") // info | warning | urgent
+  title       String
+  body        String?
+  projectId   String?
+  timeEntryId String?
+  expenseId   String?
+  actorId     String?   // user who triggered it (if any)
+  dedupeKey   String?   @unique // collapse repeats (e.g. one open-clockout alert per entry)
+  channels    String?   // delivered channels, csv: inapp,email,gchat
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([createdAt])
+  @@index([projectId])
+  @@index([readAt])
 }
 
 model Contract {

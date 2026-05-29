@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { notifyReview } from "@/lib/notify";
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
 Analyze this receipt image and extract the following information as JSON:
@@ -240,6 +241,17 @@ export async function POST(req: NextRequest) {
                 });
                 expenseCreated = true;
                 expenseId = expense.id;
+                // AI expense lands uncoded + Pending — tell a reviewer to code and approve it.
+                await notifyReview({
+                    type: "expense_needs_review",
+                    severity: "warning",
+                    title: "AI receipt needs a cost code",
+                    body: `$${Number(parsed.total).toFixed(2)} — ${String(parsed.vendor)} (AI ${confidence}%). Assign a cost code, then approve.`,
+                    projectId,
+                    expenseId: expense.id,
+                    actorId: user.id,
+                    dedupeKey: `ai_expense:${expense.id}`,
+                }).catch(() => {});
             }
         }
 

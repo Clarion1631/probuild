@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { computeLaborCost } from "@/lib/labor-cost";
+import { notifyReview } from "@/lib/notify";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -43,7 +45,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // either silently drop telemetry (the bug Codex flagged) or recompute cost off
     // partial inputs. Mobile sends one or the other.
     const telemetryFields = ["offsiteMs", "isOffsite", "lastLocationCheck"] as const;
-    const editFields = ["startTime", "endTime", "editNotes"] as const;
+    const editFields = ["startTime", "endTime", "editNotes", "mealSkipped"] as const;
     const hasTelemetry = telemetryFields.some((k) => body[k] !== undefined);
     const hasEdit = editFields.some((k) => body[k] !== undefined);
 
@@ -129,9 +131,32 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         : await prisma.user.findUnique({ where: { id: existing.userId } });
     if (!owner) return NextResponse.json({ error: "Entry owner not found" }, { status: 404 });
 
-    const durationHours = newEnd ? (newEnd.getTime() - newStart.getTime()) / 3_600_000 : null;
-    const laborCost = durationHours != null ? durationHours * toNum(owner.hourlyRate) : null;
-    const burdenCost = durationHours != null ? durationHours * toNum(owner.burdenRate) : null;
+    // Recompute via the shared WA-compliant engine (meal deduction, cents rounding).
+    // durationHours stores PAYABLE hours; mealDeductionHours records the deduction.
+    const mealSkipped =
+        typeof body.mealSkipped === "boolean" ? body.mealSkipped : existing.mealSkipped;
+
+    let durationHours: number | null = null;
+    let laborCost: number | null = null;
+    let burdenCost: number | null = null;
+    let mealDeductionHours: number | null = null;
+    let needsReview = false;
+    let reviewReason: string | null = null;
+    if (newEnd) {
+        const c = computeLaborCost({
+            start: newStart,
+            end: newEnd,
+            hourlyRate: toNum(owner.hourlyRate),
+            burdenRate: toNum(owner.burdenRate),
+            mealSkipped,
+        });
+        durationHours = c.payableHours;
+        laborCost = c.laborCost;
+        burdenCost = c.burdenCost;
+        mealDeductionHours = c.mealDeductionHours;
+        needsReview = c.needsReview;
+        reviewReason = c.reviewReason;
+    }
 
     const data: Record<string, unknown> = {
         startTime: newStart,
@@ -139,6 +164,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         durationHours,
         laborCost,
         burdenCost,
+        mealSkipped,
+        mealDeductionHours,
+        needsReview,
+        reviewReason,
         editNotes: body.editNotes.trim(),
         isEdited: true,
     };
@@ -156,6 +185,27 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
 
     const updated = await prisma.timeEntry.update({ where: { id }, data });
+
+    // Durable notification so the edit is seen even if no one opens the dashboard that day.
+    const editedByManager = isPrivileged && !isOwner;
+    await notifyReview({
+        type: "time_entry_edited",
+        severity: needsReview ? "warning" : "info",
+        title: editedByManager
+            ? "Manager edited a crew member's time entry"
+            : "Time entry edited",
+        body: [
+            `${(durationHours ?? 0).toFixed(2)} payable hrs${mealDeductionHours ? ` (−${mealDeductionHours}h meal)` : ""}`,
+            `Reason: ${body.editNotes.trim()}`,
+            reviewReason ?? "",
+        ]
+            .filter(Boolean)
+            .join(" · "),
+        projectId: existing.projectId,
+        timeEntryId: id,
+        actorId: user.id,
+    }).catch(() => {});
+
     return NextResponse.json(JSON.parse(JSON.stringify(updated)));
 }
 

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
 import { signMobileToken } from "@/lib/mobile-auth";
+import { rateLimit, clientIp } from "@/lib/rate-limit";
 
 export const dynamic = 'force-dynamic';
 
@@ -12,6 +13,16 @@ export async function POST(req: Request) {
 
         if (!email || !pinCode) {
             return NextResponse.json({ error: "Email and PIN are required" }, { status: 400 });
+        }
+
+        // Throttle PIN guessing: short numeric PINs are brute-forceable. Cap attempts per
+        // email+IP. (In-memory / per-instance — see lib/rate-limit caveat.)
+        const rl = rateLimit(`pin-login:${String(email).toLowerCase()}:${clientIp(req)}`, 8, 10 * 60 * 1000);
+        if (!rl.allowed) {
+            return NextResponse.json(
+                { error: "Too many login attempts. Please wait a few minutes and try again." },
+                { status: 429, headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) } }
+            );
         }
 
         const user = await prisma.user.findFirst({

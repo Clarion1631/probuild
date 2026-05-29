@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveCostCode } from "@/lib/cost-coding";
+import { computeLaborCost } from "@/lib/labor-cost";
+import { notifyReview } from "@/lib/notify";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -94,7 +96,7 @@ export async function PUT(req: Request) {
     const { user } = auth;
 
     const body = await req.json();
-    const { id, endTime, latitude, longitude } = body;
+    const { id, endTime, latitude, longitude, mealSkipped } = body;
 
     if (!id) return NextResponse.json({ error: "Time Entry ID is required" }, { status: 400 });
 
@@ -106,9 +108,12 @@ export async function PUT(req: Request) {
     }
 
     const end = endTime ? new Date(endTime) : new Date();
-    const durationMs = end.getTime() - existing.startTime.getTime();
-    let durationHours = durationMs / (1000 * 60 * 60);
-    if (durationHours < 0) durationHours = 0;
+    if (Number.isNaN(end.getTime())) {
+        return NextResponse.json({ error: "Invalid endTime" }, { status: 400 });
+    }
+    if (end.getTime() < existing.startTime.getTime()) {
+        return NextResponse.json({ error: "endTime cannot be before startTime" }, { status: 400 });
+    }
 
     // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
     // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
@@ -116,14 +121,25 @@ export async function PUT(req: Request) {
         ? user
         : await prisma.user.findUnique({ where: { id: existing.userId } });
     if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
-    const laborCost = durationHours * toNum(owner.hourlyRate);
-    const burdenCost = durationHours * toNum(owner.burdenRate);
+
+    // WA-compliant cost: meal deduction for shifts >5h (unless skipped), cents rounding.
+    const cost = computeLaborCost({
+        start: existing.startTime,
+        end,
+        hourlyRate: toNum(owner.hourlyRate),
+        burdenRate: toNum(owner.burdenRate),
+        mealSkipped: typeof mealSkipped === "boolean" ? mealSkipped : existing.mealSkipped,
+    });
 
     const updateData: any = {
         endTime: end,
-        durationHours,
-        laborCost,
-        burdenCost,
+        durationHours: cost.payableHours,
+        laborCost: cost.laborCost,
+        burdenCost: cost.burdenCost,
+        mealSkipped: typeof mealSkipped === "boolean" ? mealSkipped : existing.mealSkipped,
+        mealDeductionHours: cost.mealDeductionHours,
+        needsReview: cost.needsReview,
+        reviewReason: cost.reviewReason,
     };
 
     if (latitude) updateData.latitude = latitude;
@@ -140,6 +156,20 @@ export async function PUT(req: Request) {
         where: { id },
         data: updateData
     });
+
+    // Flag for review when a meal was skipped on a long shift (WA L&I premium/owed-pay check).
+    if (cost.needsReview) {
+        await notifyReview({
+            type: "meal_skipped",
+            severity: "warning",
+            title: "Meal break skipped on a long shift",
+            body: `${cost.payableHours.toFixed(2)} hrs clocked with no meal break (shift over 5h). ${cost.reviewReason ?? ""}`.trim(),
+            projectId: existing.projectId,
+            timeEntryId: id,
+            actorId: user.id,
+            dedupeKey: `meal_skipped:${id}`,
+        }).catch(() => {});
+    }
 
     return NextResponse.json(JSON.parse(JSON.stringify(timeEntry)));
 }
