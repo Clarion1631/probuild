@@ -74,34 +74,22 @@ export async function POST(req: NextRequest) {
 
     const externalIssueRef = `github-issue:${ghIssue.number}`;
 
-    const result = await prisma.$queryRaw<any[]>`
-      INSERT INTO "HelpRequest" (
-        "userId",
-        "type",
-        "question",
-        "response",
-        "currentPage",
-        "status",
-        "changeLocation",
-        "externalIssueRef",
-        "conversationId"
-      )
-      VALUES (
-        ${userId},
-        'bug_fix',
-        ${title},
-        ${issueDetails},
-        ${currentPage || null},
-        'submitted',
-        ${ghIssue.url},
-        ${externalIssueRef},
-        ${conversationId}
-      )
-      RETURNING *
-    `;
+    const requestRow = await prisma.helpRequest.create({
+      data: {
+        userId,
+        type: "bug_fix",
+        question: title,
+        response: issueDetails,
+        currentPage: currentPage || null,
+        status: "submitted",
+        changeLocation: ghIssue.url,
+        externalIssueRef,
+        conversationId,
+      },
+    });
 
     return NextResponse.json({
-      request: result[0],
+      request: requestRow,
       issueNumber: ghIssue.number,
       issueUrl: ghIssue.url,
     });

@@ -5,6 +5,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
 import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+import { resolveCostCode } from "@/lib/cost-coding";
 
 // ─── Time Entry Actions ────────────────────────────────────────
 
@@ -19,8 +20,17 @@ export async function createTimeEntry(data: {
     isTaxable?: boolean;
     notes?: string;
 }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    // On-behalf-of entry (accepts an arbitrary userId): require the timeClock permission and
+    // access to this project, not merely a logged-in session.
+    const actor = await getCurrentUserWithPermissions();
+    if (!actor) throw new Error("Unauthorized");
+    if (!hasPermission(actor, "timeClock") || !canAccessProject(actor, data.projectId)) {
+        throw new Error("Forbidden");
+    }
+
+    // Job-costing gate: no uncoded labour, even from the web manual-entry form.
+    const coded = await resolveCostCode({ costCodeId: data.costCodeId });
+    if (!coded.ok) throw new Error(coded.error);
 
     const startTime = new Date(data.date);
 
@@ -28,7 +38,8 @@ export async function createTimeEntry(data: {
         data: {
             projectId: data.projectId,
             userId: data.userId,
-            costCodeId: data.costCodeId,
+            costCodeId: coded.costCodeId,
+            costTypeId: coded.costTypeId,
             startTime,
             durationHours: data.durationHours,
             laborCost: data.laborCost,
@@ -50,8 +61,15 @@ export async function updateTimeEntry(
         laborCost: number;
     }
 ) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    const actor = await getCurrentUserWithPermissions();
+    if (!actor) throw new Error("Unauthorized");
+    if (!hasPermission(actor, "timeClock") || !canAccessProject(actor, data.projectId)) {
+        throw new Error("Forbidden");
+    }
+
+    // An edit must not un-code the entry.
+    const coded = await resolveCostCode({ costCodeId: data.costCodeId });
+    if (!coded.ok) throw new Error(coded.error);
 
     const startTime = new Date(data.date);
 
@@ -59,7 +77,8 @@ export async function updateTimeEntry(
         where: { id },
         data: {
             userId: data.userId,
-            costCodeId: data.costCodeId,
+            costCodeId: coded.costCodeId,
+            costTypeId: coded.costTypeId,
             startTime,
             durationHours: data.durationHours,
             laborCost: data.laborCost,
@@ -129,15 +148,23 @@ export async function createExpense(data: {
     receiptUrl?: string;
     projectId: string;
 }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    const actor = await getCurrentUserWithPermissions();
+    if (!actor) throw new Error("Unauthorized");
+    if (!hasPermission(actor, "timeClock") || !canAccessProject(actor, data.projectId)) {
+        throw new Error("Forbidden");
+    }
+
+    // Job-costing gate: no uncoded spend. When the code came from a line item, the item's
+    // cost type wins; otherwise honour an explicitly-passed costTypeId.
+    const coded = await resolveCostCode({ costCodeId: data.costCodeId, lineItemId: data.itemId });
+    if (!coded.ok) throw new Error(coded.error);
 
     await prisma.expense.create({
         data: {
             estimateId: data.estimateId,
             itemId: data.itemId || null,
-            costCodeId: data.costCodeId || null,
-            costTypeId: data.costTypeId || null,
+            costCodeId: coded.costCodeId,
+            costTypeId: coded.costTypeId ?? data.costTypeId ?? null,
             amount: data.amount,
             vendor: data.vendor || null,
             date: data.date ? new Date(data.date) : null,

@@ -138,5 +138,36 @@ export async function POST(req: Request) {
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
     await autoGrantProjectAccessToEligibleUsers(created.id);
 
+    // Fetch client email to share Drive folder
+    let clientEmail: string | null = null;
+    try {
+        const client = await prisma.client.findUnique({
+            where: { id: clientId },
+            select: { email: true }
+        });
+        clientEmail = client?.email || null;
+    } catch (e) {
+        console.error("[Google Drive] Failed to fetch client email for Drive provisioning:", e);
+    }
+
+    // Provision Google Drive folder
+    try {
+        const { createProjectDriveFolder } = await import("@/lib/google-drive");
+        const driveResult = await createProjectDriveFolder(created.name, clientEmail);
+        
+        if (driveResult.success) {
+            await prisma.fileFolder.create({
+                data: {
+                    name: `📁 Google Drive - Client Shared Folder`,
+                    projectId: created.id,
+                    visibility: "shared",
+                }
+            });
+            console.log(`[Google Drive] Successfully provisioned Google Drive for project created via API: ${created.id}`);
+        }
+    } catch (driveErr) {
+        console.error("[Google Drive] Failed to provision Google Drive folder during API creation:", driveErr);
+    }
+
     return NextResponse.json(created);
 }

@@ -17,11 +17,10 @@ export async function GET() {
   const userId = (session.user as any).id;
 
   try {
-    const requests = await prisma.$queryRaw<any[]>`
-      SELECT * FROM "HelpRequest"
-      WHERE "userId" = ${userId}
-      ORDER BY "createdAt" DESC
-    `;
+    const requests = await prisma.helpRequest.findMany({
+      where: { userId },
+      orderBy: { createdAt: "desc" },
+    });
 
     return NextResponse.json({ requests });
   } catch (error) {

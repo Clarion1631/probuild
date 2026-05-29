@@ -57,15 +57,11 @@ export async function POST(req: NextRequest) {
   const externalIssueRef = `github-issue:${issueNumber}`;
 
   try {
-    const requests = await prisma.$queryRaw<any[]>`
-      SELECT *
-      FROM "HelpRequest"
-      WHERE "externalIssueRef" = ${externalIssueRef}
-      ORDER BY "createdAt" DESC
-      LIMIT 1
-    `;
+    const request = await prisma.helpRequest.findFirst({
+      where: { externalIssueRef },
+      orderBy: { createdAt: "desc" },
+    });
 
-    const request = requests[0];
     if (!request) {
       return NextResponse.json(
         { error: "Help request not found" },
@@ -78,15 +74,16 @@ export async function POST(req: NextRequest) {
       : null;
     const verifiedAt = status === "verified" ? new Date() : null;
 
-    await prisma.$executeRaw`
-      UPDATE "HelpRequest"
-      SET "status" = ${status},
-          "completedAt" = COALESCE(${completedAt}, "completedAt"),
-          "verifiedAt" = COALESCE(${verifiedAt}, "verifiedAt"),
-          "changeDescription" = ${summary.trim()},
-          "changeLocation" = COALESCE(${deployUrl || null}, "changeLocation")
-      WHERE "id" = ${request.id}
-    `;
+    await prisma.helpRequest.update({
+      where: { id: request.id },
+      data: {
+        status,
+        changeDescription: summary.trim(),
+        ...(completedAt && { completedAt }),
+        ...(verifiedAt && { verifiedAt }),
+        ...(deployUrl && { changeLocation: deployUrl }),
+      },
+    });
 
     if (!request.conversationId) {
       console.warn(

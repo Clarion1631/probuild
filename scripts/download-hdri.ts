@@ -43,7 +43,7 @@ interface HdriSource {
 }
 
 const SOURCES: HdriSource[] = [
-    { filename: "interior_warm.hdr", slug: "cozy_living_room_2", label: "Warm Interior" },
+    { filename: "interior_warm.hdr", slug: "wooden_lounge", label: "Warm Interior" },
     { filename: "photo_studio.hdr", slug: "studio_small_04", label: "Bright Daylight" },
     { filename: "overcast_sky.hdr", slug: "kloppenheim_06", label: "Overcast" },
     { filename: "evening_road.hdr", slug: "evening_road_01", label: "Evening Warm" },

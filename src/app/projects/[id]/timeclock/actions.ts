@@ -1,9 +1,9 @@
 "use server";
 
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
+import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+import { resolveCostCode } from "@/lib/cost-coding";
 
 export async function createTimeEntry(data: {
     projectId: string;
@@ -13,8 +13,17 @@ export async function createTimeEntry(data: {
     durationHours: number;
     laborCost: number;
 }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    // On-behalf-of entry: require the timeClock permission and access to this project,
+    // not just any logged-in session (this action accepts an arbitrary userId).
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock") || !canAccessProject(user, data.projectId)) {
+        throw new Error("Forbidden");
+    }
+
+    // Job-costing gate: no uncoded labour from the web time-clock either.
+    const coded = await resolveCostCode({ costCodeId: data.costCodeId });
+    if (!coded.ok) throw new Error(coded.error);
 
     // Start time at midnight of the selected date (simplified for this context)
     const startTime = new Date(data.date);
@@ -23,7 +32,8 @@ export async function createTimeEntry(data: {
         data: {
             projectId: data.projectId,
             userId: data.userId,
-            costCodeId: data.costCodeId,
+            costCodeId: coded.costCodeId,
+            costTypeId: coded.costTypeId,
             startTime,
             durationHours: data.durationHours,
             laborCost: data.laborCost
@@ -42,8 +52,14 @@ export async function updateTimeEntry(id: string, data: {
     durationHours: number;
     laborCost: number;
 }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock") || !canAccessProject(user, data.projectId)) {
+        throw new Error("Forbidden");
+    }
+
+    const coded = await resolveCostCode({ costCodeId: data.costCodeId });
+    if (!coded.ok) throw new Error(coded.error);
 
     const startTime = new Date(data.date);
 
@@ -51,7 +67,8 @@ export async function updateTimeEntry(id: string, data: {
         where: { id },
         data: {
             userId: data.userId,
-            costCodeId: data.costCodeId,
+            costCodeId: coded.costCodeId,
+            costTypeId: coded.costTypeId,
             startTime,
             durationHours: data.durationHours,
             laborCost: data.laborCost
@@ -63,11 +80,13 @@ export async function updateTimeEntry(id: string, data: {
 }
 
 export async function deleteTimeEntry(id: string) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
 
     const entry = await prisma.timeEntry.findUnique({ where: { id }});
     if (!entry) throw new Error("Not found");
+    if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
 
     await prisma.timeEntry.delete({ where: { id } });
 

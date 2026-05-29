@@ -99,3 +99,6 @@ scripts/.template-backup-*.json
 
 
 .env.vercel
+
+# SQL Backups
+/backups/

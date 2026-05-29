@@ -39,6 +39,41 @@ setup("seed test data + probe anthropic", async () => {
         });
         console.log("[data.setup] project upserted:", { id: project.id, name: project.name, clientId: project.clientId });
 
+        const ESTIMATE_ID = "cmml6vtx7001dpwrh8n65xzy6";
+        const estimate = await prisma.estimate.upsert({
+            where: { id: ESTIMATE_ID },
+            update: {},
+            create: {
+                id: ESTIMATE_ID,
+                title: "Test Estimate — DO NOT DELETE (used by e2e)",
+                projectId: PROJECT_ID,
+                code: "EST-161",
+                status: "Sent",
+                privacy: "Shared",
+                totalAmount: 1500,
+                balanceDue: 1500,
+            },
+        });
+        console.log("[data.setup] estimate upserted:", { id: estimate.id, title: estimate.title });
+
+        const ESTIMATE_ITEM_ID = "cmml6vtx7001dpwrh8n65xyz7";
+        const estimateItem = await prisma.estimateItem.upsert({
+            where: { id: ESTIMATE_ITEM_ID },
+            update: {},
+            create: {
+                id: ESTIMATE_ITEM_ID,
+                estimateId: ESTIMATE_ID,
+                name: "Demolition & Site Prep",
+                quantity: 1,
+                unitCost: 1500,
+                total: 1500,
+                baseCost: 1200,
+                markupPercent: 25,
+                order: 0,
+            },
+        });
+        console.log("[data.setup] estimate item upserted:", { id: estimateItem.id, name: estimateItem.name });
+
         const verify = await prisma.project.findUnique({ where: { id: PROJECT_ID }, select: { id: true, name: true } });
         console.log("[data.setup] verify project exists:", verify);
     } catch (e) {

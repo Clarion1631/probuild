@@ -48,6 +48,27 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
 
+        if (projectId && folderId) {
+            // Check if folderId is a Google Drive folder ID
+            if (folderId.startsWith("gd_")) {
+                const { listDriveFiles } = await import("@/lib/google-drive");
+                const driveFiles = await listDriveFiles(projectId, folderId);
+                return NextResponse.json(driveFiles);
+            }
+
+            // Check if folderId is the Google Drive Client Shared Folder in Prisma
+            const dbFolder = await prisma.fileFolder.findUnique({
+                where: { id: folderId },
+                select: { name: true }
+            });
+
+            if (dbFolder && dbFolder.name.includes("Google Drive - Client Shared Folder")) {
+                const { listDriveFiles } = await import("@/lib/google-drive");
+                const driveFiles = await listDriveFiles(projectId, null);
+                return NextResponse.json(driveFiles);
+            }
+        }
+
         const where: any = {};
         if (projectId) where.projectId = projectId;
         if (leadId) where.leadId = leadId;

@@ -64,6 +64,9 @@ export async function POST(req: NextRequest) {
         let imageBase64: string | null = null;
         let mimeType = "image/jpeg";
         let projectId: string | null = null;
+        // Preserve the stored receipt URL (mobile mode 3) so the AI-created expense keeps a
+        // link to the image it was parsed from instead of dropping it.
+        let storedReceiptUrl: string | null = null;
 
         if (contentType.includes("multipart/form-data")) {
             const formData = await req.formData();
@@ -83,6 +86,7 @@ export async function POST(req: NextRequest) {
                         { status: 400 }
                     );
                 }
+                storedReceiptUrl = body.receiptUrl;
                 // Time-bound the download. Vercel's function timeout is the outer limit;
                 // a faster local timeout makes a slow link fail fast and frees the slot.
                 const controller = new AbortController();
@@ -223,10 +227,14 @@ export async function POST(req: NextRequest) {
                 const expense = await prisma.expense.create({
                     data: {
                         estimateId: estimate.id,
-                        description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
+                        description: `[AI ${confidence}%] ${parsed.vendor} receipt — assign a cost code, then approve`,
                         amount: parsed.total as number,
                         date: parsed.date ? new Date(parsed.date as string) : new Date(),
                         vendor: parsed.vendor as string,
+                        // Keep the parsed receipt image linked to the expense (was dropped before).
+                        receiptUrl: storedReceiptUrl,
+                        // Created uncoded: stays Pending and the approve route blocks until a
+                        // reviewer assigns a cost code, so AI spend can't bypass the gate.
                         status: "Pending",
                     },
                 });

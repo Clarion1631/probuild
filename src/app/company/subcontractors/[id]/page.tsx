@@ -399,8 +399,7 @@ export default function SubcontractorDetailPage({ params }: { params: Promise<{ 
                         </div>
                         <div className="p-5">
                             <p className="text-xs text-slate-500 mb-4">Certificate of Insurance (COI) is required for subcontractors to perform work on job sites.</p>
-                            
-                            {/* TODO: Supabase Storage uploader here in future steps */}
+
                             {sub.coiUploaded ? (
                                 <div className="p-3 border border-emerald-200 bg-emerald-50 rounded-lg flex items-center justify-between">
                                     <div className="flex items-center gap-2">

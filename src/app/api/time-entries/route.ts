@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
+import { resolveCostCode } from "@/lib/cost-coding";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -50,11 +51,33 @@ export async function POST(req: Request) {
     const fail = await assertProjectAccess(user, projectId);
     if (fail) return fail;
 
+    // If a line item was chosen it must belong to THIS project's estimate — otherwise the
+    // entry would be coded against another job's line item.
+    if (estimateItemId) {
+        const item = await prisma.estimateItem.findFirst({
+            where: { id: estimateItemId, estimate: { projectId } },
+            select: { id: true },
+        });
+        if (!item) {
+            return NextResponse.json(
+                { error: "That line item doesn't belong to this project." },
+                { status: 400 }
+            );
+        }
+    }
+
+    // Job-costing gate: no uncoded labour. Require an active cost code, derived from the
+    // chosen estimate line item when not supplied directly. Reject the clock-in otherwise
+    // so labour can never land on a job with no cost attribution.
+    const coded = await resolveCostCode({ costCodeId, lineItemId: estimateItemId });
+    if (!coded.ok) return NextResponse.json({ error: coded.error }, { status: coded.status });
+
     const timeEntry = await prisma.timeEntry.create({
         data: {
             userId: user.id,
             projectId,
-            costCodeId: costCodeId || null,
+            costCodeId: coded.costCodeId,
+            costTypeId: coded.costTypeId,
             estimateItemId: estimateItemId || null,
             startTime: startTime ? new Date(startTime) : new Date(),
             latitude,

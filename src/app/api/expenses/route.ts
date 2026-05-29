@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { resolveCostCode } from "@/lib/cost-coding";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
 // chose the estimate) OR `projectId` (mobile flow — server picks the project's first
@@ -13,7 +14,7 @@ export async function POST(req: NextRequest) {
         const { user } = auth;
 
         const body = await req.json();
-        const { itemId, amount, vendor, date, description, receiptUrl } = body;
+        const { itemId, costCodeId, amount, vendor, date, description, receiptUrl } = body;
         let { estimateId, projectId } = body;
 
         if (!estimateId && !projectId) {
@@ -78,6 +79,11 @@ export async function POST(req: NextRequest) {
             }
         }
 
+        // Job-costing gate: no uncoded spend. Require an active cost code, derived from the
+        // chosen line item when not supplied directly, so every expense posts to the job ledger.
+        const coded = await resolveCostCode({ costCodeId, lineItemId: itemId });
+        if (!coded.ok) return NextResponse.json({ error: coded.error }, { status: coded.status });
+
         const numericAmount = typeof amount === "number" ? amount : Number(amount);
         if (!Number.isFinite(numericAmount) || numericAmount < 0) {
             return NextResponse.json(
@@ -99,6 +105,8 @@ export async function POST(req: NextRequest) {
             data: {
                 estimateId,
                 itemId: itemId || null,
+                costCodeId: coded.costCodeId,
+                costTypeId: coded.costTypeId,
                 amount: numericAmount,
                 vendor: vendor || null,
                 date: parsedDate,

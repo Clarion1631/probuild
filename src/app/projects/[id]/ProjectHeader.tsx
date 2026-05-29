@@ -144,16 +144,34 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
                                     className="bg-transparent border-b border-indigo-400 outline-none text-sm text-hui-textMuted min-w-[180px]"
                                 />
                             ) : (
-                                <span
-                                    className="cursor-pointer hover:text-hui-textMain flex items-center gap-1"
-                                    onClick={() => setEditingLocation(true)}
-                                    title="Click to edit location"
-                                >
-                                    {location || "No location"}
-                                    <svg className="w-3 h-3 opacity-0 group-hover/location:opacity-100 [@media(hover:none)]:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2">
-                                        <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
-                                        <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
-                                    </svg>
+                                <span className="flex items-center">
+                                    <span
+                                        className="cursor-pointer hover:text-hui-textMain flex items-center gap-1"
+                                        onClick={() => setEditingLocation(true)}
+                                        title="Click to edit location"
+                                    >
+                                        {location || "No location"}
+                                        <svg className="w-3 h-3 opacity-0 group-hover/location:opacity-100 [@media(hover:none)]:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2">
+                                            <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+                                            <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+                                        </svg>
+                                    </span>
+                                    {location && (
+                                        <a
+                                            href={location.toLowerCase().startsWith("http") ? location : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="ml-2 inline-flex items-center gap-0.5 text-[10px] text-indigo-600 hover:text-indigo-800 font-semibold bg-indigo-50 hover:bg-indigo-100 px-2 py-0.5 rounded transition shadow-sm"
+                                            title="Get directions on Google Maps"
+                                            onClick={(e) => e.stopPropagation()}
+                                        >
+                                            <span>Directions</span>
+                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                                            </svg>
+                                        </a>
+                                    )}
                                 </span>
                             )}
                         </p>

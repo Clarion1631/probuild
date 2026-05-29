@@ -29,35 +29,58 @@ export async function POST(req: NextRequest) {
 
         const publicUrl = `/uploads/receipts/${filename}`;
 
-        if (!process.env.ANTHROPIC_API_KEY) {
-            console.error("ANTHROPIC_API_KEY is missing");
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) {
+            console.error("GEMINI_API_KEY is missing");
             return NextResponse.json({ error: "AI Parsing is not configured on this server." }, { status: 500 });
         }
 
-        const safeMime = (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(file.type)
+        const safeMime = (["image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"].includes(file.type)
             ? file.type
-            : "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+            : "image/jpeg");
 
-        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-        const response = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 1024,
-            messages: [{
-                role: "user",
-                content: [
+        const { GoogleGenAI } = await import("@google/genai");
+        const ai = new GoogleGenAI({ apiKey });
+
+        const promptText = "Extract the following from this receipt: amount (number), vendor name, date (YYYY-MM-DD), and a brief description of what was purchased. Return ONLY a valid JSON object with the keys 'amount', 'vendor', 'date', and 'description'.";
+
+        let aiText = "";
+        try {
+            const aiResponse = await ai.models.generateContent({
+                model: "gemini-3-flash-preview",
+                contents: [
                     {
-                        type: "image",
-                        source: { type: "base64", media_type: safeMime, data: buffer.toString("base64") },
+                        inlineData: {
+                            data: buffer.toString("base64"),
+                            mimeType: safeMime
+                        }
                     },
-                    {
-                        type: "text",
-                        text: "Extract the following from this receipt: amount (number), vendor name, date (YYYY-MM-DD), and a brief description of what was purchased. Return ONLY a valid JSON object with the keys 'amount', 'vendor', 'date', and 'description'.",
-                    },
+                    promptText
                 ],
-            }],
-        });
-
-        const aiText = (response.content[0] as { type: "text"; text: string }).text || "";
+                config: {
+                    responseMimeType: "application/json"
+                }
+            });
+            aiText = aiResponse.text || "";
+        } catch (genError) {
+            console.error("Primary model gemini-3-flash-preview failed, falling back...", genError);
+            const aiResponse = await ai.models.generateContent({
+                model: "gemini-2.5-flash",
+                contents: [
+                    {
+                        inlineData: {
+                            data: buffer.toString("base64"),
+                            mimeType: safeMime
+                        }
+                    },
+                    promptText
+                ],
+                config: {
+                    responseMimeType: "application/json"
+                }
+            });
+            aiText = aiResponse.text || "";
+        }
         // Extremely simple JSON extraction just in case it's wrapped in markdown
         const jsonMatch = aiText.match(/```json\n([\s\S]*?)\n```/) || aiText.match(/\{[\s\S]*\}/);
         let entryData = {};

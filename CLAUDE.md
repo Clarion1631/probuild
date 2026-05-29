@@ -72,6 +72,7 @@ vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat0
 - `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
 - Only deploy when changes are verified locally via `npm run build`
 - Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
+- **Regression check** — if `vercel.json` shows `git.deploymentEnabled.main: true`, flip it back to `false`. It was re-enabled once in `6643bae` on the bet that an `ignoreCommand` would skip docs-only builds, but the guard couldn't survive Vercel's `--depth=10` shallow clone and was dropped in `b944328` — leaving auto-deploy on with no skip, which is exactly the $250 condition
 
 ## Dev server — clean start
 ```bash

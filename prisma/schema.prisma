@@ -1528,3 +1528,24 @@ model StripeEvent {
 
   @@index([status])
 }
+
+model HelpRequest {
+  id                String    @id @default(dbgenerated("gen_random_uuid()::text"))
+  userId            String
+  type              String    @default("help")
+  question          String
+  response          String?
+  currentPage       String?
+  status            String?   @default("open")
+  slackMessageTs    String?
+  completedAt       DateTime?
+  verifiedAt        DateTime?
+  changeDescription String?
+  changeLocation    String?
+  externalIssueRef  String?
+  conversationId    String?
+  createdAt         DateTime? @default(now())
+
+  @@index([conversationId])
+  @@index([externalIssueRef])
+}

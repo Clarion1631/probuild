@@ -408,7 +408,24 @@ export default function LeadDetailsSidebar({
                             <p className="text-green-600 font-medium">{clientName}</p>
                         </div>
                         <div>
-                            <p className="text-slate-500 text-xs font-medium mb-0.5">Job Site</p>
+                            <p className="text-slate-500 text-xs font-medium mb-0.5 flex items-center gap-1.5">
+                                <span>Job Site</span>
+                                {location && (
+                                    <a
+                                        href={location.toLowerCase().startsWith("http") ? location : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center gap-0.5 text-[10px] text-green-600 hover:text-green-700 font-semibold bg-green-50 hover:bg-green-100 px-2 py-0.5 rounded transition shadow-sm"
+                                        title="Get directions on Google Maps"
+                                    >
+                                        <span>Directions</span>
+                                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                                        </svg>
+                                    </a>
+                                )}
+                            </p>
                             <p className="text-hui-textMain mb-2">{location || "Not specified"}</p>
                             {location && <GoogleMapPreview address={location} />}
                         </div>
