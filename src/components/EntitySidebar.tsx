@@ -231,6 +231,7 @@ export default function EntitySidebar({
                             <div key={section.id} className="mb-4">
                                 <button
                                     onClick={() => toggleSection(section.id)}
+                                    aria-expanded={!collapsedSections[section.id]}
                                     className="w-full flex items-center justify-between text-left focus:outline-none px-3 mb-2 hover:bg-slate-100 rounded py-1 transition-colors"
                                 >
                                     <h3 className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
