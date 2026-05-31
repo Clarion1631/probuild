@@ -1,0 +1,4 @@
+## 2024-05-24 - [Medium] Prevent Timing Attacks on Webhook Secret Verification
+**Vulnerability:** The Phantom webhook in `src/app/api/help-chat/bug-fix/webhook/route.ts` used a basic string equality comparison (`===`) to verify the authentication header against `process.env.PHANTOM_WEBHOOK_SECRET`. This could allow an attacker to guess the secret over time by measuring how long the server takes to reject incorrect tokens (a timing attack).
+**Learning:** Even internal or utility webhooks require robust cryptographic verification. A simple equality check is insufficient for secret validation because it fails fast on the first mismatched character, exposing timing differences.
+**Prevention:** Always use `crypto.timingSafeEqual(Buffer, Buffer)` when comparing secrets or signatures in Next.js/Node API routes. Remember to pad or verify the lengths are equal beforehand, because `timingSafeEqual` throws an error if the buffer lengths do not match exactly.

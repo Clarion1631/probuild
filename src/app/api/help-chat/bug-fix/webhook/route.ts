@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { timingSafeEqual } from "crypto";
 
 const ALLOWED_STATUSES = new Set(["in_progress", "deployed", "verified"]);
 
@@ -35,7 +36,15 @@ export async function POST(req: NextRequest) {
   }
 
   const authHeader = req.headers.get("authorization");
-  if (authHeader !== `Bearer ${secret}`) {
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const token = authHeader.substring(7);
+  const expectedBuf = Buffer.from(secret);
+  const tokenBuf = Buffer.from(token);
+
+  if (expectedBuf.length !== tokenBuf.length || !timingSafeEqual(expectedBuf, tokenBuf)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
