@@ -1,0 +1,3 @@
+## 2024-06-01 - Dynamic Imports for Heavy Components (`Tiptap`, `Recharts`)
+**Learning:** Heavy components like Tiptap (`ContractWysiwygEditor`) and Recharts block the main thread during hydration on client components when statically imported. This bloats the main bundle, even if the user never uses the editor or charts. This happens frequently in Next.js apps with rich client-side interactivity.
+**Action:** Always dynamically import (`next/dynamic` with `ssr: false`) components with heavy dependencies (`@tiptap/*`, `recharts`, `three`, etc.) that are not critical for the initial FCP. Use placeholder loaders (e.g. pulse animations) while they load to improve the user experience and prevent Cumulative Layout Shift (CLS).
