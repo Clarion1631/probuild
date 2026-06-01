@@ -36,6 +36,7 @@ export default function DeleteEstimateButton({ estimateId, estimateTitle, status
         <>
             <button
                 title="Delete estimate"
+                aria-label="Delete estimate"
                 onClick={() => setShowConfirm(true)}
                 className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100"
             >

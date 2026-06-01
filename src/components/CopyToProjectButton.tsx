@@ -231,6 +231,7 @@ export default function CopyToProjectButton({
         <>
             <button
                 title="Copy to another project"
+                aria-label="Copy to another project"
                 onClick={() => setOpen(true)}
                 className="text-slate-300 hover:text-slate-600 hover:bg-slate-100 rounded p-1.5 transition opacity-0 group-hover:opacity-100"
             >

@@ -33,7 +33,7 @@ export default function SendInvoiceModal({ invoiceId, clientEmail, onClose }: { 
                         <h2 className="text-lg font-bold text-hui-textMain">Send Invoice to Client</h2>
                         <p className="text-xs text-hui-textMuted mt-0.5">The client will receive an email with a link to view and pay online.</p>
                     </div>
-                    <button onClick={onClose} className="text-hui-textMuted hover:text-hui-textMain transition">
+                    <button onClick={onClose} aria-label="Close" className="text-hui-textMuted hover:text-hui-textMain transition">
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                     </button>
                 </div>
