@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, useMemo, useRef, useEffect } from "react";
-import AddLeadModal from "@/app/leads/AddLeadModal";
+import NewProjectModal from "./NewProjectModal";
 import { toast } from "sonner";
 import { updateProjectStatus, deleteProjects, updateProjectTags } from "@/lib/actions";
 import { CustomizeStatusModal, ManageStatusModal, ProjectStatus } from "./StatusModals";
@@ -396,7 +396,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                 </>
             )}
 
-            {showModal && <AddLeadModal onClose={() => setShowModal(false)} />}
+            {showModal && <NewProjectModal statusOptions={activeStatuses.map(s => s.label)} onClose={() => setShowModal(false)} />}
             {showCustomizeModal && (
                 <CustomizeStatusModal 
                     statuses={statuses} 

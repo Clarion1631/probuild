@@ -900,6 +900,81 @@ export async function convertLeadToProject(leadId: string) {
     return { id: project.id };
 }
 
+// Create a project directly (e.g. a repeat customer with another job).
+// Maintains the 1-1 Project↔Lead invariant: every project is backed by a lead.
+// Pass `clientId` to tie the project to an EXISTING customer, or `clientName`
+// (+ optional contact details) to create a new one.
+export async function createProject(data: {
+    name: string;
+    clientId?: string;
+    clientName?: string;
+    clientEmail?: string;
+    clientPhone?: string;
+    location?: string;
+    addressLine1?: string;
+    city?: string;
+    state?: string;
+    zipCode?: string;
+    projectType?: string;
+    status?: string;
+}) {
+    if (!data.name?.trim()) throw new Error("Project name is required.");
+
+    // Resolve the customer: prefer an existing client by id; otherwise find-or-create by name.
+    let clientId: string | undefined = data.clientId;
+    if (clientId) {
+        const exists = await prisma.client.findUnique({ where: { id: clientId }, select: { id: true } });
+        if (!exists) clientId = undefined;
+    }
+    if (!clientId) {
+        const clientName = (data.clientName || "").trim();
+        if (!clientName) throw new Error("A customer is required to create a project.");
+        let client = await prisma.client.findFirst({ where: { name: clientName } });
+        if (!client) {
+            const initials = clientName.split(" ").map((n) => n[0]).join("").toUpperCase().slice(0, 2);
+            client = await prisma.client.create({
+                data: {
+                    name: clientName,
+                    initials,
+                    email: data.clientEmail || null,
+                    primaryPhone: data.clientPhone || null,
+                    primaryPhoneE164: normalizeE164(data.clientPhone),
+                    addressLine1: data.addressLine1 || null,
+                    city: data.city || null,
+                    state: data.state || null,
+                    zipCode: data.zipCode || null,
+                },
+            });
+        }
+        clientId = client.id;
+    }
+
+    // Back the project with a lead, then reuse the conversion path so the project is
+    // created + linked 1-1 (also provisions Drive and grants team access).
+    const lead = await prisma.lead.create({
+        data: {
+            name: data.name.trim(),
+            clientId,
+            location: data.location || null,
+            projectType: data.projectType || null,
+            source: "Direct project",
+            stage: "New",
+            isUnread: false,
+        },
+    });
+
+    const { id: projectId } = await convertLeadToProject(lead.id);
+
+    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
+    if (data.status && data.status !== "In Progress") {
+        await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
+    }
+
+    revalidatePath("/projects");
+    revalidatePath("/leads");
+    return { id: projectId };
+}
+
 export async function createDraftEstimate(projectId: string) {
     const estimate = await prisma.estimate.create({
         data: {

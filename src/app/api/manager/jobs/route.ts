@@ -134,6 +134,20 @@ export async function POST(req: Request) {
         },
     });
 
+    // Maintain the 1-1 Project↔Lead invariant — the web app relies on every project
+    // having a backing lead. Create one and link it (no client-facing side effects).
+    const jobLead = await prisma.lead.create({
+        data: {
+            name,
+            clientId,
+            location: typeof body.location === "string" ? body.location : null,
+            source: "Direct project (mobile)",
+            stage: "Won",
+            isUnread: false,
+        },
+    });
+    await prisma.project.update({ where: { id: created.id }, data: { leadId: jobLead.id } });
+
     // Auto-grant access to eligible team members
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
     await autoGrantProjectAccessToEligibleUsers(created.id);
