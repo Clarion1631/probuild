@@ -233,6 +233,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");
     const stripeEnabled = companySettings?.stripeEnabled !== false;
     const schedules: any[] = initialEstimate.paymentSchedules || [];
+    const files: any[] = initialEstimate.files || [];
     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
     // Suppress immediately after a successful payment redirect — webhook may not have updated status yet
     const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && (
@@ -624,9 +625,42 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </p>
                     </div>
                 </div>
+
+                {/* Attachments — interactive download links, shown only in the live portal (not in the captured PDF) */}
+                {!isCapture && files.length > 0 && (
+                    <div className="bg-white rounded-lg shadow-sm mt-6 print:hidden">
+                        <div className="px-10 py-5 border-b border-slate-100">
+                            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Attachments</h2>
+                        </div>
+                        <ul className="divide-y divide-slate-100">
+                            {files.map((f: any) => (
+                                <li key={f.id}>
+                                    <a
+                                        href={f.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="flex items-center gap-3 px-10 py-3 hover:bg-slate-50 transition group"
+                                    >
+                                        <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                                        <span className="flex-1 text-sm font-medium text-slate-700 group-hover:text-indigo-600 truncate">{f.name}</span>
+                                        <span className="text-xs text-slate-400 flex-shrink-0">{formatFileSize(f.size)}</span>
+                                        <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                    </a>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
             </div>
         </div>
     );
+}
+
+function formatFileSize(bytes: number): string {
+    if (!bytes || bytes <= 0) return "—";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function TermsAndConditions({ html }: { html: string }) {

@@ -1280,6 +1280,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                     lead: { include: { client: true } },
                     items: { orderBy: { order: "asc" } },
                     paymentSchedules: { orderBy: { order: "asc" } },
+                    files: { orderBy: { createdAt: "desc" } },
                 },
             });
         } catch (err) {
@@ -1305,6 +1306,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                                 costCodeId: true, costTypeId: true, createdAt: true,
                             },
                         },
+                        files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
                         paymentSchedules: { orderBy: { order: "asc" } },
                     },
                 });
@@ -1335,6 +1337,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                 lead: { include: { client: true } },
                 items: { orderBy: { order: "asc" } },
                 paymentSchedules: { orderBy: { order: "asc" } },
+                files: { orderBy: { createdAt: "desc" } },
             },
         });
     } catch (err) {
@@ -1359,6 +1362,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                             costCodeId: true, costTypeId: true, createdAt: true,
                         },
                     },
+                    files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
                     paymentSchedules: { orderBy: { order: "asc" } },
                 },
             });
@@ -3874,6 +3878,54 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         // Do not block the email send — matches approveEstimate() pattern
     }
 
+    // Also attach any files uploaded to the estimate, capped so the email stays deliverable.
+    // Anything skipped here is still viewable in the client portal.
+    let attachedFileCount = 0;
+    try {
+        const estimateFiles = await prisma.estimateFile.findMany({
+            where: { estimateId },
+            orderBy: { createdAt: "desc" },
+        });
+        if (estimateFiles.length > 0) {
+            const MAX_SINGLE_FILE_BYTES = 8 * 1024 * 1024;  // 8 MB per file
+            const MAX_TOTAL_EMAIL_BYTES = 18 * 1024 * 1024; // 18 MB total raw (PDF + files); ~25 MB once base64-encoded
+            // Seed the budget with whatever is already attached (the estimate PDF) so we don't exceed Resend's payload limit.
+            let usedBytes = (emailAttachments || []).reduce((sum, a) => sum + a.content.length, 0);
+            const skipped: string[] = [];
+            for (const f of estimateFiles) {
+                if (f.size > MAX_SINGLE_FILE_BYTES) { skipped.push(`${f.name} (exceeds per-file limit)`); continue; }
+                if (usedBytes + f.size > MAX_TOTAL_EMAIL_BYTES) { skipped.push(`${f.name} (over total size budget)`); continue; }
+                // Defense-in-depth: only fetch our own Supabase storage URLs, never an arbitrary host (SSRF guard).
+                let parsedUrl: URL;
+                try { parsedUrl = new URL(f.url); } catch { skipped.push(`${f.name} (invalid url)`); continue; }
+                if (parsedUrl.protocol !== "https:" || !parsedUrl.hostname.endsWith(".supabase.co")) {
+                    skipped.push(`${f.name} (untrusted url host)`);
+                    continue;
+                }
+                try {
+                    const res = await fetch(f.url, { signal: AbortSignal.timeout(15_000) });
+                    if (!res.ok) { skipped.push(`${f.name} (fetch ${res.status})`); continue; }
+                    const buf = Buffer.from(await res.arrayBuffer());
+                    // Re-check against the real downloaded size in case the stored metadata was wrong.
+                    if (buf.length > MAX_SINGLE_FILE_BYTES) { skipped.push(`${f.name} (exceeds per-file limit)`); continue; }
+                    if (usedBytes + buf.length > MAX_TOTAL_EMAIL_BYTES) { skipped.push(`${f.name} (over total size budget)`); continue; }
+                    emailAttachments = emailAttachments || [];
+                    emailAttachments.push({ filename: f.name, content: buf });
+                    usedBytes += buf.length;
+                    attachedFileCount++;
+                } catch (err) {
+                    skipped.push(`${f.name} (download error)`);
+                }
+            }
+            if (skipped.length > 0) {
+                console.warn(`[sendEstimateToClient] ${skipped.length} estimate file(s) not attached (still viewable in the client portal):`, skipped);
+            }
+        }
+    } catch (e) {
+        console.error("[sendEstimateToClient] Failed to attach estimate files:", e);
+        // Do not block the send — files remain viewable in the portal
+    }
+
     // Send email notification to client
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     let portalUrl: string;
@@ -3904,6 +3956,12 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
            </div>`
         : '';
 
+    const attachmentsNote = attachedFileCount > 0
+        ? `<div style="background: #f8fafc; border-left: 3px solid #4f46e5; padding: 12px 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
+               <p style="color: #334155; margin: 0; font-size: 13px; font-weight: 600;">📎 ${attachedFileCount} additional file${attachedFileCount > 1 ? 's' : ''} attached. You can also view ${attachedFileCount > 1 ? 'them' : 'it'} anytime in your portal.</p>
+           </div>`
+        : '';
+
     const sendResult = await sendNotification(
         recipientEmail,
         `${companyName} sent you an estimate`,
@@ -3918,6 +3976,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
                 ${personalNote}
                 ${pdfNote}
+                ${attachmentsNote}
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you an estimate for review and approval.
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
