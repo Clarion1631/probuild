@@ -5,6 +5,7 @@ import { useState, useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { usePermissions } from "@/components/PermissionsProvider";
 import { RoomDesignerNavContent } from "@/components/room-designer/RoomDesignerNavContent";
+import SendPortalLinkButton from "@/components/SendPortalLinkButton";
 import { toast } from "sonner";
 
 interface EntitySidebarProps {
@@ -200,7 +201,7 @@ export default function EntitySidebar({
             )}
 
             {entity.type === "project" && (
-                <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0">
+                <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0 space-y-2">
                     <Link
                         href={`/portal/projects/${id}`}
                         target="_blank"
@@ -211,6 +212,7 @@ export default function EntitySidebar({
                         </svg>
                         View Client Portal
                     </Link>
+                    <SendPortalLinkButton projectId={id} clientName={entity.clientName} />
                 </div>
             )}
 

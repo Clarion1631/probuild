@@ -5693,9 +5693,9 @@ export async function emailPortalLinkToClient(projectId: string) {
         return { success: false, error: "Client email not found on project." };
     }
     
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || "http://localhost:3000";
-    const portalUrl = `${appUrl}/portal/projects/${projectId}`;
-    
+    const { buildClientPortalUrl } = await import("./client-portal-auth");
+    const portalUrl = await buildClientPortalUrl(project.client.id, project.client.email, `/portal/projects/${projectId}`);
+
     // Send email using our enhanced library fn
     const { sendNotification } = await import('@/lib/email');
     const portalCc = buildCc(project.client.email, (project.client as any).additionalEmail);
@@ -5976,8 +5976,8 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
         data: { status: "Sent", sentAt: new Date() }
     });
 
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-    const portalUrl = `${appUrl}/portal/change-orders/${changeOrderId}`;
+    const { buildClientPortalUrl } = await import("./client-portal-auth");
+    const portalUrl = await buildClientPortalUrl(client.id, client.email, `/portal/change-orders/${changeOrderId}`);
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
@@ -6844,7 +6844,8 @@ export async function sendSelectionBoardToClient(boardId: string) {
     const clientEmail = board.project.client?.email;
     if (clientEmail) {
         const settings = await getCompanySettings();
-        const portalUrl = `https://probuild.goldentouchremodeling.com/portal/projects/${board.projectId}/selections`;
+        const { buildClientPortalUrl } = await import("./client-portal-auth");
+        const portalUrl = await buildClientPortalUrl(board.project.client?.id, clientEmail, `/portal/projects/${board.projectId}/selections`);
         const selectionCc = buildCc(clientEmail, (board.project.client as any)?.additionalEmail);
         await sendNotification(
             clientEmail,
