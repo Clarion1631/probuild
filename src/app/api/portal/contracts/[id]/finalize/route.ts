@@ -242,6 +242,7 @@ export async function POST(
                     fromName: companyName,
                     replyTo: companyEmail || undefined,
                     cc: ccList,
+                    copyToInternal: true,
                 }
             );
         }

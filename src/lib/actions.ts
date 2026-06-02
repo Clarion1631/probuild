@@ -714,7 +714,7 @@ END:VCALENDAR`;
                 `Meeting Scheduled: ${data.title}`,
                 `<p>Hi ${lead.client.name},<br><br>We have scheduled a meeting to discuss your project: ${data.title}.<br>Time: ${startDate.toLocaleString()}<br><br>Please see the attached calendar invite.<br><br>Thanks,<br>Golden Touch Remodeling</p>`,
                 attachments,
-                meetingCc ? { cc: meetingCc } : undefined
+                { cc: meetingCc, copyToInternal: true }
             );
         }
     } catch (e) {
@@ -1831,7 +1831,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                 <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;">${companyName}${settings.address ? ` • ${settings.address}` : ""}</p>
             </div>`,
             attachments,
-            { fromName: companyName, replyTo: settings.email || undefined, cc: approvedCc }
+            { fromName: companyName, replyTo: settings.email || undefined, cc: approvedCc, copyToInternal: true }
         );
     }
 
@@ -2062,7 +2062,7 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
         </body>
         </html>`,
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc, copyToInternal: true }
     );
 
     // Log to activity feed (project-scoped only)
@@ -3996,7 +3996,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         </body>
         </html>`,
         emailAttachments,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails, copyToInternal: true }
     );
 
     if (!sendResult.success) {
@@ -4495,7 +4495,7 @@ export async function sendContractToClient(contractId: string) {
             '</div></body></html>',
         ].join(''),
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: contractCc }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: contractCc, copyToInternal: true }
     );
 
     // Log to activity feed — project side uses ActivityLog, lead side uses the client message thread.
@@ -5704,7 +5704,7 @@ export async function emailPortalLinkToClient(projectId: string) {
         `Your Dashboard for ${project.name} is Ready`,
         `<p>Hi ${project.client.name},</p><p>We have updated the portal for your project: <strong>${project.name}</strong>.</p><p><a href="${portalUrl}" style="display:inline-block;padding:10px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:5px;">Access Your Client Dashboard</a></p><p>From here you can view estimates, invoices, updates, and more.</p><br/>Thanks,<br/>Golden Touch Remodeling`,
         undefined,
-        portalCc ? { cc: portalCc } : undefined
+        { cc: portalCc, copyToInternal: true }
     );
     
     if (result.success && result.id) {
@@ -6014,7 +6014,7 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
         </body>
         </html>`,
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc, copyToInternal: true }
     );
 
     // Log activity
@@ -6858,7 +6858,7 @@ export async function sendSelectionBoardToClient(boardId: string) {
                 <p style="color:#666;font-size:13px;">— ${settings.companyName || 'Your Project Team'}</p>
             </div>`,
             undefined,
-            selectionCc ? { cc: selectionCc } : undefined
+            { cc: selectionCc, copyToInternal: true }
         );
     }
 
