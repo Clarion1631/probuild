@@ -83,6 +83,33 @@ const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), 
 
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 
+// Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
+// Mirrors the JSON shape that /api/ai-estimate/import + transformPhasesToItems expect.
+const CHATGPT_ESTIMATE_PROMPT = `You are a residential remodeling estimator. Produce a detailed construction estimate for the project described below as VALID JSON ONLY (no markdown, no commentary), in exactly this structure:
+
+{
+  "phases": [
+    {
+      "phaseName": "string (e.g. Demolition)",
+      "phaseCode": "string (optional)",
+      "items": [
+        { "name": "string", "description": "string", "costType": "Labor | Material | Subcontractor | Equipment | Unit | Allowance | Other", "quantity": number, "unit": "string e.g. sq ft, hr, each, job, linear ft", "unitCost": number }
+      ]
+    }
+  ],
+  "paymentMilestones": [ { "name": "string", "percentage": number } ]
+}
+
+Rules:
+- Organize into 6-12 logical construction phases, 2-5 line items each.
+- "unitCost" is the FINAL price charged to the client per unit (cost + markup already included). Line total = quantity x unitCost.
+- "costType" must be exactly one of the listed values. Use "Allowance" for customer selections (fixtures, finishes, appliances).
+- Use realistic Vancouver, WA / Pacific Northwest 2024-2025 market rates.
+- Provide 3-4 payment milestones whose percentages sum to 100.
+- Output ONLY the JSON object — no backticks, no explanation.
+
+PROJECT: <describe the scope of work, square footage, finishes, etc.>`;
+
 export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
@@ -100,6 +127,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [showAiModal, setShowAiModal] = useState(false);
     const [aiPrompt, setAiPrompt] = useState("");
     const [isGenerating, setIsGenerating] = useState(false);
+    const [showImportModal, setShowImportModal] = useState(false);
+    const [importJson, setImportJson] = useState("");
+    const [isImporting, setIsImporting] = useState(false);
     const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [viewMode, setViewMode] = useState<"internal" | "client">("client");
     const [showTemplateModal, setShowTemplateModal] = useState(false);
@@ -886,113 +916,171 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             }
 
             const data = await res.json();
-            if (data.items && data.items.length > 0) {
-                const newItems = [...items, ...data.items];
-                const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
-                    ? [...paymentSchedules, ...data.paymentMilestones]
-                    : paymentSchedules;
-
-                // Close modal and update UI immediately — don't wait for save
-                setItems(newItems);
-                if (data.paymentMilestones && data.paymentMilestones.length > 0) {
-                    setPaymentSchedules(newSchedules);
-                }
-                setShowAiModal(false);
-                setAiPrompt("");
-                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
-
-                // Auto-save in background — set isSaving to block concurrent blur-triggered save
-                setIsSaving(true);
-                try {
-                    // Recompute section header totals from children before saving
-                    const aiChildTotals = new Map<string, number>();
-                    for (const item of newItems) {
-                        if (item.parentId) {
-                            aiChildTotals.set(item.parentId, (aiChildTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-                        }
-                    }
-                    const mappedItems = newItems.map((item: any, index: number) => {
-                        const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
-                        const ct = isSect ? (aiChildTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                        return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
-                    });
-                    const mappedSchedules = newSchedules.map((schedule, index) => ({
-                        ...schedule,
-                        order: index
-                    }));
-                    // Subtotal from leaf items only (sections would double-count)
-                    const newSubtotal = newItems.reduce((acc: number, item: any) => {
-                        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                        if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                        return acc;
-                    }, 0);
-                    const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
-                    await saveEstimate(initialEstimate.id, context.id, context.type, {
-                        title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
-                        taxRateName: taxExempt ? null : (activeTax?.name || null),
-                        taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-                    }, mappedItems);
-                    toast.success("Estimate auto-saved");
-
-                    // Update lastSavedStateRef so subsequent blur saves are skipped
-                    const aiSnapshot = {
-                        title: title || "",
-                        code: code || "",
-                        status: status || "Draft",
-                        processingFeeMarkup: Number(processingFeeMarkup) || 0,
-                        hideProcessingFee: !!hideProcessingFee,
-                        expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
-                        memo: memo || null,
-                        termsAndConditions: termsAndConditions || null,
-                        signatureUrl: signatureUrl || null,
-                        targetMarginPercent: parseFloat(targetMargin) || 25,
-                        taxExempt: !!taxExempt,
-                        taxRateName: taxExempt ? null : (activeTax?.name || null),
-                        taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-                        items: mappedItems.map((item: any, index: number) => ({
-                            id: item.id || null,
-                            parentId: item.parentId || null,
-                            name: item.name || "",
-                            description: item.description || "",
-                            quantity: String(item.quantity || "0"),
-                            unitCost: String(item.unitCost || "0"),
-                            costCodeId: item.costCodeId || null,
-                            costTypeId: item.costTypeId || null,
-                            vendorId: item.vendorId || null,
-                            approvalStatus: item.approvalStatus || null,
-                            order: index,
-                            total: item.total,
-                        })),
-                        paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
-                            id: schedule.id || null,
-                            name: schedule.name || "",
-                            amount: String(schedule.amount || "0"),
-                            dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
-                            status: schedule.status || "Pending",
-                            paymentMethod: schedule.paymentMethod || null,
-                            paymentReference: schedule.paymentReference || null,
-                            percentage: String(schedule.percentage || "0"),
-                            type: schedule.type || null,
-                            order: index
-                        })),
-                    };
-                    lastSavedStateRef.current = JSON.stringify(aiSnapshot);
-
-                    router.refresh();
-                } catch (saveErr) {
-                    console.error("Auto-save after AI generate failed:", saveErr);
-                    toast.error("Items added — but auto-save failed. Click Save to persist.");
-                } finally {
-                    setIsSaving(false);
-                }
-            } else {
-                toast.error('AI returned no items');
-            }
+            await applyGeneratedEstimate(data, {
+                verb: "AI generated",
+                onMerged: () => { setShowAiModal(false); setAiPrompt(""); },
+            });
         } catch (err: any) {
             console.error('AI Generate error:', err);
             toast.error(err?.message || 'Failed to generate estimate — check console');
         } finally {
             setIsGenerating(false);
+        }
+    }
+
+    /**
+     * Shared merge + auto-save path for a generated OR imported estimate payload
+     * ({ items, paymentMilestones, count, totalEstimate }). Appends to existing items,
+     * recomputes section-header totals, persists, and syncs the saved-state ref so blur
+     * saves are skipped. Used by both AI generate and ChatGPT import.
+     */
+    async function applyGeneratedEstimate(
+        data: { items?: any[]; paymentMilestones?: any[]; count?: number; totalEstimate?: number },
+        { verb = "Added", onMerged }: { verb?: string; onMerged?: () => void } = {},
+    ) {
+        if (!data.items || data.items.length === 0) {
+            toast.error('No line items found to add');
+            return;
+        }
+        const newItems = [...items, ...data.items];
+        const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
+            ? [...paymentSchedules, ...data.paymentMilestones]
+            : paymentSchedules;
+
+        // Update UI immediately — don't wait for save
+        setItems(newItems);
+        if (data.paymentMilestones && data.paymentMilestones.length > 0) {
+            setPaymentSchedules(newSchedules);
+        }
+        onMerged?.();
+        toast.success(`${verb} ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
+
+        // Auto-save in background — set isSaving to block concurrent blur-triggered save
+        setIsSaving(true);
+        try {
+            // Recompute section header totals from children before saving
+            const childTotals = new Map<string, number>();
+            for (const item of newItems) {
+                if (item.parentId) {
+                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                }
+            }
+            const mappedItems = newItems.map((item: any, index: number) => {
+                const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
+                const ct = isSect ? (childTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
+            });
+            const mappedSchedules = newSchedules.map((schedule, index) => ({
+                ...schedule,
+                order: index
+            }));
+            // Subtotal from leaf items only (sections would double-count)
+            const newSubtotal = newItems.reduce((acc: number, item: any) => {
+                if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return acc;
+            }, 0);
+            const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
+            await saveEstimate(initialEstimate.id, context.id, context.type, {
+                title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            }, mappedItems);
+            toast.success("Estimate auto-saved");
+
+            // Update lastSavedStateRef so subsequent blur saves are skipped
+            const savedSnapshot = {
+                title: title || "",
+                code: code || "",
+                status: status || "Draft",
+                processingFeeMarkup: Number(processingFeeMarkup) || 0,
+                hideProcessingFee: !!hideProcessingFee,
+                expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
+                memo: memo || null,
+                termsAndConditions: termsAndConditions || null,
+                signatureUrl: signatureUrl || null,
+                targetMarginPercent: parseFloat(targetMargin) || 25,
+                taxExempt: !!taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+                items: mappedItems.map((item: any, index: number) => ({
+                    id: item.id || null,
+                    parentId: item.parentId || null,
+                    name: item.name || "",
+                    description: item.description || "",
+                    quantity: String(item.quantity || "0"),
+                    unitCost: String(item.unitCost || "0"),
+                    costCodeId: item.costCodeId || null,
+                    costTypeId: item.costTypeId || null,
+                    vendorId: item.vendorId || null,
+                    approvalStatus: item.approvalStatus || null,
+                    order: index,
+                    total: item.total,
+                })),
+                paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
+                    id: schedule.id || null,
+                    name: schedule.name || "",
+                    amount: String(schedule.amount || "0"),
+                    dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
+                    status: schedule.status || "Pending",
+                    paymentMethod: schedule.paymentMethod || null,
+                    paymentReference: schedule.paymentReference || null,
+                    percentage: String(schedule.percentage || "0"),
+                    type: schedule.type || null,
+                    order: index
+                })),
+            };
+            lastSavedStateRef.current = JSON.stringify(savedSnapshot);
+
+            router.refresh();
+        } catch (saveErr) {
+            console.error("Auto-save after estimate merge failed:", saveErr);
+            toast.error("Items added — but auto-save failed. Click Save to persist.");
+        } finally {
+            setIsSaving(false);
+        }
+    }
+
+    async function handleImportEstimate() {
+        const raw = importJson.trim();
+        if (!raw) {
+            toast.error("Paste the JSON from ChatGPT first");
+            return;
+        }
+        let parsed: any;
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            toast.error("That doesn't look like valid JSON. Paste ChatGPT's full output — it should start with { and end with }.");
+            return;
+        }
+        setIsImporting(true);
+        try {
+            const res = await fetch('/api/ai-estimate/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    phases: parsed.phases,
+                    paymentMilestones: parsed.paymentMilestones,
+                    costCodes,
+                    costTypes,
+                }),
+            });
+            if (!res.ok) {
+                const d = await res.json().catch(() => ({}));
+                toast.error(d.error || 'Import failed — check the JSON format');
+                return;
+            }
+            const data = await res.json();
+            await applyGeneratedEstimate(data, {
+                verb: "Imported",
+                onMerged: () => { setShowImportModal(false); setImportJson(""); },
+            });
+        } catch (err: any) {
+            console.error('Import estimate error:', err);
+            toast.error(err?.message || 'Failed to import estimate');
+        } finally {
+            setIsImporting(false);
         }
     }
 
@@ -1332,7 +1420,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu && !isSaving) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving) {
                     handleSave();
                 }
             }}
@@ -1422,6 +1510,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     >
                                         <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
                                         AI Generate
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowImportModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700"
+                                    >
+                                        <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
+                                        Import from ChatGPT
                                     </button>
                                     <button
                                         onClick={() => { handleHistoricalPricing(); setShowMoreMenu(false); }}
@@ -2978,6 +3073,93 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     <>
                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
                                         Generate Estimate
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Import from ChatGPT Modal */}
+            {showImportModal && (
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full overflow-hidden border border-purple-200">
+                        <div className="px-6 py-4 border-b border-purple-100 bg-gradient-to-r from-purple-50 to-indigo-50 flex justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="w-8 h-8 rounded-lg bg-purple-100 flex items-center justify-center">
+                                    <svg className="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
+                                </div>
+                                <div>
+                                    <h2 className="text-lg font-bold text-hui-textMain">Import from ChatGPT</h2>
+                                    <p className="text-xs text-purple-600">Paste JSON • builds phases + line items + milestones</p>
+                                </div>
+                            </div>
+                            <button onClick={() => setShowImportModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-6 space-y-4">
+                            <div className="bg-slate-50 rounded-lg p-3 text-xs text-slate-600 space-y-1.5">
+                                <div className="font-semibold text-slate-700">How to use:</div>
+                                <div>1. Click <strong>Copy ChatGPT prompt</strong> below and paste it into ChatGPT, then describe your project.</div>
+                                <div>2. Copy ChatGPT&apos;s JSON reply and paste it into the box below.</div>
+                                <div>3. Click <strong>Import</strong> — phases become collapsible groups with line items beneath them.</div>
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        try {
+                                            await navigator.clipboard.writeText(CHATGPT_ESTIMATE_PROMPT);
+                                            toast.success("Prompt copied — paste it into ChatGPT");
+                                        } catch {
+                                            toast.error("Couldn't copy — select the prompt manually");
+                                        }
+                                    }}
+                                    className="mt-1 inline-flex items-center gap-1.5 text-purple-700 hover:text-purple-900 font-medium"
+                                >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                    Copy ChatGPT prompt
+                                </button>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-hui-textMain mb-2">Paste ChatGPT&apos;s JSON</label>
+                                <textarea
+                                    value={importJson}
+                                    onChange={e => setImportJson(e.target.value)}
+                                    placeholder={'{\n  "phases": [ { "phaseName": "Demolition", "items": [ { "name": "...", "costType": "Labor", "quantity": 1, "unit": "job", "unitCost": 1800 } ] } ],\n  "paymentMilestones": [ { "name": "Deposit", "percentage": 25 } ]\n}'}
+                                    className="hui-input w-full h-40 resize-none font-mono text-xs"
+                                    disabled={isImporting}
+                                />
+                            </div>
+                            {items.length > 0 && (
+                                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
+                                    <strong>Note:</strong> Imported items will be appended to your existing {items.length} item(s).
+                                </div>
+                            )}
+                        </div>
+                        <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50">
+                            <button
+                                type="button"
+                                onClick={() => setShowImportModal(false)}
+                                disabled={isImporting}
+                                className="hui-btn hui-btn-secondary"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleImportEstimate}
+                                disabled={isImporting || !importJson.trim()}
+                                className="hui-btn bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 disabled:opacity-50 flex items-center gap-2"
+                            >
+                                {isImporting ? (
+                                    <>
+                                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Importing...
+                                    </>
+                                ) : (
+                                    <>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19l3 3m0 0l3-3m-3 3V10M5 8a4 4 0 014-4h6a4 4 0 014 4" /></svg>
+                                        Import
                                     </>
                                 )}
                             </button>
