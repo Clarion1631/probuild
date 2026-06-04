@@ -321,6 +321,7 @@ function Btn({
         <button
             type="button"
             title={title}
+            aria-label={title}
             disabled={disabled}
             onClick={onClick}
             className={`rounded p-1 font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-40 ${className}`}
