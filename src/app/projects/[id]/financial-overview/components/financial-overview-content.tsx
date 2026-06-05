@@ -1,11 +1,15 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import dynamic from "next/dynamic";
 import CashFlowCard from "./cash-flow-card";
-import IncomingPaymentsCard from "./incoming-payments-card";
-import OutgoingPaymentsCard from "./outgoing-payments-card";
-import CashFlowTrackerChart from "./cash-flow-tracker-chart";
 import FinancialItemsSection from "./financial-items-section";
+
+// ⚡ Bolt: Dynamically import heavy Recharts components to prevent blocking the main thread during hydration
+// Impact: Reduces First Input Delay and initial JS bundle size on the financial dashboard
+const IncomingPaymentsCard = dynamic(() => import("./incoming-payments-card"), { ssr: false, loading: () => <div className="animate-pulse rounded-md bg-slate-200 h-[320px]"></div> });
+const OutgoingPaymentsCard = dynamic(() => import("./outgoing-payments-card"), { ssr: false, loading: () => <div className="animate-pulse rounded-md bg-slate-200 h-[320px]"></div> });
+const CashFlowTrackerChart = dynamic(() => import("./cash-flow-tracker-chart"), { ssr: false, loading: () => <div className="animate-pulse rounded-md bg-slate-200 h-[350px]"></div> });
 
 // Basic switch replacement
 const Switch = ({ checked, onCheckedChange, id }: any) => (
