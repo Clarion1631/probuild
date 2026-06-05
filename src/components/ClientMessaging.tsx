@@ -638,7 +638,7 @@ export default function ClientMessaging({
                                     <button onClick={() => setPreviewMode("desktop")} className={`px-3 py-1.5 text-xs font-semibold rounded-md transition ${previewMode === "desktop" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500"}`}>Desktop</button>
                                     <button onClick={() => setPreviewMode("mobile")} className={`px-3 py-1.5 text-xs font-semibold rounded-md transition ${previewMode === "mobile" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500"}`}>Mobile</button>
                                 </div>
-                                <button onClick={() => setShowPreview(false)} className="text-slate-400 hover:text-slate-600"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                <button onClick={() => setShowPreview(false)} className="text-slate-400 hover:text-slate-600" aria-label="Close preview"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
                             </div>
                         </div>
                         <div className="flex-1 overflow-y-auto p-8 flex justify-center bg-slate-100">

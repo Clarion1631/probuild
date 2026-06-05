@@ -1,0 +1,3 @@
+## 2025-06-05 - Add ARIA labels to modal close buttons across different components
+**Learning:** Found a common anti-pattern where icon-only buttons (like `×`, `&times;`, or an `svg`) representing close actions in modals and side-panels lacked `aria-label` attributes. This issue was spread across several components (e.g. `EntityContractsClient.tsx`, `ClientMessaging.tsx`) and hurts keyboard accessibility and screen readers.
+**Action:** When implementing modal, drawer, or preview components that contain "close" actions, always explicitly add an `aria-label` attribute (e.g., `aria-label="Close"`) if the text within the button is just a visual icon or character entity. Add lint rules or create a reusable generic `<IconButton>` to avoid this anti-pattern.
