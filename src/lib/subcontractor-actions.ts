@@ -6,9 +6,11 @@ import { sendNotification } from "./email";
 import { sendSMS } from "./sms";
 import { SignJWT } from "jose";
 
-const JWT_SECRET = new TextEncoder().encode(
-    process.env.SUB_PORTAL_SECRET || "sub-portal-dev-secret-change-me"
-);
+function getJwtSecret(): Uint8Array {
+    const secret = process.env.SUB_PORTAL_SECRET;
+    if (!secret) throw new Error("SUB_PORTAL_SECRET environment variable is not configured");
+    return new TextEncoder().encode(secret);
+}
 
 export async function getProjectSubcontractors(projectId: string) {
     const allSubs = await prisma.subcontractor.findMany({
@@ -97,7 +99,7 @@ export async function inviteNewSubcontractor(projectId: string, data: {
                 .setProtectedHeader({ alg: "HS256" })
                 .setIssuedAt()
                 .setExpirationTime("72h") // Invite links last longer than standard re-login ones
-                .sign(JWT_SECRET);
+                .sign(getJwtSecret());
                 
             portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/api/sub-portal/verify?token=${token}&next=/sub-portal/projects/${projectId}`;
         } catch (e) {
@@ -199,7 +201,7 @@ export async function resendSubcontractorInvite(projectId: string, subcontractor
             .setProtectedHeader({ alg: "HS256" })
             .setIssuedAt()
             .setExpirationTime("72h")
-            .sign(JWT_SECRET);
+            .sign(getJwtSecret());
             
         portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/api/sub-portal/verify?token=${token}&next=/sub-portal/projects/${projectId}`;
     } catch (e) {
