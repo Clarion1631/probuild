@@ -6,9 +6,11 @@ import { sendNotification } from "./email";
 import { sendSMS } from "./sms";
 import { SignJWT } from "jose";
 
-const JWT_SECRET = new TextEncoder().encode(
-    process.env.SUB_PORTAL_SECRET || "sub-portal-dev-secret-change-me"
-);
+const SECRET_RAW = process.env.SUB_PORTAL_SECRET;
+if (!SECRET_RAW) {
+    throw new Error("SUB_PORTAL_SECRET must be set.");
+}
+const JWT_SECRET = new TextEncoder().encode(SECRET_RAW);
 
 export async function getProjectSubcontractors(projectId: string) {
     const allSubs = await prisma.subcontractor.findMany({
