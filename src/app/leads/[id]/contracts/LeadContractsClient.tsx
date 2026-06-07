@@ -4,7 +4,21 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createContractFromTemplate, createContractBlank, sendContractToClient, deleteContract, getContractSigningHistory, updateContract } from "@/lib/actions";
 import { toast } from "sonner";
-import { ContractWysiwygEditor } from "@/components/ContractWysiwygEditor";
+import dynamic from "next/dynamic";
+
+// ⚡ Bolt: Dynamically importing heavy Tiptap text editor dependencies
+// to prevent main-thread hydration freeze and reduce initial JS bundle size.
+const ContractWysiwygEditor = dynamic(
+    () => import("@/components/ContractWysiwygEditor").then((m) => m.ContractWysiwygEditor),
+    {
+        ssr: false,
+        loading: () => (
+            <div className="h-96 w-full animate-pulse rounded-lg bg-slate-100 flex items-center justify-center text-slate-400 text-sm">
+                Loading editor tools...
+            </div>
+        ),
+    }
+);
 
 interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
