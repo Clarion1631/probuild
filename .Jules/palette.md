@@ -1,0 +1,3 @@
+## 2024-06-08 - EntitySidebar Interactive Elements Accessibility
+**Learning:** Found several dynamic disclosure components (accordion sections and a 'More Actions' dropdown) in the `EntitySidebar` that lacked `aria-expanded` and `aria-controls` properties, which makes their state opaque to screen reader users. This suggests a pattern where dynamic disclosure state isn't consistently tied to a11y attributes across the app.
+**Action:** When adding or reviewing custom disclosure widgets (dropdowns, accordions, popovers), always ensure `aria-expanded` is mapped to the open/closed state variable, and `aria-controls` targets the `id` of the container being toggled.

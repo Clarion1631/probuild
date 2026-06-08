@@ -233,6 +233,8 @@ export default function EntitySidebar({
                             <div key={section.id} className="mb-4">
                                 <button
                                     onClick={() => toggleSection(section.id)}
+                                    aria-expanded={!collapsedSections[section.id]}
+                                    aria-controls={`section-${section.id}`}
                                     className="w-full flex items-center justify-between text-left focus:outline-none px-3 mb-2 hover:bg-slate-100 rounded py-1 transition-colors"
                                 >
                                     <h3 className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
@@ -246,7 +248,7 @@ export default function EntitySidebar({
                                     </svg>
                                 </button>
                                 {!collapsedSections[section.id] && (
-                                    <ul className="space-y-1">
+                                    <ul id={`section-${section.id}`} className="space-y-1">
                                         {visibleItems.map((item) => {
                                             const isActive = pathname === item.href || (pathname?.startsWith(item.href + "/") && item.href !== `/leads/${id}` && item.href !== `/projects/${id}`);
                                             const showBadge = item.label === "Client Messages" && unreadMessageCount > 0;
@@ -289,6 +291,8 @@ export default function EntitySidebar({
                     <div className="relative mt-3">
                         <button
                             onClick={() => setShowMoreActions(!showMoreActions)}
+                            aria-expanded={showMoreActions}
+                            aria-controls="more-actions-menu"
                             className="w-full flex items-center justify-center gap-1 text-sm text-slate-700 hover:text-slate-900 transition font-medium py-1"
                         >
                             More Actions
@@ -297,7 +301,7 @@ export default function EntitySidebar({
                             </svg>
                         </button>
                         {showMoreActions && (
-                            <div className="mt-1 bg-white border border-slate-200 rounded-lg shadow-lg overflow-hidden z-20 relative">
+                            <div id="more-actions-menu" className="mt-1 bg-white border border-slate-200 rounded-lg shadow-lg overflow-hidden z-20 relative">
                                 {[
                                     { label: "Print", action: () => window.print() },
                                     {
