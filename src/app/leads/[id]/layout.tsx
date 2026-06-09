@@ -52,7 +52,7 @@ export default async function LeadLayout({
             id: true,
             name: true,
             client: { select: { name: true } },
-            project: { select: { id: true, name: true } },
+            project: { select: { id: true, name: true, deletedAt: true } },
         },
     });
     if (!lead) notFound();
@@ -63,7 +63,7 @@ export default async function LeadLayout({
         redirect("/projects");
     }
 
-    const linkedEntity = lead.project
+    const linkedEntity = lead.project && !lead.project.deletedAt
         ? { type: "project" as const, id: lead.project.id, name: lead.project.name }
         : null;
 

@@ -1,11 +1,22 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { isProdDatabase } from '@/lib/db-guard';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: Request) {
     if (process.env.ALLOW_SEEDING !== 'true') {
         return new Response('Seeding is disabled. Set ALLOW_SEEDING=true to enable.', { status: 403 });
+    }
+
+    // Hard refusal: this route wipes ALL clients/leads/projects/estimates. Never run it
+    // against production, even if ALLOW_SEEDING was mistakenly set there. See src/lib/db-guard.ts.
+    if (isProdDatabase()) {
+        return new Response(
+            'Refusing to seed: DATABASE_URL points at the PRODUCTION database. ' +
+            'This route deletes all clients/leads/projects/estimates and must only run against a non-prod database.',
+            { status: 403 }
+        );
     }
 
     try {

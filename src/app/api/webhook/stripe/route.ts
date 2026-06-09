@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { after } from "next/server";
 import { stripe } from "@/lib/stripe";
-import { prisma } from "@/lib/prisma";
+import { prisma, prismaBase } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
@@ -113,7 +113,11 @@ async function processEvent(eventId: string) {
                     // Single transaction: claim + sibling-read + parent update. See invoice branch for rationale.
                     const scheduleId = metadata.estimatePaymentScheduleId;
                     const estimateId = metadata.estimateId;
-                    const tx = await prisma.$transaction(async (t) => {
+                    // Use prismaBase (un-filtered): a real payment must still be recorded
+                    // even if the estimate/schedule was soft-deleted after the Stripe
+                    // checkout link was created. The filtered client would hide the
+                    // schedule and make findUniqueOrThrow throw, dropping the payment.
+                    const tx = await prismaBase.$transaction(async (t) => {
                         const claim = await t.estimatePaymentSchedule.updateMany({
                             where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
@@ -278,15 +282,17 @@ async function processEvent(eventId: string) {
                     break;
                 }
 
-                // Try estimate payment schedule
-                const estSchedule = await prisma.estimatePaymentSchedule.findFirst({
+                // Try estimate payment schedule. Use prismaBase (un-filtered) so a refund
+                // can still reconcile a schedule whose estimate was soft-deleted after the
+                // original payment was recorded — mirrors the completed-payment branch.
+                const estSchedule = await prismaBase.estimatePaymentSchedule.findFirst({
                     where: { stripePaymentIntentId: paymentIntentId },
                     include: { estimate: true },
                 });
 
                 if (estSchedule) {
                     if (isFullyRefunded) {
-                        await prisma.$transaction(async (t) => {
+                        await prismaBase.$transaction(async (t) => {
                             await t.estimatePaymentSchedule.update({
                                 where: { id: estSchedule.id },
                                 data: { status: "Pending", paidAt: null, paymentDate: null },

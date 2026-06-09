@@ -22,6 +22,7 @@ export default async function VarianceReportPage() {
         where: { status: "In Progress" },
         include: {
             estimates: {
+                where: { deletedAt: null },
                 include: {
                     items: {
                         include: { costCode: true, costType: true }

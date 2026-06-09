@@ -11,9 +11,10 @@ interface ProjectHeaderProps {
     clientName: string;
     location: string | null;
     status: string;
+    qbProjectId?: string | null;
 }
 
-export default function ProjectHeader({ projectId, name, clientName, location, status }: ProjectHeaderProps) {
+export default function ProjectHeader({ projectId, name, clientName, location, status, qbProjectId }: ProjectHeaderProps) {
     const [editing, setEditing] = useState(false);
     const [value, setValue] = useState(name);
     const [saving, setSaving] = useState(false);
@@ -25,7 +26,29 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
     const locationInputRef = useRef<HTMLInputElement>(null);
     const locationEscapedRef = useRef(false);
 
+    const [syncingQB, setSyncingQB] = useState(false);
+    const [qbSyncStatus, setQBSyncStatus] = useState(qbProjectId ? "synced" : "not_synced");
+
     const router = useRouter();
+
+    async function handleSyncProject() {
+        setSyncingQB(true);
+        try {
+            const res = await fetch("/api/quickbooks/projects/sync", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+            });
+            if (!res.ok) throw new Error("Sync failed");
+            toast.success("Project synced to QuickBooks!");
+            setQBSyncStatus("synced");
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e.message || "Failed to sync project");
+        } finally {
+            setSyncingQB(false);
+        }
+    }
 
     useEffect(() => {
         if (editing && inputRef.current) {
@@ -160,7 +183,19 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
                     </div>
                 </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2.5">
+                <button
+                    onClick={handleSyncProject}
+                    disabled={syncingQB || qbSyncStatus === "synced"}
+                    className={`text-xs font-medium px-3 py-1.5 rounded-lg border transition flex items-center gap-1.5 ${
+                        qbSyncStatus === "synced"
+                            ? "bg-green-50 text-green-700 border-green-200 cursor-default"
+                            : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 active:bg-slate-100"
+                    }`}
+                >
+                    <span className={`w-1.5 h-1.5 rounded-full ${qbSyncStatus === "synced" ? "bg-green-500" : "bg-slate-400"}`} />
+                    {syncingQB ? "Syncing to QB..." : qbSyncStatus === "synced" ? "Synced to QB" : "Sync to QuickBooks"}
+                </button>
                 <span className={`text-xs font-semibold px-3 py-1.5 rounded-full ${statusClass}`}>{statusLabel}</span>
             </div>
         </div>

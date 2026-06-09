@@ -105,6 +105,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                 clientName={project.client?.name || "No client"}
                 location={project.location}
                 status={project.status}
+                qbProjectId={project.qbProjectId}
             />
 
             {/* Stats Row */}

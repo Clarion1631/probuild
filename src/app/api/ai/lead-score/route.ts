@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
         include: {
             client: true,
             notes: { orderBy: { createdAt: "desc" }, take: 10 },
-            estimates: { select: { status: true, totalAmount: true } },
+            estimates: { where: { deletedAt: null }, select: { status: true, totalAmount: true } },
             tasks: { select: { status: true, title: true } },
         },
     });

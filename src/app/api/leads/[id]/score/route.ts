@@ -20,7 +20,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         where: { id },
         include: {
             client: { select: { name: true } },
-            estimates: { select: { totalAmount: true, status: true } },
+            estimates: { where: { deletedAt: null }, select: { totalAmount: true, status: true } },
             notes: { orderBy: { createdAt: "desc" }, take: 5, select: { content: true } },
             meetings: { select: { status: true, meetingType: true } },
             tasks: { where: { status: { not: "Done" } }, select: { title: true } },

@@ -1,0 +1,58 @@
+[
+  {
+    "id": "cmmk88e1t0000zn11x659eqyk",
+    "name": "Labor",
+    "description": "Crew labor hours and installation work",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.410Z",
+    "updatedAt": "2026-03-10T06:26:13.410Z"
+  },
+  {
+    "id": "cmmk88e340001zn110xicqjdx",
+    "name": "Material",
+    "description": "Purchased materials and supplies",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.457Z",
+    "updatedAt": "2026-03-10T06:26:13.457Z"
+  },
+  {
+    "id": "cmmk88e3p0002zn11p1z2ymf4",
+    "name": "Subcontractor",
+    "description": "Contracted trade work",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.478Z",
+    "updatedAt": "2026-03-10T06:26:13.478Z"
+  },
+  {
+    "id": "cmmk88e4b0003zn11vmo8mkts",
+    "name": "Equipment",
+    "description": "Tool and equipment rental or purchase",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.499Z",
+    "updatedAt": "2026-03-10T06:26:13.499Z"
+  },
+  {
+    "id": "cmmk88e4v0004zn11lturf7ph",
+    "name": "Unit",
+    "description": "Combined labor + material per unit (bundled pricing)",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.519Z",
+    "updatedAt": "2026-03-10T06:26:13.519Z"
+  },
+  {
+    "id": "cmmk88e5f0005zn11xdcocuxk",
+    "name": "Allowance",
+    "description": "Customer selection budget — client shops with this amount",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.540Z",
+    "updatedAt": "2026-03-10T06:26:13.540Z"
+  },
+  {
+    "id": "cmmk88e5y0006zn116vz9r9af",
+    "name": "Other",
+    "description": "Miscellaneous costs, overhead, or fees",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:26:13.558Z",
+    "updatedAt": "2026-03-10T06:26:13.558Z"
+  }
+]

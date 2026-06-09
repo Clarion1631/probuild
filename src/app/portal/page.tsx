@@ -64,6 +64,7 @@ export default async function PortalDashboard() {
             where: { id: sessionClientId },
             include: {
                 projects: {
+                    where: { deletedAt: null }, // soft-delete: never surface trashed projects in the client portal
                     orderBy: { createdAt: 'desc' },
                     include: {
                         invoices: {

@@ -143,6 +143,20 @@ async function convertDocViaPdf(pdfAbsPath) {
 }
 
 async function main() {
+    // Guard: phase 2 replaces ALL DocumentTemplate rows. This script legitimately seeds prod
+    // templates, but require explicit opt-in so an accidental run can't silently wipe prod config.
+    // (This .mjs can't import the TS src/lib/db-guard.ts, so the same check is inlined here.)
+    const PROD_SUPABASE_REF = "ghzdbzdnwjxazvmcefbh";
+    const dsn = `${process.env.DATABASE_URL ?? ""}\n${process.env.DIRECT_URL ?? ""}`;
+    if (dsn.includes(PROD_SUPABASE_REF) && process.env.ALLOW_PROD_TEMPLATE_SEED !== "true") {
+        console.error(
+            "✗ Refusing to run against the PRODUCTION database: this replaces every DocumentTemplate row.\n" +
+            "  To seed prod templates intentionally, re-run with ALLOW_PROD_TEMPLATE_SEED=true.\n" +
+            "  Otherwise point DATABASE_URL at a non-prod database."
+        );
+        process.exit(1);
+    }
+
     // Phase 1: convert all files in memory — no DB writes yet.
     console.log("→ Converting files...");
     const rows = [];

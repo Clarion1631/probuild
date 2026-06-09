@@ -1,4 +1,12 @@
 import { PrismaClient } from '@prisma/client'
+import { assertNotProdDatabase } from '../src/lib/db-guard'
+
+// Refuse to wipe production BEFORE constructing the client or running any query. Every local
+// .env points DATABASE_URL at prod, so a stray `tsx prisma/seed.ts` / `prisma db seed` here would
+// destroy real data. The `@prisma/client` import above has already loaded .env, so the prod URL is
+// visible to this check. See src/lib/db-guard.ts.
+assertNotProdDatabase('prisma/seed.ts')
+
 const prisma = new PrismaClient()
 
 async function main() {

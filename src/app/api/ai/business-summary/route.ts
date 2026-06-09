@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
 
     const [projects, estimates, invoices, leads, timeEntries, expenses] = await Promise.all([
         prisma.project.findMany({
-            include: { client: true, estimates: { select: { totalAmount: true, status: true } } },
+            include: { client: true, estimates: { where: { deletedAt: null }, select: { totalAmount: true, status: true } } },
         }),
         prisma.estimate.findMany({
             where: { createdAt: { gte: thirtyDaysAgo } },

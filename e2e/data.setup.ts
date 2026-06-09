@@ -2,6 +2,7 @@ import { test as setup } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { assertNotProdDatabase } from "../src/lib/db-guard";
 
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
 const TEST_CLIENT_ID = "test-client-do-not-delete";
@@ -12,6 +13,10 @@ setup("seed test data + probe anthropic", async () => {
 
     console.log("[data.setup] DATABASE_URL set:", !!process.env.DATABASE_URL);
     console.log("[data.setup] DATABASE_URL host:", (process.env.DATABASE_URL || "").match(/@([^:/?]+)/)?.[1] ?? "(none)");
+
+    // e2e must run against a dedicated test/branch database, never prod. Fail loudly if
+    // DATABASE_URL points at production (CI should set TEST_DATABASE_URL). See src/lib/db-guard.ts.
+    assertNotProdDatabase("e2e/data.setup.ts");
 
     const prisma = new PrismaClient();
     try {

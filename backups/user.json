@@ -1,0 +1,86 @@
+[
+  {
+    "id": "cmnrw7uhc00002xcl4gtk2shk",
+    "email": "garrett.erickson99@gmail.com",
+    "name": "Garrett Erickson",
+    "role": "FIELD_CREW",
+    "status": "PENDING",
+    "hourlyRate": "0",
+    "burdenRate": "0",
+    "pinCode": null,
+    "invitedAt": "2026-04-09T19:51:44.399Z",
+    "fieldUpdatesSeenAt": null
+  },
+  {
+    "id": "cmnyzxh3w00006s1gy1lzs3xv",
+    "email": "vanessaebryant95@gmail.com",
+    "name": "Vanessa Bryant",
+    "role": "FINANCE",
+    "status": "ACTIVATED",
+    "hourlyRate": "0",
+    "burdenRate": "0",
+    "pinCode": null,
+    "invitedAt": "2026-04-14T19:10:02.203Z",
+    "fieldUpdatesSeenAt": null
+  },
+  {
+    "id": "cmmjgzzpo0001ccsd9x2klsdo",
+    "email": "justin.t.adkins@gmail.com",
+    "name": "Justin Adkins",
+    "role": "ADMIN",
+    "status": "ACTIVATED",
+    "hourlyRate": "50",
+    "burdenRate": "15",
+    "pinCode": "$2b$10$uy4shyYugTJTptX89P7.HOO.ouNUEX2qiErZYHkdqHj9ZSqO6QBFW",
+    "invitedAt": "2026-03-10T18:32:10.820Z",
+    "fieldUpdatesSeenAt": null
+  },
+  {
+    "id": "176e0f0c-c973-4be1-9b51-4c0fc356ef23",
+    "email": "testcrew@goldentouchremodeling.com",
+    "name": "Test Field Crew",
+    "role": "FIELD_CREW",
+    "status": "ACTIVATED",
+    "hourlyRate": "35",
+    "burdenRate": "12",
+    "pinCode": "$2b$10$wa0wQklg2AXq5CNFkdE64ehvZ4zojBRB/N4fg5gTp6Rt2ybG1bwxe",
+    "invitedAt": "2026-04-30T21:01:55.909Z",
+    "fieldUpdatesSeenAt": null
+  },
+  {
+    "id": "cmn6oqt0p0000ovrrfodtwmvl",
+    "email": "rlord@goldentouchremodeling.com",
+    "name": "Richard Lord",
+    "role": "ADMIN",
+    "status": "ACTIVATED",
+    "hourlyRate": "0",
+    "burdenRate": "0",
+    "pinCode": null,
+    "invitedAt": "2026-03-25T23:39:22.344Z",
+    "fieldUpdatesSeenAt": "2026-05-12T15:14:35.568Z"
+  },
+  {
+    "id": "cmmjgzzmz0000ccsdt65mmu6p",
+    "email": "jadkins@goldentouchremodeling.com",
+    "name": "Justin Adkins",
+    "role": "ADMIN",
+    "status": "ACTIVATED",
+    "hourlyRate": "0",
+    "burdenRate": "0",
+    "pinCode": null,
+    "invitedAt": "2026-03-10T18:32:10.820Z",
+    "fieldUpdatesSeenAt": "2026-05-13T19:10:37.337Z"
+  },
+  {
+    "id": "cmpc8ytbv0000w63wmcvj0exu",
+    "email": "justin@constructionio.com",
+    "name": "Justin Adkins",
+    "role": "ADMIN",
+    "status": "PENDING",
+    "hourlyRate": "0",
+    "burdenRate": "0",
+    "pinCode": null,
+    "invitedAt": "2026-05-19T06:23:43.868Z",
+    "fieldUpdatesSeenAt": null
+  }
+]

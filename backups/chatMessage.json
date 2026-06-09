@@ -1,0 +1,849 @@
+[
+  {
+    "id": "cmnnm59z0000266643u1ozmu4",
+    "conversationId": "cmnnm59uu00006664quft9wb8",
+    "role": "user",
+    "content": "How do I create a new project?",
+    "createdAt": "2026-04-06T19:58:43.643Z"
+  },
+  {
+    "id": "cmnnm5dfk00046664891fqlzg",
+    "conversationId": "cmnnm59uu00006664quft9wb8",
+    "role": "assistant",
+    "content": "## Creating a New Project in ProBuild\n\nSince you're already on the **/projects** page, here's how to get started:\n\n1. **Click the \"+ New Project\"** button (typically located in the top-right corner of the Projects page).\n2. **Fill in the project details**, such as:\n   - Project name\n   - Client/customer\n   - Project address\n   - Start and end dates\n   - Project status\n3. **Save the project** by clicking **\"Create Project\"** or **\"Save\"**.\n\nOnce created, your new project will appear in your projects list, and you can begin adding estimates, invoices, schedules, and more from within the project dashboard.\n\n> **Tip:** As an Admin, you have full access to all project settings and can assign team members directly from the project page after creation.",
+    "createdAt": "2026-04-06T19:58:48.129Z"
+  },
+  {
+    "id": "cmnnm5gmw000766646t6a6wa6",
+    "conversationId": "cmnnm5gk900056664qtt7s60t",
+    "role": "user",
+    "content": "How do I create a new project?",
+    "createdAt": "2026-04-06T19:58:52.280Z"
+  },
+  {
+    "id": "cmnnm5k0700096664w413w8jv",
+    "conversationId": "cmnnm5gk900056664qtt7s60t",
+    "role": "assistant",
+    "content": "## Creating a New Project in ProBuild\n\nSince you're already on the **/projects** page, here's how to get started:\n\n1. **Click the \"+ New Project\"** button (typically located in the top-right corner of the Projects page)\n2. **Fill in the project details**, such as:\n   - Project name\n   - Client/customer\n   - Project address\n   - Start and end dates\n   - Project status\n3. **Save the project** by clicking **\"Create Project\"** or **\"Save\"**\n\nOnce created, you can open the project to add estimates, schedules, daily logs, team members, and more.\n\n> **Tip:** As an Admin, you have full access to create and manage all projects on the platform.",
+    "createdAt": "2026-04-06T19:58:56.623Z"
+  },
+  {
+    "id": "cmnnm5nmz000b6664r894503h",
+    "conversationId": "cmnnm5gk900056664qtt7s60t",
+    "role": "user",
+    "content": "What about adding an estimate to it?",
+    "createdAt": "2026-04-06T19:59:01.355Z"
+  },
+  {
+    "id": "cmnnm5rui000d6664g1ht9vvv",
+    "conversationId": "cmnnm5gk900056664qtt7s60t",
+    "role": "assistant",
+    "content": "## Adding an Estimate to a Project\n\nOnce your project is created:\n\n1. **Open the project** by clicking on it from the **/projects** page\n2. **Navigate to the \"Estimates\" tab** within the project\n3. **Click \"+ New Estimate\"** to create a new estimate\n4. **Fill in the estimate details**, such as:\n   - Estimate name/number\n   - Line items (labor, materials, etc.)\n   - Quantities and unit costs\n   - Tax rates (if applicable)\n   - Notes or terms\n5. **Save or Send** the estimate:\n   - **Save as Draft** to continue editing later\n   - **Send to Client** to email the estimate directly to your customer for approval\n\n## Tips:\n- You can create **multiple estimates** per project (e.g., for different scopes or revisions)\n- Once a client approves an estimate, you can typically **convert it to an invoice** with one click\n- As an **Admin**, you can edit, delete, or duplicate any estimate on the platform",
+    "createdAt": "2026-04-06T19:59:06.810Z"
+  },
+  {
+    "id": "cmnntwcce0002xn0xz5gngjo5",
+    "conversationId": "cmnntwc3i0000xn0x7qujsgmg",
+    "role": "user",
+    "content": "buttons are crowded in the estimate headers, find an elegant way to fix that",
+    "createdAt": "2026-04-06T23:35:43.743Z"
+  },
+  {
+    "id": "cmnntwg6w0004xn0xa83s4zl0",
+    "conversationId": "cmnntwc3i0000xn0x7qujsgmg",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Header Action Buttons\", \"description\": \"The action buttons in the estimate header are too crowded and need a cleaner layout. Proposed solutions: (1) Group secondary actions (e.g., Delete, Duplicate, Download PDF) into a '...' overflow dropdown menu, keeping only primary actions (e.g., Save, Send) as visible buttons. (2) Use icon-only buttons with tooltips on smaller screens, expanding to icon+label on larger screens. (3) Introduce a responsive button bar that collapses into a dropdown below a certain viewport width. This would reduce visual clutter, improve usability on smaller screens, and maintain quick access to the most important actions.\"}",
+    "createdAt": "2026-04-06T23:35:48.728Z"
+  },
+  {
+    "id": "cmnntwn8e0006xn0xvnxvvejl",
+    "conversationId": "cmnntwc3i0000xn0x7qujsgmg",
+    "role": "user",
+    "content": "Yes",
+    "createdAt": "2026-04-06T23:35:57.854Z"
+  },
+  {
+    "id": "cmnntwph50008xn0xha02zksj",
+    "conversationId": "cmnntwc3i0000xn0x7qujsgmg",
+    "role": "assistant",
+    "content": "Thank you for confirming! I've logged this as a feature request. The ProBuild team will review it and consider implementing a cleaner, more elegant button layout for the estimate header — likely using an overflow menu for secondary actions and keeping only primary actions prominent.\n\nIf you have any other suggestions or run into anything else, feel free to ask!",
+    "createdAt": "2026-04-06T23:36:00.698Z"
+  },
+  {
+    "id": "cmnnuvryo0002ej3pd9kkp9nj",
+    "conversationId": "cmnnuvrpp0000ej3pxs1e4z59",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-07T00:03:16.944Z"
+  },
+  {
+    "id": "cmnnuvx6f0004ej3pit3x75h9",
+    "conversationId": "cmnnuvrpp0000ej3pxs1e4z59",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimate** — Go to the relevant project and open the **Estimates** section, then click the estimate you want to convert.\n\n2. **Use the \"Convert to Invoice\" option** — Inside the estimate, look for the **\"Convert to Invoice\"** button (typically in the top-right action menu or toolbar).\n\n3. **Review the invoice details** — ProBuild will pre-populate the invoice with the estimate's line items, amounts, and client info. Make any adjustments needed (e.g., partial billing, due date, payment terms).\n\n4. **Save or Send** — Click **Save** to keep it as a draft, or **Send** to email it directly to your client.\n\n### Tips:\n- You can do this from **Invoices** section as well by selecting *\"New Invoice from Estimate\"*\n- The original estimate remains unchanged after conversion\n- You can create **multiple invoices** from a single estimate (useful for progress billing)\n\n> 💡 As an **Admin**, you have full access to create, edit, and send invoices without any restrictions.",
+    "createdAt": "2026-04-07T00:03:23.641Z"
+  },
+  {
+    "id": "cmnnv2oy2000260jn1ol0t3f5",
+    "conversationId": "cmnnv2opt000060jnr6mynh6a",
+    "role": "user",
+    "content": "buttons are crowded in the estimate headers, find an elegant way to fix that",
+    "createdAt": "2026-04-07T00:08:39.627Z"
+  },
+  {
+    "id": "cmnnv2sjs000460jngbc0g9dq",
+    "conversationId": "cmnnv2opt000060jnr6mynh6a",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Header Action Buttons\", \"description\": \"The action buttons in the estimate header are too crowded and hurt usability. Proposed solutions: (1) Group secondary actions (e.g., duplicate, delete, print/export) into a '...' overflow dropdown menu, keeping only primary CTAs (e.g., 'Save', 'Send to Client') as visible buttons. (2) On smaller screens, collapse all actions into a single dropdown. (3) Optionally, use icon-only buttons with tooltips for common actions to reduce horizontal space. This would create a cleaner, more scannable header without sacrificing access to any functionality.\"}",
+    "createdAt": "2026-04-07T00:08:44.237Z"
+  },
+  {
+    "id": "cmnnv3i82000660jn7tz5h6y2",
+    "conversationId": "cmnnv2opt000060jnr6mynh6a",
+    "role": "user",
+    "content": "yes please",
+    "createdAt": "2026-04-07T00:09:17.570Z"
+  },
+  {
+    "id": "cmnnv3khs000860jn1jl72w43",
+    "conversationId": "cmnnv2opt000060jnr6mynh6a",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Header Action Buttons\", \"description\": \"The action buttons in the estimate header are too crowded and hurt usability. Proposed solutions: (1) Group secondary actions (e.g., duplicate, delete, print/export) into a '...' overflow dropdown menu, keeping only primary CTAs (e.g., 'Save', 'Send to Client') as visible buttons. (2) On smaller screens, collapse all actions into a single dropdown. (3) Optionally, use icon-only buttons with tooltips for common actions to reduce horizontal space. This would create a cleaner, more scannable header without sacrificing access to any functionality.\"}",
+    "createdAt": "2026-04-07T00:09:20.512Z"
+  },
+  {
+    "id": "cmnnv40yj0001144sgbruaq9k",
+    "conversationId": "cmnnuvrpp0000ej3pxs1e4z59",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-07T00:09:41.852Z"
+  },
+  {
+    "id": "cmoyp0irg0001fr9o664cw4kg",
+    "conversationId": "cmoyov5t0000010b6b3ox30dh",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T18:44:10.876Z"
+  },
+  {
+    "id": "cmoypjy8q0001pqibvvqbqov3",
+    "conversationId": "cmoyp9mv10000x2vpjssu924w",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T18:59:17.402Z"
+  },
+  {
+    "id": "cmnnv43kw0003144s94dy8ybu",
+    "conversationId": "cmnnuvrpp0000ej3pxs1e4z59",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimate** — Go to the relevant project and open the **Estimates** section, then click the estimate you want to convert.\n\n2. **Use the \"Convert to Invoice\" option** — Inside the estimate, look for the **\"Convert to Invoice\"** button (typically in the top-right action menu or toolbar).\n\n3. **Review the invoice details** — ProBuild will pre-populate the invoice with the estimate's line items, amounts, and client info. Make any adjustments needed (e.g., partial billing, due date, payment terms).\n\n4. **Save or Send** — Click **Save** to keep it as a draft, or **Send** to email it directly to your client.\n\n### Tips:\n- You can also do this from the **Invoices** section by selecting *\"New Invoice from Estimate\"*\n- The original estimate remains unchanged after conversion\n- You can create **multiple invoices** from a single estimate (useful for progress billing)\n\n> 💡 As an **Admin**, you have full access to create, edit, and send invoices without any restrictions.",
+    "createdAt": "2026-04-07T00:09:45.249Z"
+  },
+  {
+    "id": "cmno5ykug0002dbjopojsw6w8",
+    "conversationId": "cmno5ykm70000dbjo30epsk83",
+    "role": "user",
+    "content": "can you unclutter the buttons above in the estimate header",
+    "createdAt": "2026-04-07T05:13:23.464Z"
+  },
+  {
+    "id": "cmno5ynwt0004dbjodllf24wh",
+    "conversationId": "cmno5ykm70000dbjo30epsk83",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Header Action Buttons\", \"description\": \"Users find the estimate header area too cluttered with too many buttons visible at once. Request to simplify the header UI by grouping secondary actions into a dropdown menu (e.g., a '...' or 'More Actions' button), keeping only the most critical actions (such as Save, Send, and status indicator) prominently visible. This would improve usability and reduce visual noise on the estimate detail page.\"}",
+    "createdAt": "2026-04-07T05:13:27.438Z"
+  },
+  {
+    "id": "cmno5ywje0006dbjo8u818d52",
+    "conversationId": "cmno5ykm70000dbjo30epsk83",
+    "role": "user",
+    "content": "yes",
+    "createdAt": "2026-04-07T05:13:38.618Z"
+  },
+  {
+    "id": "cmno5z0wm0008dbjosh4pt9in",
+    "conversationId": "cmno5ykm70000dbjo30epsk83",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Header Action Buttons\", \"description\": \"Users find the estimate header area too cluttered with too many buttons visible at once. Request to simplify the header UI by grouping secondary actions into a dropdown menu (e.g., a '...' or 'More Actions' button), keeping only the most critical actions (such as Save, Send, and status indicator) prominently visible. This would improve usability and reduce visual noise on the estimate detail page.\"}",
+    "createdAt": "2026-04-07T05:13:44.278Z"
+  },
+  {
+    "id": "cmno5zyng000adbjoumexsifj",
+    "conversationId": "cmnnv2opt000060jnr6mynh6a",
+    "role": "user",
+    "content": "please send this request through",
+    "createdAt": "2026-04-07T05:14:28.013Z"
+  },
+  {
+    "id": "cmno600lz000cdbjoha1liv8o",
+    "conversationId": "cmnnv2opt000060jnr6mynh6a",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Header Action Buttons\", \"description\": \"The action buttons in the estimate header are too crowded and hurt usability. Proposed solutions: (1) Group secondary actions (e.g., duplicate, delete, print/export) into a '...' overflow dropdown menu, keeping only primary CTAs (e.g., 'Save', 'Send to Client') as visible buttons. (2) On smaller screens, collapse all actions into a single dropdown. (3) Optionally, use icon-only buttons with tooltips for common actions to reduce horizontal space. This would create a cleaner, more scannable header without sacrificing access to any functionality.\"}",
+    "createdAt": "2026-04-07T05:14:30.551Z"
+  },
+  {
+    "id": "cmno63kms00012x967gyc9pj2",
+    "conversationId": "cmno5ykm70000dbjo30epsk83",
+    "role": "user",
+    "content": "please implement",
+    "createdAt": "2026-04-07T05:17:16.468Z"
+  },
+  {
+    "id": "cmno63oat00032x96spr3uwzj",
+    "conversationId": "cmno5ykm70000dbjo30epsk83",
+    "role": "assistant",
+    "content": "I'm just a help assistant — I'm not able to directly implement changes to the codebase. However, your feature request has been logged and can be reviewed by the development team for implementation.\n\nIf you'd like to escalate this, you could:\n1. **Contact your ProBuild admin or support team** and reference the feature request for decluttering the estimate header buttons.\n2. **Submit it through the official feedback channel** if ProBuild has one.\n\nThe request is well-documented and clearly describes grouping secondary actions into a **\"More Actions\" dropdown** to keep the header clean.",
+    "createdAt": "2026-04-07T05:17:21.164Z"
+  },
+  {
+    "id": "cmno64niv00062x96sgqozqmt",
+    "conversationId": "cmno64nav00042x96stvnn1jb",
+    "role": "user",
+    "content": "uncrowd the buttons in the header on the estimate page",
+    "createdAt": "2026-04-07T05:18:06.872Z"
+  },
+  {
+    "id": "cmno64q3700082x96o2k01pet",
+    "conversationId": "cmno64nav00042x96stvnn1jb",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Uncrowd header buttons on estimate page\", \"description\": \"The action buttons in the header of the estimate detail page are too crowded together. Consider grouping secondary actions into a dropdown menu (e.g., a '...' or 'More' button), increasing spacing between buttons, or reorganizing the layout to reduce visual clutter and improve usability on the estimate page header.\"}",
+    "createdAt": "2026-04-07T05:18:10.196Z"
+  },
+  {
+    "id": "cmno6cu1t0002tonw06etn6iq",
+    "conversationId": "cmno6cttr0000tonwzuhlfflq",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-07T05:24:28.578Z"
+  },
+  {
+    "id": "cmno6cyux0004tonwt6vq4kue",
+    "conversationId": "cmno6cttr0000tonwzuhlfflq",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimate** — Go to the project, then open the **Estimates** tab and select the estimate you want to convert.\n\n2. **Use the Convert Option** — Click the **\"Create Invoice\"** (or **\"Convert to Invoice\"**) button, typically found in the top-right action menu of the estimate detail view.\n\n3. **Review & Edit** — The invoice will pre-populate with the line items, amounts, and client details from the estimate. Make any adjustments needed (due date, deposit amount, etc.).\n\n4. **Save & Send** — Click **Save** to store the invoice, then use the **Send** button to email it directly to your client.\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified.\n- You can create **partial invoices** from an estimate if you only want to bill for certain line items.\n- Check the **Invoices** tab on the project to confirm the new invoice appears there.\n\nLet me know if you run into any issues!",
+    "createdAt": "2026-04-07T05:24:34.752Z"
+  },
+  {
+    "id": "cmno6fev80001xn1rdbsex5ym",
+    "conversationId": "cmno64nav00042x96stvnn1jb",
+    "role": "user",
+    "content": "uncrowd the buttons in the header on estimate page",
+    "createdAt": "2026-04-07T05:26:28.868Z"
+  },
+  {
+    "id": "cmno6fh4a0003xn1rpc42rrjz",
+    "conversationId": "cmno64nav00042x96stvnn1jb",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Uncrowd header buttons on estimate page\", \"description\": \"The action buttons in the header of the estimate detail page are too crowded together. Consider grouping secondary actions into a dropdown menu (e.g., a '...' or 'More' button), increasing spacing between buttons, or reorganizing the layout to reduce visual clutter and improve usability on the estimate page header.\"}",
+    "createdAt": "2026-04-07T05:26:31.787Z"
+  },
+  {
+    "id": "cmno72w1i0004kfpk8leupn86",
+    "conversationId": "cmno72vt00002kfpkmemn1jad",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-07T05:44:44.214Z"
+  },
+  {
+    "id": "cmoyp9nnu0002x2vpdiddsacr",
+    "conversationId": "cmoyp9mv10000x2vpjssu924w",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T18:51:16.559Z"
+  },
+  {
+    "id": "cmoyu2xrj00028jxfphamcg0b",
+    "conversationId": "cmoyu2xi200008jxfhfh7e7b7",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T21:06:01.711Z"
+  },
+  {
+    "id": "cmoyuexv10002fpsya75z8vuw",
+    "conversationId": "cmoyuexj90000fpsyneasbrzw",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T21:15:21.709Z"
+  },
+  {
+    "id": "cmoz1yl9m000111johkkxuepa",
+    "conversationId": "cmoyuexj90000fpsyneasbrzw",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T00:46:35.818Z"
+  },
+  {
+    "id": "cmoz20k0b0001xygrog7d9qns",
+    "conversationId": "cmoyuexj90000fpsyneasbrzw",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T00:48:07.499Z"
+  },
+  {
+    "id": "cmoz23ai00002487n2ehlnlot",
+    "conversationId": "cmoz23a690000487nkrthn37t",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T00:50:15.145Z"
+  },
+  {
+    "id": "cmoz24aav0001f8fx4kiqoij7",
+    "conversationId": "cmoz23a690000487nkrthn37t",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T00:51:01.544Z"
+  },
+  {
+    "id": "cmno730mg0006kfpknmti3co4",
+    "conversationId": "cmno72vt00002kfpkmemn1jad",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** of your project (or go to the main Estimates page)\n2. **Open the estimate** you want to convert\n3. **Click the \"Convert to Invoice\" button** — usually found in the top-right action menu or estimate detail toolbar\n4. The invoice will be **pre-populated** with the estimate's line items, costs, and client details\n5. **Review and adjust** any details (payment terms, due date, deposit amounts, etc.)\n6. **Save or Send** the invoice directly to your client\n\n### Tips:\n- The original estimate remains intact after conversion\n- You can do a **partial invoice** if you only want to bill for certain line items\n- The invoice will be automatically linked to the same project for easy tracking\n\nYou can find your new invoice under the **Invoices** section of the project or the main Invoices page.",
+    "createdAt": "2026-04-07T05:44:50.153Z"
+  },
+  {
+    "id": "cmno7dt9400051tyuvb82ecui",
+    "conversationId": "cmno72vt00002kfpkmemn1jad",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-07T05:53:13.816Z"
+  },
+  {
+    "id": "cmno7dxcx00071tyun3scjgdp",
+    "conversationId": "cmno72vt00002kfpkmemn1jad",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** of your project (or go to the main Estimates page)\n2. **Open the estimate** you want to convert\n3. **Click the \"Convert to Invoice\" button** — usually found in the top-right action menu or estimate detail toolbar\n4. The invoice will be **pre-populated** with the estimate's line items, costs, and client details\n5. **Review and adjust** any details (payment terms, due date, deposit amounts, etc.)\n6. **Save or Send** the invoice directly to your client\n\n### Tips:\n- The original estimate remains intact after conversion\n- You can do a **partial invoice** if you only want to bill for certain line items\n- The invoice will be automatically linked to the same project for easy tracking\n\nYou can find your new invoice under the **Invoices** section of the project or the main Invoices page.",
+    "createdAt": "2026-04-07T05:53:19.137Z"
+  },
+  {
+    "id": "cmnovqayb0003mdjm97wl9cce",
+    "conversationId": "cmnovqar10000mdjmqg6blcwq",
+    "role": "user",
+    "content": "The export button crashes Safari every time I click it after opening an estimate.",
+    "createdAt": "2026-04-07T17:14:47.291Z"
+  },
+  {
+    "id": "cmnovqb1h0005mdjmlylhldn6",
+    "conversationId": "cmnovqaux0001mdjmz9z0rekx",
+    "role": "user",
+    "content": "I wish ProBuild could duplicate an estimate with all line items.",
+    "createdAt": "2026-04-07T17:14:47.411Z"
+  },
+  {
+    "id": "cmnovqdil0007mdjmzn8n8aym",
+    "conversationId": "cmnovqar10000mdjmqg6blcwq",
+    "role": "assistant",
+    "content": "It sounds like you've found a bug: \"Export button crashes Safari on estimate page\". Clicking the export button on an estimate page causes Safari to crash every time",
+    "createdAt": "2026-04-07T17:14:50.734Z"
+  },
+  {
+    "id": "cmnovqdom0009mdjmd9jpuymh",
+    "conversationId": "cmnovqaux0001mdjmz9z0rekx",
+    "role": "assistant",
+    "content": "This looks like a feature request: \"Duplicate Estimate with Line Items\"",
+    "createdAt": "2026-04-07T17:14:50.935Z"
+  },
+  {
+    "id": "cmnovrkim000bmdjm46ikmf4x",
+    "conversationId": "cmnovqar10000mdjmqg6blcwq",
+    "role": "assistant",
+    "content": "Update on bug fix \"Export button crashes Safari on estimate page\": it has been verified and ready.\n\nFixed the Safari export crash and verified the export flow.\n\nDeployment: https://probuild.app",
+    "createdAt": "2026-04-07T17:15:46.407Z"
+  },
+  {
+    "id": "cmnoxwxdt0002klk14lsba8nw",
+    "conversationId": "cmnoxwx4q0000klk15qvsjgr3",
+    "role": "user",
+    "content": "The overheard buttons are crowded on the estimate editor, please elaganlty fix.",
+    "createdAt": "2026-04-07T18:15:55.649Z"
+  },
+  {
+    "id": "cmnoxx0vo0004klk1dnpc7jlq",
+    "conversationId": "cmnoxwx4q0000klk15qvsjgr3",
+    "role": "assistant",
+    "content": "{\"type\": \"feature_request\", \"title\": \"Declutter Estimate Editor Header Buttons\", \"description\": \"The action buttons in the estimate editor header/toolbar are too crowded and visually cluttered. Improvements could include: grouping related actions into dropdown menus, using icon-only buttons with tooltips for secondary actions, adding proper spacing and visual hierarchy, collapsing less-used actions behind a 'More' menu, and ensuring a responsive layout that adapts gracefully on smaller screens.\"}",
+    "createdAt": "2026-04-07T18:16:00.180Z"
+  },
+  {
+    "id": "cmnpv5o3z0002s2r4yugmzgxb",
+    "conversationId": "cmnpv5nrl0000s2r41dpx5nvn",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-08T09:46:30.864Z"
+  },
+  {
+    "id": "cmns5fho10001zfa3fs4wzhyr",
+    "conversationId": "cmnpv5nrl0000s2r41dpx5nvn",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-10T00:09:37.586Z"
+  },
+  {
+    "id": "cmnsccjqq0002voyzcadwlva6",
+    "conversationId": "cmnsccjed0000voyzzdj9t8i8",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-10T03:23:17.618Z"
+  },
+  {
+    "id": "cmnskjwc600019d3s8xflj0j0",
+    "conversationId": "cmnsccjed0000voyzzdj9t8i8",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-10T07:12:57.463Z"
+  },
+  {
+    "id": "cmnu0dcxi0002135pcelucepe",
+    "conversationId": "cmnu0dckz0000135pvpzxd98p",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-11T07:23:32.406Z"
+  },
+  {
+    "id": "cmo0o6qrf0001110z48bzz306",
+    "conversationId": "cmnu0dckz0000135pvpzxd98p",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-15T23:16:51.580Z"
+  },
+  {
+    "id": "cmo7vib5j0002tnhw3bi92lm8",
+    "conversationId": "cmo7viawo0000tnhws8wp9wv7",
+    "role": "user",
+    "content": "how do i set sales tax",
+    "createdAt": "2026-04-21T00:16:11.768Z"
+  },
+  {
+    "id": "cmo7vifu30004tnhwtptmzha1",
+    "conversationId": "cmo7viawo0000tnhws8wp9wv7",
+    "role": "assistant",
+    "content": "## Setting Sales Tax in ProBuild\n\nSince you're on the **Company Settings** page, you're in the right place!\n\nLook for a **Tax Settings** or **Sales Tax** section on this page. There you can:\n\n1. **Enable sales tax** by toggling it on\n2. **Enter your default tax rate** (e.g., 8.5%)\n3. **Save** your changes\n\nOnce set, this default tax rate will automatically apply to new **Estimates** and **Invoices**.\n\n### Additional Tips:\n- You can **override the tax rate** on individual line items or per estimate/invoice if needed\n- Some plans allow **multiple tax rates** for different jurisdictions or material types\n\nIf you don't see a Tax Settings section on your current page, try scrolling down — it's sometimes near the billing or financial settings area.",
+    "createdAt": "2026-04-21T00:16:17.835Z"
+  },
+  {
+    "id": "cmokkif9l0002akoljjwoh452",
+    "conversationId": "cmokkif6q0000akolkaoh5pfu",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-29T21:29:21.609Z"
+  },
+  {
+    "id": "cmokkku4q0001133vpr5zvh1n",
+    "conversationId": "cmokkif6q0000akolkaoh5pfu",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-29T21:31:14.187Z"
+  },
+  {
+    "id": "cmoklii6h0001fn2dr6j1xfpg",
+    "conversationId": "cmokkif6q0000akolkaoh5pfu",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-29T21:57:25.001Z"
+  },
+  {
+    "id": "cmokml1gr0001q9yjsr2vz946",
+    "conversationId": "cmokkif6q0000akolkaoh5pfu",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-29T22:27:22.923Z"
+  },
+  {
+    "id": "cmokp3ssp00025iq1ti847vy1",
+    "conversationId": "cmokp3sj500005iq1tzgfw7fi",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-29T23:37:57.385Z"
+  },
+  {
+    "id": "cmokqu6eq0002nn00ap6exg8n",
+    "conversationId": "cmokqu6300000nn00na4h1994",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-04-30T00:26:27.698Z"
+  },
+  {
+    "id": "cmox3ezm400025wjmwyle3z58",
+    "conversationId": "cmox3ezj700005wjmzxmjwfz4",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-08T15:51:48.173Z"
+  },
+  {
+    "id": "cmoxi5xob0001s8bahbx751v5",
+    "conversationId": "cmox3ezj700005wjmzxmjwfz4",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-08T22:44:39.996Z"
+  },
+  {
+    "id": "cmoxmqh2g0001vkc64dkfvhu5",
+    "conversationId": "cmox3ezj700005wjmzxmjwfz4",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T00:52:36.713Z"
+  },
+  {
+    "id": "cmoxnco4z0002k8frml1unaba",
+    "conversationId": "cmoxncnt60000k8frmaauuhf2",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T01:09:52.307Z"
+  },
+  {
+    "id": "cmoyipzdg00012g26jf7zrdjk",
+    "conversationId": "cmoxncnt60000k8frmaauuhf2",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T15:48:01.492Z"
+  },
+  {
+    "id": "cmoyjev140001imu5xcdfyn6q",
+    "conversationId": "cmoxncnt60000k8frmaauuhf2",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T16:07:22.265Z"
+  },
+  {
+    "id": "cmoyjkz030001orsdp2rdv88t",
+    "conversationId": "cmoxncnt60000k8frmaauuhf2",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T16:12:07.347Z"
+  },
+  {
+    "id": "cmoyldeta00029604tdjzej6y",
+    "conversationId": "cmoyldegw00009604d4v96mpf",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T17:02:13.822Z"
+  },
+  {
+    "id": "cmoyofbj20001n44cscbn2j6a",
+    "conversationId": "cmoyldegw00009604d4v96mpf",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T18:27:41.727Z"
+  },
+  {
+    "id": "cmoyov65o000210b6jjswufup",
+    "conversationId": "cmoyov5t0000010b6b3ox30dh",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-09T18:40:01.260Z"
+  },
+  {
+    "id": "cmoz24ajt000113z4j7anjmsq",
+    "conversationId": "cmoz23a690000487nkrthn37t",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T00:51:01.866Z"
+  },
+  {
+    "id": "cmoz3a4jo000159wla9d9iooh",
+    "conversationId": "cmoz23a690000487nkrthn37t",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T01:23:33.636Z"
+  },
+  {
+    "id": "cmoz3m3q100028smytrofk7tp",
+    "conversationId": "cmoz3m3cv00008smyfrcu9uq1",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-10T01:32:52.442Z"
+  },
+  {
+    "id": "cmp0frau0000111cvsu2mub37",
+    "conversationId": "cmoz3m3cv00008smyfrcu9uq1",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T00:00:36.505Z"
+  },
+  {
+    "id": "cmp0fwqdp0001swyj1m8qqe23",
+    "conversationId": "cmoz3m3cv00008smyfrcu9uq1",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T00:04:49.933Z"
+  },
+  {
+    "id": "cmp0g1ybs0001cdqzjep4rbcd",
+    "conversationId": "cmoz3m3cv00008smyfrcu9uq1",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T00:08:53.513Z"
+  },
+  {
+    "id": "cmp0g8uqu0002kzqqhwfjjhhe",
+    "conversationId": "cmp0g8uey0000kzqqid2zes4i",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T00:14:15.462Z"
+  },
+  {
+    "id": "cmp1j73470001sjsf9rq0osqy",
+    "conversationId": "cmp0g8uey0000kzqqid2zes4i",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T18:24:38.023Z"
+  },
+  {
+    "id": "cmp1j78jg0003sjsf1pes5z8x",
+    "conversationId": "cmp0g8uey0000kzqqid2zes4i",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimates section** — Go to the relevant project or find the estimate in your Estimates list.\n\n2. **Open the Estimate** — Click on the estimate you want to convert.\n\n3. **Use the \"Convert to Invoice\" option** — Look for a **\"Convert to Invoice\"** button or option in the top action bar or the dropdown menu (⋮) on the estimate.\n\n4. **Review the Invoice** — ProBuild will pre-populate the invoice with the details from the estimate (line items, costs, client info). Review and make any adjustments needed.\n\n5. **Save or Send** — Once satisfied, **Save** the invoice or **Send** it directly to your client.\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or altered.\n- You can do a **partial invoice** if you only want to bill for a portion of the estimate.\n- Make sure the estimate is in an **Approved** status before converting for a smoother workflow.\n\nIf you're having trouble finding the \"Convert to Invoice\" button, make sure you're inside the specific **project context** where the estimate lives. Let me know if you need more help!",
+    "createdAt": "2026-05-11T18:24:45.053Z"
+  },
+  {
+    "id": "cmp1jbfo40002z6g3g07gnu8x",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T18:28:00.916Z"
+  },
+  {
+    "id": "cmp1jblvl0004z6g3a0oy6wrb",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-11T18:28:08.348Z"
+  },
+  {
+    "id": "cmp1jbv0a0001stexn2bj52zv",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T18:28:20.794Z"
+  },
+  {
+    "id": "cmp1jbxs80003stexf9wcbpxl",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-11T18:28:24.335Z"
+  },
+  {
+    "id": "cmp1kidnd00017d2e1z6f2znt",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T19:01:24.506Z"
+  },
+  {
+    "id": "cmp1kig6b00037d2ejbevadgf",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-11T19:01:27.779Z"
+  },
+  {
+    "id": "cmp1lb3hj0001rj26u4jq9vzs",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T19:23:44.359Z"
+  },
+  {
+    "id": "cmp1lb69k0003rj26qt40e2ur",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-11T19:23:47.961Z"
+  },
+  {
+    "id": "cmp1m9j0v00017hf0p5rrj5sk",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T19:50:30.799Z"
+  },
+  {
+    "id": "cmp1m9lr800037hf084uz50l4",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-11T19:50:34.340Z"
+  },
+  {
+    "id": "cmp1mwzzm0001i8885k36uasz",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-11T20:08:45.875Z"
+  },
+  {
+    "id": "cmp1mx2n40003i888q9i2joqg",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-11T20:08:49.313Z"
+  },
+  {
+    "id": "cmp26cexl0001v0jgx0uy9dul",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-12T05:12:37.786Z"
+  },
+  {
+    "id": "cmp26chfn0003v0jg7hh1le8x",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-12T05:12:41.027Z"
+  },
+  {
+    "id": "cmp2vrez90001hd3ckpuwl2ct",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-12T17:04:08.085Z"
+  },
+  {
+    "id": "cmp2vrhk10003hd3c5cukeabw",
+    "conversationId": "cmp1jbfcc0000z6g3m5gxm4do",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main Estimates module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or in the estimate's options (⋮) menu.\n\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client info. Make any adjustments needed (due date, payment terms, etc.).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- The original estimate remains unchanged after conversion.\n- You can do **partial invoicing** if you only want to bill for certain line items.\n- The estimate status will update to reflect it has been invoiced.\n\nIf you don't see the **Convert to Invoice** option, double-check that the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-12T17:04:11.426Z"
+  },
+  {
+    "id": "cmp35ff190002cx2ixoox7h1f",
+    "conversationId": "cmp35feru0000cx2i8flos32m",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-12T21:34:44.446Z"
+  },
+  {
+    "id": "cmp35fk300004cx2i71xiep4o",
+    "conversationId": "cmp35feru0000cx2i8flos32m",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimates section** from the sidebar menu\n2. **Open the estimate** you want to convert by clicking on it\n3. **Click the \"Convert to Invoice\"** button (typically found in the top-right action menu or at the bottom of the estimate)\n4. Review the pre-populated invoice details (line items, amounts, and client info will carry over automatically)\n5. **Adjust any fields** if needed (due date, payment terms, deposit amount, etc.)\n6. **Save or Send** the invoice directly to your client\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified\n- You can do a **partial invoice** if you only want to bill for a portion of the estimate\n- Once converted, the invoice will appear in your **Invoices section** and be linked to the associated project\n\nIf you don't see the \"Convert to Invoice\" option, make sure the estimate is in an **Approved** status, as draft estimates may not be eligible for conversion.",
+    "createdAt": "2026-05-12T21:34:50.923Z"
+  },
+  {
+    "id": "cmp36g42g0002m8darq95rxo3",
+    "conversationId": "cmp36g3pi0000m8dah65xiu3g",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-12T22:03:16.504Z"
+  },
+  {
+    "id": "cmp36g9pp0004m8dagmu1wksp",
+    "conversationId": "cmp36g3pi0000m8dah65xiu3g",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project containing your estimate, or find it via the main Estimates page.\n2. **Open the Estimate** – Click on the estimate you want to convert.\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or at the bottom of the estimate detail view.\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client details. Make any necessary adjustments (due date, payment terms, etc.).\n5. **Save or Send** – Save the invoice as a draft or send it directly to the client.\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified.\n- You can do **partial invoicing** if you only want to bill for a portion of the estimate.\n- The estimate's status will update to reflect that an invoice has been created from it.\n\nIf you don't see the **Convert to Invoice** option, make sure the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-12T22:03:23.731Z"
+  },
+  {
+    "id": "cmp3pr5i00001mxe8uduhuols",
+    "conversationId": "cmp36g3pi0000m8dah65xiu3g",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T07:03:44.280Z"
+  },
+  {
+    "id": "cmp3pr7wd0003mxe87dgzmm3w",
+    "conversationId": "cmp36g3pi0000m8dah65xiu3g",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project containing your estimate, or find it via the main Estimates page.\n2. **Open the Estimate** – Click on the estimate you want to convert.\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or at the bottom of the estimate detail view.\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client details. Make any necessary adjustments (due date, payment terms, etc.).\n5. **Save or Send** – Save the invoice as a draft or send it directly to the client.\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified.\n- You can do **partial invoicing** if you only want to bill for a portion of the estimate.\n- The estimate's status will update to reflect that an invoice has been created from it.\n\nIf you don't see the **Convert to Invoice** option, make sure the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-13T07:03:47.390Z"
+  },
+  {
+    "id": "cmp3say8r0001ui8oaugizphx",
+    "conversationId": "cmp36g3pi0000m8dah65xiu3g",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T08:15:07.228Z"
+  },
+  {
+    "id": "cmp3sb11j0003ui8oqh2v8zjw",
+    "conversationId": "cmp36g3pi0000m8dah65xiu3g",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project containing your estimate, or find it via the main Estimates page.\n2. **Open the Estimate** – Click on the estimate you want to convert.\n3. **Select \"Convert to Invoice\"** – Look for the **Convert to Invoice** button, typically found in the top-right action menu or at the bottom of the estimate detail view.\n4. **Review & Edit** – The invoice will be pre-populated with the estimate's line items, amounts, and client details. Make any necessary adjustments (due date, payment terms, etc.).\n5. **Save or Send** – Save the invoice as a draft or send it directly to the client.\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified.\n- You can do **partial invoicing** if you only want to bill for a portion of the estimate.\n- The estimate's status will update to reflect that an invoice has been created from it.\n\nIf you don't see the **Convert to Invoice** option, make sure the estimate is in an **Approved** status, as drafts may not be eligible for conversion.",
+    "createdAt": "2026-05-13T08:15:10.856Z"
+  },
+  {
+    "id": "cmp3suoxi0002knj712cusrzj",
+    "conversationId": "cmp3suoku0000knj7n6gd22di",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T08:30:28.279Z"
+  },
+  {
+    "id": "cmp3suv7j0004knj76mqyowrj",
+    "conversationId": "cmp3suoku0000knj7n6gd22di",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it via the main Estimates page.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Use the \"Convert to Invoice\" option** – Look for a **\"Convert to Invoice\"** button or option in the top action menu (usually in the top-right corner of the estimate detail view).\n\n4. **Review the invoice details** – ProBuild will pre-populate the invoice with the line items, amounts, and client info from the estimate. Review and adjust as needed (e.g., due date, partial billing amounts).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- You can do a **partial invoice** if you only want to bill for a portion of the estimate.\n- The original estimate will be linked to the invoice for easy reference.\n- Check the estimate's **status** — it typically needs to be in an *Approved* state before converting.\n\nIf you're having trouble finding the \"Convert to Invoice\" button, make sure the estimate is fully saved and that you have the correct project permissions as an Admin.",
+    "createdAt": "2026-05-13T08:30:36.416Z"
+  },
+  {
+    "id": "cmp3tfajd0001ak1baz9faxdj",
+    "conversationId": "cmp3suoku0000knj7n6gd22di",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T08:46:29.401Z"
+  },
+  {
+    "id": "cmp3tfdfz0003ak1b7hcrz1l7",
+    "conversationId": "cmp3suoku0000knj7n6gd22di",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it via the main Estimates page.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Use the \"Convert to Invoice\" option** – Look for a **\"Convert to Invoice\"** button or option in the top action menu (usually in the top-right corner of the estimate detail view).\n\n4. **Review the invoice details** – ProBuild will pre-populate the invoice with the line items, amounts, and client info from the estimate. Review and adjust as needed (e.g., due date, partial billing amounts).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- You can do a **partial invoice** if you only want to bill for a portion of the estimate.\n- The original estimate will be linked to the invoice for easy reference.\n- Check the estimate's **status** — it typically needs to be in an *Approved* state before converting.\n\nIf you're having trouble finding the \"Convert to Invoice\" button, make sure the estimate is fully saved and that you have the correct project permissions as an Admin.",
+    "createdAt": "2026-05-13T08:46:33.168Z"
+  },
+  {
+    "id": "cmp3ti99m0001d30846fmi5rm",
+    "conversationId": "cmp3suoku0000knj7n6gd22di",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T08:48:47.722Z"
+  },
+  {
+    "id": "cmp3ticme0003d3084rdfdfz5",
+    "conversationId": "cmp3suoku0000knj7n6gd22di",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it via the main Estimates page.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Use the \"Convert to Invoice\" option** – Look for a **\"Convert to Invoice\"** button or option in the top action menu (usually in the top-right corner of the estimate detail view).\n\n4. **Review the invoice details** – ProBuild will pre-populate the invoice with the line items, amounts, and client info from the estimate. Review and adjust as needed (e.g., due date, partial billing amounts).\n\n5. **Save or Send** – Click **Save** to keep it as a draft, or **Send** to deliver it directly to your client.\n\n### Tips:\n- You can do a **partial invoice** if you only want to bill for a portion of the estimate.\n- The original estimate will be linked to the invoice for easy reference.\n- Check the estimate's **status** — it typically needs to be in an *Approved* state before converting.\n\nIf you're having trouble finding the \"Convert to Invoice\" button, make sure the estimate is fully saved and that you have the correct project permissions as an Admin.",
+    "createdAt": "2026-05-13T08:48:52.071Z"
+  },
+  {
+    "id": "cmp3v02ms0002qv1sl4buy02m",
+    "conversationId": "cmp3v029x0000qv1sozuyqyao",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T09:30:38.548Z"
+  },
+  {
+    "id": "cmp3v07qg0004qv1satukikzh",
+    "conversationId": "cmp3v029x0000qv1sozuyqyao",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimates section** from your sidebar menu\n2. **Open the estimate** you want to convert by clicking on it\n3. **Click the \"Convert to Invoice\"** button — typically found at the top right of the estimate detail view\n4. **Review the invoice details** — line items, amounts, and client info will be pre-populated from the estimate\n5. **Make any adjustments** needed (due date, payment terms, additional line items, etc.)\n6. **Save or Send** the invoice directly to your client\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified\n- You can partial-invoice an estimate if you only want to bill for completed work\n- Once converted, you can track payment status from the **Invoices** section\n\nIf you need to get there quickly, you can also go to **Invoices → New Invoice** and select an existing estimate as the source to pull in its data.",
+    "createdAt": "2026-05-13T09:30:45.069Z"
+  },
+  {
+    "id": "cmp3vmz6d00015ddhdvnkaa03",
+    "conversationId": "cmp3v029x0000qv1sozuyqyao",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T09:48:27.158Z"
+  },
+  {
+    "id": "cmp3vn1ix00035ddhsd38z0y0",
+    "conversationId": "cmp3v029x0000qv1sozuyqyao",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate in ProBuild\n\nHere's how to convert an estimate to an invoice:\n\n1. **Navigate to the Estimates section** from your sidebar menu\n2. **Open the estimate** you want to convert by clicking on it\n3. **Click the \"Convert to Invoice\"** button — typically found at the top right of the estimate detail view\n4. **Review the invoice details** — line items, amounts, and client info will be pre-populated from the estimate\n5. **Make any adjustments** needed (due date, payment terms, additional line items, etc.)\n6. **Save or Send** the invoice directly to your client\n\n### Tips:\n- The original estimate remains intact after conversion — it won't be deleted or modified\n- You can partial-invoice an estimate if you only want to bill for completed work\n- Once converted, you can track payment status from the **Invoices** section\n\nIf you need to get there quickly, you can also go to **Invoices → New Invoice** and select an existing estimate as the source to pull in its data.",
+    "createdAt": "2026-05-13T09:48:30.201Z"
+  },
+  {
+    "id": "cmp3x4ba60002b1tvuyjsys62",
+    "conversationId": "cmp3x4axg0000b1tv858q0v4r",
+    "role": "user",
+    "content": "How do I create an invoice from an estimate?",
+    "createdAt": "2026-05-13T10:29:55.614Z"
+  },
+  {
+    "id": "cmp3x4h190004b1tv70xj7wih",
+    "conversationId": "cmp3x4axg0000b1tv858q0v4r",
+    "role": "assistant",
+    "content": "## Creating an Invoice from an Estimate\n\nHere's how to convert an estimate to an invoice in ProBuild:\n\n1. **Navigate to the Estimates section** – Go to the project where your estimate lives, or find it under the main **Estimates** module.\n\n2. **Open the Estimate** – Click on the estimate you want to convert.\n\n3. **Use the \"Convert to Invoice\" option** – Look for a **Convert to Invoice** button or option in the top action bar or the dropdown menu (⋮) on the estimate.\n\n4. **Review the invoice details** – ProBuild will pre-populate the invoice with the estimate's line items, amounts, and client info. Make any adjustments needed (e.g., partial billing, due date).\n\n5. **Save or Send** – Click **Save** to store the invoice, or **Send** to deliver it directly to your client via email.\n\n### Tips:\n- You can do **partial invoicing** if you don't want to bill the full estimate amount at once.\n- The original estimate will be **linked** to the invoice for easy reference.\n- Invoice status will be trackable under the **Invoices** section of the project.\n\nLet me know if you need help with anything else!",
+    "createdAt": "2026-05-13T10:30:03.069Z"
+  }
+]

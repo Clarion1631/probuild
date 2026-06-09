@@ -16,7 +16,7 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
             id: true,
             name: true,
             client: { select: { id: true, name: true, email: true, primaryPhone: true } },
-            estimates: { select: { id: true, code: true, title: true, status: true } },
+            estimates: { where: { deletedAt: null }, select: { id: true, code: true, title: true, status: true } },
         },
     });
 

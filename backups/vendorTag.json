@@ -1,0 +1,44 @@
+[
+  {
+    "id": "cmnfkkyew0000jdn5syy5kjuv",
+    "name": "Plumbing",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.520Z"
+  },
+  {
+    "id": "cmnfkkyir0002jdn5i93a7uuo",
+    "name": "HVAC",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.659Z"
+  },
+  {
+    "id": "cmnfkkyjw0003jdn5m5q97rnm",
+    "name": "Framing",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.700Z"
+  },
+  {
+    "id": "cmnfkkykw0004jdn5djiity36",
+    "name": "General",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.736Z"
+  },
+  {
+    "id": "cmnfkkyn00006jdn5fo40xk67",
+    "name": "Painting",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.812Z"
+  },
+  {
+    "id": "cmnfkkyly0005jdn5ah2cobaf",
+    "name": "Drywall",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.774Z"
+  },
+  {
+    "id": "cmnfkkyhc0001jdn5h31e03to",
+    "name": "Electrical",
+    "color": null,
+    "createdAt": "2026-04-01T04:52:46.608Z"
+  }
+]

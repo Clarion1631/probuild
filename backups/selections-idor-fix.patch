@@ -1,0 +1,36 @@
+﻿diff --git a/src/app/portal/projects/[id]/selections/page.tsx b/src/app/portal/projects/[id]/selections/page.tsx
+index ca74d9e..34087bc 100644
+--- a/src/app/portal/projects/[id]/selections/page.tsx
++++ b/src/app/portal/projects/[id]/selections/page.tsx
+@@ -3,14 +3,30 @@ import { authOptions } from "@/lib/auth";
+ import { prisma } from "@/lib/prisma";
+ import { notFound } from "next/navigation";
+ import { getSelectionBoardsForPortal, getPortalVisibility } from "@/lib/actions";
++import { resolveSessionClientId } from "@/lib/portal-auth";
+ import Link from "next/link";
+ import PortalSelectionsClient from "./PortalSelectionsClient";
+ 
+ export default async function PortalSelectionsPage(props: { params: Promise<{ id: string }> }) {
+     const { id } = await props.params;
+ 
++    // Scope the project lookup by ownership: staff (ADMIN/MANAGER) preview any
++    // project; clients only their own. Prevents an IDOR where any portal viewer
++    // could read another project's selection boards by guessing the project id.
++    const staffSession = await getServerSession(authOptions);
++    const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
++
++    let projectWhere: any;
++    if (isStaff) {
++        projectWhere = { id };
++    } else {
++        const sessionClientId = await resolveSessionClientId();
++        if (!sessionClientId) return notFound();
++        projectWhere = { id, clientId: sessionClientId };
++    }
++
+     const project = await prisma.project.findFirst({
+-        where: { id },
++        where: projectWhere,
+         include: { client: true },
+     });
+ 

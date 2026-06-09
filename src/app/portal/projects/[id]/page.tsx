@@ -42,7 +42,7 @@ export default async function PortalProjectDetail(props: {
         include: {
             client: true,
             estimates: {
-                where: { privacy: 'Shared', status: { not: 'Draft' } },
+                where: { privacy: 'Shared', status: { not: 'Draft' }, deletedAt: null },
                 orderBy: { createdAt: 'desc' },
                 select: {
                     id: true, number: true, title: true, code: true, status: true,

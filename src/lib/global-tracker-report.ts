@@ -32,7 +32,7 @@ export async function queryGlobalTrackerData(filters: GlobalTrackerFilters) {
         orderBy: { createdAt: "desc" },
         include: {
             client: { select: { id: true, name: true } },
-            estimates: { select: { totalAmount: true, status: true } },
+            estimates: { where: { deletedAt: null }, select: { totalAmount: true, status: true } },
             invoices: { select: { totalAmount: true, balanceDue: true, status: true } },
             scheduleTasks: { select: { id: true, status: true } },
             dailyLogs: { select: { createdAt: true } },

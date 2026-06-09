@@ -58,6 +58,13 @@ model Client {
 
   internalNotes String?
 
+  qbCustomerId String?
+
+  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
+  deletedAt     DateTime?
+  deletedById   String?
+  deleteBatchId String? // groups one cascade so restore reverses exactly that batch
+
   projects       Project[]
   leads          Lead[]
   invoices       Invoice[]
@@ -66,6 +73,7 @@ model Client {
 
   @@index([primaryPhoneE164])
   @@index([additionalPhoneE164])
+  @@index([deletedAt])
 }
 
 model Lead {
@@ -109,9 +117,15 @@ model Lead {
   message        String? // Initial inquiry message from the client
   project        Project? // reverse relation: the project created from this lead
 
+  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
+  deletedAt     DateTime?
+  deletedById   String?
+  deleteBatchId String? // groups one cascade so restore reverses exactly that batch
+
   @@index([createdAt])
   @@index([clientId])
   @@index([stage])
+  @@index([deletedAt])
 }
 
 model LeadNote {
@@ -203,10 +217,19 @@ model Project {
   teamMessages        TeamMessage[]
   activityLogs        ActivityLog[]
 
+  qbProjectId         String?
+  qbSyncedAt          DateTime?
+
+  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
+  deletedAt     DateTime?
+  deletedById   String?
+  deleteBatchId String? // groups one cascade so restore reverses exactly that batch
+
   @@index([viewedAt])
   @@index([clientId])
   @@index([status])
   @@index([createdAt])
+  @@index([deletedAt])
 }
 
 model RoomDesign {
@@ -307,10 +330,19 @@ model Estimate {
   changeOrders       ChangeOrder[]
   files              EstimateFile[]
 
+  qbEstimateId       String?
+  qbSyncedAt         DateTime?
+
+  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
+  deletedAt     DateTime?
+  deletedById   String?
+  deleteBatchId String? // groups one cascade so restore reverses exactly that batch
+
   @@index([createdAt])
   @@index([projectId])
   @@index([leadId])
   @@index([status])
+  @@index([deletedAt])
 }
 
 model EstimateFile {
@@ -344,7 +376,12 @@ model EstimatePaymentSchedule {
   paidAt                DateTime?
   paymentDate           DateTime?
 
+  // Soft delete (cascade-soft-deleted with parent Estimate — see SOFT_DELETE.md).
+  deletedAt     DateTime?
+  deleteBatchId String?
+
   @@index([estimateId])
+  @@index([deletedAt])
 }
 
 model EstimateItem {
@@ -379,8 +416,13 @@ model EstimateItem {
   scheduleTask   ScheduleTask?
   createdAt      DateTime       @default(now())
 
+  // Soft delete (cascade-soft-deleted with parent Estimate — see SOFT_DELETE.md).
+  deletedAt     DateTime?
+  deleteBatchId String?
+
   @@index([estimateId])
   @@index([purchaseOrderId])
+  @@index([deletedAt])
 }
 
 model Expense {
@@ -427,6 +469,9 @@ model Invoice {
   sentAt      DateTime?
   viewedAt    DateTime?
   createdAt   DateTime  @default(now())
+
+  qbInvoiceId String?
+  qbSyncedAt  DateTime?
 
   payments PaymentSchedule[]
 
@@ -547,6 +592,9 @@ model TimeEntry {
 
   // Invoice linkage — set when pulled into a cost-plus invoice
   invoicedAt DateTime?
+
+  qbTimeActivityId String?
+  qbSyncedAt       DateTime?
 
   @@index([projectId])
   @@index([userId])
@@ -1527,4 +1575,22 @@ model StripeEvent {
   createdAt   DateTime  @default(now())
 
   @@index([status])
+}
+
+/// Append-only audit trail for the customer-data recovery net (see SOFT_DELETE.md).
+/// On DELETE the `snapshot` captures the full row (and cascaded children) so the
+/// record is recoverable even after a later hard purge.
+model AuditLog {
+  id         String   @id @default(cuid())
+  entity     String // Model name, e.g. "Client", "Lead", "Project", "Estimate"
+  entityId   String // Primary key of the affected row
+  action     String // CREATE | UPDATE | DELETE | RESTORE
+  actorId    String? // User.id of the actor (null for dev/system actions)
+  actorEmail String? // Denormalized actor email so the log reads without a join
+  snapshot   Json? // Full row state (+ cascaded children) — captured on DELETE
+  createdAt  DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([action])
+  @@index([createdAt])
 }

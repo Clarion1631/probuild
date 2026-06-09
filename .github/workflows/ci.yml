@@ -73,8 +73,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DIRECT_URL: ${{ secrets.DIRECT_URL }}
+      # E2E seeds/mutates data, so it MUST point at a dedicated non-prod (Supabase branch/test)
+      # database — never the prod DATABASE_URL secret. Configure TEST_DATABASE_URL / TEST_DIRECT_URL
+      # in repo secrets (Settings → Secrets → Actions). src/lib/db-guard.ts hard-fails the run if
+      # these ever resolve to the prod project ref, so a missing/misconfigured secret fails closed.
+      DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+      DIRECT_URL: ${{ secrets.TEST_DIRECT_URL }}
       NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
       NEXTAUTH_URL: http://localhost:3000
       NEXT_PUBLIC_APP_URL: http://localhost:3000

@@ -126,7 +126,7 @@ export async function POST(request: Request) {
             where: { id: leadId },
             include: {
                 client: true,
-                estimates: { select: { id: true, code: true, title: true, status: true } },
+                estimates: { where: { deletedAt: null }, select: { id: true, code: true, title: true, status: true } },
             },
         });
         if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
@@ -140,7 +140,7 @@ export async function POST(request: Request) {
             where: { id: projectId! },
             include: {
                 client: true,
-                estimates: { select: { id: true, code: true, title: true, status: true } },
+                estimates: { where: { deletedAt: null }, select: { id: true, code: true, title: true, status: true } },
             },
         });
         if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });

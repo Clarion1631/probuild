@@ -1,7 +1,9 @@
 import { PrismaClient } from '@prisma/client';
+import { softDeleteExtension } from './prisma-soft-delete-extension';
 
 const globalForPrisma = globalThis as unknown as {
-    prisma: PrismaClient | undefined
+    prismaBase: PrismaClient | undefined
+    prismaExtended: PrismaClient | undefined
 }
 
 function buildPrismaClient(): PrismaClient {
@@ -31,17 +33,42 @@ function buildPrismaClient(): PrismaClient {
     });
 }
 
-// Lazy singleton: only create PrismaClient when it's actually used at runtime,
+// Lazy singletons: only create the PrismaClient when it's actually used at runtime,
 // not when the module is evaluated during Vercel's static page collection.
-function getPrismaClient(): PrismaClient {
-    if (!globalForPrisma.prisma) {
-        globalForPrisma.prisma = buildPrismaClient();
+function getBaseClient(): PrismaClient {
+    if (!globalForPrisma.prismaBase) {
+        globalForPrisma.prismaBase = buildPrismaClient();
     }
-    return globalForPrisma.prisma;
+    return globalForPrisma.prismaBase;
 }
 
+function getExtendedClient(): PrismaClient {
+    if (!globalForPrisma.prismaExtended) {
+        // $extends shares the underlying engine/connection with the base client.
+        globalForPrisma.prismaExtended = getBaseClient().$extends(
+            softDeleteExtension
+        ) as unknown as PrismaClient;
+    }
+    return globalForPrisma.prismaExtended;
+}
+
+/**
+ * Default client — auto-hides soft-deleted rows (deletedAt != null) on the covered
+ * models via the soft-delete extension. Use this everywhere for normal reads/writes.
+ */
 export const prisma = new Proxy({} as PrismaClient, {
     get(_target, prop) {
-        return (getPrismaClient() as any)[prop];
+        return (getExtendedClient() as any)[prop];
+    }
+});
+
+/**
+ * ESCAPE HATCH — the un-extended client. Reads here are NOT filtered, so it can see
+ * soft-deleted rows. Use ONLY for the soft-delete/restore actions and the admin
+ * Trash/Audit UI (see src/lib/soft-delete.ts). Do not use for normal app reads.
+ */
+export const prismaBase = new Proxy({} as PrismaClient, {
+    get(_target, prop) {
+        return (getBaseClient() as any)[prop];
     }
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { toast } from "sonner";
 import Link from "next/link";
 
@@ -28,6 +28,41 @@ export default function QuickBooksClient({
     const [mappings, setMappings] = useState<Record<string, string>>(initialMappings);
     const [saving, setSaving] = useState(false);
 
+    const [employees, setEmployees] = useState<Array<{ id: string; name: string }>>([]);
+    const [users, setUsers] = useState<Array<{ id: string; name: string | null; email: string }>>([]);
+    const [empMappings, setEmpMappings] = useState<Record<string, string>>({});
+    const [loadingEmployees, setLoadingEmployees] = useState(false);
+    const [savingEmployees, setSavingEmployees] = useState(false);
+
+    useEffect(() => {
+        if (!isConnected) return;
+        
+        async function fetchWorkersAndMappings() {
+            setLoadingEmployees(true);
+            try {
+                const [workersRes, mappingsRes] = await Promise.all([
+                    fetch("/api/quickbooks/employees"),
+                    fetch("/api/quickbooks/employee-mappings")
+                ]);
+
+                if (workersRes.ok && mappingsRes.ok) {
+                    const workersData = await workersRes.json();
+                    const mappingsData = await mappingsRes.json();
+                    
+                    setEmployees(workersData.workers || []);
+                    setUsers(mappingsData.users || []);
+                    setEmpMappings(mappingsData.employeeMappings || {});
+                }
+            } catch (err) {
+                console.error("Failed to load worker mappings", err);
+            } finally {
+                setLoadingEmployees(false);
+            }
+        }
+
+        fetchWorkersAndMappings();
+    }, [isConnected]);
+
     async function handleSaveMappings() {
         setSaving(true);
         try {
@@ -42,6 +77,23 @@ export default function QuickBooksClient({
             toast.error("Failed to save mappings");
         } finally {
             setSaving(false);
+        }
+    }
+
+    async function handleSaveEmployees() {
+        setSavingEmployees(true);
+        try {
+            const res = await fetch("/api/quickbooks/employee-mappings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ employeeMappings: empMappings }),
+            });
+            if (!res.ok) throw new Error("Failed to save");
+            toast.success("Employee mappings saved");
+        } catch {
+            toast.error("Failed to save employee mappings");
+        } finally {
+            setSavingEmployees(false);
         }
     }
 
@@ -172,6 +224,64 @@ export default function QuickBooksClient({
                     <p className="text-xs text-hui-textMuted mt-2">Connect to QuickBooks before saving mappings.</p>
                 )}
             </div>
+
+            {/* Employee Mapping Card */}
+            {isConnected && (
+                <div className="hui-card p-5">
+                    <div className="mb-4">
+                        <h2 className="font-semibold text-hui-textMain text-sm">Employee / Subcontractor Mapping</h2>
+                        <p className="text-xs text-hui-textMuted mt-1">
+                            Map each ProBuild team member to a QuickBooks Employee or Vendor to enable Time Tracking sync.
+                        </p>
+                    </div>
+
+                    {loadingEmployees ? (
+                        <div className="text-sm text-hui-textMuted py-4 text-center">Loading workers...</div>
+                    ) : (
+                        <div className="space-y-4">
+                            <div className="grid grid-cols-2 gap-3 text-[10px] font-semibold uppercase tracking-widest text-hui-textMuted px-1">
+                                <span>ProBuild User</span>
+                                <span>QuickBooks Employee / Vendor</span>
+                            </div>
+
+                            {users.length === 0 && (
+                                <p className="text-sm text-hui-textMuted py-2 text-center">No active users found.</p>
+                            )}
+
+                            {users.map((u) => (
+                                <div key={u.id} className="grid grid-cols-2 gap-3 items-center">
+                                    <div className="text-sm text-hui-textMain">
+                                        <div className="font-medium">{u.name || "Unnamed"}</div>
+                                        <div className="text-[10px] text-hui-textMuted font-mono">{u.email}</div>
+                                    </div>
+                                    <select
+                                        className="hui-input text-sm"
+                                        value={empMappings[u.id] || ""}
+                                        onChange={(e) => setEmpMappings(prev => ({ ...prev, [u.id]: e.target.value }))}
+                                    >
+                                        <option value="">-- Unmapped --</option>
+                                        {employees.map((emp) => (
+                                            <option key={emp.id} value={emp.id}>
+                                                {emp.name}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+                            ))}
+
+                            <div className="pt-2">
+                                <button
+                                    onClick={handleSaveEmployees}
+                                    disabled={savingEmployees}
+                                    className="hui-btn text-sm"
+                                >
+                                    {savingEmployees ? "Saving…" : "Save Employee Mappings"}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* How it works */}
             <div className="hui-card p-5">

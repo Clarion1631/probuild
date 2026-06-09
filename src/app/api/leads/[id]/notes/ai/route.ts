@@ -19,7 +19,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
             where: { id: leadId },
             include: {
                 client: true,
-                estimates: { select: { title: true, totalAmount: true, status: true } },
+                estimates: { where: { deletedAt: null }, select: { title: true, totalAmount: true, status: true } },
                 meetings: { select: { title: true, scheduledAt: true, status: true } },
                 clientMessages: {
                     // Exclude SYSTEM activity banners — they'd show up as

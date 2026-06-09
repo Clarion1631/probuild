@@ -1,0 +1,539 @@
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 446c91a..e284990 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -58,6 +58,10 @@ model Client {
+ 
+   internalNotes String?
+ 
++  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
++  deletedAt   DateTime?
++  deletedById String?
++
+   projects       Project[]
+   leads          Lead[]
+   invoices       Invoice[]
+@@ -66,6 +70,7 @@ model Client {
+ 
+   @@index([primaryPhoneE164])
+   @@index([additionalPhoneE164])
++  @@index([deletedAt])
+ }
+ 
+ model Lead {
+@@ -109,9 +114,14 @@ model Lead {
+   message        String? // Initial inquiry message from the client
+   project        Project? // reverse relation: the project created from this lead
+ 
++  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
++  deletedAt   DateTime?
++  deletedById String?
++
+   @@index([createdAt])
+   @@index([clientId])
+   @@index([stage])
++  @@index([deletedAt])
+ }
+ 
+ model LeadNote {
+@@ -203,10 +213,15 @@ model Project {
+   teamMessages        TeamMessage[]
+   activityLogs        ActivityLog[]
+ 
++  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
++  deletedAt   DateTime?
++  deletedById String?
++
+   @@index([viewedAt])
+   @@index([clientId])
+   @@index([status])
+   @@index([createdAt])
++  @@index([deletedAt])
+ }
+ 
+ model RoomDesign {
+@@ -307,10 +322,15 @@ model Estimate {
+   changeOrders       ChangeOrder[]
+   files              EstimateFile[]
+ 
++  // Soft delete (recovery net — see SOFT_DELETE.md). Set instead of hard-deleting.
++  deletedAt   DateTime?
++  deletedById String?
++
+   @@index([createdAt])
+   @@index([projectId])
+   @@index([leadId])
+   @@index([status])
++  @@index([deletedAt])
+ }
+ 
+ model EstimateFile {
+@@ -344,7 +364,11 @@ model EstimatePaymentSchedule {
+   paidAt                DateTime?
+   paymentDate           DateTime?
+ 
++  // Soft delete (cascade-soft-deleted with parent Estimate — see SOFT_DELETE.md).
++  deletedAt DateTime?
++
+   @@index([estimateId])
++  @@index([deletedAt])
+ }
+ 
+ model EstimateItem {
+@@ -379,8 +403,12 @@ model EstimateItem {
+   scheduleTask   ScheduleTask?
+   createdAt      DateTime       @default(now())
+ 
++  // Soft delete (cascade-soft-deleted with parent Estimate — see SOFT_DELETE.md).
++  deletedAt DateTime?
++
+   @@index([estimateId])
+   @@index([purchaseOrderId])
++  @@index([deletedAt])
+ }
+ 
+ model Expense {
+@@ -1510,21 +1538,39 @@ model ActivityLog {
+ 
+   @@index([projectId, createdAt])
+ }
+-
+-model Integration {
+-  id        String   @id
+-  settings  String
+-  updatedAt DateTime @updatedAt
+-}
+-
+-model StripeEvent {
+-  id          String    @id
+-  type        String
+-  payload     String
+-  status      String    @default("PENDING")
+-  error       String?
+-  processedAt DateTime?
+-  createdAt   DateTime  @default(now())
+-
+-  @@index([status])
++
++model Integration {
++  id        String   @id
++  settings  String
++  updatedAt DateTime @updatedAt
++}
++
++model StripeEvent {
++  id          String    @id
++  type        String
++  payload     String
++  status      String    @default("PENDING")
++  error       String?
++  processedAt DateTime?
++  createdAt   DateTime  @default(now())
++
++  @@index([status])
++}
++
++/// Append-only audit trail for the customer-data recovery net (see SOFT_DELETE.md).
++/// On DELETE the `snapshot` captures the full row (and cascaded children) so the
++/// record is recoverable even after a later hard purge.
++model AuditLog {
++  id         String   @id @default(cuid())
++  entity     String // Model name, e.g. "Client", "Lead", "Project", "Estimate"
++  entityId   String // Primary key of the affected row
++  action     String // CREATE | UPDATE | DELETE | RESTORE
++  actorId    String? // User.id of the actor (null for dev/system actions)
++  actorEmail String? // Denormalized actor email so the log reads without a join
++  snapshot   Json? // Full row state (+ cascaded children) — captured on DELETE
++  createdAt  DateTime @default(now())
++
++  @@index([entity, entityId])
++  @@index([action])
++  @@index([createdAt])
+ }
+diff --git a/src/app/api/clients/[id]/route.ts b/src/app/api/clients/[id]/route.ts
+index 6ed90e2..fe44ba5 100644
+--- a/src/app/api/clients/[id]/route.ts
++++ b/src/app/api/clients/[id]/route.ts
+@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
+ import { getServerSession } from "next-auth/next";
+ import { authOptions } from "@/lib/auth";
+ import { normalizeE164 } from "@/lib/phone";
++import { softDeleteClient } from "@/lib/soft-delete";
++import { getAuditActor, recordAuditSafe } from "@/lib/audit";
+ export const dynamic = 'force-dynamic';
+ 
+ async function requireManagerSession() {
+@@ -56,6 +58,7 @@ export async function PUT(
+             data: updateData,
+         });
+ 
++        await recordAuditSafe({ entity: "Client", entityId: client.id, action: "UPDATE", snapshot: client });
+         return NextResponse.json(client);
+     } catch (error) {
+         console.error("Error updating client:", error);
+@@ -76,9 +79,12 @@ export async function DELETE(
+             return NextResponse.json({ error: "Client ID is required" }, { status: 400 });
+         }
+ 
+-        await prisma.client.delete({
+-            where: { id },
+-        });
++        // SOFT DELETE (recovery net — see SOFT_DELETE.md): cascade soft-delete the
++        // client and ALL its leads + projects + estimates, capturing a full snapshot
++        // in the audit log. Cascading both leads and projects keeps the
++        // "every project has a lead" invariant intact (no live lead-less project).
++        const actor = await getAuditActor();
++        await softDeleteClient(id, actor);
+ 
+         return NextResponse.json({ success: true });
+     } catch (error) {
+diff --git a/src/app/settings/layout.tsx b/src/app/settings/layout.tsx
+index 2d1b170..aa4b07a 100644
+--- a/src/app/settings/layout.tsx
++++ b/src/app/settings/layout.tsx
+@@ -55,6 +55,14 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
+                             {navLink("/settings/cost-codes", "Cost Codes")}
+                         </ul>
+                     </div>
++
++                    {/* Admin (page itself is ADMIN-gated) */}
++                    <div>
++                        <p className="text-[10px] font-semibold uppercase tracking-widest text-hui-textMuted mb-1.5 px-3">Admin</p>
++                        <ul className="space-y-0.5">
++                            {navLink("/settings/data-recovery", "Data Recovery")}
++                        </ul>
++                    </div>
+                 </div>
+             </aside>
+             {/* Content */}
+diff --git a/src/lib/actions.ts b/src/lib/actions.ts
+index e98de8d..8d02d50 100644
+--- a/src/lib/actions.ts
++++ b/src/lib/actions.ts
+@@ -1,7 +1,20 @@
+ "use server";
+ 
+ import { getServerSession } from "next-auth";
+-import { prisma } from "./prisma";
++import { prisma, prismaBase } from "./prisma";
++import {
++    softDeleteEstimate as softDeleteEstimateCascade,
++    softDeleteLead as softDeleteLeadCascade,
++    softDeleteProject as softDeleteProjectCascade,
++    softDeleteClient as softDeleteClientCascade,
++    restoreEstimateRecord,
++    restoreLeadRecord,
++    restoreProjectRecord,
++    restoreClientRecord,
++    listTrash,
++    listAuditLog,
++} from "./soft-delete";
++import { getAuditActor, recordAuditSafe } from "./audit";
+ import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
+ import { cache } from "react";
+ import { authOptions, getSessionOrDev } from "./auth";
+@@ -39,6 +52,9 @@ function buildCc(primaryEmail: string, additionalEmail?: string | null): string[
+ // Remove this wrapper once the DB Push workflow succeeds and the Estimate table
+ // has: processingFeeMarkup, hideProcessingFee, expirationDate, archivedAt.
+ const safeEstimateInclude = {
++    // Soft-delete: hide trashed estimates from every nested estimates include
++    // (Prisma extensions don't filter nested reads — see SOFT_DELETE.md).
++    where: { deletedAt: null },
+     select: {
+         id: true,
+         number: true,
+@@ -257,6 +273,7 @@ export async function createLead(data: { name: string; clientName: string; clien
+         },
+     });
+ 
++    await recordAuditSafe({ entity: "Lead", entityId: lead.id, action: "CREATE", snapshot: lead });
+     revalidatePath("/leads");
+ 
+     try {
+@@ -296,25 +313,25 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
+ }
+ 
+ export async function deleteLead(id: string) {
+-    // Prevent deletion of leads that have a linked project — checking the FK directly is
+-    // authoritative. Previously this only checked stage === "Won", but any stage can be
+-    // linked to a project, and with unlink removed there is no recovery path from a
+-    // Postgres FK constraint violation.
+-    const linked = await prisma.project.findUnique({ where: { leadId: id }, select: { id: true } });
++    // SOFT DELETE (recovery net — see SOFT_DELETE.md). Sets deletedAt instead of
++    // hard-deleting, and cascade soft-deletes the lead's estimates (+ their items
++    // and payment schedules). Contracts are left intact (out of scope, and the lead
++    // row still exists so their FK stays valid).
++    //
++    // Block if ANY project links to this lead — live OR soft-deleted. We use
++    // prismaBase so a trashed project still counts: restoring that project must
++    // never find its lead missing (project_every_project_has_lead invariant).
++    const linked = await prismaBase.project.findUnique({ where: { leadId: id }, select: { id: true } });
+     if (linked) {
+         throw new Error("Cannot delete a lead that has a linked project. Archive it instead.");
+     }
+-    const lead = await prisma.lead.findUnique({ where: { id }, select: { stage: true } });
+-    if (lead?.stage === "Won") {
++    const lead = await prismaBase.lead.findUnique({ where: { id }, select: { stage: true, deletedAt: true } });
++    if (!lead || lead.deletedAt) return; // already gone or already trashed
++    if (lead.stage === "Won") {
+         throw new Error("Cannot delete a converted lead. Archive it instead.");
+     }
+-    // Contract.lead FK is onDelete:SetNull — explicitly delete lead-only contracts to
+-    // avoid orphaning rows with both leadId=null and projectId=null after the lead is gone.
+-    // (Leads with a linked project are already blocked above, so all contracts here have projectId=null.)
+-    await prisma.contract.deleteMany({ where: { leadId: id, projectId: null } });
+-    await prisma.lead.delete({
+-        where: { id }
+-    });
++    const actor = await getAuditActor();
++    await softDeleteLeadCascade(id, actor);
+     revalidatePath(`/leads`);
+ }
+ 
+@@ -457,9 +474,10 @@ export async function getClients() {
+         orderBy: { name: "asc" },
+         include: {
+             projects: {
++                where: { deletedAt: null },
+                 include: { estimates: safeEstimateInclude }
+             },
+-            leads: true
++            leads: { where: { deletedAt: null } }
+         }
+     });
+     return JSON.parse(JSON.stringify(clients));
+@@ -469,8 +487,8 @@ export async function getClient(id: string) {
+     return await prisma.client.findUnique({
+         where: { id },
+         include: {
+-            projects: true,
+-            leads: true,
++            projects: { where: { deletedAt: null } },
++            leads: { where: { deletedAt: null } },
+             invoices: true,
+         }
+     });
+@@ -500,6 +518,7 @@ export async function createClient(data: { name: string; email?: string; company
+             internalNotes: data.internalNotes || null,
+         },
+     });
++    await recordAuditSafe({ entity: "Client", entityId: client.id, action: "CREATE", snapshot: client });
+     revalidatePath("/clients");
+     return client;
+ }
+@@ -774,7 +793,7 @@ export async function getProjects() {
+         orderBy: { viewedAt: "desc" },
+         include: {
+             client: true,
+-            estimates: { select: { totalAmount: true, status: true } },
++            estimates: { where: { deletedAt: null }, select: { totalAmount: true, status: true } },
+         },
+     });
+     return JSON.parse(JSON.stringify(projects.map((p: any) => ({
+@@ -786,6 +805,7 @@ export const getProject = cache(async function getProject(id: string) {
+     const include = {
+         client: true,
+         estimates: {
++            where: { deletedAt: null },
+             select: {
+                 id: true,
+                 number: true,
+@@ -970,6 +990,7 @@ export async function createProject(data: {
+         await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
+     }
+ 
++    await recordAuditSafe({ entity: "Project", entityId: projectId, action: "CREATE", snapshot: { id: projectId, leadId: lead.id, clientId, name: data.name.trim() } });
+     revalidatePath("/projects");
+     revalidatePath("/leads");
+     return { id: projectId };
+@@ -3397,17 +3418,12 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
+         };
+     }
+ 
+-    // Delete related Budget
+-    const budget = await prisma.budget.findUnique({ where: { estimateId } });
+-    if (budget) {
+-        await prisma.budget.delete({ where: { id: budget.id } });
+-    }
+-
+-    // Delete related items, schedules, expenses, and the estimate itself
+-    await prisma.estimateItem.deleteMany({ where: { estimateId } });
+-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+-    await prisma.expense.deleteMany({ where: { estimateId } });
+-    await prisma.estimate.delete({ where: { id: estimateId } });
++    // SOFT DELETE (recovery net — see SOFT_DELETE.md): mark the estimate + its items
++    // and payment schedules as deleted and capture a full snapshot in the audit log.
++    // Budget/Expenses are left intact (out of scope, reversible); the guards above
++    // already ensure no expenses or time entries are attached.
++    const actor = await getAuditActor();
++    await softDeleteEstimateCascade(estimateId, actor);
+ 
+     if (estimate.projectId) {
+         revalidatePath(`/projects/${estimate.projectId}/estimates`);
+@@ -5528,9 +5544,14 @@ export async function updateProjectLocation(projectId: string, location: string)
+ }
+ 
+ export async function deleteProjects(projectIds: string[]) {
+-    await prisma.project.deleteMany({
+-        where: { id: { in: projectIds } }
+-    });
++    // SOFT DELETE (recovery net — see SOFT_DELETE.md): mark each project as deleted
++    // and cascade soft-delete its estimates (+ items/payment schedules), capturing a
++    // full snapshot per project in the audit log. The linked Lead is intentionally
++    // left live — a lead may exist without a project.
++    const actor = await getAuditActor();
++    for (const id of projectIds) {
++        await softDeleteProjectCascade(id, actor);
++    }
+     revalidatePath(`/projects`);
+     return { success: true };
+ }
+@@ -7851,4 +7872,84 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
+     return item;
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════════
++// Soft-delete recovery: admin Trash / Audit actions (see SOFT_DELETE.md)
++// ════════════════════════════════════════════════════════════════════════════
++
++/** Resolve the actor and require ADMIN. Throws "Forbidden" otherwise. */
++async function requireAdminActor(): Promise<{ id: string | null; email: string | null }> {
++    const session = await getSessionOrDev();
++    const email = session?.user?.email ?? null;
++    let role = (session?.user as any)?.role as string | undefined;
++    if (!role && email) {
++        const u = await prisma.user.findUnique({ where: { email }, select: { role: true } });
++        role = u?.role;
++    }
++    if (role !== "ADMIN") {
++        throw new Error("Forbidden: admin only");
++    }
++    return { id: (session?.user as any)?.id ?? null, email };
++}
++
++function revalidateAfterRestore(extra: string) {
++    revalidatePath("/settings/data-recovery");
++    revalidatePath(extra);
++}
++
++export async function restoreClient(id: string) {
++    const actor = await requireAdminActor();
++    await restoreClientRecord(id, actor);
++    revalidateAfterRestore("/clients");
++    return { success: true };
++}
++
++export async function restoreLead(id: string) {
++    const actor = await requireAdminActor();
++    await restoreLeadRecord(id, actor);
++    revalidateAfterRestore("/leads");
++    return { success: true };
++}
++
++export async function restoreProject(id: string) {
++    const actor = await requireAdminActor();
++    await restoreProjectRecord(id, actor);
++    revalidateAfterRestore("/projects");
++    return { success: true };
++}
++
++export async function restoreEstimate(id: string) {
++    const actor = await requireAdminActor();
++    await restoreEstimateRecord(id, actor);
++    revalidateAfterRestore("/estimates");
++    return { success: true };
++}
++
++/** Unified restore dispatcher used by the admin Trash UI. */
++export async function restoreTrashItem(entity: string, id: string): Promise<{ success: boolean; error?: string }> {
++    try {
++        switch (entity) {
++            case "Client": await restoreClient(id); break;
++            case "Lead": await restoreLead(id); break;
++            case "Project": await restoreProject(id); break;
++            case "Estimate": await restoreEstimate(id); break;
++            default: return { success: false, error: `Unknown entity: ${entity}` };
++        }
++        return { success: true };
++    } catch (e: any) {
++        return { success: false, error: e?.message ?? "Restore failed" };
++    }
++}
++
++/** Admin-only: list top-level soft-deleted records for the Trash view. */
++export async function getTrashItems() {
++    await requireAdminActor();
++    return listTrash();
++}
++
++/** Admin-only: list recent audit-log entries (who/what/when). */
++export async function getAuditLogEntries(limit = 200) {
++    await requireAdminActor();
++    return listAuditLog(limit);
++}
++
+ 
+diff --git a/src/lib/prisma.ts b/src/lib/prisma.ts
+index e8d166d..d5eaef5 100644
+--- a/src/lib/prisma.ts
++++ b/src/lib/prisma.ts
+@@ -1,7 +1,9 @@
+ import { PrismaClient } from '@prisma/client';
++import { softDeleteExtension } from './prisma-soft-delete-extension';
+ 
+ const globalForPrisma = globalThis as unknown as {
+-    prisma: PrismaClient | undefined
++    prismaBase: PrismaClient | undefined
++    prismaExtended: PrismaClient | undefined
+ }
+ 
+ function buildPrismaClient(): PrismaClient {
+@@ -31,17 +33,42 @@ function buildPrismaClient(): PrismaClient {
+     });
+ }
+ 
+-// Lazy singleton: only create PrismaClient when it's actually used at runtime,
++// Lazy singletons: only create the PrismaClient when it's actually used at runtime,
+ // not when the module is evaluated during Vercel's static page collection.
+-function getPrismaClient(): PrismaClient {
+-    if (!globalForPrisma.prisma) {
+-        globalForPrisma.prisma = buildPrismaClient();
++function getBaseClient(): PrismaClient {
++    if (!globalForPrisma.prismaBase) {
++        globalForPrisma.prismaBase = buildPrismaClient();
+     }
+-    return globalForPrisma.prisma;
++    return globalForPrisma.prismaBase;
+ }
+ 
++function getExtendedClient(): PrismaClient {
++    if (!globalForPrisma.prismaExtended) {
++        // $extends shares the underlying engine/connection with the base client.
++        globalForPrisma.prismaExtended = getBaseClient().$extends(
++            softDeleteExtension
++        ) as unknown as PrismaClient;
++    }
++    return globalForPrisma.prismaExtended;
++}
++
++/**
++ * Default client — auto-hides soft-deleted rows (deletedAt != null) on the covered
++ * models via the soft-delete extension. Use this everywhere for normal reads/writes.
++ */
+ export const prisma = new Proxy({} as PrismaClient, {
+     get(_target, prop) {
+-        return (getPrismaClient() as any)[prop];
++        return (getExtendedClient() as any)[prop];
++    }
++});
++
++/**
++ * ESCAPE HATCH — the un-extended client. Reads here are NOT filtered, so it can see
++ * soft-deleted rows. Use ONLY for the soft-delete/restore actions and the admin
++ * Trash/Audit UI (see src/lib/soft-delete.ts). Do not use for normal app reads.
++ */
++export const prismaBase = new Proxy({} as PrismaClient, {
++    get(_target, prop) {
++        return (getBaseClient() as any)[prop];
+     }
+ });

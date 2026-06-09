@@ -37,6 +37,7 @@ export async function POST(request: Request) {
             include: {
                 client: true,
                 estimates: {
+                    where: { deletedAt: null },
                     select: { id: true, code: true, title: true, status: true, totalAmount: true, createdAt: true },
                     orderBy: { createdAt: "desc" },
                 },
@@ -93,6 +94,7 @@ export async function POST(request: Request) {
             include: {
                 client: true,
                 estimates: {
+                    where: { deletedAt: null },
                     select: { id: true, code: true, title: true, status: true, totalAmount: true, createdAt: true },
                     orderBy: { createdAt: "desc" },
                 },

@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { normalizeE164 } from "@/lib/phone";
+import { softDeleteClient } from "@/lib/soft-delete";
+import { getAuditActor, recordAuditSafe } from "@/lib/audit";
 export const dynamic = 'force-dynamic';
 
 async function requireManagerSession() {
@@ -56,6 +58,7 @@ export async function PUT(
             data: updateData,
         });
 
+        await recordAuditSafe({ entity: "Client", entityId: client.id, action: "UPDATE", snapshot: client });
         return NextResponse.json(client);
     } catch (error) {
         console.error("Error updating client:", error);
@@ -76,9 +79,12 @@ export async function DELETE(
             return NextResponse.json({ error: "Client ID is required" }, { status: 400 });
         }
 
-        await prisma.client.delete({
-            where: { id },
-        });
+        // SOFT DELETE (recovery net — see SOFT_DELETE.md): cascade soft-delete the
+        // client and ALL its leads + projects + estimates, capturing a full snapshot
+        // in the audit log. Cascading both leads and projects keeps the
+        // "every project has a lead" invariant intact (no live lead-less project).
+        const actor = await getAuditActor();
+        await softDeleteClient(id, actor);
 
         return NextResponse.json({ success: true });
     } catch (error) {

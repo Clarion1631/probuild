@@ -15,6 +15,8 @@ interface TimeEntry {
     laborCost: any;
     user: { id: string; name: string | null; email: string; hourlyRate?: any };
     costCode: { id: string; name: string; code: string } | null;
+    qbTimeActivityId?: string | null;
+    qbSyncedAt?: string | Date | null;
 }
 
 interface Props {
@@ -42,6 +44,7 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
     const [filter, setFilter] = useState("");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
+    const [syncingQB, setSyncingQB] = useState(false);
 
     const refreshEntries = useCallback(async () => {
         try {
@@ -188,6 +191,40 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                                 </svg>
                                 {isCreatingInvoice ? "Creating..." : `Create Invoice (${selectedIds.size})`}
                             </button>
+
+                            <button
+                                onClick={async () => {
+                                    setSyncingQB(true);
+                                    try {
+                                        const res = await fetch("/api/quickbooks/time/sync", {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ timeEntryIds: Array.from(selectedIds) }),
+                                        });
+                                        if (!res.ok) throw new Error("Sync failed");
+                                        const data = await res.json();
+                                        if (data.errors && data.errors.length > 0) {
+                                            toast.error(`Synced ${data.syncedCount} entries, but had errors:\n` + data.errors.join("\n"));
+                                        } else {
+                                            toast.success(`Synced ${data.syncedCount} entries to QuickBooks!`);
+                                        }
+                                        setSelectedIds(new Set());
+                                        await refreshEntries();
+                                    } catch (err: any) {
+                                        toast.error(err.message || "Failed to sync entries");
+                                    } finally {
+                                        setSyncingQB(false);
+                                    }
+                                }}
+                                disabled={syncingQB}
+                                className="hui-btn bg-purple-600 hover:bg-purple-700 text-white text-sm px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50 animate-fade-in"
+                            >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.2" />
+                                </svg>
+                                {syncingQB ? "Syncing..." : `Sync to QB (${selectedIds.size})`}
+                            </button>
+
                             {(currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                 <button
                                     onClick={handleBulkDelete}
@@ -238,6 +275,7 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Cost Code</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Hours</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Cost</th>
+                                    <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">QB Sync</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider w-20"></th>
                                 </tr>
                             </thead>
@@ -252,6 +290,19 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                                         <td className="px-4 py-3 text-slate-600">{entry.costCode ? `${entry.costCode.code} — ${entry.costCode.name}` : "—"}</td>
                                         <td className="px-4 py-3 text-right tabular-nums text-slate-600">{num(entry.durationHours).toFixed(1)}h</td>
                                         <td className="px-4 py-3 text-right tabular-nums font-medium text-hui-textMain">{fmtMoney(num(entry.laborCost))}</td>
+                                        <td className="px-4 py-3 text-center">
+                                            {entry.qbTimeActivityId ? (
+                                                <span className="text-xs text-green-600 font-medium inline-flex items-center gap-1" title={entry.qbSyncedAt ? `Synced at ${new Date(entry.qbSyncedAt).toLocaleString()}` : ''}>
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-green-500 inline-block" />
+                                                    Synced
+                                                </span>
+                                            ) : (
+                                                <span className="text-xs text-slate-400 font-medium inline-flex items-center gap-1">
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-slate-300 inline-block" />
+                                                    Pending
+                                                </span>
+                                            )}
+                                        </td>
                                         <td className="px-4 py-3 text-right">
                                             {(currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                                 <button onClick={() => handleDelete(entry.id)} className="text-slate-400 hover:text-red-500 transition" title="Delete">

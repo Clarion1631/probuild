@@ -55,6 +55,14 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
                             {navLink("/settings/cost-codes", "Cost Codes")}
                         </ul>
                     </div>
+
+                    {/* Admin (page itself is ADMIN-gated) */}
+                    <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-widest text-hui-textMuted mb-1.5 px-3">Admin</p>
+                        <ul className="space-y-0.5">
+                            {navLink("/settings/data-recovery", "Data Recovery")}
+                        </ul>
+                    </div>
                 </div>
             </aside>
             {/* Content */}

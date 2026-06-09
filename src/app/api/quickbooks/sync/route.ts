@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
                     id: true, code: true, title: true, status: true,
                     totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
                     items: { select: { name: true, quantity: true, unitCost: true, total: true, type: true } },
-                    project: { include: { client: true } },
+                    project: { select: { name: true, qbProjectId: true, client: true } },
                 },
             });
             if (!estimate) return NextResponse.json({ error: "Estimate not found" }, { status: 404 });
@@ -65,7 +65,16 @@ export async function POST(req: NextRequest) {
                 })),
                 client: { name: client.name, email: client.email ?? null },
                 project: estimate.project ? { name: estimate.project.name } : null,
+                qbProjectId: estimate.project?.qbProjectId || null,
             }, qb.glMappings || {});
+
+            await prisma.estimate.update({
+                where: { id: estimate.id },
+                data: {
+                    qbEstimateId: result.qbId,
+                    qbSyncedAt: new Date(),
+                },
+            });
 
             return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
         }
@@ -80,13 +89,22 @@ export async function POST(req: NextRequest) {
             });
             if (!invoice) return NextResponse.json({ error: "Invoice not found" }, { status: 404 });
 
-                const result = await syncInvoiceToQB(tokens, {
-                    code: invoice.code,
-                    totalAmount: toNum(invoice.totalAmount),
-                    balanceDue: toNum(invoice.balanceDue),
-                    client: { name: invoice.client.name, email: invoice.client.email ?? null },
-                    project: invoice.project ? { name: invoice.project.name } : null,
-                });
+            const result = await syncInvoiceToQB(tokens, {
+                code: invoice.code,
+                totalAmount: toNum(invoice.totalAmount),
+                balanceDue: toNum(invoice.balanceDue),
+                client: { name: invoice.client.name, email: invoice.client.email ?? null },
+                project: invoice.project ? { name: invoice.project.name } : null,
+                qbProjectId: invoice.project?.qbProjectId || null,
+            });
+
+            await prisma.invoice.update({
+                where: { id: invoice.id },
+                data: {
+                    qbInvoiceId: result.qbId,
+                    qbSyncedAt: new Date(),
+                },
+            });
 
             return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
         }

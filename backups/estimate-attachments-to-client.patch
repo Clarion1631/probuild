@@ -1,0 +1,251 @@
+diff --git a/src/app/portal/estimates/[id]/PortalEstimateClient.tsx b/src/app/portal/estimates/[id]/PortalEstimateClient.tsx
+index 817057b..893049d 100644
+--- a/src/app/portal/estimates/[id]/PortalEstimateClient.tsx
++++ b/src/app/portal/estimates/[id]/PortalEstimateClient.tsx
+@@ -233,6 +233,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings
+     const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");
+     const stripeEnabled = companySettings?.stripeEnabled !== false;
+     const schedules: any[] = initialEstimate.paymentSchedules || [];
++    const files: any[] = initialEstimate.files || [];
+     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
+     // Suppress immediately after a successful payment redirect — webhook may not have updated status yet
+     const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && (
+@@ -624,11 +625,44 @@ export default function PortalEstimateClient({ initialEstimate, companySettings
+                         </p>
+                     </div>
+                 </div>
++
++                {/* Attachments — interactive download links, shown only in the live portal (not in the captured PDF) */}
++                {!isCapture && files.length > 0 && (
++                    <div className="bg-white rounded-lg shadow-sm mt-6 print:hidden">
++                        <div className="px-10 py-5 border-b border-slate-100">
++                            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Attachments</h2>
++                        </div>
++                        <ul className="divide-y divide-slate-100">
++                            {files.map((f: any) => (
++                                <li key={f.id}>
++                                    <a
++                                        href={f.url}
++                                        target="_blank"
++                                        rel="noopener noreferrer"
++                                        className="flex items-center gap-3 px-10 py-3 hover:bg-slate-50 transition group"
++                                    >
++                                        <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
++                                        <span className="flex-1 text-sm font-medium text-slate-700 group-hover:text-indigo-600 truncate">{f.name}</span>
++                                        <span className="text-xs text-slate-400 flex-shrink-0">{formatFileSize(f.size)}</span>
++                                        <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
++                                    </a>
++                                </li>
++                            ))}
++                        </ul>
++                    </div>
++                )}
+             </div>
+         </div>
+     );
+ }
+ 
++function formatFileSize(bytes: number): string {
++    if (!bytes || bytes <= 0) return "—";
++    if (bytes < 1024) return `${bytes} B`;
++    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
++}
++
+ function TermsAndConditions({ html }: { html: string }) {
+     const ref = useRef<HTMLDivElement>(null);
+ 
+diff --git a/src/lib/actions.ts b/src/lib/actions.ts
+index d1d7fcb..d1bafb3 100644
+--- a/src/lib/actions.ts
++++ b/src/lib/actions.ts
+@@ -900,6 +900,81 @@ export async function convertLeadToProject(leadId: string) {
+     return { id: project.id };
+ }
+ 
++// Create a project directly (e.g. a repeat customer with another job).
++// Maintains the 1-1 Project↔Lead invariant: every project is backed by a lead.
++// Pass `clientId` to tie the project to an EXISTING customer, or `clientName`
++// (+ optional contact details) to create a new one.
++export async function createProject(data: {
++    name: string;
++    clientId?: string;
++    clientName?: string;
++    clientEmail?: string;
++    clientPhone?: string;
++    location?: string;
++    addressLine1?: string;
++    city?: string;
++    state?: string;
++    zipCode?: string;
++    projectType?: string;
++    status?: string;
++}) {
++    if (!data.name?.trim()) throw new Error("Project name is required.");
++
++    // Resolve the customer: prefer an existing client by id; otherwise find-or-create by name.
++    let clientId: string | undefined = data.clientId;
++    if (clientId) {
++        const exists = await prisma.client.findUnique({ where: { id: clientId }, select: { id: true } });
++        if (!exists) clientId = undefined;
++    }
++    if (!clientId) {
++        const clientName = (data.clientName || "").trim();
++        if (!clientName) throw new Error("A customer is required to create a project.");
++        let client = await prisma.client.findFirst({ where: { name: clientName } });
++        if (!client) {
++            const initials = clientName.split(" ").map((n) => n[0]).join("").toUpperCase().slice(0, 2);
++            client = await prisma.client.create({
++                data: {
++                    name: clientName,
++                    initials,
++                    email: data.clientEmail || null,
++                    primaryPhone: data.clientPhone || null,
++                    primaryPhoneE164: normalizeE164(data.clientPhone),
++                    addressLine1: data.addressLine1 || null,
++                    city: data.city || null,
++                    state: data.state || null,
++                    zipCode: data.zipCode || null,
++                },
++            });
++        }
++        clientId = client.id;
++    }
++
++    // Back the project with a lead, then reuse the conversion path so the project is
++    // created + linked 1-1 (also provisions Drive and grants team access).
++    const lead = await prisma.lead.create({
++        data: {
++            name: data.name.trim(),
++            clientId,
++            location: data.location || null,
++            projectType: data.projectType || null,
++            source: "Direct project",
++            stage: "New",
++            isUnread: false,
++        },
++    });
++
++    const { id: projectId } = await convertLeadToProject(lead.id);
++
++    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
++    if (data.status && data.status !== "In Progress") {
++        await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
++    }
++
++    revalidatePath("/projects");
++    revalidatePath("/leads");
++    return { id: projectId };
++}
++
+ export async function createDraftEstimate(projectId: string) {
+     const estimate = await prisma.estimate.create({
+         data: {
+@@ -1205,6 +1280,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
+                     lead: { include: { client: true } },
+                     items: { orderBy: { order: "asc" } },
+                     paymentSchedules: { orderBy: { order: "asc" } },
++                    files: { orderBy: { createdAt: "desc" } },
+                 },
+             });
+         } catch (err) {
+@@ -1230,6 +1306,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
+                                 costCodeId: true, costTypeId: true, createdAt: true,
+                             },
+                         },
++                        files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
+                         paymentSchedules: { orderBy: { order: "asc" } },
+                     },
+                 });
+@@ -1260,6 +1337,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
+                 lead: { include: { client: true } },
+                 items: { orderBy: { order: "asc" } },
+                 paymentSchedules: { orderBy: { order: "asc" } },
++                files: { orderBy: { createdAt: "desc" } },
+             },
+         });
+     } catch (err) {
+@@ -1284,6 +1362,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
+                             costCodeId: true, costTypeId: true, createdAt: true,
+                         },
+                     },
++                    files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
+                     paymentSchedules: { orderBy: { order: "asc" } },
+                 },
+             });
+@@ -3799,6 +3878,54 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
+         // Do not block the email send — matches approveEstimate() pattern
+     }
+ 
++    // Also attach any files uploaded to the estimate, capped so the email stays deliverable.
++    // Anything skipped here is still viewable in the client portal.
++    let attachedFileCount = 0;
++    try {
++        const estimateFiles = await prisma.estimateFile.findMany({
++            where: { estimateId },
++            orderBy: { createdAt: "desc" },
++        });
++        if (estimateFiles.length > 0) {
++            const MAX_SINGLE_FILE_BYTES = 8 * 1024 * 1024;  // 8 MB per file
++            const MAX_TOTAL_EMAIL_BYTES = 18 * 1024 * 1024; // 18 MB total raw (PDF + files); ~25 MB once base64-encoded
++            // Seed the budget with whatever is already attached (the estimate PDF) so we don't exceed Resend's payload limit.
++            let usedBytes = (emailAttachments || []).reduce((sum, a) => sum + a.content.length, 0);
++            const skipped: string[] = [];
++            for (const f of estimateFiles) {
++                if (f.size > MAX_SINGLE_FILE_BYTES) { skipped.push(`${f.name} (exceeds per-file limit)`); continue; }
++                if (usedBytes + f.size > MAX_TOTAL_EMAIL_BYTES) { skipped.push(`${f.name} (over total size budget)`); continue; }
++                // Defense-in-depth: only fetch our own Supabase storage URLs, never an arbitrary host (SSRF guard).
++                let parsedUrl: URL;
++                try { parsedUrl = new URL(f.url); } catch { skipped.push(`${f.name} (invalid url)`); continue; }
++                if (parsedUrl.protocol !== "https:" || !parsedUrl.hostname.endsWith(".supabase.co")) {
++                    skipped.push(`${f.name} (untrusted url host)`);
++                    continue;
++                }
++                try {
++                    const res = await fetch(f.url, { signal: AbortSignal.timeout(15_000) });
++                    if (!res.ok) { skipped.push(`${f.name} (fetch ${res.status})`); continue; }
++                    const buf = Buffer.from(await res.arrayBuffer());
++                    // Re-check against the real downloaded size in case the stored metadata was wrong.
++                    if (buf.length > MAX_SINGLE_FILE_BYTES) { skipped.push(`${f.name} (exceeds per-file limit)`); continue; }
++                    if (usedBytes + buf.length > MAX_TOTAL_EMAIL_BYTES) { skipped.push(`${f.name} (over total size budget)`); continue; }
++                    emailAttachments = emailAttachments || [];
++                    emailAttachments.push({ filename: f.name, content: buf });
++                    usedBytes += buf.length;
++                    attachedFileCount++;
++                } catch (err) {
++                    skipped.push(`${f.name} (download error)`);
++                }
++            }
++            if (skipped.length > 0) {
++                console.warn(`[sendEstimateToClient] ${skipped.length} estimate file(s) not attached (still viewable in the client portal):`, skipped);
++            }
++        }
++    } catch (e) {
++        console.error("[sendEstimateToClient] Failed to attach estimate files:", e);
++        // Do not block the send — files remain viewable in the portal
++    }
++
+     // Send email notification to client
+     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+     let portalUrl: string;
+@@ -3829,6 +3956,12 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
+            </div>`
+         : '';
+ 
++    const attachmentsNote = attachedFileCount > 0
++        ? `<div style="background: #f8fafc; border-left: 3px solid #4f46e5; padding: 12px 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
++               <p style="color: #334155; margin: 0; font-size: 13px; font-weight: 600;">📎 ${attachedFileCount} additional file${attachedFileCount > 1 ? 's' : ''} attached. You can also view ${attachedFileCount > 1 ? 'them' : 'it'} anytime in your portal.</p>
++           </div>`
++        : '';
++
+     const sendResult = await sendNotification(
+         recipientEmail,
+         `${companyName} sent you an estimate`,
+@@ -3843,6 +3976,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
+                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
+                 ${personalNote}
+                 ${pdfNote}
++                ${attachmentsNote}
+                 <p style="color: #666; line-height: 1.6;">
+                     ${companyName} has sent you an estimate for review and approval.
+                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.

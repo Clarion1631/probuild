@@ -1,0 +1,263 @@
+[
+  {
+    "id": "cmmk7u43b0000qk2ee57v09mv",
+    "code": "01-DEMO",
+    "name": "Demolition",
+    "description": "Tear-out, removal, and hauling of existing materials",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.319Z",
+    "updatedAt": "2026-03-10T06:15:07.319Z"
+  },
+  {
+    "id": "cmmk7u45a0001qk2et6uaz6kg",
+    "code": "02-FRAME",
+    "name": "Framing",
+    "description": "Structural framing, walls, headers, blocking",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.391Z",
+    "updatedAt": "2026-03-10T06:15:07.391Z"
+  },
+  {
+    "id": "cmmk7u45y0002qk2ed1t8wk6t",
+    "code": "03-PLUMB",
+    "name": "Plumbing",
+    "description": "Rough-in and finish plumbing, fixtures, water heater",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.414Z",
+    "updatedAt": "2026-03-10T06:15:07.414Z"
+  },
+  {
+    "id": "cmmk7u46l0003qk2ef3u5mrax",
+    "code": "04-ELEC",
+    "name": "Electrical",
+    "description": "Rough-in and finish electrical, panels, lighting, outlets",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.437Z",
+    "updatedAt": "2026-03-10T06:15:07.437Z"
+  },
+  {
+    "id": "cmmk7u4770004qk2earpr88so",
+    "code": "05-HVAC",
+    "name": "HVAC",
+    "description": "Heating, ventilation, air conditioning, ductwork",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.459Z",
+    "updatedAt": "2026-03-10T06:15:07.459Z"
+  },
+  {
+    "id": "cmmk7u47u0005qk2ecsyu0tuo",
+    "code": "06-INSUL",
+    "name": "Insulation",
+    "description": "Wall, ceiling, and floor insulation",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.482Z",
+    "updatedAt": "2026-03-10T06:15:07.482Z"
+  },
+  {
+    "id": "cmmk7u48f0006qk2e306ghv32",
+    "code": "07-DRYWALL",
+    "name": "Drywall",
+    "description": "Hang, tape, mud, and sand drywall",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.503Z",
+    "updatedAt": "2026-03-10T06:15:07.503Z"
+  },
+  {
+    "id": "cmmk7u4910007qk2ehkqoicz1",
+    "code": "08-PAINT",
+    "name": "Paint & Finish",
+    "description": "Interior/exterior painting, staining, and wall finishes",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.525Z",
+    "updatedAt": "2026-03-10T06:15:07.525Z"
+  },
+  {
+    "id": "cmmk7u49m0008qk2e0dhnidrv",
+    "code": "09-FLOOR",
+    "name": "Flooring",
+    "description": "Tile, hardwood, LVP, carpet installation",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.547Z",
+    "updatedAt": "2026-03-10T06:15:07.547Z"
+  },
+  {
+    "id": "cmmk7u4a80009qk2ehzrkmysz",
+    "code": "10-TILE",
+    "name": "Tile Work",
+    "description": "Backsplash, shower tile, floor tile",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.568Z",
+    "updatedAt": "2026-03-10T06:15:07.568Z"
+  },
+  {
+    "id": "cmmk7u4ay000aqk2ep1kgpol7",
+    "code": "11-CABINET",
+    "name": "Cabinetry",
+    "description": "Kitchen/bath cabinet supply and install",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.594Z",
+    "updatedAt": "2026-03-10T06:15:07.594Z"
+  },
+  {
+    "id": "cmmk7u4bi000bqk2en96t0ghk",
+    "code": "12-COUNTER",
+    "name": "Countertops",
+    "description": "Granite, quartz, marble, laminate countertops",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.615Z",
+    "updatedAt": "2026-03-10T06:15:07.615Z"
+  },
+  {
+    "id": "cmmk7u4c3000cqk2egw22fwev",
+    "code": "13-TRIM",
+    "name": "Trim & Millwork",
+    "description": "Baseboards, crown molding, door/window casings",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.635Z",
+    "updatedAt": "2026-03-10T06:15:07.635Z"
+  },
+  {
+    "id": "cmmk7u4co000dqk2esfvi5inb",
+    "code": "14-DOOR",
+    "name": "Doors & Windows",
+    "description": "Interior/exterior doors, windows, hardware",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.656Z",
+    "updatedAt": "2026-03-10T06:15:07.656Z"
+  },
+  {
+    "id": "cmmk7u4d7000eqk2ewo4lbbvu",
+    "code": "15-ROOF",
+    "name": "Roofing",
+    "description": "Roofing tear-off, underlayment, shingles, flashing",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.675Z",
+    "updatedAt": "2026-03-10T06:15:07.675Z"
+  },
+  {
+    "id": "cmmk7u4ds000fqk2ezw1ynsie",
+    "code": "16-SIDING",
+    "name": "Siding & Exterior",
+    "description": "Siding, soffit, fascia, gutters",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.696Z",
+    "updatedAt": "2026-03-10T06:15:07.696Z"
+  },
+  {
+    "id": "cmmk7u4ec000gqk2ert41w4bi",
+    "code": "17-CONCRETE",
+    "name": "Concrete & Foundation",
+    "description": "Footings, slabs, flatwork, foundation repairs",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.717Z",
+    "updatedAt": "2026-03-10T06:15:07.717Z"
+  },
+  {
+    "id": "cmmk7u4ey000hqk2enb54ghk5",
+    "code": "18-APPLIANCE",
+    "name": "Appliances",
+    "description": "Kitchen and laundry appliance supply",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.739Z",
+    "updatedAt": "2026-03-10T06:15:07.739Z"
+  },
+  {
+    "id": "cmmk7u4fj000iqk2emk3wswbi",
+    "code": "19-FIXTURE",
+    "name": "Fixtures & Hardware",
+    "description": "Faucets, sinks, toilets, shower fixtures, knobs",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.759Z",
+    "updatedAt": "2026-03-10T06:15:07.759Z"
+  },
+  {
+    "id": "cmmk7u4g3000jqk2eubvay1rp",
+    "code": "20-CLEAN",
+    "name": "Cleanup & Disposal",
+    "description": "Job site cleanup, dumpster, debris hauling",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.779Z",
+    "updatedAt": "2026-03-10T06:15:07.779Z"
+  },
+  {
+    "id": "cmmk7u4gr000kqk2el26oc66p",
+    "code": "21-PERMITS",
+    "name": "Permits & Inspections",
+    "description": "Building permits, plan review, inspection fees",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.804Z",
+    "updatedAt": "2026-03-10T06:15:07.804Z"
+  },
+  {
+    "id": "cmmk7u4hc000lqk2e5d4lty4m",
+    "code": "22-DESIGN",
+    "name": "Design & Engineering",
+    "description": "Architectural plans, engineering, design services",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.824Z",
+    "updatedAt": "2026-03-10T06:15:07.824Z"
+  },
+  {
+    "id": "cmmk7u4hv000mqk2elws3cjik",
+    "code": "23-SITEWORK",
+    "name": "Site Work",
+    "description": "Excavation, grading, and site preparation",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.844Z",
+    "updatedAt": "2026-03-10T06:15:07.844Z"
+  },
+  {
+    "id": "cmmk7u4if000nqk2ew9r7783f",
+    "code": "24-LANDSCAPE",
+    "name": "Landscaping",
+    "description": "Hardscape, softscape, irrigation, outdoor living",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.863Z",
+    "updatedAt": "2026-03-10T06:15:07.863Z"
+  },
+  {
+    "id": "cmmk7u4j2000oqk2euetxr51s",
+    "code": "25-FIREPLACE",
+    "name": "Fireplace",
+    "description": "Gas/wood fireplace install, stone/mantle work",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.887Z",
+    "updatedAt": "2026-03-10T06:15:07.887Z"
+  },
+  {
+    "id": "cmmk7u4jq000pqk2eynvewwt6",
+    "code": "26-SHOWER",
+    "name": "Shower Systems",
+    "description": "Shower pans, glass enclosures, steam systems",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.911Z",
+    "updatedAt": "2026-03-10T06:15:07.911Z"
+  },
+  {
+    "id": "cmmk7u4kb000qqk2eb4re9mpx",
+    "code": "27-LOWVOLT",
+    "name": "Low Voltage",
+    "description": "Home automation, audio, security, networking",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.931Z",
+    "updatedAt": "2026-03-10T06:15:07.931Z"
+  },
+  {
+    "id": "cmmk7u4kx000rqk2ehxb8ury3",
+    "code": "28-MISC",
+    "name": "Miscellaneous",
+    "description": "General labor, punch list, warranty callbacks",
+    "isActive": true,
+    "createdAt": "2026-03-10T06:15:07.953Z",
+    "updatedAt": "2026-03-10T06:15:07.953Z"
+  },
+  {
+    "id": "cmnxiyg4v0000zlw4wehu53yg",
+    "code": "29-FUEL SURCHARGE",
+    "name": "Fuel",
+    "description": null,
+    "isActive": true,
+    "createdAt": "2026-04-13T18:27:07.952Z",
+    "updatedAt": "2026-04-13T18:27:07.952Z"
+  }
+]
