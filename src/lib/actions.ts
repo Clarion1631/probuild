@@ -11,7 +11,8 @@ import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
-import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
+import { emptyDoc } from "@/lib/studio/doc";
+import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
@@ -1092,7 +1093,7 @@ export async function createDraftRoom(opts: {
             roomType: roomType ?? "kitchen",
             projectId: projectId ?? null,
             leadId: leadId ?? null,
-            layoutJson: buildDefaultLayout() as any,
+            layoutJson: emptyDoc() as any,
         },
     });
     if (projectId) revalidatePath(`/projects/${projectId}/room-designer`);
@@ -7620,8 +7621,10 @@ export async function createEstimateFromRoomDesign(roomId: string) {
     const ownerId = isProject ? room.projectId : room.leadId;
     if (!ownerId) throw new Error("Room Design is not associated with any Lead or Project");
 
-    // Dynamic import to avoid circular dependency
-    const { ASSET_REGISTRY } = await import("@/lib/room-designer/asset-registry");
+    // Dynamic imports to avoid circular dependency
+    const { getItemDef } = await import("@/lib/studio/catalog");
+    const { getFinish } = await import("@/lib/studio/materials");
+    const { toInches } = await import("@/lib/studio/units");
 
     const items: Array<{
         name: string;
@@ -7636,103 +7639,58 @@ export async function createEstimateFromRoomDesign(roomId: string) {
 
     let totalEstimate = 0;
 
+    // Rough budgetary pricing per builder recipe; width-scaled for millwork.
+    const MESH_BASE_COST: Record<string, number> = {
+        "cabinet-base": 350, "cabinet-drawers": 420, "cabinet-sink": 480, "cabinet-corner": 480,
+        "cabinet-cooktop": 460, island: 1450, "island-overhang": 1750, "cabinet-wall": 280,
+        "cabinet-wall-glass": 360, "open-shelves": 180, "cabinet-tall": 650, "cabinet-oven-tower": 780,
+        vanity: 620, "vanity-double": 1150,
+        "fridge-french": 2199, "fridge-side": 1599, range: 1299, "range-pro": 3499, hood: 549,
+        dishwasher: 799, microwave: 399, "wine-fridge": 899, washer: 899, dryer: 849,
+        "sink-farmhouse": 650, toilet: 385, tub: 1850, "tub-alcove": 620, shower: 2400,
+        "pedestal-sink": 320, fireplace: 2800,
+        recessed: 95, pendant: 185, "pendant-glass": 220, "pendant-trio": 540, chandelier: 690,
+        "flush-mount": 140, sconce: 160, "floor-lamp": 210, "table-lamp": 120, track: 260,
+        door: 380, "door-double": 720, "door-sliding": 1650, doorway: 250,
+        window: 480, "window-double": 880, "window-picture": 1350,
+        sofa: 1400, sectional: 2400, armchair: 700, "coffee-table": 380, "side-table": 180,
+        "tv-console": 650, "dining-table": 950, "dining-chair": 160, stool: 140, bookshelf: 420,
+        bed: 1300, dresser: 850, nightstand: 280, desk: 520, rug: 450,
+        plant: 120, "plant-small": 35, mirror: 220, art: 150, vase: 40,
+    };
+
     for (let idx = 0; idx < room.assets.length; idx++) {
         const asset = room.assets[idx];
-        const reg = ASSET_REGISTRY.find((a) => a.id === asset.assetId);
-
-        let baseCost = 250; // fallback base cost
+        const def = getItemDef(asset.assetId);
         const markupPercent = 25;
-        const name = reg?.name || `${asset.assetType.charAt(0).toUpperCase() + asset.assetType.slice(1)}`;
+        const name = def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
 
         const metadata = (asset.metadata ?? {}) as Record<string, any>;
-        const cabinet = (metadata.cabinet ?? {}) as Record<string, any>;
-        const appliance = (metadata.appliance ?? {}) as Record<string, any>;
-        const fixture = (metadata.fixture ?? {}) as Record<string, any>;
+        const studio = (metadata.studio ?? {}) as Record<string, any>;
+        const finishes = { ...(def?.finishes ?? {}), ...((studio.finishes ?? {}) as Record<string, string>) };
 
-        const detailsArray: string[] = [];
+        let baseCost = def ? MESH_BASE_COST[def.mesh] ?? 250 : 250;
 
-        if (asset.assetType === "cabinet") {
-            // pricing based on cabinet subcategory
-            if (reg?.subcategory === "wall") baseCost = 280;
-            else if (reg?.subcategory === "tall") baseCost = 650;
-            else if (reg?.subcategory === "corner") baseCost = 480;
-            else if (reg?.subcategory === "island") baseCost = 750;
-            else baseCost = 350; // base base cabinet
+        const wM = typeof studio.w === "number" ? studio.w : def?.w ?? 0.6;
+        const hM = typeof studio.h === "number" ? studio.h : def?.h ?? 0.76;
+        const dM = typeof studio.d === "number" ? studio.d : def?.d ?? 0.6;
+        const wIn = Math.round(toInches(wM));
 
-            // Adjust based on custom overrides (width, height, depth) if provided
-            const wVal = cabinet.width ? Math.round(cabinet.width * 39.3701) : Math.round((reg?.dimensions?.width ?? 0.6) * 39.3701);
-            const hVal = cabinet.height ? Math.round(cabinet.height * 39.3701) : Math.round((reg?.dimensions?.height ?? 0.8) * 39.3701);
-            const dVal = cabinet.depth ? Math.round(cabinet.depth * 39.3701) : Math.round((reg?.dimensions?.depth ?? 0.6) * 39.3701);
-
-            detailsArray.push(`Size: ${wVal}"W x ${hVal}"H x ${dVal}"D`);
-
-            if (cabinet.doorStyle) {
-                detailsArray.push(`Door Style: ${cabinet.doorStyle.charAt(0).toUpperCase() + cabinet.doorStyle.slice(1)}`);
-                if (cabinet.doorStyle === "glass") baseCost += 75;
-                if (cabinet.doorStyle === "raised") baseCost += 40;
-            }
-            if (cabinet.finish) {
-                detailsArray.push(`Finish: ${cabinet.finish.charAt(0).toUpperCase() + cabinet.finish.slice(1)}`);
-                if (["navy", "green", "wood", "walnut"].includes(cabinet.finish)) {
-                    baseCost += 50;
-                }
-            }
-            if (cabinet.hardware) {
-                detailsArray.push(`Hardware: ${cabinet.hardware.charAt(0).toUpperCase() + cabinet.hardware.slice(1)}`);
-                if (cabinet.hardware !== "none") baseCost += 15;
-            }
-            if (cabinet.interior) {
-                detailsArray.push(`Interior: ${cabinet.interior.charAt(0).toUpperCase() + cabinet.interior.slice(1)}`);
-                if (cabinet.interior === "lazy-susan") baseCost += 150;
-                if (cabinet.interior === "drawer-org") baseCost += 80;
-                if (cabinet.interior === "pullout") baseCost += 95;
-                if (cabinet.interior === "trash") baseCost += 60;
-            }
-
-            // Generate SKU
-            const finishCode = String(cabinet.finish || "std").substring(0, 3).toUpperCase();
-            const styleCode = String(cabinet.doorStyle || "std").substring(0, 3).toUpperCase();
-            const sku = `RTA-CAB-${styleCode}-${finishCode}-${wVal}${hVal}${dVal}`;
-            detailsArray.unshift(`SKU: ${sku}`);
-
-        } else if (asset.assetType === "appliance") {
-            if (asset.assetId.includes("refrigerator")) baseCost = 1599;
-            else if (asset.assetId.includes("range") || asset.assetId.includes("stove")) baseCost = 1299;
-            else if (asset.assetId.includes("dishwasher")) baseCost = 799;
-            else if (asset.assetId.includes("microwave")) baseCost = 399;
-            else baseCost = 699;
-
-            if (appliance.brand) detailsArray.push(`Brand: ${appliance.brand}`);
-            if (appliance.finish) {
-                detailsArray.push(`Finish: ${appliance.finish.charAt(0).toUpperCase() + appliance.finish.slice(1)}`);
-                if (["stainless", "black-ss"].includes(appliance.finish)) baseCost += 100;
-            }
-
-            const brandCode = String(appliance.brand || "GEN").substring(0, 3).toUpperCase();
-            const finishCode = String(appliance.finish || "SS").substring(0, 3).toUpperCase();
-            const sku = `APP-${brandCode}-${finishCode}-${idx + 100}`;
-            detailsArray.unshift(`SKU: ${sku}`);
-
-        } else if (asset.assetType === "fixture") {
-            if (asset.assetId.includes("faucet")) baseCost = 199;
-            else if (asset.assetId.includes("sink")) baseCost = 450;
-            else baseCost = 150;
-
-            if (fixture.finish) {
-                detailsArray.push(`Finish: ${fixture.finish.charAt(0).toUpperCase() + fixture.finish.slice(1)}`);
-                if (["matte-black", "brass"].includes(fixture.finish)) baseCost += 40;
-            }
-
-            const finishCode = String(fixture.finish || "CH").substring(0, 2).toUpperCase();
-            const sku = `FIX-${finishCode}-${idx + 100}`;
-            detailsArray.unshift(`SKU: ${sku}`);
-
-        } else {
-            if (asset.assetType === "window") baseCost = 250;
-            else if (asset.assetType === "door") baseCost = 300;
-            else if (asset.assetType === "lighting") baseCost = 120;
-            else baseCost = 45;
+        // Millwork scales by width vs the catalog default (24" base assumption).
+        if (def?.category === "cabinets" && def.resizable) {
+            const defaultIn = Math.max(1, Math.round(toInches(def.w)));
+            baseCost = Math.round(baseCost * Math.max(0.6, wIn / defaultIn));
         }
+
+        const detailsArray: string[] = [
+            `Size: ${wIn}"W x ${Math.round(toInches(hM))}"H x ${Math.round(toInches(dM))}"D`,
+        ];
+        for (const [slot, finishId] of Object.entries(finishes)) {
+            if (!finishId) continue;
+            detailsArray.push(`${slot.charAt(0).toUpperCase()}${slot.slice(1)}: ${getFinish(finishId, "cab-white").name}`);
+        }
+        const sku = `GTR-${(def?.category ?? "item").slice(0, 3).toUpperCase()}-${(def?.id ?? asset.assetId).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 10)}-${wIn}`;
+        detailsArray.unshift(`SKU: ${sku}`);
 
         const unitCost = Math.round(baseCost * (1 + markupPercent / 100));
         const total = unitCost * 1;

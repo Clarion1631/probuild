@@ -10,7 +10,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import type { DbRoomAsset } from "@/lib/room-designer/blueprint3d-adapter";
+import type { ApiRoomAsset } from "@/lib/studio/doc";
 
 export const dynamic = "force-dynamic";
 
@@ -81,12 +81,12 @@ export async function PUT(req: Request, { params }: RouteParams) {
 
     let body: {
         layoutJson?: unknown;
-        assets?: Array<Partial<DbRoomAsset> & { id?: string }>;
+        assets?: Array<Partial<ApiRoomAsset> & { id?: string }>;
         name?: string;
         roomType?: string;
-        // TODO (Stage 4): `shareToken` and `shareEnabled` are explicitly stripped
-        // here. Only a dedicated /api/rooms/[id]/share endpoint (not yet built)
-        // should mutate those fields.
+        thumbnail?: string;
+        // `shareToken` and `shareEnabled` are explicitly stripped here. Only
+        // the dedicated /api/rooms/[id]/share endpoints mutate those fields.
     };
     try {
         body = await req.json();
@@ -98,8 +98,18 @@ export async function PUT(req: Request, { params }: RouteParams) {
         layoutJson?: any;
         name?: string;
         roomType?: string;
+        thumbnail?: string;
     } = {};
     if (body.layoutJson !== undefined) updates.layoutJson = body.layoutJson as any;
+    // Small JPEG data-URL preview for room cards. Cap size so a hostile client
+    // can't balloon the row.
+    if (
+        typeof body.thumbnail === "string" &&
+        body.thumbnail.startsWith("data:image/") &&
+        body.thumbnail.length < 400_000
+    ) {
+        updates.thumbnail = body.thumbnail;
+    }
     if (typeof body.name === "string" && body.name.trim()) updates.name = body.name.slice(0, 120);
     if (typeof body.roomType === "string") {
         const validRoomTypes = ["kitchen", "bathroom", "laundry", "bedroom", "other"];

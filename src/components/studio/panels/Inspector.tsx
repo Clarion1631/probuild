@@ -1,0 +1,279 @@
+"use client";
+
+// Room Studio - right panel: properties for the selected item or surface.
+
+import { useMemo } from "react";
+import { RotateCw, Copy, Trash2, ArrowUpDown } from "lucide-react";
+import { getItemDef } from "@/lib/studio/catalog";
+import {
+  PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, METALS, FABRICS, WOODS, TILES,
+  getFinish, type Finish,
+} from "@/lib/studio/materials";
+import { formatFtIn, inches, toInches } from "@/lib/studio/units";
+import { useStudio, useSelectedItem } from "../store";
+import { Swatch } from "./CatalogPanel";
+
+const SLOT_LABELS: Record<string, string> = {
+  cabinet: "Cabinet color",
+  counter: "Countertop",
+  hardware: "Hardware",
+  metal: "Metal finish",
+  sink: "Sink",
+  faucet: "Faucet",
+  fabric: "Fabric",
+  legs: "Legs",
+  wood: "Wood",
+  frame: "Frame",
+  door: "Door color",
+  shade: "Shade",
+  basin: "Basin",
+  tile: "Tile",
+  surround: "Surround",
+  mantel: "Mantel",
+};
+
+function optionsForSlot(slot: string): Finish[] {
+  switch (slot) {
+    case "cabinet": return CABINET_FINISHES;
+    case "counter": return COUNTERS;
+    case "hardware":
+    case "metal":
+    case "sink":
+    case "faucet": return METALS;
+    case "fabric":
+    case "shade": return FABRICS;
+    case "legs":
+    case "wood":
+    case "mantel":
+    case "frame": return [...WOODS, ...METALS.slice(0, 4), ...PAINTS.slice(0, 6)];
+    case "door": return PAINTS;
+    case "basin": return CABINET_FINISHES.slice(0, 6);
+    case "tile":
+    case "surround": return TILES;
+    default: return PAINTS;
+  }
+}
+
+export function Inspector() {
+  const item = useSelectedItem();
+  const activeSurface = useStudio((s) => s.activeSurface);
+
+  if (item) return <ItemInspector key={item.id} />;
+  if (activeSurface) return <SurfaceInspector />;
+  return null;
+}
+
+function ItemInspector() {
+  const item = useSelectedItem();
+  const updateItem = useStudio((s) => s.updateItem);
+  const removeItem = useStudio((s) => s.removeItem);
+  const duplicateItem = useStudio((s) => s.duplicateItem);
+
+  const def = useMemo(() => (item ? getItemDef(item.defId) : undefined), [item]);
+  if (!item || !def) return null;
+
+  const w = item.w ?? def.w;
+  const h = item.h ?? def.h;
+  const elevation = item.y ?? def.elevation ?? 0;
+  const finishes = { ...def.finishes, ...item.finishes };
+  const slots = Object.keys(def.finishes ?? {});
+
+  const stepW = (dir: 1 | -1) => {
+    if (!def.resizable) return;
+    const step = def.resizable.step ?? inches(3);
+    const next = Math.min(def.resizable.max, Math.max(def.resizable.min, w + dir * step));
+    if (def.resizable.axis === "wd") {
+      const ratio = (item.d ?? def.d) / w;
+      updateItem(item.id, { w: next, d: next * ratio });
+    } else {
+      updateItem(item.id, { w: next });
+    }
+  };
+
+  return (
+    <div className="flex h-full w-[270px] shrink-0 flex-col overflow-y-auto border-l border-slate-200 bg-white">
+      <div className="border-b border-slate-100 p-3.5">
+        <div className="text-sm font-bold text-slate-800">{item.label ?? def.name}</div>
+        <div className="mt-0.5 text-[11px] text-slate-400">
+          {formatFtIn(w)} w x {formatFtIn(item.d ?? def.d)} d x {formatFtIn(h)} h
+        </div>
+        <div className="mt-2.5 flex gap-1.5">
+          <ActionButton
+            title="Rotate 90 (R)"
+            onClick={() => updateItem(item.id, { rotation: item.rotation + Math.PI / 2 })}
+          >
+            <RotateCw className="h-3.5 w-3.5" />
+          </ActionButton>
+          <ActionButton title="Duplicate (Ctrl+D)" onClick={() => duplicateItem(item.id)}>
+            <Copy className="h-3.5 w-3.5" />
+          </ActionButton>
+          <ActionButton title="Delete (Del)" danger onClick={() => removeItem(item.id)}>
+            <Trash2 className="h-3.5 w-3.5" />
+          </ActionButton>
+        </div>
+      </div>
+
+      {def.resizable && (
+        <Row label="Width">
+          <div className="flex items-center gap-1">
+            <Stepper onClick={() => stepW(-1)}>-</Stepper>
+            <span className="min-w-[64px] text-center text-xs font-semibold text-slate-700">{formatFtIn(w)}</span>
+            <Stepper onClick={() => stepW(1)}>+</Stepper>
+          </div>
+        </Row>
+      )}
+
+      {(def.mount === "wall" && def.category !== "doors-windows") && (
+        <Row label="Height off floor" icon={<ArrowUpDown className="h-3 w-3" />}>
+          <input
+            type="range"
+            min={0}
+            max={84}
+            step={1}
+            value={Math.round(toInches(elevation))}
+            onChange={(e) => updateItem(item.id, { y: inches(Number(e.target.value)) })}
+            className="w-28 accent-blue-600"
+          />
+          <span className="ml-1.5 w-10 text-right text-[11px] font-medium text-slate-600">
+            {Math.round(toInches(elevation))}&quot;
+          </span>
+        </Row>
+      )}
+
+      {def.category === "doors-windows" && def.id.startsWith("window") && (
+        <Row label="Sill height">
+          <input
+            type="range"
+            min={0}
+            max={48}
+            step={1}
+            value={Math.round(toInches(elevation))}
+            onChange={(e) => updateItem(item.id, { y: inches(Number(e.target.value)) })}
+            className="w-28 accent-blue-600"
+          />
+          <span className="ml-1.5 w-10 text-right text-[11px] font-medium text-slate-600">
+            {Math.round(toInches(elevation))}&quot;
+          </span>
+        </Row>
+      )}
+
+      {slots.map((slot) => (
+        <div key={slot} className="border-b border-slate-50 px-3.5 py-2.5">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
+              {SLOT_LABELS[slot] ?? slot}
+            </span>
+            <span className="text-[10px] text-slate-400">{getFinish(finishes[slot], "cab-white").name}</span>
+          </div>
+          <div className="grid grid-cols-6 gap-1">
+            {optionsForSlot(slot).map((f) => (
+              <button
+                key={f.id}
+                title={f.name}
+                onClick={() => updateItem(item.id, { finishes: { ...item.finishes, [slot]: f.id } })}
+                className={`h-7 rounded-md border border-black/10 transition-transform hover:scale-110 ${
+                  finishes[slot] === f.id ? "ring-2 ring-blue-500 ring-offset-1" : ""
+                }`}
+                style={{ backgroundColor: f.hex }}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <div className="px-3.5 py-3 text-[10.5px] leading-relaxed text-slate-400">
+        Drag the piece to move it - it snaps to walls and lines up with neighbors.
+        Drag the blue dot to spin it. Press <b>R</b> to rotate 90.
+      </div>
+    </div>
+  );
+}
+
+function SurfaceInspector() {
+  const activeSurface = useStudio((s) => s.activeSurface);
+  const doc = useStudio((s) => s.doc);
+  const setWallPaint = useStudio((s) => s.setWallPaint);
+  const setFloorFinish = useStudio((s) => s.setFloorFinish);
+
+  if (!activeSurface) return null;
+
+  if (activeSurface.kind === "floor") {
+    return (
+      <div className="flex h-full w-[270px] shrink-0 flex-col overflow-y-auto border-l border-slate-200 bg-white">
+        <div className="border-b border-slate-100 p-3.5">
+          <div className="text-sm font-bold text-slate-800">Floor</div>
+          <div className="mt-0.5 text-[11px] text-slate-400">{getFinish(doc.surfaces.floor, "floor-oak-natural").name}</div>
+        </div>
+        <div className="grid grid-cols-4 gap-1.5 p-3">
+          {FLOORS.map((f) => (
+            <Swatch key={f.id} hex={f.hex} name={f.name} selected={doc.surfaces.floor === f.id} onClick={() => setFloorFinish(f.id)} />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const wallIdx = activeSurface.wallIndex;
+  const currentId = doc.surfaces.walls[String(wallIdx)] ?? doc.surfaces.walls.all;
+
+  return (
+    <div className="flex h-full w-[270px] shrink-0 flex-col overflow-y-auto border-l border-slate-200 bg-white">
+      <div className="border-b border-slate-100 p-3.5">
+        <div className="text-sm font-bold text-slate-800">Wall {wallIdx + 1}</div>
+        <div className="mt-0.5 text-[11px] text-slate-400">{getFinish(currentId, "paint-soft-chalk").name}</div>
+        <button
+          onClick={() => currentId && setWallPaint("all", currentId)}
+          className="mt-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-200"
+        >
+          Apply this color to every wall
+        </button>
+      </div>
+      <div className="grid grid-cols-4 gap-1.5 p-3">
+        {PAINTS.map((p) => (
+          <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => setWallPaint(wallIdx, p.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Row({ label, icon, children }: { label: string; icon?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between border-b border-slate-50 px-3.5 py-2.5">
+      <span className="flex items-center gap-1 text-[11px] font-bold uppercase tracking-wide text-slate-500">
+        {icon}
+        {label}
+      </span>
+      <div className="flex items-center">{children}</div>
+    </div>
+  );
+}
+
+function Stepper({ children, onClick }: { children: React.ReactNode; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex h-7 w-7 items-center justify-center rounded-md bg-slate-100 text-sm font-bold text-slate-600 hover:bg-slate-200 active:scale-95"
+    >
+      {children}
+    </button>
+  );
+}
+
+function ActionButton({ children, title, onClick, danger }: {
+  children: React.ReactNode; title: string; onClick: () => void; danger?: boolean;
+}) {
+  return (
+    <button
+      title={title}
+      onClick={onClick}
+      className={`flex h-8 w-8 items-center justify-center rounded-lg border transition-colors ${
+        danger
+          ? "border-red-200 text-red-500 hover:bg-red-50"
+          : "border-slate-200 text-slate-600 hover:bg-slate-100"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}

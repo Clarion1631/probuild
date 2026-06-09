@@ -12,8 +12,8 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { buildShareUrl } from "@/lib/room-designer/share-url";
-import { generateShareToken } from "@/lib/room-designer/share-token";
+import { buildShareUrl } from "@/lib/studio/share-url";
+import { generateShareToken } from "@/lib/studio/share-token";
 
 export const dynamic = "force-dynamic";
 

@@ -74,10 +74,15 @@ export default async function PortalProjectDetail(props: {
 
     if (!project) return notFound();
 
-    const [settings, visibility, scheduleTasks] = await Promise.all([
+    const [settings, visibility, scheduleTasks, sharedRooms] = await Promise.all([
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
         getPortalVisibility(projectId),
         getScheduleTasks(projectId).catch(() => [] as any[]),
+        prisma.roomDesign.findMany({
+            where: { projectId, shareEnabled: true, shareToken: { not: null } },
+            select: { id: true, name: true, shareToken: true, thumbnail: true, updatedAt: true },
+            orderBy: { updatedAt: "desc" },
+        }),
     ]);
 
     if (!visibility.isPortalEnabled) {
@@ -133,7 +138,7 @@ export default async function PortalProjectDetail(props: {
         { id: "updates", label: "Updates", count: updateCount, visible: visibility.showDailyLogs && updateCount > 0 },
         { id: "files", label: "Files", visible: visibility.showFiles },
         { id: "selections", label: "Selections", visible: visibility.showSelections },
-        { id: "designs", label: "Designs", visible: visibility.showMoodBoards },
+        { id: "designs", label: "Designs", visible: visibility.showMoodBoards || sharedRooms.length > 0 },
         { id: "change-orders", label: "Change Orders", count: changeOrderCount, visible: showChangeOrders && changeOrderCount > 0 },
     ];
 
@@ -599,15 +604,46 @@ export default async function PortalProjectDetail(props: {
                 )}
 
                 {activeTab === "designs" && (
-                    <Link href={`/portal/projects/${projectId}/mood-boards`} className="block hui-card p-6 hover:border-indigo-500 hover:shadow-md transition text-center border-dashed">
-                        <div className="w-12 h-12 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-3">
-                            <svg className="w-6 h-6 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
-                            </svg>
-                        </div>
-                        <h3 className="text-base font-bold text-slate-800">View Design Concepts</h3>
-                        <p className="text-sm text-slate-500 mt-1">Explore visual layouts and material choices for your space.</p>
-                    </Link>
+                    <div className="space-y-4">
+                        {sharedRooms.length > 0 && (
+                            <div>
+                                <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500 mb-2">3D Room Designs</h3>
+                                <div className="grid gap-3 sm:grid-cols-2">
+                                    {sharedRooms.map((room) => (
+                                        <a
+                                            key={room.id}
+                                            href={`/share/room/${room.shareToken}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="block hui-card overflow-hidden hover:border-blue-400 hover:shadow-md transition"
+                                        >
+                                            {room.thumbnail ? (
+                                                // eslint-disable-next-line @next/next/no-img-element
+                                                <img src={room.thumbnail} alt={room.name} className="h-36 w-full object-cover bg-slate-100" />
+                                            ) : (
+                                                <div className="h-36 w-full bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center text-slate-400 text-sm">
+                                                    3D preview
+                                                </div>
+                                            )}
+                                            <div className="p-3">
+                                                <div className="font-semibold text-slate-800 text-sm">{room.name}</div>
+                                                <div className="text-xs text-slate-400 mt-0.5">Tap to explore in 3D</div>
+                                            </div>
+                                        </a>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                        <Link href={`/portal/projects/${projectId}/mood-boards`} className="block hui-card p-6 hover:border-indigo-500 hover:shadow-md transition text-center border-dashed">
+                            <div className="w-12 h-12 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-3">
+                                <svg className="w-6 h-6 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
+                                </svg>
+                            </div>
+                            <h3 className="text-base font-bold text-slate-800">View Design Concepts</h3>
+                            <p className="text-sm text-slate-500 mt-1">Explore visual layouts and material choices for your space.</p>
+                        </Link>
+                    </div>
                 )}
 
                 {activeTab === "change-orders" && (
