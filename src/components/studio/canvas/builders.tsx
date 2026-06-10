@@ -54,6 +54,8 @@ export const BUILDERS: Record<string, ComponentType<BuilderProps>> = {
   fireplace: K.Fireplace,
   "shower-niche": K.ShowerNiche,
   "pony-wall": K.PonyWall,
+  "interior-wall": K.InteriorWall,
+  "interior-wall-doorway": K.InteriorWallDoorway,
   // lighting
   recessed: L.Recessed,
   pendant: L.Pendant,

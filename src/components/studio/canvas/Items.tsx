@@ -116,7 +116,11 @@ function ItemNode({
   shell: RoomShellInfo;
   allowLight: boolean;
 }) {
-  const { item, def, w, d, h, finishes } = resolved;
+  const { item, def, w, d, finishes } = resolved;
+  // Interior walls always stretch to the ceiling at their position.
+  const h = def.fullHeight
+    ? roomHeightAt(shell, { x: item.x, z: item.z }) - 0.01
+    : resolved.h;
   const selected = useStudio((s) => s.selectedId === item.id);
   const presentMode = useStudio((s) => s.presentMode);
   const lightsOn = useStudio((s) => s.lightsOn);

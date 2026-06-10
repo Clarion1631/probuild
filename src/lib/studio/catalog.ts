@@ -40,6 +40,8 @@ export interface CatalogItem {
   tags?: string[];
   /** Emits light when "lights on". */
   emitsLight?: boolean;
+  /** Item height always stretches to the ceiling at its position (interior walls). */
+  fullHeight?: boolean;
 }
 
 const IN = inches;
@@ -104,6 +106,8 @@ export const FIXTURES: CatalogItem[] = [
   def({ id: "fireplace", name: "Fireplace", category: "fixtures", mesh: "fireplace", w: IN(60), d: IN(16), h: IN(48), mount: "floor", wallSnap: true, resizable: { min: IN(42), max: IN(84), step: IN(6) }, finishes: { surround: "tile-marble-herringbone", mantel: "wood-oak" }, emitsLight: true, tags: ["fireplace", "living", "mantel"] }),
   def({ id: "shower-niche", name: "Shower Niche", category: "fixtures", mesh: "shower-niche", w: IN(24), d: IN(3.5), h: IN(14), mount: "wall", elevation: IN(42), wallSnap: true, resizable: { min: IN(12), max: IN(60), step: IN(2) }, finishes: { tile: "tile-white-subway", trim: "metal-brushed-nickel" }, tags: ["niche", "shower", "shampoo", "recessed", "bathroom"] }),
   def({ id: "pony-wall", name: "Pony Wall", category: "fixtures", mesh: "pony-wall", w: IN(48), d: IN(5), h: IN(36), mount: "floor", resizable: { min: IN(18), max: IN(120), step: IN(2) }, finishes: { paint: "paint-soft-chalk", cap: "wood-oak" }, tags: ["half wall", "knee wall", "pony", "divider", "stub"] }),
+  def({ id: "interior-wall", name: "Interior Wall", category: "fixtures", mesh: "interior-wall", w: IN(96), d: IN(4.5), h: IN(96), mount: "floor", fullHeight: true, resizable: { min: IN(24), max: IN(288), step: IN(2) }, finishes: { paint: "paint-soft-chalk" }, tags: ["partition", "divider", "wall", "internal", "room"] }),
+  def({ id: "interior-wall-doorway", name: "Interior Wall + Doorway", category: "fixtures", mesh: "interior-wall-doorway", w: IN(120), d: IN(4.5), h: IN(96), mount: "floor", fullHeight: true, resizable: { min: IN(72), max: IN(288), step: IN(2) }, finishes: { paint: "paint-soft-chalk" }, tags: ["partition", "doorway", "opening", "wall", "internal", "cased"] }),
 ];
 
 // -------------------------------- Lighting --------------------------------

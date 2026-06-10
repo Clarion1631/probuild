@@ -630,6 +630,53 @@ export function PonyWall({ w, d, h, finishes }: BuilderProps) {
   );
 }
 
+/**
+ * Full-height interior partition wall. The wrapper stretches `h` to the
+ * ceiling at the item's position (fullHeight catalog flag), so it always
+ * meets the ceiling - flat or sloped. Painted both sides, baseboards both sides.
+ */
+export function InteriorWall({ w, d, h, finishes }: BuilderProps) {
+  const paint = mat(finishes.paint, "paint-soft-chalk");
+  const base = fixedMat("pony-base", () => new THREE.MeshStandardMaterial({ color: "#eceae3", roughness: 0.7 }));
+  return (
+    <group>
+      <Box s={[w, h, d]} p={[0, h / 2, 0]} m={paint} />
+      <Box s={[w, IN(4.5), IN(0.9)]} p={[0, IN(2.25), d / 2 + IN(0.4)]} m={base} castShadow={false} />
+      <Box s={[w, IN(4.5), IN(0.9)]} p={[0, IN(2.25), -d / 2 - IN(0.4)]} m={base} castShadow={false} />
+    </group>
+  );
+}
+
+/** Interior wall with a centered cased doorway opening (36" x 80"). */
+export function InteriorWallDoorway({ w, d, h, finishes }: BuilderProps) {
+  const paint = mat(finishes.paint, "paint-soft-chalk");
+  const base = fixedMat("pony-base", () => new THREE.MeshStandardMaterial({ color: "#eceae3", roughness: 0.7 }));
+  const trim = fixedMat("trim-white2", () => new THREE.MeshStandardMaterial({ color: "#f2f0ea", roughness: 0.7 }));
+  const openW = Math.min(IN(36), w * 0.45);
+  const openH = Math.min(IN(80), h - IN(8));
+  const sideW = (w - openW) / 2;
+  return (
+    <group>
+      {/* side panels */}
+      <Box s={[sideW, h, d]} p={[-(openW + sideW) / 2, h / 2, 0]} m={paint} />
+      <Box s={[sideW, h, d]} p={[(openW + sideW) / 2, h / 2, 0]} m={paint} />
+      {/* header above the opening */}
+      <Box s={[openW, h - openH, d]} p={[0, openH + (h - openH) / 2, 0]} m={paint} />
+      {/* casing */}
+      <Box s={[openW + IN(4), IN(3), d + IN(1.2)]} p={[0, openH + IN(1.5), 0]} m={trim} castShadow={false} />
+      <Box s={[IN(2), openH, d + IN(1.2)]} p={[-openW / 2 - IN(1), openH / 2, 0]} m={trim} castShadow={false} />
+      <Box s={[IN(2), openH, d + IN(1.2)]} p={[openW / 2 + IN(1), openH / 2, 0]} m={trim} castShadow={false} />
+      {/* baseboards on the side panels, both faces */}
+      {[-1, 1].map((side) => (
+        <group key={side}>
+          <Box s={[sideW, IN(4.5), IN(0.9)]} p={[-(openW + sideW) / 2, IN(2.25), side * (d / 2 + IN(0.4))]} m={base} castShadow={false} />
+          <Box s={[sideW, IN(4.5), IN(0.9)]} p={[(openW + sideW) / 2, IN(2.25), side * (d / 2 + IN(0.4))]} m={base} castShadow={false} />
+        </group>
+      ))}
+    </group>
+  );
+}
+
 export function Fireplace({ w, d, h, finishes, lightsOn }: BuilderProps) {
   const boxW = w * 0.55;
   const boxH = h * 0.5;
