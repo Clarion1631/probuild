@@ -67,9 +67,9 @@ export const glassMat = () =>
 
 export const mirrorMat = () =>
   fixedMat("mirror", () => new THREE.MeshStandardMaterial({
-    color: "#cdd6dc",
-    roughness: 0.03,
-    metalness: 0.9,
+    color: "#e3e9ee",
+    roughness: 0.06,
+    metalness: 0.65,
   }));
 
 export const bulbMat = (on: boolean) =>

@@ -310,7 +310,7 @@ export function CabinetOvenTower({ w, d, h, finishes }: BuilderProps) {
   );
 }
 
-export function Vanity({ w, d, h, finishes }: BuilderProps) {
+function VanityBody({ w, d, h, finishes }: BuilderProps) {
   const f = finishes.cabinet;
   const frontH = h - TOE_H - IN(1);
   const doors = w > IN(30) ? 2 : 1;
@@ -328,6 +328,15 @@ export function Vanity({ w, d, h, finishes }: BuilderProps) {
         );
       })}
       <CounterSlab w={w} d={d} h={h} counter={finishes.counter} />
+    </group>
+  );
+}
+
+export function Vanity(props: BuilderProps) {
+  const { d, h, finishes } = props;
+  return (
+    <group>
+      <VanityBody {...props} />
       <VanityBasin x={0} d={d} h={h} faucet={finishes.sink} />
     </group>
   );
@@ -337,8 +346,7 @@ export function VanityDouble(props: BuilderProps) {
   const { w, d, h, finishes } = props;
   return (
     <group>
-      <Vanity {...props} />
-      {/* second basin replaces center one: hide center by drawing two offset */}
+      <VanityBody {...props} />
       <VanityBasin x={-w / 4} d={d} h={h} faucet={finishes.sink} />
       <VanityBasin x={w / 4} d={d} h={h} faucet={finishes.sink} />
     </group>
