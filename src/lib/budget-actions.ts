@@ -4,51 +4,51 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 
 export async function getBudgetData(projectId: string) {
-    const estimates = await prisma.estimate.findMany({
-        where: { projectId },
-        select: {
-            id: true,
-            number: true,
-            title: true,
-            code: true,
-            status: true,
-            totalAmount: true,
-            balanceDue: true,
-            createdAt: true,
-            projectId: true,
-            items: {
-                include: { costCode: true, costType: true },
-                orderBy: { order: "asc" },
+    // ⚡ Bolt: Performance optimization
+    // Run independent database queries concurrently using Promise.all
+    // Expected impact: Significantly reduces Time to First Byte (TTFB) by avoiding waterfall sequential network round trips.
+    const [estimates, changeOrders, expenses, timeEntries, purchaseOrders, invoices] = await Promise.all([
+        prisma.estimate.findMany({
+            where: { projectId },
+            select: {
+                id: true,
+                number: true,
+                title: true,
+                code: true,
+                status: true,
+                totalAmount: true,
+                balanceDue: true,
+                createdAt: true,
+                projectId: true,
+                items: {
+                    include: { costCode: true, costType: true },
+                    orderBy: { order: "asc" },
+                },
             },
-        },
-    });
-
-    const changeOrders = await prisma.changeOrder.findMany({
-        where: { projectId },
-        include: {
-            items: { include: { costCode: true, costType: true } },
-        },
-    });
-
-    const expenses = await prisma.expense.findMany({
-        where: { estimate: { is: { projectId } } },
-        include: { costCode: true, costType: true, item: true },
-    });
-
-    const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
-        include: { costCode: true, costType: true, estimateItem: true, user: { select: { name: true } } },
-    });
-
-    const purchaseOrders = await prisma.purchaseOrder.findMany({
-        where: { projectId, status: { not: "Cancelled" } },
-        include: { items: { include: { costCode: true, costType: true } }, vendor: { select: { name: true } } },
-    });
-
-    const invoices = await prisma.invoice.findMany({
-        where: { projectId },
-        include: { payments: true },
-    });
+        }),
+        prisma.changeOrder.findMany({
+            where: { projectId },
+            include: {
+                items: { include: { costCode: true, costType: true } },
+            },
+        }),
+        prisma.expense.findMany({
+            where: { estimate: { is: { projectId } } },
+            include: { costCode: true, costType: true, item: true },
+        }),
+        prisma.timeEntry.findMany({
+            where: { projectId },
+            include: { costCode: true, costType: true, estimateItem: true, user: { select: { name: true } } },
+        }),
+        prisma.purchaseOrder.findMany({
+            where: { projectId, status: { not: "Cancelled" } },
+            include: { items: { include: { costCode: true, costType: true } }, vendor: { select: { name: true } } },
+        }),
+        prisma.invoice.findMany({
+            where: { projectId },
+            include: { payments: true },
+        })
+    ]);
 
     return {
         estimates: estimates.map((estimate) => ({
