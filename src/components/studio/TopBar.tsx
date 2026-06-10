@@ -7,11 +7,12 @@ import { useState, useRef, useEffect } from "react";
 import {
   ArrowLeft, Undo2, Redo2, Camera, Share2, Lightbulb, LightbulbOff,
   Presentation, Map as MapIcon, Box as BoxIcon, Footprints, Ruler, Check, Loader2, AlertTriangle,
+  Square,
 } from "lucide-react";
 import { toast } from "sonner";
 import { feet, parseFtIn, formatFtIn } from "@/lib/studio/units";
 import { makeRectRoom, makeLShapeRoom } from "@/lib/studio/doc";
-import { polygonBounds } from "@/lib/studio/geometry";
+import { polygonBounds, squareUpPolygon } from "@/lib/studio/geometry";
 import { useStudio, type ViewMode } from "./store";
 import { captureSnapshot, downloadDataUrl } from "./snapshot";
 
@@ -251,6 +252,23 @@ function RoomSizeButton() {
             className="mt-2 w-full rounded-lg bg-blue-600 py-2 text-xs font-bold text-white hover:bg-blue-700"
           >
             Apply size
+          </button>
+
+          <button
+            onClick={() => {
+              const squared = squareUpPolygon(doc.room.points);
+              if (squared) {
+                setRoomShape({ ...doc.room, points: squared });
+                toast.success("Walls squared to 90°");
+              } else {
+                toast.error("Couldn't square these walls up - straighten the worst corner first");
+              }
+            }}
+            className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-200 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            title="Snap every nearly-straight wall to exact horizontal/vertical"
+          >
+            <Square className="h-3.5 w-3.5" />
+            Square up walls
           </button>
 
           <div className="mt-3 border-t border-slate-100 pt-2.5">

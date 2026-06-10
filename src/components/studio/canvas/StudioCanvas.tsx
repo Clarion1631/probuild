@@ -5,7 +5,7 @@
 
 import * as THREE from "three";
 import { Canvas, useThree, useFrame } from "@react-three/fiber";
-import { ContactShadows, Environment, Lightformer } from "@react-three/drei";
+import { ContactShadows, Environment, Grid, Lightformer } from "@react-three/drei";
 import { useEffect, useMemo } from "react";
 import type { DesignDoc } from "@/lib/studio/doc";
 import { polygonBounds, wallSegments } from "@/lib/studio/geometry";
@@ -181,6 +181,23 @@ export function StudioCanvas() {
         intensity={0.5}
         color="#e8ecf4"
       />
+
+      {/* measuring grid - plan view only: 1 ft cells, 4 ft sections */}
+      {view === "plan" && (
+        <Grid
+          position={[0, 0.006, 0]}
+          cellSize={0.3048}
+          cellThickness={0.55}
+          cellColor="#b6c2cf"
+          sectionSize={1.2192}
+          sectionThickness={1}
+          sectionColor="#8da2b5"
+          fadeDistance={70}
+          fadeStrength={0}
+          infiniteGrid
+          raycast={() => null}
+        />
+      )}
 
       <Room doc={doc} />
       <Items doc={doc} />

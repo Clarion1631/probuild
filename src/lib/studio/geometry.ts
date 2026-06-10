@@ -53,6 +53,68 @@ export interface RoomShellInfo {
 }
 
 /**
+ * Straighten a nearly-rectilinear polygon: every wall within `toleranceDeg`
+ * of horizontal/vertical becomes exactly axis-aligned by walking the loop and
+ * carrying the corrected corners forward. Returns null when the result would
+ * not close cleanly or degenerates (caller should keep the original).
+ */
+export function squareUpPolygon(points: Pt[], toleranceDeg = 20): Pt[] | null {
+  const tol = (toleranceDeg * Math.PI) / 180;
+  const n = points.length;
+  const out: Pt[] = [{ ...points[0] }];
+
+  for (let i = 0; i < n - 1; i++) {
+    const cur = out[i];
+    const target = points[i + 1];
+    const dx = target.x - points[i].x;
+    const dz = target.z - points[i].z;
+    const len = Math.hypot(dx, dz);
+    const angle = Math.atan2(dz, dx);
+    // distance to the nearest axis direction (0, 90, 180, 270)
+    const snapped = Math.round(angle / (Math.PI / 2)) * (Math.PI / 2);
+    if (Math.abs(angDelta(angle, snapped)) <= tol) {
+      out.push({
+        x: cur.x + Math.cos(snapped) * len,
+        z: cur.z + Math.sin(snapped) * len,
+      });
+    } else {
+      // leave deliberately-angled walls alone: carry the original offset
+      out.push({ x: cur.x + dx, z: cur.z + dz });
+    }
+  }
+
+  // The loop must close: the last wall runs from out[n-1] back to out[0].
+  // If that closing wall is near-axis, force the final corner onto the axis
+  // of the first point; otherwise accept the drift if it's small.
+  const last = out[n - 1];
+  const first = out[0];
+  const cdx = first.x - last.x;
+  const cdz = first.z - last.z;
+  const cAngle = Math.atan2(cdz, cdx);
+  const cSnapped = Math.round(cAngle / (Math.PI / 2)) * (Math.PI / 2);
+  if (Math.abs(angDelta(cAngle, cSnapped)) <= tol) {
+    // axis-align the closing wall by projecting the last corner
+    if (Math.abs(Math.cos(cSnapped)) > 0.5) last.z = first.z; // closing wall is horizontal
+    else last.x = first.x; // closing wall is vertical
+  }
+
+  if (Math.abs(signedArea(out)) < 0.5) return null;
+  for (let i = 0; i < n; i++) {
+    const a = out[i];
+    const b = out[(i + 1) % n];
+    if (Math.hypot(b.x - a.x, b.z - a.z) < 0.2) return null;
+  }
+  return out;
+}
+
+function angDelta(a: number, b: number): number {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/**
  * Ceiling height at a plan point. Flat rooms return `height`. A slanted
  * (shed) ceiling interpolates from `slope.lowHeight` at the low wall to
  * `height` at the opposite side - only meaningful for 4-corner rect rooms,

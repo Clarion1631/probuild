@@ -2,14 +2,16 @@
 
 // Room Studio - right panel: properties for the selected item or surface.
 
-import { useMemo } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { RotateCw, Copy, Trash2, ArrowUpDown } from "lucide-react";
+import { toast } from "sonner";
 import { getItemDef } from "@/lib/studio/catalog";
 import {
   PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, METALS, FABRICS, WOODS, TILES,
   getFinish, type Finish,
 } from "@/lib/studio/materials";
-import { formatFtIn, inches, toInches } from "@/lib/studio/units";
+import { formatFtIn, inches, toInches, parseFtIn } from "@/lib/studio/units";
+import { wallSegments, signedArea } from "@/lib/studio/geometry";
 import { useStudio, useSelectedItem } from "../store";
 import { Swatch } from "./CatalogPanel";
 
@@ -192,6 +194,7 @@ function ItemInspector() {
 function SurfaceInspector() {
   const activeSurface = useStudio((s) => s.activeSurface);
   const doc = useStudio((s) => s.doc);
+  const docRev = useStudio((s) => s.docRev);
   const setWallPaint = useStudio((s) => s.setWallPaint);
   const setFloorFinish = useStudio((s) => s.setFloorFinish);
 
@@ -228,11 +231,66 @@ function SurfaceInspector() {
           Apply this color to every wall
         </button>
       </div>
+      {/* keyed by edit revision: input text re-derives after every commit */}
+      <WallLengthEditor key={`${wallIdx}:${docRev}`} wallIdx={wallIdx} />
       <div className="grid grid-cols-4 gap-1.5 p-3">
         {PAINTS.map((p) => (
           <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => setWallPaint(wallIdx, p.id)} />
         ))}
       </div>
+    </div>
+  );
+}
+
+/** Exact wall length editing: typing a new length slides the wall's far
+    corner along the wall direction (the next wall adjusts automatically). */
+function WallLengthEditor({ wallIdx }: { wallIdx: number }) {
+  const doc = useStudio((s) => s.doc);
+  const setRoomShape = useStudio((s) => s.setRoomShape);
+  const walls = useMemo(() => wallSegments(doc.room.points), [doc.room.points]);
+  const wall = walls[wallIdx];
+  // Parent keys this component by edit revision, so lazy init stays fresh.
+  const [text, setText] = useState(() => (wall ? formatFtIn(wall.length) : ""));
+
+  if (!wall) return null;
+
+  const apply = () => {
+    const next = parseFtIn(text);
+    if (next === null) {
+      setText(formatFtIn(wall.length));
+      return;
+    }
+    const len = Math.min(inches(720), Math.max(inches(12), next));
+    const points = doc.room.points.map((p) => ({ ...p }));
+    const j = (wallIdx + 1) % points.length;
+    points[j] = {
+      x: wall.a.x + wall.dir.x * len,
+      z: wall.a.z + wall.dir.z * len,
+    };
+    // reject degenerate results (the FOLLOWING wall absorbs the change)
+    const k = (j + 1) % points.length;
+    const nextLen = Math.hypot(points[k].x - points[j].x, points[k].z - points[j].z);
+    if (nextLen < inches(12) || Math.abs(signedArea(points)) < 0.75) {
+      toast.error("That length would collapse the next wall");
+      setText(formatFtIn(wall.length));
+      return;
+    }
+    setRoomShape({ ...doc.room, points });
+  };
+
+  return (
+    <div className="flex items-center justify-between border-b border-slate-100 px-3.5 py-2.5">
+      <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Length</span>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={apply}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+        className="w-24 rounded-md border border-slate-200 px-2 py-1.5 text-right text-xs outline-none focus:border-blue-400"
+      />
     </div>
   );
 }

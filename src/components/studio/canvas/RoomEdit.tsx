@@ -19,6 +19,9 @@ import { useStudio } from "../store";
 const GRID = inches(1);
 const MIN_EDGE = inches(12);
 const MIN_AREA = 0.75; // m^2
+/** Corner drags snap onto a neighbor's x/z axis within this radius - this is
+    what keeps corners at 90 degrees without fighting the user. */
+const AXIS_SNAP = inches(4);
 // Handles float above every wall (max ceiling 16ft + slope headroom). Under
 // the orthographic plan camera their screen position is unchanged, but they
 // become the FIRST raycast hit - at floor level the wall slabs occlude them
@@ -59,6 +62,22 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
   const walls = useMemo(() => wallSegments(points), [points]);
   const origSign = useMemo(() => Math.sign(signedArea(points)), [points]);
   const dragRef = useRef<RoomDrag | null>(null);
+  // Alignment guide lines, mutated directly during drags (no React churn).
+  const guideXRef = useRef<THREE.Mesh>(null);
+  const guideZRef = useRef<THREE.Mesh>(null);
+
+  const setGuides = (gx: number | null, gz: number | null) => {
+    const vx = guideXRef.current;
+    const vz = guideZRef.current;
+    if (vx) {
+      vx.visible = gx !== null;
+      if (gx !== null) vx.position.x = gx;
+    }
+    if (vz) {
+      vz.visible = gz !== null;
+      if (gz !== null) vz.position.z = gz;
+    }
+  };
 
   const intersectFloor = (ray: THREE.Ray): Pt | null => {
     if (Math.abs(ray.direction.y) < 1e-6) return null;
@@ -92,10 +111,27 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
 
     const next = drag.points.map((q) => ({ ...q }));
     if (drag.target.kind === "corner") {
-      next[drag.target.index] = {
-        x: Math.round(p.x / GRID) * GRID,
-        z: Math.round(p.z / GRID) * GRID,
-      };
+      const i = drag.target.index;
+      let x = Math.round(p.x / GRID) * GRID;
+      let z = Math.round(p.z / GRID) * GRID;
+      // Right-angle assist: lock onto a neighboring corner's axis when close,
+      // and show the alignment guide.
+      const prev = drag.points[(i - 1 + next.length) % next.length];
+      const nxt = drag.points[(i + 1) % next.length];
+      let gx: number | null = null;
+      let gz: number | null = null;
+      for (const nb of [prev, nxt]) {
+        if (Math.abs(x - nb.x) < AXIS_SNAP) {
+          x = nb.x;
+          gx = nb.x;
+        }
+        if (Math.abs(z - nb.z) < AXIS_SNAP) {
+          z = nb.z;
+          gz = nb.z;
+        }
+      }
+      setGuides(gx, gz);
+      next[i] = { x, z };
     } else {
       // translate the wall along its normal by the pointer's normal distance
       const w = wallSegments(drag.points)[drag.target.index];
@@ -128,6 +164,7 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
     const drag = dragRef.current;
     if (!drag || e.pointerId !== drag.pointerId) return;
     dragRef.current = null;
+    setGuides(null, null);
     try {
       (e.target as Element).releasePointerCapture(e.pointerId);
     } catch {
@@ -161,6 +198,15 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
 
   return (
     <group>
+      {/* alignment guides - toggled imperatively during corner drags */}
+      <mesh ref={guideXRef} visible={false} position={[0, HANDLE_Y - 0.1, 0]} raycast={() => null}>
+        <boxGeometry args={[0.015, 0.01, 60]} />
+        <meshBasicMaterial color="#16a34a" depthTest={false} />
+      </mesh>
+      <mesh ref={guideZRef} visible={false} position={[0, HANDLE_Y - 0.1, 0]} raycast={() => null}>
+        <boxGeometry args={[60, 0.01, 0.015]} />
+        <meshBasicMaterial color="#16a34a" depthTest={false} />
+      </mesh>
       {/* corner handles */}
       {points.map((p, i) => (
         <group key={`c${i}`} position={[p.x, HANDLE_Y, p.z]}>
