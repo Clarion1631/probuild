@@ -102,6 +102,8 @@ export const FIXTURES: CatalogItem[] = [
   def({ id: "shower-glass", name: "Glass Shower", category: "fixtures", mesh: "shower", w: IN(48), d: IN(36), h: IN(84), mount: "floor", wallSnap: true, resizable: { min: IN(32), max: IN(72), step: IN(4) }, finishes: { metal: "metal-matte-black", tile: "tile-white-subway" }, tags: ["shower", "glass", "walk-in"] }),
   def({ id: "pedestal-sink", name: "Pedestal Sink", category: "fixtures", mesh: "pedestal-sink", w: IN(24), d: IN(20), h: IN(34), mount: "floor", wallSnap: true, finishes: { faucet: "metal-chrome" }, tags: ["bathroom", "sink"] }),
   def({ id: "fireplace", name: "Fireplace", category: "fixtures", mesh: "fireplace", w: IN(60), d: IN(16), h: IN(48), mount: "floor", wallSnap: true, resizable: { min: IN(42), max: IN(84), step: IN(6) }, finishes: { surround: "tile-marble-herringbone", mantel: "wood-oak" }, emitsLight: true, tags: ["fireplace", "living", "mantel"] }),
+  def({ id: "shower-niche", name: "Shower Niche", category: "fixtures", mesh: "shower-niche", w: IN(24), d: IN(3.5), h: IN(14), mount: "wall", elevation: IN(42), wallSnap: true, resizable: { min: IN(12), max: IN(60), step: IN(2) }, finishes: { tile: "tile-white-subway", trim: "metal-brushed-nickel" }, tags: ["niche", "shower", "shampoo", "recessed", "bathroom"] }),
+  def({ id: "pony-wall", name: "Pony Wall", category: "fixtures", mesh: "pony-wall", w: IN(48), d: IN(5), h: IN(36), mount: "floor", resizable: { min: IN(18), max: IN(120), step: IN(2) }, finishes: { paint: "paint-soft-chalk", cap: "wood-oak" }, tags: ["half wall", "knee wall", "pony", "divider", "stub"] }),
 ];
 
 // -------------------------------- Lighting --------------------------------
@@ -117,6 +119,7 @@ export const LIGHTING: CatalogItem[] = [
   def({ id: "floor-lamp", name: "Floor Lamp", category: "lighting", mesh: "floor-lamp", w: IN(16), d: IN(16), h: IN(62), mount: "floor", finishes: { metal: "metal-brass", shade: "fab-oat" }, emitsLight: true, tags: ["lamp", "floor"] }),
   def({ id: "table-lamp", name: "Table Lamp", category: "lighting", mesh: "table-lamp", w: IN(12), d: IN(12), h: IN(22), mount: "counter", elevation: 0, finishes: { metal: "metal-brass", shade: "fab-oat" }, emitsLight: true, tags: ["lamp", "table"] }),
   def({ id: "track-light", name: "Track Lighting", category: "lighting", mesh: "track", w: IN(48), d: IN(5), h: IN(8), mount: "ceiling", resizable: { min: IN(24), max: IN(96), step: IN(12) }, finishes: { metal: "metal-matte-black" }, emitsLight: true, tags: ["track"] }),
+  def({ id: "under-cab-light", name: "Under-Cabinet Light", category: "lighting", mesh: "under-cab-light", w: IN(30), d: IN(2), h: IN(1.2), mount: "wall", elevation: IN(52.5), wallSnap: true, resizable: { min: IN(12), max: IN(48), step: IN(6) }, emitsLight: true, tags: ["under cabinet", "strip", "task", "led"] }),
 ];
 
 // ----------------------------- Doors & Windows -----------------------------

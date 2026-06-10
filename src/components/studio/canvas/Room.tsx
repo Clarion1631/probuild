@@ -4,10 +4,12 @@
 // per-wall paint, camera-facing wall auto-hide (dollhouse view).
 
 import * as THREE from "three";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { type ThreeEvent } from "@react-three/fiber";
 import type { DesignDoc, PlacedItem } from "@/lib/studio/doc";
-import { wallSegments, inwardLocalZ, type WallSeg } from "@/lib/studio/geometry";
+import {
+  wallSegments, inwardLocalZ, roomHeightAt, type WallSeg, type RoomShellInfo,
+} from "@/lib/studio/geometry";
 import { getFinish } from "@/lib/studio/materials";
 import { getItemDef } from "@/lib/studio/catalog";
 import { useStudio } from "../store";
@@ -129,27 +131,46 @@ function openingsByWall(items: PlacedItem[], walls: WallSeg[], wallThickness: nu
   return map;
 }
 
-/** Slice one wall (length L x height H) around its openings into rectangles. */
-function wallSlices(L: number, H: number, openings: Opening[]): Array<{ x: number; y: number; w: number; h: number }> {
-  const slices: Array<{ x: number; y: number; w: number; h: number }> = [];
-  const sorted = [...openings]
-    .map((o) => ({ ...o, start: Math.max(0, o.at - o.width / 2), end: Math.min(L, o.at + o.width / 2) }))
-    .filter((o) => o.end > o.start && o.y1 > o.y0)
-    .sort((a, b) => a.start - b.start);
+/**
+ * Build one wall as a 2D outline (wall-local: x along the wall, y up) with
+ * its openings as holes, extruded to the wall thickness. The top edge can be
+ * sloped (shed ceilings), which boxes-per-slice couldn't represent.
+ */
+function buildWallGeometry(
+  L: number,
+  hStart: number,
+  hEnd: number,
+  openings: Opening[],
+  thickness: number,
+): THREE.ExtrudeGeometry {
+  const outline = new THREE.Shape();
+  outline.moveTo(0, 0);
+  outline.lineTo(L, 0);
+  outline.lineTo(L, hEnd);
+  outline.lineTo(0, hStart);
+  outline.closePath();
 
-  let cursor = 0;
-  for (const o of sorted) {
-    if (o.start > cursor + 0.001) slices.push({ x: cursor, y: 0, w: o.start - cursor, h: H });
-    const left = Math.max(cursor, o.start);
-    const width = o.end - left;
-    if (width > 0.001) {
-      if (o.y0 > 0.001) slices.push({ x: left, y: 0, w: width, h: o.y0 });
-      if (o.y1 < H - 0.001) slices.push({ x: left, y: o.y1, w: width, h: H - o.y1 });
-    }
-    cursor = Math.max(cursor, o.end);
+  const heightAt = (x: number) => hStart + (hEnd - hStart) * (x / L);
+  for (const o of openings) {
+    const start = Math.max(0.01, o.at - o.width / 2);
+    const end = Math.min(L - 0.01, o.at + o.width / 2);
+    if (end - start < 0.02) continue;
+    // keep the hole inside the (possibly sloped) outline
+    const maxTop = Math.min(heightAt(start), heightAt(end)) - 0.04;
+    const y0 = Math.max(0, o.y0);
+    const y1 = Math.min(o.y1, maxTop);
+    if (y1 - y0 < 0.02) continue;
+    const hole = new THREE.Path();
+    hole.moveTo(start, y0);
+    hole.lineTo(end, y0);
+    hole.lineTo(end, y1);
+    hole.lineTo(start, y1);
+    hole.closePath();
+    outline.holes.push(hole);
   }
-  if (cursor < L - 0.001) slices.push({ x: cursor, y: 0, w: L - cursor, h: H });
-  return slices;
+
+  const geo = new THREE.ExtrudeGeometry(outline, { depth: thickness, bevelEnabled: false });
+  return geo;
 }
 
 export function Room({ doc }: { doc: DesignDoc }) {
@@ -159,6 +180,10 @@ export function Room({ doc }: { doc: DesignDoc }) {
 
   const walls = useMemo(() => wallSegments(doc.room.points), [doc.room.points]);
   const inwardZ = useMemo(() => inwardLocalZ(doc.room.points), [doc.room.points]);
+  const shell: RoomShellInfo = useMemo(
+    () => ({ points: doc.room.points, height: doc.room.height, slope: doc.room.slope }),
+    [doc.room.points, doc.room.height, doc.room.slope],
+  );
   const openings = useMemo(
     () => openingsByWall(doc.items, walls, doc.room.wallThickness),
     [doc.items, walls, doc.room.wallThickness],
@@ -204,7 +229,6 @@ export function Room({ doc }: { doc: DesignDoc }) {
   };
 
   const t = doc.room.wallThickness;
-  const H = doc.room.height;
 
   return (
     <group>
@@ -229,11 +253,11 @@ export function Room({ doc }: { doc: DesignDoc }) {
       <group>
         {walls.map((w) => {
           const finish = getFinish(paintFor(w.index), WALL_FALLBACK);
-          const slices = wallSlices(w.length, H, openings.get(w.index) ?? []);
+          const hStart = roomHeightAt(shell, w.a);
+          const hEnd = roomHeightAt(shell, w.b);
           const angle = Math.atan2(w.b.z - w.a.z, w.b.x - w.a.x);
           const isActive = activeSurface?.kind === "wall" && activeSurface.wallIndex === w.index;
-          // Inner wall face sits exactly on the polygon edge; slab extends outward.
-          const slabZ = -inwardZ * (t / 2);
+          const level = Math.abs(hStart - hEnd) < 0.005;
           return (
             <group
               key={w.index}
@@ -241,26 +265,34 @@ export function Room({ doc }: { doc: DesignDoc }) {
               rotation={[0, -angle, 0]}
               userData={{ wallIndex: w.index }}
             >
-              {slices.map((s, i) => (
-                <mesh
-                  key={i}
-                  position={[s.x + s.w / 2, s.y + s.h / 2, slabZ]}
-                  castShadow
-                  receiveShadow
-                  onClick={(e) => onWallClick(e, w.index)}
-                >
-                  <boxGeometry args={[s.w, s.h, t]} />
-                  <meshStandardMaterial
-                    color={isActive ? blend(finish.hex, "#5b8dd6", 0.3) : finish.hex}
-                    roughness={finish.roughness ?? 0.94}
-                  />
-                </mesh>
-              ))}
+              <WallMesh
+                length={w.length}
+                hStart={hStart}
+                hEnd={hEnd}
+                openings={openings.get(w.index) ?? []}
+                thickness={t}
+                inwardZ={inwardZ}
+                color={isActive ? blend(finish.hex, "#5b8dd6", 0.3) : finish.hex}
+                roughness={finish.roughness ?? 0.94}
+                onClick={(e) => onWallClick(e, w.index)}
+              />
               {/* baseboard on the interior face */}
               <mesh position={[w.length / 2, 0.057, inwardZ * 0.011]} receiveShadow raycast={() => null}>
                 <boxGeometry args={[w.length, 0.114, 0.022]} />
                 <meshStandardMaterial color="#eceae3" roughness={0.7} />
               </mesh>
+              {/* crown molding - level walls only (sloped tops skip it) */}
+              {doc.room.crown && level && (
+                <mesh
+                  position={[w.length / 2, hStart - 0.045, inwardZ * 0.019]}
+                  rotation={[inwardZ * Math.PI / 4, 0, 0]}
+                  receiveShadow
+                  raycast={() => null}
+                >
+                  <boxGeometry args={[w.length, 0.095, 0.012]} />
+                  <meshStandardMaterial color="#f2f0ea" roughness={0.65} />
+                </mesh>
+              )}
             </group>
           );
         })}
@@ -268,15 +300,68 @@ export function Room({ doc }: { doc: DesignDoc }) {
 
       {/* Ceiling - walk mode only so orbit/plan stay open */}
       {view === "walk" && (
-        <mesh rotation={[Math.PI / 2, 0, 0]} position={[0, H, 0]}>
-          <shapeGeometry args={[floorShape]} />
-          <meshStandardMaterial
-            color={getFinish(doc.surfaces.ceiling, "paint-pure-white").hex}
-            side={THREE.DoubleSide}
-            roughness={0.95}
-          />
-        </mesh>
+        <CeilingMesh
+          shell={shell}
+          color={getFinish(doc.surfaces.ceiling, "paint-pure-white").hex}
+        />
       )}
     </group>
+  );
+}
+
+function WallMesh({
+  length, hStart, hEnd, openings, thickness, inwardZ, color, roughness, onClick,
+}: {
+  length: number;
+  hStart: number;
+  hEnd: number;
+  openings: Opening[];
+  thickness: number;
+  inwardZ: 1 | -1;
+  color: string;
+  roughness: number;
+  onClick: (e: ThreeEvent<MouseEvent>) => void;
+}) {
+  const geometry = useMemo(
+    () => buildWallGeometry(length, hStart, hEnd, openings, thickness),
+    [length, hStart, hEnd, openings, thickness],
+  );
+  // free the previous geometry when a rebuild replaces it
+  useEffect(() => () => geometry.dispose(), [geometry]);
+  // Extrusion grows along +Z from the shape plane; shift so the INNER face
+  // lands exactly on the polygon edge and the slab body extends outward.
+  const zOffset = inwardZ === 1 ? -thickness : 0;
+  return (
+    <mesh
+      geometry={geometry}
+      position={[0, 0, zOffset]}
+      castShadow
+      receiveShadow
+      onClick={onClick}
+    >
+      <meshStandardMaterial color={color} roughness={roughness} />
+    </mesh>
+  );
+}
+
+/** Flat or tilted ceiling plane built from the room polygon with per-corner heights. */
+function CeilingMesh({ shell, color }: { shell: RoomShellInfo; color: string }) {
+  const geometry = useMemo(() => {
+    const pts = shell.points;
+    const positions: number[] = [];
+    const indices: number[] = [];
+    for (const p of pts) positions.push(p.x, roomHeightAt(shell, p), p.z);
+    for (let i = 1; i < pts.length - 1; i++) indices.push(0, i, i + 1);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    return geo;
+  }, [shell]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
+  return (
+    <mesh geometry={geometry}>
+      <meshStandardMaterial color={color} side={THREE.DoubleSide} roughness={0.95} />
+    </mesh>
   );
 }

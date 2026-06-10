@@ -14,6 +14,7 @@ import { Room } from "./Room";
 import { Items } from "./Items";
 import { Placement } from "./Placement";
 import { Controls } from "./Controls";
+import { RoomEdit } from "./RoomEdit";
 
 /** Exposes the GL trio for snapshot capture without re-rendering React. */
 export interface CanvasHandles {
@@ -67,9 +68,6 @@ function HandleBridge() {
   const advance = useThree((s) => s.advance);
   useEffect(() => {
     liveHandles = { gl, scene, camera, advance: () => advance(performance.now() / 1000, true) };
-    // Generated env map provides reflections; keep its diffuse contribution low
-    // so the directional/hemisphere rig stays in charge of overall brightness.
-    scene.environmentIntensity = 0.55;
     if (process.env.NODE_ENV === "development") {
       (window as unknown as { __studio?: CanvasHandles }).__studio = liveHandles;
     }
@@ -119,18 +117,21 @@ export function StudioCanvas() {
 
   const shadowSpan = Math.max(bounds.width, bounds.length) * 0.9 + 2;
 
-  if (process.env.NODE_ENV === "development") console.log("[studio] StudioCanvas render");
   return (
     <Canvas
       shadows={{ type: THREE.PCFSoftShadowMap }}
       dpr={[1, 1.75]}
       resize={{ scroll: false, debounce: 0 }}
-      onCreated={() => console.log("[studio] R3F created")}
       gl={{
         antialias: true,
         toneMapping: THREE.ACESFilmicToneMapping,
         toneMappingExposure: 1.12,
         preserveDrawingBuffer: true,
+      }}
+      onCreated={(state) => {
+        // Generated env map provides reflections; keep its diffuse contribution
+        // low so the directional/hemisphere rig stays in charge of brightness.
+        state.scene.environmentIntensity = 0.55;
       }}
       onPointerMissed={() => {
         select(null);
@@ -184,6 +185,7 @@ export function StudioCanvas() {
       <Room doc={doc} />
       <Items doc={doc} />
       <Placement doc={doc} />
+      <RoomEdit doc={doc} />
       <DollhouseSync doc={doc} />
 
       {/* grounding shadow outside the room footprint (plan/orbit polish) */}

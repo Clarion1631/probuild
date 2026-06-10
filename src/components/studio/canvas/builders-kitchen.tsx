@@ -585,6 +585,51 @@ export function PedestalSink({ w, d, h, finishes }: BuilderProps) {
   );
 }
 
+/**
+ * Recessed shower niche. Mounts on a wall; the visible part is a tiled inset
+ * with a trim frame and a center shelf - reads as recessed without needing a
+ * real wall cutout.
+ */
+export function ShowerNiche({ w, d, h, finishes }: BuilderProps) {
+  const tile = mat(finishes.tile, "tile-white-subway");
+  const trim = mat(finishes.trim, "metal-brushed-nickel");
+  const inset = Math.min(d, IN(3.5));
+  return (
+    <group>
+      {/* trim frame sits proud of the wall face */}
+      <Box s={[w, IN(0.8), IN(0.6)]} p={[0, h - IN(0.4), inset / 2]} m={trim} castShadow={false} />
+      <Box s={[w, IN(0.8), IN(0.6)]} p={[0, IN(0.4), inset / 2]} m={trim} castShadow={false} />
+      <Box s={[IN(0.8), h, IN(0.6)]} p={[-w / 2 + IN(0.4), h / 2, inset / 2]} m={trim} castShadow={false} />
+      <Box s={[IN(0.8), h, IN(0.6)]} p={[w / 2 - IN(0.4), h / 2, inset / 2]} m={trim} castShadow={false} />
+      {/* recessed box: back + sides + top/bottom in tile, slightly darker back */}
+      <Box s={[w - IN(1.6), h - IN(1.6), IN(0.4)]} p={[0, h / 2, -inset / 2]} m={matShade(finishes.tile, 0.12, "tile-white-subway")} castShadow={false} />
+      <Box s={[w - IN(1.6), IN(0.5), inset]} p={[0, IN(0.85), 0]} m={tile} castShadow={false} />
+      <Box s={[w - IN(1.6), IN(0.5), inset]} p={[0, h - IN(0.85), 0]} m={tile} castShadow={false} />
+      <Box s={[IN(0.5), h - IN(1.6), inset]} p={[-w / 2 + IN(1.05), h / 2, 0]} m={tile} castShadow={false} />
+      <Box s={[IN(0.5), h - IN(1.6), inset]} p={[w / 2 - IN(1.05), h / 2, 0]} m={tile} castShadow={false} />
+      {/* glass center shelf */}
+      <Box s={[w - IN(1.8), IN(0.3), inset - IN(0.4)]} p={[0, h / 2, 0]} m={glassMat()} castShadow={false} />
+    </group>
+  );
+}
+
+/**
+ * Pony / knee wall - a freestanding half-height wall stub with a cap. Place
+ * against walls or in the open to split spaces (tub surrounds, stair edges,
+ * room dividers).
+ */
+export function PonyWall({ w, d, h, finishes }: BuilderProps) {
+  return (
+    <group>
+      <Box s={[w, h - IN(1.2), d]} p={[0, (h - IN(1.2)) / 2, 0]} m={mat(finishes.paint, "paint-soft-chalk")} />
+      {/* cap with a slight overhang */}
+      <Box s={[w + IN(1.5), IN(1.2), d + IN(1.5)]} p={[0, h - IN(0.6), 0]} m={mat(finishes.cap, "wood-oak")} />
+      {/* baseboard wrap */}
+      <Box s={[w + IN(0.6), IN(4.5), d + IN(0.6)]} p={[0, IN(2.25), 0]} m={fixedMat("pony-base", () => new THREE.MeshStandardMaterial({ color: "#eceae3", roughness: 0.7 }))} castShadow={false} />
+    </group>
+  );
+}
+
 export function Fireplace({ w, d, h, finishes, lightsOn }: BuilderProps) {
   const boxW = w * 0.55;
   const boxH = h * 0.5;

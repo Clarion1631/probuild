@@ -152,6 +152,8 @@ function ViewToggle({ view, setView, floating }: { view: ViewMode; setView: (v: 
   );
 }
 
+const SLOPE_SIDES = ["North", "East", "South", "West"];
+
 function RoomSizeButton() {
   const doc = useStudio((s) => s.doc);
   const setRoomShape = useStudio((s) => s.setRoomShape);
@@ -162,14 +164,17 @@ function RoomSizeButton() {
   const [wText, setWText] = useState("");
   const [lText, setLText] = useState("");
   const [hText, setHText] = useState("");
-  const [shape, setShape] = useState<"rect" | "l-shape">(doc.room.points.length > 4 ? "l-shape" : "rect");
+  const [lowText, setLowText] = useState("");
+
+  const isRect = doc.room.points.length === 4;
+  const slope = doc.room.slope;
 
   useEffect(() => {
     if (open) {
       setWText(formatFtIn(bounds.width));
       setLText(formatFtIn(bounds.length));
       setHText(formatFtIn(doc.room.height));
-      setShape(doc.room.points.length > 4 ? "l-shape" : "rect");
+      setLowText(formatFtIn(doc.room.slope?.lowHeight ?? feet(5)));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -183,19 +188,42 @@ function RoomSizeButton() {
     return () => window.removeEventListener("mousedown", onDown);
   }, [open]);
 
-  const apply = () => {
-    const w = parseFtIn(wText) ?? bounds.width;
-    const l = parseFtIn(lText) ?? bounds.length;
-    const h = parseFtIn(hText) ?? doc.room.height;
-    const clampedW = Math.min(feet(60), Math.max(feet(4), w));
-    const clampedL = Math.min(feet(60), Math.max(feet(4), l));
-    const clampedH = Math.min(feet(16), Math.max(feet(7), h));
-    if (shape === "l-shape") {
-      setRoomShape(makeLShapeRoom(clampedW, clampedL, clampedW * 0.45, clampedL * 0.45, clampedH));
-    } else {
-      setRoomShape(makeRectRoom(clampedW, clampedL, clampedH));
-    }
+  // Scale the EXISTING polygon to the new bounding box - keeps custom and
+  // angled shapes intact instead of resetting them.
+  const applyDims = () => {
+    const w = Math.min(feet(60), Math.max(feet(4), parseFtIn(wText) ?? bounds.width));
+    const l = Math.min(feet(60), Math.max(feet(4), parseFtIn(lText) ?? bounds.length));
+    const h = Math.min(feet(16), Math.max(feet(7), parseFtIn(hText) ?? doc.room.height));
+    const sx = bounds.width > 0 ? w / bounds.width : 1;
+    const sz = bounds.length > 0 ? l / bounds.length : 1;
+    const points = doc.room.points.map((p) => ({
+      x: (p.x - bounds.center.x) * sx,
+      z: (p.z - bounds.center.z) * sz,
+    }));
+    setRoomShape({ ...doc.room, points, height: h });
     setOpen(false);
+  };
+
+  const resetLayout = (shape: "rect" | "l-shape") => {
+    const w = Math.min(feet(60), Math.max(feet(4), parseFtIn(wText) ?? bounds.width));
+    const l = Math.min(feet(60), Math.max(feet(4), parseFtIn(lText) ?? bounds.length));
+    const h = Math.min(feet(16), Math.max(feet(7), parseFtIn(hText) ?? doc.room.height));
+    const base = shape === "l-shape"
+      ? makeLShapeRoom(w, l, w * 0.45, l * 0.45, h)
+      : makeRectRoom(w, l, h);
+    // slope only survives onto rect layouts
+    setRoomShape({ ...base, crown: doc.room.crown, slope: shape === "rect" ? doc.room.slope : undefined });
+  };
+
+  const setCrown = (on: boolean) => setRoomShape({ ...doc.room, crown: on || undefined });
+
+  const setSlopeSide = (idx: number | null) => {
+    if (idx === null) {
+      setRoomShape({ ...doc.room, slope: undefined });
+    } else {
+      const low = Math.min(doc.room.height - feet(1), Math.max(feet(3), parseFtIn(lowText) ?? feet(5)));
+      setRoomShape({ ...doc.room, slope: { lowWallIndex: idx, lowHeight: low } });
+    }
   };
 
   return (
@@ -208,33 +236,88 @@ function RoomSizeButton() {
         {formatFtIn(bounds.width)} x {formatFtIn(bounds.length)}
       </button>
       {open && (
-        <div className="absolute left-0 top-10 z-30 w-64 rounded-xl border border-slate-200 bg-white p-3.5 shadow-xl">
+        <div className="absolute left-0 top-10 z-30 w-72 rounded-xl border border-slate-200 bg-white p-3.5 shadow-xl">
           <div className="mb-2 text-xs font-bold text-slate-700">Room size</div>
-          <div className="mb-2 flex gap-1">
-            {(["rect", "l-shape"] as const).map((s) => (
-              <button
-                key={s}
-                onClick={() => setShape(s)}
-                className={`flex-1 rounded-md px-2 py-1.5 text-[11px] font-semibold ${
-                  shape === s ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                }`}
-              >
-                {s === "rect" ? "Rectangle" : "L-Shape"}
-              </button>
-            ))}
-          </div>
           <div className="space-y-2">
             <SizeInput label="Width" value={wText} onChange={setWText} />
             <SizeInput label="Length" value={lText} onChange={setLText} />
             <SizeInput label="Ceiling" value={hText} onChange={setHText} />
           </div>
-          <div className="mt-1.5 text-[10px] text-slate-400">Use formats like 12&apos;6&quot; or 150&quot;</div>
+          <div className="mt-1.5 text-[10px] text-slate-400">
+            Formats like 12&apos;6&quot; or 150&quot;. Resizing keeps your wall shape - drag walls and corners directly in Plan view.
+          </div>
           <button
-            onClick={apply}
-            className="mt-2.5 w-full rounded-lg bg-blue-600 py-2 text-xs font-bold text-white hover:bg-blue-700"
+            onClick={applyDims}
+            className="mt-2 w-full rounded-lg bg-blue-600 py-2 text-xs font-bold text-white hover:bg-blue-700"
           >
-            Apply
+            Apply size
           </button>
+
+          <div className="mt-3 border-t border-slate-100 pt-2.5">
+            <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">Reset layout</div>
+            <div className="flex gap-1">
+              <button onClick={() => resetLayout("rect")} className="flex-1 rounded-md bg-slate-100 px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-200">
+                Rectangle
+              </button>
+              <button onClick={() => resetLayout("l-shape")} className="flex-1 rounded-md bg-slate-100 px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-200">
+                L-Shape
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-3 border-t border-slate-100 pt-2.5">
+            <label className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Crown molding</span>
+              <input
+                type="checkbox"
+                checked={!!doc.room.crown}
+                onChange={(e) => setCrown(e.target.checked)}
+                className="h-4 w-4 accent-blue-600"
+              />
+            </label>
+          </div>
+
+          <div className="mt-3 border-t border-slate-100 pt-2.5">
+            <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">Slanted ceiling</div>
+            {isRect ? (
+              <>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => setSlopeSide(null)}
+                    className={`flex-1 rounded-md px-1.5 py-1.5 text-[11px] font-semibold ${!slope ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"}`}
+                  >
+                    Off
+                  </button>
+                  {SLOPE_SIDES.map((label, idx) => (
+                    <button
+                      key={label}
+                      onClick={() => setSlopeSide(idx)}
+                      title={`Low side: ${label}`}
+                      className={`flex-1 rounded-md px-1.5 py-1.5 text-[11px] font-semibold ${slope?.lowWallIndex === idx ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"}`}
+                    >
+                      {label[0]}
+                    </button>
+                  ))}
+                </div>
+                {slope && (
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold text-slate-500">Low-side height</span>
+                    <input
+                      value={lowText}
+                      onChange={(e) => setLowText(e.target.value)}
+                      onBlur={() => setSlopeSide(slope.lowWallIndex)}
+                      onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Enter") setSlopeSide(slope.lowWallIndex); }}
+                      className="w-20 rounded-md border border-slate-200 px-2 py-1.5 text-right text-xs outline-none focus:border-blue-400"
+                    />
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="text-[10.5px] leading-snug text-slate-400">
+                Available for 4-corner rectangular rooms.
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

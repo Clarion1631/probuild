@@ -34,6 +34,12 @@ export interface PlacedItem {
   label?: string;
 }
 
+export interface RoomSlope {
+  /** Wall index whose top edge drops to lowHeight; the opposite side keeps room.height. Rect rooms only. */
+  lowWallIndex: number;
+  lowHeight: number;
+}
+
 export interface DesignDoc {
   version: 2;
   room: {
@@ -41,6 +47,10 @@ export interface DesignDoc {
     points: Pt[];
     height: number;
     wallThickness: number;
+    /** Crown molding strip along the top of every level wall. */
+    crown?: boolean;
+    /** Slanted (shed) ceiling - only honored for 4-corner rectangular rooms. */
+    slope?: RoomSlope;
   };
   surfaces: {
     floor: string;

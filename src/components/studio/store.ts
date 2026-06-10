@@ -56,6 +56,9 @@ interface StudioState {
   setCeilingFinish: (finishId: string) => void;
   setWallPaint: (wallIndex: number | "all", finishId: string) => void;
   setRoomShape: (room: DesignDoc["room"]) => void;
+  /** Live preview while dragging walls/corners in plan view - no undo step,
+      no dirty flag. Call setRoomShape with the final shape on release. */
+  previewRoomShape: (room: DesignDoc["room"]) => void;
   saveCamera: (camera: DesignDoc["camera"]) => void;
 
   undo: () => void;
@@ -193,6 +196,8 @@ export const useStudio = create<StudioState>((set, get) => ({
     const s = get();
     s.commitDoc({ ...s.doc, room });
   },
+
+  previewRoomShape: (room) => set((s) => ({ doc: { ...s.doc, room } })),
 
   saveCamera: (camera) => {
     // Camera saves should NOT create undo steps; fold into the doc silently

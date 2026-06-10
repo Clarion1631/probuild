@@ -132,6 +132,22 @@ export function TableLamp({ w, h, finishes, lightsOn }: BuilderProps) {
   );
 }
 
+/**
+ * Under-cabinet light strip. Mounts to the wall just below upper cabinets;
+ * a slim channel with a warm glowing diffuser when lights are on.
+ */
+export function UnderCabinetLight({ w, h, lightsOn }: BuilderProps) {
+  return (
+    <group>
+      <Box s={[w, h, IN(1.1)]} p={[0, h / 2, 0]} m={mat("metal-matte-black", "metal-matte-black")} castShadow={false} />
+      <Box s={[w - IN(0.6), h * 0.45, IN(0.5)]} p={[0, h * 0.3, IN(0.4)]} m={bulbMat(!!lightsOn)} castShadow={false} />
+      {lightsOn && (
+        <pointLight position={[0, -IN(2), IN(2)]} intensity={0.35} distance={1.6} decay={2} color="#ffe2b0" />
+      )}
+    </group>
+  );
+}
+
 export function Track({ w, d, h, finishes, lightsOn }: BuilderProps) {
   const metal = mat(finishes.metal, "metal-matte-black");
   const heads = Math.max(3, Math.round(w / IN(16)));

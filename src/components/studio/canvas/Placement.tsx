@@ -8,6 +8,7 @@ import * as THREE from "three";
 import { useMemo, useRef, useEffect, useState, useCallback } from "react";
 import type { ThreeEvent } from "@react-three/fiber";
 import type { DesignDoc } from "@/lib/studio/doc";
+import type { CatalogItem } from "@/lib/studio/catalog";
 import {
   wallSegments, nearestWall, wallFacingRotation, pointInPolygon, snapToNeighbors, type OBB,
 } from "@/lib/studio/geometry";
@@ -20,6 +21,12 @@ const GRID = inches(1);
 
 export function Placement({ doc }: { doc: DesignDoc }) {
   const placing = useStudio((s) => s.placing);
+  if (!placing) return null;
+  // Keyed by item id: pose state resets naturally when the armed item changes.
+  return <PlacementInner key={placing.id} doc={doc} placing={placing} />;
+}
+
+function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem }) {
   const setPlacing = useStudio((s) => s.setPlacing);
   const addItem = useStudio((s) => s.addItem);
   const lightsOn = useStudio((s) => s.lightsOn);
@@ -27,10 +34,11 @@ export function Placement({ doc }: { doc: DesignDoc }) {
   const walls = useMemo(() => wallSegments(doc.room.points), [doc.room.points]);
   const [pose, setPose] = useState<{ x: number; z: number; rotation: number } | null>(null);
   const poseRef = useRef(pose);
-  poseRef.current = pose;
+  useEffect(() => {
+    poseRef.current = pose;
+  }, [pose]);
 
   const obbOthers = useMemo<OBB[]>(() => {
-    if (!placing) return [];
     return doc.items
       .map((o) => {
         const ro = resolveItem(o);
@@ -41,19 +49,14 @@ export function Placement({ doc }: { doc: DesignDoc }) {
   }, [doc.items, placing]);
 
   useEffect(() => {
-    if (!placing) {
-      setPose(null);
-      return;
-    }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setPlacing(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [placing, setPlacing]);
+  }, [setPlacing]);
 
   const computePose = useCallback((pt: { x: number; z: number }) => {
-    if (!placing) return null;
     let x = pt.x;
     let z = pt.z;
     let rotation = poseRef.current?.rotation ?? 0;
@@ -101,14 +104,10 @@ export function Placement({ doc }: { doc: DesignDoc }) {
     return { x, z, rotation };
   }, [placing, walls, obbOthers, doc.room.points]);
 
-  if (!placing) return null;
-
   const Builder = BUILDERS[placing.mesh];
   const baseY = placing.mount === "ceiling"
     ? doc.room.height - placing.h
-    : placing.mount === "wall"
-      ? placing.elevation ?? 0
-      : placing.elevation ?? 0;
+    : placing.elevation ?? 0;
 
   const onMove = (e: ThreeEvent<PointerEvent>) => {
     const next = computePose({ x: e.point.x, z: e.point.z });

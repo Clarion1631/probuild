@@ -13,6 +13,7 @@ import {
 import { PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, getFinish } from "@/lib/studio/materials";
 import { formatIn, formatFtIn } from "@/lib/studio/units";
 import { useStudio } from "../store";
+import { useItemThumbnail } from "./thumbnails";
 
 type Tab = "items" | "paint" | "floors";
 
@@ -129,6 +130,7 @@ export function CatalogPanel() {
 }
 
 function ItemCard({ item, active, onClick }: { item: CatalogItem; active: boolean; onClick: () => void }) {
+  const thumb = useItemThumbnail(item);
   const accent = item.finishes
     ? getFinish(item.finishes.cabinet ?? item.finishes.fabric ?? item.finishes.wood ?? item.finishes.metal ?? Object.values(item.finishes)[0], "cab-white").hex
     : "#cbd5e1";
@@ -142,10 +144,15 @@ function ItemCard({ item, active, onClick }: { item: CatalogItem; active: boolea
       }`}
     >
       <div
-        className="mb-1.5 flex h-12 items-center justify-center rounded-lg"
-        style={{ background: `linear-gradient(135deg, ${accent}33, ${accent}66)` }}
+        className="mb-1.5 flex h-16 items-center justify-center overflow-hidden rounded-lg"
+        style={{ background: `linear-gradient(150deg, ${accent}1f, ${accent}4d)` }}
       >
-        <span className="text-slate-700">{CATEGORY_ICONS[item.category]}</span>
+        {thumb ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={thumb} alt={item.name} className="h-full w-full object-contain" draggable={false} />
+        ) : (
+          <span className="text-slate-600">{CATEGORY_ICONS[item.category]}</span>
+        )}
       </div>
       <span className="truncate text-[11px] font-semibold text-slate-800">{item.name}</span>
       <span className="text-[10px] text-slate-400">

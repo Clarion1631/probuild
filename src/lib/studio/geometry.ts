@@ -46,6 +46,37 @@ export function inwardLocalZ(points: Pt[]): 1 | -1 {
   return signedArea(points) > 0 ? 1 : -1;
 }
 
+export interface RoomShellInfo {
+  points: Pt[];
+  height: number;
+  slope?: { lowWallIndex: number; lowHeight: number };
+}
+
+/**
+ * Ceiling height at a plan point. Flat rooms return `height`. A slanted
+ * (shed) ceiling interpolates from `slope.lowHeight` at the low wall to
+ * `height` at the opposite side - only meaningful for 4-corner rect rooms,
+ * which is enforced by the UI.
+ */
+export function roomHeightAt(room: RoomShellInfo, p: Pt): number {
+  const s = room.slope;
+  if (!s || room.points.length !== 4) return room.height;
+  const walls = wallSegments(room.points);
+  const low = walls[s.lowWallIndex];
+  if (!low) return room.height;
+  // distance from the low wall plane along its inward normal
+  const d = (p.x - low.a.x) * low.normal.x + (p.z - low.a.z) * low.normal.z;
+  // room depth along that axis = distance of the farthest corner
+  let span = 0;
+  for (const c of room.points) {
+    const dc = (c.x - low.a.x) * low.normal.x + (c.z - low.a.z) * low.normal.z;
+    span = Math.max(span, dc);
+  }
+  if (span < 1e-6) return room.height;
+  const t = Math.min(1, Math.max(0, d / span));
+  return s.lowHeight + (room.height - s.lowHeight) * t;
+}
+
 export function pointInPolygon(p: Pt, points: Pt[]): boolean {
   let inside = false;
   for (let i = 0, j = points.length - 1; i < points.length; j = i++) {

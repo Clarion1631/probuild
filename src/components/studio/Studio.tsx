@@ -72,7 +72,7 @@ function HintBar() {
   if (placing) hint = "Click to place - Shift keeps placing - Esc cancels";
   else if (selectedId) hint = "Drag to move - blue dot spins - R rotates 90 - Ctrl+D duplicates - Del removes";
   else if (view === "walk") hint = "Drag to look around - W A S D to walk";
-  else if (view === "plan") hint = "Scroll to zoom - drag to pan - click any piece to select it";
+  else if (view === "plan") hint = "Drag blue dots to reshape walls - double-click a wall dot to add a corner - drag pieces to move them";
   else hint = "Drag to orbit - right-drag to pan - scroll to zoom - click walls or floor to change colors";
 
   return (

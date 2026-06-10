@@ -12,7 +12,7 @@ import type { DesignDoc, PlacedItem } from "@/lib/studio/doc";
 import { getItemDef, type CatalogItem } from "@/lib/studio/catalog";
 import {
   wallSegments, nearestWall, wallFacingRotation, snapToNeighbors,
-  pointInPolygon, type WallSeg, type OBB,
+  pointInPolygon, roomHeightAt, type WallSeg, type OBB, type RoomShellInfo,
 } from "@/lib/studio/geometry";
 import { inches, formatFtIn } from "@/lib/studio/units";
 import { useStudio } from "../store";
@@ -64,22 +64,32 @@ interface DragState {
 const DRAG_START_M = 0.015;
 
 export function Items({ doc }: { doc: DesignDoc }) {
-  const ceilingH = doc.room.height;
   const walls = useMemo(() => wallSegments(doc.room.points), [doc.room.points]);
+  const shell: RoomShellInfo = useMemo(
+    () => ({ points: doc.room.points, height: doc.room.height, slope: doc.room.slope }),
+    [doc.room.points, doc.room.height, doc.room.slope],
+  );
 
   // Cap real point lights for perf; remaining emitters stay emissive-only.
-  let lightBudget = MAX_REAL_LIGHTS;
+  const lightItemIds = useMemo(() => {
+    const ids = new Set<string>();
+    let budget = MAX_REAL_LIGHTS;
+    for (const item of doc.items) {
+      if (budget <= 0) break;
+      const def = getItemDef(item.defId);
+      if (def?.emitsLight) {
+        ids.add(item.id);
+        budget -= 1;
+      }
+    }
+    return ids;
+  }, [doc.items]);
 
   return (
     <group>
       {doc.items.map((item) => {
         const r = resolveItem(item);
         if (!r) return null;
-        let allowLight = false;
-        if (r.def.emitsLight && lightBudget > 0) {
-          allowLight = true;
-          lightBudget -= 1;
-        }
         return (
           <ItemNode
             key={item.id}
@@ -87,8 +97,8 @@ export function Items({ doc }: { doc: DesignDoc }) {
             walls={walls}
             roomPoints={doc.room.points}
             allItems={doc.items}
-            ceilingH={ceilingH}
-            allowLight={allowLight}
+            shell={shell}
+            allowLight={lightItemIds.has(item.id)}
           />
         );
       })}
@@ -97,13 +107,13 @@ export function Items({ doc }: { doc: DesignDoc }) {
 }
 
 function ItemNode({
-  resolved, walls, roomPoints, allItems, ceilingH, allowLight,
+  resolved, walls, roomPoints, allItems, shell, allowLight,
 }: {
   resolved: ResolvedItem;
   walls: WallSeg[];
   roomPoints: DesignDoc["room"]["points"];
   allItems: PlacedItem[];
-  ceilingH: number;
+  shell: RoomShellInfo;
   allowLight: boolean;
 }) {
   const { item, def, w, d, h, finishes } = resolved;
@@ -115,8 +125,10 @@ function ItemNode({
   const groupRef = useRef<THREE.Group>(null);
   const dragRef = useRef<DragState | null>(null);
 
-  // Ceiling items mount at the ceiling regardless of stored y.
-  const baseY = def.mount === "ceiling" ? ceilingH - h : resolved.y;
+  // Ceiling items hang from the (possibly sloped) ceiling at their position.
+  const baseY = def.mount === "ceiling"
+    ? roomHeightAt(shell, { x: item.x, z: item.z }) - h
+    : resolved.y;
 
   const Builder = BUILDERS[def.mesh];
 
@@ -423,15 +435,16 @@ function SelectionChrome({
           <meshBasicMaterial color="#2563eb" transparent opacity={0.7} depthWrite={false} />
         </mesh>
       </group>
-      {/* dims label */}
-      <Html position={[0, 0.05, -hd - 0.12]} center distanceFactor={7} zIndexRange={[20, 0]}>
+      {/* dims label - fixed screen size (distanceFactor breaks under the
+          orthographic plan camera and blows the label up to fill the view) */}
+      <Html position={[0, 0.05, -hd - 0.12]} center zIndexRange={[20, 0]}>
         <div
           style={{
             background: "rgba(15,23,42,0.85)",
             color: "#fff",
-            padding: "4px 10px",
+            padding: "3px 9px",
             borderRadius: 7,
-            fontSize: 13,
+            fontSize: 12,
             fontFamily: "system-ui, sans-serif",
             whiteSpace: "nowrap",
             pointerEvents: "none",
