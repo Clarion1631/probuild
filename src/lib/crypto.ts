@@ -1,10 +1,13 @@
 import crypto from "crypto";
 
 const ALGORITHM = "aes-256-gcm";
-const SECRET = process.env.NEXTAUTH_SECRET || "development-secret-key-at-least-32-chars-long!!";
+const SECRET = process.env.NEXTAUTH_SECRET;
 
 // Derive a 256-bit key from the secret
 function getEncryptionKey(): Buffer {
+    if (!SECRET) {
+        throw new Error("NEXTAUTH_SECRET environment variable is not configured. Failing securely.");
+    }
     return crypto.createHash("sha256").update(SECRET).digest();
 }
 
