@@ -4,6 +4,7 @@ import { authOptions } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
+import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
 
 export const dynamic = 'force-dynamic';
 
@@ -19,7 +20,7 @@ export default async function VarianceReportPage() {
 
     // Get all projects with their time entries grouped by cost code
     const projects = await prisma.project.findMany({
-        where: { status: "In Progress" },
+        where: { status: { in: OPEN_PROJECT_STATUSES } },
         include: {
             estimates: {
                 include: {

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import twilio from "twilio";
 import { prisma } from "@/lib/prisma";
 import { normalizeE164 } from "@/lib/phone";
+import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
 
 // Twilio's default opt-out / help / start keywords. Twilio handles the
 // auto-reply for these itself at the Messaging Service level — we just
@@ -116,7 +117,7 @@ export async function POST(request: Request) {
             projectId = lastOutbound.projectId;
         } else {
             const activeProject = await prisma.project.findFirst({
-                where: { clientId: client.id, status: "In Progress" },
+                where: { clientId: client.id, status: { in: OPEN_PROJECT_STATUSES } },
                 orderBy: { viewedAt: "desc" },
                 select: { id: true },
             });

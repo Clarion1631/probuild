@@ -6,8 +6,9 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import ClientCombobox from "@/components/ClientCombobox";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
+import { PROJECT_STATUS_VALUES } from "@/lib/project-status";
 
-const DEFAULT_STATUS_OPTIONS = ["Open", "In Progress", "Paid, Ready to Start", "Done", "Closed"];
+const DEFAULT_STATUS_OPTIONS = PROJECT_STATUS_VALUES;
 
 export default function NewProjectModal({
     onClose,

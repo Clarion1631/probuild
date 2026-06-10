@@ -165,10 +165,9 @@ export default function EditLeadModal({ isOpen, onClose, lead, client }: { isOpe
                                     <option value="New">New</option>
                                     <option value="Followed Up">Followed Up</option>
                                     <option value="Connected">Connected</option>
-                                    <option value="Meeting Scheduled">Meeting Scheduled</option>
                                     <option value="Estimate Sent">Estimate Sent</option>
                                     <option value="Won">Won</option>
-                                    <option value="Closed">Closed</option>
+                                    <option value="Closed Lost">Closed Lost</option>
                                 </select>
                             </div>
                         </div>

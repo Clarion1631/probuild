@@ -19,7 +19,7 @@ type TabKey = "All" | "New" | "Hot" | "Qualified" | "Won" | "Lost" | "Snoozed" |
 const HOT_STAGES = ["Connected", "Estimate Sent"];
 const QUALIFIED_STAGES = ["Followed Up", "Connected"];
 const WON_STAGE = "Won";
-const LOST_STAGE = "Closed";
+const LOST_STAGE = "Closed Lost";
 const NEW_STAGE = "New";
 
 function TabButton({ active, onClick, count, children }: {

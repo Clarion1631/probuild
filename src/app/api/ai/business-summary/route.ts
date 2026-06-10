@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
         }),
     ]);
 
-    const activeProjects = projects.filter(p => p.status === "Active" || p.status === "In Progress");
+    const activeProjects = projects.filter(p => p.status === "In Progress" || p.status === "Substantial Completion" || p.status === "Active");
     const totalPipeline = leads.reduce((s, l) => s + Number(l.targetRevenue || 0), 0);
     const wonLeads = leads.filter(l => l.stage === "Won");
     const totalRevenue = invoices.reduce((s, i) => s + Number(i.totalAmount || 0), 0);

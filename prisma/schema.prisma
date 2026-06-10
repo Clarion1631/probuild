@@ -74,7 +74,7 @@ model Lead {
   name              String
   clientId          String
   client            Client    @relation(fields: [clientId], references: [id])
-  stage             String    @default("New") // New, Followed Up, Connected, Estimate Sent, Won, Closed
+  stage             String    @default("New") // New, Followed Up, Connected, Estimate Sent, Won, Closed Lost
   source            String? // My website, Houzz, Manually created lead
   projectType       String?
   location          String?
@@ -170,7 +170,7 @@ model Project {
   locationLat            Float?
   locationLng            Float?
   geofenceRadiusMeters   Int?     @default(100)
-  status              String                       @default("In Progress") // In Progress, Closed, Paid Ready to Start
+  status              String                       @default("In Progress") // In Progress, Substantial Completion, Closed Complete, Closed Lost (see lib/project-status.ts)
   type                String? // Kitchen Remodeling, Patio, Water Damage
   code                String?
   tags                String?

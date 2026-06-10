@@ -45,7 +45,7 @@ export async function GET(req: Request) {
                 name: 'Fisher water damage',
                 clientId: client2.id,
                 location: 'Vancouver, Washington',
-                status: 'Closed',
+                status: 'Closed Lost',
                 type: 'Water Damage Restoration',
                 code: '#1001'
             }
@@ -122,7 +122,7 @@ export async function GET(req: Request) {
                 name: 'Parkin Laundry Room',
                 clientId: client4.id,
                 location: 'Vancouver, Washington',
-                status: 'Open',
+                status: 'In Progress',
                 type: 'Laundry Room',
                 code: '#1003'
             }
@@ -144,7 +144,7 @@ export async function GET(req: Request) {
                 name: 'Anspach Bedroom',
                 clientId: client6.id,
                 location: 'Vancouver, Washington',
-                status: 'Done',
+                status: 'Closed Complete',
                 type: 'Bedroom Remodel',
                 code: '#1005'
             }
@@ -155,7 +155,7 @@ export async function GET(req: Request) {
                 name: 'Atherton Kitchen',
                 clientId: client7.id,
                 location: 'Vancouver, Washington',
-                status: 'Paid, Ready to Start',
+                status: 'In Progress',
                 type: 'Kitchen Remodel',
                 code: '#1006'
             }
@@ -166,7 +166,7 @@ export async function GET(req: Request) {
                 name: 'OHaver Garage Conversion',
                 clientId: client8.id,
                 location: 'Portland, Oregon',
-                status: 'Open',
+                status: 'Substantial Completion',
                 type: 'Garage Conversion',
                 code: '#1007'
             }
