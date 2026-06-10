@@ -30,6 +30,14 @@
 - Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
 - Auto-deploy is **disabled**. Deploy manually via `vercel --prod`
 
+## Room Studio (3D room designer)
+- Lives in `src/components/studio/` + `src/lib/studio/` (react-three-fiber). The legacy `room-designer` modules are gone — don't recreate them.
+- Document model: `RoomDesign.layoutJson` holds a v2 `DesignDoc` (`lib/studio/doc.ts`); placed items mirror into `RoomAsset` rows. v1 layouts upgrade on load.
+- Catalog/finishes/templates are code-seeded (`lib/studio/catalog.ts`, `materials.ts`, `templates.ts`) — no GLTF downloads, all meshes procedural (`components/studio/canvas/builders-*.tsx`).
+- Perf contract: nothing writes to the zustand store per-frame; drags mutate three.js objects and commit on pointerup. No postprocessing. Keep it that way.
+- LiDAR intake: `POST /api/rooms/scan-import` (RoomPlan JSON or simplified corners). Mobile capture screen: gtr-probuild-mobile `apps/mobile/app/room-scan.tsx`.
+- Client sharing: `/share/room/[token]` (public route in AppLayout) + portal Designs tab lists share-enabled rooms.
+
 ## Product Vision
 See **VISION.md** — AI-first remodeling platform. Every feature should ask: "What can AI do here so the human doesn't have to?"
 

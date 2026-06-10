@@ -54,8 +54,14 @@ interface DragState {
   /** Pointer-to-item offset on the drag plane, so items don't jump to cursor. */
   offX: number;
   offZ: number;
+  /** Plane point at pointer-down; movement under DRAG_START_M is click jitter. */
+  startX: number;
+  startZ: number;
   cur: { x: number; z: number; rotation: number };
 }
+
+/** Pointer must travel this far on the floor plane before a drag begins. */
+const DRAG_START_M = 0.015;
 
 export function Items({ doc }: { doc: DesignDoc }) {
   const ceilingH = doc.room.height;
@@ -212,12 +218,16 @@ function ItemNode({
       moved: false,
       offX: 0,
       offZ: 0,
+      startX: 0,
+      startZ: 0,
       cur: { x: item.x, z: item.z, rotation: item.rotation },
     };
     const p = intersectPlane(e.ray, planeY);
     if (p) {
       dragRef.current.offX = item.x - p.x;
       dragRef.current.offZ = item.z - p.z;
+      dragRef.current.startX = p.x;
+      dragRef.current.startZ = p.z;
     }
     useStudio.getState().select(item.id);
   };
@@ -228,6 +238,8 @@ function ItemNode({
     const p = intersectPlane(e.ray, planeY);
     if (!p) return;
     if (!drag.moved) {
+      // ignore click jitter - selection clicks shouldn't start a drag
+      if (Math.hypot(p.x - drag.startX, p.z - drag.startZ) < DRAG_START_M) return;
       drag.moved = true;
       useStudio.getState().setDragging(true);
     }
@@ -252,11 +264,27 @@ function ItemNode({
     }
     if (drag.moved) {
       useStudio.getState().setDragging(false);
-      useStudio.getState().updateItem(item.id, {
-        x: drag.cur.x,
-        z: drag.cur.z,
-        rotation: drag.cur.rotation,
-      });
+      // No-op commits (snapped back to the start) shouldn't dirty the doc
+      // or burn an undo step.
+      const changed =
+        Math.abs(drag.cur.x - item.x) > 1e-6 ||
+        Math.abs(drag.cur.z - item.z) > 1e-6 ||
+        Math.abs(drag.cur.rotation - item.rotation) > 1e-6;
+      if (changed) {
+        useStudio.getState().updateItem(item.id, {
+          x: drag.cur.x,
+          z: drag.cur.z,
+          rotation: drag.cur.rotation,
+        });
+      } else {
+        // restore the transient three.js pose to the committed one
+        const g = groupRef.current;
+        if (g) {
+          g.position.x = item.x;
+          g.position.z = item.z;
+          g.rotation.y = item.rotation;
+        }
+      }
     }
   };
 

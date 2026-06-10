@@ -202,13 +202,28 @@ export function fromRoomRecord(record: ApiRoomRecord): DesignDoc {
   const length = clampNum(dims.length, feet(6), feet(60), feet(10));
   const height = clampNum(dims.height, feet(7), feet(20), feet(9));
 
+  // makeRectRoom wall order: 0 = north, 1 = east, 2 = south, 3 = west.
+  const walls: Record<string, string> = {
+    all: upgradeFinish(v1.surfaces?.["wall-north"], DEFAULT_SURFACES.wall),
+  };
+  const V1_WALL_INDEX: Array<[string, number]> = [
+    ["wall-north", 0],
+    ["wall-east", 1],
+    ["wall-south", 2],
+    ["wall-west", 3],
+  ];
+  for (const [key, idx] of V1_WALL_INDEX) {
+    const finish = v1.surfaces?.[key];
+    if (finish) walls[String(idx)] = upgradeFinish(finish, DEFAULT_SURFACES.wall);
+  }
+
   const doc: DesignDoc = {
     version: 2,
     room: makeRectRoom(width, length, height),
     surfaces: {
       floor: upgradeFinish(v1.surfaces?.floor, DEFAULT_SURFACES.floor),
       ceiling: DEFAULT_SURFACES.ceiling,
-      walls: { all: upgradeFinish(v1.surfaces?.["wall-north"], DEFAULT_SURFACES.wall) },
+      walls,
     },
     items: [],
   };

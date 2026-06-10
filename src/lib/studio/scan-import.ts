@@ -124,6 +124,8 @@ interface WallLine {
   a: Pt;
   b: Pt;
   height: number;
+  /** Surface center height above the floor (transform origin Y). */
+  centerY: number;
 }
 
 function roomPlanToDoc(capture: RoomPlanCapture): DesignDoc {
@@ -153,7 +155,7 @@ function roomPlanToDoc(capture: RoomPlanCapture): DesignDoc {
   };
 
   const walls = wallSegments(points);
-  const place = (s: RoomPlanSurface, defId: string, defaultH: number, sill?: number) => {
+  const place = (s: RoomPlanSurface, defId: string, defaultH: number, useSill?: boolean) => {
     const line = surfaceToLine(s);
     if (!line) return;
     const cx = (line.a.x + line.b.x) / 2 - offset.x;
@@ -161,20 +163,29 @@ function roomPlanToDoc(capture: RoomPlanCapture): DesignDoc {
     const hit = nearestWall({ x: cx, z: cz }, walls);
     if (!hit || hit.distance > 0.6) return;
     const width = clamp(Math.hypot(line.b.x - line.a.x, line.b.z - line.a.z) || inches(32), inches(12), inches(192));
+    const h = clamp(line.height || defaultH, inches(12), feet(12));
+    // Window sill = surface center height minus half its height. RoomPlan's
+    // world origin sits on the floor; centerY <= 0 means the transform didn't
+    // carry a usable elevation, so fall back to a standard 30" sill.
+    let y: number | undefined;
+    if (useSill) {
+      const sill = line.centerY > 0.01 ? line.centerY - h / 2 : inches(30);
+      y = clamp(sill, 0, feet(8));
+    }
     doc.items.push({
       id: newItemId(),
       defId,
       x: hit.point.x,
       z: hit.point.z,
-      y: sill,
+      y,
       rotation: wallFacingRotation(hit.wall),
       w: width,
-      h: clamp(line.height || defaultH, inches(12), feet(12)),
+      h,
     });
   };
 
   for (const d of capture.doors ?? []) place(d, "door-single", inches(80));
-  for (const w of capture.windows ?? []) place(w, "window-single", inches(48), inches(30));
+  for (const w of capture.windows ?? []) place(w, "window-single", inches(48), true);
   for (const o of capture.openings ?? []) place(o, "doorway-open", inches(80));
 
   return doc;
@@ -191,6 +202,7 @@ function surfaceToLine(s: RoomPlanSurface): WallLine | null {
   // Column-major simd_float4x4: basis X = (t[0], t[1], t[2]), origin = (t[12], t[13], t[14]).
   // RoomPlan's plan axes are X/Z (Y up) - project to the floor plane.
   const ox = num(t[12]);
+  const oy = num(t[13]);
   const oz = num(t[14]);
   const bx = num(t[0]);
   const bz = num(t[2]);
@@ -201,6 +213,7 @@ function surfaceToLine(s: RoomPlanSurface): WallLine | null {
     a: { x: ox - (ux * w) / 2, z: oz - (uz * w) / 2 },
     b: { x: ox + (ux * w) / 2, z: oz + (uz * w) / 2 },
     height: h,
+    centerY: oy,
   };
 }
 
@@ -208,12 +221,17 @@ function surfaceToLine(s: RoomPlanSurface): WallLine | null {
  * Order scanned wall segments into a closed polygon: greedily chain each
  * wall's far endpoint to the nearest endpoint of an unused wall. RoomPlan
  * walls arrive unordered and with small gaps at corners; endpoints within
- * 30 cm snap together.
+ * 50 cm snap together (averaged - a sub-tolerance skew of the joined wall
+ * is accepted; it's within RoomPlan's own corner tolerance).
+ *
+ * Throws when the walls don't form one closed loop (an unmatched gap, or
+ * leftover walls) - a truncated polygon must not silently become a room.
  */
 function chainWalls(lines: WallLine[]): Pt[] {
+  const GAP = 0.5;
   const used = new Array(lines.length).fill(false);
   const pts: Pt[] = [];
-  let cur = lines[0];
+  const cur = lines[0];
   used[0] = true;
   pts.push(cur.a);
   let tail = cur.b;
@@ -229,7 +247,11 @@ function chainWalls(lines: WallLine[]): Pt[] {
       if (dA < bestDist) { bestDist = dA; bestIdx = i; bestFlip = false; }
       if (dB < bestDist) { bestDist = dB; bestIdx = i; bestFlip = true; }
     }
-    if (bestIdx === -1 || bestDist > 0.5) break;
+    if (bestIdx === -1 || bestDist > GAP) {
+      throw new ScanImportError(
+        "Scan walls don't connect into a closed room - try re-scanning with slower passes at the corners",
+      );
+    }
     used[bestIdx] = true;
     const w = lines[bestIdx];
     const from = bestFlip ? w.b : w.a;
@@ -238,7 +260,13 @@ function chainWalls(lines: WallLine[]): Pt[] {
     pts.push({ x: (tail.x + from.x) / 2, z: (tail.z + from.z) / 2 });
     tail = to;
   }
-  pts.push(tail);
+
+  // the loop must close back to the first wall's start
+  if (Math.hypot(tail.x - pts[0].x, tail.z - pts[0].z) > GAP) {
+    throw new ScanImportError(
+      "Scan walls don't close back to the starting corner - the room outline is incomplete",
+    );
+  }
   return pts;
 }
 

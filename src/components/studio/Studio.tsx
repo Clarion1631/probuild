@@ -87,6 +87,10 @@ function HintBar() {
 function useAutosave(roomId: string) {
   const dirty = useStudio((s) => s.dirty);
   const dragging = useStudio((s) => s.dragging);
+  const docRev = useStudio((s) => s.docRev);
+  // Bumped after a failed save so the effect re-arms a retry even when no new
+  // edits arrive (dirty/docRev alone wouldn't change).
+  const [retryTick, setRetryTick] = useState(0);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inflight = useRef(false);
   const lastThumb = useRef(0);
@@ -98,6 +102,7 @@ function useAutosave(roomId: string) {
       if (inflight.current) return;
       inflight.current = true;
       const s = useStudio.getState();
+      const savedRev = s.docRev;
       s.markSaving();
       try {
         const payload: Record<string, unknown> = toApiPayload(s.doc);
@@ -115,9 +120,13 @@ function useAutosave(roomId: string) {
           body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error(String(res.status));
-        useStudio.getState().markSaved();
+        // Only clears dirty if no edits landed while the request was in
+        // flight; otherwise saveState returns to "unsaved" and the effect
+        // below re-arms because docRev changed.
+        useStudio.getState().markSaved(savedRev);
       } catch {
         useStudio.getState().markSaveError();
+        setRetryTick((t) => t + 1); // re-arm a retry after the debounce period
       } finally {
         inflight.current = false;
       }
@@ -125,9 +134,11 @@ function useAutosave(roomId: string) {
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [dirty, dragging, roomId]);
+  }, [dirty, dragging, roomId, docRev, retryTick]);
 
-  // Flush on tab hide / close so the last edits always land.
+  // Flush pending edits whenever the page goes away: tab close (pagehide /
+  // beforeunload), tab background (visibilitychange on document - it does not
+  // reliably reach window listeners), and client-side route changes (unmount).
   useEffect(() => {
     const flush = () => {
       const s = useStudio.getState();
@@ -147,11 +158,14 @@ function useAutosave(roomId: string) {
     const onVis = () => {
       if (document.visibilityState === "hidden") flush();
     };
-    window.addEventListener("visibilitychange", onVis);
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("pagehide", flush);
     window.addEventListener("beforeunload", flush);
     return () => {
-      window.removeEventListener("visibilitychange", onVis);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("pagehide", flush);
       window.removeEventListener("beforeunload", flush);
+      flush(); // App Router navigation unmounts without any page event
     };
   }, [roomId]);
 }

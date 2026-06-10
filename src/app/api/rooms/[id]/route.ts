@@ -101,11 +101,13 @@ export async function PUT(req: Request, { params }: RouteParams) {
         thumbnail?: string;
     } = {};
     if (body.layoutJson !== undefined) updates.layoutJson = body.layoutJson as any;
-    // Small JPEG data-URL preview for room cards. Cap size so a hostile client
-    // can't balloon the row.
+    // Small raster data-URL preview for room cards. Strict prefix (no SVG -
+    // it can carry script) and a size cap so a hostile client can't balloon
+    // the row. Invalid thumbnails are dropped rather than failing the save:
+    // the layout payload matters more than a cosmetic preview.
     if (
         typeof body.thumbnail === "string" &&
-        body.thumbnail.startsWith("data:image/") &&
+        /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(body.thumbnail) &&
         body.thumbnail.length < 400_000
     ) {
         updates.thumbnail = body.thumbnail;

@@ -38,6 +38,9 @@ export async function POST(req: Request) {
     if (!body.scan || typeof body.scan !== "object") {
         return NextResponse.json({ error: "Missing scan payload" }, { status: 400 });
     }
+    if (body.name !== undefined && typeof body.name !== "string") {
+        return NextResponse.json({ error: "name must be a string" }, { status: 400 });
+    }
 
     if (projectId) {
         const ok = await userCanAccessProject(user, projectId);

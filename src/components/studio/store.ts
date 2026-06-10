@@ -30,6 +30,9 @@ interface StudioState {
   dragging: boolean;
   saveState: SaveState;
   dirty: boolean;
+  /** Monotonic edit revision - bumped on EVERY doc change. Autosave compares
+      the revision it saved against the current one before clearing dirty. */
+  docRev: number;
   /** Bumped on every doc replacement that ISN'T from user edits (load, undo) so canvas effects can resync. */
   docEpoch: number;
 
@@ -39,7 +42,8 @@ interface StudioState {
   // -- lifecycle --
   loadDoc: (doc: DesignDoc) => void;
   markSaving: () => void;
-  markSaved: () => void;
+  /** Clear dirty only if nothing changed since `savedRev` was captured. */
+  markSaved: (savedRev: number) => void;
   markSaveError: () => void;
 
   // -- edits (each = undo step) --
@@ -78,6 +82,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   dragging: false,
   saveState: "saved",
   dirty: false,
+  docRev: 0,
   docEpoch: 0,
   undoStack: [],
   redoStack: [],
@@ -90,11 +95,17 @@ export const useStudio = create<StudioState>((set, get) => ({
       selectedId: null,
       dirty: false,
       saveState: "saved",
+      docRev: s.docRev + 1,
       docEpoch: s.docEpoch + 1,
     })),
 
   markSaving: () => set({ saveState: "saving" }),
-  markSaved: () => set({ saveState: "saved", dirty: false }),
+  markSaved: (savedRev) =>
+    set((s) =>
+      s.docRev === savedRev
+        ? { saveState: "saved", dirty: false }
+        : { saveState: "unsaved" }, // newer edits arrived while saving - stay dirty
+    ),
   markSaveError: () => set({ saveState: "error" }),
 
   commitDoc: (next) =>
@@ -104,6 +115,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       redoStack: [],
       dirty: true,
       saveState: "unsaved",
+      docRev: s.docRev + 1,
     })),
 
   addItem: (defId, pos) => {
@@ -183,9 +195,14 @@ export const useStudio = create<StudioState>((set, get) => ({
   },
 
   saveCamera: (camera) => {
-    // Camera saves should NOT create undo steps or dirty the doc aggressively;
-    // fold it into doc silently and mark dirty without pushing undo.
-    set((s) => ({ doc: { ...s.doc, camera }, dirty: true, saveState: s.saveState === "saved" ? "unsaved" : s.saveState }));
+    // Camera saves should NOT create undo steps; fold into the doc silently
+    // but still bump the revision so autosave sees the change.
+    set((s) => ({
+      doc: { ...s.doc, camera },
+      dirty: true,
+      docRev: s.docRev + 1,
+      saveState: s.saveState === "saved" ? "unsaved" : s.saveState,
+    }));
   },
 
   undo: () =>
@@ -199,6 +216,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         dirty: true,
         saveState: "unsaved",
         selectedId: null,
+        docRev: s.docRev + 1,
         docEpoch: s.docEpoch + 1,
       };
     }),
@@ -214,6 +232,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         dirty: true,
         saveState: "unsaved",
         selectedId: null,
+        docRev: s.docRev + 1,
         docEpoch: s.docEpoch + 1,
       };
     }),
