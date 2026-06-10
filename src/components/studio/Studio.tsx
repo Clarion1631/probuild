@@ -4,8 +4,10 @@
 // the panel layout around the canvas.
 
 import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import type { DesignDoc } from "@/lib/studio/doc";
 import { toApiPayload } from "@/lib/studio/doc";
+import { removeCornerFromPolygon } from "@/lib/studio/geometry";
 import { useStudio } from "./store";
 import { StudioCanvas } from "./canvas/StudioCanvas";
 import { CatalogPanel } from "./panels/CatalogPanel";
@@ -72,7 +74,7 @@ function HintBar() {
   if (placing) hint = "Click to place - Shift keeps placing - Esc cancels";
   else if (selectedId) hint = "Drag to move - blue dot spins - R rotates 90 - Ctrl+D duplicates - Del removes";
   else if (view === "walk") hint = "Drag to look around - W A S D to walk";
-  else if (view === "plan") hint = "Drag blue dots to reshape - corners snap square to green guides - click a wall to edit its length and color";
+  else if (view === "plan") hint = "Drag blue dots to reshape (they snap square) - click a corner or wall for more options - double-click a wall dot adds a corner";
   else hint = "Drag to orbit - right-drag to pan - scroll to zoom - click walls or floor to change colors";
 
   return (
@@ -199,6 +201,20 @@ function useKeyboardShortcuts() {
         if (s.selectedId) {
           e.preventDefault();
           s.removeItem(s.selectedId);
+        } else if (s.activeSurface?.kind === "corner") {
+          e.preventDefault();
+          const next = removeCornerFromPolygon(s.doc.room.points, s.activeSurface.index);
+          if (next) {
+            s.setRoomShape({
+              ...s.doc.room,
+              points: next,
+              slope: next.length === 4 ? s.doc.room.slope : undefined,
+            });
+            s.setActiveSurface(null);
+            toast.success("Corner removed - Ctrl+Z to undo");
+          } else {
+            toast.error("This corner can't be removed - the room would collapse");
+          }
         }
         return;
       }

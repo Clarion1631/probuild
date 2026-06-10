@@ -115,6 +115,23 @@ function angDelta(a: number, b: number): number {
 }
 
 /**
+ * Remove one corner from a room polygon. Returns the new points, or null if
+ * the result would degenerate (fewer than 3 corners, collapsed area, or a
+ * too-short wall).
+ */
+export function removeCornerFromPolygon(points: Pt[], index: number): Pt[] | null {
+  if (points.length <= 3) return null;
+  const next = points.filter((_, i) => i !== index);
+  if (Math.abs(signedArea(next)) < 0.75) return null;
+  for (let i = 0; i < next.length; i++) {
+    const a = next[i];
+    const b = next[(i + 1) % next.length];
+    if (Math.hypot(b.x - a.x, b.z - a.z) < 0.3048) return null;
+  }
+  return next;
+}
+
+/**
  * Ceiling height at a plan point. Flat rooms return `height`. A slanted
  * (shed) ceiling interpolates from `slope.lowHeight` at the low wall to
  * `height` at the opposite side - only meaningful for 4-corner rect rooms,

@@ -11,7 +11,7 @@ import {
   getFinish, type Finish,
 } from "@/lib/studio/materials";
 import { formatFtIn, inches, toInches, parseFtIn } from "@/lib/studio/units";
-import { wallSegments, signedArea } from "@/lib/studio/geometry";
+import { wallSegments, signedArea, removeCornerFromPolygon } from "@/lib/studio/geometry";
 import { useStudio, useSelectedItem } from "../store";
 import { Swatch } from "./CatalogPanel";
 
@@ -200,6 +200,10 @@ function SurfaceInspector() {
 
   if (!activeSurface) return null;
 
+  if (activeSurface.kind === "corner") {
+    return <CornerInspector index={activeSurface.index} />;
+  }
+
   if (activeSurface.kind === "floor") {
     return (
       <div className="flex h-full w-[270px] shrink-0 flex-col overflow-y-auto border-l border-slate-200 bg-white">
@@ -237,6 +241,56 @@ function SurfaceInspector() {
         {PAINTS.map((p) => (
           <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => setWallPaint(wallIdx, p.id)} />
         ))}
+      </div>
+    </div>
+  );
+}
+
+function CornerInspector({ index }: { index: number }) {
+  const doc = useStudio((s) => s.doc);
+  const setRoomShape = useStudio((s) => s.setRoomShape);
+  const setActiveSurface = useStudio((s) => s.setActiveSurface);
+  const p = doc.room.points[index];
+  if (!p) return null;
+
+  const removable = removeCornerFromPolygon(doc.room.points, index) !== null;
+
+  const remove = () => {
+    const next = removeCornerFromPolygon(doc.room.points, index);
+    if (!next) {
+      toast.error("This corner can't be removed - the room would collapse");
+      return;
+    }
+    setRoomShape({
+      ...doc.room,
+      points: next,
+      slope: next.length === 4 ? doc.room.slope : undefined,
+    });
+    setActiveSurface(null);
+    toast.success("Corner removed - Ctrl+Z to undo");
+  };
+
+  return (
+    <div className="flex h-full w-[270px] shrink-0 flex-col overflow-y-auto border-l border-slate-200 bg-white">
+      <div className="border-b border-slate-100 p-3.5">
+        <div className="text-sm font-bold text-slate-800">Corner {index + 1}</div>
+        <div className="mt-0.5 text-[11px] text-slate-400">
+          {formatFtIn(p.x)} , {formatFtIn(p.z)} from room center
+        </div>
+      </div>
+      <div className="p-3.5">
+        <button
+          onClick={remove}
+          disabled={!removable}
+          className="w-full rounded-lg border border-red-200 py-2 text-xs font-bold text-red-600 hover:bg-red-50 disabled:opacity-40 disabled:hover:bg-transparent"
+        >
+          Remove corner (merge the two walls)
+        </button>
+        <p className="mt-2.5 text-[10.5px] leading-relaxed text-slate-400">
+          Drag the dot to move this corner - it snaps square to neighboring corners.
+          Removing it joins the two walls that meet here into one straight wall.
+          You can also press <b>Del</b> while it&apos;s selected.
+        </p>
       </div>
     </div>
   );

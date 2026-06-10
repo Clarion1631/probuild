@@ -11,6 +11,7 @@ import * as THREE from "three";
 import { useMemo, useRef } from "react";
 import { Html } from "@react-three/drei";
 import type { ThreeEvent } from "@react-three/fiber";
+import { toast } from "sonner";
 import type { DesignDoc, Pt } from "@/lib/studio/doc";
 import { wallSegments, signedArea, polygonBounds } from "@/lib/studio/geometry";
 import { inches, formatFtIn } from "@/lib/studio/units";
@@ -36,16 +37,6 @@ interface RoomDrag {
   origRoom: DesignDoc["room"];
   points: Pt[];
   moved: boolean;
-}
-
-function validPolygon(points: Pt[]): boolean {
-  if (Math.abs(signedArea(points)) < MIN_AREA) return false;
-  for (let i = 0; i < points.length; i++) {
-    const a = points[i];
-    const b = points[(i + 1) % points.length];
-    if (Math.hypot(b.x - a.x, b.z - a.z) < MIN_EDGE) return false;
-  }
-  return true;
 }
 
 export function RoomEdit({ doc }: { doc: DesignDoc }) {
@@ -170,13 +161,26 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
     } catch {
       // already released
     }
-    if (!drag.moved) return;
-    useStudio.getState().setDragging(false);
     const s = useStudio.getState();
+    if (drag.moved) s.setDragging(false);
+
     const finalRoom = s.doc.room;
-    // restore the original silently, then commit the final shape as ONE undo step
-    s.previewRoomShape(drag.origRoom);
-    s.setRoomShape(finalRoom);
+    const changed =
+      drag.moved &&
+      JSON.stringify(finalRoom.points) !== JSON.stringify(drag.origRoom.points);
+
+    if (changed) {
+      // restore the original silently, then commit the final shape as ONE undo step
+      s.previewRoomShape(drag.origRoom);
+      s.setRoomShape(finalRoom);
+      return;
+    }
+
+    // a jiggle-free click: select the corner so the panel offers Remove
+    if (drag.moved) s.previewRoomShape(drag.origRoom);
+    if (drag.target.kind === "corner") {
+      s.setActiveSurface({ kind: "corner", index: drag.target.index });
+    }
   };
 
   const splitWall = (index: number) => {
@@ -184,17 +188,13 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
     const mid = { x: (w.a.x + w.b.x) / 2, z: (w.a.z + w.b.z) / 2 };
     const next = [...points.slice(0, index + 1), mid, ...points.slice(index + 1)];
     useStudio.getState().setRoomShape({ ...doc.room, points: next, slope: undefined });
-  };
-
-  const removeCorner = (index: number) => {
-    if (points.length <= 3) return;
-    const next = points.filter((_, i) => i !== index);
-    if (!validPolygon(next)) return;
-    useStudio.getState().setRoomShape({ ...doc.room, points: next, slope: points.length - 1 === 4 ? doc.room.slope : undefined });
+    toast.success("Corner added - drag the new dot to shape the wall");
   };
 
   const bounds = polygonBounds(points);
   const dragging = useStudio((s) => s.dragging);
+  const activeSurface = useStudio((s) => s.activeSurface);
+  const selectedCorner = activeSurface?.kind === "corner" ? activeSurface.index : null;
 
   return (
     <group>
@@ -207,12 +207,12 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
         <boxGeometry args={[60, 0.01, 0.015]} />
         <meshBasicMaterial color="#16a34a" depthTest={false} />
       </mesh>
-      {/* corner handles */}
+      {/* corner handles - click selects (panel offers Remove), drag reshapes */}
       {points.map((p, i) => (
         <group key={`c${i}`} position={[p.x, HANDLE_Y, p.z]}>
           <mesh raycast={() => null}>
-            <cylinderGeometry args={[0.085, 0.085, 0.02, 20]} />
-            <meshBasicMaterial color="#2563eb" depthTest={false} />
+            <cylinderGeometry args={[selectedCorner === i ? 0.115 : 0.085, selectedCorner === i ? 0.115 : 0.085, 0.02, 20]} />
+            <meshBasicMaterial color={selectedCorner === i ? "#1d4ed8" : "#2563eb"} depthTest={false} />
           </mesh>
           {/* generous hit zone - transparent, not invisible (raycaster skips invisible) */}
           <mesh
@@ -220,10 +220,6 @@ function RoomEditInner({ doc }: { doc: DesignDoc }) {
             onPointerMove={move}
             onPointerUp={end}
             onPointerCancel={end}
-            onDoubleClick={(e) => {
-              e.stopPropagation();
-              removeCorner(i);
-            }}
           >
             <cylinderGeometry args={[0.22, 0.22, 0.04, 12]} />
             <meshBasicMaterial transparent opacity={0} depthWrite={false} depthTest={false} />

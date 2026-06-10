@@ -25,7 +25,11 @@ interface StudioState {
   lightsOn: boolean;
   presentMode: boolean;
   /** Surface paint target: when a wall/floor is clicked with the finish panel open. */
-  activeSurface: { kind: "wall"; wallIndex: number } | { kind: "floor" } | null;
+  activeSurface:
+    | { kind: "wall"; wallIndex: number }
+    | { kind: "floor" }
+    | { kind: "corner"; index: number }
+    | null;
   /** True while an item drag is in progress (disables camera controls; no autosave). */
   dragging: boolean;
   saveState: SaveState;
