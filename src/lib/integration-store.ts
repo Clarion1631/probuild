@@ -68,19 +68,31 @@ export async function getQBSettings(): Promise<QBSettings> {
     return settings.quickbooks || { connected: false };
 }
 
+// Decrypt the stored blob, but never let an undecryptable row (e.g. written
+// under a rotated INTEGRATION key) brick all future saves — start fresh instead.
+// This exact failure blocked the first QuickBooks OAuth connect (Jun 2026).
+function decryptOrReset(ciphertext: string): IntegrationSettings {
+    try {
+        return decryptObject(ciphertext) as IntegrationSettings;
+    } catch (err) {
+        console.error("[integration-store] Existing settings undecryptable — resetting:", err);
+        return {};
+    }
+}
+
 export async function saveQBSettings(qb: Partial<QBSettings>): Promise<void> {
     // Safe transaction to prevent race conditions during concurrent token updates
     await prisma.$transaction(async (tx) => {
         const row = await tx.integration.findUnique({
             where: { id: INTEGRATION_ROW_ID }
         });
-        const settings: IntegrationSettings = row && row.settings 
-            ? decryptObject(row.settings) 
+        const settings: IntegrationSettings = row && row.settings
+            ? decryptOrReset(row.settings)
             : {};
-        
+
         settings.quickbooks = { ...(settings.quickbooks || { connected: false }), ...qb };
         const encrypted = encryptObject(settings);
-        
+
         await tx.integration.upsert({
             where: { id: INTEGRATION_ROW_ID },
             create: { id: INTEGRATION_ROW_ID, settings: encrypted },
@@ -100,10 +112,10 @@ export async function saveGustoSettings(gusto: Partial<GustoSettings>): Promise<
         const row = await tx.integration.findUnique({
             where: { id: INTEGRATION_ROW_ID }
         });
-        const settings: IntegrationSettings = row && row.settings 
-            ? decryptObject(row.settings) 
+        const settings: IntegrationSettings = row && row.settings
+            ? decryptOrReset(row.settings)
             : {};
-        
+
         settings.gusto = { ...(settings.gusto || { connected: false }), ...gusto };
         const encrypted = encryptObject(settings);
         
