@@ -44,8 +44,9 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
     await page.goto("/leads", { waitUntil: "networkidle" });
     await capture(page, testInfo, 1, 2, "before-add-lead");
 
-    // Click Add Lead
-    const addBtn = page.locator('button:has-text("Add Lead")');
+    // Click Add Lead — .first(): an empty leads list renders a second
+    // "Add Lead" button in the empty state alongside the header one.
+    const addBtn = page.locator('button:has-text("Add Lead")').first();
     await expect(addBtn, "Add Lead button not found").toBeVisible();
     await addBtn.click();
     await page.waitForTimeout(1000);
