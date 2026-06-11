@@ -98,6 +98,10 @@ model Lead {
   snoozedUntil DateTime?
   isArchived   Boolean   @default(false)
 
+  // Google Drive folder for this lead's photos/videos (mobile intake).
+  driveFolderId  String?
+  driveFolderUrl String?
+
   // Relations
   estimates      Estimate[]
   roomDesigns    RoomDesign[]
@@ -225,6 +229,8 @@ model RoomDesign {
   shareToken   String?     @unique
   shareEnabled Boolean     @default(false)
   thumbnail    String?
+  // USDZ export of the LiDAR scan - powers "View in AR" (Apple Quick Look).
+  scanUsdzUrl  String?
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   assets       RoomAsset[]
@@ -678,6 +684,9 @@ model CompanySettings {
   logoUrl             String?
   licenseNumber       String?
   notificationEmail   String? // Where to send View/Sign alerts
+  // Google Drive (work account) - lead media folders. Set via Settings > Integrations.
+  googleDriveRefreshToken String?
+  googleDriveEmail        String?
   projectStatuses     String? // JSON string array of custom statues [{label, value, color, dot}, ...]
   subcontractorTrades String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
   stripeEnabled       Boolean @default(false)
