@@ -21,12 +21,27 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
 
-    let body: { action?: string };
+    let body: { action?: string; paymentScheduleId?: string };
     try {
         body = await req.json();
     } catch {
         return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
     }
+
+    // Push (or re-fetch) one milestone's QBO invoice — same path signing uses.
+    if (body.action === "push-milestone") {
+        if (!body.paymentScheduleId) {
+            return NextResponse.json({ ok: false, reason: "paymentScheduleId required" }, { status: 400 });
+        }
+        const { pushMilestoneToQuickBooks } = await import("@/lib/quickbooks-payments");
+        try {
+            const res = await pushMilestoneToQuickBooks(body.paymentScheduleId);
+            return NextResponse.json({ ok: true, ...res });
+        } catch (e) {
+            return NextResponse.json({ ok: false, reason: e instanceof Error ? e.message.slice(0, 300) : "push failed" }, { status: 500 });
+        }
+    }
+
     if (body.action !== "sync-payment-options") {
         return NextResponse.json({ ok: false, reason: "unknown-action" }, { status: 400 });
     }

@@ -187,12 +187,19 @@ export async function createQBMilestoneInvoice(
         customerId: string;
         itemId: string;
         description: string;
-        amount: number;
+        amount: number; // grand total the client pays (tax-inclusive)
+        // When set, the QBO invoice carries the sales tax explicitly:
+        // a pre-tax taxable line + TxnTaxDetail, so QBO's sales-tax reporting
+        // sees the liability and the invoice total still equals `amount`.
+        tax?: { preTaxAmount: number; taxAmount: number } | null;
         dueDate?: Date | null;
         billEmail?: string | null;
         privateNote?: string;
     }
-): Promise<{ qbId: string; qbUrl: string }> {
+): Promise<{ qbId: string; qbUrl: string; total: number }> {
+    const withTax = !!input.tax && input.tax.taxAmount > 0;
+    const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
+
     const payload: Record<string, unknown> = {
         DocNumber: input.docNumber.slice(0, 21),
         TxnDate: new Date().toISOString().split("T")[0],
@@ -209,22 +216,25 @@ export async function createQBMilestoneInvoice(
             {
                 LineNum: 1,
                 Description: input.description.slice(0, 4000),
-                Amount: input.amount,
+                Amount: lineAmount,
                 DetailType: "SalesItemLineDetail",
                 SalesItemLineDetail: {
                     ItemRef: { value: input.itemId },
                     Qty: 1,
-                    UnitPrice: input.amount,
+                    UnitPrice: lineAmount,
+                    ...(withTax ? { TaxCodeRef: { value: "TAX" } } : {}),
                 },
             },
         ],
+        ...(withTax ? { TxnTaxDetail: { TotalTax: input.tax!.taxAmount } } : {}),
     };
 
     const res = await qbFetch("/invoice", tokens, { method: "POST", body: JSON.stringify(payload) });
     if (!res.ok) throw new Error(`QB milestone invoice create failed: ${await res.text()}`);
     const data = await res.json();
     const qbId = data.Invoice?.Id;
-    return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}` };
+    const total = Number(data.Invoice?.TotalAmt ?? 0);
+    return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
 }
 
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */

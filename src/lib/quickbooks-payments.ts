@@ -111,16 +111,37 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string): Prom
     const docNumber = `${invoice.code}-${position}`;
 
     const projectName = invoice.project?.name || "Project";
-    const { qbId } = await createQBMilestoneInvoice(tokens, {
+    const amount = toNum(schedule.amount);
+
+    // Carry the sales tax explicitly so Vanessa's QBO sales-tax reporting sees
+    // the liability. The milestone amount is tax-inclusive; split it using the
+    // invoice's rate (each milestone carries its proportional share of tax).
+    const taxRate = toNum(invoice.taxRate);
+    let tax: { preTaxAmount: number; taxAmount: number } | null = null;
+    if (taxRate > 0) {
+        const preTaxAmount = Math.round((amount / (1 + taxRate / 100)) * 100) / 100;
+        const taxAmount = Math.round((amount - preTaxAmount) * 100) / 100;
+        if (taxAmount > 0) tax = { preTaxAmount, taxAmount };
+    }
+
+    const { qbId, total } = await createQBMilestoneInvoice(tokens, {
         docNumber,
         customerId,
         itemId,
         description: `${projectName} — ${schedule.name}`,
-        amount: toNum(schedule.amount),
+        amount,
+        tax,
         dueDate: schedule.dueDate,
         billEmail: invoice.client?.email || null,
         privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
     });
+
+    // QBO Automated Sales Tax can recalculate on top of what we send — verify the
+    // grand total still equals the milestone. A drift means the client would be
+    // asked for a different amount than ProBuild expects; flag it loudly.
+    if (Math.abs(total - amount) > 0.05) {
+        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
+    }
 
     const payLink = await getQBInvoicePaymentLink(tokens, qbId);
 

@@ -1812,6 +1812,31 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     }
     if (!projectId) return null;
 
+    // 1.5) Tax integrity: if the estimate never had a tax rate chosen, the portal
+    // DISPLAY adds the default rate on top while the stored total excludes it —
+    // the client would see more than they get billed. Snapshot the default rate
+    // and gross the totals (and pending milestones) up to match what was shown,
+    // exactly once, before any invoice is created from it.
+    const taxCheck = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { taxRatePercent: true, taxExempt: true, totalAmount: true, balanceDue: true },
+    });
+    if (taxCheck && !taxCheck.taxExempt && taxCheck.taxRatePercent == null) {
+        const defaultRate = await getDefaultSalesTaxRate();
+        if (defaultRate > 0) {
+            const factor = 1 + defaultRate / 100;
+            await prisma.estimate.update({
+                where: { id: estimateId },
+                data: {
+                    taxRatePercent: defaultRate,
+                    totalAmount: Math.round(toNum(taxCheck.totalAmount) * factor * 100) / 100,
+                    balanceDue: Math.round(toNum(taxCheck.balanceDue) * factor * 100) / 100,
+                },
+            });
+            await prisma.$executeRaw`UPDATE "EstimatePaymentSchedule" SET amount = ROUND(amount * ${factor}::numeric, 2) WHERE "estimateId" = ${estimateId} AND status = 'Pending'`;
+        }
+    }
+
     // 2) One invoice per signed estimate (idempotent on re-approval).
     let invoice = await prisma.invoice.findFirst({
         where: { estimateId },
