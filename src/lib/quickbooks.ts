@@ -197,7 +197,10 @@ export async function createQBMilestoneInvoice(
         DocNumber: input.docNumber.slice(0, 21),
         TxnDate: new Date().toISOString().split("T")[0],
         CustomerRef: { value: input.customerId },
-        AllowOnlineCreditCardPayment: true,
+        // Bank-transfer ONLY on the QuickBooks hosted page (free for the client).
+        // Card payments are deliberately routed through Stripe instead, where the
+        // 2.9% processing fee is passed to the client — QBO can't surcharge cards.
+        AllowOnlineCreditCardPayment: false,
         AllowOnlineACHPayment: true,
         ...(input.billEmail ? { BillEmail: { Address: input.billEmail } } : {}),
         ...(input.dueDate ? { DueDate: input.dueDate.toISOString().split("T")[0] } : {}),

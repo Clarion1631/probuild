@@ -83,14 +83,32 @@ export default function PortalPayButton({
     const outerClasses = "flex-shrink-0 w-auto px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded-md shadow-sm transition-colors flex items-center justify-center gap-2 no-underline";
     const modalCtaClasses = "w-full mt-4 bg-emerald-600 hover:bg-emerald-700 text-white py-3 rounded-lg font-bold transition flex items-center justify-center gap-2 no-underline";
 
-    // QuickBooks rail: straight to Intuit's hosted page — no method modal, no card fee.
+    // QuickBooks rail: the hosted page takes FREE bank transfers (cards are disabled
+    // on it). Card payments route through Stripe below, where the processing fee is
+    // passed to the client — so cards always carry the fee, bank stays free.
     if (qbPayLink) {
         return (
-            <div className="flex flex-col items-end gap-1">
+            <div className="flex flex-col items-end gap-1.5">
                 <a data-pay-button href={qbPayLink} target="_blank" rel="noopener noreferrer" className={outerClasses}>
-                    {label} - ${Number(amount).toLocaleString()}
+                    {label} by Bank - ${Number(amount).toLocaleString()}
                 </a>
-                <span className="text-[11px] text-slate-400">Card or bank transfer · secured by QuickBooks</span>
+                <span className="text-[11px] text-slate-400">Free bank transfer · secured by QuickBooks</span>
+                {settings?.stripeEnabled !== false && (
+                    checkoutUrl ? (
+                        <a data-pay-button href={checkoutUrl} target="_top" className="text-xs font-semibold text-emerald-700 underline underline-offset-2">
+                            Tap to continue to card checkout →
+                        </a>
+                    ) : (
+                        <button
+                            data-pay-button
+                            onClick={() => handlePay("card")}
+                            disabled={isLoading}
+                            className="text-xs text-slate-500 underline underline-offset-2 hover:text-slate-700 disabled:opacity-50"
+                        >
+                            {isLoading ? "Connecting…" : `or pay by card${passFee ? ` (+${rate}% processing fee)` : ""}`}
+                        </button>
+                    )
+                )}
             </div>
         );
     }

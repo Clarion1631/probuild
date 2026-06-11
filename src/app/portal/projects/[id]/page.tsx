@@ -244,24 +244,14 @@ export default async function PortalProjectDetail(props: {
                                     </div>
                                     <div className="shrink-0">
                                         {pendingPayments.length === 1 ? (
-                                            pendingPayments[0].payment.qbInvoiceLink ? (
-                                                <a
-                                                    href={pendingPayments[0].payment.qbInvoiceLink}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    className="inline-flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold px-5 py-2.5 rounded-lg transition"
-                                                >
-                                                    Pay Now
-                                                </a>
-                                            ) : (
                                             <PortalPayButton
                                                 invoiceId={pendingPayments[0].invoiceId}
                                                 paymentScheduleId={pendingPayments[0].payment.id}
                                                 amount={Number(pendingPayments[0].payment.amount)}
                                                 label="Pay Now"
                                                 settings={settings}
+                                                qbPayLink={pendingPayments[0].payment.qbInvoiceLink || null}
                                             />
-                                            )
                                         ) : (
                                             <Link
                                                 href={`/portal/projects/${projectId}?tab=invoices`}
@@ -509,27 +499,14 @@ export default async function PortalProjectDetail(props: {
                                                 </div>
                                                 <div className="flex flex-col sm:items-end w-full sm:w-auto mt-2 sm:mt-0">
                                                     {payment.status === 'Pending' ? (
-                                                        payment.qbInvoiceLink ? (
-                                                            <div className="flex flex-col sm:items-end gap-1">
-                                                                <a
-                                                                    href={payment.qbInvoiceLink}
-                                                                    target="_blank"
-                                                                    rel="noopener noreferrer"
-                                                                    className="inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition"
-                                                                >
-                                                                    Pay Now · {formatCurrency(payment.amount)}
-                                                                </a>
-                                                                <span className="text-[11px] text-hui-textMuted">Card or bank transfer · secured by QuickBooks</span>
-                                                            </div>
-                                                        ) : (
-                                                            <PortalPayButton
-                                                                invoiceId={inv.id}
-                                                                paymentScheduleId={payment.id}
-                                                                amount={Number(payment.amount)}
-                                                                label="Pay Now"
-                                                                settings={settings}
-                                                            />
-                                                        )
+                                                        <PortalPayButton
+                                                            invoiceId={inv.id}
+                                                            paymentScheduleId={payment.id}
+                                                            amount={Number(payment.amount)}
+                                                            label="Pay Now"
+                                                            settings={settings}
+                                                            qbPayLink={payment.qbInvoiceLink || null}
+                                                        />
                                                     ) : (
                                                         <span className="text-sm font-medium text-hui-textMain">{formatCurrency(payment.amount)}</span>
                                                     )}

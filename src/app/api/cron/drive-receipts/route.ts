@@ -3,6 +3,7 @@ import { google } from "googleapis";
 import { prisma } from "@/lib/prisma";
 import { oauth2Client, loadToken } from "@/lib/gmail-client";
 import { parseReceiptWithAI } from "@/lib/receipt-ai";
+import { matchProjectByName } from "@/lib/project-match";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -20,25 +21,7 @@ const FOLDER_ID = process.env.DRIVE_RECEIPTS_FOLDER_ID || "1sv8xcq9Z90xSmtHuvpe9
 const MAX_FILES_PER_RUN = 6;
 const FILE_MIME_OK = (m: string) => m === "application/pdf" || m.startsWith("image/");
 
-function normalize(s: string): string[] {
-    return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-}
-
-/** Match a Drive folder name ("Mueller Bathroom") to a project ("Mueller Remodel"). */
-function matchProject(folderName: string, projects: { id: string; name: string }[]): { id: string; name: string } | null {
-    const folderWords = normalize(folderName);
-    if (folderWords.length === 0) return null;
-    let best: { p: { id: string; name: string }; score: number } | null = null;
-    for (const p of projects) {
-        const projWords = normalize(p.name);
-        const shared = folderWords.filter(w => projWords.includes(w)).length;
-        // First word (usually the client surname) must match to count at all.
-        const firstMatches = projWords.includes(folderWords[0]);
-        const score = firstMatches ? shared + 1 : shared >= 2 ? shared : 0;
-        if (score > 0 && (!best || score > best.score)) best = { p, score };
-    }
-    return best?.p ?? null;
-}
+// Project matching lives in lib/project-match.ts (shared with /api/integrations/receipt-ingest).
 
 export async function GET(request: Request) {
     const authHeader = request.headers.get("authorization");
@@ -92,7 +75,7 @@ export async function GET(request: Request) {
             if (/needs review|processed|archive|upload ready/i.test(name)) continue;
             summary.foldersScanned++;
 
-            const project = matchProject(name, projects);
+            const project = matchProjectByName(name, projects);
             if (!project) {
                 summary.unmatchedFolders.push(name);
                 continue;
