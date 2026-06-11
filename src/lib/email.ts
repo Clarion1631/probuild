@@ -16,7 +16,10 @@ export async function sendNotification(
     attachments?: { filename: string, content: Buffer }[],
     options?: { fromName?: string; replyTo?: string; cc?: string[]; bcc?: string[]; copyToInternal?: boolean }
 ): Promise<{ success: boolean; id?: string }> {
-    if (!toEmail) {
+    // The "to" can be comma-separated (e.g. the System Notification Email setting
+    // holding several team addresses) — split into a proper recipient list.
+    const toList = toEmail ? toEmail.split(",").map(e => e.trim()).filter(Boolean) : [];
+    if (toList.length === 0) {
         return { success: false };
     }
 
@@ -56,10 +59,10 @@ export async function sendNotification(
             const s = await prisma.companySettings.findUnique({ where: { id: 'singleton' }, select: { notificationEmail: true } });
             if (s?.notificationEmail?.trim()) copyAddr = s.notificationEmail.trim();
         } catch { /* keep fallback */ }
-        if (copyAddr) {
-            const key = copyAddr.toLowerCase();
-            const dup = toEmail.toLowerCase() === key || (options?.cc || []).some(e => e.toLowerCase() === key);
-            if (!dup) bccByKey.set(key, copyAddr);
+        for (const addr of copyAddr.split(",").map(e => e.trim()).filter(Boolean)) {
+            const key = addr.toLowerCase();
+            const dup = toList.some(e => e.toLowerCase() === key) || (options?.cc || []).some(e => e.toLowerCase() === key);
+            if (!dup) bccByKey.set(key, addr);
         }
     }
     const bccList = bccByKey.size > 0 ? [...bccByKey.values()] : undefined;
@@ -67,7 +70,7 @@ export async function sendNotification(
     try {
         const data = await resend.emails.send({
             from: `${displayName} <notifications@goldentouchremodeling.com>`,
-            to: [toEmail],
+            to: toList,
             replyTo: options?.replyTo || 'jadkins@goldentouchremodeling.com',
             subject: subject,
             html: htmlContent,

@@ -3061,6 +3061,10 @@ export async function recordPayment(
 
     if (!tx.success) return tx;
 
+    // Team "money in" alert (Settings → Notifications · Payment Received toggle).
+    const { notifyTeamPaymentReceived } = await import("./quickbooks-payments");
+    await notifyTeamPaymentReceived(paymentId).catch(() => {});
+
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
