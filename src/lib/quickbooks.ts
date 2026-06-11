@@ -274,6 +274,35 @@ export async function getQBPayment(
     };
 }
 
+/** Posted money-out transactions (expenses/checks/card charges) from the books. */
+export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
+    const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
+    const rows = await qbQuery<any>(tokens, `SELECT * FROM Purchase WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`);
+    return rows.map(p => ({
+        qbId: String(p.Id),
+        date: p.TxnDate ?? null,
+        amount: Number(p.TotalAmt ?? 0),
+        paymentType: p.PaymentType ?? null, // Cash | Check | CreditCard
+        docNumber: p.DocNumber ?? null,
+        vendor: p.EntityRef?.name ?? null,
+        account: p.AccountRef?.name ?? null,
+        memo: p.PrivateNote ?? null,
+    }));
+}
+
+/** Posted customer payments (money in) from the books. */
+export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: number) {
+    const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
+    const rows = await qbQuery<any>(tokens, `SELECT * FROM Payment WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`);
+    return rows.map(p => ({
+        qbId: String(p.Id),
+        date: p.TxnDate ?? null,
+        amount: Number(p.TotalAmt ?? 0),
+        customer: p.CustomerRef?.name ?? null,
+        reference: p.PaymentRefNum ?? null,
+    }));
+}
+
 /** Push an estimate to QB. Returns the QB estimate ID. */
 export async function syncEstimateToQB(
     tokens: QBTokens,
