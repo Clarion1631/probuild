@@ -81,6 +81,13 @@ vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat0
 - Only deploy when changes are verified locally via `npm run build`
 - Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
 
+## E2E testing — never against the live DB
+See **docs/TESTING.md**. E2E creates leads/estimates/invoices, so:
+- CI runs e2e in a throwaway Postgres container (`.github/workflows/ci.yml`)
+- `e2e/data.setup.ts` refuses to run when DATABASE_URL looks like Supabase (override: `ALLOW_PROD_E2E=1`)
+- Specs that create data must tear it down in `afterAll` (see `qa-lead-estimate-invoice.spec.ts`)
+- History: QA runs against prod once filled /leads with "Master Bath Renovation - Henderson" junk (cleaned 2026-06-11)
+
 ## Dev server — clean start
 ```bash
 kill -9 $(lsof -ti tcp:3000,3001,3002) 2>/dev/null; rm -f .next/dev/lock; sleep 2

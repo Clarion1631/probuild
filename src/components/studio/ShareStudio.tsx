@@ -28,9 +28,15 @@ export interface ShareStudioProps {
   ownerName: string;
   contractor: { name: string; logoUrl: string | null };
   renders?: Array<{ id: string; url: string }>;
+  arUsdzUrl?: string | null;
 }
 
-export default function ShareStudio({ doc, roomName, ownerName, contractor, renders = [] }: ShareStudioProps) {
+export default function ShareStudio({ doc, roomName, ownerName, contractor, renders = [], arUsdzUrl }: ShareStudioProps) {
+  // AR Quick Look only exists on iOS Safari - show the button there only.
+  const [isIOS, setIsIOS] = useState(false);
+  useEffect(() => {
+    setIsIOS(/iPhone|iPad/.test(navigator.userAgent));
+  }, []);
   const loadDoc = useStudio((s) => s.loadDoc);
   const setPresentMode = useStudio((s) => s.setPresentMode);
   const view = useStudio((s) => s.view);
@@ -64,6 +70,18 @@ export default function ShareStudio({ doc, roomName, ownerName, contractor, rend
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {arUsdzUrl && isIOS && (
+            <a
+              href={arUsdzUrl}
+              rel="ar"
+              className="flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-bold text-white"
+            >
+              {/* AR Quick Look requires an <img> as the anchor's first child */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" alt="" width={1} height={1} />
+              View in AR
+            </a>
+          )}
           <button
             onClick={() => setLightsOn(!lightsOn)}
             className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
