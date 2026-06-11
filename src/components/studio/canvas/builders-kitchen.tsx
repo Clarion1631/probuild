@@ -12,6 +12,10 @@ import {
 } from "./parts";
 import type { BuilderProps } from "./builders";
 import * as THREE from "three";
+import { RectAreaLightUniformsLib } from "three/examples/jsm/lights/RectAreaLightUniformsLib.js";
+
+// RectAreaLight needs its LTC lookup tables initialized once per app.
+if (typeof window !== "undefined") RectAreaLightUniformsLib.init();
 
 const IN = inches;
 const TOE_H = IN(4);
@@ -615,7 +619,15 @@ export function ShowerNiche({ w, d, h, finishes, lightsOn, led }: BuilderProps) 
         <Box s={[w - IN(1.5), IN(0.2), IN(0.35)]} p={[0, h - IN(0.35), -IN(0.6)]} m={bulbMat(!!lightsOn)} castShadow={false} />
       )}
       {led && lightsOn && (
-        <pointLight position={[0, h - IN(3), -d / 2 + IN(1)]} intensity={0.3} distance={1.3} decay={2} color="#ffe2b0" />
+        // strip light: even wash across the full width, angled down the back tile
+        <rectAreaLight
+          position={[0, h - IN(0.55), -IN(0.6)]}
+          rotation={[-Math.PI / 2 + 0.5, 0, 0]}
+          width={Math.max(0.05, w - IN(1.5))}
+          height={IN(0.3)}
+          intensity={28}
+          color="#ffe2b0"
+        />
       )}
     </group>
   );
