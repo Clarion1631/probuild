@@ -30,6 +30,13 @@ export async function POST(req: Request) {
             : (await prisma.paymentSchedule.findUnique({ where: { id: paymentScheduleId }, select: { amount: true } }))?.amount?.toString() || "0";
         const idempotencyKey = `pay-session:${paymentScheduleId}:${selectedMethod || "default"}:${scheduleAmount}`;
 
+        // Stripe blackout: company-wide kill switch (CompanySettings.stripeEnabled=false)
+        // while the 180-day Stripe hold is in effect — all payments go through the
+        // QuickBooks Payments links instead.
+        if (settings?.stripeEnabled === false) {
+            return new NextResponse("Online payments are handled through QuickBooks — use the Pay Now link on your invoice, or contact us.", { status: 403 });
+        }
+
         // Validate selectedMethod is enabled in company settings
         if (selectedMethod && typeof selectedMethod !== "string") {
             return new NextResponse("Invalid selectedMethod", { status: 400 });

@@ -1992,8 +1992,8 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <div style="background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 16px 18px; margin-bottom: 20px;">
                         <p style="margin: 0 0 10px; color: #312e81; font-size: 14px; font-weight: 600;">Next step — ${postApproval.depositName || "Deposit"}: ${formatCurrency(postApproval.depositAmount)}</p>
                         ${postApproval.payLink
-                            ? `<a href="${postApproval.payLink}" style="display: inline-block; background: #4f46e5; color: #ffffff; font-size: 14px; font-weight: 600; padding: 11px 24px; border-radius: 8px; text-decoration: none;">Pay by Bank Transfer — Free</a>
-                               <p style="margin: 10px 0 0; color: #6366f1; font-size: 12px;">Secure bank payment via QuickBooks · Invoice ${postApproval.invoiceCode}. Prefer a card? Pay from your portal (a ${Number(settings.cardProcessingRate ?? 2.9)}% processing fee applies to cards).</p>`
+                            ? `<a href="${postApproval.payLink}" style="display: inline-block; background: #4f46e5; color: #ffffff; font-size: 14px; font-weight: 600; padding: 11px 24px; border-radius: 8px; text-decoration: none;">Pay Securely Online</a>
+                               <p style="margin: 10px 0 0; color: #6366f1; font-size: 12px;">Card, debit, or bank transfer on QuickBooks' secure page · Invoice ${postApproval.invoiceCode}</p>`
                             : `<p style="margin: 0; color: #4338ca; font-size: 13px;">Invoice ${postApproval.invoiceCode} has been created for your project — we'll follow up with payment instructions.</p>`}
                     </div>` : ""}
                     <p style="color: #64748b; font-size: 13px; line-height: 1.6; margin: 0;">
