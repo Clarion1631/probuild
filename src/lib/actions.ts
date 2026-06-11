@@ -1282,6 +1282,22 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                     items: { orderBy: { order: "asc" } },
                     paymentSchedules: { orderBy: { order: "asc" } },
                     files: { orderBy: { createdAt: "desc" } },
+                    // Auto-created invoice (signing) — its milestones are the payable source of truth
+                    invoices: {
+                        select: {
+                            id: true, code: true, status: true,
+                            payments: {
+                                select: {
+                                    id: true, name: true, amount: true, status: true, dueDate: true,
+                                    paidAt: true, paymentDate: true, paymentMethod: true,
+                                    stripeSessionId: true, qbInvoiceLink: true,
+                                },
+                                orderBy: { createdAt: "asc" },
+                            },
+                        },
+                        orderBy: { createdAt: "asc" },
+                        take: 1,
+                    },
                 },
             });
         } catch (err) {
@@ -1309,6 +1325,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                         },
                         files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
                         paymentSchedules: { orderBy: { order: "asc" } },
+                        invoices: {
+                            select: {
+                                id: true, code: true, status: true,
+                                payments: {
+                                    select: {
+                                        id: true, name: true, amount: true, status: true, dueDate: true,
+                                        paidAt: true, paymentDate: true, paymentMethod: true,
+                                        stripeSessionId: true, qbInvoiceLink: true,
+                                    },
+                                    orderBy: { createdAt: "asc" },
+                                },
+                            },
+                            orderBy: { createdAt: "asc" },
+                            take: 1,
+                        },
                     },
                 });
             } catch (fallbackErr) {
@@ -1339,6 +1370,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                 items: { orderBy: { order: "asc" } },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 files: { orderBy: { createdAt: "desc" } },
+                invoices: {
+                    select: {
+                        id: true, code: true, status: true,
+                        payments: {
+                            select: {
+                                id: true, name: true, amount: true, status: true, dueDate: true,
+                                paidAt: true, paymentDate: true, paymentMethod: true,
+                                stripeSessionId: true, qbInvoiceLink: true,
+                            },
+                            orderBy: { createdAt: "asc" },
+                        },
+                    },
+                    orderBy: { createdAt: "asc" },
+                    take: 1,
+                },
             },
         });
     } catch (err) {
@@ -1365,6 +1411,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                     },
                     files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
                     paymentSchedules: { orderBy: { order: "asc" } },
+                    invoices: {
+                        select: {
+                            id: true, code: true, status: true,
+                            payments: {
+                                select: {
+                                    id: true, name: true, amount: true, status: true, dueDate: true,
+                                    paidAt: true, paymentDate: true, paymentMethod: true,
+                                    stripeSessionId: true, qbInvoiceLink: true,
+                                },
+                                orderBy: { createdAt: "asc" },
+                            },
+                        },
+                        orderBy: { createdAt: "asc" },
+                        take: 1,
+                    },
                 },
             });
         } catch (fallbackErr) {
@@ -1763,27 +1824,37 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
             data: { status: "Issued", issueDate: new Date() },
             select: { id: true, code: true },
         });
-        // The money now lives on the invoice — flip the estimate to Invoiced so
-        // financial forecasts don't count the same dollars twice.
-        await prisma.estimate.update({ where: { id: estimateId }, data: { status: "Invoiced" } });
     }
+    // The money now lives on the invoice — flip the estimate to Invoiced so
+    // financial forecasts don't count the same dollars twice. Runs outside the
+    // creation branch so a re-approval can't leave the status stuck on Approved,
+    // and never downgrades a payment-driven status (Partially Paid / Paid).
+    await prisma.estimate.updateMany({
+        where: { id: estimateId, status: { in: ["Sent", "Viewed", "Approved"] } },
+        data: { status: "Invoiced" },
+    });
 
-    // 3) First pending milestone (the deposit) → QuickBooks invoice + pay link.
+    // 3) Every pending milestone → its own QuickBooks invoice + hosted pay link,
+    //    so the portal can default to QuickBooks for all of them. The first one
+    //    (the deposit) also rides the approval email.
     let payLink: string | null = null;
-    const deposit = await prisma.paymentSchedule.findFirst({
+    const pendingMilestones = await prisma.paymentSchedule.findMany({
         where: { invoiceId: invoice.id, status: "Pending" },
         orderBy: { createdAt: "asc" },
         select: { id: true, name: true, amount: true },
     });
-    if (deposit) {
+    const deposit = pendingMilestones[0] || null;
+    if (pendingMilestones.length > 0) {
         try {
             const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-            const pushed = await pushMilestoneToQuickBooks(deposit.id);
-            payLink = pushed.payLink;
+            for (const milestone of pendingMilestones) {
+                const pushed = await pushMilestoneToQuickBooks(milestone.id);
+                if (milestone.id === deposit?.id) payLink = pushed.payLink;
+            }
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
-            // manual recording still work; the PM can push the link later.
-            console.warn("[approveEstimate] QuickBooks deposit push skipped:", e instanceof Error ? e.message : e);
+            // manual recording still work; the PM can push links later.
+            console.warn("[approveEstimate] QuickBooks milestone push skipped:", e instanceof Error ? e.message : e);
         }
     }
 

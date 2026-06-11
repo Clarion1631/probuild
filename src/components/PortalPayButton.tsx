@@ -9,14 +9,18 @@ export default function PortalPayButton({
     estimateId,
     amount,
     label,
-    settings
+    settings,
+    qbPayLink
 }: {
     paymentScheduleId: string,
     invoiceId?: string,
     estimateId?: string,
     amount: number,
     label: string,
-    settings?: any
+    settings?: any,
+    // QuickBooks-hosted "Review & Pay" page. When present it is the DEFAULT
+    // payment rail (card/ACH via QuickBooks Payments, no Stripe, no fee modal).
+    qbPayLink?: string | null
 }) {
     const [isLoading, setIsLoading] = useState(false);
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -78,6 +82,18 @@ export default function PortalPayButton({
 
     const outerClasses = "flex-shrink-0 w-auto px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded-md shadow-sm transition-colors flex items-center justify-center gap-2 no-underline";
     const modalCtaClasses = "w-full mt-4 bg-emerald-600 hover:bg-emerald-700 text-white py-3 rounded-lg font-bold transition flex items-center justify-center gap-2 no-underline";
+
+    // QuickBooks rail: straight to Intuit's hosted page — no method modal, no card fee.
+    if (qbPayLink) {
+        return (
+            <div className="flex flex-col items-end gap-1">
+                <a data-pay-button href={qbPayLink} target="_blank" rel="noopener noreferrer" className={outerClasses}>
+                    {label} - ${Number(amount).toLocaleString()}
+                </a>
+                <span className="text-[11px] text-slate-400">Card or bank transfer · secured by QuickBooks</span>
+            </div>
+        );
+    }
 
     return (
         <>

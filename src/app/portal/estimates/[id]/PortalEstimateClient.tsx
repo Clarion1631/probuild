@@ -229,14 +229,25 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const taxLabel = taxExempt ? null : `${effectiveName} (${effectiveRateDisplay}%)`;
     const tax = Math.round(subtotal * taxRate * 100) / 100;
     const total = subtotal + tax;
-    // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update
-    const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");
+    // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update.
+    // Signing auto-invoices the estimate, so post-approval statuses (Invoiced/Partially Paid/Paid)
+    // and a stored signature all count as approved.
+    const isApproved = approvedOverride ?? (
+        ["Approved", "Invoiced", "Partially Paid", "Paid"].includes(initialEstimate.status) || !!initialEstimate.approvedAt
+    );
     const stripeEnabled = companySettings?.stripeEnabled !== false;
-    const schedules: any[] = initialEstimate.paymentSchedules || [];
+    // Signing auto-creates an invoice from this estimate; once it exists, ITS
+    // milestones are the payable source of truth (QuickBooks pay links live there,
+    // and paying estimate-side copies would double-bill the job).
+    const linkedInvoice: any = (initialEstimate.invoices && initialEstimate.invoices[0]) || null;
+    const schedules: any[] = linkedInvoice?.payments?.length
+        ? linkedInvoice.payments
+        : (initialEstimate.paymentSchedules || []);
     const files: any[] = initialEstimate.files || [];
     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
     // Suppress immediately after a successful payment redirect — webhook may not have updated status yet
-    const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && (
+    // (and always once the invoice exists — its milestones carry the pay buttons instead)
+    const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && !linkedInvoice && (
         schedules.length === 0 ||
         schedules.some(s => s.name === "Payment in Full" && s.status !== "Paid" && !s.stripeSessionId)
     );
@@ -524,13 +535,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                 {paymentStatus === "success" && !isPaid && p.stripeSessionId ? (
                                                     <span className="text-xs text-slate-500 italic">Payment processing…</span>
                                                 ) : (
-                                                    isApproved && !isPaid && stripeEnabled && Number(p.amount) > 0 && (
+                                                    isApproved && !isPaid && Number(p.amount) > 0 && (p.qbInvoiceLink || stripeEnabled) && (
                                                         <PortalPayButton
                                                             paymentScheduleId={p.id}
-                                                            estimateId={initialEstimate.id}
+                                                            {...(linkedInvoice ? { invoiceId: linkedInvoice.id } : { estimateId: initialEstimate.id })}
                                                             amount={Number(p.amount)}
                                                             label="Pay Now"
                                                             settings={companySettings}
+                                                            qbPayLink={p.qbInvoiceLink || null}
                                                         />
                                                     )
                                                 )}

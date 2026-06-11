@@ -156,6 +156,45 @@ async function processEvent(eventId: string) {
                                 ...(isFirstPayment && { statusBeforePayment: updatedSchedule.estimate.status }),
                             },
                         });
+
+                        // Signing auto-creates an invoice whose milestones mirror this
+                        // schedule — settle the matching copy too so the job can't be
+                        // billed twice (estimate-side Stripe + invoice-side QB/manual).
+                        if (!alreadyPaid) {
+                            const linkedInvoice = await t.invoice.findFirst({
+                                where: { estimateId },
+                                include: { payments: true },
+                            });
+                            if (linkedInvoice) {
+                                const copy = linkedInvoice.payments.find(p =>
+                                    p.status !== "Paid" &&
+                                    p.name === updatedSchedule.name &&
+                                    toNum(p.amount) === toNum(updatedSchedule.amount)
+                                );
+                                if (copy) {
+                                    await t.paymentSchedule.update({
+                                        where: { id: copy.id },
+                                        data: {
+                                            status: "Paid",
+                                            paymentMethod,
+                                            paymentDate: new Date(),
+                                            paidAt: new Date(),
+                                            stripePaymentIntentId: (session.payment_intent as string | null) ?? null,
+                                        },
+                                    });
+                                    const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                                    const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                    const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                                    await t.invoice.update({
+                                        where: { id: linkedInvoice.id },
+                                        data: {
+                                            balanceDue: invBalance,
+                                            status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                                        },
+                                    });
+                                }
+                            }
+                        }
                         return { alreadyPaid, updatedSchedule, newBalance };
                     });
                     if (!tx.alreadyPaid) {
