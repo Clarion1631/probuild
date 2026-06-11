@@ -20,6 +20,7 @@ interface ShareData {
     roomName: string;
     ownerName: string;
     contractor: { name: string; logoUrl: string | null };
+    renders: Array<{ id: string; url: string }>;
 }
 
 async function getRoomForShare(token: string): Promise<ShareData | null> {
@@ -30,6 +31,7 @@ async function getRoomForShare(token: string): Promise<ShareData | null> {
             assets: true,
             project: { select: { name: true } },
             lead: { select: { name: true } },
+            renders: { orderBy: { createdAt: "desc" }, take: 12, select: { id: true, url: true } },
         },
     });
     if (!room) return null;
@@ -66,6 +68,7 @@ async function getRoomForShare(token: string): Promise<ShareData | null> {
             name: settings?.companyName ?? "ProBuild",
             logoUrl: settings?.logoUrl ?? null,
         },
+        renders: room.renders,
     };
 }
 
@@ -90,6 +93,7 @@ export default async function SharedRoomPage({ params }: PageProps) {
             roomName={data.roomName}
             ownerName={data.ownerName}
             contractor={data.contractor}
+            renders={data.renders}
         />
     );
 }

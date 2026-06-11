@@ -5,7 +5,7 @@
 // extracted, save selected entries, and manage what's already in the library.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Trash2, Upload, Sparkles, Loader2, Plus } from "lucide-react";
+import { Trash2, Upload, Sparkles, Loader2, Plus, Inbox } from "lucide-react";
 import { toast } from "sonner";
 
 interface LibFinish {
@@ -43,9 +43,28 @@ const KIND_LABELS: Record<string, string> = {
   tile: "Tile",
 };
 
+interface Clip {
+  id: string;
+  sourceUrl: string | null;
+  title: string | null;
+  text: string;
+  createdAt: string;
+}
+
+function clipVendorGuess(clip: Clip): string {
+  if (!clip.sourceUrl) return "";
+  try {
+    return new URL(clip.sourceUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
 export default function CatalogSettingsClient() {
   const [finishes, setFinishes] = useState<LibFinish[]>([]);
   const [products, setProducts] = useState<LibProduct[]>([]);
+  const [clips, setClips] = useState<Clip[]>([]);
+  const [activeClip, setActiveClip] = useState<Clip | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -60,11 +79,31 @@ export default function CatalogSettingsClient() {
     } finally {
       setLoading(false);
     }
+    // clip inbox is ADMIN/MANAGER-only; ignore quietly otherwise
+    try {
+      const res = await fetch("/api/studio-library/clip");
+      if (res.ok) {
+        const data = await res.json();
+        setClips(data.clips ?? []);
+      }
+    } catch {
+      // inbox unavailable - leave empty
+    }
   }, []);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  const dismissClip = async (id: string) => {
+    setClips((cs) => cs.filter((c) => c.id !== id));
+    if (activeClip?.id === id) setActiveClip(null);
+    await fetch("/api/studio-library/clip", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, status: "dismissed" }),
+    });
+  };
 
   const removeFinish = async (id: string) => {
     await fetch(`/api/studio-library?finishId=${id}`, { method: "DELETE" });
@@ -86,7 +125,65 @@ export default function CatalogSettingsClient() {
         </p>
       </div>
 
-      <Importer onSaved={load} />
+      {clips.length > 0 && (
+        <section className="rounded-2xl border border-violet-100 bg-violet-50/40 p-5">
+          <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-700">
+            <Inbox className="h-4 w-4 text-violet-600" />
+            Clips inbox ({clips.length})
+          </h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Sent from your browser with the &quot;Send to ProBuild&quot; extension. Review one to load it
+            into the importer below.
+          </p>
+          <div className="mt-3 space-y-1.5">
+            {clips.map((c) => (
+              <div
+                key={c.id}
+                className={`flex items-center gap-3 rounded-lg border bg-white px-3 py-2 ${
+                  activeClip?.id === c.id ? "border-violet-300 ring-1 ring-violet-200" : "border-slate-100"
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-semibold text-slate-700">
+                    {c.title || c.sourceUrl || "Clipped text"}
+                  </div>
+                  <div className="truncate text-[10px] text-slate-400">
+                    {clipVendorGuess(c) || "unknown source"} - {new Date(c.createdAt).toLocaleString()} -{" "}
+                    {c.text.slice(0, 80)}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setActiveClip(c)}
+                  className="rounded-lg bg-violet-600 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-violet-700"
+                >
+                  Review
+                </button>
+                <button
+                  onClick={() => dismissClip(c.id)}
+                  className="rounded p-1.5 text-slate-300 hover:bg-red-50 hover:text-red-500"
+                  title="Dismiss"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <Importer
+        key={activeClip?.id ?? "fresh"}
+        prefill={activeClip ? { clipId: activeClip.id, text: activeClip.text, vendor: clipVendorGuess(activeClip) } : undefined}
+        onSaved={() => {
+          load();
+          const saved = activeClip; // the clip THIS importer instance was reviewing
+          if (saved) {
+            setClips((cs) => cs.filter((c) => c.id !== saved.id));
+            // don't clobber a different clip the user switched to mid-save
+            setActiveClip((cur) => (cur?.id === saved.id ? null : cur));
+          }
+        }}
+      />
 
       <section className="rounded-2xl border border-slate-200 bg-white p-5">
         <h2 className="text-sm font-bold text-slate-700">Finishes &amp; color lines ({finishes.length})</h2>
@@ -156,9 +253,14 @@ export default function CatalogSettingsClient() {
   );
 }
 
-function Importer({ onSaved }: { onSaved: () => void }) {
-  const [text, setText] = useState("");
-  const [vendor, setVendor] = useState("");
+function Importer({
+  onSaved, prefill,
+}: {
+  onSaved: () => void;
+  prefill?: { clipId: string; text: string; vendor: string };
+}) {
+  const [text, setText] = useState(prefill?.text ?? "");
+  const [vendor, setVendor] = useState(prefill?.vendor ?? "");
   const [busy, setBusy] = useState<"extract" | "save" | null>(null);
   const [candidates, setCandidates] = useState<Candidates | null>(null);
   const [checkedF, setCheckedF] = useState<Set<number>>(new Set());
@@ -227,6 +329,15 @@ function Importer({ onSaved }: { onSaved: () => void }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? String(res.status));
       toast.success(`Saved ${data.finishes} finishes and ${data.products} products to your library`);
+      // Mark the extension clip consumed only if something actually saved, and
+      // before onSaved() refetches the inbox (avoids the clip reappearing).
+      if (prefill?.clipId && (data.finishes ?? 0) + (data.products ?? 0) > 0) {
+        await fetch("/api/studio-library/clip", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: prefill.clipId, status: "imported" }),
+        }).catch(() => {});
+      }
       setCandidates(null);
       setText("");
       onSaved();

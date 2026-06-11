@@ -14,6 +14,7 @@ import { CatalogPanel } from "./panels/CatalogPanel";
 import { Inspector } from "./panels/Inspector";
 import { TopBar } from "./TopBar";
 import { ShareDialog, type ShareState } from "./ShareDialog";
+import { RendersDialog } from "./RendersDialog";
 import { captureThumbnail } from "./snapshot";
 
 const AUTOSAVE_MS = 2_500;
@@ -31,6 +32,7 @@ export function Studio({ roomId, roomName, initialDoc, backHref, initialShare }:
   const loadDoc = useStudio((s) => s.loadDoc);
   const presentMode = useStudio((s) => s.presentMode);
   const [shareOpen, setShareOpen] = useState(false);
+  const [rendersOpen, setRendersOpen] = useState(false);
   const [share, setShare] = useState<ShareState>(initialShare);
 
   // Load once per room.
@@ -44,7 +46,12 @@ export function Studio({ roomId, roomName, initialDoc, backHref, initialShare }:
 
   return (
     <div className="relative flex h-full w-full flex-col overflow-hidden bg-slate-100">
-      <TopBar roomName={roomName} backHref={backHref} onShare={() => setShareOpen(true)} />
+      <TopBar
+        roomName={roomName}
+        backHref={backHref}
+        onShare={() => setShareOpen(true)}
+        onRenders={() => setRendersOpen(true)}
+      />
       <div className="flex min-h-0 flex-1">
         {!presentMode && <CatalogPanel />}
         <div className="relative min-w-0 flex-1">
@@ -61,6 +68,7 @@ export function Studio({ roomId, roomName, initialDoc, backHref, initialShare }:
           onClose={() => setShareOpen(false)}
         />
       )}
+      {rendersOpen && <RendersDialog roomId={roomId} onClose={() => setRendersOpen(false)} />}
     </div>
   );
 }

@@ -15,7 +15,7 @@ export interface SnapshotResult {
   height: number;
 }
 
-export function captureSnapshot(opts?: { width?: number }): SnapshotResult | null {
+export function captureSnapshot(opts?: { width?: number; format?: "png" | "jpeg" }): SnapshotResult | null {
   const handles = getCanvasHandles();
   if (!handles) return null;
   const { gl, camera } = handles;
@@ -38,7 +38,9 @@ export function captureSnapshot(opts?: { width?: number }): SnapshotResult | nul
     // Drive a real R3F frame (not a bare gl.render) so per-frame logic - the
     // camera-facing wall hide especially - applies to the capture.
     handles.advance();
-    const dataUrl = gl.domElement.toDataURL("image/png");
+    const dataUrl = opts?.format === "jpeg"
+      ? gl.domElement.toDataURL("image/jpeg", 0.92)
+      : gl.domElement.toDataURL("image/png");
     return { dataUrl, width: targetW, height: targetH };
   } finally {
     gl.setPixelRatio(prevPixelRatio);

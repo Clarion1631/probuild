@@ -32,6 +32,7 @@ model User {
   documentComments DocumentComment[]
   teamMessages     TeamMessage[]
   fieldUpdatesSeenAt DateTime?
+  clippedImports   ClippedImport[]
 }
 
 model Client {
@@ -227,11 +228,40 @@ model RoomDesign {
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   assets       RoomAsset[]
+  renders      RoomRender[]
 
   // XOR check: exactly one of projectId or leadId must be non-null.
   // Enforced at the DB via CHECK constraint "RoomDesign_owner_xor" (not expressible in Prisma).
   @@index([projectId, updatedAt])
   @@index([leadId, updatedAt])
+}
+
+// AI photorealistic render of a room snapshot (Gemini image-out), stored in
+// Supabase storage. Shown in the studio gallery + the client share page.
+model RoomRender {
+  id           String     @id @default(cuid())
+  roomDesignId String
+  roomDesign   RoomDesign @relation(fields: [roomDesignId], references: [id], onDelete: Cascade)
+  url          String
+  style        String?
+  createdAt    DateTime   @default(now())
+
+  @@index([roomDesignId, createdAt])
+}
+
+// Raw text clipped from a vendor/product web page via the browser extension.
+// Reviewed on Settings > Design Catalog, then extracted into the library.
+model ClippedImport {
+  id          String   @id @default(cuid())
+  sourceUrl   String?
+  title       String?
+  text        String
+  status      String   @default("pending") // pending | imported | dismissed
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([status, createdAt])
 }
 
 model RoomAsset {

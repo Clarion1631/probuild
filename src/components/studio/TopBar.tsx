@@ -7,7 +7,7 @@ import { useState, useRef, useEffect } from "react";
 import {
   ArrowLeft, Undo2, Redo2, Camera, Share2, Lightbulb, LightbulbOff,
   Presentation, Map as MapIcon, Box as BoxIcon, Footprints, Ruler, Check, Loader2, AlertTriangle,
-  Square,
+  Square, Sparkles,
 } from "lucide-react";
 import { toast } from "sonner";
 import { feet, parseFtIn, formatFtIn } from "@/lib/studio/units";
@@ -17,11 +17,12 @@ import { useStudio, type ViewMode } from "./store";
 import { captureSnapshot, downloadDataUrl } from "./snapshot";
 
 export function TopBar({
-  roomName, backHref, onShare,
+  roomName, backHref, onShare, onRenders,
 }: {
   roomName: string;
   backHref: string;
   onShare: () => void;
+  onRenders: () => void;
 }) {
   const view = useStudio((s) => s.view);
   const setView = useStudio((s) => s.setView);
@@ -107,6 +108,15 @@ export function TopBar({
       >
         <Camera className="h-3.5 w-3.5" />
         Snapshot
+      </button>
+
+      <button
+        onClick={onRenders}
+        className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+        title="AI photorealistic renders of this room"
+      >
+        <Sparkles className="h-3.5 w-3.5 text-violet-500" />
+        Photo render
       </button>
 
       <button
