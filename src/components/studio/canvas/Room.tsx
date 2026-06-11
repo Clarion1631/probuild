@@ -103,12 +103,12 @@ interface Opening {
   y1: number;
 }
 
-/** Match wall-mounted door/window items to their nearest wall. */
+/** Match wall-mounted door/window/niche items to their nearest wall. */
 function openingsByWall(items: PlacedItem[], walls: WallSeg[], wallThickness: number): Map<number, Opening[]> {
   const map = new Map<number, Opening[]>();
   for (const it of items) {
     const def = getItemDef(it.defId);
-    if (!def || def.category !== "doors-windows") continue;
+    if (!def || (def.category !== "doors-windows" && !def.cutsWall)) continue;
     let best: { wall: WallSeg; dist: number; t: number } | null = null;
     for (const w of walls) {
       const apx = it.x - w.a.x;

@@ -32,6 +32,8 @@ export interface PlacedItem {
   finishes?: Record<string, string>;
   /** Optional user label ("Pantry wall run"). */
   label?: string;
+  /** LED strip on (items whose def has ledOption). */
+  led?: boolean;
 }
 
 export interface RoomSlope {

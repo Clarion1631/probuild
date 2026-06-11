@@ -145,6 +145,21 @@ function ItemInspector() {
         </Row>
       )}
 
+      {def.ledOption && (
+        <Row label="LED strip light">
+          <button
+            onClick={() => updateItem(item.id, { led: !item.led })}
+            className={`relative h-5 w-9 rounded-full transition-colors ${item.led ? "bg-blue-600" : "bg-slate-300"}`}
+            aria-pressed={!!item.led}
+            title="Toggle the built-in LED strip"
+          >
+            <span
+              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${item.led ? "left-[18px]" : "left-0.5"}`}
+            />
+          </button>
+        </Row>
+      )}
+
       {def.category === "doors-windows" && def.id.startsWith("window") && (
         <Row label="Sill height">
           <input

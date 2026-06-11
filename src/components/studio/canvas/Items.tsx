@@ -102,6 +102,7 @@ export function Items({ doc }: { doc: DesignDoc }) {
             allItems={doc.items}
             shell={shell}
             allowLight={lightItemIds.has(item.id)}
+            wallThickness={doc.room.wallThickness}
           />
         );
       })}
@@ -110,7 +111,7 @@ export function Items({ doc }: { doc: DesignDoc }) {
 }
 
 function ItemNode({
-  resolved, walls, roomPoints, allItems, shell, allowLight,
+  resolved, walls, roomPoints, allItems, shell, allowLight, wallThickness,
 }: {
   resolved: ResolvedItem;
   walls: WallSeg[];
@@ -118,6 +119,7 @@ function ItemNode({
   allItems: PlacedItem[];
   shell: RoomShellInfo;
   allowLight: boolean;
+  wallThickness: number;
 }) {
   const { item, def, w, d, finishes } = resolved;
   // Interior walls always stretch to the ceiling at their position.
@@ -139,13 +141,13 @@ function ItemNode({
 
   const Builder = BUILDERS[def.mesh];
 
-  // Doors/windows belong to a wall - tag them so DollhouseSync hides them
-  // together with the wall they sit in.
+  // Doors/windows/niches belong to a wall - tag them so DollhouseSync hides
+  // them together with the wall they sit in.
   const hostWallIndex = useMemo(() => {
-    if (def.category !== "doors-windows") return undefined;
+    if (def.category !== "doors-windows" && !def.cutsWall) return undefined;
     const hit = nearestWall({ x: item.x, z: item.z }, walls);
     return hit && hit.distance < 0.4 ? hit.wall.index : undefined;
-  }, [def.category, item.x, item.z, walls]);
+  }, [def, item.x, item.z, walls]);
 
   const obbOthers = useMemo(() => {
     if (!def.wallSnap && def.category !== "cabinets") return [];
@@ -175,11 +177,12 @@ function ItemNode({
     let rotation = dragRef.current?.cur.rotation ?? item.rotation;
 
     if (def.mount === "wall") {
-      // Wall items slide along the nearest wall, always flush.
+      // Wall items slide along the nearest wall, always flush. Items that cut
+      // into the wall (doors, windows, niches) center on the wall face.
       const hit = nearestWall({ x, z }, walls);
       if (hit) {
         rotation = wallFacingRotation(hit.wall);
-        const off = def.category === "doors-windows" ? 0 : d / 2;
+        const off = def.category === "doors-windows" || def.cutsWall ? 0 : d / 2;
         // Clamp t so the item stays within the wall span.
         const halfFrac = (w / 2) / hit.wall.length;
         const t = Math.min(1 - halfFrac, Math.max(halfFrac, hit.t));
@@ -328,7 +331,15 @@ function ItemNode({
           e.stopPropagation();
         }}
       >
-        <Builder w={w} d={d} h={h} finishes={finishes} lightsOn={lightsOn} />
+        <Builder
+          w={w}
+          // recessed items can't be deeper than the wall they cut into
+          d={def.cutsWall ? Math.min(d, wallThickness - 0.02) : d}
+          h={h}
+          finishes={finishes}
+          lightsOn={lightsOn}
+          led={!!item.led}
+        />
       </group>
 
       {/* real light for emitters within budget */}

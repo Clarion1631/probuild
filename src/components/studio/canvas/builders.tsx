@@ -15,6 +15,8 @@ export interface BuilderProps {
   finishes: Record<string, string | undefined>;
   /** Global lights toggle (bulb emissives + flame). */
   lightsOn?: boolean;
+  /** Per-item LED strip toggle (defs with ledOption). */
+  led?: boolean;
 }
 
 export const BUILDERS: Record<string, ComponentType<BuilderProps>> = {

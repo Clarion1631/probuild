@@ -42,6 +42,10 @@ export interface CatalogItem {
   emitsLight?: boolean;
   /** Item height always stretches to the ceiling at its position (interior walls). */
   fullHeight?: boolean;
+  /** Wall-mount item carves a real recess hole into its host wall (niches). */
+  cutsWall?: boolean;
+  /** Item supports an optional LED strip, toggled per placement in the Inspector. */
+  ledOption?: boolean;
 }
 
 const IN = inches;
@@ -104,7 +108,7 @@ export const FIXTURES: CatalogItem[] = [
   def({ id: "shower-glass", name: "Glass Shower", category: "fixtures", mesh: "shower", w: IN(48), d: IN(36), h: IN(84), mount: "floor", wallSnap: true, resizable: { min: IN(32), max: IN(72), step: IN(4) }, finishes: { metal: "metal-matte-black", tile: "tile-white-subway" }, tags: ["shower", "glass", "walk-in"] }),
   def({ id: "pedestal-sink", name: "Pedestal Sink", category: "fixtures", mesh: "pedestal-sink", w: IN(24), d: IN(20), h: IN(34), mount: "floor", wallSnap: true, finishes: { faucet: "metal-chrome" }, tags: ["bathroom", "sink"] }),
   def({ id: "fireplace", name: "Fireplace", category: "fixtures", mesh: "fireplace", w: IN(60), d: IN(16), h: IN(48), mount: "floor", wallSnap: true, resizable: { min: IN(42), max: IN(84), step: IN(6) }, finishes: { surround: "tile-marble-herringbone", mantel: "wood-oak" }, emitsLight: true, tags: ["fireplace", "living", "mantel"] }),
-  def({ id: "shower-niche", name: "Shower Niche", category: "fixtures", mesh: "shower-niche", w: IN(24), d: IN(3.5), h: IN(14), mount: "wall", elevation: IN(42), wallSnap: true, resizable: { min: IN(12), max: IN(60), step: IN(2) }, finishes: { tile: "tile-white-subway", trim: "metal-brushed-nickel" }, tags: ["niche", "shower", "shampoo", "recessed", "bathroom"] }),
+  def({ id: "shower-niche", name: "Shower Niche", category: "fixtures", mesh: "shower-niche", w: IN(24), d: IN(3.5), h: IN(14), mount: "wall", elevation: IN(42), wallSnap: true, cutsWall: true, ledOption: true, resizable: { min: IN(12), max: IN(60), step: IN(2) }, finishes: { tile: "tile-white-subway", trim: "metal-brushed-nickel" }, tags: ["niche", "shower", "shampoo", "recessed", "bathroom", "led"] }),
   def({ id: "pony-wall", name: "Pony Wall", category: "fixtures", mesh: "pony-wall", w: IN(48), d: IN(5), h: IN(36), mount: "floor", resizable: { min: IN(18), max: IN(120), step: IN(2) }, finishes: { paint: "paint-soft-chalk", cap: "wood-oak" }, tags: ["half wall", "knee wall", "pony", "divider", "stub"] }),
   def({ id: "interior-wall", name: "Interior Wall", category: "fixtures", mesh: "interior-wall", w: IN(96), d: IN(4.5), h: IN(96), mount: "floor", fullHeight: true, resizable: { min: IN(24), max: IN(288), step: IN(2) }, finishes: { paint: "paint-soft-chalk" }, tags: ["partition", "divider", "wall", "internal", "room"] }),
   def({ id: "interior-wall-doorway", name: "Interior Wall + Doorway", category: "fixtures", mesh: "interior-wall-doorway", w: IN(120), d: IN(4.5), h: IN(96), mount: "floor", fullHeight: true, resizable: { min: IN(72), max: IN(288), step: IN(2) }, finishes: { paint: "paint-soft-chalk" }, tags: ["partition", "doorway", "opening", "wall", "internal", "cased"] }),

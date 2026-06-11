@@ -8,7 +8,7 @@
 import { inches } from "@/lib/studio/units";
 import {
   Box, Cyl, Ball, ShakerFront, BarPull, mat, matShade, glassMat, blackGlassMat,
-  ceramicMat, fixedMat, flameMat,
+  ceramicMat, fixedMat, flameMat, bulbMat,
 } from "./parts";
 import type { BuilderProps } from "./builders";
 import * as THREE from "three";
@@ -586,29 +586,37 @@ export function PedestalSink({ w, d, h, finishes }: BuilderProps) {
 }
 
 /**
- * Recessed shower niche. Mounts on a wall; the visible part is a tiled inset
- * with a trim frame and a center shelf - reads as recessed without needing a
- * real wall cutout.
+ * Recessed shower niche. The item centers ON the wall face (cutsWall carves a
+ * real hole in the host wall); this builder lines that hole: tiled liner box
+ * sunk into the wall (local -Z), a flush trim ring on the room face, a glass
+ * shelf, and an optional LED strip under the head tile.
  */
-export function ShowerNiche({ w, d, h, finishes }: BuilderProps) {
+export function ShowerNiche({ w, d, h, finishes, lightsOn, led }: BuilderProps) {
   const tile = mat(finishes.tile, "tile-white-subway");
   const trim = mat(finishes.trim, "metal-brushed-nickel");
-  const inset = Math.min(d, IN(3.5));
+  const FW = IN(0.8); // trim frame strip width
   return (
     <group>
-      {/* trim frame sits proud of the wall face */}
-      <Box s={[w, IN(0.8), IN(0.6)]} p={[0, h - IN(0.4), inset / 2]} m={trim} castShadow={false} />
-      <Box s={[w, IN(0.8), IN(0.6)]} p={[0, IN(0.4), inset / 2]} m={trim} castShadow={false} />
-      <Box s={[IN(0.8), h, IN(0.6)]} p={[-w / 2 + IN(0.4), h / 2, inset / 2]} m={trim} castShadow={false} />
-      <Box s={[IN(0.8), h, IN(0.6)]} p={[w / 2 - IN(0.4), h / 2, inset / 2]} m={trim} castShadow={false} />
-      {/* recessed box: back + sides + top/bottom in tile, slightly darker back */}
-      <Box s={[w - IN(1.6), h - IN(1.6), IN(0.4)]} p={[0, h / 2, -inset / 2]} m={matShade(finishes.tile, 0.12, "tile-white-subway")} castShadow={false} />
-      <Box s={[w - IN(1.6), IN(0.5), inset]} p={[0, IN(0.85), 0]} m={tile} castShadow={false} />
-      <Box s={[w - IN(1.6), IN(0.5), inset]} p={[0, h - IN(0.85), 0]} m={tile} castShadow={false} />
-      <Box s={[IN(0.5), h - IN(1.6), inset]} p={[-w / 2 + IN(1.05), h / 2, 0]} m={tile} castShadow={false} />
-      <Box s={[IN(0.5), h - IN(1.6), inset]} p={[w / 2 - IN(1.05), h / 2, 0]} m={tile} castShadow={false} />
+      {/* trim ring, just proud of the wall face - covers the hole rim */}
+      <Box s={[w + 2 * FW, FW, IN(0.5)]} p={[0, h + FW / 2, IN(0.25)]} m={trim} castShadow={false} />
+      <Box s={[w + 2 * FW, FW, IN(0.5)]} p={[0, -FW / 2, IN(0.25)]} m={trim} castShadow={false} />
+      <Box s={[FW, h, IN(0.5)]} p={[-(w / 2 + FW / 2), h / 2, IN(0.25)]} m={trim} castShadow={false} />
+      <Box s={[FW, h, IN(0.5)]} p={[w / 2 + FW / 2, h / 2, IN(0.25)]} m={trim} castShadow={false} />
+      {/* tiled liner filling the wall cutout (slightly oversize to seal the hole edges) */}
+      <Box s={[w + IN(0.4), h + IN(0.4), IN(0.4)]} p={[0, h / 2, -d + IN(0.2)]} m={matShade(finishes.tile, 0.12, "tile-white-subway")} castShadow={false} />
+      <Box s={[w + IN(0.4), IN(0.6), d]} p={[0, h + IN(0.05), -d / 2]} m={tile} castShadow={false} />
+      <Box s={[w + IN(0.4), IN(0.6), d]} p={[0, -IN(0.05), -d / 2]} m={tile} castShadow={false} />
+      <Box s={[IN(0.6), h + IN(0.4), d]} p={[-(w / 2 + IN(0.05)), h / 2, -d / 2]} m={tile} castShadow={false} />
+      <Box s={[IN(0.6), h + IN(0.4), d]} p={[w / 2 + IN(0.05), h / 2, -d / 2]} m={tile} castShadow={false} />
       {/* glass center shelf */}
-      <Box s={[w - IN(1.8), IN(0.3), inset - IN(0.4)]} p={[0, h / 2, 0]} m={glassMat()} castShadow={false} />
+      <Box s={[w - IN(0.5), IN(0.3), d - IN(0.8)]} p={[0, h / 2, -d / 2]} m={glassMat()} castShadow={false} />
+      {/* optional LED strip under the head tile */}
+      {led && (
+        <Box s={[w - IN(1.5), IN(0.2), IN(0.35)]} p={[0, h - IN(0.35), -IN(0.6)]} m={bulbMat(!!lightsOn)} castShadow={false} />
+      )}
+      {led && lightsOn && (
+        <pointLight position={[0, h - IN(3), -d / 2 + IN(1)]} intensity={0.3} distance={1.3} decay={2} color="#ffe2b0" />
+      )}
     </group>
   );
 }
