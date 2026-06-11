@@ -22,6 +22,8 @@ export default defineConfig({
     {
       name: "setup",
       testMatch: /(^|[\\/])auth\.setup\.ts$/,
+      // data first: on a fresh test DB the admin user must exist before login
+      dependencies: ["data"],
     },
     {
       name: "chromium",
