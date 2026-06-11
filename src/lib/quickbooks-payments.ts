@@ -71,6 +71,7 @@ async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promi
 export interface MilestonePushResult {
     qbInvoiceId: string;
     payLink: string | null;
+    qbTotal?: number; // grand total as QBO computed it (drift check vs the milestone)
 }
 
 /**
@@ -100,7 +101,8 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string): Prom
         if (payLink && payLink !== schedule.qbInvoiceLink) {
             await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: payLink } });
         }
-        return { qbInvoiceId: schedule.qbInvoiceId, payLink };
+        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId);
+        return { qbInvoiceId: schedule.qbInvoiceId, payLink, qbTotal: status?.total };
     }
 
     const invoice = schedule.invoice;
@@ -150,7 +152,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string): Prom
         data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date() },
     });
 
-    return { qbInvoiceId: qbId, payLink };
+    return { qbInvoiceId: qbId, payLink, qbTotal: total };
 }
 
 /**
