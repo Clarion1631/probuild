@@ -284,6 +284,69 @@ export async function getQBPayment(
     };
 }
 
+/** Read core invoice fields needed for payments/deletes. */
+export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string) {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+    if (!res.ok) return null;
+    const inv = (await res.json()).Invoice;
+    if (!inv) return null;
+    return {
+        syncToken: String(inv.SyncToken),
+        customerId: String(inv.CustomerRef?.value ?? ""),
+        balance: Number(inv.Balance ?? 0),
+        total: Number(inv.TotalAmt ?? 0),
+        docNumber: inv.DocNumber ?? null,
+    };
+}
+
+/** Receive a payment against an invoice (full open balance). TEST/admin tooling. */
+export async function createQBPaymentForInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<{ paymentId: string; amount: number } | null> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId);
+    if (!inv || inv.balance <= 0 || !inv.customerId) return null;
+    const res = await qbFetch("/payment", tokens, {
+        method: "POST",
+        body: JSON.stringify({
+            TotalAmt: inv.balance,
+            CustomerRef: { value: inv.customerId },
+            Line: [{ Amount: inv.balance, LinkedTxn: [{ TxnId: qbInvoiceId, TxnType: "Invoice" }] }],
+        }),
+    });
+    if (!res.ok) throw new Error(`QB payment create failed: ${await res.text()}`);
+    const p = (await res.json()).Payment;
+    return { paymentId: String(p.Id), amount: Number(p.TotalAmt ?? inv.balance) };
+}
+
+/** Hard-delete a payment (test cleanup). */
+export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Promise<boolean> {
+    const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
+    if (!get.ok) return false;
+    const syncToken = String((await get.json()).Payment?.SyncToken ?? "0");
+    const res = await fetch(
+        `${QB_API_BASE}/${tokens.realmId}/payment?operation=delete&minorversion=73`,
+        {
+            method: "POST",
+            headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({ Id: paymentId, SyncToken: syncToken }),
+        }
+    );
+    return res.ok;
+}
+
+/** Hard-delete an invoice (test cleanup). Fails in QBO if payments are still linked. */
+export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<boolean> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId);
+    if (!inv) return false;
+    const res = await fetch(
+        `${QB_API_BASE}/${tokens.realmId}/invoice?operation=delete&minorversion=73`,
+        {
+            method: "POST",
+            headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({ Id: qbInvoiceId, SyncToken: inv.syncToken }),
+        }
+    );
+    return res.ok;
+}
+
 /** Read an invoice's online-payment toggles + sync token (for sparse updates). */
 export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string) {
     const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });

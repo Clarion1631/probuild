@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
-import { getQBInvoicePaymentOptions, setQBInvoicePaymentOptions } from "@/lib/quickbooks";
+import {
+    getQBInvoicePaymentOptions, setQBInvoicePaymentOptions,
+    createQBPaymentForInvoice, deleteQBPayment, deleteQBInvoice,
+} from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -21,11 +24,46 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
 
-    let body: { action?: string; paymentScheduleId?: string };
+    let body: { action?: string; paymentScheduleId?: string; qbInvoiceId?: string; qbPaymentId?: string };
     try {
         body = await req.json();
     } catch {
         return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
+    }
+
+    // ── Settle-loop QA + test cleanup actions (all idempotent, secret-gated) ──
+    if (body.action === "test-settle" || body.action === "delete-qbo-payment" || body.action === "delete-qbo-invoice" || body.action === "sync-payments") {
+        let tokens;
+        try {
+            tokens = await getFreshQBTokens();
+        } catch (e) {
+            if (e instanceof QBNotConnectedError) {
+                return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
+            }
+            throw e;
+        }
+
+        if (body.action === "test-settle") {
+            if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
+            const created = await createQBPaymentForInvoice(tokens, body.qbInvoiceId);
+            if (!created) return NextResponse.json({ ok: false, reason: "invoice-not-found-or-already-paid" });
+            return NextResponse.json({ ok: true, ...created });
+        }
+        if (body.action === "sync-payments") {
+            const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
+            const result = await syncQuickBooksPayments();
+            return NextResponse.json({ ok: true, ...result });
+        }
+        if (body.action === "delete-qbo-payment") {
+            if (!body.qbPaymentId) return NextResponse.json({ ok: false, reason: "qbPaymentId required" }, { status: 400 });
+            const deleted = await deleteQBPayment(tokens, body.qbPaymentId);
+            return NextResponse.json({ ok: deleted });
+        }
+        if (body.action === "delete-qbo-invoice") {
+            if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
+            const deleted = await deleteQBInvoice(tokens, body.qbInvoiceId);
+            return NextResponse.json({ ok: deleted });
+        }
     }
 
     // Push (or re-fetch) one milestone's QBO invoice — same path signing uses.
