@@ -8,11 +8,16 @@ import {
   Layers, ShowerHead, X,
 } from "lucide-react";
 import {
-  CATALOG, CATEGORY_LABELS, CATEGORY_ORDER, type CatalogItem, type Category,
+  CATALOG, CATEGORY_LABELS, CATEGORY_ORDER, getLibraryProducts,
+  type CatalogItem, type Category,
 } from "@/lib/studio/catalog";
-import { PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, getFinish } from "@/lib/studio/materials";
+import {
+  PAINTS, SW_PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, getFinish,
+  getLibraryFinishesByKind,
+} from "@/lib/studio/materials";
 import { formatIn, formatFtIn } from "@/lib/studio/units";
 import { useStudio } from "../store";
+import { useLibrary } from "../useLibrary";
 import { useItemThumbnail } from "./thumbnails";
 
 type Tab = "items" | "paint" | "floors";
@@ -33,14 +38,19 @@ export function CatalogPanel() {
   const [query, setQuery] = useState("");
   const placing = useStudio((s) => s.placing);
   const setPlacing = useStudio((s) => s.setPlacing);
+  const library = useLibrary();
 
   const items = useMemo(() => {
+    // Library products (real vendor SKUs) list ahead of the seeded items.
+    const all = [...getLibraryProducts(), ...CATALOG];
     const q = query.trim().toLowerCase();
-    if (!q) return CATALOG.filter((c) => c.category === category);
-    return CATALOG.filter(
-      (c) => c.name.toLowerCase().includes(q) || c.tags?.some((t) => t.includes(q)),
+    if (!q) return all.filter((c) => c.category === category);
+    return all.filter(
+      (c) => c.name.toLowerCase().includes(q) || c.tags?.some((t) => t.toLowerCase().includes(q)),
     );
-  }, [category, query]);
+    // library is in deps so the list refreshes once products register
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [category, query, library]);
 
   return (
     <div className="flex h-full w-[280px] shrink-0 flex-col border-r border-slate-200 bg-white">
@@ -131,18 +141,25 @@ export function CatalogPanel() {
 
 function ItemCard({ item, active, onClick }: { item: CatalogItem; active: boolean; onClick: () => void }) {
   const thumb = useItemThumbnail(item);
+  const isLibrary = item.id.startsWith("prod-");
+  const product = useLibraryProductInfo(isLibrary ? item.id.slice(5) : null);
   const accent = item.finishes
     ? getFinish(item.finishes.cabinet ?? item.finishes.fabric ?? item.finishes.wood ?? item.finishes.metal ?? Object.values(item.finishes)[0], "cab-white").hex
     : "#cbd5e1";
   return (
     <button
       onClick={onClick}
-      className={`group flex flex-col items-stretch rounded-xl border p-2 text-left transition-all ${
+      className={`group relative flex flex-col items-stretch rounded-xl border p-2 text-left transition-all ${
         active
           ? "border-blue-500 bg-blue-50 shadow-sm ring-2 ring-blue-200"
           : "border-slate-200 bg-white hover:border-slate-300 hover:shadow-sm"
       }`}
     >
+      {isLibrary && (
+        <span className="absolute right-1.5 top-1.5 z-10 rounded bg-emerald-600 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-white">
+          Yours
+        </span>
+      )}
       <div
         className="mb-1.5 flex h-16 items-center justify-center overflow-hidden rounded-lg"
         style={{ background: `linear-gradient(150deg, ${accent}1f, ${accent}4d)` }}
@@ -155,11 +172,18 @@ function ItemCard({ item, active, onClick }: { item: CatalogItem; active: boolea
         )}
       </div>
       <span className="truncate text-[11px] font-semibold text-slate-800">{item.name}</span>
-      <span className="text-[10px] text-slate-400">
+      <span className="truncate text-[10px] text-slate-400">
         {item.w >= 0.9 ? formatFtIn(item.w) : formatIn(item.w)} w
+        {product?.vendor ? ` - ${product.vendor}` : ""}
+        {product?.price != null ? ` - $${product.price.toLocaleString()}` : ""}
       </span>
     </button>
   );
+}
+
+function useLibraryProductInfo(id: string | null) {
+  const library = useLibrary();
+  return id ? library.products.find((p) => p.id === id) ?? null : null;
 }
 
 function PaintTab() {
@@ -184,16 +208,50 @@ function PaintTab() {
           Click a wall in the room to paint just that wall, or pick a color now for every wall.
         </div>
       </div>
-      <div className="grid flex-1 auto-rows-min grid-cols-4 gap-1.5 overflow-y-auto p-3">
-        {PAINTS.map((p) => (
-          <Swatch
-            key={p.id}
-            hex={p.hex}
-            name={p.name}
-            selected={currentId === p.id}
-            onClick={() => setWallPaint(activeSurface?.kind === "wall" ? activeSurface.wallIndex : "all", p.id)}
-          />
-        ))}
+      <div className="flex-1 overflow-y-auto p-3">
+        <PaintSections
+          currentId={currentId}
+          onPick={(id) => setWallPaint(activeSurface?.kind === "wall" ? activeSurface.wallIndex : "all", id)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** Studio palette + Sherwin-Williams + the org's own library paints. */
+export function PaintSections({ currentId, onPick }: { currentId?: string; onPick: (id: string) => void }) {
+  useLibrary();
+  const libraryPaints = getLibraryFinishesByKind("paint");
+  return (
+    <div className="space-y-3">
+      {libraryPaints.length > 0 && (
+        <div>
+          <SectionLabel>Your library</SectionLabel>
+          <div className="mt-1 grid grid-cols-4 gap-1.5">
+            {libraryPaints.map((p) => (
+              <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => onPick(p.id)} />
+            ))}
+          </div>
+        </div>
+      )}
+      <div>
+        <SectionLabel>Studio palette</SectionLabel>
+        <div className="mt-1 grid grid-cols-4 gap-1.5">
+          {PAINTS.map((p) => (
+            <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => onPick(p.id)} />
+          ))}
+        </div>
+      </div>
+      <div>
+        <SectionLabel>Sherwin-Williams</SectionLabel>
+        <div className="mt-1 grid grid-cols-4 gap-1.5">
+          {SW_PAINTS.map((p) => (
+            <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => onPick(p.id)} />
+          ))}
+        </div>
+        <div className="mt-1 text-[9.5px] leading-snug text-slate-400">
+          Screen approximations - confirm with physical chips.
+        </div>
       </div>
     </div>
   );
@@ -203,6 +261,10 @@ function FloorsTab() {
   const doc = useStudio((s) => s.doc);
   const setFloorFinish = useStudio((s) => s.setFloorFinish);
   const commitDoc = useStudio((s) => s.commitDoc);
+  useLibrary();
+  const libFloors = getLibraryFinishesByKind("floor");
+  const libCounters = getLibraryFinishesByKind("counter");
+  const libCabinets = getLibraryFinishesByKind("cabinet");
 
   const applyCounterAll = (finishId: string) => {
     const items = doc.items.map((it) => {
@@ -228,19 +290,19 @@ function FloorsTab() {
     <div className="flex flex-1 flex-col gap-1 overflow-y-auto p-3">
       <SectionLabel>Flooring</SectionLabel>
       <div className="grid grid-cols-4 gap-1.5">
-        {FLOORS.map((f) => (
+        {[...libFloors, ...FLOORS].map((f) => (
           <Swatch key={f.id} hex={f.hex} name={f.name} selected={doc.surfaces.floor === f.id} onClick={() => setFloorFinish(f.id)} />
         ))}
       </div>
       <SectionLabel className="mt-3">Countertops - apply to all</SectionLabel>
       <div className="grid grid-cols-4 gap-1.5">
-        {COUNTERS.map((f) => (
+        {[...libCounters, ...COUNTERS].map((f) => (
           <Swatch key={f.id} hex={f.hex} name={f.name} onClick={() => applyCounterAll(f.id)} />
         ))}
       </div>
       <SectionLabel className="mt-3">Cabinet color - apply to all</SectionLabel>
       <div className="grid grid-cols-4 gap-1.5">
-        {CABINET_FINISHES.map((f) => (
+        {[...libCabinets, ...CABINET_FINISHES].map((f) => (
           <Swatch key={f.id} hex={f.hex} name={f.name} onClick={() => applyCabinetAll(f.id)} />
         ))}
       </div>

@@ -99,3 +99,4 @@ scripts/.template-backup-*.json
 
 
 .env.vercel
+qa-screenshots/

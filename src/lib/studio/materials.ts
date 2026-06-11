@@ -81,6 +81,61 @@ export const PAINTS: Finish[] = [
   P("paint-first-light", "First Light", "#EBD9D4"),
 ];
 
+// Popular Sherwin-Williams colors for spec-matching real jobs. Names/numbers
+// are SW's identifiers used for reference; hex values are close screen
+// approximations (paint chips should always be confirmed physically).
+
+export const SW_PAINTS: Finish[] = [
+  P("sw-7008", "SW 7008 Alabaster", "#EDEAE0"),
+  P("sw-7757", "SW 7757 High Reflective White", "#F7F7F1"),
+  P("sw-7005", "SW 7005 Pure White", "#EFEDE6"),
+  P("sw-7042", "SW 7042 Shoji White", "#E6E0D2"),
+  P("sw-7012", "SW 7012 Creamy", "#F1EADC"),
+  P("sw-7551", "SW 7551 Greek Villa", "#F0EADC"),
+  P("sw-7029", "SW 7029 Agreeable Gray", "#D1CBC1"),
+  P("sw-7015", "SW 7015 Repose Gray", "#C9C5BD"),
+  P("sw-7641", "SW 7641 Colonnade Gray", "#C5C0B5"),
+  P("sw-7043", "SW 7043 Worldly Gray", "#CCC5B8"),
+  P("sw-7036", "SW 7036 Accessible Beige", "#D1C7B8"),
+  P("sw-7050", "SW 7050 Useful Gray", "#CFC9BC"),
+  P("sw-7016", "SW 7016 Mindful Gray", "#BCB6AB"),
+  P("sw-7017", "SW 7017 Dorian Gray", "#ACA79C"),
+  P("sw-7019", "SW 7019 Gauntlet Gray", "#79756C"),
+  P("sw-7048", "SW 7048 Urbane Bronze", "#54504A"),
+  P("sw-7069", "SW 7069 Iron Ore", "#434341"),
+  P("sw-6258", "SW 6258 Tricorn Black", "#2F2F30"),
+  P("sw-7006", "SW 7006 Extra White", "#EEEFEA"),
+  P("sw-9130", "SW 9130 Evergreen Fog", "#95978A"),
+  P("sw-6204", "SW 6204 Sea Salt", "#CDD2C4"),
+  P("sw-6212", "SW 6212 Quietude", "#ADBBB2"),
+  P("sw-6244", "SW 6244 Naval", "#2F3D4C"),
+  P("sw-9178", "SW 9178 In the Navy", "#30394A"),
+  P("sw-9176", "SW 9176 Dress Blues", "#3D4D60"),
+  P("sw-6221", "SW 6221 Moody Blue", "#7E909A"),
+  P("sw-9151", "SW 9151 Daphne", "#A7BCC7"),
+  P("sw-6219", "SW 6219 Rain", "#B6C5C4"),
+  P("sw-6478", "SW 6478 Watery", "#B3CCC9"),
+  P("sw-7602", "SW 7602 Indigo Batik", "#41546B"),
+  P("sw-6991", "SW 6991 Black Magic", "#323233"),
+  P("sw-7675", "SW 7675 Sealskin", "#4A443D"),
+  P("sw-6090", "SW 6090 Java", "#6A5546"),
+  P("sw-9092", "SW 9092 Iced Mocha", "#B3997F"),
+  P("sw-6106", "SW 6106 Kilim Beige", "#D9C7AC"),
+  P("sw-7531", "SW 7531 Canvas Tan", "#DCD2BD"),
+  P("sw-6148", "SW 6148 Wool Skein", "#D8CDB4"),
+  P("sw-9109", "SW 9109 Natural Linen", "#DFD4BE"),
+  P("sw-6172", "SW 6172 Hardware", "#8B8579"),
+  P("sw-6199", "SW 6199 Rare Gray", "#B6B5A9"),
+  P("sw-7735", "SW 7735 Palm Leaf", "#7A7B62"),
+  P("sw-6188", "SW 6188 Shade-Grown", "#4C5448"),
+  P("sw-2847", "SW 2847 Roycroft Bottle Green", "#324038"),
+  P("sw-6041", "SW 6041 Otter", "#7A6A5D"),
+  P("sw-6385", "SW 6385 Dover White", "#F0E8D4"),
+  P("sw-6840", "SW 6840 Exuberant Pink", "#B55C74"),
+  P("sw-6321", "SW 6321 Red Bay", "#8E4A3F"),
+  P("sw-7589", "SW 7589 Habanero Chile", "#B65540"),
+];
+
 // ─────────────────────────── Flooring (16) ───────────────────────────
 
 const F = (id: string, name: string, hex: string, roughness = 0.62, accentHex?: string): Finish =>
@@ -192,14 +247,27 @@ export const TILES: Finish[] = [
 // ─────────────────────────── Lookup ───────────────────────────
 
 export const ALL_FINISHES: Finish[] = [
-  ...PAINTS, ...FLOORS, ...COUNTERS, ...CABINET_FINISHES, ...METALS, ...FABRICS, ...WOODS, ...TILES,
+  ...PAINTS, ...SW_PAINTS, ...FLOORS, ...COUNTERS, ...CABINET_FINISHES, ...METALS, ...FABRICS, ...WOODS, ...TILES,
 ];
 
 const FINISH_MAP = new Map(ALL_FINISHES.map((f) => [f.id, f]));
 
+// DB-backed library finishes (real vendor lines) register at runtime and
+// resolve exactly like seeded ones. See lib/studio/library.ts.
+const LIBRARY_FINISH_MAP = new Map<string, Finish>();
+
+export function registerLibraryFinishes(finishes: Finish[]): void {
+  LIBRARY_FINISH_MAP.clear();
+  for (const f of finishes) LIBRARY_FINISH_MAP.set(f.id, f);
+}
+
+export function getLibraryFinishesByKind(kind: FinishKind): Finish[] {
+  return [...LIBRARY_FINISH_MAP.values()].filter((f) => f.kind === kind);
+}
+
 export function getFinish(id: string | undefined | null, fallback: string): Finish {
   if (id) {
-    const f = FINISH_MAP.get(id);
+    const f = FINISH_MAP.get(id) ?? LIBRARY_FINISH_MAP.get(id);
     if (f) return f;
   }
   return FINISH_MAP.get(fallback)!;

@@ -65,6 +65,7 @@
     "next-safe-action": "^8.3.0",
     "nodemailer": "^7.0.13",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.0.227",
     "prisma": "^5.22.0",
     "radix-ui": "^1.4.3",
     "react": "19.2.3",

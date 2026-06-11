@@ -177,8 +177,21 @@ export const CATALOG: CatalogItem[] = [
 
 const CATALOG_MAP = new Map(CATALOG.map((c) => [c.id, c]));
 
+// DB-backed library products (real SKUs on procedural meshes) register at
+// runtime. See lib/studio/library.ts.
+const LIBRARY_PRODUCT_MAP = new Map<string, CatalogItem>();
+
+export function registerLibraryProducts(items: CatalogItem[]): void {
+  LIBRARY_PRODUCT_MAP.clear();
+  for (const item of items) LIBRARY_PRODUCT_MAP.set(item.id, item);
+}
+
+export function getLibraryProducts(): CatalogItem[] {
+  return [...LIBRARY_PRODUCT_MAP.values()];
+}
+
 export function getItemDef(defId: string): CatalogItem | undefined {
-  return CATALOG_MAP.get(defId) ?? LEGACY_ASSET_MAP_RESOLVED.get(defId);
+  return CATALOG_MAP.get(defId) ?? LIBRARY_PRODUCT_MAP.get(defId) ?? LEGACY_ASSET_MAP_RESOLVED.get(defId);
 }
 
 export const CATEGORY_LABELS: Record<Category, string> = {
@@ -193,6 +206,25 @@ export const CATEGORY_LABELS: Record<Category, string> = {
 
 export const CATEGORY_ORDER: Category[] = [
   "cabinets", "appliances", "fixtures", "lighting", "doors-windows", "furniture", "decor",
+];
+
+/** Every procedural builder key (kept in sync with canvas/builders.tsx, which
+    can't be imported server-side because it pulls in three.js). The AI
+    importer maps real products onto these recipes. */
+export const MESH_KEYS: string[] = [
+  "cabinet-base", "cabinet-drawers", "cabinet-sink", "cabinet-corner", "cabinet-cooktop",
+  "island", "island-overhang", "cabinet-wall", "cabinet-wall-glass", "open-shelves",
+  "cabinet-tall", "cabinet-oven-tower", "vanity", "vanity-double",
+  "fridge-french", "fridge-side", "range", "range-pro", "hood", "dishwasher", "microwave",
+  "wine-fridge", "washer", "dryer",
+  "sink-farmhouse", "toilet", "tub", "tub-alcove", "shower", "pedestal-sink", "fireplace",
+  "shower-niche", "pony-wall", "interior-wall", "interior-wall-doorway",
+  "recessed", "pendant", "pendant-glass", "pendant-trio", "chandelier", "flush-mount",
+  "sconce", "floor-lamp", "table-lamp", "track", "under-cab-light",
+  "door", "door-double", "door-sliding", "doorway", "window", "window-double", "window-picture",
+  "sofa", "sectional", "armchair", "coffee-table", "side-table", "tv-console", "dining-table",
+  "dining-chair", "stool", "bookshelf", "bed", "dresser", "nightstand", "desk", "rug",
+  "plant", "plant-small", "mirror", "art", "vase",
 ];
 
 // Legacy v1 asset-registry ids → studio ids (best-effort upgrade of old rooms).

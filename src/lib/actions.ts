@@ -7659,25 +7659,49 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         plant: 120, "plant-small": 35, mirror: 220, art: 150, vase: 40,
     };
 
+    // Real vendor products placed from the library price by their actual
+    // price/SKU instead of the budgetary table.
+    const productIds = room.assets
+        .filter((a) => a.assetId.startsWith("prod-"))
+        .map((a) => a.assetId.slice(5));
+    const libraryProducts = productIds.length
+        ? await prisma.catalogProduct.findMany({ where: { id: { in: productIds } } })
+        : [];
+    const productById = new Map(libraryProducts.map((p) => [p.id, p]));
+
+    // Library finishes referenced in placed items, for naming in line items.
+    const libraryFinishes = await prisma.catalogFinish.findMany({
+        select: { id: true, name: true, vendor: true },
+    });
+    const libFinishName = new Map(
+        libraryFinishes.map((f) => [`lib-${f.id}`, f.vendor ? `${f.name} (${f.vendor})` : f.name]),
+    );
+
     for (let idx = 0; idx < room.assets.length; idx++) {
         const asset = room.assets[idx];
+        const product = asset.assetId.startsWith("prod-")
+            ? productById.get(asset.assetId.slice(5))
+            : undefined;
         const def = getItemDef(asset.assetId);
         const markupPercent = 25;
-        const name = def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
+        const name = product?.name ?? def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
 
         const metadata = (asset.metadata ?? {}) as Record<string, any>;
         const studio = (metadata.studio ?? {}) as Record<string, any>;
         const finishes = { ...(def?.finishes ?? {}), ...((studio.finishes ?? {}) as Record<string, string>) };
 
         let baseCost = def ? MESH_BASE_COST[def.mesh] ?? 250 : 250;
+        if (product?.price != null) baseCost = Number(product.price);
+        else if (product) baseCost = MESH_BASE_COST[product.mesh] ?? 250;
 
         const wM = typeof studio.w === "number" ? studio.w : def?.w ?? 0.6;
         const hM = typeof studio.h === "number" ? studio.h : def?.h ?? 0.76;
         const dM = typeof studio.d === "number" ? studio.d : def?.d ?? 0.6;
         const wIn = Math.round(toInches(wM));
 
-        // Millwork scales by width vs the catalog default (24" base assumption).
-        if (def?.category === "cabinets" && def.resizable) {
+        // Millwork scales by width vs the catalog default (24" base assumption)
+        // - but never rescale a real product's actual price.
+        if (!product?.price && def?.category === "cabinets" && def.resizable) {
             const defaultIn = Math.max(1, Math.round(toInches(def.w)));
             baseCost = Math.round(baseCost * Math.max(0.6, wIn / defaultIn));
         }
@@ -7685,11 +7709,14 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         const detailsArray: string[] = [
             `Size: ${wIn}"W x ${Math.round(toInches(hM))}"H x ${Math.round(toInches(dM))}"D`,
         ];
+        if (product?.vendor) detailsArray.push(`Vendor: ${product.vendor}`);
         for (const [slot, finishId] of Object.entries(finishes)) {
             if (!finishId) continue;
-            detailsArray.push(`${slot.charAt(0).toUpperCase()}${slot.slice(1)}: ${getFinish(finishId, "cab-white").name}`);
+            const finishName = libFinishName.get(finishId) ?? getFinish(finishId, "cab-white").name;
+            detailsArray.push(`${slot.charAt(0).toUpperCase()}${slot.slice(1)}: ${finishName}`);
         }
-        const sku = `GTR-${(def?.category ?? "item").slice(0, 3).toUpperCase()}-${(def?.id ?? asset.assetId).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 10)}-${wIn}`;
+        const sku = product?.sku
+            ?? `GTR-${(def?.category ?? "item").slice(0, 3).toUpperCase()}-${(def?.id ?? asset.assetId).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 10)}-${wIn}`;
         detailsArray.unshift(`SKU: ${sku}`);
 
         const unitCost = Math.round(baseCost * (1 + markupPercent / 100));

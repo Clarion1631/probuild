@@ -16,6 +16,7 @@ import {
 } from "@/lib/studio/geometry";
 import { inches, formatFtIn } from "@/lib/studio/units";
 import { useStudio } from "../store";
+import { useLibrary } from "../useLibrary";
 import { BUILDERS } from "./builders";
 
 const CLICK_SLOP_PX = 5;
@@ -64,6 +65,8 @@ interface DragState {
 const DRAG_START_M = 0.015;
 
 export function Items({ doc }: { doc: DesignDoc }) {
+  // re-render when the product library registers (library defIds resolve late)
+  useLibrary();
   const walls = useMemo(() => wallSegments(doc.room.points), [doc.room.points]);
   const shell: RoomShellInfo = useMemo(
     () => ({ points: doc.room.points, height: doc.room.height, slope: doc.room.slope }),

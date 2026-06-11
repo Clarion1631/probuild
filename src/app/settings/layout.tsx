@@ -53,6 +53,7 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
                         <ul className="space-y-0.5">
                             {navLink("/settings/contacts", "Contacts")}
                             {navLink("/settings/cost-codes", "Cost Codes")}
+                            {navLink("/settings/catalog", "Design Catalog")}
                         </ul>
                     </div>
                 </div>

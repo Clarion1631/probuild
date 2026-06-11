@@ -1528,3 +1528,43 @@ model StripeEvent {
 
   @@index([status])
 }
+
+// ── Room Studio product library ──────────────────────────────────────────────
+// Org-wide custom finishes (real paint/cabinet/floor lines) and placeable
+// products (real SKUs mapped onto procedural builder meshes).
+
+model CatalogFinish {
+  id        String   @id @default(cuid())
+  kind      String // cabinet | paint | floor | counter | tile
+  name      String
+  hex       String
+  vendor    String?
+  sku       String?
+  priceNote String?
+  notes     String?
+  sourceUrl String?
+  createdAt DateTime @default(now())
+
+  @@index([kind])
+}
+
+model CatalogProduct {
+  id          String   @id @default(cuid())
+  name        String
+  vendor      String?
+  sku         String?
+  category    String // studio category key
+  mesh        String // procedural builder key
+  widthIn     Float
+  depthIn     Float
+  heightIn    Float
+  mount       String   @default("floor")
+  elevationIn Float?
+  price       Decimal?
+  finishes    Json?
+  sourceUrl   String?
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  @@index([category])
+}

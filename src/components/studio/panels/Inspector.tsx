@@ -7,13 +7,14 @@ import { RotateCw, Copy, Trash2, ArrowUpDown } from "lucide-react";
 import { toast } from "sonner";
 import { getItemDef } from "@/lib/studio/catalog";
 import {
-  PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, METALS, FABRICS, WOODS, TILES,
-  getFinish, type Finish,
+  PAINTS, SW_PAINTS, FLOORS, COUNTERS, CABINET_FINISHES, METALS, FABRICS, WOODS, TILES,
+  getFinish, getLibraryFinishesByKind, type Finish,
 } from "@/lib/studio/materials";
 import { formatFtIn, inches, toInches, parseFtIn } from "@/lib/studio/units";
 import { wallSegments, signedArea, removeCornerFromPolygon } from "@/lib/studio/geometry";
 import { useStudio, useSelectedItem } from "../store";
-import { Swatch } from "./CatalogPanel";
+import { useLibrary } from "../useLibrary";
+import { Swatch, PaintSections } from "./CatalogPanel";
 
 const SLOT_LABELS: Record<string, string> = {
   cabinet: "Cabinet color",
@@ -36,8 +37,8 @@ const SLOT_LABELS: Record<string, string> = {
 
 function optionsForSlot(slot: string): Finish[] {
   switch (slot) {
-    case "cabinet": return CABINET_FINISHES;
-    case "counter": return COUNTERS;
+    case "cabinet": return [...getLibraryFinishesByKind("cabinet"), ...CABINET_FINISHES];
+    case "counter": return [...getLibraryFinishesByKind("counter"), ...COUNTERS];
     case "hardware":
     case "metal":
     case "sink":
@@ -49,9 +50,10 @@ function optionsForSlot(slot: string): Finish[] {
     case "mantel":
     case "frame": return [...WOODS, ...METALS.slice(0, 4), ...PAINTS.slice(0, 6)];
     case "door": return PAINTS;
+    case "paint": return [...getLibraryFinishesByKind("paint"), ...PAINTS, ...SW_PAINTS];
     case "basin": return CABINET_FINISHES.slice(0, 6);
     case "tile":
-    case "surround": return TILES;
+    case "surround": return [...getLibraryFinishesByKind("tile"), ...TILES];
     default: return PAINTS;
   }
 }
@@ -70,6 +72,7 @@ function ItemInspector() {
   const updateItem = useStudio((s) => s.updateItem);
   const removeItem = useStudio((s) => s.removeItem);
   const duplicateItem = useStudio((s) => s.duplicateItem);
+  useLibrary(); // finish options include the org library once loaded
 
   const def = useMemo(() => (item ? getItemDef(item.defId) : undefined), [item]);
   if (!item || !def) return null;
@@ -237,10 +240,8 @@ function SurfaceInspector() {
       </div>
       {/* keyed by edit revision: input text re-derives after every commit */}
       <WallLengthEditor key={`${wallIdx}:${docRev}`} wallIdx={wallIdx} />
-      <div className="grid grid-cols-4 gap-1.5 p-3">
-        {PAINTS.map((p) => (
-          <Swatch key={p.id} hex={p.hex} name={p.name} selected={currentId === p.id} onClick={() => setWallPaint(wallIdx, p.id)} />
-        ))}
+      <div className="p-3">
+        <PaintSections currentId={currentId} onPick={(id) => setWallPaint(wallIdx, id)} />
       </div>
     </div>
   );
