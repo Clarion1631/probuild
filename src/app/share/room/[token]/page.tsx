@@ -21,6 +21,7 @@ interface ShareData {
     ownerName: string;
     contractor: { name: string; logoUrl: string | null };
     renders: Array<{ id: string; url: string }>;
+    arUsdzUrl: string | null;
 }
 
 async function getRoomForShare(token: string): Promise<ShareData | null> {
@@ -69,6 +70,7 @@ async function getRoomForShare(token: string): Promise<ShareData | null> {
             logoUrl: settings?.logoUrl ?? null,
         },
         renders: room.renders,
+        arUsdzUrl: room.scanUsdzUrl ?? null,
     };
 }
 
@@ -94,6 +96,7 @@ export default async function SharedRoomPage({ params }: PageProps) {
             ownerName={data.ownerName}
             contractor={data.contractor}
             renders={data.renders}
+            arUsdzUrl={data.arUsdzUrl}
         />
     );
 }

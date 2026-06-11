@@ -93,6 +93,25 @@ export async function POST(req: NextRequest) {
             )
         );
 
+        // Mirror lead photos into the lead's Google Drive folder (best-effort -
+        // mirrorUrlToLeadFolder never throws). Videos skip this path: they go
+        // direct-to-Drive via /api/mobile/leads/[id]/drive-video.
+        const leadImages = files.filter((f) => f.leadId && f.mimeType?.startsWith("image/"));
+        if (leadImages.length) {
+            const { mirrorUrlToLeadFolder } = await import("@/lib/lead-drive");
+            await Promise.all(
+                leadImages.map((f) =>
+                    mirrorUrlToLeadFolder({
+                        leadId: f.leadId!,
+                        url: f.url,
+                        name: f.name,
+                        mimeType: f.mimeType,
+                        size: f.size,
+                    })
+                )
+            );
+        }
+
         return NextResponse.json({ files: created }, { status: 201 });
     } catch (err: any) {
         console.error("POST /api/files/register error:", err);
