@@ -90,10 +90,9 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
 
     await capture(page, testInfo, 1, 2, "form-filled");
 
-    // Submit
-    const submitBtn = page.locator(
-      'button:has-text("Create Lead"), button:has-text("Add Lead"):not([disabled])'
-    ).last();
+    // Submit — the modal's submit button is the only type=submit "Create Lead";
+    // a text-based .last() can grab the empty-state "Add Lead" behind the modal.
+    const submitBtn = page.locator('button[type="submit"]:has-text("Create Lead")');
     await submitBtn.click();
 
     // Wait for redirect to lead detail
