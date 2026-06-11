@@ -7,6 +7,7 @@ import { Toaster } from "sonner";
 import { getCompanySettings } from "@/lib/actions";
 import { getSessionOrDev } from "@/lib/auth";
 import HelpChatWidgetWrapper from "@/components/HelpChatWidgetWrapper";
+import VersionWatcher from "@/components/VersionWatcher";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -50,6 +51,7 @@ export default async function RootLayout({
           />
         </Providers>
         <Toaster position="bottom-right" richColors />
+        <VersionWatcher />
       </body>
     </html>
   );
