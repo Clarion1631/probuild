@@ -208,7 +208,7 @@ export interface QBPaymentSyncResult {
  * Poll QuickBooks for settled milestone invoices and record them in ProBuild.
  * Safe to run repeatedly (cron + on-view). Never throws on a single bad row.
  */
-export async function syncQuickBooksPayments(scope?: { invoiceId?: string }): Promise<QBPaymentSyncResult> {
+export async function syncQuickBooksPayments(scope?: { invoiceId?: string; projectId?: string }): Promise<QBPaymentSyncResult> {
     const result: QBPaymentSyncResult = { checked: 0, settled: 0, partiallyPaid: 0, errors: [] };
 
     const pending = await prisma.paymentSchedule.findMany({
@@ -216,6 +216,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string }): Pr
             status: "Pending",
             qbInvoiceId: { not: null },
             ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+            ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
         },
         select: {
             id: true, invoiceId: true, qbInvoiceId: true, name: true, amount: true,

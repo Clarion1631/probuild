@@ -37,6 +37,19 @@ export default async function PortalProjectDetail(props: {
         projectWhere = { id: projectId, clientId: sessionClientId };
     }
 
+    // Self-healing payment state: if any milestone on this project is still
+    // Pending but lives on the QuickBooks rail, pull settled payments NOW so a
+    // client returning from the Intuit pay page sees "Paid" immediately
+    // (the hourly cron remains the backstop).
+    const pendingQB = await prisma.paymentSchedule.findFirst({
+        where: { status: "Pending", qbInvoiceId: { not: null }, invoice: { projectId } },
+        select: { id: true },
+    });
+    if (pendingQB) {
+        const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
+        await syncQuickBooksPayments({ projectId }).catch(() => {});
+    }
+
     const project = await prisma.project.findFirst({
         where: projectWhere,
         include: {
