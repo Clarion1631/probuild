@@ -118,8 +118,8 @@ There is **no compliant way around A2P 10DLC consent** for business-initiated te
 - **Manual rail (built, working — this is the underused key):** `RecordPaymentModal` on any invoice records check / cash / Zelle / Venmo / wire / ACH / other with a reference # and notes, and updates balances exactly like Stripe does.
 - **QuickBooks (half-built):** OAuth connect works; one-way **push** of estimates/invoices to QBO (the "QB" button in the invoice list). No payments come back. No customer sync. GL mappings stubbed.
 
-### Recommended model while the Stripe relationship matures
-Use **Stripe for small/deposit payments** (instant, automated) and **QuickBooks Payments for large draws** — but ProBuild stays the source of truth for *what is owed*:
+### Payment model (updated Jun 11, 2026 — Stripe blackout)
+**Stripe is disabled company-wide for ~180 days** (`CompanySettings.stripeEnabled=false`, enforced at the checkout route). ALL client payments run through **QuickBooks Payments** hosted invoice pages — card, debit, and bank transfer (card fees are merchant-absorbed; Intuit can't surcharge). Checks are recorded via Record Payment / applied in QBO and pulled back automatically. ProBuild stays the source of truth for *what is owed*:
 
 1. Create + send the invoice from ProBuild (it can push to QBO with the same code/number).
 2. Take the large payment in QuickBooks (their payment link / ACH).
