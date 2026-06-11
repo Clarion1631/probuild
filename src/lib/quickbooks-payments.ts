@@ -277,7 +277,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
  * QuickBooks settlements and manually recorded checks alike — independent of
  * whether the client has an email for their receipt.
  */
-export async function notifyTeamPaymentReceived(paymentScheduleId: string) {
+export async function notifyTeamPaymentReceived(paymentScheduleId: string): Promise<{ success: boolean; id?: string } | void> {
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     if (!settings?.notificationEmail) return;
     try {
@@ -310,7 +310,7 @@ export async function notifyTeamPaymentReceived(paymentScheduleId: string) {
         ? `https://probuild.goldentouchremodeling.com/projects/${s.invoice.project.id}/invoices/${s.invoice.id}`
         : "https://probuild.goldentouchremodeling.com/invoices";
 
-    await sendNotification(
+    return await sendNotification(
         settings.notificationEmail,
         `💰 Payment received — ${amount} · ${s.invoice.code}`,
         `<div style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 0 auto; padding: 20px;">

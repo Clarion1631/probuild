@@ -32,7 +32,7 @@ export async function POST(req: Request) {
     }
 
     // ── Settle-loop QA + test cleanup actions (all idempotent, secret-gated) ──
-    if (body.action === "test-settle" || body.action === "delete-qbo-payment" || body.action === "delete-qbo-invoice" || body.action === "sync-payments") {
+    if (body.action === "test-settle" || body.action === "delete-qbo-payment" || body.action === "delete-qbo-invoice" || body.action === "sync-payments" || body.action === "test-team-notify") {
         let tokens;
         try {
             tokens = await getFreshQBTokens();
@@ -53,6 +53,12 @@ export async function POST(req: Request) {
             const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
             const result = await syncQuickBooksPayments();
             return NextResponse.json({ ok: true, ...result });
+        }
+        if (body.action === "test-team-notify") {
+            if (!body.paymentScheduleId) return NextResponse.json({ ok: false, reason: "paymentScheduleId required" }, { status: 400 });
+            const { notifyTeamPaymentReceived } = await import("@/lib/quickbooks-payments");
+            const sent = await notifyTeamPaymentReceived(body.paymentScheduleId);
+            return NextResponse.json({ ok: true, sent: sent ?? null });
         }
         if (body.action === "delete-qbo-payment") {
             if (!body.qbPaymentId) return NextResponse.json({ ok: false, reason: "qbPaymentId required" }, { status: 400 });
