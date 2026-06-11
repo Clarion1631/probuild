@@ -7,6 +7,16 @@ export const dynamic = "force-dynamic";
 
 const REPORT_SECTIONS = [
     {
+        heading: "Profitability",
+        reports: [
+            {
+                title: "Profitability (incl. overhead)",
+                description: "Are we profitable? Collected revenue − burdened labor − expenses − monthly overhead, company-wide and per project, with transaction drill-down.",
+                href: "/reports/profitability",
+            },
+        ],
+    },
+    {
         heading: "Payments",
         reports: [
             {

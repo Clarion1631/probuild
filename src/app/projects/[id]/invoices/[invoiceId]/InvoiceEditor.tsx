@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt } from "@/lib/actions";
+import { useState, useEffect, useRef } from "react";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -14,6 +14,7 @@ const METHOD_LABELS: Record<string, string> = {
     ach: "ACH",
     check: "Check",
     cash: "Cash",
+    quickbooks: "QuickBooks",
 };
 
 function formatPaymentMethod(method: string | null | undefined, ref: string | null | undefined): string {
@@ -39,6 +40,51 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [isUndoing, setIsUndoing] = useState<string | null>(null);
     const [recordingFor, setRecordingFor] = useState<{ id: string; name: string; amount: number } | null>(null);
     const [isSendingReceipt, setIsSendingReceipt] = useState<string | null>(null);
+    const [qbBusy, setQbBusy] = useState<string | null>(null);
+
+    // On view: if any pending milestone is on the QuickBooks rail, pull settled
+    // payments right now (the hourly cron is the backstop, this is the fast path).
+    const qbCheckedRef = useRef(false);
+    useEffect(() => {
+        if (qbCheckedRef.current) return;
+        const hasQBPending = (initialInvoice.payments || []).some((p: any) => p.status === "Pending" && p.qbInvoiceId);
+        if (!hasQBPending) return;
+        qbCheckedRef.current = true;
+        refreshQBPayments(initialInvoice.id)
+            .then((res) => {
+                if (res.settled > 0) {
+                    toast.success(`Payment received via QuickBooks (${res.settled} milestone${res.settled > 1 ? "s" : ""} settled)`);
+                    router.refresh();
+                }
+            })
+            .catch(() => { /* cron will catch up */ });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [initialInvoice.id]);
+
+    async function handleQBLink(payment: { id: string; qbInvoiceLink?: string | null }) {
+        // Already pushed → just copy the live link.
+        if (payment.qbInvoiceLink) {
+            await navigator.clipboard.writeText(payment.qbInvoiceLink).catch(() => {});
+            toast.success("QuickBooks pay link copied to clipboard");
+            return;
+        }
+        setQbBusy(payment.id);
+        try {
+            const res = await createQBPaymentLink(payment.id);
+            if (!res.success) {
+                toast.error(res.error || "QuickBooks push failed");
+            } else if (res.payLink) {
+                await navigator.clipboard.writeText(res.payLink).catch(() => {});
+                toast.success("QuickBooks invoice created — pay link copied to clipboard");
+                router.refresh();
+            } else {
+                toast.warning("QuickBooks invoice created, but no pay link — enable QuickBooks Payments in QBO to accept cards/ACH.");
+                router.refresh();
+            }
+        } finally {
+            setQbBusy(null);
+        }
+    }
 
     // Split payments state
     type SplitRow = { id: number; name: string; amount: string };
@@ -539,12 +585,22 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                             <td className="px-6 py-4 text-right">
                                                 <div className="flex items-center justify-end gap-2 flex-wrap">
                                                     {payment.status !== 'Paid' && (
+                                                        <>
+                                                        <button
+                                                            onClick={() => handleQBLink(payment)}
+                                                            disabled={qbBusy === payment.id}
+                                                            title={payment.qbInvoiceLink ? "Copy the QuickBooks pay link" : "Create a QuickBooks invoice with a hosted pay link (card/ACH)"}
+                                                            className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap disabled:opacity-50"
+                                                        >
+                                                            {qbBusy === payment.id ? "Pushing…" : payment.qbInvoiceLink ? "Copy QB Link" : "QuickBooks Link"}
+                                                        </button>
                                                         <button
                                                             onClick={() => setRecordingFor({ id: payment.id, name: payment.name, amount: Number(payment.amount) })}
                                                             className="hui-btn hui-btn-primary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
                                                         >
                                                             Record Payment
                                                         </button>
+                                                        </>
                                                     )}
                                                     {payment.status === 'Paid' && (
                                                         <>

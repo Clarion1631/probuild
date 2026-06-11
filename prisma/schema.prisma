@@ -58,6 +58,9 @@ model Client {
 
   internalNotes String?
 
+  // QuickBooks Online customer id (set on first invoice push; avoids name-match drift)
+  qbCustomerId String?
+
   projects       Project[]
   leads          Lead[]
   invoices       Invoice[]
@@ -272,6 +275,7 @@ model Estimate {
   paymentSchedules EstimatePaymentSchedule[]
   budget           Budget?
   takeoff          Takeoff?
+  invoices         Invoice[] // invoices generated from this estimate (auto-created on signing)
 
   // Processing fee & expiration
   processingFeeMarkup Decimal?
@@ -416,6 +420,9 @@ model Invoice {
   project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
   clientId    String
   client      Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  // Estimate this invoice was generated from (signed-estimate → invoice link; idempotency for auto-invoicing)
+  estimateId  String?
+  estimate    Estimate? @relation(fields: [estimateId], references: [id], onDelete: SetNull)
   status      String    @default("Draft") // Draft, Issued, Paid, Overdue
   totalAmount Decimal     @default(0)
   subtotal    Decimal     @default(0)  // pre-tax
@@ -432,6 +439,7 @@ model Invoice {
 
   @@index([projectId])
   @@index([createdAt])
+  @@index([estimateId])
 }
 
 model PaymentSchedule {
@@ -445,15 +453,22 @@ model PaymentSchedule {
   paymentDate           DateTime?
   stripeSessionId       String?
   stripePaymentIntentId String?
-  paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"
+  paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"; "quickbooks" via QB Payments
   referenceNumber       String? // check # / confirmation #
   notes                 String? // free-form memo
   receiptSentAt         DateTime? // last time admin sent the receipt email
   paidAt                DateTime?
   createdAt             DateTime  @default(now())
 
+  // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
+  qbInvoiceId   String?
+  qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
+  qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
+  qbSyncedAt    DateTime?
+
   @@index([invoiceId])
   @@index([stripePaymentIntentId])
+  @@index([qbInvoiceId])
 }
 
 model Budget {
@@ -645,6 +660,10 @@ model CompanySettings {
   passProcessingFee  Boolean @default(false)
   cardProcessingRate Decimal   @default(2.9)
   cardProcessingFlat Decimal   @default(0.30)
+
+  // Company overhead per month (rent, insurance, owner salary, vehicles, software…)
+  // Used by /reports/profitability to answer "are we profitable including overhead".
+  monthlyOverhead Decimal @default(0)
 
   // Calendar settings
   workDays      String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]

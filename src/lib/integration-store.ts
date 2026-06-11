@@ -13,6 +13,7 @@ export interface QBSettings {
     realmId?: string;
     connectedAt?: string;
     glMappings?: Record<string, string>; // costCodeId -> QB GL account name
+    serviceItemId?: string; // QBO "Construction Services" item used on pushed invoice lines
 }
 
 export interface GustoSettings {

@@ -1,0 +1,275 @@
+/**
+ * QuickBooks Payments rail.
+ *
+ * Each ProBuild payment milestone (PaymentSchedule) maps to ONE QuickBooks
+ * invoice with QuickBooks Payments enabled, so the customer pays large draws
+ * on Intuit's hosted page (card/ACH) instead of Stripe. Money recorded in
+ * QuickBooks — including manual checks Vanessa applies against the QBO
+ * invoice from the Washington Trust bank feed — flows back into ProBuild via
+ * `syncQuickBooksPayments()` (hourly cron + on-view refresh), which marks the
+ * milestone Paid exactly like the Stripe webhook does. That keeps ProBuild,
+ * QuickBooks, and the bank in sync, and keeps the sales-tax report truthful.
+ */
+import { prisma } from "./prisma";
+import { toNum } from "./prisma-helpers";
+import { getQBSettings, saveQBSettings } from "./integration-store";
+import {
+    type QBTokens,
+    refreshQBToken,
+    ensureQBCustomer,
+    ensureQBServiceItem,
+    createQBMilestoneInvoice,
+    getQBInvoicePaymentLink,
+    getQBInvoiceStatus,
+    getQBPayment,
+} from "./quickbooks";
+
+export class QBNotConnectedError extends Error {
+    constructor() {
+        super("QuickBooks is not connected (Settings → Integrations → QuickBooks)");
+        this.name = "QBNotConnectedError";
+    }
+}
+
+/** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
+export async function getFreshQBTokens(): Promise<QBTokens> {
+    const qb = await getQBSettings();
+    if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
+        throw new QBNotConnectedError();
+    }
+    try {
+        const fresh = await refreshQBToken(qb.refreshToken);
+        await saveQBSettings({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
+        return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
+    } catch {
+        // Refresh can fail transiently; the old access token may still be valid.
+        return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
+    }
+}
+
+async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
+    const client = await prisma.client.findUnique({
+        where: { id: clientId },
+        select: { id: true, name: true, email: true, qbCustomerId: true },
+    });
+    if (!client) throw new Error("Client not found");
+
+    const customerId = await ensureQBCustomer(tokens, client);
+    if (customerId !== client.qbCustomerId) {
+        await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+    }
+
+    const qb = await getQBSettings();
+    let itemId = qb.serviceItemId;
+    if (!itemId) {
+        itemId = await ensureQBServiceItem(tokens);
+        await saveQBSettings({ serviceItemId: itemId });
+    }
+    return { customerId, itemId };
+}
+
+export interface MilestonePushResult {
+    qbInvoiceId: string;
+    payLink: string | null;
+}
+
+/**
+ * Create (or reuse) the QBO invoice for one milestone and return its pay link.
+ * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
+ */
+export async function pushMilestoneToQuickBooks(paymentScheduleId: string): Promise<MilestonePushResult> {
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        include: {
+            invoice: {
+                include: {
+                    client: { select: { id: true, name: true, email: true, qbCustomerId: true } },
+                    project: { select: { id: true, name: true } },
+                    payments: { select: { id: true, createdAt: true }, orderBy: { createdAt: "asc" } },
+                },
+            },
+        },
+    });
+    if (!schedule) throw new Error("Payment milestone not found");
+    if (schedule.status === "Paid") throw new Error("Milestone is already paid");
+
+    const tokens = await getFreshQBTokens();
+
+    if (schedule.qbInvoiceId) {
+        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId));
+        if (payLink && payLink !== schedule.qbInvoiceLink) {
+            await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: payLink } });
+        }
+        return { qbInvoiceId: schedule.qbInvoiceId, payLink };
+    }
+
+    const invoice = schedule.invoice;
+    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId);
+
+    // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
+    const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
+    const docNumber = `${invoice.code}-${position}`;
+
+    const projectName = invoice.project?.name || "Project";
+    const { qbId } = await createQBMilestoneInvoice(tokens, {
+        docNumber,
+        customerId,
+        itemId,
+        description: `${projectName} — ${schedule.name}`,
+        amount: toNum(schedule.amount),
+        dueDate: schedule.dueDate,
+        billEmail: invoice.client?.email || null,
+        privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
+    });
+
+    const payLink = await getQBInvoicePaymentLink(tokens, qbId);
+
+    await prisma.paymentSchedule.update({
+        where: { id: schedule.id },
+        data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date() },
+    });
+
+    return { qbInvoiceId: qbId, payLink };
+}
+
+/**
+ * Mark a milestone Paid from a QuickBooks settlement. Mirrors the Stripe
+ * webhook's claim-then-recalculate transaction so balances never drift.
+ */
+async function markMilestonePaidFromQB(
+    paymentScheduleId: string,
+    invoiceId: string,
+    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null }
+): Promise<boolean> {
+    return prisma.$transaction(async (t) => {
+        const claim = await t.paymentSchedule.updateMany({
+            where: { id: paymentScheduleId, status: { not: "Paid" } },
+            data: {
+                status: "Paid",
+                paymentMethod: "quickbooks",
+                paidAt: payment.paidAt,
+                paymentDate: payment.paidAt,
+                referenceNumber: payment.referenceNumber,
+                qbPaymentId: payment.qbPaymentId,
+                qbSyncedAt: new Date(),
+            },
+        });
+        if (claim.count === 0) return false;
+
+        const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) return false;
+        const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
+        const totalPaid = allSchedules
+            .filter(s => s.status === "Paid")
+            .reduce((sum, s) => sum + toNum(s.amount), 0);
+        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+        await t.invoice.update({
+            where: { id: invoiceId },
+            data: {
+                balanceDue: newBalance,
+                status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
+            },
+        });
+        return true;
+    });
+}
+
+export interface QBPaymentSyncResult {
+    checked: number;
+    settled: number;
+    partiallyPaid: number;
+    errors: string[];
+}
+
+/**
+ * Poll QuickBooks for settled milestone invoices and record them in ProBuild.
+ * Safe to run repeatedly (cron + on-view). Never throws on a single bad row.
+ */
+export async function syncQuickBooksPayments(scope?: { invoiceId?: string }): Promise<QBPaymentSyncResult> {
+    const result: QBPaymentSyncResult = { checked: 0, settled: 0, partiallyPaid: 0, errors: [] };
+
+    const pending = await prisma.paymentSchedule.findMany({
+        where: {
+            status: "Pending",
+            qbInvoiceId: { not: null },
+            ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+        },
+        select: {
+            id: true, invoiceId: true, qbInvoiceId: true, name: true, amount: true,
+            invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
+        },
+        take: 100,
+    });
+    if (pending.length === 0) return result;
+
+    let tokens: QBTokens;
+    try {
+        tokens = await getFreshQBTokens();
+    } catch (e) {
+        result.errors.push(e instanceof Error ? e.message : "QB tokens unavailable");
+        return result;
+    }
+
+    for (const schedule of pending) {
+        result.checked++;
+        try {
+            const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId!);
+            if (!status) continue;
+
+            if (status.total > 0 && status.balance <= 0) {
+                // Fully settled in QuickBooks (online payment OR a check Vanessa applied)
+                const paymentId = status.paymentTxnIds[0] || null;
+                let paidAt = new Date();
+                let referenceNumber: string | null = null;
+                if (paymentId) {
+                    const p = await getQBPayment(tokens, paymentId);
+                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00`);
+                    referenceNumber = p?.referenceNumber || null;
+                }
+                const recorded = await markMilestonePaidFromQB(schedule.id, schedule.invoiceId, {
+                    paidAt,
+                    referenceNumber,
+                    qbPaymentId: paymentId,
+                });
+                if (recorded) {
+                    result.settled++;
+                    await notifyPaymentRecorded(schedule, paidAt).catch(() => {});
+                }
+            } else if (status.balance < status.total) {
+                result.partiallyPaid++;
+            }
+        } catch (e) {
+            result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
+        }
+    }
+
+    return result;
+}
+
+async function notifyPaymentRecorded(
+    schedule: { name: string; amount: unknown; invoice: { code: string; project: { id: string; name: string } | null; client: { name: string; email: string | null } | null } },
+    paidAt: Date
+) {
+    const { sendNotification } = await import("./email");
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const companyName = settings?.companyName || "Golden Touch Remodeling";
+    const amount = toNum(schedule.amount).toLocaleString("en-US", { style: "currency", currency: "USD" });
+    const projectName = schedule.invoice.project?.name || "your project";
+
+    // Receipt to the client
+    if (schedule.invoice.client?.email) {
+        await sendNotification(
+            schedule.invoice.client.email,
+            `Payment received — ${schedule.invoice.code}`,
+            `<div style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 0 auto; padding: 20px;">
+                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 22px;">
+                    <h2 style="margin: 0 0 6px; color: #166534; font-size: 18px;">Thank you — payment received</h2>
+                    <p style="margin: 0; color: #333; font-size: 14px;">We received your payment of <strong>${amount}</strong> for <strong>${schedule.name}</strong> on ${projectName} (invoice ${schedule.invoice.code}) on ${paidAt.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}.</p>
+                </div>
+                <p style="text-align:center; color:#94a3b8; font-size:11px; margin-top:14px;">${companyName}</p>
+            </div>`,
+            undefined,
+            { fromName: companyName, copyToInternal: true }
+        );
+    }
+}

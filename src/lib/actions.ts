@@ -1721,6 +1721,86 @@ export async function markContractViewed(contractId: string, accessToken?: strin
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Signed estimate → project + invoice + QuickBooks deposit pay link.
+// Signing is the moment a lead becomes a project — and the first time anything
+// is allowed to touch QuickBooks (keeps QBO free of unsold estimates).
+// Every step is fail-soft: a QBO outage can never block a client's signature.
+// ─────────────────────────────────────────────────────────────────────────────
+interface PostApprovalInfo {
+    projectId: string;
+    invoiceId: string;
+    invoiceCode: string;
+    depositName: string | null;
+    depositAmount: number | null;
+    payLink: string | null;
+}
+
+async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Promise<PostApprovalInfo | null> {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { id: true, projectId: true, leadId: true },
+    });
+    if (!estimate) return null;
+
+    // 1) Ensure a project exists (idempotent — conversion returns the existing one).
+    let projectId = estimate.projectId;
+    if (!projectId && estimate.leadId) {
+        const converted = await convertLeadToProject(estimate.leadId);
+        projectId = converted.id;
+    }
+    if (!projectId) return null;
+
+    // 2) One invoice per signed estimate (idempotent on re-approval).
+    let invoice = await prisma.invoice.findFirst({
+        where: { estimateId },
+        select: { id: true, code: true },
+    });
+    if (!invoice) {
+        const created = await createInvoiceFromEstimate(estimateId);
+        invoice = await prisma.invoice.update({
+            where: { id: created.id },
+            data: { status: "Issued", issueDate: new Date() },
+            select: { id: true, code: true },
+        });
+        // The money now lives on the invoice — flip the estimate to Invoiced so
+        // financial forecasts don't count the same dollars twice.
+        await prisma.estimate.update({ where: { id: estimateId }, data: { status: "Invoiced" } });
+    }
+
+    // 3) First pending milestone (the deposit) → QuickBooks invoice + pay link.
+    let payLink: string | null = null;
+    const deposit = await prisma.paymentSchedule.findFirst({
+        where: { invoiceId: invoice.id, status: "Pending" },
+        orderBy: { createdAt: "asc" },
+        select: { id: true, name: true, amount: true },
+    });
+    if (deposit) {
+        try {
+            const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+            const pushed = await pushMilestoneToQuickBooks(deposit.id);
+            payLink = pushed.payLink;
+        } catch (e) {
+            // QuickBooks not connected or unreachable — Stripe portal payment and
+            // manual recording still work; the PM can push the link later.
+            console.warn("[approveEstimate] QuickBooks deposit push skipped:", e instanceof Error ? e.message : e);
+        }
+    }
+
+    revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+
+    return {
+        projectId,
+        invoiceId: invoice.id,
+        invoiceCode: invoice.code,
+        depositName: deposit?.name || null,
+        depositAmount: deposit ? toNum(deposit.amount) : null,
+        payLink,
+    };
+}
+
 export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, capturedPdfUrl?: string) {
     // Auth: internal admins skip ownership check; portal clients must prove ownership.
     const session = await getServerSession(authOptions);
@@ -1770,6 +1850,18 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             lead: { select: { name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
         },
     });
+
+    // ─── 0. The job is won: ensure project + invoice + QuickBooks deposit link ───
+    let postApproval: PostApprovalInfo | null = null;
+    try {
+        postApproval = await ensureProjectAndDepositInvoiceForEstimate(estimateId);
+        if (postApproval && estimate && !estimate.projectId) {
+            // Conversion just created the project — let the signed-PDF filing below see it.
+            (estimate as { projectId: string | null }).projectId = postApproval.projectId;
+        }
+    } catch (e) {
+        console.error("[approveEstimate] post-approval automation failed:", e);
+    }
 
     const settings = await getCompanySettings();
     const companyName = settings.companyName || "Golden Touch Remodeling";
@@ -1825,6 +1917,14 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;">
                         <p style="margin: 0; color: #166534; font-size: 13px;">✓ A signed copy of your estimate is attached to this email for your records.</p>
                     </div>
+                    ${postApproval?.depositAmount ? `
+                    <div style="background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 16px 18px; margin-bottom: 20px;">
+                        <p style="margin: 0 0 10px; color: #312e81; font-size: 14px; font-weight: 600;">Next step — ${postApproval.depositName || "Deposit"}: ${formatCurrency(postApproval.depositAmount)}</p>
+                        ${postApproval.payLink
+                            ? `<a href="${postApproval.payLink}" style="display: inline-block; background: #4f46e5; color: #ffffff; font-size: 14px; font-weight: 600; padding: 11px 24px; border-radius: 8px; text-decoration: none;">Pay Securely Online</a>
+                               <p style="margin: 10px 0 0; color: #6366f1; font-size: 12px;">Pay by card or bank transfer on QuickBooks' secure page · Invoice ${postApproval.invoiceCode}</p>`
+                            : `<p style="margin: 0; color: #4338ca; font-size: 13px;">Invoice ${postApproval.invoiceCode} has been created for your project — we'll follow up with payment instructions.</p>`}
+                    </div>` : ""}
                     <p style="color: #64748b; font-size: 13px; line-height: 1.6; margin: 0;">
                         If you have any questions, feel free to reach out to us${settings.phone ? ` at ${settings.phone}` : ""}${settings.email ? ` or ${settings.email}` : ""}.
                     </p>
@@ -2559,6 +2659,7 @@ export async function createInvoiceFromEstimate(estimateId: string) {
             code: "INV-TEMP",
             projectId: estimate.projectId!,
             clientId: project.clientId,
+            estimateId: estimate.id,
             status: "Draft",
             totalAmount: total,
             balanceDue: total,
@@ -2806,7 +2907,7 @@ export async function recordPayment(
 ) {
     await assertInvoicePermission();
 
-    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "other"];
+    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
     if (!VALID_METHODS.includes(method)) {
         return { success: false, error: "Invalid payment method" as const };
@@ -2876,6 +2977,63 @@ export async function recordPayment(
     return { success: true };
 }
 
+/** Set company monthly overhead (profitability report). ADMIN/FINANCE only. */
+export async function updateMonthlyOverhead(amount: number) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "FINANCE"].includes(caller.role)) {
+        return { success: false as const, error: "Only Admin or Finance can set overhead" };
+    }
+    if (!Number.isFinite(amount) || amount < 0 || amount > 10_000_000) {
+        return { success: false as const, error: "Invalid amount" };
+    }
+    await prisma.companySettings.update({
+        where: { id: "singleton" },
+        data: { monthlyOverhead: amount },
+    });
+    revalidatePath("/reports/profitability");
+    return { success: true as const };
+}
+
+// ─── QuickBooks payment-rail actions (used by InvoiceEditor + portal refresh) ───
+
+/** Create (or fetch) the QuickBooks invoice + hosted pay link for one milestone. */
+export async function createQBPaymentLink(paymentId: string) {
+    await assertInvoicePermission();
+    try {
+        const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+        const res = await pushMilestoneToQuickBooks(paymentId);
+        const schedule = await prisma.paymentSchedule.findUnique({
+            where: { id: paymentId },
+            select: { invoiceId: true, invoice: { select: { projectId: true } } },
+        });
+        if (schedule) {
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+        }
+        return { success: true as const, payLink: res.payLink, qbInvoiceId: res.qbInvoiceId };
+    } catch (e) {
+        return { success: false as const, error: e instanceof Error ? e.message : "QuickBooks push failed" };
+    }
+}
+
+/** Pull settled QuickBooks payments for one invoice right now (on-view refresh). */
+export async function refreshQBPayments(invoiceId: string) {
+    await assertInvoicePermission();
+    const { syncQuickBooksPayments } = await import("./quickbooks-payments");
+    const result = await syncQuickBooksPayments({ invoiceId });
+    if (result.settled > 0) {
+        const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
+        if (inv) {
+            revalidatePath(`/projects/${inv.projectId}/invoices/${invoiceId}`);
+            revalidatePath(`/invoices`);
+            revalidatePath(`/portal`);
+        }
+    }
+    return result;
+}
+
 export async function recordEstimatePayment(
     paymentId: string,
     estimateId: string,
@@ -2891,7 +3049,7 @@ export async function recordEstimatePayment(
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
 
-    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "other"];
+    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
     if (!VALID_METHODS.includes(method)) {
         return { success: false, error: "Invalid payment method" as const };

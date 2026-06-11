@@ -157,13 +157,15 @@ Approve-to-act, never silent auto-send. Phase 1+2 are a webhook route + a prompt
 
 | P | Gap | Fix |
 |---|---|---|
-| P0 | QB payments invisible in ProBuild | Process: record them via existing Record Payment modal (today). Build: QBO payment poller → auto-record (P1) |
-| P0 | Won leads without projects; statuses drifting again | Convert instead of flipping Won; statuses now centralized in code |
+| ✅ | QB payments invisible in ProBuild | **Built (Jun 10):** signing auto-creates the invoice + QBO milestone invoices w/ hosted pay links; hourly `/api/cron/quickbooks-payments` + on-view refresh pull settled payments (incl. checks Vanessa applies in QBO) into milestones. Needs `QB_CLIENT_ID/SECRET` + Connect in Settings → Integrations. |
+| ✅ | Won leads without projects | **Built:** signing an estimate now auto-converts the lead → project → issued invoice (QBO only ever sees projects). |
+| ✅ | No profitability answer | **Built:** `/reports/profitability` — collected − burdened labor − expenses − monthly overhead, company → project → transaction drill-down, with data-coverage warnings until all pipes flow. |
+| ✅ | Receipts in Drive invisible to ProBuild | **Built:** daily `/api/cron/drive-receipts` scans the intake folder (project-named subfolders), AI-parses images/PDFs → Pending expenses → review in /manager/receipts. Needs one-time Google reconnect to grant the new Drive scope. |
+| P1 | Gusto hours not in ProBuild | Import Gusto time → TimeEntry with project + cost code (phase), labor/burden from User rates. CSV import or Gusto API — pending decision on their plan/API access. |
 | P1 | No SMS consent capture | `smsConsent` on Client + checkbox at estimate approval / contract |
 | P1 | Field updates live in Google Chat, invisible to ProBuild | Chat→Daily Log ingest bridge (`/api/integrations/google-chat`) |
 | P1 | Nobody is nudged to invoice at Substantial Completion | Status-transition checklist now; AI nudge agent next |
 | P2 | TeamMessage has no notifications | Add notification fan-out, or retire it in favor of the Chat bridge |
-| P2 | QBO customer name-matching | Persist QBO customer id on Client |
 | P2 | Retainers are status-only (no payment integration) | Wire to PaymentSchedule like invoices |
 
 ---

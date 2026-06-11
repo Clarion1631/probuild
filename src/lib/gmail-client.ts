@@ -23,7 +23,10 @@ export function getAuthUrl() {
         access_type: 'offline',
         scope: [
             'https://www.googleapis.com/auth/gmail.modify',
-            'https://www.googleapis.com/auth/gmail.send'
+            'https://www.googleapis.com/auth/gmail.send',
+            // Drive: project folder provisioning + receipts ingestion
+            // (re-run the Google connect flow once after deploy to grant this)
+            'https://www.googleapis.com/auth/drive'
         ],
         prompt: 'consent' // Forces refresh token generation
     });
