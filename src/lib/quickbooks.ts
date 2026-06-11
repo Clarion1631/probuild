@@ -274,6 +274,40 @@ export async function getQBPayment(
     };
 }
 
+/** Read an invoice's online-payment toggles + sync token (for sparse updates). */
+export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string) {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+    if (!res.ok) return null;
+    const inv = (await res.json()).Invoice;
+    if (!inv) return null;
+    return {
+        syncToken: String(inv.SyncToken),
+        card: inv.AllowOnlineCreditCardPayment === true,
+        ach: inv.AllowOnlineACHPayment === true,
+        balance: Number(inv.Balance ?? 0),
+    };
+}
+
+/** Sparse-update an invoice's online-payment toggles (card / bank transfer). */
+export async function setQBInvoicePaymentOptions(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    syncToken: string,
+    opts: { card: boolean; ach: boolean }
+): Promise<boolean> {
+    const res = await qbFetch("/invoice", tokens, {
+        method: "POST",
+        body: JSON.stringify({
+            Id: qbInvoiceId,
+            SyncToken: syncToken,
+            sparse: true,
+            AllowOnlineCreditCardPayment: opts.card,
+            AllowOnlineACHPayment: opts.ach,
+        }),
+    });
+    return res.ok;
+}
+
 /** Posted money-out transactions (expenses/checks/card charges) from the books. */
 export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
