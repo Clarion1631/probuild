@@ -90,7 +90,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_e2e
+      # pgbouncer=true is required by src/lib/prisma.ts's URL check; on vanilla
+      # Postgres it just disables prepared statements (harmless).
+      DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_e2e?pgbouncer=true
       DIRECT_URL: postgresql://probuild:probuild@localhost:5432/probuild_e2e
       NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
       NEXTAUTH_URL: http://localhost:3000

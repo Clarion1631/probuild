@@ -54,8 +54,10 @@ Auth uses the NextAuth credentials provider that only activates when
 docker run --rm -d --name probuild-e2e -p 5433:5432 -e POSTGRES_PASSWORD=probuild postgres:16
 
 # 2. Create schema + run tests against it
-$env:DATABASE_URL = "postgresql://postgres:probuild@localhost:5433/postgres"
-$env:DIRECT_URL   = $env:DATABASE_URL
+# (pgbouncer=true is mandatory — src/lib/prisma.ts refuses URLs without it;
+#  on vanilla Postgres it just disables prepared statements)
+$env:DATABASE_URL = "postgresql://postgres:probuild@localhost:5433/postgres?pgbouncer=true"
+$env:DIRECT_URL   = "postgresql://postgres:probuild@localhost:5433/postgres"
 $env:PLAYWRIGHT_TEST_SECRET = "any-local-secret"
 npx prisma db push --skip-generate
 npx playwright test
