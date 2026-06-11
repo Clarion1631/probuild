@@ -37,6 +37,7 @@ export const config = {
          * - api/webhook (Stripe webhooks)
          * - api/payments (Client portal payment sessions)
          * - api/portal (Public backend handlers for documents)
+         * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
          * - sub-portal (Subcontractor portal, magic-link auth)
@@ -45,6 +46,6 @@ export const config = {
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          */
-        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
     ],
 };
