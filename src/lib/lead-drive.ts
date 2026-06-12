@@ -43,7 +43,10 @@ export async function isDriveConnected(): Promise<boolean> {
 async function driveClient(): Promise<drive_v3.Drive> {
     const refreshToken = await resolveRefreshToken();
     if (!refreshToken) throw new DriveNotConnectedError();
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+    const auth = new google.auth.OAuth2(
+        process.env.GOOGLE_DRIVE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_DRIVE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET,
+    );
     auth.setCredentials({ refresh_token: refreshToken });
     return google.drive({ version: "v3", auth });
 }
@@ -112,7 +115,10 @@ export async function createResumableSession(input: {
 }): Promise<string> {
     const refreshToken = await resolveRefreshToken();
     if (!refreshToken) throw new DriveNotConnectedError();
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+    const auth = new google.auth.OAuth2(
+        process.env.GOOGLE_DRIVE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_DRIVE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET,
+    );
     auth.setCredentials({ refresh_token: refreshToken });
     const { token } = await auth.getAccessToken();
     if (!token) throw new Error("Drive access token unavailable");

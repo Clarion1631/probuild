@@ -4,8 +4,12 @@ import path from 'path';
 
 const TOKEN_PATH = path.join(process.cwd(), '.gmail-token.json');
 
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+// Drive/Gmail integration uses a DEDICATED OAuth client (own redirect URIs +
+// scopes) so it stays independent of the web-login client (GOOGLE_CLIENT_ID,
+// owned in a separate Cloud project). Falls back to the login client if the
+// dedicated vars aren't set.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_DRIVE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_DRIVE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET;
 
 // Support both local dev and production on Vercel
 const REDIRECT_URI = process.env.NODE_ENV === 'production'
