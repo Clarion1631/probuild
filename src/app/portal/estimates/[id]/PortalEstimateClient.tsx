@@ -11,6 +11,7 @@ import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
+import { getTaxCertStatus } from "@/lib/tax-cert";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -244,6 +245,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         ? linkedInvoice.payments
         : (initialEstimate.paymentSchedules || []);
     const files: any[] = initialEstimate.files || [];
+    // WA DOR: a tax-exempt sale needs the client's reseller permit / exemption
+    // certificate on file. Warn (never block signing) until a valid one exists.
+    const portalClientRecord = initialEstimate.project?.client ?? initialEstimate.lead?.client ?? null;
+    const taxCertStatus = getTaxCertStatus({
+        url: portalClientRecord?.taxExemptCertUrl,
+        expiresAt: portalClientRecord?.taxExemptCertExpiresAt,
+    });
+    const showTaxCertBanner = taxExempt && taxCertStatus !== "valid";
     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
     // Suppress immediately after a successful payment redirect — webhook may not have updated status yet
     // (and always once the invoice exists — its milestones carry the pay buttons instead)
@@ -338,6 +347,35 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     <div className="bg-amber-50 border border-amber-200 rounded-lg px-5 py-3 flex items-center gap-3">
                         <svg className="w-5 h-5 text-amber-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                         <p className="text-sm font-medium text-amber-800">Payment was cancelled. You can try again anytime.</p>
+                    </div>
+                </div>
+            )}
+
+            {/* Tax-exemption certificate notice — outside the document wrapper so it
+                never lands in the captured/signed PDF; informational only, signing stays enabled */}
+            {showTaxCertBanner && !isCapture && (
+                <div className="max-w-6xl mx-auto px-4 pt-4 print:hidden">
+                    <div className="bg-amber-50 border border-amber-300 rounded-lg px-5 py-3 flex items-start gap-3">
+                        <svg className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                        <div>
+                            <p className="text-sm font-semibold text-amber-800">
+                                {taxCertStatus === "expired"
+                                    ? "The tax-exemption certificate we have on file for you has expired"
+                                    : "Tax-exemption certificate needed"}
+                            </p>
+                            <p className="text-sm text-amber-800/90 mt-0.5">
+                                This estimate is tax-exempt, and Washington State requires us to keep a current reseller
+                                permit or exemption certificate on file. Please send {taxCertStatus === "expired" ? "an updated" : "a"} copy to{" "}
+                                {companySettings?.email ? (
+                                    <a href={`mailto:${companySettings.email}?subject=${encodeURIComponent(`Tax exemption certificate — Estimate ${initialEstimate.code || ""}`)}`} className="font-semibold underline hover:text-amber-900">
+                                        {companySettings.email}
+                                    </a>
+                                ) : (
+                                    "us"
+                                )}
+                                {isApproved ? "." : " — you can still review and sign in the meantime."}
+                            </p>
+                        </div>
                     </div>
                 </div>
             )}

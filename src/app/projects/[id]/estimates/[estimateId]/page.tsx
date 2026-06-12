@@ -38,7 +38,9 @@ export default async function EstimatePage({
                         name: project.name,
                         clientName: project.client.name,
                         clientEmail: project.client.email || undefined,
-                        location: project.location || undefined
+                        location: project.location || undefined,
+                        clientTaxExemptCertUrl: (project.client as any)?.taxExemptCertUrl || null,
+                        clientTaxExemptCertExpiresAt: (project.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null
                     }}
                     initialEstimate={JSON.parse(JSON.stringify(estimate))}
                     salesTaxes={salesTaxes}

@@ -42,6 +42,9 @@ export default async function LeadMeetingsPage({ params }: { params: Promise<{ i
                 clientCity={(lead.client as any)?.city || null}
                 clientState={(lead.client as any)?.state || null}
                 clientZip={(lead.client as any)?.zipCode || null}
+                clientTaxExemptCertUrl={(lead.client as any)?.taxExemptCertUrl || null}
+                clientTaxExemptCertExpiresAt={(lead.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null}
+                clientTaxExemptCertNote={(lead.client as any)?.taxExemptCertNote || null}
                 initialMessage={lead.message || null}
             />
         </>

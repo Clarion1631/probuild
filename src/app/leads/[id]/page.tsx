@@ -57,6 +57,9 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientCity={(lead.client as any)?.city || null}
                 clientState={(lead.client as any)?.state || null}
                 clientZip={(lead.client as any)?.zipCode || null}
+                clientTaxExemptCertUrl={(lead.client as any)?.taxExemptCertUrl || null}
+                clientTaxExemptCertExpiresAt={(lead.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null}
+                clientTaxExemptCertNote={(lead.client as any)?.taxExemptCertNote || null}
                 initialMessage={initialMessage}
                 managerId={(lead as any).manager?.id || null}
                 managerName={(lead as any).manager?.name || null}

@@ -34,7 +34,9 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
                         name: lead.name,
                         clientName: lead.client.name,
                         clientEmail: lead.client.email || undefined,
-                        location: lead.location || undefined
+                        location: lead.location || undefined,
+                        clientTaxExemptCertUrl: (lead.client as any)?.taxExemptCertUrl || null,
+                        clientTaxExemptCertExpiresAt: (lead.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null
                     }}
                     initialEstimate={serializedEstimate}
                     salesTaxes={salesTaxes}
