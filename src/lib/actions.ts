@@ -4378,6 +4378,30 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
 
     // Append-only send trail — every send (incl. resends) gets its own event.
     {
+        // Legacy preservation: the first new-style resend overwrites sentAt (the
+        // only record of the original send), so freeze that timestamp into the
+        // log before it's gone. Runs at most once per estimate.
+        if (isResend && estimate.sentAt) {
+            const priorSendLogs = await prisma.activityLog.count({
+                where: { entityType: "estimate", entityId: estimateId, action: "sent_estimate" },
+            });
+            if (priorSendLogs === 0) {
+                await prisma.activityLog.create({
+                    data: {
+                        projectId: estimate.project?.id ?? null,
+                        leadId: estimate.lead?.id ?? null,
+                        actorType: "TEAM",
+                        actorName: "Team",
+                        action: "sent_estimate",
+                        entityType: "estimate",
+                        entityId: estimateId,
+                        entityName: `Estimate ${estimate.code || estimate.title}`,
+                        metadata: JSON.stringify({ resend: false, backfilled: true }),
+                        createdAt: estimate.sentAt,
+                    },
+                }).catch(() => {});
+            }
+        }
         const session = await getServerSession(authOptions).catch(() => null);
         await logActivity({
             projectId: estimate.project?.id,
@@ -4433,18 +4457,8 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         revalidatePath(`/projects/${estimate.projectId}/messages`);
     }
 
-    // Log to activity feed (project-scoped only)
-    if (estimate.projectId) {
-        await logActivity({
-            projectId: estimate.projectId,
-            actorType: "TEAM",
-            actorName: companyName,
-            action: "sent_estimate",
-            entityType: "estimate",
-            entityId: estimateId,
-            entityName: `Estimate ${estimate.code || estimate.title}`,
-        });
-    }
+    // (send is already logged to the activity feed right after sentAt is set —
+    //  richer entry with recipient + resend flag, and it covers lead estimates too)
 
     // GAP-1: Auto-update lead stage to "Estimate Sent" if applicable
     if (estimate.leadId) {
