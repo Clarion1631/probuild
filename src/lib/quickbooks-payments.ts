@@ -199,17 +199,21 @@ async function markMilestonePaidFromQB(
         // name+amount fallback for pre-link rows; claimed update).
         if (invoice.estimateId) {
             const settled = allSchedules.find(s => s.id === paymentScheduleId);
-            const estCopy = settled?.sourceScheduleId
-                ? await t.estimatePaymentSchedule.findFirst({
+            let estCopy: { id: string } | null = null;
+            if (settled?.sourceScheduleId) {
+                estCopy = await t.estimatePaymentSchedule.findFirst({
                     where: { id: settled.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
-                  })
-                : settled
-                    ? await t.estimatePaymentSchedule.findFirst({
-                        where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: settled.name },
-                      })
-                    : null;
-            const amountsMatch = !!estCopy && !!settled && (settled.sourceScheduleId ? true : toNum(estCopy.amount) === toNum(settled.amount));
-            if (estCopy && settled && amountsMatch) {
+                });
+            } else if (settled) {
+                // Fallback for pre-link rows: only safe when exactly one candidate matches.
+                const candidates = await t.estimatePaymentSchedule.findMany({
+                    where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: settled.name },
+                    take: 2,
+                });
+                const matching = candidates.filter(c => toNum(c.amount) === toNum(settled.amount));
+                estCopy = matching.length === 1 ? matching[0] : null;
+            }
+            if (estCopy && settled) {
                 const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
                     where: { id: estCopy.id, status: { not: "Paid" } },
                     data: {

@@ -1793,7 +1793,7 @@ export async function getEstimateActivity(estimateId: string): Promise<EstimateA
             select: {
                 code: true, createdAt: true, sentAt: true, viewedAt: true,
                 payments: {
-                    select: { id: true, name: true, amount: true, status: true, paidAt: true, paymentDate: true, paymentMethod: true, referenceNumber: true },
+                    select: { id: true, name: true, amount: true, status: true, paidAt: true, paymentDate: true, paymentMethod: true, referenceNumber: true, sourceScheduleId: true },
                     orderBy: { createdAt: "asc" },
                 },
             },
@@ -1839,8 +1839,14 @@ export async function getEstimateActivity(estimateId: string): Promise<EstimateA
             // Pre-invoice estimate payments (deposits) log against the estimate
             // itself. If an invoice was created later, its copied paid milestone
             // renders the same payment from live data — skip the older log then.
+            // Identity match via scheduleId; name match only for legacy logs
+            // that predate the scheduleId metadata.
             const milestone = typeof meta.milestone === "string" ? meta.milestone : null;
-            const coveredByInvoiceCopy = !!milestone && !!invoice?.payments.some(p => p.status === "Paid" && p.name === milestone);
+            const scheduleId = typeof meta.scheduleId === "string" ? meta.scheduleId : null;
+            const coveredByInvoiceCopy = !!invoice?.payments.some(p =>
+                p.status === "Paid" &&
+                (scheduleId ? p.sourceScheduleId === scheduleId : (!!milestone && p.name === milestone))
+            );
             if (coveredByInvoiceCopy) continue;
             events.push({ id: l.id, ts, kind: "payment", title: "Payment received", detail: [milestone, typeof meta.method === "string" ? meta.method.replace(/_/g, " ") : null, typeof meta.referenceNumber === "string" ? `#${meta.referenceNumber}` : null].filter(Boolean).join(" · ") || null });
         } else {
@@ -3223,17 +3229,22 @@ export async function recordPayment(
         // Mirror to the estimate-side milestone copy so the estimate editor and
         // its balance don't drift from the invoice that actually got paid.
         // Link-first (this milestone's sourceScheduleId points at its estimate
-        // original), name+amount fallback for pre-link rows; claimed update.
+        // original); name+amount fallback only when exactly one row matches.
         if (invoice.estimateId) {
-            const estCopy = payment.sourceScheduleId
-                ? await t.estimatePaymentSchedule.findFirst({
+            let estCopy: { id: string } | null = null;
+            if (payment.sourceScheduleId) {
+                estCopy = await t.estimatePaymentSchedule.findFirst({
                     where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
-                  })
-                : await t.estimatePaymentSchedule.findFirst({
+                });
+            } else {
+                const candidates = await t.estimatePaymentSchedule.findMany({
                     where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: payment.name },
-                  });
-            const amountsMatch = !!estCopy && (payment.sourceScheduleId ? true : toNum(estCopy.amount) === toNum(payment.amount));
-            if (estCopy && amountsMatch) {
+                    take: 2,
+                });
+                const matching = candidates.filter(c => toNum(c.amount) === toNum(payment.amount));
+                estCopy = matching.length === 1 ? matching[0] : null;
+            }
+            if (estCopy) {
                 const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
                     where: { id: estCopy.id, status: { not: "Paid" } },
                     data: { status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber },
@@ -3373,6 +3384,52 @@ export async function recordEstimatePayment(
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
         if (payment.estimateId !== estimateId) return { success: false as const, error: "Milestone/estimate mismatch" as const };
 
+        // When a linked invoice exists, its milestone copy is the CANONICAL claim
+        // target — claim it FIRST so a concurrent settle on the invoice/QBO side
+        // can't race this one into double side effects. Oldest invoice wins when
+        // several link back (manual re-invoicing); name+amount fallback only
+        // fires when it matches exactly one candidate.
+        let mirroredCopyId: string | null = null;
+        const linkedInvoice = await t.invoice.findFirst({
+            where: { estimateId },
+            orderBy: { createdAt: "asc" },
+            include: { payments: true },
+        });
+        if (linkedInvoice) {
+            const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId);
+            const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
+                !p.sourceScheduleId &&
+                p.name === payment.name &&
+                toNum(p.amount) === toNum(payment.amount)
+            );
+            const copy = linked ?? (fallbackCandidates.length === 1 ? fallbackCandidates[0] : null);
+            if (copy) {
+                // Already settled from the invoice/QBO side → this is a conflict,
+                // not a fresh payment. Refuse rather than double-record.
+                const mirrorClaim = await t.paymentSchedule.updateMany({
+                    where: { id: copy.id, status: { not: "Paid" } },
+                    data: {
+                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
+                        // Keep both sides agreeing on what was actually paid when the
+                        // recorded amount overrides the milestone amount.
+                        ...(input.amount != null && { amount: input.amount }),
+                    },
+                });
+                if (mirrorClaim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
+                const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                await t.invoice.update({
+                    where: { id: linkedInvoice.id },
+                    data: {
+                        balanceDue: invBalance,
+                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                    },
+                });
+                mirroredCopyId = copy.id;
+            }
+        }
+
         const claim = await t.estimatePaymentSchedule.updateMany({
             where: { id: paymentId, status: { not: "Paid" } },
             data: {
@@ -3409,48 +3466,6 @@ export async function recordEstimatePayment(
                 ...(isFirstPayment && { statusBeforePayment: estimate.status }),
             },
         });
-
-        // Mirror to the linked invoice's milestone copy so the invoice, portal,
-        // and reports see the payment too. Prefer the durable sourceScheduleId
-        // link; name+amount is the fallback for copies created before the link
-        // column existed. The mirrored update is itself claimed (status guard)
-        // so concurrent settles can't double-apply.
-        let mirroredCopyId: string | null = null;
-        const linkedInvoice = await t.invoice.findFirst({ where: { estimateId }, include: { payments: true } });
-        if (linkedInvoice) {
-            const copy =
-                linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status !== "Paid") ??
-                linkedInvoice.payments.find(p =>
-                    !p.sourceScheduleId &&
-                    p.status !== "Paid" &&
-                    p.name === payment.name &&
-                    toNum(p.amount) === toNum(payment.amount)
-                );
-            if (copy) {
-                const mirrorClaim = await t.paymentSchedule.updateMany({
-                    where: { id: copy.id, status: { not: "Paid" } },
-                    data: {
-                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
-                        // Keep both sides agreeing on what was actually paid when the
-                        // recorded amount overrides the milestone amount.
-                        ...(input.amount != null && { amount: input.amount }),
-                    },
-                });
-                if (mirrorClaim.count > 0) {
-                    const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
-                    const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                    const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
-                    await t.invoice.update({
-                        where: { id: linkedInvoice.id },
-                        data: {
-                            balanceDue: invBalance,
-                            status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
-                        },
-                    });
-                    mirroredCopyId = copy.id;
-                }
-            }
-        }
 
         return {
             success: true as const, projectId: estimate.projectId, leadId: estimate.leadId,
@@ -3494,7 +3509,9 @@ export async function recordEstimatePayment(
                 entityType: "estimate",
                 entityId: estimateId,
                 entityName: `Estimate ${estimateFull.code || estimateFull.title || ""}`.trim(),
-                metadata: { milestone: tx.paymentName, method, referenceNumber: referenceNumber || undefined },
+                // scheduleId lets the activity feed recognize this exact payment if
+                // the milestone is later copied onto an invoice (dedupe by identity).
+                metadata: { milestone: tx.paymentName, amount: tx.paymentAmount, scheduleId: paymentId, method, referenceNumber: referenceNumber || undefined },
             });
         }
     }
@@ -3603,17 +3620,18 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         });
 
         // Unwind the mirrored invoice copy too — a payment recorded on either
-        // side settles both, so unrecording must release both.
-        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, include: { payments: true } });
+        // side settles both, so unrecording must release both. Oldest linked
+        // invoice; name+amount fallback only when it matches exactly one row.
+        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, orderBy: { createdAt: "asc" }, include: { payments: true } });
         if (linkedInvoice) {
-            const copy =
-                linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid") ??
-                linkedInvoice.payments.find(p =>
-                    !p.sourceScheduleId &&
-                    p.status === "Paid" &&
-                    p.name === payment.name &&
-                    toNum(p.amount) === toNum(payment.amount)
-                );
+            const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid");
+            const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
+                !p.sourceScheduleId &&
+                p.status === "Paid" &&
+                p.name === payment.name &&
+                toNum(p.amount) === toNum(payment.amount)
+            );
+            const copy = linked ?? (fallbackCandidates.length === 1 ? fallbackCandidates[0] : null);
             if (copy) {
                 await tx.paymentSchedule.update({
                     where: { id: copy.id },
@@ -3810,15 +3828,20 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
         // name+amount) so the estimate doesn't keep claiming money the invoice
         // no longer shows as received.
         if (invoice.estimateId) {
-            const estCopy = payment.sourceScheduleId
-                ? await tx.estimatePaymentSchedule.findFirst({
+            let estCopy: { id: string; amount: unknown } | null = null;
+            if (payment.sourceScheduleId) {
+                estCopy = await tx.estimatePaymentSchedule.findFirst({
                     where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: "Paid" },
-                  })
-                : await tx.estimatePaymentSchedule.findFirst({
+                });
+            } else {
+                const candidates = await tx.estimatePaymentSchedule.findMany({
                     where: { estimateId: invoice.estimateId, status: "Paid", name: payment.name },
-                  });
-            const amountsMatch = !!estCopy && (payment.sourceScheduleId ? true : toNum(estCopy.amount) === toNum(payment.amount));
-            if (estCopy && amountsMatch) {
+                    take: 2,
+                });
+                const matching = candidates.filter(c => toNum(c.amount) === toNum(payment.amount));
+                estCopy = matching.length === 1 ? matching[0] : null;
+            }
+            if (estCopy) {
                 await tx.estimatePaymentSchedule.update({
                     where: { id: estCopy.id },
                     data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
