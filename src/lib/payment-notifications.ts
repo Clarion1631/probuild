@@ -84,6 +84,119 @@ function receiptBodyHtml(opts: {
 }
 
 /**
+ * THE single entry point for "an invoice milestone got paid" side effects:
+ * team alert (Settings → Notifications · Payment Received toggle), client
+ * receipt (deduped via receiptSentAt), and the project activity-feed entry.
+ * Called by every settle path — QuickBooks sync, manual invoice recording,
+ * estimate-side recording via its mirrored invoice copy. The Stripe webhook
+ * predates this and uses sendInvoicePaymentReceivedEmails below; a milestone
+ * can only be claimed once, so the two can never both fire for one payment.
+ *
+ * Fetches fresh state by id (call AFTER the settle transaction commits, so
+ * balanceDue is already recalculated). Never throws.
+ */
+export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ success: boolean; id?: string } | void> {
+    try {
+        const s = await prisma.paymentSchedule.findUnique({
+            where: { id: paymentScheduleId },
+            select: {
+                id: true, name: true, amount: true, status: true, paymentMethod: true, referenceNumber: true,
+                paymentDate: true, paidAt: true, receiptSentAt: true,
+                invoice: {
+                    select: {
+                        id: true, code: true, balanceDue: true,
+                        project: { select: { id: true, name: true } },
+                        client: { select: { name: true, email: true } },
+                    },
+                },
+            },
+        });
+        if (!s?.invoice) return;
+        // Hard guard: side effects only for milestones that are actually Paid
+        // (protects the maintenance test action and any future mis-call).
+        if (s.status !== "Paid") return;
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const companyName = settings?.companyName || "Golden Touch Remodeling";
+        const amount = formatCurrency(s.amount);
+        const remaining = formatCurrency(s.invoice.balanceDue);
+        const newBalanceNum = Number(s.invoice.balanceDue.toString());
+        const when = (s.paymentDate || s.paidAt || new Date()).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+        const link = s.invoice.project
+            ? `https://probuild.goldentouchremodeling.com/projects/${s.invoice.project.id}/invoices/${s.invoice.id}`
+            : "https://probuild.goldentouchremodeling.com/invoices";
+
+        // 1. Activity feed (independent of notification toggles — the audit trail
+        //    must survive notifications being switched off)
+        await prisma.activityLog.create({
+            data: {
+                projectId: s.invoice.project?.id ?? null,
+                actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
+                actorName: s.paymentMethod === "quickbooks" ? "QuickBooks" : "Team",
+                action: "payment_received",
+                entityType: "invoice",
+                entityId: s.invoice.id,
+                entityName: `Invoice ${s.invoice.code}`,
+                metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined }),
+            },
+        }).catch(() => {});
+
+        // 2. Team alert
+        let adminSend: { success: boolean; id?: string } | undefined;
+        if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
+            adminSend = await sendNotification(
+                settings.notificationEmail,
+                `💰 Payment received — ${amount} · ${s.invoice.code}`,
+                `<div style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 0 auto; padding: 20px;">
+                    <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 22px;">
+                        <h2 style="margin: 0 0 10px; color: #166534; font-size: 18px;">Payment received</h2>
+                        <table style="width: 100%; font-size: 13px; color: #444;">
+                            <tr><td style="padding: 3px 0;">Amount</td><td style="text-align: right; font-weight: 700; color: #166534;">${amount}</td></tr>
+                            <tr><td style="padding: 3px 0;">Client</td><td style="text-align: right; font-weight: 600;">${s.invoice.client?.name || "—"}</td></tr>
+                            <tr><td style="padding: 3px 0;">Project</td><td style="text-align: right;">${s.invoice.project?.name || "—"}</td></tr>
+                            <tr><td style="padding: 3px 0;">Milestone</td><td style="text-align: right;">${s.name} · ${s.invoice.code}</td></tr>
+                            <tr><td style="padding: 3px 0;">Method</td><td style="text-align: right; text-transform: capitalize;">${formatMethod(s.paymentMethod, s.referenceNumber)}</td></tr>
+                            <tr><td style="padding: 3px 0;">Date</td><td style="text-align: right;">${when}</td></tr>
+                            <tr><td style="padding: 3px 0; border-top: 1px solid #d1fae5;">Invoice balance left</td><td style="text-align: right; border-top: 1px solid #d1fae5; font-weight: 600;">${remaining}</td></tr>
+                        </table>
+                        <a href="${link}" style="display: inline-block; margin-top: 14px; background: #166534; color: #fff; font-size: 13px; font-weight: 600; padding: 9px 18px; border-radius: 7px; text-decoration: none;">Open Invoice</a>
+                    </div>
+                </div>`
+            );
+        }
+
+        // 3. Client receipt (once per milestone — receiptSentAt is the guard)
+        if (s.invoice.client?.email && !s.receiptSentAt) {
+            const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/invoices/${s.invoice.id}`;
+            await sendNotification(
+                s.invoice.client.email,
+                `Payment Receipt — Invoice #${s.invoice.code}`,
+                receiptBodyHtml({
+                    invoiceLike: { code: s.invoice.code, kind: "invoice" },
+                    clientName: s.invoice.client.name || "",
+                    schedule: { name: s.name, amount: s.amount },
+                    method: s.paymentMethod,
+                    referenceNumber: s.referenceNumber,
+                    newBalance: newBalanceNum,
+                    portalUrl,
+                    companyName,
+                    phone: settings?.phone,
+                    email: settings?.email,
+                }),
+                undefined,
+                { fromName: companyName, replyTo: settings?.email ?? undefined }
+            );
+            await prisma.paymentSchedule.update({
+                where: { id: s.id },
+                data: { receiptSentAt: new Date() },
+            }).catch(() => {});
+        }
+        return adminSend;
+    } catch (e) {
+        console.error("[notifyMilestonePaid] failed:", e);
+    }
+}
+
+/**
  * Send admin alert + customer receipt for a newly-paid invoice milestone.
  * Used by the Stripe webhook (auto) — callers must handle idempotency themselves.
  */

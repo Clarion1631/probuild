@@ -193,6 +193,52 @@ async function markMilestonePaidFromQB(
                 status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
             },
         });
+
+        // Mirror the settle onto the estimate-side milestone copy so the
+        // estimate editor/balance track the QuickBooks rail too (link-first,
+        // name+amount fallback for pre-link rows; claimed update).
+        if (invoice.estimateId) {
+            const settled = allSchedules.find(s => s.id === paymentScheduleId);
+            const estCopy = settled?.sourceScheduleId
+                ? await t.estimatePaymentSchedule.findFirst({
+                    where: { id: settled.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
+                  })
+                : settled
+                    ? await t.estimatePaymentSchedule.findFirst({
+                        where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: settled.name },
+                      })
+                    : null;
+            const amountsMatch = !!estCopy && !!settled && (settled.sourceScheduleId ? true : toNum(estCopy.amount) === toNum(settled.amount));
+            if (estCopy && settled && amountsMatch) {
+                const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
+                    where: { id: estCopy.id, status: { not: "Paid" } },
+                    data: {
+                        status: "Paid",
+                        paymentMethod: "quickbooks",
+                        paidAt: payment.paidAt,
+                        paymentDate: payment.paidAt,
+                        referenceNumber: payment.referenceNumber,
+                    },
+                });
+                if (mirrorClaim.count > 0) {
+                    const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
+                    if (estimate) {
+                        const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
+                        const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                        const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
+                        const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
+                        await t.estimate.update({
+                            where: { id: invoice.estimateId },
+                            data: {
+                                balanceDue: estBalance,
+                                status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
+                                ...(estFirstPayment && { statusBeforePayment: estimate.status }),
+                            },
+                        });
+                    }
+                }
+            }
+        }
         return true;
     });
 }
@@ -257,9 +303,8 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                 });
                 if (recorded) {
                     result.settled++;
-                    await notifyPaymentRecorded(schedule, paidAt).catch(() => {});
-                    await notifyTeamPaymentReceived(schedule.id).catch(() => {});
-                    await logPaymentActivity(schedule.id);
+                    const { notifyMilestonePaid } = await import("./payment-notifications");
+                    await notifyMilestonePaid(schedule.id);
                 }
             } else if (status.balance < status.total) {
                 result.partiallyPaid++;
@@ -270,121 +315,4 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     }
 
     return result;
-}
-
-/**
- * Project activity-feed entry for a recorded milestone payment. Separate from
- * the email alert so toggling notifications off never silences the audit trail.
- */
-export async function logPaymentActivity(paymentScheduleId: string) {
-    try {
-        const s = await prisma.paymentSchedule.findUnique({
-            where: { id: paymentScheduleId },
-            select: {
-                name: true, amount: true, paymentMethod: true, referenceNumber: true,
-                invoice: { select: { id: true, code: true, projectId: true } },
-            },
-        });
-        if (!s?.invoice) return;
-        await prisma.activityLog.create({
-            data: {
-                projectId: s.invoice.projectId,
-                actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
-                actorName: s.paymentMethod === "quickbooks" ? "QuickBooks" : "Team",
-                action: "payment_received",
-                entityType: "invoice",
-                entityId: s.invoice.id,
-                entityName: `Invoice ${s.invoice.code}`,
-                metadata: JSON.stringify({ milestone: s.name, amount: toNum(s.amount), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined }),
-            },
-        });
-    } catch { /* the log must never break payment recording */ }
-}
-
-/**
- * Team-facing "money in" alert, honoring the Settings → Notifications
- * "Payment Received" toggle. Fires for EVERY recorded milestone payment —
- * QuickBooks settlements and manually recorded checks alike — independent of
- * whether the client has an email for their receipt.
- */
-export async function notifyTeamPaymentReceived(paymentScheduleId: string): Promise<{ success: boolean; id?: string } | void> {
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    if (!settings?.notificationEmail) return;
-    try {
-        const toggles = settings.notificationToggles ? JSON.parse(settings.notificationToggles) : null;
-        if (toggles && toggles.paymentReceived === false) return;
-    } catch { /* malformed toggles → default on */ }
-
-    const s = await prisma.paymentSchedule.findUnique({
-        where: { id: paymentScheduleId },
-        select: {
-            name: true, amount: true, paymentMethod: true, referenceNumber: true,
-            paymentDate: true, paidAt: true,
-            invoice: {
-                select: {
-                    id: true, code: true, balanceDue: true,
-                    project: { select: { id: true, name: true } },
-                    client: { select: { name: true } },
-                },
-            },
-        },
-    });
-    if (!s?.invoice) return;
-
-    const { sendNotification } = await import("./email");
-    const amount = toNum(s.amount).toLocaleString("en-US", { style: "currency", currency: "USD" });
-    const remaining = toNum(s.invoice.balanceDue).toLocaleString("en-US", { style: "currency", currency: "USD" });
-    const method = (s.paymentMethod || "—").replace(/_/g, " ");
-    const when = (s.paymentDate || s.paidAt || new Date()).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
-    const link = s.invoice.project
-        ? `https://probuild.goldentouchremodeling.com/projects/${s.invoice.project.id}/invoices/${s.invoice.id}`
-        : "https://probuild.goldentouchremodeling.com/invoices";
-
-    return await sendNotification(
-        settings.notificationEmail,
-        `💰 Payment received — ${amount} · ${s.invoice.code}`,
-        `<div style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 0 auto; padding: 20px;">
-            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 22px;">
-                <h2 style="margin: 0 0 10px; color: #166534; font-size: 18px;">Payment received</h2>
-                <table style="width: 100%; font-size: 13px; color: #444;">
-                    <tr><td style="padding: 3px 0;">Amount</td><td style="text-align: right; font-weight: 700; color: #166534;">${amount}</td></tr>
-                    <tr><td style="padding: 3px 0;">Client</td><td style="text-align: right; font-weight: 600;">${s.invoice.client?.name || "—"}</td></tr>
-                    <tr><td style="padding: 3px 0;">Project</td><td style="text-align: right;">${s.invoice.project?.name || "—"}</td></tr>
-                    <tr><td style="padding: 3px 0;">Milestone</td><td style="text-align: right;">${s.name} · ${s.invoice.code}</td></tr>
-                    <tr><td style="padding: 3px 0;">Method</td><td style="text-align: right; text-transform: capitalize;">${method}${s.referenceNumber ? ` · #${s.referenceNumber}` : ""}</td></tr>
-                    <tr><td style="padding: 3px 0;">Date</td><td style="text-align: right;">${when}</td></tr>
-                    <tr><td style="padding: 3px 0; border-top: 1px solid #d1fae5;">Invoice balance left</td><td style="text-align: right; border-top: 1px solid #d1fae5; font-weight: 600;">${remaining}</td></tr>
-                </table>
-                <a href="${link}" style="display: inline-block; margin-top: 14px; background: #166534; color: #fff; font-size: 13px; font-weight: 600; padding: 9px 18px; border-radius: 7px; text-decoration: none;">Open Invoice</a>
-            </div>
-        </div>`
-    );
-}
-
-async function notifyPaymentRecorded(
-    schedule: { name: string; amount: unknown; invoice: { code: string; project: { id: string; name: string } | null; client: { name: string; email: string | null } | null } },
-    paidAt: Date
-) {
-    const { sendNotification } = await import("./email");
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Golden Touch Remodeling";
-    const amount = toNum(schedule.amount).toLocaleString("en-US", { style: "currency", currency: "USD" });
-    const projectName = schedule.invoice.project?.name || "your project";
-
-    // Receipt to the client
-    if (schedule.invoice.client?.email) {
-        await sendNotification(
-            schedule.invoice.client.email,
-            `Payment received — ${schedule.invoice.code}`,
-            `<div style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 0 auto; padding: 20px;">
-                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 22px;">
-                    <h2 style="margin: 0 0 6px; color: #166534; font-size: 18px;">Thank you — payment received</h2>
-                    <p style="margin: 0; color: #333; font-size: 14px;">We received your payment of <strong>${amount}</strong> for <strong>${schedule.name}</strong> on ${projectName} (invoice ${schedule.invoice.code}) on ${paidAt.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}.</p>
-                </div>
-                <p style="text-align:center; color:#94a3b8; font-size:11px; margin-top:14px;">${companyName}</p>
-            </div>`,
-            undefined,
-            { fromName: companyName, copyToInternal: true }
-        );
-    }
 }

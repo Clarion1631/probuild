@@ -502,9 +502,14 @@ model PaymentSchedule {
   qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt    DateTime?
 
+  // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
+  // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
+  sourceScheduleId String?
+
   @@index([invoiceId])
   @@index([stripePaymentIntentId])
   @@index([qbInvoiceId])
+  @@index([sourceScheduleId])
 }
 
 model Budget {

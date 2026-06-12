@@ -1241,10 +1241,36 @@ export const getEstimate = cache(async function getEstimate(id: string) {
 });
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
-    await prisma.estimate.update({
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+
+    const VALID_STATUSES = ["Draft", "Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid", "Declined", "Expired", "Archived"];
+    if (!VALID_STATUSES.includes(status)) throw new Error("Invalid status");
+
+    const before = await prisma.estimate.findUnique({
         where: { id },
-        data: { status }
+        select: { status: true, code: true, title: true, projectId: true, leadId: true },
     });
+    if (!before) throw new Error("Estimate not found");
+
+    if (before.status !== status) {
+        await prisma.estimate.update({
+            where: { id },
+            data: { status }
+        });
+        await logActivity({
+            projectId: before.projectId,
+            leadId: before.leadId,
+            actorType: "TEAM",
+            actorName: user.name || "Team",
+            action: "estimate_status_changed",
+            entityType: "estimate",
+            entityId: id,
+            entityName: `Estimate ${before.code || before.title || ""}`.trim(),
+            metadata: { from: before.status, to: status },
+        });
+    }
     if (leadId) revalidatePath(`/leads/${leadId}`);
     if (projectId) revalidatePath(`/projects/${projectId}`);
     revalidatePath(`/leads/${leadId}/estimates/${id}`);
@@ -1670,16 +1696,36 @@ async function postActivityToThread(leadId: string | null, projectId: string | n
 }
 
 export async function markEstimateViewed(estimateId: string) {
+    // Staff previews must never register as client views.
+    const staffSession = await getServerSession(authOptions);
+    if ((staffSession?.user as { role?: string } | undefined)?.role) return;
+
+    // Same ownership shape as getEstimateForPortal: only the owning portal
+    // client can trip the first-view signal.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return;
+
+    // Atomic first-view claim — two simultaneous opens produce exactly one
+    // notification and one activity event.
+    const claim = await prisma.estimate.updateMany({
+        where: {
+            id: estimateId,
+            viewedAt: null,
+            OR: [
+                { project: { is: { clientId: sessionClientId } } },
+                { lead: { is: { clientId: sessionClientId } } },
+            ],
+        },
+        data: { viewedAt: new Date() },
+    });
+    if (claim.count === 0) return;
+
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { viewedAt: true, title: true, code: true, projectId: true, leadId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
-    if (estimate && !estimate.viewedAt) {
-        await prisma.estimate.update({
-            where: { id: estimateId },
-            data: { viewedAt: new Date() },
-        });
+    if (estimate) {
 
         const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || "A client";
         const projectName = estimate.project?.name || estimate.lead?.name || "";
@@ -1785,6 +1831,18 @@ export async function getEstimateActivity(estimateId: string): Promise<EstimateA
             events.push({ id: l.id, ts, kind: "viewed", title: "Viewed by client", detail: l.actorName && l.actorName !== "A client" ? l.actorName : null });
         } else if (l.action === "signed_estimate") {
             events.push({ id: l.id, ts, kind: "signed", title: `Signed by ${l.actorName}` });
+        } else if (l.action === "estimate_status_changed") {
+            const from = typeof meta.from === "string" ? meta.from : "?";
+            const to = typeof meta.to === "string" ? meta.to : "?";
+            events.push({ id: l.id, ts, kind: "other", title: `Status changed: ${from} → ${to}`, detail: l.actorName && l.actorName !== "Team" ? `by ${l.actorName}` : null });
+        } else if (l.action === "payment_received") {
+            // Pre-invoice estimate payments (deposits) log against the estimate
+            // itself. If an invoice was created later, its copied paid milestone
+            // renders the same payment from live data — skip the older log then.
+            const milestone = typeof meta.milestone === "string" ? meta.milestone : null;
+            const coveredByInvoiceCopy = !!milestone && !!invoice?.payments.some(p => p.status === "Paid" && p.name === milestone);
+            if (coveredByInvoiceCopy) continue;
+            events.push({ id: l.id, ts, kind: "payment", title: "Payment received", detail: [milestone, typeof meta.method === "string" ? meta.method.replace(/_/g, " ") : null, typeof meta.referenceNumber === "string" ? `#${meta.referenceNumber}` : null].filter(Boolean).join(" · ") || null });
         } else {
             events.push({ id: l.id, ts, kind: "other", title: l.action.replace(/_/g, " "), detail: l.entityName });
         }
@@ -2216,18 +2274,8 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         );
     }
 
-    // Log to activity feed
-    if (estimate?.projectId) {
-        await logActivity({
-            projectId: estimate.projectId,
-            actorType: "CLIENT",
-            actorName: signatureName,
-            action: "signed_estimate",
-            entityType: "estimate",
-            entityId: estimateId,
-            entityName: `Estimate ${estimate.code || estimate.title}`,
-        });
-    }
+    // (signing is already logged to the activity feed right after post-approval
+    //  automation — that entry also covers lead-stage estimates)
 
     if (estimate?.projectId) {
         const existingBudget = await prisma.budget.findUnique({ where: { estimateId } });
@@ -2451,7 +2499,7 @@ export async function markInvoiceViewed(invoiceId: string) {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         select: {
-            viewedAt: true, code: true,
+            viewedAt: true, code: true, projectId: true,
             project: { select: { name: true, client: { select: { name: true } } } },
             client: { select: { name: true } },
         },
@@ -2477,6 +2525,15 @@ export async function markInvoiceViewed(invoiceId: string) {
                 </div>`
             );
         }
+        await logActivity({
+            projectId: invoice.projectId,
+            actorType: "CLIENT",
+            actorName: clientName,
+            action: "viewed_invoice",
+            entityType: "invoice",
+            entityId: invoiceId,
+            entityName: `Invoice ${invoice.code}`,
+        });
     }
 }
 
@@ -2890,6 +2947,7 @@ export async function createInvoiceFromEstimate(estimateId: string) {
             await prisma.paymentSchedule.create({
                 data: {
                     invoiceId: invoice.id,
+                    sourceScheduleId: schedule.id,
                     name: schedule.name,
                     amount: schedule.amount,
                     status: schedule.status,
@@ -3162,15 +3220,53 @@ export async function recordPayment(
             data: { balanceDue: newBalance, status: newStatus },
         });
 
+        // Mirror to the estimate-side milestone copy so the estimate editor and
+        // its balance don't drift from the invoice that actually got paid.
+        // Link-first (this milestone's sourceScheduleId points at its estimate
+        // original), name+amount fallback for pre-link rows; claimed update.
+        if (invoice.estimateId) {
+            const estCopy = payment.sourceScheduleId
+                ? await t.estimatePaymentSchedule.findFirst({
+                    where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
+                  })
+                : await t.estimatePaymentSchedule.findFirst({
+                    where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: payment.name },
+                  });
+            const amountsMatch = !!estCopy && (payment.sourceScheduleId ? true : toNum(estCopy.amount) === toNum(payment.amount));
+            if (estCopy && amountsMatch) {
+                const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
+                    where: { id: estCopy.id, status: { not: "Paid" } },
+                    data: { status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber },
+                });
+                if (mirrorClaim.count > 0) {
+                    const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
+                    if (estimate) {
+                        const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
+                        const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                        const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
+                        const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
+                        await t.estimate.update({
+                            where: { id: invoice.estimateId },
+                            data: {
+                                balanceDue: estBalance,
+                                status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
+                                // Captured so unrecording can restore the pre-payment status
+                                ...(estFirstPayment && { statusBeforePayment: estimate.status }),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
         return { success: true as const, projectId: invoice.projectId };
     });
 
     if (!tx.success) return tx;
 
-    // Team "money in" alert (Settings → Notifications · Payment Received toggle).
-    const { notifyTeamPaymentReceived, logPaymentActivity } = await import("./quickbooks-payments");
-    await notifyTeamPaymentReceived(paymentId).catch(() => {});
-    await logPaymentActivity(paymentId);
+    // Team alert + client receipt + activity entry (single canonical path).
+    const { notifyMilestonePaid } = await import("./payment-notifications");
+    await notifyMilestonePaid(paymentId);
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -3314,14 +3410,99 @@ export async function recordEstimatePayment(
             },
         });
 
-        return { success: true as const, projectId: estimate.projectId, leadId: estimate.leadId };
+        // Mirror to the linked invoice's milestone copy so the invoice, portal,
+        // and reports see the payment too. Prefer the durable sourceScheduleId
+        // link; name+amount is the fallback for copies created before the link
+        // column existed. The mirrored update is itself claimed (status guard)
+        // so concurrent settles can't double-apply.
+        let mirroredCopyId: string | null = null;
+        const linkedInvoice = await t.invoice.findFirst({ where: { estimateId }, include: { payments: true } });
+        if (linkedInvoice) {
+            const copy =
+                linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status !== "Paid") ??
+                linkedInvoice.payments.find(p =>
+                    !p.sourceScheduleId &&
+                    p.status !== "Paid" &&
+                    p.name === payment.name &&
+                    toNum(p.amount) === toNum(payment.amount)
+                );
+            if (copy) {
+                const mirrorClaim = await t.paymentSchedule.updateMany({
+                    where: { id: copy.id, status: { not: "Paid" } },
+                    data: {
+                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
+                        // Keep both sides agreeing on what was actually paid when the
+                        // recorded amount overrides the milestone amount.
+                        ...(input.amount != null && { amount: input.amount }),
+                    },
+                });
+                if (mirrorClaim.count > 0) {
+                    const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                    const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                    const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                    await t.invoice.update({
+                        where: { id: linkedInvoice.id },
+                        data: {
+                            balanceDue: invBalance,
+                            status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                        },
+                    });
+                    mirroredCopyId = copy.id;
+                }
+            }
+        }
+
+        return {
+            success: true as const, projectId: estimate.projectId, leadId: estimate.leadId,
+            mirroredCopyId, paymentName: payment.name, newBalance,
+            paymentAmount: input.amount != null ? input.amount : toNum(payment.amount),
+        };
     });
 
     if (!tx.success) return tx;
 
+    if (tx.mirroredCopyId) {
+        // Invoice copy settled — the canonical milestone-paid path covers team
+        // alert, client receipt, and the activity feed.
+        const { notifyMilestonePaid } = await import("./payment-notifications");
+        await notifyMilestonePaid(tx.mirroredCopyId);
+    } else {
+        // No invoice yet (pre-signing deposit): estimate-flavored emails + log.
+        const estimateFull = await prisma.estimate.findUnique({
+            where: { id: estimateId },
+            select: {
+                id: true, code: true, title: true, projectId: true, leadId: true,
+                project: { select: { client: { select: { name: true, email: true } } } },
+                lead: { select: { name: true, client: { select: { name: true, email: true } } } },
+            },
+        });
+        if (estimateFull) {
+            const { sendEstimatePaymentReceivedEmails } = await import("./payment-notifications");
+            await sendEstimatePaymentReceivedEmails({
+                estimate: { id: estimateFull.id, code: estimateFull.code || estimateFull.title || estimateId, project: estimateFull.project, lead: estimateFull.lead },
+                schedule: { id: paymentId, name: tx.paymentName, amount: tx.paymentAmount, referenceNumber },
+                method,
+                newBalance: tx.newBalance,
+                referenceNumber,
+            }).catch(() => {});
+            await logActivity({
+                projectId: estimateFull.projectId,
+                leadId: estimateFull.leadId,
+                actorType: "TEAM",
+                actorName: user.name || "Team",
+                action: "payment_received",
+                entityType: "estimate",
+                entityId: estimateId,
+                entityName: `Estimate ${estimateFull.code || estimateFull.title || ""}`.trim(),
+                metadata: { milestone: tx.paymentName, method, referenceNumber: referenceNumber || undefined },
+            });
+        }
+    }
+
     if (tx.projectId) {
         revalidatePath(`/projects/${tx.projectId}/estimates`);
         revalidatePath(`/projects/${tx.projectId}/estimates/${estimateId}`);
+        revalidatePath(`/projects/${tx.projectId}/invoices`);
     }
     if (tx.leadId) {
         revalidatePath(`/leads/${tx.leadId}/estimates`);
@@ -3420,6 +3601,36 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
                 ...(totalPaid === 0 && { statusBeforePayment: null }),
             },
         });
+
+        // Unwind the mirrored invoice copy too — a payment recorded on either
+        // side settles both, so unrecording must release both.
+        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, include: { payments: true } });
+        if (linkedInvoice) {
+            const copy =
+                linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid") ??
+                linkedInvoice.payments.find(p =>
+                    !p.sourceScheduleId &&
+                    p.status === "Paid" &&
+                    p.name === payment.name &&
+                    toNum(p.amount) === toNum(payment.amount)
+                );
+            if (copy) {
+                await tx.paymentSchedule.update({
+                    where: { id: copy.id },
+                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
+                });
+                const allCopies = await tx.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                await tx.invoice.update({
+                    where: { id: linkedInvoice.id },
+                    data: {
+                        balanceDue: invBalance,
+                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : "Issued",
+                    },
+                });
+            }
+        }
 
         return { projectId: estimate.projectId, leadId: estimate.leadId };
     });
@@ -3594,6 +3805,42 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
             where: { id: invoiceId },
             data: { balanceDue: newBalance, status: newStatus },
         });
+
+        // Unwind the mirrored estimate-side copy too (link-first, fallback by
+        // name+amount) so the estimate doesn't keep claiming money the invoice
+        // no longer shows as received.
+        if (invoice.estimateId) {
+            const estCopy = payment.sourceScheduleId
+                ? await tx.estimatePaymentSchedule.findFirst({
+                    where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: "Paid" },
+                  })
+                : await tx.estimatePaymentSchedule.findFirst({
+                    where: { estimateId: invoice.estimateId, status: "Paid", name: payment.name },
+                  });
+            const amountsMatch = !!estCopy && (payment.sourceScheduleId ? true : toNum(estCopy.amount) === toNum(payment.amount));
+            if (estCopy && amountsMatch) {
+                await tx.estimatePaymentSchedule.update({
+                    where: { id: estCopy.id },
+                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
+                });
+                const estimate = await tx.estimate.findUnique({ where: { id: invoice.estimateId } });
+                if (estimate) {
+                    const estSiblings = await tx.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
+                    const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                    const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
+                    await tx.estimate.update({
+                        where: { id: invoice.estimateId },
+                        data: {
+                            balanceDue: estBalance,
+                            status: estPaid === 0 ? estimate.statusBeforePayment ?? "Invoiced"
+                                : estBalance <= 0 ? "Paid"
+                                : "Partially Paid",
+                            ...(estPaid === 0 && { statusBeforePayment: null }),
+                        },
+                    });
+                }
+            }
+        }
 
         return invoice.projectId;
     });

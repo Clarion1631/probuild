@@ -56,8 +56,8 @@ export async function POST(req: Request) {
         }
         if (body.action === "test-team-notify") {
             if (!body.paymentScheduleId) return NextResponse.json({ ok: false, reason: "paymentScheduleId required" }, { status: 400 });
-            const { notifyTeamPaymentReceived } = await import("@/lib/quickbooks-payments");
-            const sent = await notifyTeamPaymentReceived(body.paymentScheduleId);
+            const { notifyMilestonePaid } = await import("@/lib/payment-notifications");
+            const sent = await notifyMilestonePaid(body.paymentScheduleId);
             return NextResponse.json({ ok: true, sent: sent ?? null });
         }
         if (body.action === "delete-qbo-payment") {
