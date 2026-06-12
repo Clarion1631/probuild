@@ -110,7 +110,9 @@ Rules:
 
 PROJECT: <describe the scope of work, square footage, finishes, etc.>`;
 
-export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any }) {
+type ActivityEvent = { id: string; ts: string; kind: "created" | "sent" | "viewed" | "signed" | "invoice" | "payment" | "other"; title: string; detail?: string | null };
+
+export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings, activityEvents }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any, activityEvents?: ActivityEvent[] }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -1426,7 +1428,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             }}
         >
             {/* Top Navigation / Action Bar */}
-            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-10 sticky top-0">
+            {/* z-30: must beat the sidebar's sticky tab bar (z-10, later in DOM) so the ⋮ dropdown isn't painted under it */}
+            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-30 sticky top-0">
                 <div className="flex items-center gap-3">
                     <button onClick={() => {
                         if (context.type === "project") {
@@ -2844,56 +2847,48 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         </div>
                     )}
 
-                    {sidebarTab === "activity" && (
-                        <div className="p-5">
-                            <div className="space-y-4">
-                                {/* Activity Timeline */}
+                    {sidebarTab === "activity" && (() => {
+                        // Append-only feed from the server (every send/resend, view, signature,
+                        // invoice lifecycle, settled payments). Falls back to the legacy
+                        // single-timestamp rendering only if the prop is missing.
+                        const events: ActivityEvent[] = activityEvents ?? [
+                            { id: "created", ts: initialEstimate.createdAt, kind: "created", title: "Estimate created" },
+                            ...(initialEstimate.sentAt ? [{ id: "sent", ts: initialEstimate.sentAt, kind: "sent" as const, title: "Sent to client" }] : []),
+                            ...(initialEstimate.viewedAt ? [{ id: "viewed", ts: initialEstimate.viewedAt, kind: "viewed" as const, title: "Viewed by client" }] : []),
+                            ...(initialEstimate.approvedAt ? [{ id: "signed", ts: initialEstimate.approvedAt, kind: "signed" as const, title: `Approved${initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ""}` }] : []),
+                        ];
+                        const iconFor = (kind: ActivityEvent["kind"]) => {
+                            switch (kind) {
+                                case "created": return { bg: "bg-slate-200", fg: "text-slate-500", path: "M12 6v6m0 0v6m0-6h6m-6 0H6" };
+                                case "sent": return { bg: "bg-amber-100", fg: "text-amber-600", path: "M12 19l9 2-9-18-9 18 9-2zm0 0v-8" };
+                                case "viewed": return { bg: "bg-blue-100", fg: "text-blue-600", path: "M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7zM15 12a3 3 0 11-6 0 3 3 0 016 0z" };
+                                case "signed": return { bg: "bg-green-100", fg: "text-green-600", path: "M5 13l4 4L19 7" };
+                                case "invoice": return { bg: "bg-indigo-100", fg: "text-indigo-600", path: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" };
+                                case "payment": return { bg: "bg-emerald-100", fg: "text-emerald-600", path: "M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" };
+                                default: return { bg: "bg-slate-100", fg: "text-slate-500", path: "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" };
+                            }
+                        };
+                        return (
+                            <div className="p-5">
                                 <div className="relative">
-                                    <div className="absolute left-[11px] top-6 bottom-0 w-0.5 bg-slate-200"></div>
+                                    <div className="absolute left-[11px] top-6 bottom-3 w-0.5 bg-slate-200"></div>
                                     <div className="space-y-4">
-                                        <div className="flex items-start gap-3 relative">
-                                            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center shrink-0 z-10">
-                                                <svg className="w-3 h-3 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
-                                            </div>
-                                            <div>
-                                                <p className="text-sm font-medium text-slate-800">Estimate created</p>
-                                                <p className="text-xs text-slate-500">{new Date(initialEstimate.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                            </div>
-                                        </div>
-                                        {initialEstimate.sentAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-amber-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                                        {events.map(ev => {
+                                            const icon = iconFor(ev.kind);
+                                            return (
+                                                <div key={ev.id} className="flex items-start gap-3 relative">
+                                                    <div className={`w-6 h-6 rounded-full ${icon.bg} flex items-center justify-center shrink-0 z-10`}>
+                                                        <svg className={`w-3 h-3 ${icon.fg}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={icon.path} /></svg>
+                                                    </div>
+                                                    <div className="min-w-0">
+                                                        <p className="text-sm font-medium text-slate-800">{ev.title}</p>
+                                                        {ev.detail && <p className="text-xs text-slate-500 truncate" title={ev.detail}>{ev.detail}</p>}
+                                                        <p className="text-xs text-slate-400">{new Date(ev.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                    </div>
                                                 </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Sent to client</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.sentAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {initialEstimate.viewedAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-blue-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
-                                                </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Viewed by client</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.viewedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {initialEstimate.approvedAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-green-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Approved{initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ''}</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.approvedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {!initialEstimate.sentAt && !initialEstimate.viewedAt && !initialEstimate.approvedAt && (
+                                            );
+                                        })}
+                                        {events.length <= 1 && (
                                             <div className="mt-4 text-center py-6">
                                                 <svg className="w-10 h-10 text-slate-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                                 <p className="text-sm text-slate-500">No activity yet</p>
@@ -2903,8 +2898,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     </div>
                                 </div>
                             </div>
-                        </div>
-                    )}
+                        );
+                    })()}
 
                     {sidebarTab === "comments" && (
                         <div className="flex-1 flex flex-col min-h-0">

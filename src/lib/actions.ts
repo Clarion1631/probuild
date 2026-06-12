@@ -1548,6 +1548,7 @@ export async function findOrCreateClientThread(projectId: string) {
 
 export async function logActivity({
     projectId,
+    leadId,
     actorType,
     actorName,
     action,
@@ -1556,7 +1557,8 @@ export async function logActivity({
     entityName,
     metadata,
 }: {
-    projectId: string;
+    projectId?: string | null;
+    leadId?: string | null;
     actorType: string;
     actorName: string;
     action: string;
@@ -1568,7 +1570,8 @@ export async function logActivity({
     try {
         await prisma.activityLog.create({
             data: {
-                projectId,
+                projectId: projectId ?? null,
+                leadId: leadId ?? null,
                 actorType,
                 actorName,
                 action,
@@ -1701,19 +1704,109 @@ export async function markEstimateViewed(estimateId: string) {
             `👁️ ${clientName} viewed estimate ${estimate.title || estimate.code}`
         );
 
-        // Log to activity feed
-        if (estimate.projectId) {
-            await logActivity({
-                projectId: estimate.projectId,
-                actorType: "CLIENT",
-                actorName: clientName,
-                action: "viewed_estimate",
-                entityType: "estimate",
-                entityId: estimateId,
-                entityName: `Estimate ${estimate.code || estimate.title}`,
+        // Log to activity feed (lead-stage estimates log against the lead)
+        await logActivity({
+            projectId: estimate.projectId,
+            leadId: estimate.leadId,
+            actorType: "CLIENT",
+            actorName: clientName,
+            action: "viewed_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+        });
+    }
+}
+
+export type EstimateActivityEvent = {
+    id: string;
+    ts: string; // ISO timestamp
+    kind: "created" | "sent" | "viewed" | "signed" | "invoice" | "payment" | "other";
+    title: string;
+    detail?: string | null;
+};
+
+/**
+ * Append-only activity feed for one estimate: ActivityLog events (every send,
+ * incl. resends), legacy single-timestamp baselines for estimates that predate
+ * the log, plus the linked invoice's lifecycle and settled payments read live —
+ * so payment history is always complete without any extra logging.
+ */
+export async function getEstimateActivity(estimateId: string): Promise<EstimateActivityEvent[]> {
+    const [estimate, logs, invoice] = await Promise.all([
+        prisma.estimate.findUnique({
+            where: { id: estimateId },
+            select: { createdAt: true, sentAt: true, viewedAt: true, approvedAt: true, approvedBy: true },
+        }),
+        prisma.activityLog.findMany({
+            where: { entityType: "estimate", entityId: estimateId },
+            orderBy: { createdAt: "asc" },
+        }),
+        prisma.invoice.findFirst({
+            where: { estimateId },
+            select: {
+                code: true, createdAt: true, sentAt: true, viewedAt: true,
+                payments: {
+                    select: { id: true, name: true, amount: true, status: true, paidAt: true, paymentDate: true, paymentMethod: true, referenceNumber: true },
+                    orderBy: { createdAt: "asc" },
+                },
+            },
+        }),
+    ]);
+    if (!estimate) return [];
+
+    const events: EstimateActivityEvent[] = [
+        { id: "created", ts: estimate.createdAt.toISOString(), kind: "created", title: "Estimate created" },
+    ];
+    const hasLog = (action: string) => logs.some(l => l.action === action);
+
+    // Legacy baselines — only when no append-only events exist for that action
+    // (estimates from before the activity log went in).
+    if (estimate.sentAt && !hasLog("sent_estimate")) {
+        events.push({ id: "sentAt", ts: estimate.sentAt.toISOString(), kind: "sent", title: "Sent to client" });
+    }
+    if (estimate.viewedAt && !hasLog("viewed_estimate")) {
+        events.push({ id: "viewedAt", ts: estimate.viewedAt.toISOString(), kind: "viewed", title: "Viewed by client" });
+    }
+    if (estimate.approvedAt && !hasLog("signed_estimate")) {
+        events.push({ id: "approvedAt", ts: estimate.approvedAt.toISOString(), kind: "signed", title: estimate.approvedBy ? `Signed by ${estimate.approvedBy}` : "Signed & approved" });
+    }
+
+    for (const l of logs) {
+        let meta: Record<string, unknown> = {};
+        try { meta = l.metadata ? JSON.parse(l.metadata) : {}; } catch { /* ignore */ }
+        const ts = l.createdAt.toISOString();
+        if (l.action === "sent_estimate") {
+            const by = l.actorName && l.actorName !== "Team" ? `by ${l.actorName}` : null;
+            events.push({ id: l.id, ts, kind: "sent", title: meta.resend ? "Resent to client" : "Sent to client", detail: [typeof meta.to === "string" ? `to ${meta.to}` : null, by].filter(Boolean).join(" · ") || null });
+        } else if (l.action === "viewed_estimate") {
+            events.push({ id: l.id, ts, kind: "viewed", title: "Viewed by client", detail: l.actorName && l.actorName !== "A client" ? l.actorName : null });
+        } else if (l.action === "signed_estimate") {
+            events.push({ id: l.id, ts, kind: "signed", title: `Signed by ${l.actorName}` });
+        } else {
+            events.push({ id: l.id, ts, kind: "other", title: l.action.replace(/_/g, " "), detail: l.entityName });
+        }
+    }
+
+    if (invoice) {
+        events.push({ id: "inv-created", ts: invoice.createdAt.toISOString(), kind: "invoice", title: `Invoice ${invoice.code} created` });
+        if (invoice.sentAt) events.push({ id: "inv-sent", ts: invoice.sentAt.toISOString(), kind: "invoice", title: `Invoice ${invoice.code} sent to client` });
+        if (invoice.viewedAt) events.push({ id: "inv-viewed", ts: invoice.viewedAt.toISOString(), kind: "viewed", title: `Invoice ${invoice.code} viewed by client` });
+        for (const p of invoice.payments) {
+            if (p.status !== "Paid") continue;
+            const ts = (p.paidAt || p.paymentDate || invoice.createdAt).toISOString();
+            const amt = toNum(p.amount).toLocaleString("en-US", { style: "currency", currency: "USD" });
+            const method = p.paymentMethod ? p.paymentMethod.replace(/_/g, " ") : null;
+            events.push({
+                id: `pay-${p.id}`, ts, kind: "payment",
+                title: `Payment received — ${amt}`,
+                detail: [p.name, method, p.referenceNumber ? `#${p.referenceNumber}` : null].filter(Boolean).join(" · ") || null,
             });
         }
     }
+
+    events.sort((a, b) => a.ts.localeCompare(b.ts));
+    return events;
 }
 
 export async function markContractViewed(contractId: string, accessToken?: string) {
@@ -1958,6 +2051,17 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     } catch (e) {
         console.error("[approveEstimate] post-approval automation failed:", e);
     }
+
+    await logActivity({
+        projectId: estimate?.projectId,
+        leadId: estimate?.leadId,
+        actorType: "CLIENT",
+        actorName: signatureName,
+        action: "signed_estimate",
+        entityType: "estimate",
+        entityId: estimateId,
+        entityName: `Estimate ${estimate?.code || estimateId}`,
+    });
 
     const settings = await getCompanySettings();
     const companyName = settings.companyName || "Golden Touch Remodeling";
@@ -3062,8 +3166,9 @@ export async function recordPayment(
     if (!tx.success) return tx;
 
     // Team "money in" alert (Settings → Notifications · Payment Received toggle).
-    const { notifyTeamPaymentReceived } = await import("./quickbooks-payments");
+    const { notifyTeamPaymentReceived, logPaymentActivity } = await import("./quickbooks-payments");
     await notifyTeamPaymentReceived(paymentId).catch(() => {});
+    await logPaymentActivity(paymentId);
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -4263,10 +4368,27 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     }
 
     const updatedStatus = ["Draft", "Sent", "Viewed"].includes(estimate.status) ? "Sent" : estimate.status;
+    const isResend = !!estimate.sentAt;
     await prisma.estimate.update({
         where: { id: estimateId },
         data: { sentAt: new Date(), status: updatedStatus },
     });
+
+    // Append-only send trail — every send (incl. resends) gets its own event.
+    {
+        const session = await getServerSession(authOptions).catch(() => null);
+        await logActivity({
+            projectId: estimate.project?.id,
+            leadId: estimate.lead?.id,
+            actorType: "TEAM",
+            actorName: session?.user?.name || session?.user?.email || "Team",
+            action: "sent_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+            metadata: { to: recipientEmail, cc: ccEmails && ccEmails.length > 0 ? ccEmails : undefined, resend: isResend },
+        });
+    }
 
     // Store as message in the appropriate thread
     const messageBody = customMessage

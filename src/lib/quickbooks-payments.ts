@@ -259,6 +259,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                     result.settled++;
                     await notifyPaymentRecorded(schedule, paidAt).catch(() => {});
                     await notifyTeamPaymentReceived(schedule.id).catch(() => {});
+                    await logPaymentActivity(schedule.id);
                 }
             } else if (status.balance < status.total) {
                 result.partiallyPaid++;
@@ -269,6 +270,35 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     }
 
     return result;
+}
+
+/**
+ * Project activity-feed entry for a recorded milestone payment. Separate from
+ * the email alert so toggling notifications off never silences the audit trail.
+ */
+export async function logPaymentActivity(paymentScheduleId: string) {
+    try {
+        const s = await prisma.paymentSchedule.findUnique({
+            where: { id: paymentScheduleId },
+            select: {
+                name: true, amount: true, paymentMethod: true, referenceNumber: true,
+                invoice: { select: { id: true, code: true, projectId: true } },
+            },
+        });
+        if (!s?.invoice) return;
+        await prisma.activityLog.create({
+            data: {
+                projectId: s.invoice.projectId,
+                actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
+                actorName: s.paymentMethod === "quickbooks" ? "QuickBooks" : "Team",
+                action: "payment_received",
+                entityType: "invoice",
+                entityId: s.invoice.id,
+                entityName: `Invoice ${s.invoice.code}`,
+                metadata: JSON.stringify({ milestone: s.name, amount: toNum(s.amount), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined }),
+            },
+        });
+    } catch { /* the log must never break payment recording */ }
 }
 
 /**

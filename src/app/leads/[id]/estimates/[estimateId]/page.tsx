@@ -1,4 +1,4 @@
-import { getEstimate, getLead, getCompanySettings } from "@/lib/actions";
+import { getEstimate, getLead, getCompanySettings, getEstimateActivity } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import EstimateEditor from "@/app/projects/[id]/estimates/[estimateId]/EstimateEditor";
 
@@ -6,10 +6,11 @@ export const dynamic = "force-dynamic";
 
 export default async function LeadEstimatePage({ params }: { params: Promise<{ id: string, estimateId: string }> }) {
     const resolvedParams = await params;
-    const [lead, estimate, settings] = await Promise.all([
+    const [lead, estimate, settings, activityEvents] = await Promise.all([
         getLead(resolvedParams.id),
         getEstimate(resolvedParams.estimateId),
         getCompanySettings(),
+        getEstimateActivity(resolvedParams.estimateId),
     ]);
 
     if (!lead || !estimate) {
@@ -38,6 +39,7 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
                     initialEstimate={serializedEstimate}
                     salesTaxes={salesTaxes}
                     settings={settings}
+                    activityEvents={activityEvents}
                 />
             </div>
         </div>

@@ -1555,8 +1555,9 @@ model TeamMessage {
 
 model ActivityLog {
   id         String   @id @default(cuid())
-  projectId  String
-  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId  String?
+  project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId     String?  // lead-stage events (estimate sent/viewed before conversion); no FK — log survives lead deletion
   actorType  String   // "CLIENT", "TEAM", "SUBCONTRACTOR", "SYSTEM"
   actorName  String
   action     String   // "viewed_estimate", "signed_contract", "paid_invoice", "sent_message", "viewed_portal"
@@ -1567,6 +1568,8 @@ model ActivityLog {
   createdAt  DateTime @default(now())
 
   @@index([projectId, createdAt])
+  @@index([entityType, entityId])
+  @@index([leadId, createdAt])
 }
 
 model Integration {
