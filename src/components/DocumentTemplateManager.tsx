@@ -140,7 +140,7 @@ export default function DocumentTemplateManager({ allowedType, showTypeSelector 
             <div className="font-sans text-slate-900 h-full flex flex-col bg-white">
                 <header className="bg-white border-b border-hui-border px-6 py-3 flex items-center justify-between shrink-0">
                     <div className="flex items-center gap-3">
-                        <button onClick={() => setShowEditor(false)} className="text-hui-textMuted hover:text-hui-textMain transition p-1">
+                        <button onClick={() => setShowEditor(false)} aria-label="Back to templates" className="text-hui-textMuted hover:text-hui-textMain transition p-1">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                         </button>
                         <div>
