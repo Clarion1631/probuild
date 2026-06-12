@@ -547,11 +547,15 @@ const TAX_CERT_MAX_BYTES = 10 * 1024 * 1024;
  *  never derive a deletable path from anything else. */
 function taxCertStoragePathFromUrl(url: string | null, bucket: string): string | null {
     if (!url) return null;
-    const marker = `/storage/v1/object/public/${bucket}/`;
-    const i = url.indexOf(marker);
-    if (i === -1) return null;
-    const path = decodeURIComponent(url.slice(i + marker.length).split("?")[0]);
-    return path.startsWith("tax-certs/") ? path : null;
+    try {
+        const pathname = new URL(url).pathname;
+        const marker = `/storage/v1/object/public/${bucket}/`;
+        if (!pathname.startsWith(marker)) return null;
+        const path = decodeURIComponent(pathname.slice(marker.length));
+        return path.startsWith("tax-certs/") ? path : null;
+    } catch {
+        return null; // malformed URL or bad % escape — skip cleanup rather than guess
+    }
 }
 
 async function revalidateClientCertSurfaces(clientId: string) {
@@ -638,22 +642,30 @@ export async function removeClientTaxExemptCert(clientId: string) {
     const client = await prisma.client.findUnique({ where: { id: clientId }, select: { taxExemptCertUrl: true } });
     if (!client) throw new Error("Client not found");
 
-    const updated = await prisma.client.update({
-        where: { id: clientId },
+    // Conditional clear: only wins if the cert wasn't concurrently replaced, so we
+    // never delete an object the row stopped pointing at (superseded certs are kept).
+    const { count } = await prisma.client.updateMany({
+        where: { id: clientId, taxExemptCertUrl: client.taxExemptCertUrl },
         data: { taxExemptCertUrl: null, taxExemptCertExpiresAt: null, taxExemptCertNote: null },
-        select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
     });
 
     // Best-effort: explicit "Remove" should not leave the file publicly reachable.
-    // (Replacing keeps superseded certs — they remain compliance artifacts for past sales.)
-    try {
-        const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-        const supabase = getSupabase();
-        const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
-        if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
-    } catch (e) {
-        console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
+    if (count === 1) {
+        try {
+            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+            const supabase = getSupabase();
+            const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
+            if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+        } catch (e) {
+            console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
+        }
     }
+
+    const updated = await prisma.client.findUnique({
+        where: { id: clientId },
+        select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
+    });
+    if (!updated) throw new Error("Client not found");
 
     await revalidateClientCertSurfaces(clientId);
     return JSON.parse(JSON.stringify(updated));
