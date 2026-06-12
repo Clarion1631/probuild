@@ -540,7 +540,19 @@ export async function updateClient(clientId: string, data: { name?: string; emai
 // certificate must be on file for every tax-exempt sale) ──────────────────────
 
 const TAX_CERT_ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+const TAX_CERT_ALLOWED_EXTENSIONS = ["pdf", "jpg", "jpeg", "png", "webp", "heic", "heif"];
 const TAX_CERT_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Map a public storage URL back to its bucket path, but only within tax-certs/ —
+ *  never derive a deletable path from anything else. */
+function taxCertStoragePathFromUrl(url: string | null, bucket: string): string | null {
+    if (!url) return null;
+    const marker = `/storage/v1/object/public/${bucket}/`;
+    const i = url.indexOf(marker);
+    if (i === -1) return null;
+    const path = decodeURIComponent(url.slice(i + marker.length).split("?")[0]);
+    return path.startsWith("tax-certs/") ? path : null;
+}
 
 async function revalidateClientCertSurfaces(clientId: string) {
     const [linkedProjects, linkedLeads] = await Promise.all([
@@ -569,7 +581,11 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
     let certUrl = client.taxExemptCertUrl;
     if (file instanceof File && file.size > 0) {
         if (file.size > TAX_CERT_MAX_BYTES) throw new Error("Certificate file is too large (10 MB max)");
-        if (file.type && !TAX_CERT_ALLOWED_TYPES.includes(file.type)) throw new Error("Certificate must be a PDF or image");
+        // MIME is client-controlled and may be empty — require BOTH a known type and extension.
+        const ext = (file.name.split(".").pop() || "").toLowerCase();
+        if (!TAX_CERT_ALLOWED_TYPES.includes(file.type) || !TAX_CERT_ALLOWED_EXTENSIONS.includes(ext)) {
+            throw new Error("Certificate must be a PDF or image");
+        }
 
         const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
         const supabase = getSupabase();
@@ -589,8 +605,15 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
 
     let expiresAt: Date | null = null;
     if (expiresAtRaw) {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(expiresAtRaw)) throw new Error("Invalid expiration date");
-        expiresAt = new Date(`${expiresAtRaw}T00:00:00.000Z`);
+        // Round-trip the UTC parts: JS silently normalizes impossible dates
+        // (2026-02-31 -> Mar 3), which would store a different date than submitted.
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expiresAtRaw);
+        expiresAt = m ? new Date(`${expiresAtRaw}T00:00:00.000Z`) : null;
+        const valid = !!m && !!expiresAt && !isNaN(expiresAt.getTime()) &&
+            expiresAt.getUTCFullYear() === Number(m[1]) &&
+            expiresAt.getUTCMonth() + 1 === Number(m[2]) &&
+            expiresAt.getUTCDate() === Number(m[3]);
+        if (!valid) throw new Error("Invalid expiration date");
     }
 
     const updated = await prisma.client.update({
@@ -612,11 +635,25 @@ export async function removeClientTaxExemptCert(clientId: string) {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
 
+    const client = await prisma.client.findUnique({ where: { id: clientId }, select: { taxExemptCertUrl: true } });
+    if (!client) throw new Error("Client not found");
+
     const updated = await prisma.client.update({
         where: { id: clientId },
         data: { taxExemptCertUrl: null, taxExemptCertExpiresAt: null, taxExemptCertNote: null },
         select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
     });
+
+    // Best-effort: explicit "Remove" should not leave the file publicly reachable.
+    // (Replacing keeps superseded certs — they remain compliance artifacts for past sales.)
+    try {
+        const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+        const supabase = getSupabase();
+        const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
+        if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+    } catch (e) {
+        console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
+    }
 
     await revalidateClientCertSurfaces(clientId);
     return JSON.parse(JSON.stringify(updated));
