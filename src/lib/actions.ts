@@ -1758,17 +1758,19 @@ export async function getEstimateActivity(estimateId: string): Promise<EstimateA
     const events: EstimateActivityEvent[] = [
         { id: "created", ts: estimate.createdAt.toISOString(), kind: "created", title: "Estimate created" },
     ];
-    const hasLog = (action: string) => logs.some(l => l.action === action);
-
-    // Legacy baselines — only when no append-only events exist for that action
-    // (estimates from before the activity log went in).
-    if (estimate.sentAt && !hasLog("sent_estimate")) {
+    // Legacy baselines from the single-timestamp columns. Hidden only when a log
+    // event of the same action sits within 5 minutes (i.e. it IS that same send —
+    // sends made after the activity log shipped write both). An older baseline
+    // (e.g. the original Oct send) always stays even after later resends.
+    const hasLogNear = (action: string, at: Date) =>
+        logs.some(l => l.action === action && Math.abs(l.createdAt.getTime() - at.getTime()) < 5 * 60 * 1000);
+    if (estimate.sentAt && !hasLogNear("sent_estimate", estimate.sentAt)) {
         events.push({ id: "sentAt", ts: estimate.sentAt.toISOString(), kind: "sent", title: "Sent to client" });
     }
-    if (estimate.viewedAt && !hasLog("viewed_estimate")) {
+    if (estimate.viewedAt && !hasLogNear("viewed_estimate", estimate.viewedAt)) {
         events.push({ id: "viewedAt", ts: estimate.viewedAt.toISOString(), kind: "viewed", title: "Viewed by client" });
     }
-    if (estimate.approvedAt && !hasLog("signed_estimate")) {
+    if (estimate.approvedAt && !hasLogNear("signed_estimate", estimate.approvedAt)) {
         events.push({ id: "approvedAt", ts: estimate.approvedAt.toISOString(), kind: "signed", title: estimate.approvedBy ? `Signed by ${estimate.approvedBy}` : "Signed & approved" });
     }
 
