@@ -118,10 +118,18 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
     await page.locator('input[placeholder="e.g. John A. Doe"]').fill(SIGNER);
     await page.locator('button:has-text("Sign & Approve")').last().click();
 
-    await expect(
-      page.locator("text=Electronically Signed and Approved"),
-      "signed confirmation block should render"
-    ).toBeVisible({ timeout: 90_000 });
+    // The UI optimistically shows the signed block DURING the client-side PDF
+    // capture — before approveEstimate has run. Asserting on it ends the test,
+    // which closes the page and kills the in-flight approval. The real
+    // completion signal is the database write, so poll that (capture + PDF +
+    // conversion pipeline can take a while in CI).
+    await expect
+      .poll(
+        async () =>
+          (await prisma.estimate.findUnique({ where: { id: IDS.estimate }, select: { status: true } }))?.status,
+        { timeout: 100_000, intervals: [2_000] }
+      )
+      .toBe("Invoiced");
   });
 
   test("M2: conversion chain — lead Won, project In Progress, linked invoice, sourceScheduleId mirrors", async () => {
