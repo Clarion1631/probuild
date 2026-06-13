@@ -1,11 +1,16 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import dynamic from "next/dynamic";
 import CashFlowCard from "./cash-flow-card";
-import IncomingPaymentsCard from "./incoming-payments-card";
-import OutgoingPaymentsCard from "./outgoing-payments-card";
-import CashFlowTrackerChart from "./cash-flow-tracker-chart";
 import FinancialItemsSection from "./financial-items-section";
+
+const Skeleton = ({ className }: { className?: string }) => <div className={`animate-pulse rounded-md bg-slate-200 ${className}`} />;
+
+// Dynamically import Recharts-based components to avoid hydration blocking and reduce initial bundle size
+const IncomingPaymentsCard = dynamic(() => import("./incoming-payments-card"), { ssr: false, loading: () => <Skeleton className="h-[320px] w-full" /> });
+const OutgoingPaymentsCard = dynamic(() => import("./outgoing-payments-card"), { ssr: false, loading: () => <Skeleton className="h-[320px] w-full" /> });
+const CashFlowTrackerChart = dynamic(() => import("./cash-flow-tracker-chart"), { ssr: false, loading: () => <Skeleton className="h-[350px] w-full" /> });
 
 // Basic switch replacement
 const Switch = ({ checked, onCheckedChange, id }: any) => (
@@ -13,7 +18,6 @@ const Switch = ({ checked, onCheckedChange, id }: any) => (
         <div className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${checked ? 'translate-x-4' : 'translate-x-0'}`} />
     </div>
 );
-const Skeleton = ({ className }: { className?: string }) => <div className={`animate-pulse rounded-md bg-slate-200 ${className}`} />;
 
 export default function FinancialOverviewContent({ projectId, projectName }: { projectId: string; projectName: string }) {
     const [includeUnissued, setIncludeUnissued] = useState(false);
