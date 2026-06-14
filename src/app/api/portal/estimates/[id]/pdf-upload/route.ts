@@ -11,7 +11,8 @@ export const maxDuration = 60;
  */
 function verifyPdfUploadToken(estimateId: string, token: string): boolean {
     try {
-        const secret = process.env.NEXTAUTH_SECRET || "probuild-pdf-token-secret";
+        const secret = process.env.NEXTAUTH_SECRET;
+        if (!secret) throw new Error("NEXTAUTH_SECRET is not configured");
         const parts = token.split(":");
         if (parts.length !== 3) return false;
         const [tokenEstimateId, expiryStr, sig] = parts;
