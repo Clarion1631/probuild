@@ -2,7 +2,9 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
-import JobCostingClient from "./JobCostingClient";
+import dynamic from "next/dynamic";
+
+const JobCostingClient = dynamic(() => import("./JobCostingClient"), { ssr: false });
 
 export default async function JobCostingPage({
     params,
@@ -70,7 +72,7 @@ export default async function JobCostingPage({
         }
     });
 
-    // We'll process the numbers on the client or server. Let's send raw to client for easy filtering if needed, 
+    // We'll process the numbers on the client or server. Let's send raw to client for easy filtering if needed,
     // or aggregate here. We'll aggregate on the client for flexibility.
 
     return (
