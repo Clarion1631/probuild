@@ -3,10 +3,10 @@
 import { useState, useEffect } from "react";
 import dynamic from "next/dynamic";
 import CashFlowCard from "./cash-flow-card";
+import IncomingPaymentsCard from "./incoming-payments-card";
+import OutgoingPaymentsCard from "./outgoing-payments-card";
 import FinancialItemsSection from "./financial-items-section";
 
-const IncomingPaymentsCard = dynamic(() => import("./incoming-payments-card"), { ssr: false });
-const OutgoingPaymentsCard = dynamic(() => import("./outgoing-payments-card"), { ssr: false });
 const CashFlowTrackerChart = dynamic(() => import("./cash-flow-tracker-chart"), { ssr: false });
 
 // Basic switch replacement

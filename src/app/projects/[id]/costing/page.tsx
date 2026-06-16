@@ -2,9 +2,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
-import dynamic from "next/dynamic";
-
-const JobCostingClient = dynamic(() => import("./JobCostingClient"), { ssr: false });
+import JobCostingClient from "./JobCostingClient";
 
 export default async function JobCostingPage({
     params,
