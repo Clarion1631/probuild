@@ -39,26 +39,26 @@ export default async function TimeClockPage({
 
     if (!project) redirect("/projects");
 
-    // Fetch required data for client
-    const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
-        include: {
-            user: { select: { id: true, name: true, email: true } },
-            costCode: { select: { id: true, name: true, code: true } }
-        },
-        orderBy: { startTime: 'desc' }
-    });
-
-    const costCodes = await prisma.costCode.findMany({
-        where: { isActive: true },
-        orderBy: { code: 'asc' }
-    });
-    
-    const teamMembersRaw = await prisma.user.findMany({
-        where: { status: { not: "DISABLED" } },
-        select: { id: true, name: true, email: true, hourlyRate: true },
-        orderBy: { name: 'asc' }
-    });
+    // Bolt Optimization: Run independent queries in parallel to improve TTFB
+    const [timeEntries, costCodes, teamMembersRaw] = await Promise.all([
+        prisma.timeEntry.findMany({
+            where: { projectId },
+            include: {
+                user: { select: { id: true, name: true, email: true } },
+                costCode: { select: { id: true, name: true, code: true } }
+            },
+            orderBy: { startTime: 'desc' }
+        }),
+        prisma.costCode.findMany({
+            where: { isActive: true },
+            orderBy: { code: 'asc' }
+        }),
+        prisma.user.findMany({
+            where: { status: { not: "DISABLED" } },
+            select: { id: true, name: true, email: true, hourlyRate: true },
+            orderBy: { name: 'asc' }
+        })
+    ]);
     const teamMembers = teamMembersRaw.map(u => ({
         ...u,
         hourlyRate: Number(u.hourlyRate),

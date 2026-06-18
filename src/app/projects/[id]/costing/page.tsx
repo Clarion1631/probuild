@@ -37,40 +37,40 @@ export default async function JobCostingPage({
 
     if (!project) redirect("/projects");
 
-    // Fetch budget (from estimates) - find active or approved estimates
-    const estimates = await prisma.estimate.findMany({
-        where: { projectId },
-        select: {
-            id: true, number: true, title: true, code: true, status: true,
-            totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
-            items: { include: { costCode: true, costType: true } },
-        },
-    });
-
-    // Fetch Actuals: Time Entries and Expenses
-    const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
-        include: { costCode: true }
-    });
-
-    const expenses = await prisma.expense.findMany({
-        where: {
-            estimate: {
-                projectId: projectId
+    // Bolt Optimization: Run independent queries in parallel to improve TTFB
+    const [estimates, timeEntries, expenses, purchaseOrders] = await Promise.all([
+        // Fetch budget (from estimates) - find active or approved estimates
+        prisma.estimate.findMany({
+            where: { projectId },
+            select: {
+                id: true, number: true, title: true, code: true, status: true,
+                totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                items: { include: { costCode: true, costType: true } },
+            },
+        }),
+        // Fetch Actuals: Time Entries and Expenses
+        prisma.timeEntry.findMany({
+            where: { projectId },
+            include: { costCode: true }
+        }),
+        prisma.expense.findMany({
+            where: {
+                estimate: {
+                    projectId: projectId
+                }
+            },
+            include: { costCode: true }
+        }),
+        // Fetch Purchase Orders for "Committed Costs"
+        prisma.purchaseOrder.findMany({
+            where: { projectId },
+            include: {
+                items: { include: { costCode: true } }
             }
-        },
-        include: { costCode: true }
-    });
+        })
+    ]);
 
-    // Fetch Purchase Orders for "Committed Costs"
-    const purchaseOrders = await prisma.purchaseOrder.findMany({
-        where: { projectId },
-        include: {
-            items: { include: { costCode: true } }
-        }
-    });
-
-    // We'll process the numbers on the client or server. Let's send raw to client for easy filtering if needed, 
+    // We'll process the numbers on the client or server. Let's send raw to client for easy filtering if needed,
     // or aggregate here. We'll aggregate on the client for flexibility.
 
     return (
