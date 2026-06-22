@@ -229,48 +229,46 @@ export async function getExpenses(projectId: string) {
 // ─── Combined Data Fetching ───────────────────────────────────
 
 export async function getTimeExpenseData(projectId: string) {
-    const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
-        include: {
-            user: { select: { id: true, name: true, email: true, hourlyRate: true } },
-            costCode: { select: { id: true, name: true, code: true } },
-        },
-        orderBy: { startTime: "desc" },
-    });
-
-    const expenses = await prisma.expense.findMany({
-        where: { estimate: { projectId } },
-        include: {
-            costCode: { select: { id: true, name: true, code: true } },
-            costType: { select: { id: true, name: true } },
-            item: { select: { id: true, name: true } },
-        },
-        orderBy: { createdAt: "desc" },
-    });
-
-    const costCodes = await prisma.costCode.findMany({
-        where: { isActive: true },
-        orderBy: { code: "asc" },
-    });
-
-    const costTypes = await prisma.costType.findMany({
-        orderBy: { name: "asc" },
-    });
-
-    const teamMembers = await prisma.user.findMany({
-        where: { status: { not: "DISABLED" } },
-        select: { id: true, name: true, email: true, hourlyRate: true },
-        orderBy: { name: "asc" },
-    });
-
-    const estimates = await prisma.estimate.findMany({
-        where: { projectId, archivedAt: null },
-        select: {
-            id: true,
-            title: true,
-            items: { select: { id: true, name: true } },
-        },
-    });
+    // ⚡ Bolt: Parallelize independent DB queries to improve TTFB
+    const [timeEntries, expenses, costCodes, costTypes, teamMembers, estimates] = await Promise.all([
+        prisma.timeEntry.findMany({
+            where: { projectId },
+            include: {
+                user: { select: { id: true, name: true, email: true, hourlyRate: true } },
+                costCode: { select: { id: true, name: true, code: true } },
+            },
+            orderBy: { startTime: "desc" },
+        }),
+        prisma.expense.findMany({
+            where: { estimate: { projectId } },
+            include: {
+                costCode: { select: { id: true, name: true, code: true } },
+                costType: { select: { id: true, name: true } },
+                item: { select: { id: true, name: true } },
+            },
+            orderBy: { createdAt: "desc" },
+        }),
+        prisma.costCode.findMany({
+            where: { isActive: true },
+            orderBy: { code: "asc" },
+        }),
+        prisma.costType.findMany({
+            orderBy: { name: "asc" },
+        }),
+        prisma.user.findMany({
+            where: { status: { not: "DISABLED" } },
+            select: { id: true, name: true, email: true, hourlyRate: true },
+            orderBy: { name: "asc" },
+        }),
+        prisma.estimate.findMany({
+            where: { projectId, archivedAt: null },
+            select: {
+                id: true,
+                title: true,
+                items: { select: { id: true, name: true } },
+            },
+        }),
+    ]);
 
     return { timeEntries, expenses, costCodes, costTypes, teamMembers, estimates };
 }
