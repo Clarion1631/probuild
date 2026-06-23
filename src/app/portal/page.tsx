@@ -16,28 +16,31 @@ export default async function PortalDashboard() {
     let clientName = "Team";
 
     if (isStaff) {
-        const allProjects = await prisma.project.findMany({
-            orderBy: { createdAt: 'desc' },
-            take: 50,
-            include: {
-                client: { select: { name: true } },
-                invoices: {
-                    where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                    select: { id: true, balanceDue: true }
+        // ⚡ Bolt: Parallelize database queries to reduce TTFB
+        const [allProjects, fetchedContracts] = await Promise.all([
+            prisma.project.findMany({
+                orderBy: { createdAt: 'desc' },
+                take: 50,
+                include: {
+                    client: { select: { name: true } },
+                    invoices: {
+                        where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
+                        select: { id: true, balanceDue: true }
+                    }
                 }
-            }
-        });
+            }),
+            prisma.contract.findMany({
+                where: { status: { in: ["Sent", "Viewed", "Signed", "Finalized"] } },
+                select: {
+                    id: true, title: true, status: true, sentAt: true, approvedAt: true,
+                    lead: { select: { name: true } }, project: { select: { name: true } },
+                },
+                orderBy: { sentAt: "desc" },
+                take: 20,
+            })
+        ]);
         projects = allProjects;
-
-        clientContracts = await prisma.contract.findMany({
-            where: { status: { in: ["Sent", "Viewed", "Signed", "Finalized"] } },
-            select: {
-                id: true, title: true, status: true, sentAt: true, approvedAt: true,
-                lead: { select: { name: true } }, project: { select: { name: true } },
-            },
-            orderBy: { sentAt: "desc" },
-            take: 20,
-        });
+        clientContracts = fetchedContracts;
     } else {
         const sessionClientId = await resolveSessionClientId();
 
@@ -60,35 +63,39 @@ export default async function PortalDashboard() {
             );
         }
 
-        const client = await prisma.client.findUnique({
-            where: { id: sessionClientId },
-            include: {
-                projects: {
-                    orderBy: { createdAt: 'desc' },
-                    include: {
-                        invoices: {
-                            where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                            select: { id: true, balanceDue: true }
+        // ⚡ Bolt: Parallelize client and contract queries to prevent cascading delays
+        const [client, fetchedClientContracts] = await Promise.all([
+            prisma.client.findUnique({
+                where: { id: sessionClientId },
+                include: {
+                    projects: {
+                        orderBy: { createdAt: 'desc' },
+                        include: {
+                            invoices: {
+                                where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
+                                select: { id: true, balanceDue: true }
+                            }
                         }
                     }
                 }
-            }
-        });
+            }),
+            prisma.contract.findMany({
+                where: {
+                    status: { in: ["Sent", "Viewed", "Signed", "Finalized"] },
+                    OR: [
+                        { lead: { clientId: sessionClientId } },
+                        { project: { clientId: sessionClientId } },
+                    ],
+                },
+                select: {
+                    id: true, title: true, status: true, sentAt: true, approvedAt: true,
+                    accessToken: true, lead: { select: { name: true } }, project: { select: { name: true } },
+                },
+                orderBy: { sentAt: "desc" },
+            })
+        ]);
 
-        clientContracts = await prisma.contract.findMany({
-            where: {
-                status: { in: ["Sent", "Viewed", "Signed", "Finalized"] },
-                OR: [
-                    { lead: { clientId: sessionClientId } },
-                    { project: { clientId: sessionClientId } },
-                ],
-            },
-            select: {
-                id: true, title: true, status: true, sentAt: true, approvedAt: true,
-                accessToken: true, lead: { select: { name: true } }, project: { select: { name: true } },
-            },
-            orderBy: { sentAt: "desc" },
-        });
+        clientContracts = fetchedClientContracts;
 
         if (!client) {
             return (
