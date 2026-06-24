@@ -452,6 +452,102 @@ export default function EntityContractsClient({
         finally { setSigningAsContractor(false); }
     };
 
+    const renderSharedModals = () => {
+        return (
+            <>
+                {/* ── CONTRACTOR SIGN MODAL ── */}
+                <DocumentSignModal
+                    isOpen={!!contractorSignModal}
+                    onClose={() => setContractorSignModal(null)}
+                    mode="signature"
+                    onSign={handleContractorSign}
+                />
+
+                {/* ── COMPANY COUNTERSIGN MODAL ── */}
+                <DocumentSignModal
+                    isOpen={!!companyCountersignModal}
+                    onClose={() => setCompanyCountersignModal(null)}
+                    mode="signature"
+                    onSign={handleCompanyCountersign}
+                />
+
+                {/* ── SEND CONTRACT DIALOG (editable CC) ── */}
+                {sendDialog && (
+                    <div className="fixed inset-0 bg-black/40 z-[60] flex items-center justify-center p-4" onClick={() => !sendingDialog && setSendDialog(null)}>
+                        <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
+                            <h3 className="text-lg font-bold text-slate-800 mb-1">Send Contract</h3>
+                            <p className="text-sm text-slate-500 mb-4">Review who receives this contract before sending.</p>
+                            <div className="space-y-3">
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">To</label>
+                                    <input type="text" value={sendDialog.toEmail} readOnly className="hui-input w-full bg-slate-50 text-slate-600" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">CC (comma-separated)</label>
+                                    <input
+                                        type="text"
+                                        value={sendDialog.cc}
+                                        onChange={e => setSendDialog({ ...sendDialog, cc: e.target.value })}
+                                        placeholder="spouse@example.com, manager@company.com"
+                                        className="hui-input w-full"
+                                    />
+                                    <p className="text-[11px] text-slate-400 mt-1">Prefilled with the client's additional email and the assigned manager. Edit as needed.</p>
+                                </div>
+                            </div>
+                            <div className="flex gap-3 justify-end mt-6">
+                                <button onClick={() => setSendDialog(null)} disabled={sendingDialog} className="hui-btn hui-btn-secondary">Cancel</button>
+                                <button onClick={confirmSend} disabled={sendingDialog} className="hui-btn hui-btn-primary">{sendingDialog ? "Sending…" : "Send Contract"}</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* ── CONTRACTOR-FIRST SIGNING PROMPT ── */}
+                {showContractorSignPrompt && pendingSendContractId && (
+                    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                        <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
+                            <div className="w-12 h-12 mx-auto bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mb-4">
+                                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
+                            </div>
+                            <h3 className="text-lg font-bold text-slate-800 text-center mb-2">Contractor Signature Required</h3>
+                            <p className="text-sm text-slate-500 text-center mb-6">This contract includes a contractor signature block. You must sign as contractor before sending to the client.</p>
+                            <div className="flex flex-col gap-2">
+                                <button
+                                    onClick={() => {
+                                        setShowContractorSignPrompt(false);
+                                        const contract = initialContracts.find((c: any) => c.id === pendingSendContractId);
+                                        setPendingSendContractId(null);
+                                        if (contract) setContractorSignModal(contract);
+                                    }}
+                                    className="w-full px-4 py-2.5 text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg transition"
+                                >
+                                    Sign as Contractor Now
+                                </button>
+                                <button
+                                    onClick={() => { setShowContractorSignPrompt(false); setPendingSendContractId(null); }}
+                                    className="w-full px-4 py-2 text-sm text-slate-400 hover:text-slate-600 transition"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Click-away to close create menu */}
+                {showCreateMenu && <div className="fixed inset-0 z-20" onClick={() => setShowCreateMenu(false)} />}
+                
+                <input
+                    type="file"
+                    ref={fileInputRef}
+                    className="hidden"
+                    accept="application/pdf"
+                    onChange={handlePdfUpload}
+                />
+            </>
+        );
+    };
+
     // ═══════════════════════════════════════
     // BLANK CONTRACT EDITOR (full-screen)
     // ═══════════════════════════════════════
@@ -484,6 +580,7 @@ export default function EntityContractsClient({
                     </div>
                 </header>
                 <ContractWysiwygEditor value={blankBody} onChange={setBlankBody} />
+                {renderSharedModals()}
             </div>
         );
     }
@@ -599,6 +696,7 @@ export default function EntityContractsClient({
                 ) : (
                     <ContractWysiwygEditor value={editBody} onChange={setEditBody} />
                 )}
+                {renderSharedModals()}
             </div>
         );
     }
@@ -928,95 +1026,7 @@ export default function EntityContractsClient({
                 </div>
             )}
 
-            {/* ── CONTRACTOR SIGN MODAL ── */}
-            <DocumentSignModal
-                isOpen={!!contractorSignModal}
-                onClose={() => setContractorSignModal(null)}
-                mode="signature"
-                onSign={handleContractorSign}
-            />
-
-            {/* ── COMPANY COUNTERSIGN MODAL ── */}
-            <DocumentSignModal
-                isOpen={!!companyCountersignModal}
-                onClose={() => setCompanyCountersignModal(null)}
-                mode="signature"
-                onSign={handleCompanyCountersign}
-            />
-
-            {/* ── SEND CONTRACT DIALOG (editable CC) ── */}
-            {sendDialog && (
-                <div className="fixed inset-0 bg-black/40 z-[60] flex items-center justify-center p-4" onClick={() => !sendingDialog && setSendDialog(null)}>
-                    <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
-                        <h3 className="text-lg font-bold text-slate-800 mb-1">Send Contract</h3>
-                        <p className="text-sm text-slate-500 mb-4">Review who receives this contract before sending.</p>
-                        <div className="space-y-3">
-                            <div>
-                                <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">To</label>
-                                <input type="text" value={sendDialog.toEmail} readOnly className="hui-input w-full bg-slate-50 text-slate-600" />
-                            </div>
-                            <div>
-                                <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">CC (comma-separated)</label>
-                                <input
-                                    type="text"
-                                    value={sendDialog.cc}
-                                    onChange={e => setSendDialog({ ...sendDialog, cc: e.target.value })}
-                                    placeholder="spouse@example.com, manager@company.com"
-                                    className="hui-input w-full"
-                                />
-                                <p className="text-[11px] text-slate-400 mt-1">Prefilled with the client's additional email and the assigned manager. Edit as needed.</p>
-                            </div>
-                        </div>
-                        <div className="flex gap-3 justify-end mt-6">
-                            <button onClick={() => setSendDialog(null)} disabled={sendingDialog} className="hui-btn hui-btn-secondary">Cancel</button>
-                            <button onClick={confirmSend} disabled={sendingDialog} className="hui-btn hui-btn-primary">{sendingDialog ? "Sending…" : "Send Contract"}</button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* ── CONTRACTOR-FIRST SIGNING PROMPT ── */}
-            {showContractorSignPrompt && pendingSendContractId && (
-                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
-                        <div className="w-12 h-12 mx-auto bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mb-4">
-                            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
-                        </div>
-                        <h3 className="text-lg font-bold text-slate-800 text-center mb-2">Contractor Signature Required</h3>
-                        <p className="text-sm text-slate-500 text-center mb-6">This contract includes a contractor signature block. You must sign as contractor before sending to the client.</p>
-                        <div className="flex flex-col gap-2">
-                            <button
-                                onClick={() => {
-                                    setShowContractorSignPrompt(false);
-                                    const contract = initialContracts.find((c: any) => c.id === pendingSendContractId);
-                                    setPendingSendContractId(null);
-                                    if (contract) setContractorSignModal(contract);
-                                }}
-                                className="w-full px-4 py-2.5 text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg transition"
-                            >
-                                Sign as Contractor Now
-                            </button>
-                            <button
-                                onClick={() => { setShowContractorSignPrompt(false); setPendingSendContractId(null); }}
-                                className="w-full px-4 py-2 text-sm text-slate-400 hover:text-slate-600 transition"
-                            >
-                                Cancel
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Click-away to close create menu */}
-            {showCreateMenu && <div className="fixed inset-0 z-20" onClick={() => setShowCreateMenu(false)} />}
-            
-            <input
-                type="file"
-                ref={fileInputRef}
-                className="hidden"
-                accept="application/pdf"
-                onChange={handlePdfUpload}
-            />
+            {renderSharedModals()}
         </div>
     );
 }
