@@ -1,11 +1,12 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import {
     createContractFromTemplate, createContractBlank, sendContractToClient,
     deleteContract, getContractSigningHistory, updateContract, signContractAsContractor,
     getResolvedMergePreview, getContractSendDefaults, countersignContractAsCompany,
+    createContractFromPdf,
 } from "@/lib/actions";
 import { toast } from "sonner";
 import DOMPurify from "dompurify";
@@ -75,6 +76,8 @@ export default function EntityContractsClient({
     const [editTitle, setEditTitle] = useState("");
     const [editBody, setEditBody] = useState("");
     const [saving, setSaving] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const [isUploadingPdf, setIsUploadingPdf] = useState(false);
 
     // ─── HISTORY ───
     const [historyModal, setHistoryModal] = useState<string | null>(null);
@@ -100,6 +103,69 @@ export default function EntityContractsClient({
     const [isPreview, setIsPreview] = useState(false);
     const [previewHtml, setPreviewHtml] = useState("");
     const [loadingPreview, setLoadingPreview] = useState(false);
+
+    // ─── READ-ONLY SIGNED CONTRACT VIEW BODY ───
+    const parsedReadOnlyBody = useMemo(() => {
+        if (!editingContract) return "";
+        let html = DOMPurify.sanitize(editingContract.body || "", { USE_PROFILES: { html: true } });
+        const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+
+        const dateStr = editingContract.approvedAt
+            ? new Date(editingContract.approvedAt).toLocaleDateString()
+            : "";
+
+        // Client Signature Block
+        html = html.replace(/\{\{SIGNATURE_BLOCK\}\}/g, () => {
+            if (editingContract.signatureUrl) {
+                const safeUrl = escapeHtml(editingContract.signatureUrl);
+                const safeName = escapeHtml(editingContract.approvedBy || "Client");
+                const sigDateHtml = dateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${dateStr}</span>` : "";
+                return `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Client Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client — ${safeName}</span>${sigDateHtml}</span>`;
+            }
+            if (editingContract.approvedBy) {
+                const safeName = escapeHtml(editingContract.approvedBy);
+                const sigDateHtml = dateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${dateStr}</span>` : "";
+                return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:200px;padding-bottom:4px;margin:4px 0;"><span style="font-weight:600;color:#0f172a;">${safeName}</span><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client Signature</span>${sigDateHtml}</span>`;
+            }
+            return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:200px;height:40px;margin:4px 0;padding-bottom:4px;"><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client Signature — Pending</span></span>`;
+        });
+
+        // Client Initial Block
+        html = html.replace(/\{\{INITIAL_BLOCK\}\}/g, () => {
+            const isSigned = editingContract.status === "Signed" || editingContract.status === "Finalized";
+            if (isSigned) {
+                return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:60px;text-align:center;padding-bottom:4px;margin:4px 0;"><span style="font-size:12px;font-weight:600;color:#0f172a;letter-spacing:1px;">Int.</span></span>`;
+            }
+            return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:60px;height:30px;margin:4px 0;padding-bottom:4px;"><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Initials</span></span>`;
+        });
+
+        // Date Block
+        html = html.replace(/\{\{DATE_BLOCK\}\}/g, dateStr ? `<strong>${dateStr}</strong>` : `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:100px;height:20px;"></span>`);
+
+        // Contractor Date Block
+        const contractorDateStr = editingContract.contractorSignedAt
+            ? new Date(editingContract.contractorSignedAt).toLocaleDateString()
+            : "";
+        const contractorDatePattern = /\{\{CONTRACTOR_DATE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_DATE_BLOCK"[^>]*>[^<]*<\/span>/g;
+        html = html.replace(contractorDatePattern, contractorDateStr ? `<strong>${contractorDateStr}</strong>` : "");
+
+        // Contractor Signature Block
+        const contractorBlockPattern = /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"[^>]*>[^<]*<\/span>/g;
+        if (editingContract.contractorSignatureUrl) {
+            const safeUrl = escapeHtml(editingContract.contractorSignatureUrl);
+            const safeName = escapeHtml(editingContract.contractorSignedBy || "Signed");
+            const sigDateHtml = contractorDateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${contractorDateStr}</span>` : "";
+            html = html.replace(contractorBlockPattern,
+                `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Contractor Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor — ${safeName}</span>${sigDateHtml}</span>`
+            );
+        } else {
+            html = html.replace(contractorBlockPattern,
+                `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:200px;height:40px;margin:4px 0;padding-bottom:4px;"><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Contractor Signature — Pending</span></span>`
+            );
+        }
+
+        return html;
+    }, [editingContract]);
 
     // Template helpers
     const filteredTemplates = templates.filter(t =>
@@ -148,10 +214,74 @@ export default function EntityContractsClient({
         finally { setSaving(false); }
     };
 
+    const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        if (file.type !== "application/pdf") {
+            toast.error("Please select a PDF file.");
+            return;
+        }
+
+        setIsUploadingPdf(true);
+        const uploadToast = toast.loading("Uploading contract PDF...");
+        try {
+            const res = await fetch("/api/files/signed-upload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    projectId: entity.type === "project" ? entity.id : undefined,
+                    leadId: entity.type === "lead" ? entity.id : undefined,
+                    visibility: "shared",
+                    files: [{ name: file.name, size: file.size, mimeType: "application/pdf" }],
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.error || "Failed to generate signed upload URL");
+            }
+
+            const upload = data.uploads[0];
+            const uploadRes = await fetch(upload.signedUrl, {
+                method: "PUT",
+                headers: {
+                    "Content-Type": "application/pdf",
+                    "x-upsert": "false",
+                },
+                body: file,
+            });
+
+            if (!uploadRes.ok) {
+                let msg = `Storage upload failed (${uploadRes.status})`;
+                try { const t = await uploadRes.text(); if (t) msg = t; } catch {}
+                throw new Error(msg);
+            }
+
+            // Create the contract in DB referencing the storagePath (upload.storagePath)
+            const titleWithoutExt = file.name.replace(/\.[^/.]+$/, "");
+            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath);
+            
+            const mappedContract = {
+                ...newContract,
+                originalPdfUrl: upload.publicUrl
+            };
+
+            toast.success("PDF contract imported successfully!", { id: uploadToast });
+            openEditor(mappedContract);
+            router.refresh();
+        } catch (err: any) {
+            console.error("PDF upload error:", err);
+            toast.error(err.message || "Failed to upload PDF contract", { id: uploadToast });
+        } finally {
+            setIsUploadingPdf(false);
+            if (fileInputRef.current) fileInputRef.current.value = "";
+        }
+    };
+
     const openEditor = (contract: any) => {
         setEditingContract(contract);
         setEditTitle(contract.title);
-        setEditBody(contract.body);
+        setEditBody(contract.body || "");
         setEditRequiresCountersign(!!contract.requiresCountersign);
     };
 
@@ -159,7 +289,11 @@ export default function EntityContractsClient({
         if (!editingContract) return;
         setSaving(true);
         try {
-            const updated = await updateContract(editingContract.id, { title: editTitle, body: editBody, requiresCountersign: editRequiresCountersign });
+            const updatePayload: any = { title: editTitle, requiresCountersign: editRequiresCountersign };
+            if (!editingContract.originalPdfPath) {
+                updatePayload.body = editBody;
+            }
+            const updated = await updateContract(editingContract.id, updatePayload);
             toast.success("Contract updated!");
             setEditingContract(updated);
             router.refresh();
@@ -236,6 +370,8 @@ export default function EntityContractsClient({
             await countersignContractAsCompany(companyCountersignModal.id, name, dataUrl);
             toast.success("Countersigned — contract fully executed!");
             setCompanyCountersignModal(null);
+            setEditingContract(null);
+            setIsPreview(false);
             router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to countersign"); }
         finally { setSigningAsCompany(false); }
@@ -356,21 +492,26 @@ export default function EntityContractsClient({
     // EXISTING CONTRACT EDITOR (full-screen)
     // ═══════════════════════════════════════
     if (editingContract) {
+        const isReadOnly = ["Signed", "Finalized"].includes(editingContract.status);
         return (
             <div className="fixed inset-0 z-50 font-sans text-slate-900 flex flex-col bg-white">
                 <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shrink-0">
                     <div className="flex items-center gap-3">
-                        <button onClick={() => setEditingContract(null)} className="text-slate-400 hover:text-slate-700 transition p-1">
+                        <button onClick={() => { setEditingContract(null); setIsPreview(false); }} className="text-slate-400 hover:text-slate-700 transition p-1">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                         </button>
                         <div>
-                            <input
-                                type="text"
-                                value={editTitle}
-                                onChange={e => setEditTitle(e.target.value)}
-                                className="text-lg font-bold text-slate-800 bg-transparent border-none outline-none w-96 placeholder:text-slate-300"
-                                placeholder="Contract Title"
-                            />
+                            {isReadOnly ? (
+                                <h2 className="text-lg font-bold text-slate-800 w-96 px-1">{editTitle}</h2>
+                            ) : (
+                                <input
+                                    type="text"
+                                    value={editTitle}
+                                    onChange={e => setEditTitle(e.target.value)}
+                                    className="text-lg font-bold text-slate-800 bg-transparent border-none outline-none w-96 placeholder:text-slate-300"
+                                    placeholder="Contract Title"
+                                />
+                            )}
                             <p className="text-xs text-slate-400">{entity.name} · {entity.clientName}</p>
                         </div>
                     </div>
@@ -378,7 +519,7 @@ export default function EntityContractsClient({
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${STATUS_COLORS[editingContract.status] || STATUS_COLORS.Draft}`}>
                             {editingContract.status}
                         </span>
-                        {!editingContract.recurringDays && (
+                        {!isReadOnly && !editingContract.recurringDays && (
                             <button
                                 type="button"
                                 onClick={() => setEditRequiresCountersign(v => !v)}
@@ -388,21 +529,64 @@ export default function EntityContractsClient({
                                 {editRequiresCountersign ? "✓ Countersign required" : "Countersign off"}
                             </button>
                         )}
-                        <button onClick={handlePreviewToggle} disabled={loadingPreview} className={`px-3 py-1.5 text-sm font-medium rounded-lg transition border ${isPreview ? "bg-amber-50 text-amber-700 border-amber-300" : "text-slate-600 border-slate-200 hover:bg-slate-50"}`}>
-                            {loadingPreview ? "Loading..." : isPreview ? "Back to Editor" : "Preview"}
-                        </button>
-                        {(editingContract.status === "Draft" || editingContract.status === "Sent") && (
+                        {!isReadOnly && !editingContract.originalPdfPath && (
+                            <button onClick={handlePreviewToggle} disabled={loadingPreview} className={`px-3 py-1.5 text-sm font-medium rounded-lg transition border ${isPreview ? "bg-amber-50 text-amber-700 border-amber-300" : "text-slate-600 border-slate-200 hover:bg-slate-50"}`}>
+                                {loadingPreview ? "Loading..." : isPreview ? "Back to Editor" : "Preview"}
+                            </button>
+                        )}
+                        {isReadOnly && editingContract.status === "Signed" && editingContract.requiresCountersign && !editingContract.companySignedBy && (
+                            <button
+                                onClick={() => setCompanyCountersignModal(editingContract)}
+                                className="px-4 py-1.5 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition shadow-sm flex items-center gap-1"
+                                title="Countersign as the company to fully execute this contract"
+                            >
+                                🖋 Countersign as Company
+                            </button>
+                        )}
+                        {isReadOnly && editingContract.executedPdfUrl && (
+                            <a
+                                href={editingContract.executedPdfUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-4 py-1.5 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition shadow-sm flex items-center gap-1"
+                                title="Download fully executed contract PDF"
+                            >
+                                ⬇ Download PDF
+                            </a>
+                        )}
+                        {!isReadOnly && (editingContract.status === "Draft" || editingContract.status === "Sent") && (
                             <button onClick={() => handleSend(editingContract.id)} className="px-4 py-1.5 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition shadow-sm">
                                 {editingContract.status === "Sent" ? "Resend" : "Send"}
                             </button>
                         )}
-                        <button onClick={() => { setEditingContract(null); setIsPreview(false); }} className="px-3 py-1.5 text-sm text-slate-500 hover:text-slate-700 border border-slate-200 rounded-lg transition">Cancel</button>
-                        <button onClick={handleSaveEdit} disabled={saving || isPreview} className="px-4 py-1.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition shadow-sm disabled:opacity-50">
-                            {saving ? "Saving..." : "Save Changes"}
-                        </button>
+                        <button onClick={() => { setEditingContract(null); setIsPreview(false); }} className="px-3 py-1.5 text-sm text-slate-500 hover:text-slate-700 border border-slate-200 rounded-lg transition">{isReadOnly ? "Close" : "Cancel"}</button>
+                        {!isReadOnly && (
+                            <button onClick={handleSaveEdit} disabled={saving || isPreview} className="px-4 py-1.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition shadow-sm disabled:opacity-50">
+                                {saving ? "Saving..." : "Save Changes"}
+                            </button>
+                        )}
                     </div>
                 </header>
-                {isPreview ? (
+                {editingContract.originalPdfPath ? (
+                    <div className="flex-1 bg-slate-100 flex items-center justify-center overflow-hidden relative">
+                        <iframe
+                            src={`${editingContract.executedPdfUrl || editingContract.originalPdfUrl}#toolbar=1&navpanes=0&scrollbar=1`}
+                            className="w-full h-full border-0"
+                            title={editingContract.title}
+                            style={{ minHeight: "100%" }}
+                        />
+                    </div>
+                ) : isReadOnly ? (
+                    <div className="flex-1 overflow-auto bg-slate-50 p-8">
+                        <div className="max-w-[816px] mx-auto bg-white shadow-sm rounded-lg p-12">
+                            <div className="mb-4 flex items-center gap-2 text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                                <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                                <span>This contract has been signed by the client and is read-only.</span>
+                            </div>
+                            <div className={CONTRACT_PROSE_CLASSES} dangerouslySetInnerHTML={{ __html: parsedReadOnlyBody }} />
+                        </div>
+                    </div>
+                ) : isPreview ? (
                     <div className="flex-1 overflow-auto bg-slate-50 p-8">
                         <div className="max-w-[816px] mx-auto bg-white shadow-sm rounded-lg p-12">
                             <div className="mb-4 flex items-center gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
@@ -468,11 +652,12 @@ export default function EntityContractsClient({
                                         From template
                                     </button>
                                     <button
-                                        onClick={() => { setShowCreateMenu(false); toast.info("Import contract coming soon"); }}
+                                        onClick={() => { setShowCreateMenu(false); fileInputRef.current?.click(); }}
                                         className="w-full flex items-center gap-3 px-4 py-3 text-sm text-slate-700 hover:bg-slate-50 transition text-left border-t border-slate-100"
+                                        disabled={isUploadingPdf}
                                     >
                                         <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-                                        Import Contract
+                                        {isUploadingPdf ? "Uploading..." : "Import Contract"}
                                     </button>
                                 </div>
                             )}
@@ -824,6 +1009,14 @@ export default function EntityContractsClient({
 
             {/* Click-away to close create menu */}
             {showCreateMenu && <div className="fixed inset-0 z-20" onClick={() => setShowCreateMenu(false)} />}
+            
+            <input
+                type="file"
+                ref={fileInputRef}
+                className="hidden"
+                accept="application/pdf"
+                onChange={handlePdfUpload}
+            />
         </div>
     );
 }

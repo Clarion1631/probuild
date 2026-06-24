@@ -5100,7 +5100,43 @@ export async function createContractBlank(
     return contract;
 }
 
+export async function createContractFromPdf(
+    context: { type: "project" | "lead"; id: string },
+    title: string,
+    originalPdfPath: string
+) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || !["ADMIN", "MANAGER"].includes(user.role)) throw new Error("Forbidden");
+
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
+
+    const contract = await prisma.contract.create({
+        data: {
+            title,
+            body: "", // Empty HTML body for PDF contracts
+            originalPdfPath,
+            requiresCountersign: coSettings?.requireContractCountersign ?? false,
+            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
+            status: "Draft",
+        }
+    });
+
+    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
+    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
+
+    return contract;
+}
+
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    const existing = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
+    if (existing && ["Signed", "Finalized"].includes(existing.status)) {
+        if (data.title !== undefined || data.body !== undefined) {
+            throw new Error("Cannot edit a contract that has already been signed or finalized");
+        }
+    }
+
     // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
     // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
     const safeData = { ...data };
@@ -5288,21 +5324,24 @@ export async function signContractAsContractor(contractId: string, signerName: s
     const ip = await getRequestIp();
     const signedAt = new Date();
 
-    // Atomic idempotency guard — updateMany only matches rows where contractorSignedAt IS NULL,
-    // so two concurrent requests can't both succeed (eliminates TOCTOU race)
-    const result = await prisma.contract.updateMany({
-        where: { id: contractId, contractorSignedAt: null },
-        data: {
-            contractorSignedBy: signerName,
-            contractorSignedAt: signedAt,
-            contractorSignatureUrl,
-        },
-    });
-    if (result.count === 0) throw new Error("Contract already signed by contractor");
-
-    // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
-    await prisma.contractSigningRecord.create({
-        data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+    // Atomic idempotency guard + audit insert share a transaction so a failed audit insert rolls
+    // the signature write back too — a retry then redoes BOTH (never leaves contractorSignedAt set
+    // with no audit row). updateMany only matches rows where contractorSignedAt IS NULL, so two
+    // concurrent requests can't both succeed (eliminates TOCTOU race).
+    await prisma.$transaction(async (tx) => {
+        const guard = await tx.contract.updateMany({
+            where: { id: contractId, contractorSignedAt: null },
+            data: {
+                contractorSignedBy: signerName,
+                contractorSignedAt: signedAt,
+                contractorSignatureUrl,
+            },
+        });
+        if (guard.count === 0) throw new Error("Contract already signed by contractor");
+        // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
+        await tx.contractSigningRecord.create({
+            data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+        });
     });
 
     revalidatePath(`/projects/[id]/contracts`, "page");
@@ -5553,8 +5592,8 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     const after = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
+            project: { include: { client: true, manager: true } },
+            lead: { include: { client: true, manager: true } },
         },
     });
     if (!after) throw new Error("Contract not found");
@@ -5601,6 +5640,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
             clientSignedBy: after.approvedBy,
             clientSignedAt: after.approvedAt,
             clientIp: after.approvalIp,
+            clientSignatureValue: after.originalPdfPath ? after.signatureUrl : null, // client signature url for PDF contracts
             companySignedBy: after.companySignedBy!,
             companySignedAt: after.companySignedAt!,
             companyIp: ip,
@@ -5628,7 +5668,8 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     try {
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const client = after.project?.client || after.lead?.client;
-        const cc = buildCc(client?.email || "", (client as any)?.additionalEmail);
+        const managerEmail = after.project?.manager?.email || after.lead?.manager?.email || null;
+        const cc = buildCc(client?.email || "", (client as any)?.additionalEmail, managerEmail);
         if (executedBuffer && archivedMeta) {
             await sendExecutedContractEmails({
                 contractTitle: after.title,

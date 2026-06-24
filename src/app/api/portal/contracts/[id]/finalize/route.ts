@@ -5,6 +5,7 @@ import { sendNotification } from "@/lib/email";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { archiveExecutedContractPdf, sendExecutedContractEmails } from "@/lib/contract-finalize";
 import { PDFDocument } from "pdf-lib";
+import { appendContractCountersignaturePage } from "@/lib/pdf";
 
 // Allow larger uploads (50MB) and longer processing times for PDF Generation
 export const maxDuration = 60;
@@ -79,6 +80,121 @@ export async function POST(
             return NextResponse.json({ error: "Contract has not been signed" }, { status: 403 });
         }
 
+        // ─── PDF Contract Flow ───
+        if (contract.originalPdfPath) {
+            if (contract.requiresCountersign) {
+                if (contract.companySignedAt) {
+                    return NextResponse.json({ success: true, awaitingCountersign: true });
+                }
+                if (contract.signedPdfPath) {
+                    return NextResponse.json({ success: true, awaitingCountersign: true });
+                }
+
+                await prisma.contract.update({
+                    where: { id: contract.id },
+                    data: { signedPdfPath: contract.originalPdfPath },
+                });
+
+                try {
+                    const cSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                    const notifyEmail = cSettings?.notificationEmail || cSettings?.email;
+                    if (notifyEmail) {
+                        const cClientName = contract.project?.client?.name || contract.lead?.client?.name || "The client";
+                        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+                        const directUrl = contract.projectId
+                            ? `${appUrl}/projects/${contract.projectId}/contracts`
+                            : `${appUrl}/leads/${contract.leadId}/contracts`;
+                        await sendNotification(
+                            notifyEmail,
+                            `Ready to countersign: ${contract.title}`,
+                            `<p><strong>${cClientName}</strong> has signed "<strong>${contract.title}</strong>". It's ready for your countersignature to finalize.</p><p><a href="${directUrl}">Open ProBuild to countersign</a></p>`,
+                            undefined,
+                            { fromName: "ProBuild Alerts" }
+                        );
+                    }
+                } catch (notifyErr) {
+                    console.error("[finalize] countersign-ready notification failed (non-fatal):", notifyErr);
+                }
+                return NextResponse.json({ success: true, awaitingCountersign: true });
+            }
+
+            let record: any = null;
+            let committed = false;
+            let storagePathUploaded: string | null = null;
+            try {
+                const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
+                if (dlErr || !dl) throw new Error("Could not load original PDF contract");
+                const originalBuffer = Buffer.from(await dl.arrayBuffer());
+
+                const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                const ip = contract.approvalIp || "0.0.0.0";
+                const clientOnlyPdf = await appendContractCountersignaturePage(originalBuffer, {
+                    companyName: settings?.companyName || "Company",
+                    contractTitle: contract.title,
+                    clientSignedBy: contract.approvedBy,
+                    clientSignedAt: contract.approvedAt,
+                    clientIp: ip,
+                    clientSignatureValue: contract.signatureUrl,
+                });
+
+                const archived = await archiveExecutedContractPdf(
+                    { id: contract.id, title: contract.title, projectId: contract.projectId, leadId: contract.leadId },
+                    clientOnlyPdf
+                );
+                record = archived.record;
+                storagePathUploaded = archived.storagePath;
+                
+                await prisma.contract.update({
+                    where: { id: contract.id },
+                    data: { status: "Finalized" },
+                });
+                committed = true;
+
+                const clientEmail = contract.project?.client?.email || contract.lead?.client?.email;
+                const clientAdditionalEmail = contract.project?.client?.additionalEmail || contract.lead?.client?.additionalEmail;
+                const clientName = contract.project?.client?.name || contract.lead?.client?.name || "Client";
+                const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+                const companySettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                const companyEmail = companySettings?.notificationEmail || companySettings?.email;
+                const companyName = companySettings?.companyName || "ProBuild";
+
+                const ccMap = new Map<string, string>();
+                for (const e of [clientAdditionalEmail, managerEmail]) {
+                    const t = e?.trim();
+                    if (t && t.toLowerCase() !== (clientEmail || "").toLowerCase()) ccMap.set(t.toLowerCase(), t);
+                }
+                const ccList = ccMap.size ? [...ccMap.values()] : undefined;
+
+                try {
+                    await sendExecutedContractEmails({
+                        contractTitle: contract.title,
+                        buffer: clientOnlyPdf,
+                        fileName: archived.fileName,
+                        publicUrl: archived.publicUrl,
+                        clientEmail,
+                        clientName,
+                        cc: ccList,
+                        companyName,
+                        companyEmail,
+                        replyTo: companySettings?.email,
+                    });
+                } catch (emailErr) {
+                    console.error("[finalize] executed-doc email failed (non-fatal):", emailErr);
+                }
+
+                return NextResponse.json({ success: true, file: record }, { status: 200 });
+
+            } catch (err: any) {
+                console.error("Finalize PDF Contract Error:", err);
+                if (!committed && storagePathUploaded) {
+                    try {
+                        await supabase.storage.from(STORAGE_BUCKET).remove([storagePathUploaded]);
+                    } catch {}
+                }
+                return NextResponse.json({ error: err.message || "Failed to finalize PDF contract" }, { status: 500 });
+            }
+        }
+
         // ─── Countersign-required branch (plan B.5) ───
         // If this contract needs a company countersignature and the company hasn't signed
         // yet, do NOT finalize. Store the client-signed PDF privately and leave status
@@ -138,10 +254,13 @@ export async function POST(
                 if (notifyEmail) {
                     const cClientName = contract.project?.client?.name || contract.lead?.client?.name || "The client";
                     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+                    const directUrl = contract.projectId
+                        ? `${appUrl}/projects/${contract.projectId}/contracts`
+                        : `${appUrl}/leads/${contract.leadId}/contracts`;
                     await sendNotification(
                         notifyEmail,
                         `Ready to countersign: ${contract.title}`,
-                        `<p><strong>${cClientName}</strong> has signed "<strong>${contract.title}</strong>". It's ready for your countersignature to finalize.</p><p><a href="${appUrl}">Open ProBuild to countersign</a></p>`,
+                        `<p><strong>${cClientName}</strong> has signed "<strong>${contract.title}</strong>". It's ready for your countersignature to finalize.</p><p><a href="${directUrl}">Open ProBuild to countersign</a></p>`,
                         undefined,
                         { fromName: "ProBuild Alerts" }
                     );

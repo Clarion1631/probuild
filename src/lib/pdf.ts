@@ -61,8 +61,9 @@ export async function appendContractCountersignaturePage(
         clientSignedBy?: string | null;
         clientSignedAt?: Date | null;
         clientIp?: string | null;
-        companySignedBy: string;
-        companySignedAt: Date;
+        clientSignatureValue?: string | null; // data-URL or Storage URL
+        companySignedBy?: string | null;
+        companySignedAt?: Date | null;
         companyIp?: string | null;
         companySignatureValue?: string | null; // data-URL or Storage URL
     }
@@ -103,9 +104,13 @@ export async function appendContractCountersignaturePage(
         y -= 22;
     };
 
-    drawParty('CLIENT', opts.clientSignedBy || '', opts.clientSignedAt, opts.clientIp, null);
-    const companyImg = opts.companySignatureValue ? await embedSignatureImage(doc, opts.companySignatureValue) : null;
-    drawParty(`COMPANY — ${opts.companyName}`, opts.companySignedBy, opts.companySignedAt, opts.companyIp, companyImg);
+    const clientImg = opts.clientSignatureValue ? await embedSignatureImage(doc, opts.clientSignatureValue) : null;
+    drawParty('CLIENT', opts.clientSignedBy || '', opts.clientSignedAt, opts.clientIp, clientImg);
+    
+    if (opts.companySignedBy) {
+        const companyImg = opts.companySignatureValue ? await embedSignatureImage(doc, opts.companySignatureValue) : null;
+        drawParty(`COMPANY — ${opts.companyName}`, opts.companySignedBy, opts.companySignedAt, opts.companyIp, companyImg);
+    }
 
     page.drawText(
         'This certificate records the electronic signatures applied to this document under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA.',

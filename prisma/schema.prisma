@@ -644,6 +644,7 @@ model Contract {
   companySignedAt     DateTime?
   companySignatureUrl String? // Supabase Storage URL of the company signature (NOT an inline data-URL)
   signedPdfPath       String? // Supabase Storage path of the client-signed intermediate PDF (held until countersign)
+  originalPdfPath     String? // Supabase Storage path of the uploaded original PDF contract
 
   // Sending
   sentAt   DateTime?
