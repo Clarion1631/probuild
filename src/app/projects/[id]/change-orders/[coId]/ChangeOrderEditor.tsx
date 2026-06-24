@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, approveChangeOrder, sendChangeOrderToClient } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -30,12 +30,14 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         if (!signName.trim()) { toast.error("Please enter a name to sign"); return; }
         setIsSigning(true);
         try {
-            await approveChangeOrder(initialData.id, signName.trim(), "", navigator.userAgent);
-            toast.success("Change order signed");
+            // Company countersignature — writes only the company fields and never
+            // touches the customer's approval (see countersignChangeOrderAsCompany).
+            await countersignChangeOrderAsCompany(initialData.id, signName.trim());
+            toast.success("Change order countersigned");
             setShowSignModal(false);
             router.refresh();
-        } catch {
-            toast.error("Failed to sign change order");
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to countersign change order");
         } finally {
             setIsSigning(false);
         }
@@ -380,9 +382,21 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
 
                                 <div className="border border-slate-200 rounded-lg p-6 bg-slate-50/50">
                                     <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">Company Signature</h4>
-                                    {initialData.companySignatureUrl ? (
-                                        <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
-                                            <img src={initialData.companySignatureUrl} alt="Signature" className="max-h-16 opacity-80" />
+                                    {initialData.companySignedBy ? (
+                                        <div className="space-y-4">
+                                            <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
+                                                {initialData.companySignatureUrl ? (
+                                                    <img src={initialData.companySignatureUrl} alt="Signature" className="max-h-16 opacity-80" />
+                                                ) : (
+                                                    <span className="font-editorial text-2xl italic text-slate-800">{initialData.companySignedBy}</span>
+                                                )}
+                                            </div>
+                                            <div className="text-sm text-slate-600">
+                                                <p><strong>Signed By:</strong> {initialData.companySignedBy}</p>
+                                                {initialData.companySignedAt && (
+                                                    <p><strong>Signed At:</strong> {new Date(initialData.companySignedAt).toLocaleString()}</p>
+                                                )}
+                                            </div>
                                         </div>
                                     ) : (
                                         <div className="bg-white border border-slate-200 rounded p-8 text-center flex flex-col items-center justify-center gap-3">

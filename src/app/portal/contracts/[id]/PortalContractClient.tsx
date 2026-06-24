@@ -23,8 +23,15 @@ export default function PortalContractClient({
 }) {
     const isSigned =
         initialContract.status === "Signed" ||
-        initialContract.status === "Approved" ||
         initialContract.status === "Finalized";
+    // Client has signed but the company still needs to countersign before the contract is
+    // fully executed (plan B). The signing form stays hidden, but we show an "awaiting
+    // countersignature" message rather than "Executed", and there's no executed PDF yet.
+    const awaitingCountersign =
+        !!initialContract.requiresCountersign &&
+        initialContract.status === "Signed" &&
+        !initialContract.companySignedAt;
+    const isExecuted = isSigned && !awaitingCountersign;
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
@@ -48,6 +55,7 @@ export default function PortalContractClient({
     const [error, setError] = useState("");
     const [isSuccess, setIsSuccess] = useState(false);
     const [pdfDownloadUrl, setPdfDownloadUrl] = useState<string | null>(null);
+    const [awaitingCountersignResult, setAwaitingCountersignResult] = useState(false);
 
     // Detect View. Pass the accessToken through so the server-side ownership
     // check accepts the magic-link path (no portal session required).
@@ -94,7 +102,7 @@ export default function PortalContractClient({
         // contractorSignedBy is HTML-escaped before injection to prevent XSS (injected after DOMPurify runs)
         const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
         const contractorBlockPattern = /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"[^>]*>[^<]*<\/span>/g;
-        if (initialContract.contractorSignatureUrl && /^data:image\/(png|jpeg|webp);base64,/.test(initialContract.contractorSignatureUrl)) {
+        if (initialContract.contractorSignatureUrl && /^(data:image\/(png|jpeg|webp);base64,|https?:\/\/)/.test(initialContract.contractorSignatureUrl)) {
             const safeUrl = escapeHtml(initialContract.contractorSignatureUrl);
             const safeName = escapeHtml(initialContract.contractorSignedBy || "Signed");
             const sigDateHtml = contractorDateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${contractorDateStr}</span>` : "";
@@ -300,10 +308,36 @@ export default function PortalContractClient({
                 replaceBlocksForCapture(".init-block", initials, "32px", "Initials");
             }
 
+            // Remote signature images (e.g. a Storage-hosted contractor signature) must be
+            // inlined as data-URLs before capture: html-to-image can drop cross-origin
+            // <img> during clone+serialize, or taint the canvas. We FETCH each remote src
+            // and swap in a data-URL, then restore the original src in finally. The client's
+            // own just-drawn blocks already carry in-memory data-URLs, so they're skipped.
+            const inlinedImgs: { el: HTMLImageElement; src: string }[] = [];
             try {
                 element.style.boxShadow = "none";
                 element.style.border = "none";
                 element.style.overflow = "visible";
+
+                const remoteImgEls = (Array.from(element.querySelectorAll("img")) as HTMLImageElement[])
+                    .filter((img) => /^https?:\/\//i.test(img.src));
+                await Promise.all(remoteImgEls.map(async (img) => {
+                    try {
+                        const res = await fetch(img.src, { cache: "force-cache" });
+                        if (!res.ok) return;
+                        const blob = await res.blob();
+                        const dataUrl = await new Promise<string>((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(reader.result as string);
+                            reader.onerror = () => reject(reader.error);
+                            reader.readAsDataURL(blob);
+                        });
+                        inlinedImgs.push({ el: img, src: img.src });
+                        img.src = dataUrl;
+                    } catch {
+                        // Leave the original src; html-to-image will still attempt a CORS fetch.
+                    }
+                }));
 
                 const pdf = await buildPdf(element, {
                     bannerText: `${companyName}  •  ${initialContract.title}  (continued)`,
@@ -313,6 +347,9 @@ export default function PortalContractClient({
                 element.style.boxShadow = prevShadow;
                 element.style.border = prevBorder;
                 element.style.overflow = prevOverflow;
+
+                // Restore inlined remote image sources
+                inlinedImgs.forEach(({ el, src }) => { el.src = src; });
 
                 // Restore original button HTML after capture
                 savedBlockHtml.forEach(({ html }, el) => {
@@ -351,6 +388,7 @@ export default function PortalContractClient({
                     throw new Error(`Failed to upload PDF: ${errText}`);
                 }
                 const result = await response.json();
+                if (result?.awaitingCountersign) setAwaitingCountersignResult(true);
                 if (result?.file?.url) setPdfDownloadUrl(result.file.url);
             }
 
@@ -368,27 +406,43 @@ export default function PortalContractClient({
         return (
             <div className="min-h-screen bg-slate-100 font-sans flex items-center justify-center p-4">
                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-10 max-w-md text-center">
-                    <div className="w-16 h-16 mx-auto bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-6">
-                        <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                        </svg>
-                    </div>
-                    <h2 className="text-2xl font-bold text-slate-800 mb-2">Document Executed</h2>
-                    <p className="text-slate-500 mb-6 leading-relaxed">
-                        Thank you! Your signed document has been finalized. A copy has been emailed to you for your records.
-                    </p>
-                    {pdfDownloadUrl && (
-                        <a
-                            href={pdfDownloadUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-2 px-6 py-3 bg-slate-800 hover:bg-slate-900 text-white text-sm font-semibold rounded-lg transition shadow-sm mb-6"
-                        >
-                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V4" />
-                            </svg>
-                            Download Executed PDF
-                        </a>
+                    {awaitingCountersignResult ? (
+                        <>
+                            <div className="w-16 h-16 mx-auto bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mb-6">
+                                <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                </svg>
+                            </div>
+                            <h2 className="text-2xl font-bold text-slate-800 mb-2">You&apos;re Signed</h2>
+                            <p className="text-slate-500 mb-6 leading-relaxed">
+                                Thank you! {companyName} will countersign to finalize this contract. We&apos;ll email you the fully executed copy — it will also appear in your portal.
+                            </p>
+                        </>
+                    ) : (
+                        <>
+                            <div className="w-16 h-16 mx-auto bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-6">
+                                <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                </svg>
+                            </div>
+                            <h2 className="text-2xl font-bold text-slate-800 mb-2">Document Executed</h2>
+                            <p className="text-slate-500 mb-6 leading-relaxed">
+                                Thank you! Your signed document has been finalized. A copy has been emailed to you for your records.
+                            </p>
+                            {pdfDownloadUrl && (
+                                <a
+                                    href={pdfDownloadUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-2 px-6 py-3 bg-slate-800 hover:bg-slate-900 text-white text-sm font-semibold rounded-lg transition shadow-sm mb-6"
+                                >
+                                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V4" />
+                                    </svg>
+                                    Download Executed PDF
+                                </a>
+                            )}
+                        </>
                     )}
                     <p className="text-sm font-medium text-slate-400">
                         You may now close this window.
@@ -416,8 +470,11 @@ export default function PortalContractClient({
                     </div>
                 </div>
                 <div className="flex items-center gap-3">
-                    {isSigned && (
+                    {isExecuted && (
                         <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Executed</span>
+                    )}
+                    {awaitingCountersign && (
+                        <span className="px-3 py-1 bg-amber-50 text-amber-700 rounded-full text-xs font-semibold border border-amber-200">Awaiting countersignature</span>
                     )}
                     <a
                         href="/portal"
@@ -428,8 +485,18 @@ export default function PortalContractClient({
                 </div>
             </header>
 
+            {/* Awaiting company countersignature — the client has signed, the company hasn't yet. */}
+            {awaitingCountersign && (
+                <div className="max-w-4xl mx-auto mt-6 px-4 print:hidden">
+                    <div className="bg-amber-50 border border-amber-200 rounded-xl p-5 shadow-sm">
+                        <h3 className="text-sm font-semibold text-amber-900">You&apos;ve signed — awaiting {companyName}&apos;s signature</h3>
+                        <p className="text-xs text-amber-700 mt-1">Thanks! {companyName} will countersign to finalize this contract. You&apos;ll receive the fully executed copy by email, and it will appear here too.</p>
+                    </div>
+                </div>
+            )}
+
             {/* Executed PDF Download Banner — shown once the document has been signed & archived */}
-            {isSigned && archivedPdfUrl && (
+            {isExecuted && archivedPdfUrl && (
                 <div className="max-w-4xl mx-auto mt-6 px-4 print:hidden">
                     <div className="bg-white border border-green-200 rounded-xl p-5 flex items-center justify-between shadow-sm">
                         <div>
@@ -465,10 +532,14 @@ export default function PortalContractClient({
                                     <p className="text-slate-500">Date: <span className="text-slate-700">{initialContract.sentAt ? new Date(initialContract.sentAt).toLocaleDateString() : new Date(initialContract.createdAt).toLocaleDateString()}</span></p>
                                 </div>
                                 <div className="mt-3">
-                                    {isSigned ? (
+                                    {isExecuted ? (
                                         <span className="inline-flex items-center gap-1 px-3 py-1 rounded-md text-xs font-bold bg-green-50 text-green-700 border border-green-200 uppercase tracking-wider">
                                             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
                                             Executed
+                                        </span>
+                                    ) : awaitingCountersign ? (
+                                        <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
+                                            Awaiting Countersignature
                                         </span>
                                     ) : (
                                         <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
@@ -488,7 +559,7 @@ export default function PortalContractClient({
                                     <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
                                 </div>
                                 <div>
-                                    <h3 className="text-sm font-semibold text-green-800">Document Executed — Electronically Signed</h3>
+                                    <h3 className="text-sm font-semibold text-green-800">{awaitingCountersign ? "You've Signed — Awaiting Company Countersignature" : "Document Executed — Electronically Signed"}</h3>
                                     <p className="text-sm text-green-700 mt-0.5">Primary Signer: <strong>{initialContract.approvedBy}</strong></p>
                                     <p className="text-xs text-green-600 mt-0.5">{new Date(initialContract.approvedAt).toLocaleString()}</p>
                                 </div>

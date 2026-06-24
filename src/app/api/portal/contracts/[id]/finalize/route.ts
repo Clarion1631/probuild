@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { sendNotification } from "@/lib/email";
 import { resolveSessionClientId } from "@/lib/portal-auth";
+import { archiveExecutedContractPdf, sendExecutedContractEmails } from "@/lib/contract-finalize";
+import { PDFDocument } from "pdf-lib";
 
 // Allow larger uploads (50MB) and longer processing times for PDF Generation
 export const maxDuration = 60;
@@ -48,8 +50,8 @@ export async function POST(
                 OR: ownershipClauses,
             },
             include: {
-                project: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
-                lead: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } } } }
+                project: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+                lead: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } }, manager: { select: { email: true } } } }
             }
         });
 
@@ -75,6 +77,79 @@ export async function POST(
                 }
             }
             return NextResponse.json({ error: "Contract has not been signed" }, { status: 403 });
+        }
+
+        // ─── Countersign-required branch (plan B.5) ───
+        // If this contract needs a company countersignature and the company hasn't signed
+        // yet, do NOT finalize. Store the client-signed PDF privately and leave status
+        // "Signed" so countersignContractAsCompany can later append the company signature and
+        // produce the executed copy. The customer sees an "awaiting countersignature" state.
+        if (contract.requiresCountersign) {
+            // The company has already countersigned (or countersign is mid-flight). Producing the
+            // executed PDF is countersignContractAsCompany's job — NEVER fall through to the normal
+            // archive below, which would finalize a client-only copy missing the company signature.
+            if (contract.companySignedAt) {
+                return NextResponse.json({ success: true, awaitingCountersign: true });
+            }
+            let cFormData;
+            try { cFormData = await req.formData(); }
+            catch { return NextResponse.json({ error: "Invalid form data" }, { status: 400 }); }
+            const cPdf = cFormData.get("pdf") as File | null;
+            if (!cPdf) return NextResponse.json({ error: "No PDF file attached" }, { status: 400 });
+            const cBuffer = Buffer.from(await cPdf.arrayBuffer());
+
+            // Validate the PDF is loadable NOW, so the later countersign step (which appends a page
+            // via pdf-lib) can never be permanently blocked by a corrupt stored intermediate.
+            try { await PDFDocument.load(cBuffer); }
+            catch { return NextResponse.json({ error: "The signed PDF could not be read. Please try again." }, { status: 400 }); }
+
+            const cPrefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
+            const intermediatePath = `${cPrefix}/intermediate/${Date.now()}_Signed_Contract_${contract.id}.pdf`;
+            const { error: cUpErr } = await supabase.storage
+                .from(STORAGE_BUCKET)
+                .upload(intermediatePath, cBuffer, { contentType: "application/pdf", upsert: false });
+            if (cUpErr) {
+                return NextResponse.json({ error: `Storage upload failed: ${cUpErr.message}` }, { status: 500 });
+            }
+
+            // Atomically claim the slot — only the first POST (signedPdfPath still null) wins.
+            // A concurrent double-submit loses here: it removes its just-uploaded object and skips
+            // the company notification, so we never orphan storage or double-notify.
+            let claim;
+            try {
+                claim = await prisma.contract.updateMany({
+                    where: { id: contract.id, signedPdfPath: null },
+                    data: { signedPdfPath: intermediatePath },
+                });
+            } catch (claimErr) {
+                // DB threw between upload and claim — remove the orphaned upload before bubbling up.
+                try { await supabase.storage.from(STORAGE_BUCKET).remove([intermediatePath]); } catch {}
+                throw claimErr;
+            }
+            if (claim.count === 0) {
+                try { await supabase.storage.from(STORAGE_BUCKET).remove([intermediatePath]); } catch {}
+                return NextResponse.json({ success: true, awaitingCountersign: true });
+            }
+
+            // Nudge the company that a contract is ready to countersign (best-effort).
+            try {
+                const cSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                const notifyEmail = cSettings?.notificationEmail || cSettings?.email;
+                if (notifyEmail) {
+                    const cClientName = contract.project?.client?.name || contract.lead?.client?.name || "The client";
+                    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+                    await sendNotification(
+                        notifyEmail,
+                        `Ready to countersign: ${contract.title}`,
+                        `<p><strong>${cClientName}</strong> has signed "<strong>${contract.title}</strong>". It's ready for your countersignature to finalize.</p><p><a href="${appUrl}">Open ProBuild to countersign</a></p>`,
+                        undefined,
+                        { fromName: "ProBuild Alerts" }
+                    );
+                }
+            } catch (notifyErr) {
+                console.error("[finalize] countersign-ready notification failed (non-fatal):", notifyErr);
+            }
+            return NextResponse.json({ success: true, awaitingCountersign: true });
         }
 
         // ─── Atomic Signed → Finalized transition (Codex peer review blocker #2) ───
@@ -138,46 +213,16 @@ export async function POST(
             const bytes = await pdfBlob.arrayBuffer();
             buffer = Buffer.from(bytes);
 
-            // Upload to Supabase Bucket.
-            // Filename embeds the contractId so lookups can unambiguously map a PDF back
-            // to its contract even when titles collide. `getExecutedContractPdf` matches
-            // on exact-equality with `Executed_Contract_{id}.pdf`.
-            const prefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
-            const storagePath = `${prefix}/${Date.now()}_${safeName}`;
-
-            const { error: uploadError } = await supabase.storage
-                .from(STORAGE_BUCKET)
-                .upload(storagePath, buffer, {
-                    contentType: "application/pdf",
-                    upsert: false,
-                });
-
-            if (uploadError) {
-                console.error("Supabase upload error:", uploadError);
-                throw new Error(`Storage upload failed: ${uploadError.message}`);
-            }
-            storagePathUploaded = storagePath;
-
-            // Generate public URL
-            const { data: urlData } = supabase.storage
-                .from(STORAGE_BUCKET)
-                .getPublicUrl(storagePath);
-
-            publicUrl = urlData?.publicUrl || storagePath;
-
-            // Archive as a Project File in the database. Status is ALREADY Finalized
-            // from the conditional transition above — do not update it again here.
-            record = await prisma.projectFile.create({
-                data: {
-                    name: safeName,
-                    url: publicUrl,
-                    size: buffer.length,
-                    mimeType: "application/pdf",
-                    visibility: "shared",
-                    ...(contract.projectId && { projectId: contract.projectId }),
-                    ...(contract.leadId && { leadId: contract.leadId }),
-                }
-            });
+            // Archive the executed PDF (upload + shared ProjectFile) via the shared helper —
+            // the same code path countersignContractAsCompany uses, so there is one writer.
+            const archived = await archiveExecutedContractPdf(
+                { id: contract.id, title: contract.title, projectId: contract.projectId, leadId: contract.leadId },
+                buffer
+            );
+            record = archived.record;
+            publicUrl = archived.publicUrl;
+            storagePathUploaded = archived.storagePath;
+            safeName = archived.fileName;
             committed = true;
         } catch (pipelineErr: any) {
             console.error("Finalize pipeline error:", pipelineErr);
@@ -206,61 +251,41 @@ export async function POST(
             return NextResponse.json({ error: `Failed to finalize contract: ${msg}` }, { status: 500 });
         }
 
-        // Resolve client/company details for email
+        // Resolve client/company details for the executed-doc emails.
         const clientEmail = contract.project?.client?.email || contract.lead?.client?.email;
         const clientAdditionalEmail = contract.project?.client?.additionalEmail || contract.lead?.client?.additionalEmail;
         const clientName = contract.project?.client?.name || contract.lead?.client?.name || "Client";
-        const ccList = clientAdditionalEmail ? [clientAdditionalEmail] : undefined;
+        const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
         const companySettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyEmail = companySettings?.notificationEmail || companySettings?.email;
         const companyName = companySettings?.companyName || "ProBuild";
 
-        const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-        const emailHtml = [
-            '<!DOCTYPE html><html><head><meta charset="utf-8"></head>',
-            '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#333;">',
-            `<div style="text-align:center;margin-bottom:24px;"><h1 style="font-size:20px;font-weight:700;margin:0;">${esc(companyName)}</h1></div>`,
-            '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;">',
-            `<h2 style="font-size:18px;margin:0 0 8px;color:#16a34a;">&#10003; Document Executed</h2>`,
-            `<p style="color:#666;margin:0 0 16px;">Hi ${esc(clientName)},</p>`,
-            `<p style="color:#666;margin:0 0 16px;line-height:1.5;">Thank you! <strong>${esc(contract.title)}</strong> has been signed and finalized. A PDF copy is attached and archived for your records.</p>`,
-            `<div style="text-align:center;margin:0 0 16px;"><a href="${encodeURI(publicUrl)}" target="_blank" style="display:inline-block;background:#222;color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-weight:600;font-size:15px;">Download PDF</a></div>`,
-            '</div></body></html>',
-        ].join('');
-
-        // Send Email to Client
-        if (clientEmail) {
-            await sendNotification(
-                clientEmail,
-                `Document Executed: ${contract.title}`,
-                emailHtml,
-                [{
-                    filename: safeName,
-                    content: buffer
-                }],
-                {
-                    fromName: companyName,
-                    replyTo: companyEmail || undefined,
-                    cc: ccList,
-                    copyToInternal: true,
-                }
-            );
+        // CC the durable stakeholders (client's additional email + assigned manager), deduped
+        // against the primary recipient.
+        const ccMap = new Map<string, string>();
+        for (const e of [clientAdditionalEmail, managerEmail]) {
+            const t = e?.trim();
+            if (t && t.toLowerCase() !== (clientEmail || "").toLowerCase()) ccMap.set(t.toLowerCase(), t);
         }
+        const ccList = ccMap.size ? [...ccMap.values()] : undefined;
 
-        // Send Email to Company
-        if (companyEmail) {
-            await sendNotification(
+        // Best-effort — the contract is already finalized + archived; an email hiccup must not
+        // turn that into a 500 (the retry path would skip resending against a Finalized contract).
+        try {
+            await sendExecutedContractEmails({
+                contractTitle: contract.title,
+                buffer,
+                fileName: safeName,
+                publicUrl,
+                clientEmail,
+                clientName,
+                cc: ccList,
+                companyName,
                 companyEmail,
-                `Client Signed Document: ${contract.title}`,
-                emailHtml,
-                [{
-                    filename: safeName,
-                    content: buffer
-                }],
-                {
-                    fromName: "ProBuild Alerts",
-                }
-            );
+                replyTo: companySettings?.email,
+            });
+        } catch (emailErr) {
+            console.error("[finalize] executed-doc email failed (non-fatal):", emailErr);
         }
 
         return NextResponse.json({ success: true, file: record }, { status: 200 });

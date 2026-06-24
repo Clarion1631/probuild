@@ -10,11 +10,16 @@ import { safeEstimateSelect, toNum } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
+import { headers } from "next/headers";
+import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
+import { appendContractCountersignaturePage } from "./pdf";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -28,12 +33,33 @@ function isNotificationEnabled(settings: { notificationToggles?: string | null }
     }
 }
 
-// Build a CC array for a secondary client email (spouse/partner).
-// Returns undefined when additionalEmail is absent, empty, or identical to the primary (case-insensitive).
-function buildCc(primaryEmail: string, additionalEmail?: string | null): string[] | undefined {
-    if (!additionalEmail) return undefined;
-    if (additionalEmail.toLowerCase() === primaryEmail.toLowerCase()) return undefined;
-    return [additionalEmail];
+// Build a CC array from any number of candidate addresses (spouse/partner, lead manager,
+// send-time extras). Drops blanks, the primary recipient, and case-insensitive duplicates.
+// Returns undefined when nothing is left to CC.
+function buildCc(primaryEmail: string, ...candidates: (string | null | undefined)[]): string[] | undefined {
+    const primary = (primaryEmail || "").trim().toLowerCase();
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of candidates) {
+        const e = c?.trim();
+        if (!e) continue;
+        const key = e.toLowerCase();
+        if (key === primary || seen.has(key)) continue;
+        seen.add(key);
+        out.push(e);
+    }
+    return out.length ? out : undefined;
+}
+
+// Best-effort client IP for the e-signature audit trail. Server actions can read request
+// headers via next/headers; behind Vercel the client IP is the first x-forwarded-for hop.
+async function getRequestIp(): Promise<string | null> {
+    try {
+        const h = await headers();
+        return h.get("x-forwarded-for")?.split(",")[0]?.trim() || h.get("x-real-ip") || null;
+    } catch {
+        return null;
+    }
 }
 
 // Safe estimate include that omits columns not yet migrated to the database.
@@ -4769,6 +4795,17 @@ function bodyHasContractorBlock(body: string): boolean {
     return /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|data-merge-field=["']CONTRACTOR_SIGNATURE_BLOCK["']/i.test(body || "");
 }
 
+// Save-time guard for the author↔portal signing-field handshake.
+// The portal and PDF rendering locate signing blocks by grepping for the raw {{KEY}} form.
+// If an un-normalized TipTap <span data-merge-field="KEY">…</span> ever reaches the saved
+// body (editor bug, pasted content, template drift), the portal would find nothing and the
+// signature fields would silently vanish for the customer. Normalizing any remaining
+// merge-field spans back to {{KEY}} on save closes that failure class. (Data merge fields are
+// already resolved to values before this runs; only unresolved/signing keys remain as spans.)
+function normalizeContractBody(body: string): string {
+    return (body || "").replace(/<span[^>]*data-merge-field=["'](\w+)["'][^>]*>[\s\S]*?<\/span>/g, "{{$1}}");
+}
+
 function escapeEmailHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -5011,12 +5048,16 @@ export async function createContractFromTemplate(
         context.type === "lead" ? context.id : null
     );
 
-    const resolvedBody = resolveMergeFields(template.body, mergeData);
+    const resolvedBody = normalizeContractBody(resolveMergeFields(template.body, mergeData));
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
 
     const contract = await prisma.contract.create({
         data: {
             title: titleOverride || template.name,
             body: resolvedBody,
+            // Recurring docs (e.g. lien releases) cycle status back to "Sent" each period and never
+            // reach a stable "Signed" state, so they can't support countersign — force it off.
+            requiresCountersign: (recurringDays && recurringDays > 0) ? false : (coSettings?.requireContractCountersign ?? false),
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
             ...(recurringDays && recurringDays > 0 ? {
                 recurringDays,
@@ -5041,12 +5082,14 @@ export async function createContractBlank(
         context.type === "lead" ? context.id : null
     );
 
-    const resolvedBody = resolveMergeFields(body, mergeData);
+    const resolvedBody = normalizeContractBody(resolveMergeFields(body, mergeData));
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
 
     const contract = await prisma.contract.create({
         data: {
             title,
             body: resolvedBody,
+            requiresCountersign: coSettings?.requireContractCountersign ?? false,
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
         }
     });
@@ -5057,8 +5100,12 @@ export async function createContractBlank(
     return contract;
 }
 
-export async function updateContract(id: string, data: { title?: string; body?: string; status?: string }) {
-    const contract = await prisma.contract.update({ where: { id }, data });
+export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
+    // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
+    const safeData = { ...data };
+    if (typeof safeData.body === "string") safeData.body = normalizeContractBody(safeData.body);
+    const contract = await prisma.contract.update({ where: { id }, data: safeData });
     revalidatePath(`/`);
     return contract;
 }
@@ -5070,12 +5117,12 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
+            project: { include: { client: true, manager: { select: { email: true } } } },
+            lead: { include: { client: true, manager: { select: { email: true } } } },
         }
     });
 
@@ -5145,7 +5192,12 @@ export async function sendContractToClient(contractId: string) {
     const logoHtml = companyLogo ? `<img src="${encodeURI(companyLogo)}" alt="${safeCompany}" style="max-height:56px;width:auto;margin:0 auto 8px;display:block;" />` : "";
     const licenseHtml = safeLicense ? `<p style="font-size:12px;color:#64748b;margin:4px 0 0;">Lic# ${safeLicense}</p>` : "";
 
-    const contractCc = buildCc(client.email, (client as any).additionalEmail);
+    // CC: an explicit send-time override if the user edited it, otherwise the durable
+    // auto-set — the client's additional email (spouse) + the assigned lead/project manager.
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const contractCc = ccOverride !== undefined
+        ? buildCc(client.email, ...ccOverride)
+        : buildCc(client.email, (client as any).additionalEmail, managerEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a contract to review`,
@@ -5189,6 +5241,29 @@ export async function sendContractToClient(contractId: string) {
     return { success: true, sentTo: client.email, clientName: client.name };
 }
 
+// Prefill for the "Send contract" dialog: the primary recipient + the default CC set
+// (additional client email + assigned manager) that the user can edit before sending.
+export async function getContractSendDefaults(contractId: string): Promise<{ toEmail: string | null; autoCc: string[] }> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER", "FINANCE"].includes(caller.role)) throw new Error("Forbidden");
+
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: { select: { email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+            lead: { include: { client: { select: { email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+        },
+    });
+    if (!contract) throw new Error("Contract not found");
+    const client = contract.project?.client || contract.lead?.client;
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const autoCc = buildCc(client?.email || "", client?.additionalEmail, managerEmail) || [];
+    return { toEmail: client?.email || null, autoCc };
+}
+
 export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -5206,17 +5281,29 @@ export async function signContractAsContractor(contractId: string, signerName: s
     const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { id: true } });
     if (!existing) throw new Error("Contract not found");
 
+    // Move the signature image out of the DB column into Supabase Storage (avoids the
+    // PgBouncer pooler message-size error on large high-DPI data-URLs). Falls back to the
+    // raw data-URL when Storage isn't configured. See persistSignature().
+    const contractorSignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    const ip = await getRequestIp();
+    const signedAt = new Date();
+
     // Atomic idempotency guard — updateMany only matches rows where contractorSignedAt IS NULL,
     // so two concurrent requests can't both succeed (eliminates TOCTOU race)
     const result = await prisma.contract.updateMany({
         where: { id: contractId, contractorSignedAt: null },
         data: {
             contractorSignedBy: signerName,
-            contractorSignedAt: new Date(),
-            contractorSignatureUrl: signatureDataUrl,
+            contractorSignedAt: signedAt,
+            contractorSignatureUrl,
         },
     });
     if (result.count === 0) throw new Error("Contract already signed by contractor");
+
+    // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
+    await prisma.contractSigningRecord.create({
+        data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+    });
 
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
@@ -5278,6 +5365,12 @@ export async function approveContract(contractId: string, signatureName: string,
         ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
         : contract.sentAt || contract.createdAt;
 
+    // Persist the signature image to Storage BEFORE the transaction so the network upload
+    // stays out of the DB tx. The same URL is written to both the Contract and the
+    // ContractSigningRecord audit row. Falls back to the data-URL when Storage is absent.
+    const signatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const ip = await getRequestIp();
+
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
             const transition = await tx.contract.updateMany({
@@ -5290,7 +5383,8 @@ export async function approveContract(contractId: string, signatureName: string,
                     approvedBy: signatureName,
                     approvedAt: now,
                     approvalUserAgent: userAgent,
-                    signatureUrl: signatureDataUrl || null,
+                    approvalIp: ip,
+                    signatureUrl,
                 },
             });
             if (transition.count === 0) {
@@ -5308,7 +5402,8 @@ export async function approveContract(contractId: string, signatureName: string,
                     approvedBy: signatureName,
                     approvedAt: now,
                     approvalUserAgent: userAgent,
-                    signatureUrl: signatureDataUrl || null,
+                    approvalIp: ip,
+                    signatureUrl,
                     status: "Sent", // Reset to Sent so it can be signed again next cycle
                     viewedAt: null,
                     nextDueDate: nextDue,
@@ -5323,8 +5418,9 @@ export async function approveContract(contractId: string, signatureName: string,
                 contractId,
                 signedBy: signatureName,
                 signedAt: now,
-                signatureUrl: signatureDataUrl || null,
+                signatureUrl,
                 userAgent,
+                ipAddress: ip,
                 periodStart,
                 periodEnd: now,
             }
@@ -5386,6 +5482,198 @@ export async function getContractSigningHistory(contractId: string) {
         where: { contractId },
         orderBy: { signedAt: "desc" },
     });
+}
+
+/**
+ * Company countersignature — executed AFTER the client signs (see plan B).
+ *
+ * Flow when contract.requiresCountersign is true:
+ *   client signs (approveContract → "Signed") → the finalize route stores the client-signed
+ *   PDF privately on contract.signedPdfPath (status stays "Signed") → an ADMIN/MANAGER calls
+ *   this action → we record the company signature, load the intermediate PDF, append a
+ *   "Certificate of Execution" page carrying both signatures, archive it as the shared
+ *   executed PDF, flip the contract to "Finalized", and email both parties.
+ *
+ * Idempotent + atomic: the company-signature write and the Signed→Finalized claim are each
+ * guarded updateMany's, and the archive step rolls the status back on failure so a retry is safe.
+ */
+export async function countersignContractAsCompany(contractId: string, signerName: string, signatureDataUrl?: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    if (!signerName?.trim()) throw new Error("Signer name is required");
+    // pdf-lib can only embed PNG/JPEG on the certificate page, so restrict to those.
+    if (signatureDataUrl && !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format (PNG or JPEG required)");
+    }
+
+    const contract = await prisma.contract.findUnique({ where: { id: contractId } });
+    if (!contract) throw new Error("Contract not found");
+
+    // Already finalized → return the executed file idempotently. If status is Finalized but the
+    // file isn't archived yet (a concurrent call is mid-archive), tell the admin to retry rather
+    // than returning a false success with no file.
+    if (contract.status === "Finalized") {
+        const existing = await getExecutedContractPdf(contract);
+        if (existing) return { success: true, file: existing, alreadyFinalized: true };
+        throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
+    }
+    if (contract.status !== "Signed" || !contract.approvedAt) {
+        throw new Error("The client must sign this contract before the company can countersign.");
+    }
+    if (!contract.signedPdfPath) {
+        throw new Error("The signed contract PDF isn't ready yet. Please wait a moment and try again.");
+    }
+
+    const ip = await getRequestIp();
+    const now = new Date();
+
+    // Record the company signature once. On a retry where it's already recorded (companySignedAt
+    // set), reuse the stored value and skip a duplicate upload. The signature write and audit
+    // record share a transaction so a failed audit insert rolls the signature back too — a retry
+    // then redoes BOTH (never leaves companySignedAt set with no audit row).
+    if (!contract.companySignedAt) {
+        const companySignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/company`);
+        await prisma.$transaction(async (tx) => {
+            const guard = await tx.contract.updateMany({
+                where: { id: contractId, status: "Signed", companySignedAt: null },
+                data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
+            });
+            if (guard.count > 0) {
+                await tx.contractSigningRecord.create({
+                    data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
+                });
+            }
+        });
+    }
+
+    // Canonical state (covers a retry that recorded the signature but failed before finalizing).
+    const after = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true } },
+            lead: { include: { client: true } },
+        },
+    });
+    if (!after) throw new Error("Contract not found");
+    if (after.status === "Finalized") {
+        return { success: true, file: await getExecutedContractPdf(after), alreadyFinalized: true };
+    }
+    if (after.status !== "Signed" || !after.companySignedAt || !after.signedPdfPath) {
+        throw new Error("Contract is not in a countersignable state.");
+    }
+
+    // Atomically claim the finalize transition so concurrent calls can't double-archive.
+    const flip = await prisma.contract.updateMany({
+        where: { id: contractId, status: "Signed" },
+        data: { status: "Finalized" },
+    });
+    if (flip.count === 0) {
+        // Lost the race. Report success only if the executed file actually exists yet — otherwise
+        // the winner is still archiving (or rolled back), so tell the admin to retry rather than
+        // returning a false success with no file.
+        const fresh = await prisma.contract.findUnique({ where: { id: contractId } });
+        const existing = fresh?.status === "Finalized" ? await getExecutedContractPdf(fresh) : null;
+        if (existing) return { success: true, file: existing, alreadyFinalized: true };
+        throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
+    }
+
+    // Build + archive the executed PDF. This is the commit point: on failure we roll status back to
+    // "Signed" and archiveExecutedContractPdf removes its own storage object, so a retry is clean.
+    // Emails happen AFTER (best-effort) — an email hiccup must not undo a successfully executed doc.
+    let executedRecord: any = null;
+    let executedBuffer: Buffer | null = null;
+    let archivedMeta: { publicUrl: string; fileName: string } | null = null;
+    try {
+        const supabase = getSupabase();
+        if (!supabase) throw new Error("Storage not configured.");
+
+        const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(after.signedPdfPath);
+        if (dlErr || !dl) throw new Error("Could not load the signed contract PDF.");
+        const clientPdf = Buffer.from(await dl.arrayBuffer());
+
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        executedBuffer = await appendContractCountersignaturePage(clientPdf, {
+            companyName: settings?.companyName || "Company",
+            contractTitle: after.title,
+            clientSignedBy: after.approvedBy,
+            clientSignedAt: after.approvedAt,
+            clientIp: after.approvalIp,
+            companySignedBy: after.companySignedBy!,
+            companySignedAt: after.companySignedAt!,
+            companyIp: ip,
+            companySignatureValue: after.companySignatureUrl,
+        });
+
+        const archived = await archiveExecutedContractPdf(
+            { id: after.id, title: after.title, projectId: after.projectId, leadId: after.leadId },
+            executedBuffer
+        );
+        executedRecord = archived.record;
+        archivedMeta = { publicUrl: archived.publicUrl, fileName: archived.fileName };
+
+        // Drop the now-superseded private intermediate (best-effort).
+        try { await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]); } catch {}
+    } catch (e: any) {
+        // Roll back the finalize claim so the admin can retry. companySignedAt stays set (the
+        // company DID sign); the retry re-claims and re-archives.
+        await prisma.contract.updateMany({ where: { id: contractId, status: "Finalized" }, data: { status: "Signed" } });
+        console.error("[countersignContractAsCompany] finalize step failed:", e);
+        throw new Error(`Couldn't generate the executed PDF: ${e?.message || e}. Your signature was saved — please retry.`);
+    }
+
+    // Best-effort notifications — a failure here does NOT undo the executed contract.
+    try {
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const client = after.project?.client || after.lead?.client;
+        const cc = buildCc(client?.email || "", (client as any)?.additionalEmail);
+        if (executedBuffer && archivedMeta) {
+            await sendExecutedContractEmails({
+                contractTitle: after.title,
+                buffer: executedBuffer,
+                fileName: archivedMeta.fileName,
+                publicUrl: archivedMeta.publicUrl,
+                clientEmail: client?.email,
+                clientName: client?.name,
+                cc,
+                companyName: settings?.companyName || "ProBuild",
+                companyEmail: settings?.notificationEmail || settings?.email,
+                replyTo: settings?.email,
+            });
+        }
+    } catch (e) {
+        console.error("[countersignContractAsCompany] executed-doc email failed (non-fatal):", e);
+    }
+
+    // Post-commit activity logging is best-effort — the contract is already executed + archived,
+    // so a logging hiccup must not surface to the admin as a failure.
+    try {
+        if (after.projectId) {
+            await logActivity({
+                projectId: after.projectId,
+                actorType: "TEAM",
+                actorName: signerName,
+                action: "countersigned_contract",
+                entityType: "contract",
+                entityId: contractId,
+                entityName: `Contract "${after.title}"`,
+            });
+        }
+        await postActivityToThread(
+            after.leadId ?? null,
+            after.projectId ?? null,
+            `🖋️ ${signerName} countersigned contract "${after.title}" on ${now.toLocaleDateString()} — fully executed.`
+        );
+    } catch (e) {
+        console.error("[countersignContractAsCompany] post-commit activity log failed (non-fatal):", e);
+    }
+
+    revalidatePath(`/projects/[id]/contracts`, "page");
+    revalidatePath(`/leads/[id]/contracts`, "page");
+    revalidatePath("/");
+    return { success: true, file: executedRecord };
 }
 
 // ────────────────────────────────────────────────
@@ -6607,6 +6895,10 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         if (!owned) return null;
     }
 
+    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
+    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
+    const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
+
     const approvedAt = new Date();
     const co = await prisma.changeOrder.update({
         where: { id },
@@ -6614,13 +6906,60 @@ export async function approveChangeOrder(id: string, signatureName: string, user
             status: "Approved",
             approvedBy: signatureName,
             approvedAt,
-            clientSignatureUrl: signatureDataUrl || null,
+            clientSignatureUrl,
         },
     });
     
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
+}
+
+// Company-side countersignature. Distinct from approveChangeOrder (the customer's
+// approval) so that signing on behalf of the company NEVER overwrites the client's
+// approvedBy/approvedAt/clientSignatureUrl audit trail. Writes ONLY company fields
+// and leaves status untouched (the customer's approval still drives Approved).
+// Auth mirrors signContractAsContractor; signatureDataUrl is optional because the
+// editor's "Sign Now" flow captures a typed name rather than a drawn signature.
+export async function countersignChangeOrderAsCompany(id: string, signerName: string, signatureDataUrl?: string) {
+    "use server";
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    // Role gate — only ADMIN/MANAGER can countersign on behalf of the company.
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    if (!signerName.trim()) throw new Error("Signer name is required");
+
+    // Validate the data URL is a safe image type before storing (only when provided).
+    if (signatureDataUrl && !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format");
+    }
+
+    // Verify the change order exists (clear 404-style error) and grab projectId for revalidation.
+    const existing = await prisma.changeOrder.findUnique({ where: { id }, select: { id: true, projectId: true } });
+    if (!existing) throw new Error("Change order not found");
+
+    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
+    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
+    const companySignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/company`);
+
+    // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
+    // so two concurrent requests can't both succeed (eliminates TOCTOU race).
+    const result = await prisma.changeOrder.updateMany({
+        where: { id, companySignedAt: null },
+        data: {
+            companySignedBy: signerName.trim(),
+            companySignedAt: new Date(),
+            companySignatureUrl,
+        },
+    });
+    if (result.count === 0) throw new Error("Change order already countersigned by company");
+
+    revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${existing.projectId}/change-orders`);
+    return { success: true };
 }
 
 export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
