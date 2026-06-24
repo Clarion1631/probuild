@@ -135,6 +135,10 @@ export async function POST(
                     clientSignedAt: contract.approvedAt,
                     clientIp: ip,
                     clientSignatureValue: contract.signatureUrl,
+                    companySignedBy: contract.contractorSignedBy || undefined,
+                    companySignedAt: contract.contractorSignedAt || undefined,
+                    companyIp: contract.contractorSignedAt ? "Stored" : undefined,
+                    companySignatureValue: contract.contractorSignatureUrl || undefined,
                 });
 
                 const archived = await archiveExecutedContractPdf(
