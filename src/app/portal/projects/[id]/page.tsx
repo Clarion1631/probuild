@@ -118,7 +118,7 @@ export default async function PortalProjectDetail(props: {
     }
 
     // ---- Compute counts and tab config ----
-    const estimateCount = project.estimates.length;
+    const estimateCount = project.estimates.filter((e: any) => e.approvedAt || ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(e.status)).length;
     const invoiceCount = project.invoices.length;
     const updateCount = (project.dailyLogs || []).length;
     const changeOrderCount = (project.changeOrders || []).length;
@@ -388,8 +388,10 @@ export default async function PortalProjectDetail(props: {
 
                 {activeTab === "estimates" && (
                     <div className="space-y-3">
-                        {project.estimates.map(est => {
-                            const isSigned = !!est.approvedAt;
+                        {project.estimates
+                            .filter(est => est.approvedAt || ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(est.status))
+                            .map(est => {
+                                const isSigned = !!est.approvedAt;
                             return (
                             <Link href={`/portal/estimates/${est.id}`} key={est.id} className="block hui-card p-4 hover:border-blue-300 hover:shadow-sm transition">
                                 <div className="flex justify-between items-start mb-2 gap-2">

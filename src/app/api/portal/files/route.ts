@@ -25,6 +25,8 @@ export async function GET(req: NextRequest) {
         const staffSession = await getServerSession(authOptions);
         const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
 
+        let leadId: string | null = null;
+
         if (!isStaff) {
             const sessionClientId = await resolveSessionClientId();
             if (!sessionClientId) {
@@ -32,11 +34,18 @@ export async function GET(req: NextRequest) {
             }
             const project = await prisma.project.findFirst({
                 where: { id: projectId, clientId: sessionClientId },
-                select: { id: true },
+                select: { id: true, leadId: true },
             });
             if (!project) {
                 return NextResponse.json({ error: "Not found" }, { status: 404 });
             }
+            leadId = project.leadId;
+        } else {
+            const project = await prisma.project.findUnique({
+                where: { id: projectId },
+                select: { leadId: true },
+            });
+            leadId = project?.leadId || null;
         }
 
         if (folderId) {
@@ -71,8 +80,10 @@ export async function GET(req: NextRequest) {
         // already verified is shared above), include both explicit "shared" AND
         // null-visibility files (they inherit from the parent).
         const fileWhere: any = {
-            projectId,
             folderId: folderId || null,
+            ...(leadId
+                ? { OR: [{ projectId }, { leadId }] }
+                : { projectId }),
             ...(folderId
                 ? { OR: [{ visibility: "shared" }, { visibility: null }] }
                 : { visibility: "shared" }),
