@@ -242,14 +242,14 @@ async function main() {
 <hr />
 <p><strong>CLIENT SIGNATURE</strong></p>
 <p>{{SIGNATURE_BLOCK}}</p>
-<p>Printed Name: ___________________________________</p>
+<p>Printed Name: {{client_name}}</p>
 <p>Date: {{DATE_BLOCK}}</p>
 <p>&nbsp;</p>
 <hr />
 <p><strong>CONTRACTOR SIGNATURE</strong></p>
 <p>{{CONTRACTOR_SIGNATURE_BLOCK}}</p>
-<p>Company: ___________________________________</p>
-<p>Date: ___________________________________</p>
+<p>Company: {{company_name}}</p>
+<p>Date: {{CONTRACTOR_DATE_BLOCK}}</p>
 `;
         }
 
