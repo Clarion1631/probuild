@@ -5355,7 +5355,7 @@ export async function signContractAsContractor(contractId: string, signerName: s
     return { success: true };
 }
 
-async function updateExecutedPdfIfFinalized(contractId: string, ip: string) {
+async function updateExecutedPdfIfFinalized(contractId: string, ip: string | null) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5384,7 +5384,7 @@ async function updateExecutedPdfIfFinalized(contractId: string, ip: string) {
     const companySignedBy = contract.companySignedBy || contract.contractorSignedBy;
     const companySignedAt = contract.companySignedAt || contract.contractorSignedAt;
     const companySignatureUrl = contract.companySignatureUrl || contract.contractorSignatureUrl;
-    const companyIp = contract.companySignedAt ? "Stored" : (contract.contractorSignedAt ? ip : undefined);
+    const companyIp = contract.companySignedAt ? "Stored" : (contract.contractorSignedAt ? (ip || "0.0.0.0") : undefined);
 
     const updatedPdfBuffer = await appendContractCountersignaturePage(originalBuffer, {
         companyName: settings?.companyName || "Company",
