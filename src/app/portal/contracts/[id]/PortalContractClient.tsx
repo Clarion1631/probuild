@@ -75,6 +75,14 @@ export default function PortalContractClient({
         // Replace Signature Blocks
         html = html.replace(/\{\{SIGNATURE_BLOCK\}\}/g, () => {
             const id = `sig-${sigCount++}`;
+            const localSig = signatures[id];
+            if (localSig) {
+                const safeUrl = escapeHtml(localSig.image);
+                const safeName = escapeHtml(localSig.name || "Client");
+                const sigDateStr = new Date().toLocaleDateString();
+                const sigDateHtml = `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${sigDateStr}</span>`;
+                return `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Client Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client — ${safeName}</span>${sigDateHtml}</span>`;
+            }
             if (isSigned && initialContract.signatureUrl) {
                 const safeUrl = escapeHtml(initialContract.signatureUrl);
                 const safeName = escapeHtml(initialContract.approvedBy || "Client");
@@ -94,6 +102,10 @@ export default function PortalContractClient({
         // Replace Initial Blocks
         html = html.replace(/\{\{INITIAL_BLOCK\}\}/g, () => {
             const id = `init-${initCount++}`;
+            const localInit = initials[id];
+            if (localInit) {
+                return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:60px;text-align:center;padding-bottom:4px;margin:4px 0;"><span style="font-size:12px;font-weight:600;color:#0f172a;letter-spacing:1px;">${escapeHtml(localInit.name || "Int.")}</span></span>`;
+            }
             if (isSigned) {
                 return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:60px;text-align:center;padding-bottom:4px;margin:4px 0;"><span style="font-size:12px;font-weight:600;color:#0f172a;letter-spacing:1px;">Int.</span></span>`;
             }
@@ -132,7 +144,7 @@ export default function PortalContractClient({
         }
 
         return { parsedBody: html, totalRequiredBlocks: sigCount + initCount, totalSigBlocks: sigCount };
-    }, [initialContract.body, isSigned, initialContract.approvedAt, initialContract.contractorSignedAt, initialContract.contractorSignatureUrl, initialContract.contractorSignedBy]);
+    }, [initialContract.body, isSigned, initialContract.approvedAt, initialContract.contractorSignedAt, initialContract.contractorSignatureUrl, initialContract.contractorSignedBy, signatures, initials]);
 
     // Attach Delegated Listeners
     useEffect(() => {
