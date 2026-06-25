@@ -191,8 +191,26 @@ async function main() {
             continue;
         }
 
-        rows.push({ name: c.name, type: c.type, body: trimmed, isDefault: c.isDefault });
-        conversionResults.push({ name: c.name, type: c.type, isDefault: c.isDefault, htmlBytes: trimmed.length, conversionPath, warnings: warnings.length });
+        let bodyWithSignatures = trimmed;
+        if (!trimmed.includes("SIGNATURE_BLOCK")) {
+            bodyWithSignatures += `
+<p>&nbsp;</p>
+<hr />
+<p><strong>CLIENT SIGNATURE</strong></p>
+<p>{{SIGNATURE_BLOCK}}</p>
+<p>Printed Name: ___________________________________</p>
+<p>Date: {{DATE_BLOCK}}</p>
+<p>&nbsp;</p>
+<hr />
+<p><strong>CONTRACTOR SIGNATURE</strong></p>
+<p>{{CONTRACTOR_SIGNATURE_BLOCK}}</p>
+<p>Company: ___________________________________</p>
+<p>Date: ___________________________________</p>
+`;
+        }
+
+        rows.push({ name: c.name, type: c.type, body: bodyWithSignatures, isDefault: c.isDefault });
+        conversionResults.push({ name: c.name, type: c.type, isDefault: c.isDefault, htmlBytes: bodyWithSignatures.length, conversionPath, warnings: warnings.length });
     }
 
     // Abort if any conversions failed so we don't wipe what's in the DB.
