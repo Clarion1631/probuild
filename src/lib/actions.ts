@@ -5344,9 +5344,116 @@ export async function signContractAsContractor(contractId: string, signerName: s
         });
     });
 
+    try {
+        await updateExecutedPdfIfFinalized(contractId, ip);
+    } catch (err) {
+        console.error("[signContractAsContractor] failed to update executed PDF:", err);
+    }
+
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
     return { success: true };
+}
+
+async function updateExecutedPdfIfFinalized(contractId: string, ip: string) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true, manager: true } },
+            lead: { include: { client: true, manager: true } },
+        },
+    });
+
+    if (!contract || contract.status !== "Finalized" || !contract.originalPdfPath) {
+        return;
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    // 1. Download original PDF
+    const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
+    if (dlErr || !dl) throw new Error("Could not load original PDF contract");
+    const originalBuffer = Buffer.from(await dl.arrayBuffer());
+
+    // 2. Generate updated PDF
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    
+    // Decide company/contractor values to show on Certificate of Execution.
+    // We prefer the company countersignature if it exists, otherwise fall back to contractor signature.
+    const companySignedBy = contract.companySignedBy || contract.contractorSignedBy;
+    const companySignedAt = contract.companySignedAt || contract.contractorSignedAt;
+    const companySignatureUrl = contract.companySignatureUrl || contract.contractorSignatureUrl;
+    const companyIp = contract.companySignedAt ? "Stored" : (contract.contractorSignedAt ? ip : undefined);
+
+    const updatedPdfBuffer = await appendContractCountersignaturePage(originalBuffer, {
+        companyName: settings?.companyName || "Company",
+        contractTitle: contract.title,
+        clientSignedBy: contract.approvedBy,
+        clientSignedAt: contract.approvedAt,
+        clientIp: contract.approvalIp || "0.0.0.0",
+        clientSignatureValue: contract.signatureUrl,
+        companySignedBy: companySignedBy || undefined,
+        companySignedAt: companySignedAt || undefined,
+        companyIp: companyIp || undefined,
+        companySignatureValue: companySignatureUrl || undefined,
+    });
+
+    // 3. Find the existing executed file
+    const fileName = `Executed_Contract_${contract.id}.pdf`;
+    const existingFile = await prisma.projectFile.findFirst({
+        where: {
+            name: fileName,
+            ...(contract.projectId ? { projectId: contract.projectId } : { leadId: contract.leadId }),
+        },
+        orderBy: { createdAt: "desc" },
+    });
+
+    // 4. Delete the old file from Storage if it exists
+    if (existingFile?.url) {
+        const match = existingFile.url.match(/\/project-files\/(.+)$/);
+        if (match) {
+            const oldStoragePath = decodeURIComponent(match[1]);
+            try {
+                await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+            } catch (removeErr) {
+                console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+            }
+        }
+        // Delete the old DB record
+        await prisma.projectFile.delete({
+            where: { id: existingFile.id }
+        });
+    }
+
+    // 5. Archive the new PDF (creates a new ProjectFile record and uploads it)
+    const archived = await archiveExecutedContractPdf(
+        { id: contract.id, title: contract.title, projectId: contract.projectId, leadId: contract.leadId },
+        updatedPdfBuffer
+    );
+
+    // 6. Send the executed contract emails with the new PDF (best-effort)
+    const client = contract.project?.client || contract.lead?.client;
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const cc = buildCc(client?.email || "", client?.additionalEmail, managerEmail);
+    const companyEmail = settings?.notificationEmail || settings?.email;
+
+    try {
+        await sendExecutedContractEmails({
+            contractTitle: contract.title,
+            buffer: updatedPdfBuffer,
+            fileName: archived.fileName,
+            publicUrl: archived.publicUrl,
+            clientEmail: client?.email,
+            clientName: client?.name,
+            cc,
+            companyName: settings?.companyName || "ProBuild",
+            companyEmail,
+            replyTo: settings?.email,
+        });
+    } catch (emailErr) {
+        console.error("[updateExecutedPdfIfFinalized] failed to send executed email:", emailErr);
+    }
 }
 
 export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, accessToken?: string) {
