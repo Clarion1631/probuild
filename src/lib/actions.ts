@@ -6,7 +6,7 @@ import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
 import { cache } from "react";
 import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
-import { safeEstimateSelect, toNum } from "./prisma-helpers";
+import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
@@ -2473,15 +2473,23 @@ export async function sendMilestoneInvoices(
     invoiceId: string,
     paymentScheduleIds: string[],
     overrideEmail?: string,
+    // Per-milestone reconcile intents the user explicitly confirmed in the review
+    // step: scheduleId -> the QBO total they saw and approved. Doubles as an
+    // optimistic-lock token (we only reconcile if the live QBO total still matches).
+    opts?: { reconcile?: Record<string, number> },
 ): Promise<{
     success: boolean;
     sent: number;
     failed: number;
     skipped: number;
-    results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed"; error?: string; sentTo?: string }>;
+    // True when one or more selected milestones drifted from QBO and were NOT sent;
+    // the modal flips into the side-by-side review step using driftReview.
+    needsReview?: boolean;
+    driftReview?: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }>;
+    results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }>;
     error?: string;
 }> {
-    await assertInvoicePermission();
+    const actor = await assertInvoicePermission();
 
     try {
         const invoice = await prisma.invoice.findUnique({
@@ -2500,7 +2508,7 @@ export async function sendMilestoneInvoices(
             return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "No milestones selected" };
         }
 
-        const { getFreshQBTokens, pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+        const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
         const { sendQBInvoice, getQBInvoiceStatus } = await import("./quickbooks");
 
         let tokens;
@@ -2523,7 +2531,9 @@ export async function sendMilestoneInvoices(
         let sentCount = 0;
         let failedCount = 0;
         let skippedCount = 0;
-        const results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed"; error?: string; sentTo?: string }> = [];
+        let reconciledEstimate = false;
+        const results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }> = [];
+        const driftReview: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }> = [];
 
         for (const schedule of selectedPayments) {
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
@@ -2558,17 +2568,78 @@ export async function sendMilestoneInvoices(
                     continue;
                 }
 
-                // Drift Guard
-                if (qbTotal != null && Math.abs(qbTotal - Number(schedule.amount)) > 0.05) {
-                    skippedCount++;
-                    results.push({
-                        id: schedule.id,
-                        name: schedule.name,
-                        status: "skipped",
-                        error: `QuickBooks total $${qbTotal.toFixed(2)} ≠ milestone $${Number(schedule.amount).toFixed(2)} — review before sending`,
-                    });
+                // Fail closed if we couldn't read the QBO total — the Drift Guard can't
+                // vouch for the amount, so don't send an unverified invoice (a transient
+                // QBO read failure must not bypass the guard).
+                if (qbTotal == null) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "Couldn't read the QuickBooks total to verify the amount — please try again." });
                     continue;
                 }
+                // A $0/negative QBO total means the invoice is voided or deleted.
+                if (qbTotal <= 0) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "QuickBooks shows $0.00 for this invoice (it may be voided or deleted) — re-push before sending." });
+                    continue;
+                }
+
+                // Drift Guard: QBO is the system of record for what the client is
+                // charged. If it has drifted from the ProBuild milestone, do not send
+                // until the user reviews and explicitly approves reconciling ProBuild
+                // to the QBO total (optimistic-locked to the exact qbTotal they saw).
+                if (Math.abs(qbTotal - Number(schedule.amount)) > 0.05) {
+                    const approved = opts?.reconcile?.[schedule.id];
+                    // Cent-exact match: only reconcile the precise total the user approved.
+                    const userApprovedThisTotal = approved != null && Math.abs(approved - qbTotal) <= 0.005;
+
+                    if (!userApprovedThisTotal) {
+                        // Phase 1 (or a stale confirmation): surface for review, do NOT send.
+                        driftReview.push({
+                            id: schedule.id,
+                            name: schedule.name,
+                            probuildAmount: Number(schedule.amount),
+                            qbTotal,
+                            direction: qbTotal > Number(schedule.amount) ? "higher" : "lower",
+                        });
+                        skippedCount++;
+                        results.push({
+                            id: schedule.id,
+                            name: schedule.name,
+                            status: "skipped",
+                            error: `QuickBooks total $${qbTotal.toFixed(2)} ≠ milestone $${Number(schedule.amount).toFixed(2)} — review before sending`,
+                        });
+                        continue;
+                    }
+
+                    // Phase 2: authorized + confirmed + still current → reconcile ProBuild to QBO.
+                    const recon = await reconcileMilestoneToQbo(schedule.id, qbTotal);
+                    if (!recon.ok) {
+                        failedCount++;
+                        results.push({ id: schedule.id, name: schedule.name, status: "failed", error: recon.error || "Failed to reconcile milestone" });
+                        continue;
+                    }
+                    if (recon.estimateTouched) reconciledEstimate = true;
+
+                    if (invoice.projectId) {
+                        await logActivity({
+                            projectId: invoice.projectId,
+                            actorType: "TEAM",
+                            actorName: actor.name || companyName,
+                            action: "reconciled_milestone_amount",
+                            entityType: "invoice",
+                            entityId: invoiceId,
+                            entityName: `Invoice ${invoice.code}`,
+                            metadata: { milestone: schedule.name, from: recon.oldAmount, to: recon.newAmount, source: "quickbooks" },
+                        });
+                    }
+                    // schedule.amount is now stale in memory; the QBO total matches the
+                    // reconciled amount, so fall through to send. Mark the result below.
+                }
+
+                const approvedTotal = opts?.reconcile?.[schedule.id];
+                const wasReconciled = Math.abs(qbTotal - Number(schedule.amount)) > 0.05
+                    && approvedTotal != null
+                    && Math.abs(approvedTotal - qbTotal) <= 0.005;
 
                 // Send QBO invoice
                 const sendRes = await sendQBInvoice(tokens, qbInvoiceId, recipient);
@@ -2585,7 +2656,7 @@ export async function sendMilestoneInvoices(
                 });
 
                 sentCount++;
-                results.push({ id: schedule.id, name: schedule.name, status: "sent", sentTo: recipient });
+                results.push({ id: schedule.id, name: schedule.name, status: wasReconciled ? "reconciled" : "sent", sentTo: recipient });
 
                 // Log activity per sent milestone
                 if (invoice.projectId) {
@@ -2617,15 +2688,26 @@ export async function sendMilestoneInvoices(
         if (invoice.projectId) {
             revalidatePath(`/projects/${invoice.projectId}/invoices`);
             revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+            // A reconcile rewrites the linked estimate + its totals — refresh those views too.
+            if (reconciledEstimate) {
+                revalidatePath(`/projects/${invoice.projectId}/estimates`);
+                if (invoice.estimateId) revalidatePath(`/projects/${invoice.projectId}/estimates/${invoice.estimateId}`);
+            }
         }
         revalidatePath(`/invoices`);
         revalidatePath(`/portal`);
+        if (reconciledEstimate) {
+            revalidatePath(`/estimates`);
+            revalidatePath(`/reports/sales-tax`);
+        }
 
         return {
             success: sentCount > 0,
             sent: sentCount,
             failed: failedCount,
             skipped: skippedCount,
+            needsReview: driftReview.length > 0,
+            driftReview: driftReview.length > 0 ? driftReview : undefined,
             results,
         };
     } catch (globalErr: any) {
@@ -3151,18 +3233,6 @@ async function getDefaultSalesTaxRate(): Promise<number> {
     }
 }
 
-// Reverse-out tax from a total (total = subtotal + subtotal * rate/100).
-// If exempt or rate <= 0, the whole amount is subtotal and taxAmount is 0.
-function deriveInvoiceTaxFields(totalAmount: number, ratePercent: number, isExempt: boolean) {
-    if (isExempt || ratePercent <= 0) {
-        return { subtotal: totalAmount, taxRate: 0, taxAmount: 0 };
-    }
-    const factor = ratePercent / (100 + ratePercent);
-    const taxAmount = Math.round(totalAmount * factor * 100) / 100;
-    const subtotal = Math.round((totalAmount - taxAmount) * 100) / 100;
-    return { subtotal, taxRate: ratePercent, taxAmount };
-}
-
 export async function createInvoiceFromEstimate(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
@@ -3603,6 +3673,86 @@ export async function refreshQBPayments(invoiceId: string) {
         }
     }
     return result;
+}
+
+/**
+ * Break a milestone's link to a voided/deleted QuickBooks invoice so it can be
+ * re-sent from scratch. Clears the QB tracking fields ONLY — never touches money
+ * state. The Paid/qbPaymentId refusal guards are the money-path safety boundary:
+ * clearing these fields on a Pending milestone changes no status, fires no
+ * notifyMilestonePaid, and doesn't touch the estimate mirror (which has no QB fields).
+ *
+ * `deleteInQBO` is wired for a future "also delete in QuickBooks" toggle but defaults
+ * OFF — we never issue a destructive QBO write (voided invoices are often kept as a
+ * deliberate audit record; a deleted one is already gone).
+ */
+export async function breakQBInvoiceLink(
+    paymentId: string,
+    opts?: { deleteInQBO?: boolean },
+): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
+    await assertInvoicePermission();
+
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentId },
+        select: {
+            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            invoiceId: true, invoice: { select: { projectId: true } },
+        },
+    });
+    if (!schedule) return { success: false, error: "Milestone not found" };
+    if (schedule.status === "Paid") {
+        return { success: false, error: "This milestone is already paid — unlinking is blocked. Use Undo first if you need to reverse it." };
+    }
+    if (schedule.qbPaymentId) {
+        return { success: false, error: "A QuickBooks payment is recorded against this milestone. Refusing to unlink." };
+    }
+    if (!schedule.qbInvoiceId) {
+        return { success: false, error: "This milestone has no QuickBooks link to break." };
+    }
+
+    // Claim the unlink atomically: the guard fields go in the WHERE, so if the QB
+    // sync settles this milestone (status→Paid, qbPaymentId set) between the read
+    // above and this write, the claim matches 0 rows and we never strip QB fields
+    // off a now-paid row. `qbInvoiceId` is pinned to the value we read so a
+    // concurrent re-push (new id) can't be clobbered either.
+    const cleared = await prisma.paymentSchedule.updateMany({
+        where: {
+            id: schedule.id,
+            status: { not: "Paid" },
+            qbPaymentId: null,
+            qbInvoiceId: schedule.qbInvoiceId,
+        },
+        data: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            qbInvoiceSentAt: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+        },
+    });
+    if (cleared.count !== 1) {
+        return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+    }
+
+    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
+    // Default OFF — we never issue a destructive QBO write unless asked.
+    let warning: string | undefined;
+    if (opts?.deleteInQBO === true) {
+        try {
+            const { getFreshQBTokens } = await import("./quickbooks-payments");
+            const { deleteQBInvoice } = await import("./quickbooks");
+            const tokens = await getFreshQBTokens();
+            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
+            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
+        } catch {
+            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
+        }
+    }
+
+    revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    return { success: true, warning };
 }
 
 export async function recordEstimatePayment(

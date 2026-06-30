@@ -267,6 +267,64 @@ export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string):
     return { balance: Number(inv.Balance ?? 0), total: Number(inv.TotalAmt ?? 0), paymentTxnIds };
 }
 
+/**
+ * Result of probing a QBO invoice's existence + payable state.
+ * Unlike getQBInvoiceStatus (which collapses every failure into null), this
+ * distinguishes a permanently gone/voided invoice from a transient API error,
+ * so the sync poller can flag stuck milestones without acting on a blip.
+ */
+export type QBInvoiceProbe =
+    | { state: "ok"; balance: number; total: number; paymentTxnIds: string[] }
+    | { state: "voided" } // HTTP 200, exists, total & balance === 0, no linked payments
+    | { state: "notFound" } // HTTP 400 Fault 610 or HTTP 404 (authoritative "gone" only)
+    | { state: "error"; status: number }; // 401/429/5xx/network/malformed — transient, never act on
+
+/**
+ * Probe a QBO invoice and classify it. QBO's behavior for gone invoices is
+ * inconsistent: a *voided* invoice returns 200 with TotalAmt=0; a *deleted* one
+ * may return 400 + Fault code 610 ("Object Not Found"), a 404, or even 200 with
+ * stale data. This folds all of those into a single discriminated result.
+ */
+export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<QBInvoiceProbe> {
+    let res: Response;
+    try {
+        res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+    } catch {
+        return { state: "error", status: 0 };
+    }
+    if (res.ok) {
+        // A 200 should always carry an Invoice. A parse failure or a missing payload
+        // is anomalous — treat it as transient (never as "gone"); only an explicit
+        // 404/610 below is authoritative for notFound.
+        let data: any;
+        try {
+            data = await res.json();
+        } catch {
+            return { state: "error", status: res.status };
+        }
+        const inv = data?.Invoice;
+        if (!inv) return { state: "error", status: res.status };
+        const total = Number(inv.TotalAmt);
+        const balance = Number(inv.Balance);
+        // A well-formed invoice always carries numeric TotalAmt/Balance. Missing or
+        // non-finite values mean a malformed/partial payload — treat as transient,
+        // never as voided (which would false-alarm an otherwise-healthy milestone).
+        if (!Number.isFinite(total) || !Number.isFinite(balance)) return { state: "error", status: res.status };
+        const paymentTxnIds: string[] = (inv.LinkedTxn || [])
+            .filter((t: any) => t.TxnType === "Payment")
+            .map((t: any) => String(t.TxnId));
+        // Voided invoices come back 200 with TotalAmt=0, Balance=0, and no linked payments.
+        if (total === 0 && balance === 0 && paymentTxnIds.length === 0) return { state: "voided" };
+        return { state: "ok", balance, total, paymentTxnIds };
+    }
+    if (res.status === 404) return { state: "notFound" };
+    const body = await res.text().catch(() => "");
+    if (res.status === 400 && /"code"\s*:\s*"610"|Object Not Found/i.test(body)) {
+        return { state: "notFound" };
+    }
+    return { state: "error", status: res.status };
+}
+
 /** Read a QBO payment (date / amount / reference) for receipt details. */
 export async function getQBPayment(
     tokens: QBTokens,
@@ -516,4 +574,22 @@ export async function syncInvoiceToQB(
     const qbId = data.Invoice?.Id;
     const qbUrl = `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
     return { qbId, qbUrl };
+}
+
+/** Send a QBO invoice email to a client. */
+export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendTo?: string | null) {
+    const qs = new URLSearchParams({ minorversion: "73" });
+    if (sendTo) qs.set("sendTo", sendTo);
+    const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}/send?${qs}`;
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${tokens.accessToken}`,
+            Accept: "application/json",
+            "Content-Type": "application/octet-stream",
+        },
+    });
+    if (!res.ok) return { ok: false as const, status: res.status, error: await res.text() };
+    const data = await res.json().catch(() => ({}));
+    return { ok: true as const, status: res.status, emailStatus: data.Invoice?.EmailStatus ?? null };
 }

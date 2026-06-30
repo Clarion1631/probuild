@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Providers from "@/components/Providers";
@@ -22,6 +22,22 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Golden Touch Remodeling | Pro",
   description: "High-end remodeling project management",
+  applicationName: "GTR Pro",
+  appleWebApp: {
+    capable: true,
+    title: "GTR Pro",
+    statusBarStyle: "black-translucent",
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#1e1e1e",
+  width: "device-width",
+  initialScale: 1,
+  // viewportFit:cover is required so env(safe-area-inset-*) resolves to real
+  // values on notched / home-indicator devices. We intentionally leave
+  // maximumScale/userScalable at their defaults to preserve pinch-zoom (WCAG 1.4.4).
+  viewportFit: "cover",
 };
 
 export default async function RootLayout({
