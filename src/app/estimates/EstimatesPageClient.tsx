@@ -67,8 +67,8 @@ export default function EstimatesPageClient({ estimates }: { estimates: Estimate
             {activeTab === "estimates" ? (
                 <div className="p-6 flex-1 flex flex-col">
                     <div className="hui-card flex-1 flex flex-col overflow-hidden">
-                        <div className="border-b border-hui-border p-4 flex items-center gap-4">
-                            <input type="text" placeholder="Search" className="hui-input w-64" />
+                        <div className="border-b border-hui-border p-4 flex flex-wrap items-center gap-3">
+                            <input type="text" placeholder="Search" className="hui-input w-full sm:w-64" />
                             <select className="hui-input w-auto"><option>Date Created: All</option></select>
                             <select className="hui-input w-auto"><option>Type: All</option></select>
                         </div>

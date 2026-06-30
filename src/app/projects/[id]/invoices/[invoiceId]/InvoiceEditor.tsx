@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, emailInvoiceCopyToMe } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -86,6 +86,32 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                 toast.warning("QuickBooks invoice created, but no pay link — enable QuickBooks Payments in QBO to accept cards/ACH.");
                 router.refresh();
             }
+        } finally {
+            setQbBusy(null);
+        }
+    }
+
+    // Recover a milestone whose QuickBooks invoice was voided/deleted: clear the
+    // stale link so it can be re-created fresh. Money state is untouched.
+    async function handleBreakQBLink(payment: { id: string; name: string }) {
+        const ok = window.confirm(
+            `Break the QuickBooks link for "${payment.name}"?\n\n` +
+            `Use this when the QuickBooks invoice was voided or deleted and this milestone ` +
+            `is stuck on "Pending". It clears the QuickBooks link in ProBuild so you can ` +
+            `re-create it fresh with "QuickBooks Link".\n\n` +
+            `It does NOT change the paid/unpaid status, and does NOT delete the invoice in QuickBooks.`
+        );
+        if (!ok) return;
+        setQbBusy(payment.id);
+        try {
+            const res = await breakQBInvoiceLink(payment.id);
+            if (!res.success) {
+                toast.error(res.error);
+                return;
+            }
+            if (res.warning) toast.warning(res.warning);
+            else toast.success("QuickBooks link cleared — you can now re-create it.");
+            router.refresh();
         } finally {
             setQbBusy(null);
         }
@@ -342,7 +368,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                 </div>
             </div>
 
-            <div className="flex-1 overflow-auto p-8 flex justify-center">
+            <div className="flex-1 overflow-auto p-4 lg:p-8 flex justify-center">
                 <div className="w-full max-w-5xl space-y-6">
 
                     {/* Document Header */}
@@ -359,7 +385,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </div>
                             </div>
 
-                            <div className="flex gap-12 text-sm">
+                            <div className="flex flex-col sm:flex-row gap-6 sm:gap-12 text-sm">
                                 <div>
                                     <p className="text-[11px] font-semibold tracking-widest uppercase text-slate-400 mb-2">Bill To</p>
                                     <p className="font-semibold text-base text-hui-textMain">{clientName}</p>
@@ -400,7 +426,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
                             <div className="h-px w-full bg-hui-border my-4"></div>
 
-                            <div className="flex justify-between items-center bg-slate-50 p-5 rounded-lg border border-hui-border">
+                            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 bg-slate-50 p-5 rounded-lg border border-hui-border">
                                 <div>
                                     <p className="text-hui-textMuted text-sm mb-1">Total Amount</p>
                                     <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(initialInvoice.totalAmount)}</p>
@@ -529,7 +555,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         )}
                         {showAddMilestone && (
                             <div className="px-6 py-4 border-b border-hui-border bg-amber-50/40">
-                                <div className="grid grid-cols-12 gap-3 items-end">
+                                <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 sm:items-end">
                                     <div className="col-span-5">
                                         <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Description</label>
                                         <input
@@ -576,7 +602,8 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </p>
                             </div>
                         )}
-                        <table className="w-full text-sm text-left">
+                        <div className="overflow-x-auto">
+                        <table className="w-full min-w-[34rem] text-sm text-left">
                             <thead className="bg-white text-hui-textMuted border-b border-hui-border">
                                 <tr>
                                     <th className="px-4 py-3 w-10 text-center">
@@ -664,7 +691,17 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 ) : 'Upon receipt'}
                                             </td>
                                             <td className="px-6 py-4">
-                                                <StatusBadge status={payment.status} />
+                                                <div className="flex items-center gap-2">
+                                                    <StatusBadge status={payment.status} />
+                                                    {payment.status !== 'Paid' && payment.qbSyncError && (
+                                                        <span
+                                                            className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
+                                                            title="The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                        >
+                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : 'voided'}
+                                                        </span>
+                                                    )}
+                                                </div>
                                             </td>
                                             <td className="px-6 py-4 text-right font-medium text-hui-textMain">
                                                 {formatCurrency(payment.amount)}
@@ -704,6 +741,16 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                         >
                                                             Record Payment
                                                         </button>
+                                                        {payment.qbInvoiceId && (
+                                                            <button
+                                                                onClick={() => handleBreakQBLink(payment)}
+                                                                disabled={qbBusy === payment.id}
+                                                                title="QuickBooks invoice voided or deleted? Clear the link so you can re-create it."
+                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50 whitespace-nowrap"
+                                                            >
+                                                                {qbBusy === payment.id ? "Working…" : "Break QB Link"}
+                                                            </button>
+                                                        )}
                                                         </>
                                                     )}
                                                     {payment.status === 'Paid' && (
@@ -735,6 +782,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 })}
                             </tbody>
                         </table>
+                        </div>
                     </div>
 
                 </div>

@@ -119,6 +119,7 @@ export function StudioCanvas() {
 
   return (
     <Canvas
+      className="touch-none"
       shadows={{ type: THREE.PCFSoftShadowMap }}
       dpr={[1, 1.75]}
       resize={{ scroll: false, debounce: 0 }}

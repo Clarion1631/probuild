@@ -167,6 +167,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         initialEstimate.taxRateName ?? defaultTaxRate?.name ?? null
     );
     const [isAiFilling, setIsAiFilling] = useState(false);
+    const [isAiAssigningPhases, setIsAiAssigningPhases] = useState(false);
     const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
     const [overwriteExisting, setOverwriteExisting] = useState(false);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
@@ -1331,6 +1332,72 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         toast.success("Budgets cleared — PO-committed items kept");
     }
 
+    async function handleAiAssignPhases() {
+        const eligibleItems = items.filter(item => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            return !isSection;
+        });
+
+        if (eligibleItems.length === 0) {
+            toast.info("No items found to assign phases.");
+            return;
+        }
+
+        setIsAiAssigningPhases(true);
+        try {
+            const payloadItems = eligibleItems.map(item => ({
+                id: item.id,
+                name: item.name,
+                description: item.description || ""
+            }));
+
+            const payloadCostCodes = costCodes.map(cc => ({
+                id: cc.id,
+                code: cc.code,
+                name: cc.name
+            }));
+
+            const res = await fetch("/api/ai-estimate/assign-phases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: payloadItems,
+                    costCodes: payloadCostCodes
+                })
+            });
+
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.error || "Failed to auto-assign phases");
+            }
+
+            const { assignments } = await res.json();
+            if (!assignments || !Array.isArray(assignments)) {
+                throw new Error("Invalid response from server");
+            }
+
+            let assignedCount = 0;
+            setItems(prev => {
+                const next = [...prev];
+                for (const ass of assignments) {
+                    const idx = next.findIndex(item => item.id === ass.id);
+                    if (idx >= 0 && ass.costCodeId !== undefined) {
+                        next[idx] = { ...next[idx], costCodeId: ass.costCodeId };
+                        assignedCount++;
+                    }
+                }
+                return next;
+            });
+
+            toast.success(`Successfully matched and assigned phases to ${assignedCount} items.`);
+        } catch (err: any) {
+            console.error("Auto-assign phases error:", err);
+            toast.error(err.message || "Failed to auto-assign phases");
+        } finally {
+            setIsAiAssigningPhases(false);
+        }
+    }
+
     function addPaymentSchedule() {
         setPaymentSchedules([...paymentSchedules, {
             id: generateId(),
@@ -1520,6 +1587,14 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     >
                                         <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
                                         Import from ChatGPT
+                                    </button>
+                                    <button
+                                        onClick={() => { handleAiAssignPhases(); setShowMoreMenu(false); }}
+                                        disabled={isAiAssigningPhases}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700 disabled:opacity-50"
+                                    >
+                                        <svg className={`w-4 h-4 text-purple-500 ${isAiAssigningPhases ? "animate-pulse" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        {isAiAssigningPhases ? "Assigning..." : "Auto-assign Phases"}
                                     </button>
                                     <button
                                         onClick={() => { handleHistoricalPricing(); setShowMoreMenu(false); }}
@@ -1732,7 +1807,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             {/* Assembly Name Modal */}
             {showAssemblyNameModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" onClick={() => setShowAssemblyNameModal(false)}>
-                    <div className="bg-white rounded-xl shadow-2xl p-6 w-96" onClick={e => e.stopPropagation()}>
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm mx-4" onClick={e => e.stopPropagation()}>
                         <h3 className="text-lg font-bold text-slate-800 mb-1">Save Assembly</h3>
                         <p className="text-sm text-slate-500 mb-4">Name this bundle so you can reuse it across estimates (e.g., &quot;Standard Bathroom Demo&quot;).</p>
                         <input
@@ -1754,8 +1829,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 </div>
             )}
 
-            <div className="flex-1 flex overflow-hidden">
-            <div className="flex-1 p-8 flex justify-center pb-24 overflow-y-auto">
+            <div className="flex-1 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
+            <div className="flex-1 p-4 lg:p-8 flex justify-center pb-24 overflow-visible lg:overflow-y-auto">
                 {activeTab === "builder" && (
                     <div className="w-full max-w-5xl">
                         {/* Premium Document Wrapper */}
@@ -1800,6 +1875,15 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     >
                                         <svg className={`w-4 h-4 ${isAiFilling ? "animate-pulse" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
                                         {isAiFilling ? "Filling…" : "AI fill budgets"}
+                                    </button>
+                                    <button
+                                        onClick={handleAiAssignPhases}
+                                        disabled={isAiAssigningPhases || isAiFilling}
+                                        className="hui-btn hui-btn-secondary text-sm flex items-center gap-2 disabled:opacity-50"
+                                        title="Auto-assign phases using AI."
+                                    >
+                                        <svg className={`w-4 h-4 text-purple-500 ${isAiAssigningPhases ? "animate-pulse" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        {isAiAssigningPhases ? "Assigning..." : "Auto-assign Phases"}
                                     </button>
                                     <button
                                         onClick={handleClearBudgets}
@@ -2717,7 +2801,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
             {/* Right Sidebar */}
             {showSidebar && (
-                <div className="w-96 border-l border-slate-200 bg-white flex flex-col overflow-y-auto overflow-x-hidden shrink-0">
+                <div className="w-full lg:w-96 border-t lg:border-t-0 lg:border-l border-slate-200 bg-white flex flex-col overflow-visible lg:overflow-y-auto overflow-x-hidden lg:shrink-0">
                     {/* Sidebar Tabs */}
                     <div className="flex border-b border-slate-200 sticky top-0 bg-white z-10">
                         <button
