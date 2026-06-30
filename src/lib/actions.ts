@@ -2469,6 +2469,177 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
     return { success: true, sentTo: recipientEmail };
 }
 
+export async function sendMilestoneInvoices(
+    invoiceId: string,
+    paymentScheduleIds: string[],
+    overrideEmail?: string,
+): Promise<{
+    success: boolean;
+    sent: number;
+    failed: number;
+    skipped: number;
+    results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed"; error?: string; sentTo?: string }>;
+    error?: string;
+}> {
+    await assertInvoicePermission();
+
+    try {
+        const invoice = await prisma.invoice.findUnique({
+            where: { id: invoiceId },
+            include: {
+                project: { include: { client: true } },
+                client: true,
+                payments: true,
+            },
+        });
+        if (!invoice) return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "Invoice not found" };
+
+        const allPayments = invoice.payments;
+        const selectedPayments = allPayments.filter(p => paymentScheduleIds.includes(p.id));
+        if (selectedPayments.length === 0) {
+            return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "No milestones selected" };
+        }
+
+        const { getFreshQBTokens, pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+        const { sendQBInvoice, getQBInvoiceStatus } = await import("./quickbooks");
+
+        let tokens;
+        try {
+            tokens = await getFreshQBTokens();
+        } catch (qbErr: any) {
+            return {
+                success: false,
+                sent: 0,
+                failed: 0,
+                skipped: 0,
+                results: [],
+                error: qbErr instanceof Error ? qbErr.message : "QuickBooks is not connected.",
+            };
+        }
+
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const companyName = settings?.companyName || "Your Contractor";
+
+        let sentCount = 0;
+        let failedCount = 0;
+        let skippedCount = 0;
+        const results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed"; error?: string; sentTo?: string }> = [];
+
+        for (const schedule of selectedPayments) {
+            if (schedule.status === "Paid" || schedule.status === "Canceled") {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Milestone is already paid or canceled" });
+                continue;
+            }
+
+            const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+            if (!recipient) {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Client has no email on file" });
+                continue;
+            }
+
+            try {
+                let qbInvoiceId = schedule.qbInvoiceId;
+                let qbTotal: number | undefined;
+
+                if (qbInvoiceId) {
+                    const status = await getQBInvoiceStatus(tokens, qbInvoiceId);
+                    qbTotal = status?.total;
+                } else {
+                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
+                    qbInvoiceId = pushRes.qbInvoiceId;
+                    qbTotal = pushRes.qbTotal;
+                }
+
+                if (!qbInvoiceId) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "Failed to create QuickBooks invoice" });
+                    continue;
+                }
+
+                // Drift Guard
+                if (qbTotal != null && Math.abs(qbTotal - Number(schedule.amount)) > 0.05) {
+                    skippedCount++;
+                    results.push({
+                        id: schedule.id,
+                        name: schedule.name,
+                        status: "skipped",
+                        error: `QuickBooks total $${qbTotal.toFixed(2)} ≠ milestone $${Number(schedule.amount).toFixed(2)} — review before sending`,
+                    });
+                    continue;
+                }
+
+                // Send QBO invoice
+                const sendRes = await sendQBInvoice(tokens, qbInvoiceId, recipient);
+                if (!sendRes.ok) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: sendRes.error || "QuickBooks send failed" });
+                    continue;
+                }
+
+                // Success -> update sent status
+                await prisma.paymentSchedule.update({
+                    where: { id: schedule.id },
+                    data: { qbInvoiceSentAt: new Date() },
+                });
+
+                sentCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "sent", sentTo: recipient });
+
+                // Log activity per sent milestone
+                if (invoice.projectId) {
+                    await logActivity({
+                        projectId: invoice.projectId,
+                        actorType: "TEAM",
+                        actorName: companyName,
+                        action: "sent_invoice",
+                        entityType: "invoice",
+                        entityId: invoiceId,
+                        entityName: `Invoice ${invoice.code}`,
+                        metadata: { milestone: schedule.name, sentTo: recipient },
+                    });
+                }
+            } catch (err: any) {
+                failedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
+            }
+        }
+
+        // If >= 1 successfully sent and invoice is Draft, flip to Issued
+        if (sentCount > 0 && invoice.status === "Draft") {
+            await prisma.invoice.update({
+                where: { id: invoiceId },
+                data: { status: "Issued", issueDate: new Date() },
+            });
+        }
+
+        if (invoice.projectId) {
+            revalidatePath(`/projects/${invoice.projectId}/invoices`);
+            revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+        }
+        revalidatePath(`/invoices`);
+        revalidatePath(`/portal`);
+
+        return {
+            success: sentCount > 0,
+            sent: sentCount,
+            failed: failedCount,
+            skipped: skippedCount,
+            results,
+        };
+    } catch (globalErr: any) {
+        return {
+            success: false,
+            sent: 0,
+            failed: 0,
+            skipped: 0,
+            results: [],
+            error: globalErr?.message || "An unexpected error occurred",
+        };
+    }
+}
+
 export async function getInvoiceForPortal(id: string) {
     const staffSession = await getServerSession(authOptions);
     const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
@@ -2543,19 +2714,44 @@ export async function markInvoiceViewed(invoiceId: string) {
         });
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
-        const settings = await getCompanySettings();
-        if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
-            await sendNotification(
-                settings.notificationEmail,
-                `👁️ Invoice Viewed — ${invoice.code}`,
-                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
-                    <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
-                        <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
-                        <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
-                    </div>
-                </div>`
-            );
+        try {
+            const settings = await getCompanySettings();
+            if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
+                const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+                const editorUrl = invoice.projectId ? `${appUrl}/projects/${invoice.projectId}/invoices/${invoiceId}` : `${appUrl}/invoices`;
+
+                let attachments: { filename: string; content: Buffer }[] | undefined = undefined;
+                try {
+                    const { generateInvoicePdf } = await import("./pdf");
+                    const pdfBuffer = await generateInvoicePdf(invoiceId);
+                    if (pdfBuffer) {
+                        attachments = [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }];
+                    }
+                } catch (e) {
+                    console.error("[markInvoiceViewed] PDF generation failed; sending without attachment:", e);
+                }
+
+                await sendNotification(
+                    settings.notificationEmail,
+                    `👁️ Invoice Viewed — ${invoice.code}`,
+                    `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                        <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
+                            <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
+                            <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                            <div style="text-align: center; margin: 16px 0;">
+                                <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
+                                    View Invoice
+                                </a>
+                            </div>
+                            ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of this invoice is attached.</p>` : ""}
+                        </div>
+                    </div>`,
+                    attachments
+                );
+            }
+        } catch (e) {
+            console.error("[markInvoiceViewed] Notification block failed:", e);
         }
         await logActivity({
             projectId: invoice.projectId,
@@ -2567,6 +2763,41 @@ export async function markInvoiceViewed(invoiceId: string) {
             entityName: `Invoice ${invoice.code}`,
         });
     }
+}
+
+export async function emailInvoiceCopyToMe(
+    invoiceId: string
+): Promise<{ success: boolean; sentTo?: string; error?: string }> {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    if (!user.email) return { success: false, error: "Your account has no email address" };
+
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: { code: true },
+    });
+    if (!invoice) return { success: false, error: "Invoice not found" };
+
+    let pdfBuffer: Buffer;
+    try {
+        const { generateInvoicePdf } = await import("./pdf");
+        pdfBuffer = await generateInvoicePdf(invoiceId);
+    } catch (e) {
+        console.error("[emailInvoiceCopyToMe] PDF generation failed:", e);
+        return { success: false, error: "Failed to generate invoice PDF" };
+    }
+
+    const result = await sendNotification(
+        user.email,
+        `Your copy — Invoice ${invoice.code}`,
+        `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
+            <p>Here is the copy of invoice <strong>${invoice.code}</strong> you requested. The PDF is attached.</p>
+        </div>`,
+        [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }]
+    );
+    if (!result.success) return { success: false, error: "Failed to send email" };
+    return { success: true, sentTo: user.email };
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
@@ -8779,6 +9010,24 @@ export async function createEstimateFromRoomDesign(roomId: string) {
     const { getFinish } = await import("@/lib/studio/materials");
     const { toInches } = await import("@/lib/studio/units");
 
+    const costCodes = await prisma.costCode.findMany({ where: { isActive: true } });
+    const costCodeMap = new Map(costCodes.map((cc) => [cc.code, cc.id]));
+
+    const getCostCodeId = (def: any, assetId: string) => {
+        const cat = def?.category;
+        if (cat === "cabinets") return costCodeMap.get("11-CABINET") ?? null;
+        if (cat === "appliances") return costCodeMap.get("18-APPLIANCE") ?? null;
+        if (cat === "doors-windows") return costCodeMap.get("14-DOOR") ?? null;
+        if (assetId === "fireplace") return costCodeMap.get("25-FIREPLACE") ?? costCodeMap.get("19-FIXTURE") ?? null;
+        if (assetId === "pony-wall" || assetId === "interior-wall" || assetId === "interior-wall-doorway") {
+            return costCodeMap.get("02-FRAME") ?? null;
+        }
+        if (cat === "fixtures") return costCodeMap.get("19-FIXTURE") ?? null;
+        if (cat === "lighting") return costCodeMap.get("19-FIXTURE") ?? costCodeMap.get("04-ELEC") ?? null;
+        if (cat === "furniture" || cat === "decor") return costCodeMap.get("19-FIXTURE") ?? null;
+        return null;
+    };
+
     const items: Array<{
         name: string;
         description: string;
@@ -8788,6 +9037,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         markupPercent: number;
         unitCost: number;
         total: number;
+        costCodeId: string | null;
     }> = [];
 
     let totalEstimate = 0;
@@ -8876,6 +9126,8 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         const total = unitCost * 1;
         totalEstimate += total;
 
+        const costCodeId = getCostCodeId(def, asset.assetId);
+
         items.push({
             name,
             description: detailsArray.join(" | "),
@@ -8885,6 +9137,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             markupPercent,
             unitCost,
             total,
+            costCodeId,
         });
     }
 
@@ -8920,6 +9173,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
                 unitCost: item.unitCost,
                 total: item.total,
                 order: idx,
+                costCodeId: item.costCodeId,
             },
         });
     }
