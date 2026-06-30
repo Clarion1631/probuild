@@ -501,6 +501,8 @@ model PaymentSchedule {
   qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt    DateTime?
+  qbInvoiceSentAt DateTime? // last time the QBO invoice email was sent to the client
+  qbSyncError   String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
 
   // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
   // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
