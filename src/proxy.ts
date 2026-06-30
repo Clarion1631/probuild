@@ -46,7 +46,8 @@ export const config = {
          * - _next/static (Static files)
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
+         * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };
