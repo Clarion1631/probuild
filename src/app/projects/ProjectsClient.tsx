@@ -300,8 +300,58 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
             {/* List View */}
             {viewMode === "list" && (
                 <>
-                    {/* Table */}
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    {/* Mobile card list (< lg) — the 10-column table is unreadable on touch */}
+                    <div className="lg:hidden space-y-3">
+                        {sortedProjects.map((project: any) => (
+                            <div key={project.id} className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+                                <div className="flex items-start gap-3">
+                                    <div className="w-1.5 self-stretch min-h-[2.5rem] rounded-full" style={{ backgroundColor: project.color || getStatusColor(project.status || "In Progress", statuses).replace("bg-", "").split("-")[0] }} />
+                                    <div className="flex-1 min-w-0">
+                                        <Link href={`/projects/${project.id}`} className="font-semibold text-slate-800 hover:text-indigo-600 transition block truncate">
+                                            {project.name}
+                                        </Link>
+                                        <div className="mt-1 flex items-center gap-2 text-sm text-slate-600">
+                                            <div className="w-5 h-5 rounded-full bg-[#34d399] flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                                                {(project.client?.name || "?")[0].toUpperCase()}
+                                            </div>
+                                            <span className="truncate">{project.client?.name || "No Client"}</span>
+                                        </div>
+                                        <div className="mt-1 text-xs text-slate-500">
+                                            {project.location ? `${project.location} · ` : ""}{new Date(project.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="mt-3">
+                                    <select
+                                        value={project.status || "In Progress"}
+                                        onChange={e => handleStatusChange(project.id, e.target.value)}
+                                        disabled={updatingId === project.id}
+                                        className={`w-full text-xs font-semibold rounded-full px-3 py-2 border border-slate-200 focus:ring-2 focus:ring-indigo-200 transition disabled:opacity-50 appearance-none bg-white ${getStatusColor(project.status || "In Progress", statuses).replace("bg-", "text-").replace("100", "700")}`}
+                                    >
+                                        {activeStatuses.map(s => (
+                                            <option key={s.value} value={s.value}>• {s.label}</option>
+                                        ))}
+                                        <option disabled>────────</option>
+                                        <option value="Manage Status">⚙ Manage Status</option>
+                                    </select>
+                                </div>
+                            </div>
+                        ))}
+                        {sortedProjects.length === 0 && (
+                            <div className="bg-white rounded-xl shadow-sm border border-slate-200 py-16 text-center">
+                                <div className="flex flex-col items-center gap-3">
+                                    <div className="w-14 h-14 bg-gradient-to-br from-slate-100 to-slate-50 rounded-2xl flex items-center justify-center">
+                                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                                    </div>
+                                    <p className="text-sm font-medium text-slate-400">No projects match your filters</p>
+                                    <button onClick={() => { setSelectedStatuses(OPEN_PROJECT_STATUSES); setSearch(""); }} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">Reset filters</button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Table (>= lg) */}
+                    <div className="hidden lg:block bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
                         <table className="w-full text-left bg-white text-sm">
                             <thead>
                                 <tr className="border-b border-slate-200">

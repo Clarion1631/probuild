@@ -507,6 +507,8 @@ model PaymentSchedule {
   qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt    DateTime?
+  qbInvoiceSentAt DateTime? // last time the QBO invoice email was sent to the client
+  qbSyncError   String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
 
   // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
   // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
@@ -637,12 +639,20 @@ model Contract {
   approvedAt        DateTime?
   approvalIp        String?
   approvalUserAgent String?
-  signatureUrl      String? // PNG data URL of drawn signature
+  signatureUrl      String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
 
   // Contractor signing fields
   contractorSignedBy       String?
   contractorSignedAt       DateTime?
-  contractorSignatureUrl   String? // PNG data URL of contractor's drawn signature
+  contractorSignatureUrl   String? // Supabase Storage URL of the contractor's drawn signature (legacy rows may hold an inline data-URL)
+
+  // Company countersignature (executed AFTER the customer signs — see countersignContractAsCompany)
+  requiresCountersign Boolean   @default(false) // when true, contract isn't Finalized until the company countersigns
+  companySignedBy     String?
+  companySignedAt     DateTime?
+  companySignatureUrl String? // Supabase Storage URL of the company signature (NOT an inline data-URL)
+  signedPdfPath       String? // Supabase Storage path of the client-signed intermediate PDF (held until countersign)
+  originalPdfPath     String? // Supabase Storage path of the uploaded original PDF contract
 
   // Sending
   sentAt   DateTime?
@@ -671,7 +681,7 @@ model ContractSigningRecord {
 
   signedBy     String // Full legal name
   signedAt     DateTime @default(now())
-  signatureUrl String? // PNG data URL of drawn signature
+  signatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
   ipAddress    String?
   userAgent    String?
 
@@ -733,6 +743,9 @@ model CompanySettings {
 
   // Notification event toggles
   notificationToggles String? // JSON: {newLead, estimateViewed, estimateSigned, contractSigned, invoiceViewed, paymentReceived, messageReceived}
+
+  // Contract signing
+  requireContractCountersign Boolean @default(false) // default for a new contract's requiresCountersign
 
   updatedAt DateTime @updatedAt
 }
@@ -1157,10 +1170,17 @@ model ChangeOrder {
   termsAndConditions String?
   memos              String?
 
-  clientSignatureUrl  String?
-  companySignatureUrl String?
+  // Customer approval (set by approveChangeOrder — portal/magic-link signer)
+  clientSignatureUrl  String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
   approvedBy          String?
   approvedAt          DateTime?
+
+  // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
+  // Separate fields so countersigning never overwrites the customer's approval/audit trail.
+  companySignatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
+  companySignedBy     String?
+  companySignedAt     DateTime?
+
   sentAt              DateTime?
   viewedAt            DateTime?
 

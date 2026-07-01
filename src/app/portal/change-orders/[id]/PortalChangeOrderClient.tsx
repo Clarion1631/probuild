@@ -161,6 +161,30 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     )}
 
+                    {/* Company Countersignature */}
+                    {initialData.companySignedBy && (
+                        <div className="mx-10 mt-4 p-5 bg-slate-50 border border-slate-200 rounded-lg">
+                            <div className="flex items-start gap-3">
+                                <div className="w-8 h-8 bg-amber-100 rounded-full flex items-center justify-center shrink-0">
+                                    <svg className="h-4 w-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
+                                </div>
+                                <div>
+                                    <h3 className="text-sm font-semibold text-slate-800">Countersigned by {companyName}</h3>
+                                    <p className="text-sm text-slate-700 mt-0.5">Signed by: <strong>{initialData.companySignedBy}</strong></p>
+                                    {initialData.companySignedAt && (
+                                        <p className="text-xs text-slate-500 mt-0.5">{new Date(initialData.companySignedAt).toLocaleString()}</p>
+                                    )}
+                                </div>
+                            </div>
+                            {initialData.companySignatureUrl && (
+                                <div className="mt-4 pt-4 border-t border-slate-200 flex flex-col items-start">
+                                    <span className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Electronic Signature</span>
+                                    <img src={initialData.companySignatureUrl} alt="Company signature" className="h-16 object-contain mix-blend-multiply" />
+                                </div>
+                            )}
+                        </div>
+                    )}
+
                     {/* Line Items Table */}
                     <div className="px-10 py-8">
                         <table className="w-full text-sm">

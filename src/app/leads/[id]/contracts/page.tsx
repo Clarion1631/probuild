@@ -2,6 +2,7 @@ import { getLead, getDocumentTemplates } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import EntityContractsClient from "@/components/EntityContractsClient";
+import { getSupabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
@@ -45,6 +46,13 @@ export default async function LeadContractsPage({ params, searchParams }: {
         select: { name: true, url: true },
     });
 
+    const supabase = getSupabase();
+    const findOriginalPdfUrl = (originalPdfPath: string | null) => {
+        if (!originalPdfPath || !supabase) return null;
+        const { data } = supabase.storage.from("project-files").getPublicUrl(originalPdfPath);
+        return data?.publicUrl || null;
+    };
+
     const findExecutedPdfUrl = (contractId: string, title: string) => {
         const exactName = `Executed_Contract_${contractId}.pdf`;
         const byId = executedFiles.find(f => f.name === exactName);
@@ -54,7 +62,11 @@ export default async function LeadContractsPage({ params, searchParams }: {
     };
 
     const serialized = JSON.parse(JSON.stringify(
-        contracts.map(c => ({ ...c, executedPdfUrl: findExecutedPdfUrl(c.id, c.title) }))
+        contracts.map(c => ({
+            ...c,
+            executedPdfUrl: findExecutedPdfUrl(c.id, c.title),
+            originalPdfUrl: findOriginalPdfUrl(c.originalPdfPath)
+        }))
     ));
 
     const linkedEntity = linkedProjectId

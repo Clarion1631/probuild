@@ -6,15 +6,20 @@ import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
 import { cache } from "react";
 import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
-import { safeEstimateSelect, toNum } from "./prisma-helpers";
+import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
+import { headers } from "next/headers";
+import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
+import { appendContractCountersignaturePage } from "./pdf";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -28,12 +33,33 @@ function isNotificationEnabled(settings: { notificationToggles?: string | null }
     }
 }
 
-// Build a CC array for a secondary client email (spouse/partner).
-// Returns undefined when additionalEmail is absent, empty, or identical to the primary (case-insensitive).
-function buildCc(primaryEmail: string, additionalEmail?: string | null): string[] | undefined {
-    if (!additionalEmail) return undefined;
-    if (additionalEmail.toLowerCase() === primaryEmail.toLowerCase()) return undefined;
-    return [additionalEmail];
+// Build a CC array from any number of candidate addresses (spouse/partner, lead manager,
+// send-time extras). Drops blanks, the primary recipient, and case-insensitive duplicates.
+// Returns undefined when nothing is left to CC.
+function buildCc(primaryEmail: string, ...candidates: (string | null | undefined)[]): string[] | undefined {
+    const primary = (primaryEmail || "").trim().toLowerCase();
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of candidates) {
+        const e = c?.trim();
+        if (!e) continue;
+        const key = e.toLowerCase();
+        if (key === primary || seen.has(key)) continue;
+        seen.add(key);
+        out.push(e);
+    }
+    return out.length ? out : undefined;
+}
+
+// Best-effort client IP for the e-signature audit trail. Server actions can read request
+// headers via next/headers; behind Vercel the client IP is the first x-forwarded-for hop.
+async function getRequestIp(): Promise<string | null> {
+    try {
+        const h = await headers();
+        return h.get("x-forwarded-for")?.split(",")[0]?.trim() || h.get("x-real-ip") || null;
+    } catch {
+        return null;
+    }
 }
 
 // Safe estimate include that omits columns not yet migrated to the database.
@@ -2578,6 +2604,259 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
     return { success: true, sentTo: recipientEmail };
 }
 
+export async function sendMilestoneInvoices(
+    invoiceId: string,
+    paymentScheduleIds: string[],
+    overrideEmail?: string,
+    // Per-milestone reconcile intents the user explicitly confirmed in the review
+    // step: scheduleId -> the QBO total they saw and approved. Doubles as an
+    // optimistic-lock token (we only reconcile if the live QBO total still matches).
+    opts?: { reconcile?: Record<string, number> },
+): Promise<{
+    success: boolean;
+    sent: number;
+    failed: number;
+    skipped: number;
+    // True when one or more selected milestones drifted from QBO and were NOT sent;
+    // the modal flips into the side-by-side review step using driftReview.
+    needsReview?: boolean;
+    driftReview?: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }>;
+    results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }>;
+    error?: string;
+}> {
+    const actor = await assertInvoicePermission();
+
+    try {
+        const invoice = await prisma.invoice.findUnique({
+            where: { id: invoiceId },
+            include: {
+                project: { include: { client: true } },
+                client: true,
+                payments: true,
+            },
+        });
+        if (!invoice) return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "Invoice not found" };
+
+        const allPayments = invoice.payments;
+        const selectedPayments = allPayments.filter(p => paymentScheduleIds.includes(p.id));
+        if (selectedPayments.length === 0) {
+            return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "No milestones selected" };
+        }
+
+        const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
+        const { sendQBInvoice, getQBInvoiceStatus } = await import("./quickbooks");
+
+        let tokens;
+        try {
+            tokens = await getFreshQBTokens();
+        } catch (qbErr: any) {
+            return {
+                success: false,
+                sent: 0,
+                failed: 0,
+                skipped: 0,
+                results: [],
+                error: qbErr instanceof Error ? qbErr.message : "QuickBooks is not connected.",
+            };
+        }
+
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const companyName = settings?.companyName || "Your Contractor";
+
+        let sentCount = 0;
+        let failedCount = 0;
+        let skippedCount = 0;
+        let reconciledEstimate = false;
+        const results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }> = [];
+        const driftReview: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }> = [];
+
+        for (const schedule of selectedPayments) {
+            if (schedule.status === "Paid" || schedule.status === "Canceled") {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Milestone is already paid or canceled" });
+                continue;
+            }
+
+            const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+            if (!recipient) {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Client has no email on file" });
+                continue;
+            }
+
+            try {
+                let qbInvoiceId = schedule.qbInvoiceId;
+                let qbTotal: number | undefined;
+
+                if (qbInvoiceId) {
+                    const status = await getQBInvoiceStatus(tokens, qbInvoiceId);
+                    qbTotal = status?.total;
+                } else {
+                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
+                    qbInvoiceId = pushRes.qbInvoiceId;
+                    qbTotal = pushRes.qbTotal;
+                }
+
+                if (!qbInvoiceId) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "Failed to create QuickBooks invoice" });
+                    continue;
+                }
+
+                // Fail closed if we couldn't read the QBO total — the Drift Guard can't
+                // vouch for the amount, so don't send an unverified invoice (a transient
+                // QBO read failure must not bypass the guard).
+                if (qbTotal == null) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "Couldn't read the QuickBooks total to verify the amount — please try again." });
+                    continue;
+                }
+                // A $0/negative QBO total means the invoice is voided or deleted.
+                if (qbTotal <= 0) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "QuickBooks shows $0.00 for this invoice (it may be voided or deleted) — re-push before sending." });
+                    continue;
+                }
+
+                // Drift Guard: QBO is the system of record for what the client is
+                // charged. If it has drifted from the ProBuild milestone, do not send
+                // until the user reviews and explicitly approves reconciling ProBuild
+                // to the QBO total (optimistic-locked to the exact qbTotal they saw).
+                if (Math.abs(qbTotal - Number(schedule.amount)) > 0.05) {
+                    const approved = opts?.reconcile?.[schedule.id];
+                    // Cent-exact match: only reconcile the precise total the user approved.
+                    const userApprovedThisTotal = approved != null && Math.abs(approved - qbTotal) <= 0.005;
+
+                    if (!userApprovedThisTotal) {
+                        // Phase 1 (or a stale confirmation): surface for review, do NOT send.
+                        driftReview.push({
+                            id: schedule.id,
+                            name: schedule.name,
+                            probuildAmount: Number(schedule.amount),
+                            qbTotal,
+                            direction: qbTotal > Number(schedule.amount) ? "higher" : "lower",
+                        });
+                        skippedCount++;
+                        results.push({
+                            id: schedule.id,
+                            name: schedule.name,
+                            status: "skipped",
+                            error: `QuickBooks total $${qbTotal.toFixed(2)} ≠ milestone $${Number(schedule.amount).toFixed(2)} — review before sending`,
+                        });
+                        continue;
+                    }
+
+                    // Phase 2: authorized + confirmed + still current → reconcile ProBuild to QBO.
+                    const recon = await reconcileMilestoneToQbo(schedule.id, qbTotal);
+                    if (!recon.ok) {
+                        failedCount++;
+                        results.push({ id: schedule.id, name: schedule.name, status: "failed", error: recon.error || "Failed to reconcile milestone" });
+                        continue;
+                    }
+                    if (recon.estimateTouched) reconciledEstimate = true;
+
+                    if (invoice.projectId) {
+                        await logActivity({
+                            projectId: invoice.projectId,
+                            actorType: "TEAM",
+                            actorName: actor.name || companyName,
+                            action: "reconciled_milestone_amount",
+                            entityType: "invoice",
+                            entityId: invoiceId,
+                            entityName: `Invoice ${invoice.code}`,
+                            metadata: { milestone: schedule.name, from: recon.oldAmount, to: recon.newAmount, source: "quickbooks" },
+                        });
+                    }
+                    // schedule.amount is now stale in memory; the QBO total matches the
+                    // reconciled amount, so fall through to send. Mark the result below.
+                }
+
+                const approvedTotal = opts?.reconcile?.[schedule.id];
+                const wasReconciled = Math.abs(qbTotal - Number(schedule.amount)) > 0.05
+                    && approvedTotal != null
+                    && Math.abs(approvedTotal - qbTotal) <= 0.005;
+
+                // Send QBO invoice
+                const sendRes = await sendQBInvoice(tokens, qbInvoiceId, recipient);
+                if (!sendRes.ok) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: sendRes.error || "QuickBooks send failed" });
+                    continue;
+                }
+
+                // Success -> update sent status
+                await prisma.paymentSchedule.update({
+                    where: { id: schedule.id },
+                    data: { qbInvoiceSentAt: new Date() },
+                });
+
+                sentCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: wasReconciled ? "reconciled" : "sent", sentTo: recipient });
+
+                // Log activity per sent milestone
+                if (invoice.projectId) {
+                    await logActivity({
+                        projectId: invoice.projectId,
+                        actorType: "TEAM",
+                        actorName: companyName,
+                        action: "sent_invoice",
+                        entityType: "invoice",
+                        entityId: invoiceId,
+                        entityName: `Invoice ${invoice.code}`,
+                        metadata: { milestone: schedule.name, sentTo: recipient },
+                    });
+                }
+            } catch (err: any) {
+                failedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
+            }
+        }
+
+        // If >= 1 successfully sent and invoice is Draft, flip to Issued
+        if (sentCount > 0 && invoice.status === "Draft") {
+            await prisma.invoice.update({
+                where: { id: invoiceId },
+                data: { status: "Issued", issueDate: new Date() },
+            });
+        }
+
+        if (invoice.projectId) {
+            revalidatePath(`/projects/${invoice.projectId}/invoices`);
+            revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+            // A reconcile rewrites the linked estimate + its totals — refresh those views too.
+            if (reconciledEstimate) {
+                revalidatePath(`/projects/${invoice.projectId}/estimates`);
+                if (invoice.estimateId) revalidatePath(`/projects/${invoice.projectId}/estimates/${invoice.estimateId}`);
+            }
+        }
+        revalidatePath(`/invoices`);
+        revalidatePath(`/portal`);
+        if (reconciledEstimate) {
+            revalidatePath(`/estimates`);
+            revalidatePath(`/reports/sales-tax`);
+        }
+
+        return {
+            success: sentCount > 0,
+            sent: sentCount,
+            failed: failedCount,
+            skipped: skippedCount,
+            needsReview: driftReview.length > 0,
+            driftReview: driftReview.length > 0 ? driftReview : undefined,
+            results,
+        };
+    } catch (globalErr: any) {
+        return {
+            success: false,
+            sent: 0,
+            failed: 0,
+            skipped: 0,
+            results: [],
+            error: globalErr?.message || "An unexpected error occurred",
+        };
+    }
+}
+
 export async function getInvoiceForPortal(id: string) {
     const staffSession = await getServerSession(authOptions);
     const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
@@ -2652,19 +2931,44 @@ export async function markInvoiceViewed(invoiceId: string) {
         });
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
-        const settings = await getCompanySettings();
-        if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
-            await sendNotification(
-                settings.notificationEmail,
-                `👁️ Invoice Viewed — ${invoice.code}`,
-                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
-                    <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
-                        <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
-                        <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
-                    </div>
-                </div>`
-            );
+        try {
+            const settings = await getCompanySettings();
+            if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
+                const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+                const editorUrl = invoice.projectId ? `${appUrl}/projects/${invoice.projectId}/invoices/${invoiceId}` : `${appUrl}/invoices`;
+
+                let attachments: { filename: string; content: Buffer }[] | undefined = undefined;
+                try {
+                    const { generateInvoicePdf } = await import("./pdf");
+                    const pdfBuffer = await generateInvoicePdf(invoiceId);
+                    if (pdfBuffer) {
+                        attachments = [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }];
+                    }
+                } catch (e) {
+                    console.error("[markInvoiceViewed] PDF generation failed; sending without attachment:", e);
+                }
+
+                await sendNotification(
+                    settings.notificationEmail,
+                    `👁️ Invoice Viewed — ${invoice.code}`,
+                    `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                        <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
+                            <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
+                            <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                            <div style="text-align: center; margin: 16px 0;">
+                                <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
+                                    View Invoice
+                                </a>
+                            </div>
+                            ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of this invoice is attached.</p>` : ""}
+                        </div>
+                    </div>`,
+                    attachments
+                );
+            }
+        } catch (e) {
+            console.error("[markInvoiceViewed] Notification block failed:", e);
         }
         await logActivity({
             projectId: invoice.projectId,
@@ -2676,6 +2980,41 @@ export async function markInvoiceViewed(invoiceId: string) {
             entityName: `Invoice ${invoice.code}`,
         });
     }
+}
+
+export async function emailInvoiceCopyToMe(
+    invoiceId: string
+): Promise<{ success: boolean; sentTo?: string; error?: string }> {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    if (!user.email) return { success: false, error: "Your account has no email address" };
+
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: { code: true },
+    });
+    if (!invoice) return { success: false, error: "Invoice not found" };
+
+    let pdfBuffer: Buffer;
+    try {
+        const { generateInvoicePdf } = await import("./pdf");
+        pdfBuffer = await generateInvoicePdf(invoiceId);
+    } catch (e) {
+        console.error("[emailInvoiceCopyToMe] PDF generation failed:", e);
+        return { success: false, error: "Failed to generate invoice PDF" };
+    }
+
+    const result = await sendNotification(
+        user.email,
+        `Your copy — Invoice ${invoice.code}`,
+        `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
+            <p>Here is the copy of invoice <strong>${invoice.code}</strong> you requested. The PDF is attached.</p>
+        </div>`,
+        [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }]
+    );
+    if (!result.success) return { success: false, error: "Failed to send email" };
+    return { success: true, sentTo: user.email };
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
@@ -3027,18 +3366,6 @@ async function getDefaultSalesTaxRate(): Promise<number> {
     } catch {
         return 0;
     }
-}
-
-// Reverse-out tax from a total (total = subtotal + subtotal * rate/100).
-// If exempt or rate <= 0, the whole amount is subtotal and taxAmount is 0.
-function deriveInvoiceTaxFields(totalAmount: number, ratePercent: number, isExempt: boolean) {
-    if (isExempt || ratePercent <= 0) {
-        return { subtotal: totalAmount, taxRate: 0, taxAmount: 0 };
-    }
-    const factor = ratePercent / (100 + ratePercent);
-    const taxAmount = Math.round(totalAmount * factor * 100) / 100;
-    const subtotal = Math.round((totalAmount - taxAmount) * 100) / 100;
-    return { subtotal, taxRate: ratePercent, taxAmount };
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
@@ -3481,6 +3808,86 @@ export async function refreshQBPayments(invoiceId: string) {
         }
     }
     return result;
+}
+
+/**
+ * Break a milestone's link to a voided/deleted QuickBooks invoice so it can be
+ * re-sent from scratch. Clears the QB tracking fields ONLY — never touches money
+ * state. The Paid/qbPaymentId refusal guards are the money-path safety boundary:
+ * clearing these fields on a Pending milestone changes no status, fires no
+ * notifyMilestonePaid, and doesn't touch the estimate mirror (which has no QB fields).
+ *
+ * `deleteInQBO` is wired for a future "also delete in QuickBooks" toggle but defaults
+ * OFF — we never issue a destructive QBO write (voided invoices are often kept as a
+ * deliberate audit record; a deleted one is already gone).
+ */
+export async function breakQBInvoiceLink(
+    paymentId: string,
+    opts?: { deleteInQBO?: boolean },
+): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
+    await assertInvoicePermission();
+
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentId },
+        select: {
+            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            invoiceId: true, invoice: { select: { projectId: true } },
+        },
+    });
+    if (!schedule) return { success: false, error: "Milestone not found" };
+    if (schedule.status === "Paid") {
+        return { success: false, error: "This milestone is already paid — unlinking is blocked. Use Undo first if you need to reverse it." };
+    }
+    if (schedule.qbPaymentId) {
+        return { success: false, error: "A QuickBooks payment is recorded against this milestone. Refusing to unlink." };
+    }
+    if (!schedule.qbInvoiceId) {
+        return { success: false, error: "This milestone has no QuickBooks link to break." };
+    }
+
+    // Claim the unlink atomically: the guard fields go in the WHERE, so if the QB
+    // sync settles this milestone (status→Paid, qbPaymentId set) between the read
+    // above and this write, the claim matches 0 rows and we never strip QB fields
+    // off a now-paid row. `qbInvoiceId` is pinned to the value we read so a
+    // concurrent re-push (new id) can't be clobbered either.
+    const cleared = await prisma.paymentSchedule.updateMany({
+        where: {
+            id: schedule.id,
+            status: { not: "Paid" },
+            qbPaymentId: null,
+            qbInvoiceId: schedule.qbInvoiceId,
+        },
+        data: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            qbInvoiceSentAt: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+        },
+    });
+    if (cleared.count !== 1) {
+        return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+    }
+
+    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
+    // Default OFF — we never issue a destructive QBO write unless asked.
+    let warning: string | undefined;
+    if (opts?.deleteInQBO === true) {
+        try {
+            const { getFreshQBTokens } = await import("./quickbooks-payments");
+            const { deleteQBInvoice } = await import("./quickbooks");
+            const tokens = await getFreshQBTokens();
+            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
+            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
+        } catch {
+            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
+        }
+    }
+
+    revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    return { success: true, warning };
 }
 
 export async function recordEstimatePayment(
@@ -4904,6 +5311,17 @@ function bodyHasContractorBlock(body: string): boolean {
     return /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|data-merge-field=["']CONTRACTOR_SIGNATURE_BLOCK["']/i.test(body || "");
 }
 
+// Save-time guard for the author↔portal signing-field handshake.
+// The portal and PDF rendering locate signing blocks by grepping for the raw {{KEY}} form.
+// If an un-normalized TipTap <span data-merge-field="KEY">…</span> ever reaches the saved
+// body (editor bug, pasted content, template drift), the portal would find nothing and the
+// signature fields would silently vanish for the customer. Normalizing any remaining
+// merge-field spans back to {{KEY}} on save closes that failure class. (Data merge fields are
+// already resolved to values before this runs; only unresolved/signing keys remain as spans.)
+function normalizeContractBody(body: string): string {
+    return (body || "").replace(/<span[^>]*data-merge-field=["'](\w+)["'][^>]*>[\s\S]*?<\/span>/g, "{{$1}}");
+}
+
 function escapeEmailHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -5146,12 +5564,16 @@ export async function createContractFromTemplate(
         context.type === "lead" ? context.id : null
     );
 
-    const resolvedBody = resolveMergeFields(template.body, mergeData);
+    const resolvedBody = normalizeContractBody(resolveMergeFields(template.body, mergeData));
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
 
     const contract = await prisma.contract.create({
         data: {
             title: titleOverride || template.name,
             body: resolvedBody,
+            // Recurring docs (e.g. lien releases) cycle status back to "Sent" each period and never
+            // reach a stable "Signed" state, so they can't support countersign — force it off.
+            requiresCountersign: (recurringDays && recurringDays > 0) ? false : (coSettings?.requireContractCountersign ?? false),
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
             ...(recurringDays && recurringDays > 0 ? {
                 recurringDays,
@@ -5176,12 +5598,14 @@ export async function createContractBlank(
         context.type === "lead" ? context.id : null
     );
 
-    const resolvedBody = resolveMergeFields(body, mergeData);
+    const resolvedBody = normalizeContractBody(resolveMergeFields(body, mergeData));
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
 
     const contract = await prisma.contract.create({
         data: {
             title,
             body: resolvedBody,
+            requiresCountersign: coSettings?.requireContractCountersign ?? false,
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
         }
     });
@@ -5192,8 +5616,48 @@ export async function createContractBlank(
     return contract;
 }
 
-export async function updateContract(id: string, data: { title?: string; body?: string; status?: string }) {
-    const contract = await prisma.contract.update({ where: { id }, data });
+export async function createContractFromPdf(
+    context: { type: "project" | "lead"; id: string },
+    title: string,
+    originalPdfPath: string
+) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || !["ADMIN", "MANAGER"].includes(user.role)) throw new Error("Forbidden");
+
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
+
+    const contract = await prisma.contract.create({
+        data: {
+            title,
+            body: "", // Empty HTML body for PDF contracts
+            originalPdfPath,
+            requiresCountersign: coSettings?.requireContractCountersign ?? false,
+            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
+            status: "Draft",
+        }
+    });
+
+    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
+    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
+
+    return contract;
+}
+
+export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    const existing = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
+    if (existing && ["Signed", "Finalized"].includes(existing.status)) {
+        if (data.title !== undefined || data.body !== undefined) {
+            throw new Error("Cannot edit a contract that has already been signed or finalized");
+        }
+    }
+
+    // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
+    // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
+    const safeData = { ...data };
+    if (typeof safeData.body === "string") safeData.body = normalizeContractBody(safeData.body);
+    const contract = await prisma.contract.update({ where: { id }, data: safeData });
     revalidatePath(`/`);
     return contract;
 }
@@ -5205,12 +5669,12 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
+            project: { include: { client: true, manager: { select: { email: true } } } },
+            lead: { include: { client: true, manager: { select: { email: true } } } },
         }
     });
 
@@ -5280,7 +5744,12 @@ export async function sendContractToClient(contractId: string) {
     const logoHtml = companyLogo ? `<img src="${encodeURI(companyLogo)}" alt="${safeCompany}" style="max-height:56px;width:auto;margin:0 auto 8px;display:block;" />` : "";
     const licenseHtml = safeLicense ? `<p style="font-size:12px;color:#64748b;margin:4px 0 0;">Lic# ${safeLicense}</p>` : "";
 
-    const contractCc = buildCc(client.email, (client as any).additionalEmail);
+    // CC: an explicit send-time override if the user edited it, otherwise the durable
+    // auto-set — the client's additional email (spouse) + the assigned lead/project manager.
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const contractCc = ccOverride !== undefined
+        ? buildCc(client.email, ...ccOverride)
+        : buildCc(client.email, (client as any).additionalEmail, managerEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a contract to review`,
@@ -5324,6 +5793,29 @@ export async function sendContractToClient(contractId: string) {
     return { success: true, sentTo: client.email, clientName: client.name };
 }
 
+// Prefill for the "Send contract" dialog: the primary recipient + the default CC set
+// (additional client email + assigned manager) that the user can edit before sending.
+export async function getContractSendDefaults(contractId: string): Promise<{ toEmail: string | null; autoCc: string[] }> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER", "FINANCE"].includes(caller.role)) throw new Error("Forbidden");
+
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: { select: { email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+            lead: { include: { client: { select: { email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+        },
+    });
+    if (!contract) throw new Error("Contract not found");
+    const client = contract.project?.client || contract.lead?.client;
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const autoCc = buildCc(client?.email || "", client?.additionalEmail, managerEmail) || [];
+    return { toEmail: client?.email || null, autoCc };
+}
+
 export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -5341,21 +5833,143 @@ export async function signContractAsContractor(contractId: string, signerName: s
     const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { id: true } });
     if (!existing) throw new Error("Contract not found");
 
-    // Atomic idempotency guard — updateMany only matches rows where contractorSignedAt IS NULL,
-    // so two concurrent requests can't both succeed (eliminates TOCTOU race)
-    const result = await prisma.contract.updateMany({
-        where: { id: contractId, contractorSignedAt: null },
-        data: {
-            contractorSignedBy: signerName,
-            contractorSignedAt: new Date(),
-            contractorSignatureUrl: signatureDataUrl,
-        },
+    // Move the signature image out of the DB column into Supabase Storage (avoids the
+    // PgBouncer pooler message-size error on large high-DPI data-URLs). Falls back to the
+    // raw data-URL when Storage isn't configured. See persistSignature().
+    const contractorSignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    const ip = await getRequestIp();
+    const signedAt = new Date();
+
+    // Atomic idempotency guard + audit insert share a transaction so a failed audit insert rolls
+    // the signature write back too — a retry then redoes BOTH (never leaves contractorSignedAt set
+    // with no audit row). updateMany only matches rows where contractorSignedAt IS NULL, so two
+    // concurrent requests can't both succeed (eliminates TOCTOU race).
+    await prisma.$transaction(async (tx) => {
+        const guard = await tx.contract.updateMany({
+            where: { id: contractId, contractorSignedAt: null },
+            data: {
+                contractorSignedBy: signerName,
+                contractorSignedAt: signedAt,
+                contractorSignatureUrl,
+            },
+        });
+        if (guard.count === 0) throw new Error("Contract already signed by contractor");
+        // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
+        await tx.contractSigningRecord.create({
+            data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+        });
     });
-    if (result.count === 0) throw new Error("Contract already signed by contractor");
+
+    try {
+        await updateExecutedPdfIfFinalized(contractId, ip);
+    } catch (err) {
+        console.error("[signContractAsContractor] failed to update executed PDF:", err);
+    }
 
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
     return { success: true };
+}
+
+async function updateExecutedPdfIfFinalized(contractId: string, ip: string | null) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true, manager: true } },
+            lead: { include: { client: true, manager: true } },
+        },
+    });
+
+    if (!contract || contract.status !== "Finalized" || !contract.originalPdfPath) {
+        return;
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    // 1. Download original PDF
+    const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
+    if (dlErr || !dl) throw new Error("Could not load original PDF contract");
+    const originalBuffer = Buffer.from(await dl.arrayBuffer());
+
+    // 2. Generate updated PDF
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    
+    // Decide company/contractor values to show on Certificate of Execution.
+    // We prefer the company countersignature if it exists, otherwise fall back to contractor signature.
+    const companySignedBy = contract.companySignedBy || contract.contractorSignedBy;
+    const companySignedAt = contract.companySignedAt || contract.contractorSignedAt;
+    const companySignatureUrl = contract.companySignatureUrl || contract.contractorSignatureUrl;
+    const companyIp = contract.companySignedAt ? "Stored" : (contract.contractorSignedAt ? (ip || "0.0.0.0") : undefined);
+
+    const updatedPdfBuffer = await appendContractCountersignaturePage(originalBuffer, {
+        companyName: settings?.companyName || "Company",
+        contractTitle: contract.title,
+        clientSignedBy: contract.approvedBy,
+        clientSignedAt: contract.approvedAt,
+        clientIp: contract.approvalIp || "0.0.0.0",
+        clientSignatureValue: contract.signatureUrl,
+        companySignedBy: companySignedBy || undefined,
+        companySignedAt: companySignedAt || undefined,
+        companyIp: companyIp || undefined,
+        companySignatureValue: companySignatureUrl || undefined,
+    });
+
+    // 3. Find the existing executed file
+    const fileName = `Executed_Contract_${contract.id}.pdf`;
+    const existingFile = await prisma.projectFile.findFirst({
+        where: {
+            name: fileName,
+            ...(contract.projectId ? { projectId: contract.projectId } : { leadId: contract.leadId }),
+        },
+        orderBy: { createdAt: "desc" },
+    });
+
+    // 4. Delete the old file from Storage if it exists
+    if (existingFile?.url) {
+        const match = existingFile.url.match(/\/project-files\/(.+)$/);
+        if (match) {
+            const oldStoragePath = decodeURIComponent(match[1]);
+            try {
+                await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+            } catch (removeErr) {
+                console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+            }
+        }
+        // Delete the old DB record
+        await prisma.projectFile.delete({
+            where: { id: existingFile.id }
+        });
+    }
+
+    // 5. Archive the new PDF (creates a new ProjectFile record and uploads it)
+    const archived = await archiveExecutedContractPdf(
+        { id: contract.id, title: contract.title, projectId: contract.projectId, leadId: contract.leadId },
+        updatedPdfBuffer
+    );
+
+    // 6. Send the executed contract emails with the new PDF (best-effort)
+    const client = contract.project?.client || contract.lead?.client;
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const cc = buildCc(client?.email || "", client?.additionalEmail, managerEmail);
+    const companyEmail = settings?.notificationEmail || settings?.email;
+
+    try {
+        await sendExecutedContractEmails({
+            contractTitle: contract.title,
+            buffer: updatedPdfBuffer,
+            fileName: archived.fileName,
+            publicUrl: archived.publicUrl,
+            clientEmail: client?.email,
+            clientName: client?.name,
+            cc,
+            companyName: settings?.companyName || "ProBuild",
+            companyEmail,
+            replyTo: settings?.email,
+        });
+    } catch (emailErr) {
+        console.error("[updateExecutedPdfIfFinalized] failed to send executed email:", emailErr);
+    }
 }
 
 export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, accessToken?: string) {
@@ -5413,6 +6027,12 @@ export async function approveContract(contractId: string, signatureName: string,
         ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
         : contract.sentAt || contract.createdAt;
 
+    // Persist the signature image to Storage BEFORE the transaction so the network upload
+    // stays out of the DB tx. The same URL is written to both the Contract and the
+    // ContractSigningRecord audit row. Falls back to the data-URL when Storage is absent.
+    const signatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const ip = await getRequestIp();
+
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
             const transition = await tx.contract.updateMany({
@@ -5425,7 +6045,8 @@ export async function approveContract(contractId: string, signatureName: string,
                     approvedBy: signatureName,
                     approvedAt: now,
                     approvalUserAgent: userAgent,
-                    signatureUrl: signatureDataUrl || null,
+                    approvalIp: ip,
+                    signatureUrl,
                 },
             });
             if (transition.count === 0) {
@@ -5443,7 +6064,8 @@ export async function approveContract(contractId: string, signatureName: string,
                     approvedBy: signatureName,
                     approvedAt: now,
                     approvalUserAgent: userAgent,
-                    signatureUrl: signatureDataUrl || null,
+                    approvalIp: ip,
+                    signatureUrl,
                     status: "Sent", // Reset to Sent so it can be signed again next cycle
                     viewedAt: null,
                     nextDueDate: nextDue,
@@ -5458,8 +6080,9 @@ export async function approveContract(contractId: string, signatureName: string,
                 contractId,
                 signedBy: signatureName,
                 signedAt: now,
-                signatureUrl: signatureDataUrl || null,
+                signatureUrl,
                 userAgent,
+                ipAddress: ip,
                 periodStart,
                 periodEnd: now,
             }
@@ -5521,6 +6144,200 @@ export async function getContractSigningHistory(contractId: string) {
         where: { contractId },
         orderBy: { signedAt: "desc" },
     });
+}
+
+/**
+ * Company countersignature — executed AFTER the client signs (see plan B).
+ *
+ * Flow when contract.requiresCountersign is true:
+ *   client signs (approveContract → "Signed") → the finalize route stores the client-signed
+ *   PDF privately on contract.signedPdfPath (status stays "Signed") → an ADMIN/MANAGER calls
+ *   this action → we record the company signature, load the intermediate PDF, append a
+ *   "Certificate of Execution" page carrying both signatures, archive it as the shared
+ *   executed PDF, flip the contract to "Finalized", and email both parties.
+ *
+ * Idempotent + atomic: the company-signature write and the Signed→Finalized claim are each
+ * guarded updateMany's, and the archive step rolls the status back on failure so a retry is safe.
+ */
+export async function countersignContractAsCompany(contractId: string, signerName: string, signatureDataUrl?: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    if (!signerName?.trim()) throw new Error("Signer name is required");
+    // pdf-lib can only embed PNG/JPEG on the certificate page, so restrict to those.
+    if (signatureDataUrl && !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format (PNG or JPEG required)");
+    }
+
+    const contract = await prisma.contract.findUnique({ where: { id: contractId } });
+    if (!contract) throw new Error("Contract not found");
+
+    // Already finalized → return the executed file idempotently. If status is Finalized but the
+    // file isn't archived yet (a concurrent call is mid-archive), tell the admin to retry rather
+    // than returning a false success with no file.
+    if (contract.status === "Finalized") {
+        const existing = await getExecutedContractPdf(contract);
+        if (existing) return { success: true, file: existing, alreadyFinalized: true };
+        throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
+    }
+    if (contract.status !== "Signed" || !contract.approvedAt) {
+        throw new Error("The client must sign this contract before the company can countersign.");
+    }
+    if (!contract.signedPdfPath) {
+        throw new Error("The signed contract PDF isn't ready yet. Please wait a moment and try again.");
+    }
+
+    const ip = await getRequestIp();
+    const now = new Date();
+
+    // Record the company signature once. On a retry where it's already recorded (companySignedAt
+    // set), reuse the stored value and skip a duplicate upload. The signature write and audit
+    // record share a transaction so a failed audit insert rolls the signature back too — a retry
+    // then redoes BOTH (never leaves companySignedAt set with no audit row).
+    if (!contract.companySignedAt) {
+        const companySignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/company`);
+        await prisma.$transaction(async (tx) => {
+            const guard = await tx.contract.updateMany({
+                where: { id: contractId, status: "Signed", companySignedAt: null },
+                data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
+            });
+            if (guard.count > 0) {
+                await tx.contractSigningRecord.create({
+                    data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
+                });
+            }
+        });
+    }
+
+    // Canonical state (covers a retry that recorded the signature but failed before finalizing).
+    const after = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true, manager: true } },
+            lead: { include: { client: true, manager: true } },
+        },
+    });
+    if (!after) throw new Error("Contract not found");
+    if (after.status === "Finalized") {
+        return { success: true, file: await getExecutedContractPdf(after), alreadyFinalized: true };
+    }
+    if (after.status !== "Signed" || !after.companySignedAt || !after.signedPdfPath) {
+        throw new Error("Contract is not in a countersignable state.");
+    }
+
+    // Atomically claim the finalize transition so concurrent calls can't double-archive.
+    const flip = await prisma.contract.updateMany({
+        where: { id: contractId, status: "Signed" },
+        data: { status: "Finalized" },
+    });
+    if (flip.count === 0) {
+        // Lost the race. Report success only if the executed file actually exists yet — otherwise
+        // the winner is still archiving (or rolled back), so tell the admin to retry rather than
+        // returning a false success with no file.
+        const fresh = await prisma.contract.findUnique({ where: { id: contractId } });
+        const existing = fresh?.status === "Finalized" ? await getExecutedContractPdf(fresh) : null;
+        if (existing) return { success: true, file: existing, alreadyFinalized: true };
+        throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
+    }
+
+    // Build + archive the executed PDF. This is the commit point: on failure we roll status back to
+    // "Signed" and archiveExecutedContractPdf removes its own storage object, so a retry is clean.
+    // Emails happen AFTER (best-effort) — an email hiccup must not undo a successfully executed doc.
+    let executedRecord: any = null;
+    let executedBuffer: Buffer | null = null;
+    let archivedMeta: { publicUrl: string; fileName: string } | null = null;
+    try {
+        const supabase = getSupabase();
+        if (!supabase) throw new Error("Storage not configured.");
+
+        const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(after.signedPdfPath);
+        if (dlErr || !dl) throw new Error("Could not load the signed contract PDF.");
+        const clientPdf = Buffer.from(await dl.arrayBuffer());
+
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        executedBuffer = await appendContractCountersignaturePage(clientPdf, {
+            companyName: settings?.companyName || "Company",
+            contractTitle: after.title,
+            clientSignedBy: after.approvedBy,
+            clientSignedAt: after.approvedAt,
+            clientIp: after.approvalIp,
+            clientSignatureValue: after.originalPdfPath ? after.signatureUrl : null, // client signature url for PDF contracts
+            companySignedBy: after.companySignedBy!,
+            companySignedAt: after.companySignedAt!,
+            companyIp: ip,
+            companySignatureValue: after.companySignatureUrl,
+        });
+
+        const archived = await archiveExecutedContractPdf(
+            { id: after.id, title: after.title, projectId: after.projectId, leadId: after.leadId },
+            executedBuffer
+        );
+        executedRecord = archived.record;
+        archivedMeta = { publicUrl: archived.publicUrl, fileName: archived.fileName };
+
+        // Drop the now-superseded private intermediate (best-effort).
+        try { await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]); } catch {}
+    } catch (e: any) {
+        // Roll back the finalize claim so the admin can retry. companySignedAt stays set (the
+        // company DID sign); the retry re-claims and re-archives.
+        await prisma.contract.updateMany({ where: { id: contractId, status: "Finalized" }, data: { status: "Signed" } });
+        console.error("[countersignContractAsCompany] finalize step failed:", e);
+        throw new Error(`Couldn't generate the executed PDF: ${e?.message || e}. Your signature was saved — please retry.`);
+    }
+
+    // Best-effort notifications — a failure here does NOT undo the executed contract.
+    try {
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const client = after.project?.client || after.lead?.client;
+        const managerEmail = after.project?.manager?.email || after.lead?.manager?.email || null;
+        const cc = buildCc(client?.email || "", (client as any)?.additionalEmail, managerEmail);
+        if (executedBuffer && archivedMeta) {
+            await sendExecutedContractEmails({
+                contractTitle: after.title,
+                buffer: executedBuffer,
+                fileName: archivedMeta.fileName,
+                publicUrl: archivedMeta.publicUrl,
+                clientEmail: client?.email,
+                clientName: client?.name,
+                cc,
+                companyName: settings?.companyName || "ProBuild",
+                companyEmail: settings?.notificationEmail || settings?.email,
+                replyTo: settings?.email,
+            });
+        }
+    } catch (e) {
+        console.error("[countersignContractAsCompany] executed-doc email failed (non-fatal):", e);
+    }
+
+    // Post-commit activity logging is best-effort — the contract is already executed + archived,
+    // so a logging hiccup must not surface to the admin as a failure.
+    try {
+        if (after.projectId) {
+            await logActivity({
+                projectId: after.projectId,
+                actorType: "TEAM",
+                actorName: signerName,
+                action: "countersigned_contract",
+                entityType: "contract",
+                entityId: contractId,
+                entityName: `Contract "${after.title}"`,
+            });
+        }
+        await postActivityToThread(
+            after.leadId ?? null,
+            after.projectId ?? null,
+            `🖋️ ${signerName} countersigned contract "${after.title}" on ${now.toLocaleDateString()} — fully executed.`
+        );
+    } catch (e) {
+        console.error("[countersignContractAsCompany] post-commit activity log failed (non-fatal):", e);
+    }
+
+    revalidatePath(`/projects/[id]/contracts`, "page");
+    revalidatePath(`/leads/[id]/contracts`, "page");
+    revalidatePath("/");
+    return { success: true, file: executedRecord };
 }
 
 // ────────────────────────────────────────────────
@@ -6742,6 +7559,10 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         if (!owned) return null;
     }
 
+    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
+    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
+    const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
+
     const approvedAt = new Date();
     const co = await prisma.changeOrder.update({
         where: { id },
@@ -6749,13 +7570,60 @@ export async function approveChangeOrder(id: string, signatureName: string, user
             status: "Approved",
             approvedBy: signatureName,
             approvedAt,
-            clientSignatureUrl: signatureDataUrl || null,
+            clientSignatureUrl,
         },
     });
     
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
+}
+
+// Company-side countersignature. Distinct from approveChangeOrder (the customer's
+// approval) so that signing on behalf of the company NEVER overwrites the client's
+// approvedBy/approvedAt/clientSignatureUrl audit trail. Writes ONLY company fields
+// and leaves status untouched (the customer's approval still drives Approved).
+// Auth mirrors signContractAsContractor; signatureDataUrl is optional because the
+// editor's "Sign Now" flow captures a typed name rather than a drawn signature.
+export async function countersignChangeOrderAsCompany(id: string, signerName: string, signatureDataUrl?: string) {
+    "use server";
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    // Role gate — only ADMIN/MANAGER can countersign on behalf of the company.
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    if (!signerName.trim()) throw new Error("Signer name is required");
+
+    // Validate the data URL is a safe image type before storing (only when provided).
+    if (signatureDataUrl && !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format");
+    }
+
+    // Verify the change order exists (clear 404-style error) and grab projectId for revalidation.
+    const existing = await prisma.changeOrder.findUnique({ where: { id }, select: { id: true, projectId: true } });
+    if (!existing) throw new Error("Change order not found");
+
+    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
+    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
+    const companySignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/company`);
+
+    // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
+    // so two concurrent requests can't both succeed (eliminates TOCTOU race).
+    const result = await prisma.changeOrder.updateMany({
+        where: { id, companySignedAt: null },
+        data: {
+            companySignedBy: signerName.trim(),
+            companySignedAt: new Date(),
+            companySignatureUrl,
+        },
+    });
+    if (result.count === 0) throw new Error("Change order already countersigned by company");
+
+    revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${existing.projectId}/change-orders`);
+    return { success: true };
 }
 
 export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
@@ -8427,6 +9295,24 @@ export async function createEstimateFromRoomDesign(roomId: string) {
     const { getFinish } = await import("@/lib/studio/materials");
     const { toInches } = await import("@/lib/studio/units");
 
+    const costCodes = await prisma.costCode.findMany({ where: { isActive: true } });
+    const costCodeMap = new Map(costCodes.map((cc) => [cc.code, cc.id]));
+
+    const getCostCodeId = (def: any, assetId: string) => {
+        const cat = def?.category;
+        if (cat === "cabinets") return costCodeMap.get("11-CABINET") ?? null;
+        if (cat === "appliances") return costCodeMap.get("18-APPLIANCE") ?? null;
+        if (cat === "doors-windows") return costCodeMap.get("14-DOOR") ?? null;
+        if (assetId === "fireplace") return costCodeMap.get("25-FIREPLACE") ?? costCodeMap.get("19-FIXTURE") ?? null;
+        if (assetId === "pony-wall" || assetId === "interior-wall" || assetId === "interior-wall-doorway") {
+            return costCodeMap.get("02-FRAME") ?? null;
+        }
+        if (cat === "fixtures") return costCodeMap.get("19-FIXTURE") ?? null;
+        if (cat === "lighting") return costCodeMap.get("19-FIXTURE") ?? costCodeMap.get("04-ELEC") ?? null;
+        if (cat === "furniture" || cat === "decor") return costCodeMap.get("19-FIXTURE") ?? null;
+        return null;
+    };
+
     const items: Array<{
         name: string;
         description: string;
@@ -8436,6 +9322,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         markupPercent: number;
         unitCost: number;
         total: number;
+        costCodeId: string | null;
     }> = [];
 
     let totalEstimate = 0;
@@ -8524,6 +9411,8 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         const total = unitCost * 1;
         totalEstimate += total;
 
+        const costCodeId = getCostCodeId(def, asset.assetId);
+
         items.push({
             name,
             description: detailsArray.join(" | "),
@@ -8533,6 +9422,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             markupPercent,
             unitCost,
             total,
+            costCodeId,
         });
     }
 
@@ -8568,6 +9458,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
                 unitCost: item.unitCost,
                 total: item.total,
                 order: idx,
+                costCodeId: item.costCodeId,
             },
         });
     }

@@ -196,6 +196,89 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
     }
 }
 
+/** One milestone whose linked QBO invoice was found voided/deleted by the sync poller. */
+export type QBSyncIssue = {
+    scheduleId: string;
+    invoiceId: string;
+    invoiceCode: string;
+    milestoneName: string;
+    projectId: string | null;
+    projectName: string | null;
+    state: "voided" | "notFound";
+};
+
+/**
+ * Report milestones whose QuickBooks invoice was voided/deleted (so the cron can
+ * never settle them). Writes a project activity entry per milestone and sends ONE
+ * digest email to the team. Callers pass only NEWLY-flagged rows, so this fires
+ * once per breakage, not every hourly run. Never throws.
+ */
+export async function notifyQBSyncIssues(issues: QBSyncIssue[]): Promise<void> {
+    if (issues.length === 0) return;
+    try {
+        const stateLabel = (s: QBSyncIssue["state"]) => (s === "notFound" ? "deleted/missing" : "voided");
+
+        // 1. Activity feed — one entry per affected milestone (independent of toggles).
+        for (const i of issues) {
+            await prisma.activityLog.create({
+                data: {
+                    projectId: i.projectId,
+                    actorType: "SYSTEM",
+                    actorName: "QuickBooks",
+                    action: "qb_sync_issue",
+                    entityType: "invoice",
+                    entityId: i.invoiceId,
+                    entityName: `Invoice ${i.invoiceCode}`,
+                    metadata: JSON.stringify({ milestone: i.milestoneName, state: i.state }),
+                },
+            }).catch(() => {});
+        }
+
+        // 2. Team digest email (respects Settings → Notifications · quickbooksSyncIssue).
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        if (!settings?.notificationEmail || !isToggleOn(settings, "quickbooksSyncIssue")) return;
+
+        const rows = issues.map(i => {
+            const link = i.projectId
+                ? `https://probuild.goldentouchremodeling.com/projects/${i.projectId}/invoices/${i.invoiceId}`
+                : `https://probuild.goldentouchremodeling.com/invoices`;
+            return `<tr>
+                <td style="padding: 6px 8px; border-bottom: 1px solid #fde68a;">${i.invoiceCode}</td>
+                <td style="padding: 6px 8px; border-bottom: 1px solid #fde68a;">${i.milestoneName}</td>
+                <td style="padding: 6px 8px; border-bottom: 1px solid #fde68a;">${i.projectName || "—"}</td>
+                <td style="padding: 6px 8px; border-bottom: 1px solid #fde68a; text-transform: capitalize;">${stateLabel(i.state)}</td>
+                <td style="padding: 6px 8px; border-bottom: 1px solid #fde68a;"><a href="${link}" style="color: #b45309; font-weight: 600;">Open</a></td>
+            </tr>`;
+        }).join("");
+
+        const count = issues.length;
+        await sendNotification(
+            settings.notificationEmail,
+            `⚠ ${count} QuickBooks invoice${count === 1 ? "" : "s"} voided/deleted — milestone${count === 1 ? "" : "s"} need re-issue`,
+            `<div style="font-family: -apple-system, sans-serif; max-width: 640px; margin: 0 auto; padding: 20px;">
+                <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 22px;">
+                    <h2 style="margin: 0 0 8px; color: #b45309; font-size: 18px;">QuickBooks invoices no longer collectible</h2>
+                    <p style="margin: 0 0 14px; font-size: 13px; color: #444;">
+                        The QuickBooks invoice${count === 1 ? "" : "s"} below ${count === 1 ? "was" : "were"} voided or deleted in QuickBooks, so the matching payment milestone${count === 1 ? "" : "s"} can no longer settle and ${count === 1 ? "is" : "are"} stuck on <strong>Pending</strong>. Open each invoice and click <strong>Break QB Link</strong> to clear the link, then re-create it.
+                    </p>
+                    <table style="width: 100%; font-size: 13px; color: #444; border-collapse: collapse;">
+                        <tr style="text-align: left; color: #92400e;">
+                            <th style="padding: 6px 8px; border-bottom: 2px solid #fcd34d;">Invoice</th>
+                            <th style="padding: 6px 8px; border-bottom: 2px solid #fcd34d;">Milestone</th>
+                            <th style="padding: 6px 8px; border-bottom: 2px solid #fcd34d;">Project</th>
+                            <th style="padding: 6px 8px; border-bottom: 2px solid #fcd34d;">State</th>
+                            <th style="padding: 6px 8px; border-bottom: 2px solid #fcd34d;"></th>
+                        </tr>
+                        ${rows}
+                    </table>
+                </div>
+            </div>`
+        );
+    } catch (e) {
+        console.error("[notifyQBSyncIssues] failed:", e);
+    }
+}
+
 /**
  * Send admin alert + customer receipt for a newly-paid invoice milestone.
  * Used by the Stripe webhook (auto) — callers must handle idempotency themselves.

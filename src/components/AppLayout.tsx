@@ -2,6 +2,7 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import Sidebar from "./Sidebar";
+import MobileNavDrawer from "./nav/MobileNavDrawer";
 import Header from "./Header";
 import { useSession, signOut } from "next-auth/react";
 import { useEffect } from "react";
@@ -65,11 +66,12 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     }
 
     return (
-        <div className="flex h-screen bg-hui-background overflow-hidden">
+        <div className="flex h-[100dvh] bg-hui-background overflow-hidden">
             <Sidebar />
+            <MobileNavDrawer />
             <div className="flex-1 flex flex-col overflow-hidden">
                 <Header />
-                <main className="flex-1 p-6 overflow-y-auto overflow-x-hidden">
+                <main className="flex-1 overflow-y-auto overflow-x-hidden px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom))] lg:p-6">
                     {children}
                 </main>
             </div>

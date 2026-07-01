@@ -61,3 +61,21 @@ export function toNum(value: unknown): number {
     const n = Number(value);
     return isNaN(n) ? 0 : n;
 }
+
+/**
+ * Reverse-out tax from a tax-inclusive total (total = subtotal + subtotal * rate/100).
+ * If exempt or rate <= 0, the whole amount is subtotal and taxAmount is 0.
+ *
+ * Shared single source of truth for the tax-reversal math. Lives here (a plain
+ * module) rather than actions.ts because "use server" files can only export async
+ * functions — so both actions.ts and the QuickBooks rail import it from here.
+ */
+export function deriveInvoiceTaxFields(totalAmount: number, ratePercent: number, isExempt: boolean) {
+    if (isExempt || ratePercent <= 0) {
+        return { subtotal: totalAmount, taxRate: 0, taxAmount: 0 };
+    }
+    const factor = ratePercent / (100 + ratePercent);
+    const taxAmount = Math.round(totalAmount * factor * 100) / 100;
+    const subtotal = Math.round((totalAmount - taxAmount) * 100) / 100;
+    return { subtotal, taxRate: ratePercent, taxAmount };
+}

@@ -1,7 +1,124 @@
-import { PDFDocument, PDFPage, PDFFont, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, PDFPage, PDFFont, PDFImage, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
 import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
+import { isOwnSignatureStorageUrl } from './signature-storage';
+
+/**
+ * Embed a signature image from either a legacy inline data-URL or a migrated http(s)
+ * Storage URL. Returns the embedded image, or null if it can't be loaded/decoded.
+ * pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so other types fall
+ * through to a PNG attempt and are caught.
+ */
+async function embedSignatureImage(doc: PDFDocument, value: string): Promise<PDFImage | null> {
+    try {
+        const dataUrlMatch = value.match(/^data:image\/(png|jpe?g|webp);base64,(.+)$/i);
+        if (dataUrlMatch) {
+            const bytes = Buffer.from(dataUrlMatch[2], 'base64');
+            return /^jpe?g$/i.test(dataUrlMatch[1]) ? await doc.embedJpg(bytes) : await doc.embedPng(bytes);
+        }
+        if (/^https?:\/\//i.test(value)) {
+            // SSRF guard: only fetch URLs that point at our own Supabase Storage signatures
+            // dir. A DB-stored signature column must never be able to aim the server at an
+            // arbitrary host (e.g. cloud metadata). Anything else is treated as no image.
+            if (!isOwnSignatureStorageUrl(value)) return null;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            let res: Response;
+            try {
+                res = await fetch(value, { signal: controller.signal });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+            if (!res.ok) return null;
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            const contentType = (res.headers.get('content-type') || '').toLowerCase();
+            return contentType.includes('jpeg') || contentType.includes('jpg')
+                ? await doc.embedJpg(bytes)
+                : await doc.embedPng(bytes);
+        }
+        return null;
+    } catch (err) {
+        console.warn('Could not embed signature image in PDF:', err);
+        return null;
+    }
+}
+
+/**
+ * Append a "Certificate of Execution" page to an existing (client-signed) contract PDF,
+ * recording the company countersignature alongside the client's. Returns the new PDF as a Buffer.
+ *
+ * The customer's browser already produced a PDF with the document body + their signature
+ * (the client-signed intermediate). At countersign time we load that PDF, stamp a final
+ * certificate page carrying both parties' attribution + audit metadata, and re-save — so the
+ * executed copy is a single PDF with both signatures. No headless browser required.
+ */
+export async function appendContractCountersignaturePage(
+    existingPdf: Uint8Array | Buffer,
+    opts: {
+        companyName: string;
+        contractTitle: string;
+        clientSignedBy?: string | null;
+        clientSignedAt?: Date | null;
+        clientIp?: string | null;
+        clientSignatureValue?: string | null; // data-URL or Storage URL
+        companySignedBy?: string | null;
+        companySignedAt?: Date | null;
+        companyIp?: string | null;
+        companySignatureValue?: string | null; // data-URL or Storage URL
+    }
+): Promise<Buffer> {
+    const doc = await PDFDocument.load(existingPdf);
+    const helv = await doc.embedFont(StandardFonts.Helvetica);
+    const helvBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const page = doc.addPage([612, 792]); // US Letter
+    const { width, height } = page.getSize();
+    const margin = 56;
+    const ink = rgb(0.06, 0.09, 0.16);
+    const muted = rgb(0.42, 0.45, 0.5);
+    const accent = rgb(0.31, 0.27, 0.9);
+    let y = height - margin;
+
+    page.drawText('Certificate of Execution', { x: margin, y, size: 20, font: helvBold, color: ink });
+    y -= 24;
+    page.drawText((opts.contractTitle || '').slice(0, 90), { x: margin, y, size: 11, font: helv, color: muted, maxWidth: width - margin * 2 });
+    y -= 14;
+    page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 1, color: accent });
+    y -= 36;
+
+    const drawParty = (heading: string, name: string, when?: Date | null, ip?: string | null, img?: PDFImage | null) => {
+        page.drawText(heading, { x: margin, y, size: 9, font: helvBold, color: muted });
+        y -= 17;
+        page.drawText((name || '—').slice(0, 70), { x: margin, y, size: 13, font: helvBold, color: ink, maxWidth: width - margin * 2 });
+        y -= 16;
+        if (when) { page.drawText(`Signed: ${when.toLocaleString()}`, { x: margin, y, size: 9, font: helv, color: muted }); y -= 13; }
+        if (ip) { page.drawText(`IP address: ${ip}`, { x: margin, y, size: 9, font: helv, color: muted }); y -= 13; }
+        if (img) {
+            const maxW = 180, maxH = 56;
+            const scale = Math.min(maxW / img.width, maxH / img.height, 1);
+            const w = img.width * scale, h = img.height * scale;
+            page.drawImage(img, { x: margin, y: y - h - 4, width: w, height: h });
+            y -= h + 10;
+        }
+        y -= 22;
+    };
+
+    const clientImg = opts.clientSignatureValue ? await embedSignatureImage(doc, opts.clientSignatureValue) : null;
+    drawParty('CLIENT', opts.clientSignedBy || '', opts.clientSignedAt, opts.clientIp, clientImg);
+    
+    if (opts.companySignedBy) {
+        const companyImg = opts.companySignatureValue ? await embedSignatureImage(doc, opts.companySignatureValue) : null;
+        drawParty(`COMPANY — ${opts.companyName}`, opts.companySignedBy, opts.companySignedAt, opts.companyIp, companyImg);
+    }
+
+    page.drawText(
+        'This certificate records the electronic signatures applied to this document under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA.',
+        { x: margin, y: margin, size: 8, font: helv, color: muted, maxWidth: width - margin * 2, lineHeight: 11 }
+    );
+
+    return Buffer.from(await doc.save());
+}
 
 // Color helpers
 const colors = {
@@ -456,23 +573,18 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             });
         }
 
-        // Signature Image
-        if (estimate.signatureUrl && estimate.signatureUrl.startsWith('data:image/png;base64,')) {
-            try {
-                const base64Data = estimate.signatureUrl.replace('data:image/png;base64,', '');
-                const sigImageBytes = Buffer.from(base64Data, 'base64');
-                const embeddedSig = await doc.embedPng(sigImageBytes);
-                
+        // Signature Image — handles legacy inline data-URLs and migrated Storage URLs.
+        if (estimate.signatureUrl) {
+            const embeddedSig = await embedSignatureImage(doc, estimate.signatureUrl);
+            if (embeddedSig) {
                 // Scale signature down so it fits nicely
-                const sigDims = embeddedSig.scale(0.35); 
+                const sigDims = embeddedSig.scale(0.35);
                 page.drawImage(embeddedSig, {
                     x: pageWidth - margin - sigDims.width,
                     y: y, // draw next to metadata
                     width: sigDims.width,
                     height: sigDims.height,
                 });
-            } catch (err) {
-                console.warn("Could not embed signature image in PDF:", err);
             }
         }
         
@@ -985,15 +1097,25 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     const coTotalW = helveticaBold.widthOfTextAtSize(coTotalStr, 14);
     page.drawText(coTotalStr, { x: coCols.total - coTotalW, y, size: 14, font: helveticaBold, color: colors.primary });
 
-    // Signature
+    // Signatures — client approval and company countersignature are independent blocks.
     if (co.status === 'Approved' && co.approvedBy) {
         y -= 50;
         checkNewPage(100);
-        page.drawText('Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        page.drawText('Client Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
         y -= 20;
         page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 15;
         page.drawText(`Date: ${co.approvedAt ? new Date(co.approvedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+    }
+
+    if (co.companySignedBy) {
+        y -= 30;
+        checkNewPage(100);
+        page.drawText('Company Countersignature', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        y -= 20;
+        page.drawText(`Signed By: ${co.companySignedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 15;
+        page.drawText(`Date: ${co.companySignedAt ? new Date(co.companySignedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
     }
 
     const coFooterText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;

@@ -1,11 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
 import RecordPaymentModal from "@/components/RecordPaymentModal";
+import BulkActionBar from "@/components/BulkActionBar";
+import SendMilestonesModal from "@/components/SendMilestonesModal";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 
@@ -30,6 +32,8 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [isIssuing, setIsIssuing] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [showSendModal, setShowSendModal] = useState(false);
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [showSendMilestonesModal, setShowSendMilestonesModal] = useState(false);
     const [notes, setNotes] = useState(initialInvoice.notes || "");
     const [isSavingNotes, setIsSavingNotes] = useState(false);
     const [showAddMilestone, setShowAddMilestone] = useState(false);
@@ -41,6 +45,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [recordingFor, setRecordingFor] = useState<{ id: string; name: string; amount: number } | null>(null);
     const [isSendingReceipt, setIsSendingReceipt] = useState<string | null>(null);
     const [qbBusy, setQbBusy] = useState<string | null>(null);
+    const [isEmailingCopy, setIsEmailingCopy] = useState(false);
 
     // On view: if any pending milestone is on the QuickBooks rail, pull settled
     // payments right now (the hourly cron is the backstop, this is the fast path).
@@ -86,6 +91,32 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
         }
     }
 
+    // Recover a milestone whose QuickBooks invoice was voided/deleted: clear the
+    // stale link so it can be re-created fresh. Money state is untouched.
+    async function handleBreakQBLink(payment: { id: string; name: string }) {
+        const ok = window.confirm(
+            `Break the QuickBooks link for "${payment.name}"?\n\n` +
+            `Use this when the QuickBooks invoice was voided or deleted and this milestone ` +
+            `is stuck on "Pending". It clears the QuickBooks link in ProBuild so you can ` +
+            `re-create it fresh with "QuickBooks Link".\n\n` +
+            `It does NOT change the paid/unpaid status, and does NOT delete the invoice in QuickBooks.`
+        );
+        if (!ok) return;
+        setQbBusy(payment.id);
+        try {
+            const res = await breakQBInvoiceLink(payment.id);
+            if (!res.success) {
+                toast.error(res.error);
+                return;
+            }
+            if (res.warning) toast.warning(res.warning);
+            else toast.success("QuickBooks link cleared — you can now re-create it.");
+            router.refresh();
+        } finally {
+            setQbBusy(null);
+        }
+    }
+
     // Split payments state
     type SplitRow = { id: number; name: string; amount: string };
     let splitNextId = 1;
@@ -107,6 +138,22 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
             toast.error(e?.message || "Failed to send receipt");
         } finally {
             setIsSendingReceipt(null);
+        }
+    }
+
+    async function handleEmailMeCopy() {
+        setIsEmailingCopy(true);
+        try {
+            const res = await emailInvoiceCopyToMe(initialInvoice.id);
+            if (res.success) {
+                toast.success(`Copy emailed to ${res.sentTo}`);
+            } else {
+                toast.error(res.error || "Failed to email copy");
+            }
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to email copy");
+        } finally {
+            setIsEmailingCopy(false);
         }
     }
 
@@ -227,6 +274,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
     const paidCount = (initialInvoice.payments || []).filter((p: any) => p.status === "Paid").length;
     const totalCount = (initialInvoice.payments || []).length;
+    const sendablePayments = (initialInvoice.payments || []).filter((p: any) => p.status !== "Paid" && p.status !== "Canceled");
     const canDelete = initialInvoice.status === "Draft" || (initialInvoice.status === "Issued" && paidCount === 0);
 
     return (
@@ -255,6 +303,34 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                     >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
                         Preview
+                    </button>
+
+                    {/* Download PDF */}
+                    <a
+                        href={`/api/pdf/invoices/${initialInvoice.id}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="hui-btn hui-btn-secondary flex items-center gap-2"
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
+                        </svg>
+                        Download PDF
+                    </a>
+
+                    {/* Email me a copy */}
+                    <button
+                        onClick={handleEmailMeCopy}
+                        disabled={isEmailingCopy}
+                        className="hui-btn hui-btn-secondary flex items-center gap-2 disabled:opacity-50"
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+                            <polyline points="22,6 12,13 2,6" />
+                        </svg>
+                        {isEmailingCopy ? "Sending..." : "Email me a copy"}
                     </button>
 
 
@@ -292,7 +368,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                 </div>
             </div>
 
-            <div className="flex-1 overflow-auto p-8 flex justify-center">
+            <div className="flex-1 overflow-auto p-4 lg:p-8 flex justify-center">
                 <div className="w-full max-w-5xl space-y-6">
 
                     {/* Document Header */}
@@ -309,7 +385,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </div>
                             </div>
 
-                            <div className="flex gap-12 text-sm">
+                            <div className="flex flex-col sm:flex-row gap-6 sm:gap-12 text-sm">
                                 <div>
                                     <p className="text-[11px] font-semibold tracking-widest uppercase text-slate-400 mb-2">Bill To</p>
                                     <p className="font-semibold text-base text-hui-textMain">{clientName}</p>
@@ -350,7 +426,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
                             <div className="h-px w-full bg-hui-border my-4"></div>
 
-                            <div className="flex justify-between items-center bg-slate-50 p-5 rounded-lg border border-hui-border">
+                            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 bg-slate-50 p-5 rounded-lg border border-hui-border">
                                 <div>
                                     <p className="text-hui-textMuted text-sm mb-1">Total Amount</p>
                                     <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(initialInvoice.totalAmount)}</p>
@@ -479,7 +555,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         )}
                         {showAddMilestone && (
                             <div className="px-6 py-4 border-b border-hui-border bg-amber-50/40">
-                                <div className="grid grid-cols-12 gap-3 items-end">
+                                <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 sm:items-end">
                                     <div className="col-span-5">
                                         <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Description</label>
                                         <input
@@ -526,9 +602,24 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </p>
                             </div>
                         )}
-                        <table className="w-full text-sm text-left">
+                        <div className="overflow-x-auto">
+                        <table className="w-full min-w-[34rem] text-sm text-left">
                             <thead className="bg-white text-hui-textMuted border-b border-hui-border">
                                 <tr>
+                                    <th className="px-4 py-3 w-10 text-center">
+                                        <input
+                                            type="checkbox"
+                                            checked={sendablePayments.length > 0 && sendablePayments.every((p: any) => selectedIds.has(p.id))}
+                                            onChange={(e) => {
+                                                if (e.target.checked) {
+                                                    setSelectedIds(new Set(sendablePayments.map((p: any) => p.id)));
+                                                } else {
+                                                    setSelectedIds(new Set());
+                                                }
+                                            }}
+                                            className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500 h-4 w-4 cursor-pointer"
+                                        />
+                                    </th>
                                     <th className="px-6 py-3 font-medium">Description</th>
                                     <th className="px-6 py-3 font-medium">Due Date</th>
                                     <th className="px-6 py-3 font-medium">Status</th>
@@ -540,7 +631,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                             <tbody className="divide-y divide-hui-border">
                                 {(!initialInvoice.payments || initialInvoice.payments.length === 0) && (
                                     <tr>
-                                        <td colSpan={6} className="px-6 py-12 text-center text-hui-textMuted">
+                                        <td colSpan={7} className="px-6 py-12 text-center text-hui-textMuted">
                                             <div className="flex flex-col items-center">
                                                 <svg className="w-10 h-10 mb-2 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                                 <p className="font-medium text-hui-textMain">No payment schedule</p>
@@ -555,12 +646,40 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                     const receiptSentLabel = payment.receiptSentAt
                                         ? `Last sent ${new Date(payment.receiptSentAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
                                         : undefined;
+                                    const isSendable = payment.status !== "Paid" && payment.status !== "Canceled";
+                                    const sentLabel = payment.qbInvoiceSentAt
+                                        ? `Sent · ${new Date(payment.qbInvoiceSentAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
+                                        : null;
                                     return (
                                         <tr key={payment.id} className={`hover:bg-slate-50 transition ${isPastDue ? 'bg-red-50/30' : ''}`}>
+                                            <td className="px-4 py-4 w-10 text-center">
+                                                {isSendable ? (
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedIds.has(payment.id)}
+                                                        onChange={(e) => {
+                                                            const newSet = new Set(selectedIds);
+                                                            if (e.target.checked) {
+                                                                newSet.add(payment.id);
+                                                            } else {
+                                                                newSet.delete(payment.id);
+                                                            }
+                                                            setSelectedIds(newSet);
+                                                        }}
+                                                        className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500 h-4 w-4 cursor-pointer"
+                                                    />
+                                                ) : null}
+                                            </td>
                                             <td className="px-6 py-4 font-medium text-hui-textMain">
                                                 <div>{payment.name}</div>
                                                 {payment.status === 'Paid' && methodLabel && (
                                                     <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{methodLabel}</div>
+                                                )}
+                                                {payment.status !== 'Paid' && sentLabel && (
+                                                    <div className="text-[11px] text-emerald-600 font-semibold mt-0.5 flex items-center gap-1">
+                                                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                                                        {sentLabel}
+                                                    </div>
                                                 )}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
@@ -572,7 +691,17 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 ) : 'Upon receipt'}
                                             </td>
                                             <td className="px-6 py-4">
-                                                <StatusBadge status={payment.status} />
+                                                <div className="flex items-center gap-2">
+                                                    <StatusBadge status={payment.status} />
+                                                    {payment.status !== 'Paid' && payment.qbSyncError && (
+                                                        <span
+                                                            className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
+                                                            title="The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                        >
+                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : 'voided'}
+                                                        </span>
+                                                    )}
+                                                </div>
                                             </td>
                                             <td className="px-6 py-4 text-right font-medium text-hui-textMain">
                                                 {formatCurrency(payment.amount)}
@@ -594,12 +723,34 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                         >
                                                             {qbBusy === payment.id ? "Pushing…" : payment.qbInvoiceLink ? "Copy QB Link" : "QuickBooks Link"}
                                                         </button>
+                                                        {isSendable && (
+                                                            <button
+                                                                onClick={() => {
+                                                                    setSelectedIds(new Set([payment.id]));
+                                                                    setShowSendMilestonesModal(true);
+                                                                }}
+                                                                className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
+                                                                title={payment.qbInvoiceSentAt ? "Resend invoice email via QuickBooks" : "Send invoice email via QuickBooks"}
+                                                            >
+                                                                {payment.qbInvoiceSentAt ? "Resend" : "Send"}
+                                                            </button>
+                                                        )}
                                                         <button
                                                             onClick={() => setRecordingFor({ id: payment.id, name: payment.name, amount: Number(payment.amount) })}
                                                             className="hui-btn hui-btn-primary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
                                                         >
                                                             Record Payment
                                                         </button>
+                                                        {payment.qbInvoiceId && (
+                                                            <button
+                                                                onClick={() => handleBreakQBLink(payment)}
+                                                                disabled={qbBusy === payment.id}
+                                                                title="QuickBooks invoice voided or deleted? Clear the link so you can re-create it."
+                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50 whitespace-nowrap"
+                                                            >
+                                                                {qbBusy === payment.id ? "Working…" : "Break QB Link"}
+                                                            </button>
+                                                        )}
                                                         </>
                                                     )}
                                                     {payment.status === 'Paid' && (
@@ -631,6 +782,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 })}
                             </tbody>
                         </table>
+                        </div>
                     </div>
 
                 </div>
@@ -655,6 +807,38 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         const result = await recordPayment(recordingFor.id, initialInvoice.id, { ...input, method: input.method as string });
                         if (result.success) router.refresh();
                         return { success: result.success, error: (result as any).error };
+                    }}
+                />
+            )}
+
+            {selectedIds.size > 0 && (
+                <BulkActionBar
+                    count={selectedIds.size}
+                    onClear={() => setSelectedIds(new Set())}
+                    actions={[
+                        {
+                            label: "Send to client",
+                            icon: (
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                                </svg>
+                            ),
+                            onClick: () => setShowSendMilestonesModal(true),
+                        },
+                    ]}
+                />
+            )}
+
+            {showSendMilestonesModal && (
+                <SendMilestonesModal
+                    invoiceId={initialInvoice.id}
+                    clientEmail={clientEmail}
+                    selectedPaymentIds={Array.from(selectedIds)}
+                    selectedPayments={initialInvoice.payments?.filter((p: any) => selectedIds.has(p.id)) || []}
+                    onClose={() => {
+                        setShowSendMilestonesModal(false);
+                        setSelectedIds(new Set());
+                        router.refresh();
                     }}
                 />
             )}
