@@ -8,6 +8,7 @@ import SendInvoiceModal from "@/components/SendInvoiceModal";
 import RecordPaymentModal from "@/components/RecordPaymentModal";
 import BulkActionBar from "@/components/BulkActionBar";
 import SendMilestonesModal from "@/components/SendMilestonesModal";
+import UndoPaymentModal from "@/components/UndoPaymentModal";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 
@@ -41,7 +42,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [milestoneAmount, setMilestoneAmount] = useState("");
     const [milestoneDueDate, setMilestoneDueDate] = useState<string>("");
     const [isAddingMilestone, setIsAddingMilestone] = useState(false);
-    const [isUndoing, setIsUndoing] = useState<string | null>(null);
+    const [undoPaymentTarget, setUndoPaymentTarget] = useState<any | null>(null);
     const [recordingFor, setRecordingFor] = useState<{ id: string; name: string; amount: number } | null>(null);
     const [isSendingReceipt, setIsSendingReceipt] = useState<string | null>(null);
     const [qbBusy, setQbBusy] = useState<string | null>(null);
@@ -207,15 +208,13 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     }
 
     async function handleUnrecord(paymentId: string) {
-        setIsUndoing(paymentId);
         try {
             await unrecordPayment(paymentId, initialInvoice.id);
             toast("Payment unrecorded");
+            setUndoPaymentTarget(null);
             router.refresh();
         } catch (e: any) {
             toast.error(e?.message || "Failed to unrecord payment");
-        } finally {
-            setIsUndoing(null);
         }
     }
 
@@ -766,12 +765,11 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                                     : payment.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
                                                             </button>
                                                             <button
-                                                                onClick={() => handleUnrecord(payment.id)}
-                                                                disabled={isUndoing === payment.id}
-                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50"
+                                                                onClick={() => setUndoPaymentTarget(payment)}
+                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2"
                                                                 title="Mark as unpaid"
                                                             >
-                                                                {isUndoing === payment.id ? "Undoing..." : "Undo"}
+                                                                Undo
                                                             </button>
                                                         </>
                                                     )}
@@ -810,6 +808,35 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                     }}
                 />
             )}
+
+            {/* Undo Payment Modal */}
+            {undoPaymentTarget && (() => {
+                const payments = initialInvoice.payments || [];
+                const invoiceTotal = Number(initialInvoice.totalAmount) || 0;
+                const paidSchedules = payments.filter((p: any) => p.status === "Paid");
+                const paidSum = paidSchedules.reduce((sum: number, p: any) => sum + (Number(p.amount) || 0), 0);
+                const currentBalance = Math.max(0, invoiceTotal - paidSum);
+                return (
+                    <UndoPaymentModal
+                        milestoneName={undoPaymentTarget.name || "Payment"}
+                        amount={Number(undoPaymentTarget.amount) || 0}
+                        paymentMethod={undoPaymentTarget.paymentMethod || null}
+                        referenceNumber={undoPaymentTarget.referenceNumber || null}
+                        paidAt={undoPaymentTarget.paidAt || null}
+                        paymentDate={undoPaymentTarget.paymentDate || null}
+                        hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
+                        hasQbPayment={!!undoPaymentTarget.qbPaymentId || undoPaymentTarget.paymentMethod === "quickbooks"}
+                        entityLabel="invoice"
+                        currentBalance={currentBalance}
+                        estimateTotal={invoiceTotal}
+                        currentStatus={initialInvoice.status}
+                        otherPaidCount={paidSchedules.filter((p: any) => p.id !== undoPaymentTarget.id).length}
+                        statusBeforePayment={null}
+                        onClose={() => setUndoPaymentTarget(null)}
+                        onConfirm={() => handleUnrecord(undoPaymentTarget.id)}
+                    />
+                );
+            })()}
 
             {selectedIds.size > 0 && (
                 <BulkActionBar
