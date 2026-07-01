@@ -562,6 +562,141 @@ export async function updateClient(clientId: string, data: { name?: string; emai
     return client;
 }
 
+// ── Client tax-exemption certificate (WA DOR: a reseller permit / exemption
+// certificate must be on file for every tax-exempt sale) ──────────────────────
+
+const TAX_CERT_ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+const TAX_CERT_ALLOWED_EXTENSIONS = ["pdf", "jpg", "jpeg", "png", "webp", "heic", "heif"];
+const TAX_CERT_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Map a public storage URL back to its bucket path, but only within tax-certs/ —
+ *  never derive a deletable path from anything else. */
+function taxCertStoragePathFromUrl(url: string | null, bucket: string): string | null {
+    if (!url) return null;
+    try {
+        const pathname = new URL(url).pathname;
+        const marker = `/storage/v1/object/public/${bucket}/`;
+        if (!pathname.startsWith(marker)) return null;
+        const path = decodeURIComponent(pathname.slice(marker.length));
+        return path.startsWith("tax-certs/") ? path : null;
+    } catch {
+        return null; // malformed URL or bad % escape — skip cleanup rather than guess
+    }
+}
+
+async function revalidateClientCertSurfaces(clientId: string) {
+    const [linkedProjects, linkedLeads] = await Promise.all([
+        prisma.project.findMany({ where: { clientId }, select: { id: true } }),
+        prisma.lead.findMany({ where: { clientId }, select: { id: true } }),
+    ]);
+    for (const p of linkedProjects) revalidatePath(`/projects/${p.id}`, "layout");
+    for (const l of linkedLeads) revalidatePath(`/leads/${l.id}`, "layout");
+    revalidatePath("/settings/contacts");
+}
+
+/** Upload/update the client's tax-exemption certificate. `file` is optional when a
+ *  certificate is already on file (metadata-only edit); expiresAt is "YYYY-MM-DD" or "". */
+export async function saveClientTaxExemptCert(clientId: string, formData: FormData) {
+    "use server";
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+
+    const client = await prisma.client.findUnique({ where: { id: clientId }, select: { taxExemptCertUrl: true } });
+    if (!client) throw new Error("Client not found");
+
+    const file = formData.get("file");
+    const expiresAtRaw = String(formData.get("expiresAt") ?? "").trim();
+    const note = String(formData.get("note") ?? "").trim();
+
+    let certUrl = client.taxExemptCertUrl;
+    if (file instanceof File && file.size > 0) {
+        if (file.size > TAX_CERT_MAX_BYTES) throw new Error("Certificate file is too large (10 MB max)");
+        // MIME is client-controlled and may be empty — require BOTH a known type and extension.
+        const ext = (file.name.split(".").pop() || "").toLowerCase();
+        if (!TAX_CERT_ALLOWED_TYPES.includes(file.type) || !TAX_CERT_ALLOWED_EXTENSIONS.includes(ext)) {
+            throw new Error("Certificate must be a PDF or image");
+        }
+
+        const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+        const supabase = getSupabase();
+        if (!supabase) throw new Error("Storage not configured");
+
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const storagePath = `tax-certs/${clientId}/${Date.now()}_${safeName}`;
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const { error: uploadError } = await supabase.storage
+            .from(STORAGE_BUCKET)
+            .upload(storagePath, buffer, { contentType: file.type || "application/octet-stream", upsert: false });
+        if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+        const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+        certUrl = urlData?.publicUrl || storagePath;
+    }
+    if (!certUrl) throw new Error("Attach a certificate file");
+
+    let expiresAt: Date | null = null;
+    if (expiresAtRaw) {
+        // Round-trip the UTC parts: JS silently normalizes impossible dates
+        // (2026-02-31 -> Mar 3), which would store a different date than submitted.
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expiresAtRaw);
+        expiresAt = m ? new Date(`${expiresAtRaw}T00:00:00.000Z`) : null;
+        const valid = !!m && !!expiresAt && !isNaN(expiresAt.getTime()) &&
+            expiresAt.getUTCFullYear() === Number(m[1]) &&
+            expiresAt.getUTCMonth() + 1 === Number(m[2]) &&
+            expiresAt.getUTCDate() === Number(m[3]);
+        if (!valid) throw new Error("Invalid expiration date");
+    }
+
+    const updated = await prisma.client.update({
+        where: { id: clientId },
+        data: {
+            taxExemptCertUrl: certUrl,
+            taxExemptCertExpiresAt: expiresAt,
+            taxExemptCertNote: note || null,
+        },
+        select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
+    });
+
+    await revalidateClientCertSurfaces(clientId);
+    return JSON.parse(JSON.stringify(updated));
+}
+
+export async function removeClientTaxExemptCert(clientId: string) {
+    "use server";
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+
+    const client = await prisma.client.findUnique({ where: { id: clientId }, select: { taxExemptCertUrl: true } });
+    if (!client) throw new Error("Client not found");
+
+    // Conditional clear: only wins if the cert wasn't concurrently replaced, so we
+    // never delete an object the row stopped pointing at (superseded certs are kept).
+    const { count } = await prisma.client.updateMany({
+        where: { id: clientId, taxExemptCertUrl: client.taxExemptCertUrl },
+        data: { taxExemptCertUrl: null, taxExemptCertExpiresAt: null, taxExemptCertNote: null },
+    });
+
+    // Best-effort: explicit "Remove" should not leave the file publicly reachable.
+    if (count === 1) {
+        try {
+            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+            const supabase = getSupabase();
+            const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
+            if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+        } catch (e) {
+            console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
+        }
+    }
+
+    const updated = await prisma.client.findUnique({
+        where: { id: clientId },
+        select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
+    });
+    if (!updated) throw new Error("Client not found");
+
+    await revalidateClientCertSurfaces(clientId);
+    return JSON.parse(JSON.stringify(updated));
+}
+
 export async function updateLead(leadId: string, data: { name?: string; source?: string; expectedStartDate?: string | null; targetRevenue?: number | null; location?: string; projectType?: string }) {
     "use server";
     const updateData: any = {};

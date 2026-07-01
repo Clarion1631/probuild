@@ -72,6 +72,7 @@ function formatEstPaymentMethod(method: string | null | undefined, ref: string |
 }
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { getTaxCertStatus, formatCertExpiry } from "@/lib/tax-cert";
 
 const ReusableSignaturePad = dynamic(() => import("@/components/ReusableSignaturePad"), { ssr: false });
 
@@ -112,7 +113,7 @@ PROJECT: <describe the scope of work, square footage, finishes, etc.>`;
 
 type ActivityEvent = { id: string; ts: string; kind: "created" | "sent" | "viewed" | "signed" | "invoice" | "payment" | "other"; title: string; detail?: string | null };
 
-export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings, activityEvents }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any, activityEvents?: ActivityEvent[] }) {
+export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings, activityEvents }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string, clientTaxExemptCertUrl?: string | null, clientTaxExemptCertExpiresAt?: string | null }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any, activityEvents?: ActivityEvent[] }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
@@ -638,6 +639,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
     const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
     const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
+    // WA DOR: exempt sales need a reseller permit / exemption certificate on the client record
+    const taxCertStatus = getTaxCertStatus({ url: context.clientTaxExemptCertUrl, expiresAt: context.clientTaxExemptCertExpiresAt });
+    const showTaxCertWarning = taxExempt && taxCertStatus !== "valid";
+    const taxCertFixHref = context.type === "lead" ? `/leads/${context.id}` : "/settings/contacts";
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
@@ -1526,6 +1531,16 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             <option key={s} value={s}>{s}</option>
                         ))}
                     </select>
+                    {showTaxCertWarning && (
+                        <button
+                            onClick={() => router.push(taxCertFixHref)}
+                            title="This estimate is tax-exempt but the client has no valid exemption certificate on file. WA DOR requires one for every exempt sale. Click to open the client record."
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold border transition ${taxCertStatus === "expired" ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
+                        >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                            {taxCertStatus === "expired" ? "Tax-exempt cert expired" : "No tax-exempt cert on file"}
+                        </button>
+                    )}
                 </div>
 
                 {/* Tabs Middle */}
@@ -2567,6 +2582,22 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                             <label htmlFor="taxExempt" className="cursor-pointer select-none">
                                                 Tax exempt (subcontractor / resale)
                                             </label>
+                                        </div>
+                                    )}
+                                    {viewMode === "internal" && showTaxCertWarning && (
+                                        <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
+                                            <div className="flex items-start gap-2">
+                                                <svg className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                                                <div className="text-xs">
+                                                    <p className="font-bold text-amber-800">
+                                                        {taxCertStatus === "expired"
+                                                            ? `Exemption certificate expired${context.clientTaxExemptCertExpiresAt ? ` ${formatCertExpiry(context.clientTaxExemptCertExpiresAt)}` : ""}`
+                                                            : "No exemption certificate on file"}
+                                                    </p>
+                                                    <p className="text-amber-700 mt-0.5">WA DOR requires a reseller permit or exemption certificate on file for every tax-exempt sale. Signing is not blocked.</p>
+                                                    <a href={taxCertFixHref} className="inline-block mt-1 font-semibold text-amber-800 underline hover:text-amber-900">Add it on the client record →</a>
+                                                </div>
+                                            </div>
                                         </div>
                                     )}
                                     {/* Processing Fee Markup — hidden from client view by default */}

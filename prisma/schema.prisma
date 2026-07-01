@@ -62,6 +62,12 @@ model Client {
   // QuickBooks Online customer id (set on first invoice push; avoids name-match drift)
   qbCustomerId String?
 
+  // WA DOR: a reseller permit / exemption certificate must be on file for every
+  // tax-exempt sale (Estimate.taxExempt). File lives in Supabase storage.
+  taxExemptCertUrl       String?
+  taxExemptCertExpiresAt DateTime?
+  taxExemptCertNote      String?
+
   projects       Project[]
   leads          Lead[]
   invoices       Invoice[]

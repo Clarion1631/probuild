@@ -10,6 +10,7 @@ import EditLeadModal from "./EditLeadModal";
 import GoogleMapPreview from "@/components/GoogleMapPreview";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
 import ManagerAssignRow from "@/components/ManagerAssignRow";
+import TaxExemptCertCard from "@/components/TaxExemptCertCard";
 
 interface LeadDetailsSidebarProps {
     leadId: string;
@@ -29,6 +30,9 @@ interface LeadDetailsSidebarProps {
     clientCity: string | null;
     clientState: string | null;
     clientZip: string | null;
+    clientTaxExemptCertUrl?: string | null;
+    clientTaxExemptCertExpiresAt?: string | null;
+    clientTaxExemptCertNote?: string | null;
     initialMessage: string | null;
     managerId?: string | null;
     managerName?: string | null;
@@ -37,6 +41,7 @@ interface LeadDetailsSidebarProps {
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
     clientId, clientName, clientEmail, clientAdditionalEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
+    clientTaxExemptCertUrl = null, clientTaxExemptCertExpiresAt = null, clientTaxExemptCertNote = null,
     initialMessage, managerId, managerName,
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
@@ -341,6 +346,16 @@ export default function LeadDetailsSidebar({
                         </div>
                     </div>
                 )}
+            </div>
+
+            {/* Tax Exemption Certificate */}
+            <div className="p-5 border-b border-hui-border">
+                <TaxExemptCertCard
+                    clientId={clientId}
+                    certUrl={clientTaxExemptCertUrl}
+                    certExpiresAt={clientTaxExemptCertExpiresAt}
+                    certNote={clientTaxExemptCertNote}
+                />
             </div>
 
             {/* Lead Details - Collapsible */}
