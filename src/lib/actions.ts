@@ -1397,6 +1397,7 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
+                invoices: { select: { id: true, code: true, status: true } },
             },
         });
     }

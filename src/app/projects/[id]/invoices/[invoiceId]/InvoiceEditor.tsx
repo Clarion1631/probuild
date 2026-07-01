@@ -209,7 +209,13 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
     async function handleUnrecord(paymentId: string) {
         try {
-            await unrecordPayment(paymentId, initialInvoice.id);
+            const res = await unrecordPayment(paymentId, initialInvoice.id);
+            if (!res?.success) {
+                toast.error("Nothing to unrecord — the payment may have already been undone");
+                setUndoPaymentTarget(null);
+                router.refresh();
+                return;
+            }
             toast("Payment unrecorded");
             setUndoPaymentTarget(null);
             router.refresh();
@@ -825,7 +831,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         paidAt={undoPaymentTarget.paidAt || null}
                         paymentDate={undoPaymentTarget.paymentDate || null}
                         hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
-                        hasQbPayment={!!undoPaymentTarget.qbPaymentId || undoPaymentTarget.paymentMethod === "quickbooks"}
+                        hasQbPayment={undoPaymentTarget.paymentMethod === "quickbooks"}
                         entityLabel="invoice"
                         currentBalance={currentBalance}
                         estimateTotal={invoiceTotal}

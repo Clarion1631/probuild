@@ -49,9 +49,13 @@ export default function UndoPaymentModal({
 
     const paidDate = paidAt || paymentDate;
     const newBalance = Math.min(estimateTotal, currentBalance + amount);
+    // Mirrors unrecordPayment's status ladder: invoices keep Overdue when the
+    // last payment is undone and the invoice was already Overdue.
     const newStatus = otherPaidCount > 0
         ? (newBalance <= 0 ? "Paid" : "Partially Paid")
-        : (statusBeforePayment || (entityLabel === "invoice" ? "Issued" : "Approved"));
+        : entityLabel === "invoice"
+            ? (currentStatus === "Overdue" ? "Overdue" : "Issued")
+            : (statusBeforePayment || "Approved");
     const taxImpact = estimateTotal > 0
         ? Math.round((amount / estimateTotal) * 100)
         : 0;
@@ -59,7 +63,7 @@ export default function UndoPaymentModal({
     const canConfirm = confirmText.toUpperCase() === "UNDO";
 
     async function handleConfirm() {
-        if (!canConfirm) return;
+        if (!canConfirm || isSubmitting) return;
         setIsSubmitting(true);
         try {
             await onConfirm();
