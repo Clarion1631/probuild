@@ -120,6 +120,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [status, setStatus] = useState(initialEstimate.status);
     const [items, setItems] = useState<any[]>(initialEstimate.items || []);
     const [paymentSchedules, setPaymentSchedules] = useState<any[]>(initialEstimate.paymentSchedules || []);
+    // Invoice generated from this estimate (if any) — milestone edits here do not
+    // cascade to it, so the schedule UI warns when one exists.
+    const linkedInvoice: { id: string; code: string; status: string } | null =
+        initialEstimate.invoices?.[0] || null;
     const [isSaving, setIsSaving] = useState(false);
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
@@ -1444,6 +1448,16 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function removePaymentSchedule(index: number) {
+        // Invoice-side milestones are snapshots — deleting the estimate copy does
+        // NOT remove it from an already-generated invoice.
+        if (linkedInvoice) {
+            const ok = window.confirm(
+                `This estimate has already been invoiced (${linkedInvoice.code}). ` +
+                `Deleting this milestone will NOT remove it from the invoice — ` +
+                `the invoice must be adjusted separately. Delete anyway?`
+            );
+            if (!ok) return;
+        }
         const newSchedules = [...paymentSchedules];
         newSchedules.splice(index, 1);
         setPaymentSchedules(newSchedules);
@@ -2326,6 +2340,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                 <div className="flex items-center justify-between bg-slate-50/50 border-b border-slate-100 px-8 py-5">
                                     <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
                                 </div>
+                                {linkedInvoice && (
+                                    <div className="flex items-start gap-2.5 bg-amber-50 border-b border-amber-200 px-8 py-3">
+                                        <svg className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                                        </svg>
+                                        <p className="text-xs text-amber-800">
+                                            <span className="font-semibold">This estimate has been invoiced ({linkedInvoice.code}).</span>{" "}
+                                            Adding, editing, or deleting milestones here does <strong>not</strong> update the invoice — align the invoice&apos;s payment schedule separately.
+                                        </p>
+                                    </div>
+                                )}
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-white border-b border-slate-100 px-8 py-3 uppercase tracking-wider">
                                     <div className="flex-1">Payment Name</div>
                                     <div className="w-32">Percentage</div>
@@ -3411,6 +3436,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         paidAt={undoPaymentTarget.paidAt || null}
                         paymentDate={undoPaymentTarget.paymentDate || null}
                         hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
+                        hasQbPayment={undoPaymentTarget.paymentMethod === "quickbooks"}
                         currentBalance={currentBalance}
                         estimateTotal={total}
                         currentStatus={status}

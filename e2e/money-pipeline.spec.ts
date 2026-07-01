@@ -213,6 +213,11 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
 
     const depositRow = page.locator("tr", { hasText: "MP Deposit" });
     await depositRow.locator('button:has-text("Undo")').click();
+
+    // Undo is guarded by the heavy confirmation modal: type UNDO, then confirm.
+    await page.getByPlaceholder("UNDO").fill("UNDO");
+    await page.locator('button:has-text("Undo Payment")').click();
+
     await expect(depositRow.locator('button:has-text("Record Payment")')).toBeVisible({ timeout: 15_000 });
 
     const invCopy = await prisma.paymentSchedule.findFirstOrThrow({ where: { invoiceId, name: "MP Deposit" } });
