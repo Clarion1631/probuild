@@ -105,7 +105,7 @@ const handler = createMcpHandler(
                 title: "List GTR estimate templates",
                 description:
                     "Catalog of GTR's standard estimate templates. Room templates (Kitchen Remodel, Single Room Remodel, Whole House Remodel, Bathroom Remodel) are full production sequences; " +
-                    "'Chunk — …' templates are reusable procedure blocks (site services, permits, demo, MEP rough/finish, closeout) for composing custom scopes. " +
+                    "'… Package' templates are reusable scope blocks (site services, permits, demolition, MEP rough/finish, closeout) for composing custom scopes. " +
                     "ALWAYS start an estimate from these instead of drafting freehand.",
                 inputSchema: {},
             },
@@ -174,7 +174,7 @@ const handler = createMcpHandler(
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
-            "TEMPLATE-FIRST workflow for estimates: 1) list_templates, 2) get_template for the closest room template (or compose from 'Chunk — …' blocks), " +
+            "TEMPLATE-FIRST workflow for estimates: 1) list_templates, 2) get_template for the closest room template (or compose from the '… Package' scope blocks), " +
             "3) scale quantities, allowances and prices to the actual job with the user — template numbers are starting points, " +
             "4) confirm the target with list_projects / list_leads, 5) create_estimate. " +
             "Every line item needs a costCode from get_estimating_codes. costType is just a line label (Labor / Material / Allowance / Subcontractor / Equipment / Other) — " +
