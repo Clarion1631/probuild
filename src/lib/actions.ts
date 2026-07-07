@@ -3,6 +3,7 @@
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
+import { after } from "next/server";
 import { cache } from "react";
 import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
@@ -7248,15 +7249,10 @@ export async function deleteChangeOrder(id: string) {
     revalidatePath(`/projects/${co.projectId}/change-orders`);
 }
 
-export async function updateChangeOrderStatus(id: string, status: string, projectId: string) {
-    "use server";
-    await prisma.changeOrder.update({
-        where: { id },
-        data: { status }
-    });
-    revalidatePath(`/projects/${projectId}/change-orders/${id}`);
-    revalidatePath(`/projects/${projectId}/change-orders`);
-}
+// updateChangeOrderStatus was removed: it had no callers and, as an unauthenticated
+// remotely-invokable server action, let anyone flip CO statuses — bypassing both the
+// signature flow and the approval automation. Rebuild with auth + the approval hook
+// if a raw status setter is ever actually needed.
 
 export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     "use server";
@@ -7284,9 +7280,12 @@ export async function approveChangeOrder(id: string, signatureName: string, user
     // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
     const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
 
+    // Atomic transition: only the FIRST approval flips the status (a concurrent
+    // or repeated signing matches zero rows), which also preserves the original
+    // signer's audit trail instead of overwriting it.
     const approvedAt = new Date();
-    const co = await prisma.changeOrder.update({
-        where: { id },
+    const transition = await prisma.changeOrder.updateMany({
+        where: { id, status: { not: "Approved" } },
         data: {
             status: "Approved",
             approvedBy: signatureName,
@@ -7294,7 +7293,30 @@ export async function approveChangeOrder(id: string, signatureName: string, user
             clientSignatureUrl,
         },
     });
-    
+    const co = await prisma.changeOrder.findUnique({ where: { id } });
+    if (!co) return null;
+
+    // Exactly-once post-approval automation: bill the CO onto the invoice and send
+    // the payment link (the signature on the exact amount is the approval), with a
+    // team notification either way. Scheduled AFTER the response so the customer's
+    // signing screen never waits on QuickBooks; falls back to inline best-effort
+    // outside a request context.
+    if (transition.count === 1) {
+        const runAutomation = async () => {
+            try {
+                const { handleChangeOrderApproved } = await import("./billing-core");
+                await handleChangeOrderApproved(id);
+            } catch (err) {
+                console.error("[approveChangeOrder] post-approval automation failed:", err);
+            }
+        };
+        try {
+            after(runAutomation);
+        } catch {
+            await runAutomation();
+        }
+    }
+
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;

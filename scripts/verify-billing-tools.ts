@@ -2,7 +2,7 @@
 // change-order draft round-trip (create -> verify -> delete), and error paths of
 // the send cores. Deliberately never triggers a customer email or QB send.
 import { prisma } from "../src/lib/prisma";
-import { getProjectBilling, createChangeOrderDraft, sendMilestoneInvoicesCore, resendInvoiceCore, billChangeOrderCore, sendChangeOrderToClientCore } from "../src/lib/billing-core";
+import { getProjectBilling, createChangeOrderDraft, sendMilestoneInvoicesCore, resendInvoiceCore, billChangeOrderCore, sendChangeOrderToClientCore, handleChangeOrderApproved } from "../src/lib/billing-core";
 
 async function main() {
     const checks: [string, boolean][] = [];
@@ -122,6 +122,10 @@ async function main() {
     // 3b. Change-order send: error path only (never emails)
     const badCoSend = await sendChangeOrderToClientCore("not-a-real-co");
     checks.push(["CO send: bad id errors cleanly", badCoSend.success === false]);
+
+    // 3c. Approval automation: failure paths only, notifications suppressed
+    const badApprove = await handleChangeOrderApproved("not-a-real-co", { notify: false });
+    checks.push(["approval hook: bad id doesn't throw", badApprove.billed === false && badApprove.sent === false && badApprove.issues.length > 0]);
 
     // 4. Send cores: error paths only (never send for real)
     const badSend = await sendMilestoneInvoicesCore("not-a-real-invoice", ["x"], undefined, undefined, "test");

@@ -648,6 +648,85 @@ export async function billChangeOrderCore(changeOrderId: string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Post-approval automation: when the customer signs a change order, bill it onto
+// the invoice and send them the payment link immediately — their signature on
+// the exact amount IS the approval. The team is notified either way; any hiccup
+// (no invoice yet, QuickBooks down) turns into an ACTION-NEEDED alert instead of
+// a silent stall. Never throws: the customer's approval must stand regardless.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function handleChangeOrderApproved(changeOrderId: string, opts?: { notify?: boolean }): Promise<{ billed: boolean; sent: boolean; issues: string[] }> {
+    const summary = { billed: false, sent: false, issues: [] as string[] };
+    let coLabel = changeOrderId;
+    let amountLabel = "";
+    let projectName = "";
+    let sentTo = "";
+
+    try {
+        const co = await prisma.changeOrder.findUnique({
+            where: { id: changeOrderId },
+            select: { code: true, title: true, totalAmount: true, approvedBy: true, project: { select: { name: true } } },
+        });
+        if (co) {
+            coLabel = `${co.code} — ${co.title}`;
+            amountLabel = formatCurrency(co.totalAmount);
+            projectName = co.project?.name ?? "";
+        }
+
+        const bill = await billChangeOrderCore(changeOrderId);
+        if (!bill.ok) {
+            summary.issues.push(bill.error);
+        } else if (bill.alreadyBilled) {
+            // Only the call that FRESHLY billed the CO may auto-send — this makes a
+            // concurrent/replayed approval a no-op instead of a duplicate payment
+            // email (billChangeOrderCore's row lock guarantees exactly one fresh bill).
+            summary.billed = true;
+            summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
+        } else {
+            summary.billed = true;
+            const send = await sendMilestoneInvoicesCore(bill.invoiceId, [bill.milestoneId], undefined, undefined, "Auto (change-order approval)");
+            const resultIssues = send.results.map(r => r.error).filter((e): e is string => !!e);
+            summary.sent = send.results.some(r => !!r.sentTo);
+            if (resultIssues.length) summary.issues.push(...resultIssues);
+            if (!summary.sent && !resultIssues.length) summary.issues.push(send.error || "QuickBooks send failed");
+            sentTo = send.results.find(r => r.sentTo)?.sentTo ?? "";
+        }
+    } catch (err: any) {
+        summary.issues.push(err?.message || "Unexpected error during auto-billing");
+    }
+
+    // Team notification (System Notification Email in Settings → Company).
+    if (opts?.notify === false) return summary;
+    try {
+        const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, companyName: true, email: true } });
+        const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
+        if (to) {
+            const ok = summary.sent;
+            const subject = ok
+                ? `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`
+                : `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`;
+            const detail = ok
+                ? `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`
+                : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
+            await sendNotification(
+                to,
+                subject,
+                `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; color: #333;">
+                    <h2 style="font-size:18px;">Change order approved${projectName ? ` — ${esc(projectName)}` : ""}</h2>
+                    <p><strong>${esc(coLabel)}</strong> (${esc(amountLabel)})</p>
+                    ${detail}
+                </div>`,
+                undefined,
+                { fromName: settings?.companyName || "ProBuild" },
+            );
+        }
+    } catch { /* notification is best-effort */ }
+
+    return summary;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Change-order signature request. Moved verbatim from actions.ts's
 // sendChangeOrderToClient; emails the customer a portal link to review & sign.
 // ─────────────────────────────────────────────────────────────────────────────
