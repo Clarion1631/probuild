@@ -74,6 +74,7 @@ const handler = createMcpHandler(
             "list_projects",
             {
                 title: "List ProBuild projects",
+                annotations: { readOnlyHint: true },
                 description: "List open projects (id, name, client, status). Use the id as create_estimate's projectId.",
                 inputSchema: {},
             },
@@ -94,6 +95,7 @@ const handler = createMcpHandler(
             "list_leads",
             {
                 title: "List ProBuild leads",
+                annotations: { readOnlyHint: true },
                 description: "List open leads (id, name, client, stage). Use the id as create_estimate's leadId when the job has no project yet.",
                 inputSchema: {},
             },
@@ -114,6 +116,7 @@ const handler = createMcpHandler(
             "get_estimating_codes",
             {
                 title: "Get ProBuild cost codes and line-item type labels",
+                annotations: { readOnlyHint: true },
                 description: "Returns the active cost codes (REQUIRED on every line item) and the valid costType labels. costType is just a line label — Labor, Material, Allowance, Subcontractor, Equipment, Other — matching how GTR estimates (allowances + lump-sum labor).",
                 inputSchema: {},
             },
@@ -129,6 +132,7 @@ const handler = createMcpHandler(
             "list_templates",
             {
                 title: "List GTR estimate templates",
+                annotations: { readOnlyHint: true },
                 description:
                     "Catalog of GTR's standard estimate templates. Room templates (Kitchen Remodel, Single Room Remodel, Whole House Remodel, Bathroom Remodel) are full production sequences; " +
                     "'… Package' templates are reusable scope blocks (site services, permits, demolition, MEP rough/finish, closeout) for composing custom scopes. " +
@@ -157,6 +161,7 @@ const handler = createMcpHandler(
             "get_template",
             {
                 title: "Get a GTR estimate template",
+                annotations: { readOnlyHint: true },
                 description:
                     "Returns a template's full phases + line items (with cost codes, quantities and starting unit costs) in the exact shape create_estimate accepts. " +
                     "Pull it, scale quantities/allowances to the actual job with the user, add or drop phases, then create_estimate.",
@@ -175,6 +180,7 @@ const handler = createMcpHandler(
             "create_estimate",
             {
                 title: "Create a draft estimate in ProBuild",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
                 description:
                     "Push a phase-grouped estimate into ProBuild against one project OR one lead. " +
                     "Creates it as Draft/Private for human review — it is not customer-visible until shared. " +
@@ -201,6 +207,7 @@ const handler = createMcpHandler(
             "list_project_billing",
             {
                 title: "List a project's invoices, milestones and estimates",
+                annotations: { readOnlyHint: true },
                 description:
                     "Billing snapshot for one project: estimates (for change orders), invoices with their payment milestones, per-milestone paid/sent status, and whether the QuickBooks payment link is stale. " +
                     "Use this FIRST to find the right invoiceId / milestone ids / estimateId before send_milestone_invoice, resend_invoice, or create_change_order.",
@@ -313,6 +320,7 @@ const handler = createMcpHandler(
             "create_change_order",
             {
                 title: "Create a draft change order",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
                 description:
                     "Captures a field change order as a DRAFT on a project (attached to one of its estimates — find the estimateId via list_project_billing). " +
                     "Line items follow the same costCode/costType rules as estimates. It is NOT sent to the customer — review and send happen in ProBuild.",
@@ -388,6 +396,7 @@ const handler = createMcpHandler(
             "bill_change_order",
             {
                 title: "Bill an approved change order",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                 description:
                     "Adds an APPROVED change order to the project's invoice as a new payment milestone (idempotent — a CO can only be billed once). " +
                     "Nothing is emailed by this tool; it returns the milestone id so you can then run send_milestone_invoice (preview → user approval → confirm) " +
