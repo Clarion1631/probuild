@@ -112,6 +112,178 @@ export async function getProjectBilling(projectId: string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Accounts receivable: every invoice still owed money, across all projects.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function listReceivables() {
+    const now = Date.now();
+    const invoices = await prisma.invoice.findMany({
+        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft"] } },
+        orderBy: { issueDate: "asc" },
+        select: {
+            id: true, code: true, status: true, totalAmount: true, balanceDue: true,
+            issueDate: true, sentAt: true, createdAt: true,
+            project: { select: { id: true, name: true } },
+            client: { select: { name: true, email: true } },
+            payments: {
+                where: { status: "Pending" },
+                orderBy: { createdAt: "asc" },
+                select: { id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true },
+            },
+        },
+    });
+
+    const rows = invoices.map(inv => {
+        const anchor = inv.issueDate ?? inv.sentAt ?? inv.createdAt;
+        const ageDays = Math.floor((now - anchor.getTime()) / 86_400_000);
+        // Due dates are business dates: a milestone isn't "past due" until the
+        // whole due day has elapsed (24h grace covers timezone-of-storage skew).
+        const pastDue = inv.payments.some(p => p.dueDate && p.dueDate.getTime() + 86_400_000 < now);
+        return {
+            invoiceId: inv.id,
+            code: inv.code,
+            status: inv.status,
+            project: inv.project?.name ?? null,
+            projectId: inv.project?.id ?? null,
+            client: inv.client?.name ?? null,
+            balanceDue: Number(inv.balanceDue),
+            total: Number(inv.totalAmount),
+            ageDays,
+            overdue: pastDue || ageDays > 30,
+            unpaidMilestones: inv.payments.map(p => ({
+                id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
+                lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
+            })),
+        };
+    });
+
+    return {
+        totalOutstanding: Math.round(rows.reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
+        overdueOutstanding: Math.round(rows.filter(r => r.overdue).reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
+        invoiceCount: rows.length,
+        invoices: rows,
+    };
+}
+
+/**
+ * Weekly AR digest to the team (System Notification Email). Returns the summary
+ * so the cron response is inspectable; sends nothing when nothing is owed.
+ */
+export async function sendArDigest() {
+    const ar = await listReceivables();
+    if (ar.invoiceCount === 0) return { sent: false, reason: "nothing outstanding", ...ar };
+
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, email: true, companyName: true } });
+    const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
+    if (!to) return { sent: false, reason: "no notification email configured", ...ar };
+
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const row = (r: (typeof ar.invoices)[number]) => `
+        <tr style="${r.overdue ? "background:#fef2f2;" : ""}">
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.code)}${r.overdue ? " ⚠️" : ""}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.project ?? "—")}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.client ?? "—")}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.balanceDue)}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${r.ageDays}d</td>
+        </tr>`;
+
+    const sendResult = await sendNotification(
+        to,
+        `AR digest — ${formatCurrency(ar.totalOutstanding)} outstanding across ${ar.invoiceCount} invoice${ar.invoiceCount === 1 ? "" : "s"}${ar.overdueOutstanding > 0 ? ` (${formatCurrency(ar.overdueOutstanding)} overdue)` : ""}`,
+        `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px; color: #333;">
+            <h2 style="font-size:18px;">Accounts receivable</h2>
+            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> outstanding · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (30+ days or past due date)</p>
+            <table style="border-collapse:collapse;width:100%;font-size:13px;">
+                <tr style="text-align:left;color:#64748b;"><th style="padding:6px 10px;">Invoice</th><th style="padding:6px 10px;">Project</th><th style="padding:6px 10px;">Client</th><th style="padding:6px 10px;text-align:right;">Balance</th><th style="padding:6px 10px;text-align:right;">Age</th></tr>
+                ${ar.invoices.map(row).join("")}
+            </table>
+            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the invoice on [project]" to nudge with a fresh payment link.</p>
+        </div>`,
+        undefined,
+        { fromName: settings?.companyName || "ProBuild" },
+    );
+    if (!sendResult.success) return { sent: false, reason: "email send failed", ...ar };
+    return { sent: true, ...ar };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invoice creation from a signed estimate, with the duplicate guard the raw
+// action lacks (it's also called by the customer signing flow, so it must stay
+// ungated and unmodified — the guard lives here).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function createInvoiceFromEstimateGuarded(estimateId: string) {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { id: true, code: true, title: true, projectId: true, totalAmount: true },
+    });
+    if (!estimate) return { ok: false as const, error: "Estimate not found" };
+    if (!estimate.projectId) return { ok: false as const, error: `Estimate ${estimate.code} is attached to a lead, not a project — convert the lead to a project first.` };
+
+    const existing = await prisma.invoice.findFirst({
+        where: { estimateId },
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }], // same tie-break as the post-create branch
+        select: { id: true, code: true, status: true, balanceDue: true },
+    });
+    if (existing) {
+        return {
+            ok: true as const,
+            alreadyExisted: true,
+            invoiceId: existing.id,
+            invoiceCode: existing.code,
+            status: existing.status,
+            balanceDue: Number(existing.balanceDue),
+            note: "This estimate already has an invoice — no new one created.",
+        };
+    }
+
+    // Invoice.estimateId has no unique constraint (prod carries one legacy
+    // duplicate, so one can't be added yet) — compensate instead of lock: if a
+    // concurrent call created an invoice first, delete ours (untouched, seconds
+    // old, milestones cascade) and return the winner. Deterministic: earliest
+    // createdAt wins, id breaks ties.
+    const { createInvoiceFromEstimate } = await import("./actions");
+    const created = await createInvoiceFromEstimate(estimateId);
+
+    const all = await prisma.invoice.findMany({
+        where: { estimateId },
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        select: { id: true, code: true, status: true, balanceDue: true },
+    });
+    const winner = all[0];
+    if (winner && winner.id !== created.id) {
+        // Conditional delete: only remove OUR seconds-old invoice if it's still an
+        // untouched draft. If anything already interacted with it, keep both and
+        // let the duplicate surface for human review rather than destroy state.
+        const removed = await prisma.invoice.deleteMany({
+            where: { id: created.id, estimateId, status: "Draft", sentAt: null },
+        });
+        if (removed.count === 1) {
+            return {
+                ok: true as const,
+                alreadyExisted: true,
+                invoiceId: winner.id,
+                invoiceCode: winner.code,
+                status: winner.status,
+                balanceDue: Number(winner.balanceDue),
+                note: "A concurrent request created this estimate's invoice first — returning that one.",
+            };
+        }
+    }
+
+    const invoice = await prisma.invoice.findUnique({ where: { id: created.id }, select: { code: true, status: true, balanceDue: true } });
+    return {
+        ok: true as const,
+        alreadyExisted: false,
+        invoiceId: created.id,
+        invoiceCode: invoice?.code ?? "",
+        status: invoice?.status ?? "Draft",
+        balanceDue: Number(invoice?.balanceDue ?? 0),
+        note: `Invoice ${invoice?.code} created from estimate ${estimate.code} with its payment milestones. Use send_milestone_invoice or resend_invoice to send it.`,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Invoice email (ProBuild-native portal link). Moved verbatim from actions.ts.
 // ─────────────────────────────────────────────────────────────────────────────
 

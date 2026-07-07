@@ -17,6 +17,10 @@
       "schedule": "30 * * * *"
     },
     {
+      "path": "/api/cron/ar-digest",
+      "schedule": "0 15 * * 1"
+    },
+    {
       "path": "/api/cron/drive-receipts",
       "schedule": "0 13 * * *"
     }

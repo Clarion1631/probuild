@@ -3,7 +3,7 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, templateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
@@ -406,6 +406,189 @@ const handler = createMcpHandler(
         );
 
         server.registerTool(
+            "send_estimate",
+            {
+                title: "Send an estimate to the customer",
+                annotations: { readOnlyHint: false },
+                description:
+                    "Emails the customer their estimate with a portal link to review and sign it (signing auto-creates the invoice). Works for project AND lead estimates. " +
+                    "TWO-STEP: call without confirmToken for a preview + token; show the user the recipient and total, then echo the confirmToken after they approve. " +
+                    "Milestones must sum to the estimate balance or the send is refused with the exact mismatch.",
+                inputSchema: {
+                    estimateId: z.string().max(50).describe("Estimate id from list_project_billing (or the id create_estimate returned)"),
+                    overrideEmail: z.string().email().optional().describe("Only to send to a different address than the client on file"),
+                    customMessage: z.string().max(2000).optional().describe("Optional personal note included in the email"),
+                    confirmToken: z.string().max(40).optional().describe("Token from the preview response; supplying it executes the send"),
+                },
+            },
+            async ({ estimateId, overrideEmail, customMessage, confirmToken }) => {
+                const estimate = await prisma.estimate.findUnique({
+                    where: { id: estimateId },
+                    select: {
+                        code: true, title: true, status: true, totalAmount: true, taxExempt: true,
+                        memo: true, termsAndConditions: true, taxRatePercent: true, taxRateName: true,
+                        items: { orderBy: { order: "asc" }, select: { id: true, name: true, description: true, quantity: true, unitCost: true, total: true, parentId: true } },
+                        paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, percentage: true, dueDate: true, status: true } },
+                        project: { select: { name: true, client: { select: { name: true, email: true } } } },
+                        lead: { select: { name: true, client: { select: { name: true, email: true } } } },
+                    },
+                });
+                if (!estimate) return { ...textResult({ error: "Estimate not found" }), isError: true };
+                const client = estimate.project?.client ?? estimate.lead?.client;
+                const recipient = (overrideEmail || client?.email || "").trim();
+                if (!recipient) return { ...textResult({ error: "The client has no email on file — add one in ProBuild first, or pass overrideEmail." }), isError: true };
+
+                // sendEstimateToClient auto-repairs the LAST unpaid milestone to make the
+                // schedule sum to the balance due. Compute that repair here so the preview
+                // discloses it and the token binds it — no silent adjustment on confirm.
+                const rc = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+                const schedules = estimate.paymentSchedules;
+                const paidSum = schedules.filter(s => s.status === "Paid").reduce((s, m) => s + Number(m.amount), 0);
+                const unpaid = schedules.filter(s => s.status !== "Paid");
+                const balanceDue = rc(Number(estimate.totalAmount) - paidSum);
+                let milestoneRepair: { milestone: string; from: number; to: number } | null = null;
+                if (unpaid.length > 0) {
+                    const otherUnpaid = unpaid.slice(0, -1).reduce((s, m) => s + Number(m.amount), 0);
+                    const last = unpaid[unpaid.length - 1];
+                    const correctLast = rc(balanceDue - otherUnpaid);
+                    if (correctLast < 0) {
+                        // Unrepairable: the other milestones alone already exceed the balance
+                        // due. Refuse now with the exact mismatch instead of minting a token
+                        // for a send that would fail after the user approves.
+                        return {
+                            ...textResult({
+                                error: `Milestones don't fit the estimate: the unpaid milestones before "${last.name}" already total $${otherUnpaid.toFixed(2)}, but the balance due is $${balanceDue.toFixed(2)}. Fix the milestone amounts in ProBuild before sending.`,
+                            }),
+                            isError: true,
+                        };
+                    }
+                    if (Math.abs(correctLast - Number(last.amount)) > 0.001) {
+                        milestoneRepair = { milestone: last.name, from: Number(last.amount), to: correctLast };
+                    }
+                }
+
+                // Fingerprint the full customer-visible content (items, milestones,
+                // memo/terms, tax, message, pending repair) so ANY edit between preview
+                // and confirm invalidates the token — total alone can't mask a change.
+                const fingerprint = createHash("sha256").update(JSON.stringify({
+                    items: estimate.items.map(i => [i.id, i.name, i.description, i.quantity, Number(i.unitCost), Number(i.total), i.parentId]),
+                    schedules: schedules.map(s => [s.id, s.name, Number(s.amount), s.percentage, s.dueDate?.toISOString() ?? null, s.status]),
+                    memo: estimate.memo, terms: estimate.termsAndConditions,
+                    taxExempt: estimate.taxExempt,
+                    taxRatePercent: estimate.taxRatePercent != null ? Number(estimate.taxRatePercent) : null,
+                    taxRateName: estimate.taxRateName,
+                    customMessage: customMessage ?? null,
+                    milestoneRepair,
+                })).digest("hex").slice(0, 24);
+                const payload = JSON.stringify({ estimateId, recipient, code: estimate.code, total: Number(estimate.totalAmount), status: estimate.status, fingerprint });
+
+                if (!verifyPreviewToken(confirmToken, payload)) {
+                    return textResult({
+                        preview: true,
+                        estimate: { code: estimate.code, title: estimate.title, status: estimate.status, total: Number(estimate.totalAmount), taxExempt: estimate.taxExempt, balanceDue },
+                        target: estimate.project?.name ?? estimate.lead?.name,
+                        recipient,
+                        clientName: client?.name,
+                        ...(milestoneRepair ? {
+                            milestoneAdjustmentOnSend: `Sending will adjust milestone "${milestoneRepair.milestone}" from $${milestoneRepair.from.toFixed(2)} to $${milestoneRepair.to.toFixed(2)} so the schedule matches the balance due — tell the user.`,
+                        } : {}),
+                        confirmToken: mintPreviewToken(payload),
+                        instruction: "Show this to the user (including any milestone adjustment). Call again with this confirmToken ONLY after they explicitly approve.",
+                    });
+                }
+                const { sendEstimateToClient } = await import("@/lib/actions");
+                const result = await sendEstimateToClient(estimateId, undefined, overrideEmail, undefined, customMessage);
+                if (!result.success) return { ...textResult({ error: result.error }), isError: true };
+                return textResult({ ...result, note: "The customer reviews and signs via the portal link; signing auto-creates the invoice in ProBuild." });
+            },
+        );
+
+        server.registerTool(
+            "create_invoice_from_estimate",
+            {
+                title: "Create the project invoice from an estimate",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    "Creates the invoice (with its payment milestones) from a project estimate — the prerequisite for billing milestones or change orders on a project that has no invoice yet. " +
+                    "Idempotent: if the estimate already has an invoice, that one is returned. Nothing is emailed.",
+                inputSchema: {
+                    estimateId: z.string().max(50).describe("Estimate id from list_project_billing"),
+                },
+            },
+            async ({ estimateId }) => {
+                const result = await createInvoiceFromEstimateGuarded(estimateId);
+                if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
+                return textResult(result);
+            },
+        );
+
+        server.registerTool(
+            "list_receivables",
+            {
+                title: "Who owes us money (all projects)",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Accounts receivable across ALL projects: every invoice with a balance due, its unpaid milestones, age in days, and overdue flags (past due date or 30+ days old). " +
+                    "Use for 'who owes us money?', 'what's overdue?', 'total outstanding?'.",
+                inputSchema: {},
+            },
+            async () => textResult(await listReceivables()),
+        );
+
+        server.registerTool(
+            "create_lead",
+            {
+                title: "Create a lead",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                description:
+                    "Captures a new lead in ProBuild (finds or creates the client; duplicate leads within 24h are deduped). Use when the user meets a prospect in the field. " +
+                    "The prospect is NOT emailed; an internal new-lead alert may go to the team.",
+                inputSchema: {
+                    name: z.string().min(1).max(200).describe("Lead name, e.g. 'Smith kitchen remodel'"),
+                    clientName: z.string().min(1).max(200).describe("The prospect's name"),
+                    clientEmail: z.string().email().optional(),
+                    clientPhone: z.string().max(30).optional(),
+                    location: z.string().max(300).optional().describe("City or address"),
+                    projectType: z.string().max(100).optional().describe("e.g. Kitchen Remodeling, Bathroom, ADU"),
+                    message: z.string().max(2000).optional().describe("Notes about the job"),
+                },
+            },
+            async args => {
+                const { createLead } = await import("@/lib/actions");
+                const lead = await createLead(args);
+                // Client matching is by exact name — if the caller supplied contact info
+                // that differs from what's on the matched client, surface it so a
+                // same-name collision doesn't silently attach to the wrong person.
+                const created = await prisma.lead.findUnique({
+                    where: { id: lead.id },
+                    select: { client: { select: { name: true, email: true, primaryPhone: true } } },
+                });
+                const warnings: string[] = [];
+                if (args.clientEmail) {
+                    if (!created?.client?.email) {
+                        warnings.push(`Matched existing client "${created?.client?.name}" who has NO email on file — the provided email (${args.clientEmail}) was NOT saved. Add it on the client record in ProBuild if it's them.`);
+                    } else if (created.client.email.toLowerCase() !== args.clientEmail.toLowerCase()) {
+                        warnings.push(`Attached to existing client "${created.client.name}" whose email on file is ${created.client.email}, not ${args.clientEmail} — verify it's the same person (the provided email was NOT saved).`);
+                    }
+                }
+                if (args.clientPhone) {
+                    const digits = (s: string) => s.replace(/\D/g, "").slice(-10);
+                    if (!created?.client?.primaryPhone) {
+                        warnings.push(`Matched client has no phone on file — the provided phone was NOT saved; add it in ProBuild if it's them.`);
+                    } else if (digits(created.client.primaryPhone) !== digits(args.clientPhone)) {
+                        warnings.push(`Existing client's phone on file (${created.client.primaryPhone}) differs from the one provided — verify it's the same person.`);
+                    }
+                }
+                return textResult({
+                    leadId: lead.id,
+                    url: `https://probuild.goldentouchremodeling.com/leads/${lead.id}`,
+                    warnings,
+                    note: "Lead created (or matched to an identical lead from the last 24h).",
+                });
+            },
+        );
+
+        server.registerTool(
             "bill_change_order",
             {
                 title: "Bill an approved change order",
@@ -426,7 +609,7 @@ const handler = createMcpHandler(
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.3.0" },
+        serverInfo: { name: "probuild", version: "1.4.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -436,8 +619,11 @@ const handler = createMcpHandler(
             "Every line item needs a costCode from get_estimating_codes. costType is just a line label (Labor / Material / Allowance / Subcontractor / Equipment / Other) — " +
             "the user estimates with allowances and lump-sum labor, so keep those labels accurate. " +
             "All prices are USD sell prices. Estimates arrive as private drafts for review in ProBuild. " +
-            "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice and resend_invoice EMAIL THE CUSTOMER — " +
-            "always run the preview step, show the user exactly what will be sent and to whom, and only pass confirm: true after their explicit approval. Never self-confirm. " +
+            "ESTIMATE lifecycle: create_estimate (draft) → send_estimate (preview + user approval; customer signs via portal, which auto-creates the invoice). " +
+            "If a project needs an invoice without a signed estimate, create_invoice_from_estimate. list_receivables answers 'who owes us money?' across all projects. " +
+            "create_lead captures field prospects. " +
+            "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice, resend_invoice and send_estimate EMAIL THE CUSTOMER — " +
+            "always run the preview step, show the user exactly what will be sent and to whom, and only echo back the preview's confirmToken after their explicit approval. Never self-confirm. " +
             "Change-order lifecycle: create_change_order (draft) → send_change_order (preview + user approval; customer signs via portal) → " +
             "once Approved, bill_change_order puts it on the invoice → send_milestone_invoice emails the payment link. " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",

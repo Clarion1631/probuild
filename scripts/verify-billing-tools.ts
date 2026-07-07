@@ -2,7 +2,8 @@
 // change-order draft round-trip (create -> verify -> delete), and error paths of
 // the send cores. Deliberately never triggers a customer email or QB send.
 import { prisma } from "../src/lib/prisma";
-import { getProjectBilling, createChangeOrderDraft, sendMilestoneInvoicesCore, resendInvoiceCore, billChangeOrderCore, sendChangeOrderToClientCore, handleChangeOrderApproved } from "../src/lib/billing-core";
+import { getProjectBilling, createChangeOrderDraft, sendMilestoneInvoicesCore, resendInvoiceCore, billChangeOrderCore, sendChangeOrderToClientCore, handleChangeOrderApproved, listReceivables, createInvoiceFromEstimateGuarded } from "../src/lib/billing-core";
+import { createLead } from "../src/lib/actions";
 
 async function main() {
     const checks: [string, boolean][] = [];
@@ -134,6 +135,48 @@ async function main() {
     checks.push(["milestone send: bad invoice errors cleanly", badSend.success === false && badSend.error === "Invoice not found"]);
     const badResend = await resendInvoiceCore("not-a-real-invoice");
     checks.push(["resend: bad invoice errors cleanly", badResend.success === false]);
+
+    // 5. Accounts receivable (read-only)
+    const ar = await listReceivables();
+    checks.push(["AR returns summary", typeof ar.totalOutstanding === "number" && Array.isArray(ar.invoices)]);
+    checks.push(["AR totals = sum of balances", Math.abs(ar.totalOutstanding - ar.invoices.reduce((s, r) => s + r.balanceDue, 0)) < 0.01]);
+    checks.push(["AR overdue ⊆ total", ar.overdueOutstanding <= ar.totalOutstanding + 0.01]);
+    checks.push(["AR excludes drafts/zero-balance", ar.invoices.every(r => r.status !== "Draft" && r.balanceDue > 0)]);
+
+    // 6. Invoice-from-estimate guard: an estimate that ALREADY has an invoice must
+    // return it, not create a duplicate.
+    const invoiced = await prisma.invoice.findFirst({ where: { estimateId: { not: null } }, select: { id: true, estimateId: true } });
+    if (invoiced?.estimateId) {
+        const before = await prisma.invoice.count({ where: { estimateId: invoiced.estimateId } });
+        const guard = await createInvoiceFromEstimateGuarded(invoiced.estimateId);
+        const after = await prisma.invoice.count({ where: { estimateId: invoiced.estimateId } });
+        checks.push(["invoice guard returns existing", guard.ok && guard.alreadyExisted === true && guard.invoiceId === invoiced.id]);
+        checks.push(["invoice guard creates nothing", before === after]);
+    }
+    const badInv = await createInvoiceFromEstimateGuarded("not-a-real-estimate");
+    checks.push(["invoice guard: bad id errors cleanly", !badInv.ok]);
+
+    // 7. Lead round-trip (create → verify dedup → delete; client cleanup if created).
+    // createLead ends with revalidatePath, which throws outside a request context
+    // (fine in the MCP route) — swallow it here and verify via lookup.
+    const clientBefore = await prisma.client.findFirst({ where: { name: "LEAD VERIFY DELETE ME" }, select: { id: true } });
+    const tolerantCreateLead = async (data: Parameters<typeof createLead>[0]) => {
+        try { return await createLead(data); } catch (e: any) {
+            if (!String(e?.message).includes("static generation store")) throw e;
+            const found = await prisma.lead.findFirst({ where: { name: data.name, client: { name: data.clientName } }, orderBy: { createdAt: "desc" }, select: { id: true } });
+            if (!found) throw e;
+            return { id: found.id };
+        }
+    };
+    const lead1 = await tolerantCreateLead({ name: "Verify lead — delete me", clientName: "LEAD VERIFY DELETE ME", clientEmail: "lead-verify@example.invalid", projectType: "Kitchen Remodeling" });
+    const lead2 = await tolerantCreateLead({ name: "Verify lead — delete me", clientName: "LEAD VERIFY DELETE ME" });
+    checks.push(["lead created", !!lead1.id]);
+    checks.push(["24h dedup returns same lead", lead2.id === lead1.id]);
+    const leadRow = await prisma.lead.findUnique({ where: { id: lead1.id }, select: { clientId: true, projectType: true } });
+    checks.push(["lead carries projectType", leadRow?.projectType === "Kitchen Remodeling"]);
+    await prisma.lead.delete({ where: { id: lead1.id } });
+    if (!clientBefore && leadRow?.clientId) await prisma.client.delete({ where: { id: leadRow.clientId } });
+    console.log("lead cleanup done");
 
     let failed = 0;
     for (const [label, ok] of checks) { console.log(`${ok ? "PASS" : "FAIL"}  ${label}`); if (!ok) failed++; }
