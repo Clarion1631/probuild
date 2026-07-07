@@ -3,7 +3,7 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, templateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore } from "@/lib/billing-core";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -337,9 +337,74 @@ const handler = createMcpHandler(
                 return textResult(result);
             },
         );
+
+        server.registerTool(
+            "send_change_order",
+            {
+                title: "Send a change order to the customer for signature",
+                description:
+                    "Emails the customer a portal link to review and SIGN a Draft (or re-sends a Sent) change order — they approve or decline on their phone. " +
+                    "TWO-STEP: call without confirmToken for a preview + token, show the user what will be sent and to whom, then echo the confirmToken after they approve. " +
+                    "Once the customer signs (status Approved), bill_change_order puts it on the invoice.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).describe("Change order id from list_project_billing"),
+                    confirmToken: z.string().max(40).optional().describe("Token from the preview response; supplying it executes the send"),
+                },
+            },
+            async ({ changeOrderId, confirmToken }) => {
+                const co = await prisma.changeOrder.findUnique({
+                    where: { id: changeOrderId },
+                    select: { code: true, title: true, status: true, totalAmount: true, updatedAt: true, project: { select: { name: true, client: { select: { name: true, email: true } } } } },
+                });
+                if (!co) return { ...textResult({ error: "Change order not found" }), isError: true };
+                if (co.status !== "Draft" && co.status !== "Sent") {
+                    return { ...textResult({ error: `Change order ${co.code} is "${co.status}" — only Draft or Sent change orders can be (re)sent for signature.` }), isError: true };
+                }
+                const recipient = co.project?.client?.email ?? "";
+                if (!recipient) {
+                    return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
+                }
+
+                // updatedAt in the payload means any edit to the CO between preview
+                // and confirm (title, items, totals) invalidates the token.
+                const payload = JSON.stringify({ changeOrderId, recipient, code: co.code, title: co.title, total: Number(co.totalAmount), status: co.status, updatedAt: co.updatedAt.toISOString() });
+                if (!verifyPreviewToken(confirmToken, payload)) {
+                    return textResult({
+                        preview: true,
+                        changeOrder: { code: co.code, title: co.title, status: co.status, total: Number(co.totalAmount) },
+                        project: co.project?.name,
+                        recipient,
+                        confirmToken: mintPreviewToken(payload),
+                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
+                    });
+                }
+                const result = await sendChangeOrderToClientCore(changeOrderId);
+                if (!result.success) return { ...textResult({ error: result.error }), isError: true };
+                return textResult({ ...result, note: "Customer will sign via the portal link. Once status shows Approved in list_project_billing, use bill_change_order." });
+            },
+        );
+
+        server.registerTool(
+            "bill_change_order",
+            {
+                title: "Bill an approved change order",
+                description:
+                    "Adds an APPROVED change order to the project's invoice as a new payment milestone (idempotent — a CO can only be billed once). " +
+                    "Nothing is emailed by this tool; it returns the milestone id so you can then run send_milestone_invoice (preview → user approval → confirm) " +
+                    "to email the customer the QuickBooks payment link. Find change order ids and statuses via list_project_billing.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).describe("Change order id from list_project_billing (status must be Approved)"),
+                },
+            },
+            async ({ changeOrderId }) => {
+                const result = await billChangeOrderCore(changeOrderId);
+                if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
+                return textResult(result);
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.2.0" },
+        serverInfo: { name: "probuild", version: "1.3.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -351,7 +416,9 @@ const handler = createMcpHandler(
             "All prices are USD sell prices. Estimates arrive as private drafts for review in ProBuild. " +
             "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice and resend_invoice EMAIL THE CUSTOMER — " +
             "always run the preview step, show the user exactly what will be sent and to whom, and only pass confirm: true after their explicit approval. Never self-confirm. " +
-            "create_change_order captures field changes as drafts only. QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
+            "Change-order lifecycle: create_change_order (draft) → send_change_order (preview + user approval; customer signs via portal) → " +
+            "once Approved, bill_change_order puts it on the invoice → send_milestone_invoice emails the payment link. " +
+            "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },
     { basePath: "/api/mcp", maxDuration: 60 },
 );

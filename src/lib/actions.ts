@@ -7341,79 +7341,14 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 
 export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     "use server";
-    const co = await prisma.changeOrder.findUnique({
-        where: { id: changeOrderId },
-        include: {
-            project: { include: { client: true } },
-            items: { orderBy: { order: "asc" } },
-        }
-    });
-
-    if (!co) return { success: false, error: "Change order not found" };
-    const client = co.project?.client;
-    if (!client?.email) return { success: false, error: "Client has no email address" };
-
-    // Update status to Sent (only if still in Draft or Sent state)
-    await prisma.changeOrder.updateMany({
-        where: { id: changeOrderId, status: { in: ["Draft", "Sent"] } },
-        data: { status: "Sent", sentAt: new Date() }
-    });
-
-    const { buildClientPortalUrl } = await import("./client-portal-auth");
-    const portalUrl = await buildClientPortalUrl(client.id, client.email, `/portal/change-orders/${changeOrderId}`);
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Your Contractor";
-
-    const changeOrderCc = buildCc(client.email, (client as any).additionalEmail);
-    await sendNotification(
-        client.email,
-        `${companyName} sent you a change order to review`,
-        `<!DOCTYPE html>
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                <h2 style="font-size: 20px; margin: 0 0 8px;">Change Order for Your Review</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
-                <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you a change order titled "<strong>${co.title}</strong>" for project <strong>${co.project?.name || "your project"}</strong>.
-                    Please review the scope changes and approve or decline.
-                </p>
-                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
-                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(co.totalAmount)}</div>
-                </div>
-                <div style="text-align: center; margin: 32px 0;">
-                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        Review Change Order
-                    </a>
-                </div>
-                <p style="color: #999; font-size: 13px; text-align: center;">
-                    Or copy this link: ${portalUrl}
-                </p>
-            </div>
-            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
-                Sent via ProBuild &bull; ${companyName}
-            </p>
-        </body>
-        </html>`,
-        undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc, copyToInternal: true }
-    );
-
-    // Log activity
-    await logActivity({
-        projectId: co.projectId,
-        actorType: "TEAM",
-        actorName: companyName,
-        action: "sent_change_order",
-        entityType: "change_order",
-        entityId: changeOrderId,
-        entityName: `Change Order ${co.code || co.title}`,
-    });
-
-    revalidatePath(`/projects/${co.projectId}/change-orders/${changeOrderId}`);
-    revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return { success: true, sentTo: client.email };
+    // Customer-facing send from the UI — require the changeOrders permission
+    // (this export is a remotely invokable server action). Core logic lives in
+    // billing-core.ts so the shared-secret-gated MCP connector can reuse it.
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "changeOrders")) return { success: false, error: "Forbidden" };
+    const { sendChangeOrderToClientCore } = await import("./billing-core");
+    return sendChangeOrderToClientCore(changeOrderId);
 }
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
