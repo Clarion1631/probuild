@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
+import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 
 export default function ChangeOrderEditor({ context, initialData }: { context: any, initialData: any }) {
     const router = useRouter();
@@ -23,8 +24,11 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSending, setIsSending] = useState(false);
 
     const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const tax = subtotal * 0.088;
+    // Tax follows the estimate's treatment (tax-exempt customers pay none) — kept
+    // in sync with the portal signature page and billChangeOrderCore via lib/co-tax.
+    const tax = subtotal * coTaxRate(initialData.estimate);
     const total = subtotal + tax;
+    const taxLabel = coTaxLabel(initialData.estimate);
 
     async function handleSign() {
         if (!signName.trim()) { toast.error("Please enter a name to sign"); return; }
@@ -309,7 +313,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>Estimated Tax (8.8%)</span>
+                                        <span>{taxLabel}</span>
                                         <span className="text-slate-800">{formatCurrency(tax)}</span>
                                     </div>
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>

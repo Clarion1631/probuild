@@ -6,6 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -47,8 +48,11 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
     const items = initialData.items || [];
     const subtotal = items.reduce((acc: number, item: any) => acc + (Number(item.quantity || 0) * Number(item.unitCost || 0)), 0);
-    const tax = subtotal * 0.088;
+    // Tax follows the estimate's treatment (tax-exempt customers pay none) — the
+    // amount shown here is what the customer signs AND what billing charges.
+    const tax = subtotal * coTaxRate(initialData.estimate);
     const total = subtotal + tax;
+    const taxLabel = coTaxLabel(initialData.estimate);
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -224,7 +228,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <span>{formatCurrency(subtotal)}</span>
                                 </div>
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
-                                    <span>Tax (8.8%)</span>
+                                    <span>{taxLabel}</span>
                                     <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-amber-600">
