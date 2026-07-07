@@ -37,7 +37,7 @@ async function main() {
                 await tx.estimateTemplate.deleteMany({ where: { id: { in: existing.map(e => e.id) } } });
             }
 
-            const template = await tx.estimateTemplate.create({ data: { name: seed.name } });
+            const template = await tx.estimateTemplate.create({ data: { name: seed.name, source: "standard" } });
 
             let order = 0;
             const rows: Parameters<typeof tx.estimateTemplateItem.createMany>[0]["data"] = [];

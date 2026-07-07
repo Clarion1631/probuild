@@ -1037,6 +1037,7 @@ model TakeoffFile {
 model EstimateTemplate {
   id        String                 @id @default(cuid())
   name      String
+  source    String                 @default("custom") // "standard" (seeded GTR library) | "custom" (saved in-app)
   items     EstimateTemplateItem[]
   createdAt DateTime               @default(now())
   updatedAt DateTime               @updatedAt

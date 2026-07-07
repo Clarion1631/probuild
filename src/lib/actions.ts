@@ -4751,28 +4751,42 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
     });
     if (!estimate) throw new Error("Estimate not found");
 
+    const itemRows = estimate.items.map((item) => ({
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: item.quantity,
+        baseCost: item.baseCost,
+        markupPercent: item.markupPercent,
+        unitCost: item.unitCost,
+        order: item.order,
+        parentId: item.parentId,
+        costCodeId: item.costCodeId,
+        costTypeId: item.costTypeId,
+    }));
+
+    // Saving under an existing name replaces that template's contents (keeping its
+    // id/source and bumping updatedAt) instead of piling up same-name duplicates.
+    const existing = await prisma.estimateTemplate.findFirst({
+        where: { name: { equals: templateName, mode: "insensitive" } },
+        select: { id: true },
+    });
+    if (existing) {
+        const template = await prisma.$transaction(async tx => {
+            await tx.estimateTemplateItem.deleteMany({ where: { templateId: existing.id } });
+            return tx.estimateTemplate.update({
+                where: { id: existing.id },
+                data: { name: templateName, items: { create: itemRows } },
+            });
+        });
+        return { id: template.id, name: template.name, updated: true };
+    }
+
     const template = await prisma.estimateTemplate.create({
-        data: {
-            name: templateName,
-            items: {
-                create: estimate.items.map((item) => ({
-                    name: item.name,
-                    description: item.description || "",
-                    type: item.type,
-                    quantity: item.quantity,
-                    baseCost: item.baseCost,
-                    markupPercent: item.markupPercent,
-                    unitCost: item.unitCost,
-                    order: item.order,
-                    parentId: item.parentId,
-                    costCodeId: item.costCodeId,
-                    costTypeId: item.costTypeId,
-                })),
-            },
-        },
+        data: { name: templateName, items: { create: itemRows } },
     });
 
-    return { id: template.id, name: template.name };
+    return { id: template.id, name: template.name, updated: false };
 }
 
 export async function getEstimateTemplates() {
@@ -4843,28 +4857,43 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
 // =============================================
 
 export async function saveItemsAsAssembly(name: string, items: { name: string; description?: string; type: string; quantity: number; baseCost: number; markupPercent: number; unitCost: number; order: number; parentId?: string | null; costCodeId?: string | null; costTypeId?: string | null; isSection?: boolean }[]) {
+    const itemRows = items.map((item, idx) => ({
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: item.quantity,
+        baseCost: item.baseCost || 0,
+        markupPercent: item.markupPercent,
+        unitCost: item.unitCost || 0,
+        order: idx,
+        parentId: item.parentId || null,
+        costCodeId: item.costCodeId || null,
+        costTypeId: item.costTypeId || null,
+    }));
+
+    // Same-name save replaces the existing template (keeps id/source, bumps
+    // updatedAt) so the library doesn't accumulate duplicates.
+    const existing = await prisma.estimateTemplate.findFirst({
+        where: { name: { equals: name, mode: "insensitive" } },
+        select: { id: true },
+    });
+    if (existing) {
+        const template = await prisma.$transaction(async tx => {
+            await tx.estimateTemplateItem.deleteMany({ where: { templateId: existing.id } });
+            return tx.estimateTemplate.update({
+                where: { id: existing.id },
+                data: { name, items: { create: itemRows } },
+                include: { items: true },
+            });
+        });
+        return { id: template.id, name: template.name, itemCount: template.items.length, updated: true };
+    }
+
     const template = await prisma.estimateTemplate.create({
-        data: {
-            name,
-            items: {
-                create: items.map((item, idx) => ({
-                    name: item.name,
-                    description: item.description || "",
-                    type: item.type,
-                    quantity: item.quantity,
-                    baseCost: item.baseCost || 0,
-                    markupPercent: item.markupPercent,
-                    unitCost: item.unitCost || 0,
-                    order: idx,
-                    parentId: item.parentId || null,
-                    costCodeId: item.costCodeId || null,
-                    costTypeId: item.costTypeId || null,
-                })),
-            },
-        },
+        data: { name, items: { create: itemRows } },
         include: { items: true },
     });
-    return { id: template.id, name: template.name, itemCount: template.items.length };
+    return { id: template.id, name: template.name, itemCount: template.items.length, updated: false };
 }
 
 export async function deleteAssembly(templateId: string) {
