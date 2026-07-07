@@ -7203,14 +7203,22 @@ export async function getChangeOrder(id: string) {
 
 export async function getChangeOrderForPortal(id: string) {
     "use server";
-    // IDOR-4 fix: gate by portal session's clientId
-    const sessionClientId = await resolveSessionClientId();
-    if (!sessionClientId) return null;
+    // Staff (ADMIN/MANAGER) may preview any change order — mirrors getInvoiceForPortal.
+    const staffSession = await getServerSession(authOptions);
+    const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
+
+    // IDOR-4 fix: portal clients are gated by their session's clientId
+    let clientFilter = {};
+    if (!isStaff) {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
+        clientFilter = { project: { clientId: sessionClientId } };
+    }
 
     return await prisma.changeOrder.findFirst({
         where: {
             id,
-            project: { clientId: sessionClientId },
+            ...clientFilter,
         },
         include: {
             project: { include: { client: true } },
