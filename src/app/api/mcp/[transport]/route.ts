@@ -112,14 +112,16 @@ const handler = createMcpHandler(
             async () => {
                 const templates = await prisma.estimateTemplate.findMany({
                     take: 100,
-                    orderBy: { name: "asc" },
+                    orderBy: [{ source: "desc" }, { name: "asc" }], // standard library first
                     include: { items: { where: { type: "Section" }, orderBy: { order: "asc" }, select: { name: true } } },
                 });
                 const counts = await prisma.estimateTemplateItem.groupBy({ by: ["templateId"], _count: { id: true } });
                 const countMap = new Map(counts.map(c => [c.templateId, c._count.id]));
                 return textResult(templates.map(t => ({
                     name: t.name,
+                    source: t.source, // "standard" = curated GTR library, "custom" = saved in-app
                     itemCount: countMap.get(t.id) ?? 0,
+                    updatedAt: t.updatedAt.toISOString().slice(0, 10),
                     phases: t.items.map(i => i.name),
                 })));
             },
