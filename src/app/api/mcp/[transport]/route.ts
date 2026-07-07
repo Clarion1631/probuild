@@ -3,7 +3,7 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, templateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, CO_TAX_RATE } from "@/lib/billing-core";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -377,13 +377,20 @@ const handler = createMcpHandler(
                 // and confirm (title, items, totals) invalidates the token.
                 const payload = JSON.stringify({ changeOrderId, recipient, code: co.code, title: co.title, total: Number(co.totalAmount), status: co.status, updatedAt: co.updatedAt.toISOString() });
                 if (!verifyPreviewToken(confirmToken, payload)) {
+                    const subtotal = Number(co.totalAmount);
+                    const taxAmount = Math.round(subtotal * CO_TAX_RATE * 100) / 100;
                     return textResult({
                         preview: true,
-                        changeOrder: { code: co.code, title: co.title, status: co.status, total: Number(co.totalAmount) },
+                        changeOrder: {
+                            code: co.code, title: co.title, status: co.status,
+                            subtotal,
+                            estimatedTax: taxAmount,
+                            revisedAmountCustomerSigns: Math.round((subtotal + taxAmount) * 100) / 100,
+                        },
                         project: co.project?.name,
                         recipient,
                         confirmToken: mintPreviewToken(payload),
-                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
+                        instruction: "Show this to the user including the tax breakdown — the customer signs (and is later billed) the revised amount. Call again with this confirmToken ONLY after they explicitly approve.",
                     });
                 }
                 const result = await sendChangeOrderToClientCore(changeOrderId);

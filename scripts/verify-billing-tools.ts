@@ -86,7 +86,9 @@ async function main() {
         billedInvoiceId = billed.invoiceId;
         billedAmount = billed.amount;
         checks.push(["billed CO creates Pending milestone", billed.alreadyBilled === false && billed.milestoneStatus === "Pending"]);
-        checks.push(["milestone amount = CO total", Math.abs(billed.amount - 210) < 0.005]);
+        // Customer signs subtotal + 8.8% tax: 210 -> 210 + 18.48 = 228.48
+        checks.push(["milestone amount = signed revised amount", Math.abs(billed.amount - 228.48) < 0.005]);
+        checks.push(["bill returns tax breakdown", !billed.alreadyBilled && Math.abs((billed as any).subtotal - 210) < 0.005 && Math.abs((billed as any).taxAmount - 18.48) < 0.005]);
 
         const again = await billChangeOrderCore(coBill.changeOrderId);
         checks.push(["second bill is idempotent", again.ok && again.alreadyBilled === true && again.milestoneId === billed.milestoneId]);

@@ -526,10 +526,16 @@ export async function sendMilestoneInvoicesCore(
 // rail can take it from there. Never bills the same CO twice.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Change orders are presented to the customer as subtotal + 8.8% tax — the same
+// hardcoded rate in ChangeOrderEditor.tsx and PortalChangeOrderClient.tsx (they
+// can't import this module client-side; keep all three in sync). The customer
+// signs the REVISED amount (gross), so that is what gets billed.
+export const CO_TAX_RATE = 0.088;
+
 type BillChangeOrderOutcome =
     | { kind: "error"; error: string }
     | { kind: "duplicate"; dup: { id: string; name: string; amount: number; status: string; invoiceId: string; invoiceCode: string } }
-    | { kind: "created"; milestoneId: string; milestoneName: string; amount: number; invoiceId: string; invoiceCode: string; projectId: string; coCode: string };
+    | { kind: "created"; milestoneId: string; milestoneName: string; amount: number; subtotal: number; taxAmount: number; invoiceId: string; invoiceCode: string; projectId: string; coCode: string };
 
 export async function billChangeOrderCore(changeOrderId: string) {
     // Everything — status check, idempotency check, invoice pick, create,
@@ -546,7 +552,11 @@ export async function billChangeOrderCore(changeOrderId: string) {
         if (co.status !== "Approved") {
             return { kind: "error", error: `Change order ${co.code} is "${co.status}" — only Approved change orders can be billed. Send it for customer signature first.` };
         }
-        const amount = Math.round(Number(co.totalAmount) * 100) / 100;
+        // Bill the amount the customer signed: subtotal + 8.8% tax ("Revised
+        // Amount" on the signature page), not the stored subtotal.
+        const subtotal = Math.round(Number(co.totalAmount) * 100) / 100;
+        const taxAmount = Math.round(subtotal * CO_TAX_RATE * 100) / 100;
+        const amount = Math.round((subtotal + taxAmount) * 100) / 100;
         if (!(amount > 0)) return { kind: "error", error: `Change order ${co.code} has a $0 total — nothing to bill.` };
 
         // Idempotency: a milestone named after this CO on any of the project's
@@ -597,7 +607,7 @@ export async function billChangeOrderCore(changeOrderId: string) {
                 ...(nextStatus !== invoice.status ? { status: nextStatus } : {}),
             },
         });
-        return { kind: "created", milestoneId: created.id, milestoneName, amount, invoiceId: invoice.id, invoiceCode: invoice.code, projectId: co.projectId, coCode: co.code };
+        return { kind: "created", milestoneId: created.id, milestoneName, amount, subtotal, taxAmount, invoiceId: invoice.id, invoiceCode: invoice.code, projectId: co.projectId, coCode: co.code };
     }, { timeout: 15_000 });
 
     if (outcome.kind === "error") return { ok: false as const, error: outcome.error };
@@ -642,8 +652,11 @@ export async function billChangeOrderCore(changeOrderId: string) {
         milestoneId: outcome.milestoneId,
         milestoneName: outcome.milestoneName,
         amount: outcome.amount,
+        subtotal: outcome.subtotal,
+        taxAmount: outcome.taxAmount,
+        taxRate: `${(CO_TAX_RATE * 100).toFixed(1)}%`,
         milestoneStatus: "Pending",
-        note: "Milestone added. Use send_milestone_invoice (preview -> user approval -> confirm) to email the customer the QuickBooks payment link.",
+        note: `Milestone added for the signed Revised Amount: ${formatCurrency(outcome.subtotal)} + ${formatCurrency(outcome.taxAmount)} tax = ${formatCurrency(outcome.amount)}. Use send_milestone_invoice (preview -> user approval -> confirm) to email the customer the QuickBooks payment link.`,
     };
 }
 
@@ -674,6 +687,12 @@ export async function handleChangeOrderApproved(changeOrderId: string, opts?: { 
         }
 
         const bill = await billChangeOrderCore(changeOrderId);
+        if (bill.ok) {
+            // Show the customer's true charge (subtotal + tax) in the team alert.
+            amountLabel = "alreadyBilled" in bill && !bill.alreadyBilled && "subtotal" in bill
+                ? `${formatCurrency(bill.amount)} = ${formatCurrency(bill.subtotal)} + ${formatCurrency(bill.taxAmount)} tax`
+                : formatCurrency(bill.amount);
+        }
         if (!bill.ok) {
             summary.issues.push(bill.error);
         } else if (bill.alreadyBilled) {
