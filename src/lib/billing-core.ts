@@ -86,6 +86,14 @@ export async function getProjectBilling(projectId: string) {
         estimates: project.estimates.map(e => ({
             id: e.id, code: e.code, title: e.title, status: e.status, total: Number(e.totalAmount),
         })),
+        changeOrders: (await prisma.changeOrder.findMany({
+            where: { projectId },
+            orderBy: { createdAt: "desc" },
+            select: { id: true, code: true, title: true, status: true, totalAmount: true, approvedAt: true, sentAt: true },
+        })).map(co => ({
+            id: co.id, code: co.code, title: co.title, status: co.status,
+            total: Number(co.totalAmount), approvedAt: co.approvedAt, sentAt: co.sentAt,
+        })),
         invoices: project.invoices.map(inv => ({
             id: inv.id, code: inv.code, status: inv.status,
             total: Number(inv.totalAmount), balanceDue: Number(inv.balanceDue),
@@ -510,6 +518,219 @@ export async function sendMilestoneInvoicesCore(
             error: globalErr?.message || "An unexpected error occurred",
         };
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bill an APPROVED change order: add it as a milestone on the project's invoice
+// (mirrors addInvoiceMilestone's totals math) so the existing QB milestone-send
+// rail can take it from there. Never bills the same CO twice.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type BillChangeOrderOutcome =
+    | { kind: "error"; error: string }
+    | { kind: "duplicate"; dup: { id: string; name: string; amount: number; status: string; invoiceId: string; invoiceCode: string } }
+    | { kind: "created"; milestoneId: string; milestoneName: string; amount: number; invoiceId: string; invoiceCode: string; projectId: string; coCode: string };
+
+export async function billChangeOrderCore(changeOrderId: string) {
+    // Everything — status check, idempotency check, invoice pick, create,
+    // totals bump — runs inside ONE transaction that takes a row lock on the
+    // CO (SELECT ... FOR UPDATE): concurrent bill calls serialize on the row,
+    // and concurrent status writers (approve/decline use plain updates) block
+    // until this transaction commits, so a just-declined CO can't be billed.
+    const outcome = await prisma.$transaction(async (tx): Promise<BillChangeOrderOutcome> => {
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; projectId: string; estimateId: string }>>`
+            SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId"
+            FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+        const co = locked[0];
+        if (!co) return { kind: "error", error: "Change order not found" };
+        if (co.status !== "Approved") {
+            return { kind: "error", error: `Change order ${co.code} is "${co.status}" — only Approved change orders can be billed. Send it for customer signature first.` };
+        }
+        const amount = Math.round(Number(co.totalAmount) * 100) / 100;
+        if (!(amount > 0)) return { kind: "error", error: `Change order ${co.code} has a $0 total — nothing to bill.` };
+
+        // Idempotency: a milestone named after this CO on any of the project's
+        // invoices means it's already billed (unless canceled). Name-prefix match
+        // is the only available link, so an amount mismatch is surfaced for human
+        // review instead of being silently treated as already-billed.
+        const milestoneName = `${co.code} — ${co.title}`.slice(0, 300);
+        const existing = await tx.paymentSchedule.findFirst({
+            where: {
+                name: { startsWith: `${co.code} — ` },
+                status: { not: "Canceled" },
+                invoice: { projectId: co.projectId },
+            },
+            select: { id: true, name: true, amount: true, status: true, invoiceId: true, invoice: { select: { code: true } } },
+        });
+        if (existing) {
+            if (Math.abs(Number(existing.amount) - amount) > 0.005) {
+                return {
+                    kind: "error",
+                    error: `A milestone "${existing.name}" ($${Number(existing.amount).toFixed(2)}) already exists on invoice ${existing.invoice.code} but doesn't match this change order's total ($${amount.toFixed(2)}). Review it in ProBuild before billing.`,
+                };
+            }
+            return { kind: "duplicate", dup: { id: existing.id, name: existing.name, amount: Number(existing.amount), status: existing.status, invoiceId: existing.invoiceId, invoiceCode: existing.invoice.code } };
+        }
+
+        // Target invoice: prefer the one generated from the CO's estimate, else the
+        // project's most recent. No invoice at all -> tell the user to create one
+        // (invoices are auto-created when an estimate is signed) rather than
+        // inventing financial records implicitly.
+        const invoice =
+            (await tx.invoice.findFirst({ where: { estimateId: co.estimateId }, orderBy: { createdAt: "desc" }, select: { id: true, code: true, status: true } })) ??
+            (await tx.invoice.findFirst({ where: { projectId: co.projectId }, orderBy: { createdAt: "desc" }, select: { id: true, code: true, status: true } }));
+        if (!invoice) {
+            return { kind: "error", error: "This project has no invoice yet — create the invoice from the signed estimate in ProBuild first, then bill the change order." };
+        }
+
+        const created = await tx.paymentSchedule.create({
+            data: { invoiceId: invoice.id, name: milestoneName, amount, status: "Pending" },
+        });
+        // Same totals math as addInvoiceMilestone: bump invoice totals; a fully
+        // Paid invoice becomes Partially Paid when new work lands on it.
+        const nextStatus = invoice.status === "Paid" ? "Partially Paid" : invoice.status;
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+                totalAmount: { increment: amount },
+                balanceDue: { increment: amount },
+                ...(nextStatus !== invoice.status ? { status: nextStatus } : {}),
+            },
+        });
+        return { kind: "created", milestoneId: created.id, milestoneName, amount, invoiceId: invoice.id, invoiceCode: invoice.code, projectId: co.projectId, coCode: co.code };
+    }, { timeout: 15_000 });
+
+    if (outcome.kind === "error") return { ok: false as const, error: outcome.error };
+    if (outcome.kind === "duplicate") {
+        return {
+            ok: true as const,
+            alreadyBilled: true,
+            invoiceId: outcome.dup.invoiceId,
+            invoiceCode: outcome.dup.invoiceCode,
+            milestoneId: outcome.dup.id,
+            milestoneName: outcome.dup.name,
+            amount: outcome.dup.amount,
+            milestoneStatus: outcome.dup.status,
+            note: "This change order is already on the invoice — use send_milestone_invoice if it still needs to go out.",
+        };
+    }
+
+    // Best-effort: the billing transaction is already committed — a logging
+    // hiccup must not make the caller believe the bill failed.
+    try {
+        await logActivityLazy({
+            projectId: outcome.projectId,
+            actorType: "TEAM",
+            actorName: "ChatGPT connector",
+            action: "billed_change_order",
+            entityType: "invoice",
+            entityId: outcome.invoiceId,
+            entityName: `Invoice ${outcome.invoiceCode}`,
+            metadata: { changeOrder: outcome.coCode, milestone: outcome.milestoneName, amount: outcome.amount },
+        });
+    } catch { /* activity feed only */ }
+
+    revalidatePath(`/projects/${outcome.projectId}/invoices`);
+    revalidatePath(`/projects/${outcome.projectId}/invoices/${outcome.invoiceId}`);
+    revalidatePath(`/invoices`);
+
+    return {
+        ok: true as const,
+        alreadyBilled: false,
+        invoiceId: outcome.invoiceId,
+        invoiceCode: outcome.invoiceCode,
+        milestoneId: outcome.milestoneId,
+        milestoneName: outcome.milestoneName,
+        amount: outcome.amount,
+        milestoneStatus: "Pending",
+        note: "Milestone added. Use send_milestone_invoice (preview -> user approval -> confirm) to email the customer the QuickBooks payment link.",
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Change-order signature request. Moved verbatim from actions.ts's
+// sendChangeOrderToClient; emails the customer a portal link to review & sign.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendChangeOrderToClientCore(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+    const co = await prisma.changeOrder.findUnique({
+        where: { id: changeOrderId },
+        include: {
+            project: { include: { client: true } },
+            items: { orderBy: { order: "asc" } },
+        }
+    });
+
+    if (!co) return { success: false, error: "Change order not found" };
+    const client = co.project?.client;
+    if (!client?.email) return { success: false, error: "Client has no email address" };
+
+    // Update status to Sent (only if still in Draft or Sent state). A zero count
+    // means the status flipped (Approved/Declined) since the caller checked —
+    // fail instead of emailing a signature request for a CO that's past signing.
+    const gate = await prisma.changeOrder.updateMany({
+        where: { id: changeOrderId, status: { in: ["Draft", "Sent"] } },
+        data: { status: "Sent", sentAt: new Date() }
+    });
+    if (gate.count === 0) {
+        return { success: false, error: `Change order ${co.code} is no longer in a sendable state (now "${(await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { status: true } }))?.status}") — refresh and retry.` };
+    }
+
+    const { buildClientPortalUrl } = await import("./client-portal-auth");
+    const portalUrl = await buildClientPortalUrl(client.id, client.email, `/portal/change-orders/${changeOrderId}`);
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const companyName = settings?.companyName || "Your Contractor";
+
+    const changeOrderCc = buildCc(client.email, (client as any).additionalEmail);
+    await sendNotification(
+        client.email,
+        `${companyName} sent you a change order to review`,
+        `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Change Order for Your Review</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    ${companyName} has sent you a change order titled "<strong>${co.title}</strong>" for project <strong>${co.project?.name || "your project"}</strong>.
+                    Please review the scope changes and approve or decline.
+                </p>
+                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
+                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(co.totalAmount)}</div>
+                </div>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        Review Change Order
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center;">
+                    Or copy this link: ${portalUrl}
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                Sent via ProBuild &bull; ${companyName}
+            </p>
+        </body>
+        </html>`,
+        undefined,
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc, copyToInternal: true }
+    );
+
+    // Log activity
+    await logActivityLazy({
+        projectId: co.projectId,
+        actorType: "TEAM",
+        actorName: companyName,
+        action: "sent_change_order",
+        entityType: "change_order",
+        entityId: changeOrderId,
+        entityName: `Change Order ${co.code || co.title}`,
+    });
+
+    revalidatePath(`/projects/${co.projectId}/change-orders/${changeOrderId}`);
+    revalidatePath(`/projects/${co.projectId}/change-orders`);
+    return { success: true, sentTo: client.email };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
