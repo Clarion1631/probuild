@@ -3,7 +3,8 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, templateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, CO_TAX_RATE } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore } from "@/lib/billing-core";
+import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -362,7 +363,11 @@ const handler = createMcpHandler(
             async ({ changeOrderId, confirmToken }) => {
                 const co = await prisma.changeOrder.findUnique({
                     where: { id: changeOrderId },
-                    select: { code: true, title: true, status: true, totalAmount: true, updatedAt: true, project: { select: { name: true, client: { select: { name: true, email: true } } } } },
+                    select: {
+                        code: true, title: true, status: true, totalAmount: true, updatedAt: true,
+                        estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
+                        project: { select: { name: true, client: { select: { name: true, email: true } } } },
+                    },
                 });
                 if (!co) return { ...textResult({ error: "Change order not found" }), isError: true };
                 if (co.status !== "Draft" && co.status !== "Sent") {
@@ -378,13 +383,14 @@ const handler = createMcpHandler(
                 const payload = JSON.stringify({ changeOrderId, recipient, code: co.code, title: co.title, total: Number(co.totalAmount), status: co.status, updatedAt: co.updatedAt.toISOString() });
                 if (!verifyPreviewToken(confirmToken, payload)) {
                     const subtotal = Number(co.totalAmount);
-                    const taxAmount = Math.round(subtotal * CO_TAX_RATE * 100) / 100;
+                    const taxAmount = Math.round(subtotal * coTaxRate(co.estimate) * 100) / 100;
                     return textResult({
                         preview: true,
                         changeOrder: {
                             code: co.code, title: co.title, status: co.status,
                             subtotal,
-                            estimatedTax: taxAmount,
+                            tax: taxAmount,
+                            taxTreatment: coTaxLabel(co.estimate),
                             revisedAmountCustomerSigns: Math.round((subtotal + taxAmount) * 100) / 100,
                         },
                         project: co.project?.name,

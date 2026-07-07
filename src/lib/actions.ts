@@ -7195,7 +7195,7 @@ export async function getChangeOrder(id: string) {
         where: { id },
         include: {
             project: { include: { client: true } },
-            estimate: { select: { title: true, code: true } },
+            estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
             paymentSchedules: { orderBy: { order: "asc" } }
         }
@@ -7223,7 +7223,7 @@ export async function getChangeOrderForPortal(id: string) {
         },
         include: {
             project: { include: { client: true } },
-            estimate: { select: { title: true, code: true } },
+            estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
             paymentSchedules: { orderBy: { order: "asc" } }
         }
