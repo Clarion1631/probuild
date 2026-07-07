@@ -4778,14 +4778,14 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
 export async function getEstimateTemplates() {
     return await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
-        include: { items: { orderBy: { order: "asc" } } },
+        include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
     const template = await prisma.estimateTemplate.findUnique({
         where: { id: templateId },
-        include: { items: { orderBy: { order: "asc" } } },
+        include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
     if (!template) throw new Error("Template not found");
 
@@ -4804,9 +4804,18 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
     const templateCode = `EST-${String(estimate.number).padStart(5, "0")}`;
     await prisma.estimate.update({ where: { id: estimate.id }, data: { code: templateCode } });
 
+    // Rebuild grouping by walking items in order: a Section row starts a group and
+    // the child rows after it belong to that group. Stored template parentId VALUES
+    // can't be copied — they reference rows in whatever estimate the template was
+    // saved from, and EstimateItem.parentId is a self-FK, so a raw copy fails or
+    // dangles — but null-vs-set still reliably marks a row as top-level vs child.
+    let currentSectionId: string | null = null;
     for (const item of template.items) {
+        const isSection = item.type === "Section";
+        const newId = crypto.randomUUID();
         await prisma.estimateItem.create({
             data: {
+                id: newId,
                 estimateId: estimate.id,
                 name: item.name,
                 description: item.description || "",
@@ -4817,11 +4826,12 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
                 unitCost: item.unitCost,
                 total: toNum(item.quantity) * toNum(item.unitCost),
                 order: item.order,
-                parentId: item.parentId,
+                parentId: isSection || item.parentId == null ? null : currentSectionId,
                 costCodeId: item.costCodeId,
                 costTypeId: item.costTypeId,
             },
         });
+        if (isSection) currentSectionId = newId;
     }
 
     revalidatePath(`/projects/${projectId}/estimates`);

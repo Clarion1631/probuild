@@ -39,6 +39,66 @@ export type CreateEstimateResult =
 // Validation failures raised inside the transaction; mapped to { ok: false }.
 class EstimateInputError extends Error {}
 
+/**
+ * Converts a stored EstimateTemplate's flat item rows (Section rows + parentId
+ * children) back into the phases[] shape create_estimate accepts, so ChatGPT can
+ * pull a template, adjust it with the user, and push it back unchanged in form.
+ */
+export async function templateToPhases(templateName: string): Promise<
+    | { ok: true; name: string; phases: { phaseName: string; phaseCode?: string; items: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[] }[] }
+    | { ok: false; error: string }
+> {
+    // Template names aren't unique — resolve case-insensitively but prefer an exact
+    // match, and refuse ambiguity rather than answering non-deterministically.
+    const matches = await prisma.estimateTemplate.findMany({
+        where: { name: { equals: templateName, mode: "insensitive" } },
+        include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
+    });
+    if (matches.length === 0) return { ok: false, error: `No template named "${templateName}". Call list_templates for the catalog.` };
+    const template = matches.find(t => t.name === templateName) ?? (matches.length === 1 ? matches[0] : null);
+    if (!template) return { ok: false, error: `Multiple templates match "${templateName}" (${matches.map(t => `"${t.name}"`).join(", ")}). Use the exact name.` };
+
+    // EstimateTemplateItem.costCodeId is a bare string (no relation) — map to codes manually.
+    const costCodes = await prisma.costCode.findMany({ select: { id: true, code: true } });
+    const codeById = new Map(costCodes.map(c => [c.id, c.code]));
+
+    // Grouping is rebuilt by walking items in order (a Section row starts a phase;
+    // the CHILD rows after it belong to that phase). Stored parentId values reference
+    // rows of whatever estimate the template was saved from and can't be trusted,
+    // but null-vs-set still marks top-level vs child. Genuinely top-level items
+    // (and flat legacy templates) collect in an implicit phase.
+    type Phase = { phaseName: string; phaseCode?: string; items: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[] };
+    const phases: Phase[] = [];
+    let currentSection: Phase | null = null;
+    let flat: Phase | null = null;
+
+    for (const item of template.items) {
+        if (item.type === "Section") {
+            currentSection = { phaseName: item.name, phaseCode: (item.costCodeId && codeById.get(item.costCodeId)) || undefined, items: [] };
+            phases.push(currentSection);
+            continue;
+        }
+        let current = item.parentId != null ? currentSection : null;
+        if (!current) {
+            if (!flat) {
+                flat = { phaseName: template.name, items: [] };
+                phases.push(flat);
+            }
+            current = flat;
+        }
+        current.items.push({
+            name: item.name,
+            description: item.description ?? undefined,
+            costCode: (item.costCodeId && codeById.get(item.costCodeId)) || undefined,
+            costType: item.type,
+            quantity: item.quantity,
+            unitCost: Number(item.unitCost),
+        });
+    }
+
+    return { ok: true, name: template.name, phases: phases.filter(p => p.items.length > 0) };
+}
+
 export async function createEstimateFromPhases(input: CreateEstimateInput): Promise<CreateEstimateResult> {
     const { title, projectId, leadId, phases, paymentMilestones } = input;
 

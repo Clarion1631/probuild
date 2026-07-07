@@ -31,7 +31,7 @@ AVAILABLE PHASES (use the code field exactly as shown):
 ${phasesList || "Use standard construction phases"}
 
 AVAILABLE COST TYPES (use exactly as shown):
-${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}
+${typesList || "Labor, Material, Allowance, Subcontractor, Equipment, Other"}
 
 INSTRUCTIONS:
 - Organize the estimate into 6-12 phases that apply to this project
@@ -72,7 +72,7 @@ Return ONLY a valid JSON object with this exact structure:
         {
           "name": string,
           "description": string,
-          "costType": string (exactly one of: ${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}),
+          "costType": string (exactly one of: ${typesList || "Labor, Material, Allowance, Subcontractor, Equipment, Other"}),
           "quantity": number,
           "unit": string (e.g. "sq ft", "hr", "each", "job", "linear ft"),
           "unitCost": number
