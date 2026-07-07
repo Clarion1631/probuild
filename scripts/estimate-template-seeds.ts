@@ -316,14 +316,27 @@ const WHOLE_HOUSE_REMODEL: SeedPhase[] = [
     ...CLOSEOUT_CHUNK,
 ];
 
+// "Package" = reusable scope block (matches how GTR already names estimate
+// sections: "Millwork Package", "Appliance Package"...). Room templates are
+// full project blueprints composed of the same phases.
 export const SEED_TEMPLATES: SeedTemplate[] = [
-    { name: "Chunk — Project Support & Site Services", phases: SUPPORT_CHUNK },
-    { name: "Chunk — Permits & Design", phases: PERMITS_CHUNK },
-    { name: "Chunk — Demolition", phases: DEMO_CHUNK },
-    { name: "Chunk — MEP Rough-In", phases: MEP_ROUGH_CHUNK },
-    { name: "Chunk — MEP Finish", phases: MEP_FINISH_CHUNK },
-    { name: "Chunk — Closeout & Punch List", phases: CLOSEOUT_CHUNK },
+    { name: "Site Services Package", phases: SUPPORT_CHUNK },
+    { name: "Permits & Design Package", phases: PERMITS_CHUNK },
+    { name: "Demolition Package", phases: DEMO_CHUNK },
+    { name: "MEP Rough-In Package", phases: MEP_ROUGH_CHUNK },
+    { name: "MEP Finish Package", phases: MEP_FINISH_CHUNK },
+    { name: "Closeout & Punch List Package", phases: CLOSEOUT_CHUNK },
     { name: "Kitchen Remodel", phases: KITCHEN_REMODEL },
     { name: "Single Room Remodel", phases: SINGLE_ROOM_REMODEL },
     { name: "Whole House Remodel", phases: WHOLE_HOUSE_REMODEL },
+];
+
+// Superseded names cleaned up by the seeder so renames don't leave duplicates.
+export const RETIRED_TEMPLATE_NAMES: string[] = [
+    "Chunk — Project Support & Site Services",
+    "Chunk — Permits & Design",
+    "Chunk — Demolition",
+    "Chunk — MEP Rough-In",
+    "Chunk — MEP Finish",
+    "Chunk — Closeout & Punch List",
 ];

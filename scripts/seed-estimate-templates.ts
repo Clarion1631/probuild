@@ -6,7 +6,7 @@
 // Run: npx tsx --env-file=.env.local scripts/seed-estimate-templates.ts
 import { randomUUID } from "crypto";
 import { prisma } from "../src/lib/prisma";
-import { SEED_TEMPLATES } from "./estimate-template-seeds";
+import { SEED_TEMPLATES, RETIRED_TEMPLATE_NAMES } from "./estimate-template-seeds";
 
 async function main() {
     const costCodes = await prisma.costCode.findMany({ select: { id: true, code: true } });
@@ -21,6 +21,9 @@ async function main() {
         }
     }
     if (missing.size > 0) throw new Error(`Unknown cost codes in seed data: ${[...missing].join(", ")}`);
+
+    const retired = await prisma.estimateTemplate.deleteMany({ where: { name: { in: RETIRED_TEMPLATE_NAMES, mode: "insensitive" } } });
+    if (retired.count > 0) console.log(`removed ${retired.count} retired template(s)`);
 
     for (const seed of SEED_TEMPLATES) {
         await prisma.$transaction(async tx => {
