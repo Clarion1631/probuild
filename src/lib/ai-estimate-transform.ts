@@ -11,6 +11,7 @@ export type AiPhaseItem = {
     name?: string;
     description?: string;
     costType?: string;
+    costCode?: string; // per-item cost code (e.g. "01-DEMO"); falls back to the phase's phaseCode
     quantity?: number | string;
     unit?: string;
     unitCost?: number | string;
@@ -31,6 +32,11 @@ function toNum(v: unknown): number {
         return isFinite(n) ? n : 0;
     }
     return 0;
+}
+
+/** Round to cents so Decimal columns never accumulate float drift. */
+function toCents(n: number): number {
+    return Math.round(n * 100) / 100;
 }
 
 function makeItem(i: {
@@ -74,7 +80,35 @@ export function transformPhasesToItems(
         const phase = aiPhases[pi];
         const parentId = `imp_${ts}_p${pi}`;
         const phaseItems = phase.items || [];
-        const phaseTotal = phaseItems.reduce((s, it) => s + (toNum(it.quantity) || 1) * toNum(it.unitCost), 0);
+        const parentOrder = order++;
+
+        // Child rows first: each line total is rounded to cents, and the phase total
+        // is the sum of those rounded totals so parent and children always agree.
+        const children: ReturnType<typeof makeItem>[] = [];
+        for (let ii = 0; ii < phaseItems.length; ii++) {
+            const item = phaseItems[ii];
+            const qty = toNum(item.quantity) || 1;
+            const uc = toCents(toNum(item.unitCost));
+            children.push(makeItem({
+                id: `imp_${ts}_p${pi}_i${ii}`,
+                name: item.name || "Item",
+                description: item.description || "",
+                type: item.costType || "Material",
+                quantity: qty,
+                unitCost: uc,
+                total: toCents(qty * uc),
+                parentId,
+                // An explicit item costCode wins outright: if it doesn't match a real
+                // code the item stays uncoded (callers warn) rather than silently
+                // inheriting the phase code. Only absent costCode falls back.
+                costCodeId: item.costCode
+                    ? (codeMap[item.costCode] ?? null)
+                    : (phase.phaseCode ? (codeMap[phase.phaseCode] ?? null) : null),
+                costTypeId: item.costType ? (typeMap[item.costType] ?? null) : null,
+                order: order++,
+            }));
+        }
+        const phaseTotal = toCents(children.reduce((s, c) => s + c.total, 0));
 
         // Parent row — phase header (type "Section" so editor renders it as a collapsible group).
         // unitCost = phaseTotal so qty(1) * unitCost = total survives the save-path recomputation.
@@ -89,41 +123,37 @@ export function transformPhasesToItems(
             parentId: null,
             costCodeId: phase.phaseCode ? (codeMap[phase.phaseCode] ?? null) : null,
             costTypeId: null,
-            order: order++,
+            order: parentOrder,
         }));
-
-        // Child rows
-        for (let ii = 0; ii < phaseItems.length; ii++) {
-            const item = phaseItems[ii];
-            const qty = toNum(item.quantity) || 1;
-            const uc = toNum(item.unitCost);
-            estimateItems.push(makeItem({
-                id: `imp_${ts}_p${pi}_i${ii}`,
-                name: item.name || "Item",
-                description: item.description || "",
-                type: item.costType || "Material",
-                quantity: qty,
-                unitCost: uc,
-                total: qty * uc,
-                parentId,
-                costCodeId: phase.phaseCode ? (codeMap[phase.phaseCode] ?? null) : null,
-                costTypeId: item.costType ? (typeMap[item.costType] ?? null) : null,
-                order: order++,
-            }));
-        }
+        estimateItems.push(...children);
     }
 
-    const totalEstimate = estimateItems
+    const totalEstimate = toCents(estimateItems
         .filter(i => !i.parentId) // sum phase totals only
-        .reduce((s, i) => s + i.total, 0);
+        .reduce((s, i) => s + i.total, 0));
 
+    // Milestone amounts are rounded to cents. When the percentages genuinely cover
+    // the whole estimate, the last milestone absorbs the rounding residual so the
+    // schedule sums to the estimate total exactly.
+    // Round the percentage sum to 2dp before comparing so float noise (33.33*3
+    // = 99.99000000000001) can't push a boundary case outside the tolerance.
+    // Must stay consistent with the milestone validation in gpt-estimate.ts.
+    const pcts = aiMilestones.map(m => toNum(m.percentage));
+    const pctSum = toCents(pcts.reduce((s, p) => s + p, 0));
+    const coversTotal = aiMilestones.length > 0 && Math.abs(pctSum - 100) <= 0.01;
+    let allocated = 0;
     const paymentMilestones = aiMilestones.map((m, idx) => {
-        const pct = toNum(m.percentage);
+        const pct = pcts[idx];
+        const isLast = idx === aiMilestones.length - 1;
+        const amount = coversTotal && isLast
+            ? toCents(totalEstimate - allocated)
+            : toCents(pct / 100 * totalEstimate);
+        allocated = toCents(allocated + amount);
         return {
             id: `pm_${ts}_${idx}`,
             name: m.name || `Payment ${idx + 1}`,
             percentage: String(pct || 0),
-            amount: (pct / 100 * totalEstimate).toFixed(2),
+            amount: amount.toFixed(2),
             dueDate: "",
         };
     });

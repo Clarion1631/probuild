@@ -103,3 +103,6 @@ qa-screenshots/
 
 # Google OAuth token cache (dev only - prod uses GMAIL_REFRESH_TOKEN env)
 .gmail-token.json
+
+# ChatGPT MCP connector local secret
+.mcp-secret
