@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "crypto";
 import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
-import { createEstimateFromPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
+import { createEstimateFromPhases, templateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -87,16 +87,59 @@ const handler = createMcpHandler(
         server.registerTool(
             "get_estimating_codes",
             {
-                title: "Get ProBuild cost codes and cost types",
-                description: "Returns the active cost codes and cost types. ALWAYS call this before create_estimate and put a valid costCode + costType on every line item.",
+                title: "Get ProBuild cost codes and line-item type labels",
+                description: "Returns the active cost codes (REQUIRED on every line item) and the valid costType labels. costType is just a line label — Labor, Material, Allowance, Subcontractor, Equipment, Other — matching how GTR estimates (allowances + lump-sum labor).",
                 inputSchema: {},
             },
             async () => {
-                const [costCodes, costTypes] = await Promise.all([
-                    prisma.costCode.findMany({ where: { isActive: true }, orderBy: { code: "asc" }, select: { code: true, name: true, description: true } }),
-                    prisma.costType.findMany({ where: { isActive: true }, orderBy: { name: "asc" }, select: { name: true } }),
-                ]);
-                return textResult({ costCodes, costTypes: costTypes.map(t => t.name) });
+                const costCodes = await prisma.costCode.findMany({ where: { isActive: true }, orderBy: { code: "asc" }, select: { code: true, name: true, description: true } });
+                // Static labels, not the CostType table — cost types belong to expenses;
+                // estimate lines use these labels only, matching the editor's picker.
+                return textResult({ costCodes, costTypes: ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"] });
+            },
+        );
+
+        server.registerTool(
+            "list_templates",
+            {
+                title: "List GTR estimate templates",
+                description:
+                    "Catalog of GTR's standard estimate templates. Room templates (Kitchen Remodel, Single Room Remodel, Whole House Remodel, Bathroom Remodel) are full production sequences; " +
+                    "'Chunk — …' templates are reusable procedure blocks (site services, permits, demo, MEP rough/finish, closeout) for composing custom scopes. " +
+                    "ALWAYS start an estimate from these instead of drafting freehand.",
+                inputSchema: {},
+            },
+            async () => {
+                const templates = await prisma.estimateTemplate.findMany({
+                    take: 100,
+                    orderBy: { name: "asc" },
+                    include: { items: { where: { type: "Section" }, orderBy: { order: "asc" }, select: { name: true } } },
+                });
+                const counts = await prisma.estimateTemplateItem.groupBy({ by: ["templateId"], _count: { id: true } });
+                const countMap = new Map(counts.map(c => [c.templateId, c._count.id]));
+                return textResult(templates.map(t => ({
+                    name: t.name,
+                    itemCount: countMap.get(t.id) ?? 0,
+                    phases: t.items.map(i => i.name),
+                })));
+            },
+        );
+
+        server.registerTool(
+            "get_template",
+            {
+                title: "Get a GTR estimate template",
+                description:
+                    "Returns a template's full phases + line items (with cost codes, quantities and starting unit costs) in the exact shape create_estimate accepts. " +
+                    "Pull it, scale quantities/allowances to the actual job with the user, add or drop phases, then create_estimate.",
+                inputSchema: {
+                    name: z.string().min(1).max(300).describe("Template name from list_templates (case-insensitive)"),
+                },
+            },
+            async ({ name }) => {
+                const result = await templateToPhases(name);
+                if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
+                return textResult(result);
             },
         );
 
@@ -127,12 +170,15 @@ const handler = createMcpHandler(
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.0.0" },
+        serverInfo: { name: "probuild", version: "1.1.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
-            "To build an estimate: call get_estimating_codes, draft phases with line items using those cost codes and cost types, " +
-            "confirm the target project or lead with the user (list_projects / list_leads), then create_estimate. " +
+            "TEMPLATE-FIRST workflow for estimates: 1) list_templates, 2) get_template for the closest room template (or compose from 'Chunk — …' blocks), " +
+            "3) scale quantities, allowances and prices to the actual job with the user — template numbers are starting points, " +
+            "4) confirm the target with list_projects / list_leads, 5) create_estimate. " +
+            "Every line item needs a costCode from get_estimating_codes. costType is just a line label (Labor / Material / Allowance / Subcontractor / Equipment / Other) — " +
+            "the user estimates with allowances and lump-sum labor, so keep those labels accurate. " +
             "All prices are USD sell prices. Estimates arrive as private drafts for review in ProBuild.",
     },
     { basePath: "/api/mcp", maxDuration: 60 },

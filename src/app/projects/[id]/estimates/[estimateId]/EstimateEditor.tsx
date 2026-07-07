@@ -94,7 +94,7 @@ const CHATGPT_ESTIMATE_PROMPT = `You are a residential remodeling estimator. Pro
       "phaseName": "string (e.g. Demolition)",
       "phaseCode": "string (optional)",
       "items": [
-        { "name": "string", "description": "string", "costType": "Labor | Material | Subcontractor | Equipment | Unit | Allowance | Other", "quantity": number, "unit": "string e.g. sq ft, hr, each, job, linear ft", "unitCost": number }
+        { "name": "string", "description": "string", "costType": "Labor | Material | Allowance | Subcontractor | Equipment | Other", "quantity": number, "unit": "string e.g. sq ft, hr, each, job, linear ft", "unitCost": number }
       ]
     }
   ],
@@ -130,7 +130,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [activeTab, setActiveTab] = useState("builder"); // builder | expenses
     const [showSendModal, setShowSendModal] = useState(false);
     const [costCodes, setCostCodes] = useState<any[]>([]);
-    const [costTypes, setCostTypes] = useState<any[]>([]);
+    // Cost types are an expense concept; estimate lines carry a plain type label instead.
+    const ITEM_TYPE_LABELS = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
     const [showAiModal, setShowAiModal] = useState(false);
     const [aiPrompt, setAiPrompt] = useState("");
     const [isGenerating, setIsGenerating] = useState(false);
@@ -232,6 +233,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 parentId: item.parentId || null,
                 name: item.name || "",
                 description: item.description || "",
+                type: item.type || "Material",
                 quantity: String(item.quantity || "0"),
                 unitCost: String(item.unitCost || "0"),
                 costCodeId: item.costCodeId || null,
@@ -311,7 +313,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         setAiSuggestingDesc(item.id);
         try {
             const parent = item.parentId ? items.find((i: any) => i.id === item.parentId) : null;
-            const costType = costTypes.find((ct: any) => ct.id === item.costTypeId);
             const res = await fetch("/api/ai-estimate/suggest", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -320,7 +321,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     itemName: item.name,
                     parentName: parent?.name,
                     projectName: context.name,
-                    costType: costType?.name || item.type,
+                    costType: item.type,
                 }),
             });
             if (res.ok) {
@@ -379,8 +380,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function acceptSubitemSuggestions(parentId: string, suggestions: any[]) {
-        const typeMap: Record<string, string> = {};
-        for (const ct of costTypes) typeMap[ct.name] = ct.id;
         const newItems = suggestions.map((s: any) => ({
             id: generateId(),
             name: s.name,
@@ -393,7 +392,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             total: 0,
             parentId,
             costCodeId: null,
-            costTypeId: typeMap[s.costType] || null,
+            costTypeId: null,
         }));
         setItems([...items, ...newItems]);
         setShowSubitemSuggestions(null);
@@ -507,21 +506,49 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     function handleInsertAssembly(assembly: any) {
         const newItems = [...items];
-        const sectionId = generateId();
-        newItems.push({
-            id: sectionId, name: assembly.name, description: "", type: "Section",
-            quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
-            parentId: null, costCodeId: null, costTypeId: null, isSection: true,
-        });
-        for (const tItem of assembly.items) {
+        const tItems: any[] = assembly.items || [];
+        const hasSections = tItems.some((t: any) => t.type === "Section");
+
+        if (hasSections) {
+            // Multi-phase template: keep its Section grouping. Grouping is rebuilt by
+            // walking items in order (a Section row starts a group; the CHILD rows after
+            // it belong to it). Stored parentId values reference rows of whatever
+            // estimate the template was saved from and can't be trusted — but
+            // null-vs-set still marks a row as top-level vs child.
+            let currentSectionId: string | null = null;
+            for (const tItem of tItems) {
+                const isSection = tItem.type === "Section";
+                const newId = generateId();
+                newItems.push({
+                    id: newId, name: tItem.name, description: tItem.description || "",
+                    type: tItem.type, quantity: tItem.quantity,
+                    baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                    unitCost: Number(tItem.unitCost) || 0,
+                    total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                    parentId: isSection || tItem.parentId == null ? null : currentSectionId,
+                    costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                    ...(isSection ? { isSection: true } : {}),
+                });
+                if (isSection) currentSectionId = newId;
+            }
+        } else {
+            // Flat template: wrap its items in a new section named after the template.
+            const sectionId = generateId();
             newItems.push({
-                id: generateId(), name: tItem.name, description: tItem.description || "",
-                type: tItem.type, quantity: tItem.quantity,
-                baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
-                unitCost: Number(tItem.unitCost) || 0,
-                total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
-                parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                id: sectionId, name: assembly.name, description: "", type: "Section",
+                quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
+                parentId: null, costCodeId: null, costTypeId: null, isSection: true,
             });
+            for (const tItem of tItems) {
+                newItems.push({
+                    id: generateId(), name: tItem.name, description: tItem.description || "",
+                    type: tItem.type, quantity: tItem.quantity,
+                    baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                    unitCost: Number(tItem.unitCost) || 0,
+                    total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                    parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                });
+            }
         }
         setItems(newItems);
         setShowAssemblyDropdown(false);
@@ -627,10 +654,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             .then(res => res.json())
             .then(data => { if (Array.isArray(data)) setCostCodes(data); })
             .catch((err) => console.error("[EstimateEditor] Failed to load cost codes:", err));
-        fetch('/api/cost-types?active=true')
-            .then(res => res.json())
-            .then(data => { if (Array.isArray(data)) setCostTypes(data); })
-            .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
     // Subtotal from leaf items only (sections would double-count)
@@ -917,7 +940,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     description: aiPrompt,
                     location: context.location || 'Vancouver, WA',
                     costCodes,
-                    costTypes,
                 }),
             });
 
@@ -1020,6 +1042,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     parentId: item.parentId || null,
                     name: item.name || "",
                     description: item.description || "",
+                    type: item.type || "Material",
                     quantity: String(item.quantity || "0"),
                     unitCost: String(item.unitCost || "0"),
                     costCodeId: item.costCodeId || null,
@@ -1075,7 +1098,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     phases: parsed.phases,
                     paymentMilestones: parsed.paymentMilestones,
                     costCodes,
-                    costTypes,
                 }),
             });
             if (!res.ok) {
@@ -2184,21 +2206,22 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                             ))}
                                                                         </select>
                                                                         <select
-                                                                            value={item.costTypeId || ""}
+                                                                            value={ITEM_TYPE_LABELS.includes(item.type) ? item.type : ""}
                                                                             onChange={e => {
-                                                                                updateItem(index, "costTypeId", e.target.value || null);
-                                                                                const ct = costTypes.find(c => c.id === e.target.value);
-                                                                                if (ct) updateItem(index, "type", ct.name);
+                                                                                const label = e.target.value;
+                                                                                if (!label) return;
+                                                                                // One atomic update: set the label and drop any stale CostType link.
+                                                                                setItems(prev => prev.map((it, i) => i === index ? { ...it, type: label, costTypeId: null } : it));
                                                                             }}
                                                                             className={`hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition ${
-                                                                                costTypes.find(c => c.id === item.costTypeId)?.name === 'Allowance'
+                                                                                item.type === 'Allowance'
                                                                                     ? 'bg-amber-100 text-amber-700 font-semibold'
                                                                                     : 'bg-slate-100 text-hui-textMuted'
                                                                             }`}
                                                                         >
                                                                             <option value="">Type</option>
-                                                                            {costTypes.map(ct => (
-                                                                                <option key={ct.id} value={ct.id}>{ct.name}</option>
+                                                                            {ITEM_TYPE_LABELS.map(label => (
+                                                                                <option key={label} value={label}>{label}</option>
                                                                             ))}
                                                                         </select>
                                                                         <span className="w-px h-3 bg-slate-200"></span>
