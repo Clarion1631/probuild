@@ -114,6 +114,65 @@ const handler = createMcpHandler(
         );
 
         server.registerTool(
+            "find_job",
+            {
+                title: "Find a job (lead or project) and its estimates by name",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Search leads AND projects by name or client — INCLUDING closed/won ones that list_leads and list_projects omit — plus any estimate by its code (e.g. 'EST-00145'). " +
+                    "Use this when you know the job or estimate by name/number but don't know whether it's still a lead or already a project (a won lead becomes a project). " +
+                    "Each hit includes its estimates (code, title, status, total) so you can go straight to get_estimate / update_estimate / list_project_billing.",
+                inputSchema: {
+                    query: z.string().trim().min(1).max(200).describe("Job name, client name, or estimate code to search for"),
+                },
+            },
+            async ({ query }) => {
+                const like = { contains: query.trim(), mode: "insensitive" as const };
+                const estSelect = { select: { id: true, code: true, title: true, status: true, totalAmount: true }, orderBy: { createdAt: "desc" as const } };
+                const [projects, leads, estimates] = await Promise.all([
+                    prisma.project.findMany({
+                        where: { OR: [{ name: like }, { client: { name: like } }] },
+                        take: 15,
+                        orderBy: { createdAt: "desc" },
+                        select: { id: true, name: true, status: true, type: true, location: true, client: { select: { name: true } }, estimates: estSelect },
+                    }),
+                    prisma.lead.findMany({
+                        where: { OR: [{ name: like }, { client: { name: like } }] },
+                        take: 15,
+                        orderBy: { createdAt: "desc" },
+                        select: { id: true, name: true, stage: true, projectType: true, location: true, client: { select: { name: true } }, estimates: estSelect },
+                    }),
+                    prisma.estimate.findMany({
+                        where: { code: like },
+                        take: 15,
+                        orderBy: { createdAt: "desc" },
+                        select: { id: true, code: true, title: true, status: true, totalAmount: true, project: { select: { id: true, name: true } }, lead: { select: { id: true, name: true } } },
+                    }),
+                ]);
+                const mapEstimates = (es: { id: string; code: string; title: string; status: string; totalAmount: unknown }[]) =>
+                    es.map(e => ({ estimateId: e.id, code: e.code, title: e.title, status: e.status, total: Number(e.totalAmount) }));
+                return textResult({
+                    projects: projects.map(p => ({
+                        type: "project", projectId: p.id, name: p.name, client: p.client?.name ?? null,
+                        status: p.status, projectType: p.type, location: p.location, estimates: mapEstimates(p.estimates),
+                    })),
+                    leads: leads.map(l => ({
+                        type: "lead", leadId: l.id, name: l.name, client: l.client?.name ?? null,
+                        stage: l.stage, projectType: l.projectType, location: l.location, estimates: mapEstimates(l.estimates),
+                    })),
+                    estimatesByCode: estimates.map(e => ({
+                        estimateId: e.id, code: e.code, title: e.title, status: e.status, total: Number(e.totalAmount),
+                        on: e.project ? { type: "project", projectId: e.project.id, name: e.project.name }
+                            : e.lead ? { type: "lead", leadId: e.lead.id, name: e.lead.name } : null,
+                    })),
+                    note: projects.length + leads.length + estimates.length === 0
+                        ? `Nothing matched "${query}". Try a shorter or different term (client last name, or the estimate code).`
+                        : "Matches include closed/won jobs. Use projectId/leadId with the estimate tools.",
+                });
+            },
+        );
+
+        server.registerTool(
             "get_estimating_codes",
             {
                 title: "Get ProBuild cost codes and line-item type labels",
@@ -673,7 +732,8 @@ const handler = createMcpHandler(
             "ESTIMATE lifecycle: create_estimate (draft) → [get_estimate to read, update_estimate to revise in place while still Draft/Sent] → send_estimate (preview + user approval; customer signs via portal, which auto-creates the invoice). "
             + "update_estimate edits an existing unsigned estimate (line items, tax jurisdiction/rate, title, terms); once signed or invoiced, revisions go through a change order. " +
             "If a project needs an invoice without a signed estimate, create_invoice_from_estimate. list_receivables answers 'who owes us money?' across all projects. " +
-            "create_lead captures field prospects. " +
+            "create_lead captures field prospects. "
+            + "To locate a job or estimate you only know by name/number (and don't know if it's still a lead or already a project), use find_job — it searches leads AND projects including closed/won ones, plus estimates by code. " +
             "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice, resend_invoice and send_estimate EMAIL THE CUSTOMER — " +
             "always run the preview step, show the user exactly what will be sent and to whom, and only echo back the preview's confirmToken after their explicit approval. Never self-confirm. " +
             "Change-order lifecycle: create_change_order (draft) → send_change_order (preview + user approval; customer signs via portal) → " +
