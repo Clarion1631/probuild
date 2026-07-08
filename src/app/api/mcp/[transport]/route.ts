@@ -2,7 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
-import { createEstimateFromPhases, templateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
+import { createEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 
@@ -172,6 +172,25 @@ const handler = createMcpHandler(
             },
             async ({ name }) => {
                 const result = await templateToPhases(name);
+                if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
+                return textResult(result);
+            },
+        );
+
+        server.registerTool(
+            "get_estimate",
+            {
+                title: "Read an existing estimate's full line items",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns an existing estimate's phases, line items (with cost codes, quantities, unit costs) and payment milestones — the editable detail list_project_billing omits. " +
+                    "Use to REVISE: read it here, then either update_estimate it in place, or create_estimate a new draft from the adjusted items.",
+                inputSchema: {
+                    estimate: z.string().min(1).max(50).describe("Estimate code (e.g. 'EST-00145') or id from list_project_billing"),
+                },
+            },
+            async ({ estimate }) => {
+                const result = await estimateToPhases(estimate);
                 if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
                 return textResult(result);
             },

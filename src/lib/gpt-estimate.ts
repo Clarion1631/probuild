@@ -99,6 +99,86 @@ export async function templateToPhases(templateName: string): Promise<
     return { ok: true, name: template.name, phases: phases.filter(p => p.items.length > 0) };
 }
 
+/**
+ * Reads an EXISTING estimate (by EST-code or id) into the same phases[] shape
+ * create_estimate accepts, so ChatGPT can revise a live estimate: read it,
+ * change/drop items, then create the revised version as a new draft. Within one
+ * estimate the parentId links are real (unlike template rows), so grouping is
+ * taken directly from them.
+ */
+export async function estimateToPhases(codeOrId: string): Promise<
+    | {
+          ok: true;
+          estimateId: string;
+          code: string;
+          title: string;
+          status: string;
+          projectId: string | null;
+          leadId: string | null;
+          totalAmount: number;
+          taxExempt: boolean;
+          phases: { phaseName: string; phaseCode?: string; items: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[] }[];
+          paymentMilestones: { name: string; percentage: number; amount: number }[];
+      }
+    | { ok: false; error: string }
+> {
+    const key = codeOrId.trim();
+    const estimate = await prisma.estimate.findFirst({
+        where: { OR: [{ code: { equals: key, mode: "insensitive" } }, { id: key }] },
+        include: {
+            items: { orderBy: [{ order: "asc" }, { id: "asc" }], include: { costCode: { select: { code: true } } } },
+            paymentSchedules: { orderBy: { order: "asc" } },
+        },
+    });
+    if (!estimate) return { ok: false, error: `No estimate matching "${codeOrId}". Use list_project_billing to find the estimate id or code.` };
+
+    type Phase = { phaseName: string; phaseCode?: string; items: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[] };
+    const phases: Phase[] = [];
+    const byId = new Map<string, Phase>();
+    let flat: Phase | null = null;
+
+    for (const item of estimate.items) {
+        if (item.type === "Section") {
+            const phase: Phase = { phaseName: item.name, phaseCode: item.costCode?.code ?? undefined, items: [] };
+            phases.push(phase);
+            byId.set(item.id, phase);
+            continue;
+        }
+        let phase = item.parentId ? byId.get(item.parentId) : undefined;
+        if (!phase) {
+            if (!flat) { flat = { phaseName: estimate.title || "Items", items: [] }; phases.push(flat); }
+            phase = flat;
+        }
+        phase.items.push({
+            name: item.name,
+            description: item.description ?? undefined,
+            costCode: item.costCode?.code ?? undefined,
+            costType: item.type,
+            quantity: item.quantity,
+            unitCost: Number(item.unitCost),
+        });
+    }
+
+    const total = Number(estimate.totalAmount);
+    return {
+        ok: true,
+        estimateId: estimate.id,
+        code: estimate.code,
+        title: estimate.title,
+        status: estimate.status,
+        projectId: estimate.projectId,
+        leadId: estimate.leadId,
+        totalAmount: total,
+        taxExempt: !!estimate.taxExempt,
+        phases: phases.filter(p => p.items.length > 0),
+        paymentMilestones: estimate.paymentSchedules.map(m => ({
+            name: m.name,
+            percentage: m.percentage != null ? Number(m.percentage) : 0,
+            amount: Number(m.amount),
+        })),
+    };
+}
+
 export async function createEstimateFromPhases(input: CreateEstimateInput): Promise<CreateEstimateResult> {
     const { title, projectId, leadId, phases, paymentMilestones } = input;
 
