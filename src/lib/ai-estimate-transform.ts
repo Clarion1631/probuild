@@ -35,7 +35,7 @@ function toNum(v: unknown): number {
 }
 
 /** Round to cents so Decimal columns never accumulate float drift. */
-function toCents(n: number): number {
+export function toCents(n: number): number {
     return Math.round(n * 100) / 100;
 }
 

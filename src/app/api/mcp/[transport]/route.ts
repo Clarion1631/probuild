@@ -2,7 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
-import { createEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
+import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 
@@ -219,6 +219,38 @@ const handler = createMcpHandler(
                 if (!result.ok) {
                     return { ...textResult({ error: result.error }), isError: true };
                 }
+                return textResult(result);
+            },
+        );
+
+        server.registerTool(
+            "update_estimate",
+            {
+                title: "Edit an existing (unsigned) estimate in place",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Revise an EXISTING estimate that the customer hasn't committed to yet — only Draft or Sent (unsigned, not-yet-invoiced) estimates. " +
+                    "Refuses once it's signed/Approved or already has an invoice (use a change order for those). " +
+                    "Workflow: get_estimate to read the current items, adjust, then call this. " +
+                    "Pass `phases` to REPLACE all line items (totals + milestone amounts recompute automatically); " +
+                    "pass tax fields (taxExempt, or taxRateName + taxRatePercent — e.g. change the tax jurisdiction from Vancouver to Camas) to reprice tax; " +
+                    "pass title / memo / termsAndConditions to edit those. Only the fields you send change. " +
+                    "paymentMilestones may only be sent together with phases. After editing, send_estimate to (re)deliver it.",
+                inputSchema: {
+                    estimate: z.string().min(1).max(50).describe("Estimate code (e.g. 'EST-00317') or id from get_estimate / list_project_billing"),
+                    title: z.string().min(1).max(300).optional(),
+                    phases: z.array(phaseSchema).min(1).max(50).optional().describe("If provided, REPLACES every line item on the estimate"),
+                    paymentMilestones: z.array(milestoneSchema).max(20).optional().describe("Only valid together with phases; percentages must sum to 100"),
+                    taxExempt: z.boolean().optional().describe("Mark the estimate tax-exempt (adds no tax) or clear it"),
+                    taxRateName: z.string().max(100).nullable().optional().describe("Tax jurisdiction label shown to the customer, e.g. 'Camas'"),
+                    taxRatePercent: z.number().min(0).max(30).nullable().optional().describe("Sales tax percent for that jurisdiction, e.g. 8.4"),
+                    memo: z.string().max(5000).optional(),
+                    termsAndConditions: z.string().max(20000).optional(),
+                },
+            },
+            async args => {
+                const result = await updateEstimateFromPhases(args);
+                if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
                 return textResult(result);
             },
         );
@@ -628,7 +660,7 @@ const handler = createMcpHandler(
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.4.0" },
+        serverInfo: { name: "probuild", version: "1.5.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -638,7 +670,8 @@ const handler = createMcpHandler(
             "Every line item needs a costCode from get_estimating_codes. costType is just a line label (Labor / Material / Allowance / Subcontractor / Equipment / Other) — " +
             "the user estimates with allowances and lump-sum labor, so keep those labels accurate. " +
             "All prices are USD sell prices. Estimates arrive as private drafts for review in ProBuild. " +
-            "ESTIMATE lifecycle: create_estimate (draft) → send_estimate (preview + user approval; customer signs via portal, which auto-creates the invoice). " +
+            "ESTIMATE lifecycle: create_estimate (draft) → [get_estimate to read, update_estimate to revise in place while still Draft/Sent] → send_estimate (preview + user approval; customer signs via portal, which auto-creates the invoice). "
+            + "update_estimate edits an existing unsigned estimate (line items, tax jurisdiction/rate, title, terms); once signed or invoiced, revisions go through a change order. " +
             "If a project needs an invoice without a signed estimate, create_invoice_from_estimate. list_receivables answers 'who owes us money?' across all projects. " +
             "create_lead captures field prospects. " +
             "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice, resend_invoice and send_estimate EMAIL THE CUSTOMER — " +
