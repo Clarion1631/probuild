@@ -21,6 +21,7 @@ type Task = {
     assigneeId: string | null;
     assignee: BoardUser | null;
     aiPrompt: string | null;
+    automationGap: string | null;
     createdById: string | null;
     createdAt: Date | string;
     updatedAt: Date | string;
@@ -124,6 +125,14 @@ function SparkleIcon({ className }: { className?: string }) {
     );
 }
 
+function WrenchIcon({ className }: { className?: string }) {
+    return (
+        <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.7 6.3a4 4 0 00-5.6 4.6L4 16l1.4 1.4L10.6 12.7a4 4 0 004.6-5.6l-2.1 2.1a1.5 1.5 0 01-2.1-2.1l2.1-2.1z" />
+        </svg>
+    );
+}
+
 export default function TasksBoardClient({ initialTasks, users }: Props) {
     const [tasks, setTasks] = useState<Task[]>(initialTasks);
     const [filterId, setFilterId] = useState<string | null>(null);
@@ -132,6 +141,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
     const [draftTitle, setDraftTitle] = useState("");
     const [draftNotes, setDraftNotes] = useState("");
     const [draftAiPrompt, setDraftAiPrompt] = useState("");
+    const [draftAutomationGap, setDraftAutomationGap] = useState("");
     const [, startTransition] = useTransition();
 
     const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
@@ -150,6 +160,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
             setDraftTitle(selectedTask.title);
             setDraftNotes(selectedTask.notes || "");
             setDraftAiPrompt(selectedTask.aiPrompt || "");
+            setDraftAutomationGap(selectedTask.automationGap || "");
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [selectedTaskId]);
@@ -185,6 +196,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                     setDraftTitle(fresh.title);
                     setDraftNotes(fresh.notes || "");
                     setDraftAiPrompt(fresh.aiPrompt || "");
+                    setDraftAutomationGap(fresh.automationGap || "");
                 } else {
                     setSelectedTaskId(null);
                 }
@@ -252,6 +264,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
         dueDate?: string | null;
         assigneeId?: string | null;
         aiPrompt?: string | null;
+        automationGap?: string | null;
     }) {
         setTasks((prev) =>
             prev.map((t) => {
@@ -261,6 +274,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                 if (data.notes !== undefined) updated.notes = data.notes;
                 if (data.dueDate !== undefined) updated.dueDate = data.dueDate;
                 if (data.aiPrompt !== undefined) updated.aiPrompt = data.aiPrompt;
+                if (data.automationGap !== undefined) updated.automationGap = data.automationGap;
                 if (data.assigneeId !== undefined) {
                     updated.assigneeId = data.assigneeId;
                     updated.assignee = data.assigneeId ? users.find((u) => u.id === data.assigneeId) || null : null;
@@ -402,6 +416,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                                                                     )}
                                                                     {task.notes && <NoteIcon className="w-3.5 h-3.5 text-hui-textMuted" />}
                                                                     {task.aiPrompt && <SparkleIcon className="w-3.5 h-3.5 text-hui-primary" />}
+                                                                    {task.automationGap && <WrenchIcon className="w-3.5 h-3.5 text-amber-600" />}
                                                                 </div>
                                                             </div>
                                                         )}
@@ -541,6 +556,25 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                                         Copy for Claude
                                     </button>
                                 </div>
+                            </div>
+
+                            <div className="border-t border-hui-border pt-4">
+                                <p className="text-xs font-semibold text-amber-700 uppercase tracking-wider mb-1 flex items-center gap-1">
+                                    <WrenchIcon className="w-3.5 h-3.5" /> Automation Gap
+                                </p>
+                                <p className="text-xs text-hui-textMuted mb-2">What would make this automatic next time?</p>
+                                <textarea
+                                    className="hui-input w-full bg-amber-50/50 border-amber-200 focus:border-amber-400 focus:ring-amber-400"
+                                    rows={3}
+                                    placeholder="e.g. we don't have API access to the vendor portal to check order status automatically"
+                                    value={draftAutomationGap}
+                                    onChange={(e) => setDraftAutomationGap(e.target.value)}
+                                    onBlur={() => {
+                                        if (draftAutomationGap !== (selectedTask.automationGap || "")) {
+                                            handleFieldUpdate(selectedTask.id, { automationGap: draftAutomationGap || null });
+                                        }
+                                    }}
+                                />
                             </div>
                         </div>
 

@@ -164,6 +164,7 @@ model OfficeTask {
   assigneeId  String?
   assignee    User?     @relation("OfficeTaskAssignee", fields: [assigneeId], references: [id])
   aiPrompt    String?   // suggested prompt the user can copy into Claude
+  automationGap String? // what capability gap forced this to be handed off to a human
   createdById String?
   createdBy   User?     @relation("OfficeTaskCreator", fields: [createdById], references: [id])
   createdAt   DateTime  @default(now())

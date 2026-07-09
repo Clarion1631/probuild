@@ -24,6 +24,7 @@ import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contra
 import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
+import { assertValidOfficeTaskStatus, parseOfficeTaskDateOnly } from "./office-task-utils";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -9361,23 +9362,6 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
 // Office Tasks (internal kanban board — ADMIN/MANAGER only)
 // =============================================
 
-const OFFICE_TASK_STATUSES = ["To Do", "In Progress", "Done"] as const;
-
-function assertValidOfficeTaskStatus(status: string) {
-    if (!(OFFICE_TASK_STATUSES as readonly string[]).includes(status)) {
-        throw new Error(`Invalid status: ${status}`);
-    }
-}
-
-// Parse a "YYYY-MM-DD" date-only string as UTC midnight, so the stored instant's
-// calendar date is timezone-invariant (matches what the user picked, regardless
-// of the server's or client's local timezone).
-function parseOfficeTaskDateOnly(s: string): Date {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-    if (!m) throw new Error("Invalid date");
-    return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
-}
-
 async function assertOfficeTaskAccess() {
     const session = await getSessionOrDev();
     const sessionUserId = (session?.user as any)?.id as string | null | undefined;
@@ -9467,6 +9451,7 @@ export async function updateOfficeTask(id: string, data: {
     dueDate?: string | null;
     assigneeId?: string | null;
     aiPrompt?: string | null;
+    automationGap?: string | null;
 }) {
     await assertOfficeTaskAccess();
 
@@ -9476,6 +9461,7 @@ export async function updateOfficeTask(id: string, data: {
     if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null;
     if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId || null;
     if (data.aiPrompt !== undefined) updateData.aiPrompt = data.aiPrompt || null;
+    if (data.automationGap !== undefined) updateData.automationGap = data.automationGap || null;
 
     const task = await prisma.officeTask.update({
         where: { id },
