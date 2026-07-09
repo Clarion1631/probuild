@@ -925,43 +925,87 @@ export async function handleChangeOrderApproved(changeOrderId: string, opts?: { 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendChangeOrderToClientCore(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
-    const co = await prisma.changeOrder.findUnique({
-        where: { id: changeOrderId },
-        include: {
-            project: { include: { client: true } },
-            estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
-            items: { orderBy: { order: "asc" } },
+    // Read, amount math, and the Draft/Sent -> Sent flip run inside ONE
+    // transaction holding a row lock on the CO (SELECT ... FOR UPDATE, same
+    // pattern as billChangeOrderCore): a concurrent writer (editor save,
+    // co-audit repair) blocks until commit, so the amount emailed is exactly
+    // the amount that was on the row when it was marked Sent. The email
+    // itself stays outside the transaction.
+    type SendCoOutcome =
+        | { kind: "error"; error: string }
+        | {
+            kind: "ok";
+            code: string; title: string; projectId: string; projectName: string;
+            clientId: string; clientName: string; clientEmail: string; additionalEmail: string | null;
+            coSubtotal: number; coTaxAmount: number; coRevisedAmount: number; taxLabel: string;
+        };
+    const outcome = await prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; projectId: string; estimateId: string }>>`
+            SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId"
+            FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+        const co = locked[0];
+        if (!co) return { kind: "error", error: "Change order not found" };
+        // Only Draft/Sent may be (re)sent — a CO that flipped to Approved/Declined
+        // since the caller checked must not get a signature request.
+        if (co.status !== "Draft" && co.status !== "Sent") {
+            return { kind: "error", error: `Change order ${co.code} is no longer in a sendable state (now "${co.status}") — refresh and retry.` };
         }
-    });
 
-    if (!co) return { success: false, error: "Change order not found" };
+        const project = await tx.project.findUnique({
+            where: { id: co.projectId },
+            select: { name: true, client: { select: { id: true, name: true, email: true, additionalEmail: true } } },
+        });
+        const client = project?.client;
+        if (!client?.email) return { kind: "error", error: "Client has no email address" };
 
-    // co.totalAmount is the PRE-TAX subtotal (same semantic as billChangeOrderCore).
-    // The email must show the tax-inclusive Revised Amount — the number on the
-    // signature page and the number billing will actually charge.
-    const coSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
-    const coTaxAmount = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100;
-    const coRevisedAmount = Math.round((coSubtotal + coTaxAmount) * 100) / 100;
-    const client = co.project?.client;
-    if (!client?.email) return { success: false, error: "Client has no email address" };
+        // co.totalAmount is the PRE-TAX subtotal (same semantic as billChangeOrderCore).
+        // The email must show the tax-inclusive Revised Amount — the number on the
+        // signature page and the number billing will actually charge.
+        const estimateTax = await tx.estimate.findUnique({
+            where: { id: co.estimateId },
+            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+        });
+        const coSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
+        const coTaxAmount = Math.round(coSubtotal * coTaxRate(estimateTax) * 100) / 100;
+        const coRevisedAmount = Math.round((coSubtotal + coTaxAmount) * 100) / 100;
 
-    // Update status to Sent (only if still in Draft or Sent state). A zero count
-    // means the status flipped (Approved/Declined) since the caller checked —
-    // fail instead of emailing a signature request for a CO that's past signing.
-    const gate = await prisma.changeOrder.updateMany({
-        where: { id: changeOrderId, status: { in: ["Draft", "Sent"] } },
-        data: { status: "Sent", sentAt: new Date() }
-    });
-    if (gate.count === 0) {
-        return { success: false, error: `Change order ${co.code} is no longer in a sendable state (now "${(await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { status: true } }))?.status}") — refresh and retry.` };
-    }
+        await tx.changeOrder.update({
+            where: { id: changeOrderId },
+            data: { status: "Sent", sentAt: new Date() },
+        });
+
+        return {
+            kind: "ok",
+            code: co.code, title: co.title, projectId: co.projectId, projectName: project?.name ?? "",
+            clientId: client.id, clientName: client.name, clientEmail: client.email, additionalEmail: client.additionalEmail,
+            coSubtotal, coTaxAmount, coRevisedAmount, taxLabel: coTaxLabel(estimateTax),
+        };
+    }, { timeout: 15_000 });
+
+    if (outcome.kind === "error") return { success: false, error: outcome.error };
+    const { code, title, projectId, projectName, coSubtotal, coTaxAmount, coRevisedAmount, taxLabel } = outcome;
+    const client = { id: outcome.clientId, name: outcome.clientName, email: outcome.clientEmail, additionalEmail: outcome.additionalEmail };
 
     const { buildClientPortalUrl } = await import("./client-portal-auth");
     const portalUrl = await buildClientPortalUrl(client.id, client.email, `/portal/change-orders/${changeOrderId}`);
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
-    const changeOrderCc = buildCc(client.email, (client as any).additionalEmail);
+    // The row lock released at commit, so a writer that was queued behind it
+    // (editor save, co-audit repair) can land an edit while the portal URL and
+    // settings were being built above. The send is external and can't be rolled
+    // back — re-check the row last and abort on drift instead of emailing a
+    // number that no longer matches the portal. FOR UPDATE (not findUnique):
+    // the recheck must WAIT for any in-flight writer to commit before reading,
+    // or it would read the pre-update row and pass while stale.
+    const recheckRows = await prisma.$queryRaw<Array<{ status: string; totalAmount: unknown }>>`
+        SELECT "status", "totalAmount" FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+    const recheck = recheckRows[0];
+    if (!recheck || recheck.status !== "Sent" || Math.abs(Math.round(Number(recheck.totalAmount) * 100) / 100 - coSubtotal) > 0.005) {
+        return { success: false, error: `Change order ${code} was modified while the email was being prepared — review it and send again.` };
+    }
+
+    const changeOrderCc = buildCc(client.email, client.additionalEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a change order to review`,
@@ -972,13 +1016,13 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
                 <h2 style="font-size: 20px; margin: 0 0 8px;">Change Order for Your Review</h2>
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
                 <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you a change order titled "<strong>${co.title}</strong>" for project <strong>${co.project?.name || "your project"}</strong>.
+                    ${companyName} has sent you a change order titled "<strong>${title}</strong>" for project <strong>${projectName || "your project"}</strong>.
                     Please review the scope changes and approve or decline.
                 </p>
                 <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
                     <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
                     <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>
-                    ${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${coTaxLabel(co.estimate)}</div>` : ""}
+                    ${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${taxLabel}</div>` : ""}
                 </div>
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
@@ -1000,17 +1044,17 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
 
     // Log activity
     await logActivityLazy({
-        projectId: co.projectId,
+        projectId,
         actorType: "TEAM",
         actorName: companyName,
         action: "sent_change_order",
         entityType: "change_order",
         entityId: changeOrderId,
-        entityName: `Change Order ${co.code || co.title}`,
+        entityName: `Change Order ${code || title}`,
     });
 
-    revalidatePath(`/projects/${co.projectId}/change-orders/${changeOrderId}`);
-    revalidatePath(`/projects/${co.projectId}/change-orders`);
+    revalidatePath(`/projects/${projectId}/change-orders/${changeOrderId}`);
+    revalidatePath(`/projects/${projectId}/change-orders`);
     return { success: true, sentTo: client.email };
 }
 
