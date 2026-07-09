@@ -185,7 +185,7 @@ export async function POST(req: Request) {
         if (verdict === "ok") {
             return { ok: true as const, changed: false, code: co.code, totalAmount: stored, note: "Already equals the item subtotal." };
         }
-        if (verdict === "drift" && !force) {
+        if (verdict === "drift" && force !== true) {
             return { ok: false as const, error: `${co.code} is a drift row (stored $${stored.toFixed(2)} matches neither the item subtotal $${subtotal.toFixed(2)} nor subtotal+tax $${expectedBilled.toFixed(2)}) — pass force:true only after a human confirms the items are canonical.` };
         }
         await tx.changeOrder.update({
