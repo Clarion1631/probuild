@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coItemsSubtotal } from "@/lib/co-tax";
 
 // One-off data-repair surface for the pre-2026-07-09 change-order editor bug:
 // the editor saved totalAmount tax-INCLUSIVE (item subtotal × (1 + rate)) while
@@ -12,10 +12,14 @@ import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 //          integer-cents math as createChangeOrderDraft), classify the stored
 //          totalAmount (ok / tax-inflated / drift / no-items), and cross-check
 //          Approved COs against their billed "CO-xxxxx — " milestone.
-//   POST — { changeOrderId, expectedTotalAmount }: reset ONE Draft/Sent CO's
-//          totalAmount + balanceDue to its item subtotal. Refuses Approved/
-//          Declined rows, empty-item rows, and stale reads (optimistic lock on
-//          the current total). Row-locked like billChangeOrderCore.
+//   POST — { changeOrderId, expectedTotalAmount, force? }: reset ONE Draft/Sent
+//          CO's totalAmount + balanceDue to its item subtotal. The verdict is
+//          recomputed in-transaction: only tax-inflated rows are repaired
+//          unless force:true (drift rows may carry an intentional edit).
+//          Refuses Approved/Declined rows, empty-item rows, rows whose
+//          balanceDue has diverged from totalAmount, and stale reads
+//          (optimistic lock on the current total). Row-locked like
+//          billChangeOrderCore.
 //
 // Secret-gated machine-to-machine route (same pattern as the sibling
 // /api/integrations routes): header x-audit-key must equal CO_AUDIT_SECRET.
@@ -34,18 +38,20 @@ function authorized(req: Request): boolean {
     return timingSafeEqual(a, b);
 }
 
-const rc = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+// Same cents rounding as billChangeOrderCore — the cross-check must round
+// exactly like billing does, not merely close to it.
+const rc = (n: number) => Math.round(n * 100) / 100;
 
-// Same integer-cents line math as createChangeOrderDraft (billing-core.ts):
-// unit costs become integer cents, toPrecision(12) strips float dust so
-// fractional quantities round on the intended half-cent boundary.
-function itemsSubtotal(items: { quantity: number; unitCost: unknown }[]): number {
-    let cents = 0;
-    for (const it of items) {
-        const unitCents = Math.round(Number(it.unitCost) * 100);
-        cents += Math.round(Number((it.quantity * unitCents).toPrecision(12)));
-    }
-    return cents / 100;
+// GET's "ok" tolerance and POST's no-op tolerance are the SAME constant so a
+// row the audit reports as ok can never be mutated by a follow-up POST.
+const OK_TOLERANCE = 0.01;
+
+type Verdict = "ok" | "tax-inflated" | "drift" | "no-items";
+function classify(stored: number, subtotal: number, expectedBilled: number, itemCount: number): Verdict {
+    if (itemCount === 0) return "no-items";
+    if (Math.abs(stored - subtotal) <= OK_TOLERANCE) return "ok";
+    if (Math.abs(stored - expectedBilled) <= 0.02) return "tax-inflated";
+    return "drift";
 }
 
 export async function GET(req: Request) {
@@ -76,17 +82,12 @@ export async function GET(req: Request) {
 
     const rows = cos.map(co => {
         const stored = rc(Number(co.totalAmount));
-        const subtotal = itemsSubtotal(co.items);
+        const subtotal = coItemsSubtotal(co.items.map(i => ({ quantity: i.quantity, unitCost: Number(i.unitCost) })));
         const rate = coTaxRate(co.estimate);
         const tax = rc(subtotal * rate);
         const expectedBilled = rc(subtotal + tax); // what billing charges once fixed
         const inflated = rc(stored - subtotal);
-
-        let verdict: "ok" | "tax-inflated" | "drift" | "no-items";
-        if (co.items.length === 0) verdict = "no-items";
-        else if (Math.abs(stored - subtotal) <= 0.01) verdict = "ok";
-        else if (Math.abs(stored - expectedBilled) <= 0.02) verdict = "tax-inflated";
-        else verdict = "drift";
+        const verdict = classify(stored, subtotal, expectedBilled, co.items.length);
 
         const milestones = coMilestones
             .filter(m => m.invoice.projectId === co.project.id && m.name.startsWith(`${co.code} — `))
@@ -134,7 +135,7 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
     if (!authorized(req)) return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
 
-    let body: { changeOrderId?: string; expectedTotalAmount?: number };
+    let body: { changeOrderId?: string; expectedTotalAmount?: number; force?: boolean };
     try {
         body = await req.json();
     } catch {
@@ -143,12 +144,12 @@ export async function POST(req: Request) {
     if (!body.changeOrderId || typeof body.expectedTotalAmount !== "number") {
         return NextResponse.json({ ok: false, reason: "changeOrderId and expectedTotalAmount required" }, { status: 400 });
     }
-    const { changeOrderId, expectedTotalAmount } = body;
+    const { changeOrderId, expectedTotalAmount, force } = body;
 
     const result = await prisma.$transaction(async tx => {
         // Row lock so a concurrent approve/send/bill serializes against the fix.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; balanceDue: unknown; projectId: string }>>`
-            SELECT "id", "code", "title", "status", "totalAmount", "balanceDue", "projectId"
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string }>>`
+            SELECT "id", "code", "title", "status", "totalAmount", "balanceDue", "projectId", "estimateId"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
@@ -159,24 +160,41 @@ export async function POST(req: Request) {
         if (Math.abs(stored - expectedTotalAmount) > 0.005) {
             return { ok: false as const, error: `Stale read: ${co.code} totalAmount is now $${stored.toFixed(2)}, not $${expectedTotalAmount.toFixed(2)}. Re-run the audit.` };
         }
+        const balance = rc(Number(co.balanceDue));
+        if (Math.abs(balance - stored) > 0.005) {
+            return { ok: false as const, error: `${co.code} balanceDue ($${balance.toFixed(2)}) has diverged from totalAmount ($${stored.toFixed(2)}) — review by hand before resetting either.` };
+        }
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId },
             select: { quantity: true, unitCost: true },
         });
-        if (items.length === 0) {
+        // Re-derive the verdict under the lock — the repair only applies to the
+        // tax-inclusive-total bug. A drift row (total matches neither subtotal
+        // nor subtotal+tax) may carry an intentional edit, so it needs an
+        // explicit force from a human.
+        const subtotal = coItemsSubtotal(items.map(i => ({ quantity: i.quantity, unitCost: Number(i.unitCost) })));
+        const estimateTax = await tx.estimate.findUnique({
+            where: { id: co.estimateId },
+            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+        });
+        const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(estimateTax)));
+        const verdict = classify(stored, subtotal, expectedBilled, items.length);
+        if (verdict === "no-items") {
             return { ok: false as const, error: `${co.code} has no line items — nothing to recompute from; review by hand.` };
         }
-        const subtotal = itemsSubtotal(items);
-        if (Math.abs(stored - subtotal) <= 0.005) {
+        if (verdict === "ok") {
             return { ok: true as const, changed: false, code: co.code, totalAmount: stored, note: "Already equals the item subtotal." };
+        }
+        if (verdict === "drift" && !force) {
+            return { ok: false as const, error: `${co.code} is a drift row (stored $${stored.toFixed(2)} matches neither the item subtotal $${subtotal.toFixed(2)} nor subtotal+tax $${expectedBilled.toFixed(2)}) — pass force:true only after a human confirms the items are canonical.` };
         }
         await tx.changeOrder.update({
             where: { id: changeOrderId },
             data: { totalAmount: subtotal, balanceDue: subtotal },
         });
         return {
-            ok: true as const, changed: true, code: co.code, title: co.title, projectId: co.projectId,
-            before: { totalAmount: stored, balanceDue: rc(Number(co.balanceDue)) },
+            ok: true as const, changed: true, code: co.code, title: co.title, projectId: co.projectId, verdict,
+            before: { totalAmount: stored, balanceDue: balance },
             after: { totalAmount: subtotal, balanceDue: subtotal },
         };
     }, { timeout: 15_000 });
@@ -195,6 +213,7 @@ export async function POST(req: Request) {
                     entityName: `${result.code} — ${result.title}`,
                     metadata: JSON.stringify({
                         reason: "tax-inclusive totalAmount left by pre-2026-07-09 CO editor",
+                        verdict: result.verdict,
                         before: result.before,
                         after: result.after,
                     }),
