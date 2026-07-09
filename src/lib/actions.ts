@@ -9357,4 +9357,143 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
     return item;
 }
 
+// =============================================
+// Office Tasks (internal kanban board — ADMIN/MANAGER only)
+// =============================================
+
+async function assertOfficeTaskAccess() {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    return caller;
+}
+
+export async function getOfficeTasksBoard() {
+    await assertOfficeTaskAccess();
+
+    const [tasks, users] = await Promise.all([
+        prisma.officeTask.findMany({
+            orderBy: [{ status: "asc" }, { position: "asc" }],
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        }),
+        prisma.user.findMany({
+            where: { role: { in: ["ADMIN", "MANAGER"] }, status: "ACTIVATED" },
+            select: { id: true, name: true, email: true },
+        }),
+    ]);
+
+    return { tasks, users };
+}
+
+export async function createOfficeTask(data: {
+    title: string;
+    status?: string;
+    assigneeId?: string | null;
+    dueDate?: string | null;
+}) {
+    const caller = await assertOfficeTaskAccess();
+
+    const status = data.status || "To Do";
+    const last = await prisma.officeTask.findFirst({
+        where: { status },
+        orderBy: { position: "desc" },
+        select: { position: true },
+    });
+
+    const task = await prisma.officeTask.create({
+        data: {
+            title: data.title,
+            status,
+            position: (last?.position ?? -1) + 1,
+            assigneeId: data.assigneeId || null,
+            dueDate: data.dueDate ? new Date(data.dueDate) : null,
+            createdById: caller.id,
+        },
+        include: { assignee: { select: { id: true, name: true, email: true } } },
+    });
+
+    revalidatePath("/tasks");
+    return task;
+}
+
+export async function updateOfficeTask(id: string, data: {
+    title?: string;
+    notes?: string | null;
+    dueDate?: string | null;
+    assigneeId?: string | null;
+    aiPrompt?: string | null;
+}) {
+    await assertOfficeTaskAccess();
+
+    const updateData: any = {};
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.notes !== undefined) updateData.notes = data.notes || null;
+    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? new Date(data.dueDate) : null;
+    if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId || null;
+    if (data.aiPrompt !== undefined) updateData.aiPrompt = data.aiPrompt || null;
+
+    const task = await prisma.officeTask.update({
+        where: { id },
+        data: updateData,
+        include: { assignee: { select: { id: true, name: true, email: true } } },
+    });
+
+    revalidatePath("/tasks");
+    return task;
+}
+
+export async function moveOfficeTask(id: string, newStatus: string, newIndex: number) {
+    await assertOfficeTaskAccess();
+
+    const task = await prisma.officeTask.findUnique({ where: { id } });
+    if (!task) throw new Error("Task not found");
+
+    const oldStatus = task.status;
+
+    await prisma.$transaction(async (tx) => {
+        const targetTasks = await tx.officeTask.findMany({
+            where: { status: newStatus, id: { not: id } },
+            orderBy: { position: "asc" },
+        });
+
+        const clampedIndex = Math.max(0, Math.min(newIndex, targetTasks.length));
+        targetTasks.splice(clampedIndex, 0, { ...task, status: newStatus } as typeof task);
+
+        for (let i = 0; i < targetTasks.length; i++) {
+            const t = targetTasks[i];
+            await tx.officeTask.update({
+                where: { id: t.id },
+                data: { position: i, status: newStatus },
+            });
+        }
+
+        if (oldStatus !== newStatus) {
+            const sourceTasks = await tx.officeTask.findMany({
+                where: { status: oldStatus, id: { not: id } },
+                orderBy: { position: "asc" },
+            });
+            for (let i = 0; i < sourceTasks.length; i++) {
+                await tx.officeTask.update({
+                    where: { id: sourceTasks[i].id },
+                    data: { position: i },
+                });
+            }
+        }
+    });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function deleteOfficeTask(id: string) {
+    await assertOfficeTaskAccess();
+
+    await prisma.officeTask.delete({ where: { id } });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
 
