@@ -22,6 +22,7 @@ import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
 import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
+import { geocodeJobSiteAddress } from "./geocode";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -274,11 +275,15 @@ export async function createLead(data: { name: string; clientName: string; clien
     });
     if (existing) return { id: existing.id };
 
+    // Normalize the job-site address (autocomplete isn't enforced client-side,
+    // so hand-typed text reaches here); fail-soft keeps the raw string.
+    const geo = await geocodeJobSiteAddress(data.location);
+
     const lead = await prisma.lead.create({
         data: {
             name: data.name,
             clientId: client.id,
-            location: data.location || null,
+            location: geo?.formattedAddress ?? (data.location || null),
             source: data.source || null,
             projectType: data.projectType || null,
             message: data.message || null,
@@ -430,10 +435,17 @@ export async function updateLeadInfo(id: string, data: any) {
     const lead = await prisma.lead.findUnique({ where: { id }});
     if (!lead) return;
 
+    // Normalize the job-site address before the transaction (external call).
+    // EditLeadModal sends the whole form, so skip the lookup when unchanged.
+    const geo = data.location && data.location !== lead.location
+        ? await geocodeJobSiteAddress(data.location)
+        : null;
+    const location = geo?.formattedAddress ?? data.location;
+
     const updateData: any = {
         source: data.source,
         stage: data.stage,
-        location: data.location,
+        location,
         tags: data.tags,
         targetRevenue: data.targetRevenue ? parseFloat(data.targetRevenue) : null,
         expectedProfit: data.expectedProfit ? parseFloat(data.expectedProfit) : null,
@@ -453,7 +465,18 @@ export async function updateLeadInfo(id: string, data: any) {
         if (data.location !== undefined) {
             const linked = await tx.project.findUnique({ where: { leadId: id }, select: { id: true } });
             if (linked) {
-                await tx.project.update({ where: { id: linked.id }, data: { location: data.location || null } });
+                await tx.project.update({
+                    where: { id: linked.id },
+                    data: {
+                        location: location || null,
+                        // Precise geocode also refreshes the time-clock geofence;
+                        // clearing the address clears it; coarse/failed lookups
+                        // leave existing coordinates alone.
+                        ...(geo?.lat != null && geo?.lng != null
+                            ? { locationLat: geo.lat, locationLng: geo.lng }
+                            : !location ? { locationLat: null, locationLng: null } : {}),
+                    },
+                });
                 linkedProjectId = linked.id;
             }
         }
@@ -704,7 +727,11 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.source !== undefined) updateData.source = data.source;
-    if (data.location !== undefined) updateData.location = data.location;
+    let locationGeo: Awaited<ReturnType<typeof geocodeJobSiteAddress>> = null;
+    if (data.location !== undefined) {
+        locationGeo = await geocodeJobSiteAddress(data.location);
+        updateData.location = locationGeo?.formattedAddress ?? data.location;
+    }
     if (data.projectType !== undefined) updateData.projectType = data.projectType;
     if (data.expectedStartDate !== undefined) updateData.expectedStartDate = data.expectedStartDate ? new Date(data.expectedStartDate) : null;
     if (data.targetRevenue !== undefined) updateData.targetRevenue = data.targetRevenue;
@@ -714,13 +741,26 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
         data: updateData,
     });
 
-    // Sync name to linked project when lead name changes
-    if (data.name !== undefined) {
+    // Sync name/location to linked project so they stay a single source of truth
+    if (data.name !== undefined || data.location !== undefined) {
         const linkedProject = await prisma.project.findUnique({ where: { leadId } });
         if (linkedProject) {
             await prisma.project.update({
                 where: { id: linkedProject.id },
-                data: { name: data.name },
+                data: {
+                    ...(data.name !== undefined ? { name: data.name } : {}),
+                    ...(data.location !== undefined
+                        ? {
+                            location: updateData.location || null,
+                            // Precise geocode also refreshes the time-clock geofence;
+                            // clearing the address clears it; coarse/failed lookups
+                            // leave existing coordinates alone.
+                            ...(locationGeo?.lat != null && locationGeo?.lng != null
+                                ? { locationLat: locationGeo.lat, locationLng: locationGeo.lng }
+                                : !updateData.location ? { locationLat: null, locationLng: null } : {}),
+                        }
+                        : {}),
+                },
             });
             revalidatePath(`/projects`);
             revalidatePath(`/projects/${linkedProject.id}`, 'layout');
@@ -996,13 +1036,19 @@ export async function convertLeadToProject(leadId: string) {
     const existingProject = await prisma.project.findUnique({ where: { leadId } });
     if (existingProject) return { id: existingProject.id };
 
+    // Normalize the job-site address (outside the transaction — external call).
+    // Also catches legacy leads saved before geocode-on-save existed; a precise
+    // match seeds the project's time-clock geofence coordinates.
+    const geo = await geocodeJobSiteAddress(lead.location);
+
     // Wrap entire conversion in a transaction for atomicity
     const project = await prisma.$transaction(async (tx) => {
         const project = await tx.project.create({
             data: {
                 name: lead.name,
                 clientId: lead.clientId,
-                location: lead.location,
+                location: geo?.formattedAddress ?? lead.location,
+                ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
                 status: "In Progress",
                 type: lead.projectType || "Unknown",
                 managerId: lead.managerId || null,
@@ -6861,9 +6907,17 @@ export async function updateProjectLocation(projectId: string, location: string)
         ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
         : null;
     if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const geo = await geocodeJobSiteAddress(location);
     await prisma.project.update({
         where: { id: projectId },
-        data: { location: location || null }
+        data: {
+            location: geo?.formattedAddress ?? (location || null),
+            // Precise geocode also refreshes the time-clock geofence; clearing
+            // the address clears it; coarse/failed lookups leave it alone.
+            ...(geo?.lat != null && geo?.lng != null
+                ? { locationLat: geo.lat, locationLng: geo.lng }
+                : !location ? { locationLat: null, locationLng: null } : {}),
+        }
     });
     revalidatePath(`/projects/${projectId}`, 'layout');
     return { success: true };

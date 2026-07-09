@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { ensureLeadFolder, isDriveConnected } from "@/lib/lead-drive";
+import { geocodeJobSiteAddress } from "@/lib/geocode";
 
 export const dynamic = "force-dynamic";
 
@@ -71,7 +72,10 @@ export async function POST(req: NextRequest) {
         : null;
     const clientPhone = typeof body.clientPhone === "string" ? body.clientPhone.trim() || null : null;
     const projectType = typeof body.projectType === "string" ? body.projectType.trim() || null : null;
-    const location = typeof body.location === "string" ? body.location.trim() || null : null;
+    const rawLocation = typeof body.location === "string" ? body.location.trim() || null : null;
+    // Mobile intake bypasses the web form's Places autocomplete entirely —
+    // normalize server-side (fail-soft keeps the raw string).
+    const location = (await geocodeJobSiteAddress(rawLocation))?.formattedAddress ?? rawLocation;
     const note = typeof body.note === "string" ? body.note.trim() : "";
     const leadName = (typeof body.name === "string" && body.name.trim())
         || `${clientName}${projectType ? ` - ${projectType}` : ""}`;
