@@ -6,7 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -47,11 +47,13 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const companyAddress = companySettings?.address || "";
 
     const items = initialData.items || [];
-    const subtotal = items.reduce((acc: number, item: any) => acc + (Number(item.quantity || 0) * Number(item.unitCost || 0)), 0);
-    // Tax follows the estimate's treatment (tax-exempt customers pay none) — the
-    // amount shown here is what the customer signs AND what billing charges.
-    const tax = subtotal * coTaxRate(initialData.estimate);
-    const total = subtotal + tax;
+    // Same integer-cents math as the editor, updateChangeOrder's item sync, and
+    // billChangeOrderCore. Tax follows the estimate's treatment (tax-exempt
+    // customers pay none) — the amount shown here is what the customer signs
+    // AND what billing charges, to the cent.
+    const subtotal = coItemsSubtotal(items);
+    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(initialData.estimate);
 
     return (
@@ -202,7 +204,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {items.map((item: any) => {
-                                    const itemTotal = Number(item.quantity || 0) * Number(item.unitCost || 0);
+                                    const itemTotal = coLineCents(Number(item.quantity || 0), Number(item.unitCost || 0)) / 100;
                                     return (
                                         <tr key={item.id}>
                                             <td className="py-3">
