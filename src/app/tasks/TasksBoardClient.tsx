@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { DragDropContext, Droppable, Draggable, type DropResult } from "@hello-pangea/dnd";
 import { toast } from "sonner";
 import { createOfficeTask, updateOfficeTask, moveOfficeTask, deleteOfficeTask, getOfficeTasksBoard } from "@/lib/actions";
@@ -136,6 +136,15 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
 
     const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
 
+    // Tracks the CURRENT dialog selection for async callbacks (refreshBoard)
+    // that may resolve after the user has since opened a different task's
+    // dialog — reading selectedTaskId itself there would close over whichever
+    // task was selected when the failed mutation started, not what's open now.
+    const selectedTaskIdRef = useRef<string | null>(null);
+    useEffect(() => {
+        selectedTaskIdRef.current = selectedTaskId;
+    }, [selectedTaskId]);
+
     useEffect(() => {
         if (selectedTask) {
             setDraftTitle(selectedTask.title);
@@ -169,8 +178,9 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
             const board = await getOfficeTasksBoard();
             const freshTasks = board.tasks as unknown as Task[];
             setTasks(freshTasks);
-            if (selectedTaskId) {
-                const fresh = freshTasks.find((t) => t.id === selectedTaskId);
+            const currentSelectedId = selectedTaskIdRef.current;
+            if (currentSelectedId) {
+                const fresh = freshTasks.find((t) => t.id === currentSelectedId);
                 if (fresh) {
                     setDraftTitle(fresh.title);
                     setDraftNotes(fresh.notes || "");

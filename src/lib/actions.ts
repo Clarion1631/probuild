@@ -9381,9 +9381,32 @@ function parseOfficeTaskDateOnly(s: string): Date {
 async function assertOfficeTaskAccess() {
     const session = await getSessionOrDev();
     const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionEmail = session?.user?.email as string | null | undefined;
     const sessionRole = ((session?.user as any)?.role as string | null) ?? null;
-    if (!sessionRole || !["ADMIN", "MANAGER"].includes(sessionRole)) throw new Error("Forbidden");
-    return { id: sessionUserId ?? null, role: sessionRole };
+
+    // Dev-fallback session with no backing User row (see buildDevSession in
+    // auth.ts) — same shape getFieldUpdatesFeed trusts: no id, but a synthetic
+    // ADMIN/MANAGER role. There's no DB row to re-check in that case.
+    const isSyntheticDevAccess = !sessionUserId && (sessionRole === "ADMIN" || sessionRole === "MANAGER");
+    if (isSyntheticDevAccess) {
+        return { id: null as string | null, role: sessionRole as string };
+    }
+
+    // Otherwise, re-resolve the caller from the DB instead of trusting the
+    // session's role/id: auth.ts's jwt() callback leaves token.role/userId
+    // untouched when the DB lookup finds no user (deleted user, live token),
+    // and never encodes `status` into the token at all — so a disabled user's
+    // token would still read role: ADMIN until it expires.
+    const user = sessionUserId
+        ? await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true, role: true, status: true } })
+        : sessionEmail
+            ? await prisma.user.findUnique({ where: { email: sessionEmail }, select: { id: true, role: true, status: true } })
+            : null;
+
+    if (!user || !["ADMIN", "MANAGER"].includes(user.role) || user.status === "DISABLED") {
+        throw new Error("Forbidden");
+    }
+    return { id: user.id, role: user.role };
 }
 
 export async function getOfficeTasksBoard() {
