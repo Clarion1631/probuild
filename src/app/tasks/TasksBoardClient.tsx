@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { DragDropContext, Droppable, Draggable, type DropResult } from "@hello-pangea/dnd";
 import { toast } from "sonner";
-import { createOfficeTask, updateOfficeTask, moveOfficeTask, deleteOfficeTask } from "@/lib/actions";
-import { formatLocalDateString } from "@/lib/report-utils";
+import { createOfficeTask, updateOfficeTask, moveOfficeTask, deleteOfficeTask, getOfficeTasksBoard } from "@/lib/actions";
+import { formatLocalDateString, parseLocalDateString } from "@/lib/report-utils";
 
 const STATUSES = ["To Do", "In Progress", "Done"] as const;
 type Status = (typeof STATUSES)[number];
@@ -66,22 +66,40 @@ function firstName(user: BoardUser): string {
     return user.email.split("@")[0];
 }
 
+// dueDate is stored as UTC midnight for the picked calendar date (see
+// parseOfficeTaskDateOnly in actions.ts). Extracting the date via toISOString()
+// recovers exactly that calendar date regardless of the viewer's local timezone —
+// using .toLocaleDateString()/local getters here would shift the date backward
+// by a day west of UTC (e.g. Pacific time).
+function dueDateToISO(dueDate: Date | string): string {
+    return new Date(dueDate).toISOString().slice(0, 10);
+}
+
+// Format a "YYYY-MM-DD" string for display without reintroducing timezone drift.
+function formatISODateForDisplay(iso: string): string {
+    const d = parseLocalDateString(iso);
+    if (!d) return iso;
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
 function dueDateInfo(dueDate: Date | string | null, status: string): { label: string; className: string } | null {
     if (!dueDate) return null;
-    const d = new Date(dueDate);
-    const label = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const iso = dueDateToISO(dueDate);
+    const label = formatISODateForDisplay(iso);
     if (status === "Done") return { label, className: "bg-slate-100 text-slate-600" };
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const dueMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-    const diffDays = Math.round((dueMidnight.getTime() - today.getTime()) / 86400000);
-    if (diffDays < 0) return { label, className: "bg-red-100 text-red-700" };
+
+    const todayStr = formatLocalDateString(new Date());
+    if (iso < todayStr) return { label, className: "bg-red-100 text-red-700" };
+
+    const dueLocal = parseLocalDateString(iso);
+    const todayLocal = parseLocalDateString(todayStr);
+    const diffDays = dueLocal && todayLocal ? Math.round((dueLocal.getTime() - todayLocal.getTime()) / 86400000) : 999;
     if (diffDays <= 2) return { label, className: "bg-amber-100 text-amber-700" };
     return { label, className: "bg-slate-100 text-slate-600" };
 }
 
 function composePrompt(title: string, notes: string, dueDate: Date | string | null): string {
-    const dueStr = dueDate ? new Date(dueDate).toLocaleDateString() : "No due date";
+    const dueStr = dueDate ? formatISODateForDisplay(dueDateToISO(dueDate)) : "No due date";
     return `Help me complete this Golden Touch office task: ${title}. Details: ${notes || "none"}. Due: ${dueStr}. You have access to our ProBuild backend, QuickBooks, Gmail, and Google Drive — pull whatever you need and draft the pieces that require a human to review or send.`;
 }
 
@@ -141,8 +159,32 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
         return map;
     }, [visibleTasks]);
 
+    // On any server-action failure, re-fetch the authoritative board state instead
+    // of restoring a whole-board snapshot — a snapshot restore would also wipe out
+    // any other operation that succeeded concurrently. Re-syncs the open dialog's
+    // drafts from the refreshed task (or closes the dialog if it was deleted
+    // elsewhere).
+    async function refreshBoard() {
+        try {
+            const board = await getOfficeTasksBoard();
+            const freshTasks = board.tasks as unknown as Task[];
+            setTasks(freshTasks);
+            if (selectedTaskId) {
+                const fresh = freshTasks.find((t) => t.id === selectedTaskId);
+                if (fresh) {
+                    setDraftTitle(fresh.title);
+                    setDraftNotes(fresh.notes || "");
+                    setDraftAiPrompt(fresh.aiPrompt || "");
+                } else {
+                    setSelectedTaskId(null);
+                }
+            }
+        } catch {
+            toast.error("Failed to refresh board");
+        }
+    }
+
     function performMove(taskId: string, newStatus: string, newIndex: number) {
-        const prevTasks = tasks;
         const moved = tasks.find((t) => t.id === taskId);
         if (!moved) return;
 
@@ -168,7 +210,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                 await moveOfficeTask(taskId, newStatus, clampedIndex);
             } catch {
                 toast.error("Failed to move task");
-                setTasks(prevTasks);
+                await refreshBoard();
             }
         });
     }
@@ -201,7 +243,6 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
         assigneeId?: string | null;
         aiPrompt?: string | null;
     }) {
-        const prevTasks = tasks;
         setTasks((prev) =>
             prev.map((t) => {
                 if (t.id !== id) return t;
@@ -222,7 +263,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                 await updateOfficeTask(id, data);
             } catch {
                 toast.error("Failed to update task");
-                setTasks(prevTasks);
+                await refreshBoard();
             }
         });
     }
@@ -235,7 +276,6 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
 
     function handleDelete(id: string) {
         if (!confirm("Delete this task? This cannot be undone.")) return;
-        const prevTasks = tasks;
         setTasks((prev) => prev.filter((t) => t.id !== id));
         setSelectedTaskId(null);
         startTransition(async () => {
@@ -244,7 +284,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                 toast.success("Task deleted");
             } catch {
                 toast.error("Failed to delete task");
-                setTasks(prevTasks);
+                await refreshBoard();
             }
         });
     }
@@ -256,13 +296,15 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
         handleFieldUpdate(selectedTask.id, { aiPrompt: suggested });
     }
 
-    function handleCopyForClaude() {
+    async function handleCopyForClaude() {
         if (!selectedTask) return;
         const text = draftAiPrompt.trim() || composePrompt(draftTitle, draftNotes, selectedTask.dueDate);
-        navigator.clipboard
-            .writeText(text)
-            .then(() => toast.success("Copied to clipboard"))
-            .catch(() => toast.error("Failed to copy"));
+        try {
+            await navigator.clipboard.writeText(text);
+            toast.success("Copied to clipboard");
+        } catch {
+            toast.error("Failed to copy — clipboard unavailable");
+        }
     }
 
     return (
@@ -439,7 +481,7 @@ export default function TasksBoardClient({ initialTasks, users }: Props) {
                                     <input
                                         type="date"
                                         className="hui-input mt-1 w-full"
-                                        value={selectedTask.dueDate ? formatLocalDateString(new Date(selectedTask.dueDate)) : ""}
+                                        value={selectedTask.dueDate ? dueDateToISO(selectedTask.dueDate) : ""}
                                         onChange={(e) => handleFieldUpdate(selectedTask.id, { dueDate: e.target.value || null })}
                                     />
                                 </div>

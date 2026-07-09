@@ -9361,13 +9361,29 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
 // Office Tasks (internal kanban board — ADMIN/MANAGER only)
 // =============================================
 
+const OFFICE_TASK_STATUSES = ["To Do", "In Progress", "Done"] as const;
+
+function assertValidOfficeTaskStatus(status: string) {
+    if (!(OFFICE_TASK_STATUSES as readonly string[]).includes(status)) {
+        throw new Error(`Invalid status: ${status}`);
+    }
+}
+
+// Parse a "YYYY-MM-DD" date-only string as UTC midnight, so the stored instant's
+// calendar date is timezone-invariant (matches what the user picked, regardless
+// of the server's or client's local timezone).
+function parseOfficeTaskDateOnly(s: string): Date {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m) throw new Error("Invalid date");
+    return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+}
+
 async function assertOfficeTaskAccess() {
-    const session = await getServerSession(authOptions);
-    const caller = session?.user?.email
-        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, role: true } })
-        : null;
-    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
-    return caller;
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionRole = ((session?.user as any)?.role as string | null) ?? null;
+    if (!sessionRole || !["ADMIN", "MANAGER"].includes(sessionRole)) throw new Error("Forbidden");
+    return { id: sessionUserId ?? null, role: sessionRole };
 }
 
 export async function getOfficeTasksBoard() {
@@ -9396,22 +9412,26 @@ export async function createOfficeTask(data: {
     const caller = await assertOfficeTaskAccess();
 
     const status = data.status || "To Do";
-    const last = await prisma.officeTask.findFirst({
-        where: { status },
-        orderBy: { position: "desc" },
-        select: { position: true },
-    });
+    assertValidOfficeTaskStatus(status);
 
-    const task = await prisma.officeTask.create({
-        data: {
-            title: data.title,
-            status,
-            position: (last?.position ?? -1) + 1,
-            assigneeId: data.assigneeId || null,
-            dueDate: data.dueDate ? new Date(data.dueDate) : null,
-            createdById: caller.id,
-        },
-        include: { assignee: { select: { id: true, name: true, email: true } } },
+    const task = await prisma.$transaction(async (tx) => {
+        const last = await tx.officeTask.findFirst({
+            where: { status },
+            orderBy: { position: "desc" },
+            select: { position: true },
+        });
+
+        return tx.officeTask.create({
+            data: {
+                title: data.title,
+                status,
+                position: (last?.position ?? -1) + 1,
+                assigneeId: data.assigneeId || null,
+                dueDate: data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null,
+                createdById: caller.id,
+            },
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        });
     });
 
     revalidatePath("/tasks");
@@ -9430,7 +9450,7 @@ export async function updateOfficeTask(id: string, data: {
     const updateData: any = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.notes !== undefined) updateData.notes = data.notes || null;
-    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? new Date(data.dueDate) : null;
+    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null;
     if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId || null;
     if (data.aiPrompt !== undefined) updateData.aiPrompt = data.aiPrompt || null;
 
@@ -9446,13 +9466,14 @@ export async function updateOfficeTask(id: string, data: {
 
 export async function moveOfficeTask(id: string, newStatus: string, newIndex: number) {
     await assertOfficeTaskAccess();
-
-    const task = await prisma.officeTask.findUnique({ where: { id } });
-    if (!task) throw new Error("Task not found");
-
-    const oldStatus = task.status;
+    assertValidOfficeTaskStatus(newStatus);
 
     await prisma.$transaction(async (tx) => {
+        const task = await tx.officeTask.findUnique({ where: { id } });
+        if (!task) throw new Error("Task not found");
+
+        const oldStatus = task.status;
+
         const targetTasks = await tx.officeTask.findMany({
             where: { status: newStatus, id: { not: id } },
             orderBy: { position: "asc" },
