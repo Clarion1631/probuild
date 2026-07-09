@@ -3,6 +3,7 @@ import { prisma } from './prisma';
 import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
+import { coTaxRate, coTaxLabel } from './co-tax';
 
 /**
  * Embed a signature image from either a legacy inline data-URL or a migrated http(s)
@@ -1090,12 +1091,25 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     y -= 25;
 
     const coLabelX = coCols.unitCost - 60;
-    const coTotal = Number(co.totalAmount) || 0;
+    // co.totalAmount is the PRE-TAX subtotal (billChangeOrderCore semantic); show
+    // the same Subtotal / Tax / Revised Amount breakdown the customer signs on the
+    // portal page so the PDF and signature page never disagree.
+    const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
+    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100;
+    const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
 
-    page.drawText('Change Order Total', { x: coLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
-    const coTotalStr = formatCurrency(coTotal);
-    const coTotalW = helveticaBold.widthOfTextAtSize(coTotalStr, 14);
-    page.drawText(coTotalStr, { x: coCols.total - coTotalW, y, size: 14, font: helveticaBold, color: colors.primary });
+    const drawCoTotalRow = (label: string, value: string, size: number, font: PDFFont, color: ReturnType<typeof rgb>) => {
+        page.drawText(label, { x: coLabelX, y, size, font, color });
+        const vw = font.widthOfTextAtSize(value, size);
+        page.drawText(value, { x: coCols.total - vw, y, size, font, color });
+    };
+
+    drawCoTotalRow('Subtotal', formatCurrency(coSubtotal), 10, helvetica, colors.textMain);
+    y -= 18;
+    drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
+    y -= 22;
+    checkNewPage(60);
+    drawCoTotalRow('Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
 
     // Signatures — client approval and company countersignature are independent blocks.
     if (co.status === 'Approved' && co.approvedBy) {

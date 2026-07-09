@@ -929,11 +929,19 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
         where: { id: changeOrderId },
         include: {
             project: { include: { client: true } },
+            estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
         }
     });
 
     if (!co) return { success: false, error: "Change order not found" };
+
+    // co.totalAmount is the PRE-TAX subtotal (same semantic as billChangeOrderCore).
+    // The email must show the tax-inclusive Revised Amount — the number on the
+    // signature page and the number billing will actually charge.
+    const coSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
+    const coTaxAmount = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100;
+    const coRevisedAmount = Math.round((coSubtotal + coTaxAmount) * 100) / 100;
     const client = co.project?.client;
     if (!client?.email) return { success: false, error: "Client has no email address" };
 
@@ -969,7 +977,8 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
                 </p>
                 <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
                     <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(co.totalAmount)}</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>
+                    ${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${coTaxLabel(co.estimate)}</div>` : ""}
                 </div>
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
