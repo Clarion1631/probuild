@@ -21,6 +21,7 @@ import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
 import { appendContractCountersignaturePage } from "./pdf";
+import { defaultTaxForNewEstimate } from "./wa-tax";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -1139,6 +1140,9 @@ export async function createProject(data: {
 }
 
 export async function createDraftEstimate(projectId: string) {
+    // WA is destination-based: default the rate from the job-site address,
+    // falling back to the company default (null fields) when unresolvable.
+    const taxDefault = await defaultTaxForNewEstimate({ projectId });
     const estimate = await prisma.estimate.create({
         data: {
             title: "Draft Estimate",
@@ -1148,6 +1152,7 @@ export async function createDraftEstimate(projectId: string) {
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
+            ...(taxDefault ?? {}),
         },
     });
 
@@ -1160,6 +1165,7 @@ export async function createDraftEstimate(projectId: string) {
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
+    const taxDefault = await defaultTaxForNewEstimate({ leadId });
     const estimate = await prisma.estimate.create({
         data: {
             title: "Draft Estimate",
@@ -1169,6 +1175,7 @@ export async function createDraftLeadEstimate(leadId: string) {
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
+            ...(taxDefault ?? {}),
         },
     });
 
@@ -4476,6 +4483,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
     });
     if (!template) throw new Error("Template not found");
 
+    const taxDefault = await defaultTaxForNewEstimate({ projectId });
     const estimate = await prisma.estimate.create({
         data: {
             title: template.name,
@@ -4485,6 +4493,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
+            ...(taxDefault ?? {}),
         },
     });
 
