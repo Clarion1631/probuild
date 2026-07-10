@@ -20,7 +20,7 @@ export async function GET(req: Request) {
     }
 
     const projects = await prisma.project.findMany({
-        where: { status: { not: "Closed" } },
+        where: { status: "In Progress" },
         orderBy: { name: "asc" },
         select: {
             id: true,

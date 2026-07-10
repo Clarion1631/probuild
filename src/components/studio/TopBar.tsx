@@ -17,12 +17,13 @@ import { useStudio, type ViewMode } from "./store";
 import { captureSnapshot, downloadDataUrl } from "./snapshot";
 
 export function TopBar({
-  roomName, backHref, onShare, onRenders,
+  roomName, backHref, onShare, onRenders, onAiFurnish,
 }: {
   roomName: string;
   backHref: string;
   onShare: () => void;
   onRenders: () => void;
+  onAiFurnish: () => void;
 }) {
   const view = useStudio((s) => s.view);
   const setView = useStudio((s) => s.setView);
@@ -117,6 +118,15 @@ export function TopBar({
       >
         <Sparkles className="h-3.5 w-3.5 text-violet-500" />
         Photo render
+      </button>
+
+      <button
+        onClick={onAiFurnish}
+        className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+        title="Furnish this room using an AI prompt"
+      >
+        <Sparkles className="h-3.5 w-3.5 text-blue-500" />
+        AI Furnish
       </button>
 
       <button

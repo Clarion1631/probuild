@@ -150,8 +150,15 @@ export async function PUT(req: Request, { params }: RouteParams) {
                 });
             }
         }
-        return updated;
     });
+    
+    // Re-generate the USDZ walkthrough on every manual design update
+    try {
+        const { generateUsdzForRoom } = await import("@/lib/studio/usdz-generator");
+        await generateUsdzForRoom(id);
+    } catch (e) {
+        console.error("USDZ auto-generation failed during room save:", e);
+    }
 
     return NextResponse.json(result);
 }
