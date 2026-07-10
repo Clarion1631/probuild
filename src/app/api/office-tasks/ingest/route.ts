@@ -25,6 +25,8 @@ interface IngestPayload {
     source?: string;
     assigneeEmail?: string;
     dueDate?: string; // "YYYY-MM-DD"
+    column?: string; // board column name, case-insensitive; falls back to the first column
+    status?: string; // legacy alias for `column`
 }
 
 export async function POST(req: Request) {
@@ -63,18 +65,37 @@ export async function POST(req: Request) {
         }
     }
 
-    // Dedupe: an already-filed, not-yet-Done task with the same title (case-
-    // insensitive) means this is a re-send of something already on the board.
+    // Dedupe: an already-filed, not-archived task with the same title (case-
+    // insensitive) that isn't sitting in a "Done"-style column means this is a
+    // re-send of something already on the board.
     const existing = await prisma.officeTask.findFirst({
         where: {
             title: { equals: title, mode: "insensitive" },
-            status: { not: "Done" },
+            archivedAt: null,
+            OR: [{ columnId: null }, { column: { isDoneColumn: false } }],
         },
         select: { id: true },
     });
     if (existing) {
         return NextResponse.json({ deduped: true, id: existing.id }, { status: 200 });
     }
+
+    // Resolve the target column by name (case-insensitive), falling back to the
+    // first-position column when unspecified or unmatched.
+    const columnNameInput = (body.column || body.status || "").trim();
+    let column = columnNameInput
+        ? await prisma.officeBoardColumn.findFirst({
+            where: { name: { equals: columnNameInput, mode: "insensitive" } },
+        })
+        : null;
+    if (!column) {
+        column = await prisma.officeBoardColumn.findFirst({ orderBy: { position: "asc" } });
+    }
+    if (!column) {
+        console.error("No OfficeBoardColumn configured — cannot ingest task");
+        return NextResponse.json({ error: "No board column configured" }, { status: 500 });
+    }
+    const targetColumn = column;
 
     let assigneeId: string | null = null;
     if (body.assigneeEmail?.trim()) {
@@ -97,7 +118,7 @@ export async function POST(req: Request) {
 
     const task = await prisma.$transaction(async (tx) => {
         const last = await tx.officeTask.findFirst({
-            where: { status: "To Do" },
+            where: { columnId: targetColumn.id, archivedAt: null },
             orderBy: { position: "desc" },
             select: { position: true },
         });
@@ -105,7 +126,8 @@ export async function POST(req: Request) {
         return tx.officeTask.create({
             data: {
                 title,
-                status: "To Do",
+                columnId: targetColumn.id,
+                status: targetColumn.name, // TRANSITIONAL COMPAT — see OfficeTask.status
                 position: (last?.position ?? -1) + 1,
                 notes,
                 aiPrompt: body.aiPrompt?.trim() || null,

@@ -158,8 +158,11 @@ model OfficeTask {
   id          String    @id @default(cuid())
   title       String
   notes       String?
-  status      String    @default("To Do") // To Do, In Progress, Done
-  position    Int       @default(0) // sort order within its status column
+  status      String    @default("To Do") // LEGACY — kept in sync with column.name on create/move for prod rollback safety until v2 deploys; reads should use columnId
+  columnId    String?
+  column      OfficeBoardColumn? @relation(fields: [columnId], references: [id], onDelete: SetNull)
+  position    Int       @default(0) // sort order within its column
+  archivedAt  DateTime?
   dueDate     DateTime?
   assigneeId  String?
   assignee    User?     @relation("OfficeTaskAssignee", fields: [assigneeId], references: [id])
@@ -172,6 +175,16 @@ model OfficeTask {
 
   @@index([status, position])
   @@index([assigneeId])
+  @@index([columnId])
+}
+
+model OfficeBoardColumn {
+  id           String       @id @default(cuid())
+  name         String
+  position     Int
+  isDoneColumn Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  tasks        OfficeTask[]
 }
 
 model LeadMeeting {
