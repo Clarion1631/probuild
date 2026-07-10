@@ -9397,10 +9397,10 @@ export async function getOfficeTasksBoard() {
     await assertOfficeTaskAccess();
 
     const [columns, tasks, archived, users] = await Promise.all([
-        prisma.officeBoardColumn.findMany({ orderBy: { position: "asc" } }),
+        prisma.officeBoardColumn.findMany({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] }),
         prisma.officeTask.findMany({
             where: { archivedAt: null },
-            orderBy: [{ columnId: "asc" }, { position: "asc" }],
+            orderBy: [{ columnId: "asc" }, { position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
             include: { assignee: { select: { id: true, name: true, email: true } } },
         }),
         prisma.officeTask.findMany({
@@ -9432,7 +9432,7 @@ export async function createBoardColumn(name: string) {
         if (dup) throw new Error("A column with that name already exists");
 
         const last = await tx.officeBoardColumn.findFirst({
-            orderBy: { position: "desc" },
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }],
             select: { position: true },
         });
 
@@ -9453,16 +9453,18 @@ export async function renameBoardColumn(id: string, name: string, isDoneColumn?:
     const trimmed = name.trim();
     if (!trimmed) throw new Error("Column name is required");
 
-    const dup = await prisma.officeBoardColumn.findFirst({
-        where: { name: { equals: trimmed, mode: "insensitive" }, id: { not: id } },
-        select: { id: true },
+    const column = await prisma.$transaction(async (tx) => {
+        const dup = await tx.officeBoardColumn.findFirst({
+            where: { name: { equals: trimmed, mode: "insensitive" }, id: { not: id } },
+            select: { id: true },
+        });
+        if (dup) throw new Error("A column with that name already exists");
+
+        const data: { name: string; isDoneColumn?: boolean } = { name: trimmed };
+        if (isDoneColumn !== undefined) data.isDoneColumn = isDoneColumn;
+
+        return tx.officeBoardColumn.update({ where: { id }, data });
     });
-    if (dup) throw new Error("A column with that name already exists");
-
-    const data: { name: string; isDoneColumn?: boolean } = { name: trimmed };
-    if (isDoneColumn !== undefined) data.isDoneColumn = isDoneColumn;
-
-    const column = await prisma.officeBoardColumn.update({ where: { id }, data });
 
     revalidatePath("/tasks");
     return column;
@@ -9472,7 +9474,7 @@ export async function reorderBoardColumn(id: string, newIndex: number) {
     await assertOfficeTaskAccess();
 
     await prisma.$transaction(async (tx) => {
-        const columns = await tx.officeBoardColumn.findMany({ orderBy: { position: "asc" } });
+        const columns = await tx.officeBoardColumn.findMany({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
         const idx = columns.findIndex((c) => c.id === id);
         if (idx === -1) throw new Error("Column not found");
 
@@ -9492,15 +9494,21 @@ export async function reorderBoardColumn(id: string, newIndex: number) {
 export async function deleteBoardColumn(id: string) {
     await assertOfficeTaskAccess();
 
-    const [taskCount, columnCount] = await Promise.all([
-        prisma.officeTask.count({ where: { columnId: id, archivedAt: null } }),
-        prisma.officeBoardColumn.count(),
-    ]);
+    // Checks and the delete run inside one transaction, with counts re-read
+    // inside it, so a concurrent create/move can't slip a task into this
+    // column between the check and the delete (which would otherwise orphan
+    // it to columnId NULL via the FK's ON DELETE SET NULL).
+    await prisma.$transaction(async (tx) => {
+        const [taskCount, columnCount] = await Promise.all([
+            tx.officeTask.count({ where: { columnId: id, archivedAt: null } }),
+            tx.officeBoardColumn.count(),
+        ]);
 
-    if (taskCount > 0) throw new Error("Move or archive all tasks out of this column before deleting it");
-    if (columnCount <= 1) throw new Error("The board must have at least one column");
+        if (taskCount > 0) throw new Error("Move or archive all tasks out of this column before deleting it");
+        if (columnCount <= 1) throw new Error("The board must have at least one column");
 
-    await prisma.officeBoardColumn.delete({ where: { id } });
+        await tx.officeBoardColumn.delete({ where: { id } });
+    });
 
     revalidatePath("/tasks");
     return { success: true };
@@ -9517,12 +9525,12 @@ export async function createOfficeTask(data: {
     const task = await prisma.$transaction(async (tx) => {
         const column = data.columnId
             ? await tx.officeBoardColumn.findUnique({ where: { id: data.columnId } })
-            : await tx.officeBoardColumn.findFirst({ orderBy: { position: "asc" } });
+            : await tx.officeBoardColumn.findFirst({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
         if (!column) throw new Error("No board column available");
 
         const last = await tx.officeTask.findFirst({
             where: { columnId: column.id, archivedAt: null },
-            orderBy: { position: "desc" },
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }, { id: "desc" }],
             select: { position: true },
         });
 
@@ -9587,24 +9595,34 @@ export async function moveOfficeTask(id: string, columnId: string, newIndex: num
 
         const targetTasks = await tx.officeTask.findMany({
             where: { columnId, archivedAt: null, id: { not: id } },
-            orderBy: { position: "asc" },
+            orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
         });
 
         const clampedIndex = Math.max(0, Math.min(newIndex, targetTasks.length));
         targetTasks.splice(clampedIndex, 0, { ...task, columnId } as typeof task);
 
+        // Renumbering must touch position only — status is legacy-compat and
+        // should only be rewritten for the task that actually moved, not for
+        // unrelated tasks that were already sitting in the target column.
         for (let i = 0; i < targetTasks.length; i++) {
             const t = targetTasks[i];
-            await tx.officeTask.update({
-                where: { id: t.id },
-                data: { position: i, columnId, status: column.name }, // TRANSITIONAL COMPAT — see OfficeTask.status
-            });
+            if (t.id === id) {
+                await tx.officeTask.update({
+                    where: { id: t.id },
+                    data: { position: i, columnId, status: column.name }, // TRANSITIONAL COMPAT — see OfficeTask.status
+                });
+            } else {
+                await tx.officeTask.update({
+                    where: { id: t.id },
+                    data: { position: i },
+                });
+            }
         }
 
         if (oldColumnId && oldColumnId !== columnId) {
             const sourceTasks = await tx.officeTask.findMany({
                 where: { columnId: oldColumnId, archivedAt: null, id: { not: id } },
-                orderBy: { position: "asc" },
+                orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
             });
             for (let i = 0; i < sourceTasks.length; i++) {
                 await tx.officeTask.update({
@@ -9644,15 +9662,32 @@ export async function restoreOfficeTask(id: string) {
         const existing = await tx.officeTask.findUnique({ where: { id } });
         if (!existing) throw new Error("Task not found");
 
+        // The task's column may have been deleted while it was archived (FK
+        // ON DELETE SET NULL), or it may never have had one — in either case
+        // fall back to the first-position column rather than restoring into
+        // a NULL columnId.
+        let column = existing.columnId
+            ? await tx.officeBoardColumn.findUnique({ where: { id: existing.columnId } })
+            : null;
+        if (!column) {
+            column = await tx.officeBoardColumn.findFirst({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
+        }
+        if (!column) throw new Error("No board column available");
+
         const last = await tx.officeTask.findFirst({
-            where: { columnId: existing.columnId, archivedAt: null, id: { not: id } },
-            orderBy: { position: "desc" },
+            where: { columnId: column.id, archivedAt: null, id: { not: id } },
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }, { id: "desc" }],
             select: { position: true },
         });
 
         return tx.officeTask.update({
             where: { id },
-            data: { archivedAt: null, position: (last?.position ?? -1) + 1 },
+            data: {
+                archivedAt: null,
+                columnId: column.id,
+                status: column.name, // TRANSITIONAL COMPAT — see OfficeTask.status
+                position: (last?.position ?? -1) + 1,
+            },
             include: { assignee: { select: { id: true, name: true, email: true } } },
         });
     });

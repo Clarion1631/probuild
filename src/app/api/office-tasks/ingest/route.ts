@@ -89,7 +89,7 @@ export async function POST(req: Request) {
         })
         : null;
     if (!column) {
-        column = await prisma.officeBoardColumn.findFirst({ orderBy: { position: "asc" } });
+        column = await prisma.officeBoardColumn.findFirst({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
     }
     if (!column) {
         console.error("No OfficeBoardColumn configured — cannot ingest task");
@@ -119,7 +119,7 @@ export async function POST(req: Request) {
     const task = await prisma.$transaction(async (tx) => {
         const last = await tx.officeTask.findFirst({
             where: { columnId: targetColumn.id, archivedAt: null },
-            orderBy: { position: "desc" },
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }, { id: "desc" }],
             select: { position: true },
         });
 

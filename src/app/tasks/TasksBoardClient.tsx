@@ -253,6 +253,23 @@ export default function TasksBoardClient({ initialColumns, initialTasks, initial
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [visibleTasks, columnsSorted, firstColumnId]);
 
+    // Unfiltered version of tasksByColumn — the assignee chips only affect what's
+    // rendered, so any logic that needs the REAL count/order of a column (append
+    // index for a dialog move, the empty-column precheck before deleting a
+    // column) must read this instead of tasksByColumn, or it'll compute against
+    // a partial list when a filter is active.
+    const tasksByColumnAll = useMemo(() => {
+        const map: Record<string, Task[]> = {};
+        for (const c of columnsSorted) map[c.id] = [];
+        for (const t of tasks) {
+            const key = effectiveColumnId(t);
+            if (key) (map[key] ||= []).push(t);
+        }
+        for (const key of Object.keys(map)) map[key].sort((a, b) => a.position - b.position);
+        return map;
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tasks, columnsSorted, firstColumnId]);
+
     // Purely client-side rollup of open (non-archived) tasks with a non-empty
     // automationGap, grouped by normalized text.
     const automationGapGroups = useMemo(() => {
@@ -395,7 +412,10 @@ export default function TasksBoardClient({ initialColumns, initialTasks, initial
         if (!selectedTask) return;
         const currentColumnId = effectiveColumnId(selectedTask);
         if (newColumnId === currentColumnId) return;
-        const destCount = (tasksByColumn[newColumnId] || []).length;
+        // Use the unfiltered count — tasksByColumn is scoped to the assignee
+        // chip filter, which would append before hidden tasks while a filter
+        // is active.
+        const destCount = (tasksByColumnAll[newColumnId] || []).length;
         performMove(selectedTask.id, newColumnId, destCount);
     }
 
@@ -530,7 +550,10 @@ export default function TasksBoardClient({ initialColumns, initialTasks, initial
 
     function handleDeleteColumn(columnId: string) {
         setOpenColumnMenuId(null);
-        const columnTasks = tasksByColumn[columnId] || [];
+        // Unfiltered precheck — with an assignee filter active, tasksByColumn
+        // would hide tasks and let this optimistically clear a non-empty
+        // column (the server still rejects it, but the UI would flash).
+        const columnTasks = tasksByColumnAll[columnId] || [];
         if (columnTasks.length > 0) {
             toast.error("Move or archive all tasks out of this column before deleting it");
             return;
