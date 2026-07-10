@@ -18,11 +18,11 @@ export default async function TasksPage() {
         redirect("/projects");
     }
 
-    const { tasks, users } = await getOfficeTasksBoard();
+    const { columns, tasks, archived, users } = await getOfficeTasksBoard();
 
     return (
         <div className="flex flex-col h-[calc(100vh-64px)] -m-6 overflow-hidden bg-hui-background">
-            <TasksBoardClient initialTasks={tasks} users={users} />
+            <TasksBoardClient initialColumns={columns} initialTasks={tasks} initialArchived={archived} users={users} />
         </div>
     );
 }
