@@ -24,6 +24,7 @@ import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contra
 import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
+import { assertValidOfficeTaskStatus, parseOfficeTaskDateOnly } from "./office-task-utils";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -9355,6 +9356,174 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
     revalidatePath(`/projects/${projectId}/estimates`);
 
     return item;
+}
+
+// =============================================
+// Office Tasks (internal kanban board — ADMIN/MANAGER only)
+// =============================================
+
+async function assertOfficeTaskAccess() {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionEmail = session?.user?.email as string | null | undefined;
+    const sessionRole = ((session?.user as any)?.role as string | null) ?? null;
+
+    // Dev-fallback session with no backing User row (see buildDevSession in
+    // auth.ts) — same shape getFieldUpdatesFeed trusts: no id, but a synthetic
+    // ADMIN/MANAGER role. There's no DB row to re-check in that case.
+    const isSyntheticDevAccess = !sessionUserId && (sessionRole === "ADMIN" || sessionRole === "MANAGER");
+    if (isSyntheticDevAccess) {
+        return { id: null as string | null, role: sessionRole as string };
+    }
+
+    // Otherwise, re-resolve the caller from the DB instead of trusting the
+    // session's role/id: auth.ts's jwt() callback leaves token.role/userId
+    // untouched when the DB lookup finds no user (deleted user, live token),
+    // and never encodes `status` into the token at all — so a disabled user's
+    // token would still read role: ADMIN until it expires.
+    const user = sessionUserId
+        ? await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true, role: true, status: true } })
+        : sessionEmail
+            ? await prisma.user.findUnique({ where: { email: sessionEmail }, select: { id: true, role: true, status: true } })
+            : null;
+
+    if (!user || !["ADMIN", "MANAGER"].includes(user.role) || user.status === "DISABLED") {
+        throw new Error("Forbidden");
+    }
+    return { id: user.id, role: user.role };
+}
+
+export async function getOfficeTasksBoard() {
+    await assertOfficeTaskAccess();
+
+    const [tasks, users] = await Promise.all([
+        prisma.officeTask.findMany({
+            orderBy: [{ status: "asc" }, { position: "asc" }],
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        }),
+        prisma.user.findMany({
+            where: { role: { in: ["ADMIN", "MANAGER"] }, status: "ACTIVATED" },
+            select: { id: true, name: true, email: true },
+        }),
+    ]);
+
+    return { tasks, users };
+}
+
+export async function createOfficeTask(data: {
+    title: string;
+    status?: string;
+    assigneeId?: string | null;
+    dueDate?: string | null;
+}) {
+    const caller = await assertOfficeTaskAccess();
+
+    const status = data.status || "To Do";
+    assertValidOfficeTaskStatus(status);
+
+    const task = await prisma.$transaction(async (tx) => {
+        const last = await tx.officeTask.findFirst({
+            where: { status },
+            orderBy: { position: "desc" },
+            select: { position: true },
+        });
+
+        return tx.officeTask.create({
+            data: {
+                title: data.title,
+                status,
+                position: (last?.position ?? -1) + 1,
+                assigneeId: data.assigneeId || null,
+                dueDate: data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null,
+                createdById: caller.id,
+            },
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        });
+    });
+
+    revalidatePath("/tasks");
+    return task;
+}
+
+export async function updateOfficeTask(id: string, data: {
+    title?: string;
+    notes?: string | null;
+    dueDate?: string | null;
+    assigneeId?: string | null;
+    aiPrompt?: string | null;
+    automationGap?: string | null;
+}) {
+    await assertOfficeTaskAccess();
+
+    const updateData: any = {};
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.notes !== undefined) updateData.notes = data.notes || null;
+    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null;
+    if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId || null;
+    if (data.aiPrompt !== undefined) updateData.aiPrompt = data.aiPrompt || null;
+    if (data.automationGap !== undefined) updateData.automationGap = data.automationGap || null;
+
+    const task = await prisma.officeTask.update({
+        where: { id },
+        data: updateData,
+        include: { assignee: { select: { id: true, name: true, email: true } } },
+    });
+
+    revalidatePath("/tasks");
+    return task;
+}
+
+export async function moveOfficeTask(id: string, newStatus: string, newIndex: number) {
+    await assertOfficeTaskAccess();
+    assertValidOfficeTaskStatus(newStatus);
+
+    await prisma.$transaction(async (tx) => {
+        const task = await tx.officeTask.findUnique({ where: { id } });
+        if (!task) throw new Error("Task not found");
+
+        const oldStatus = task.status;
+
+        const targetTasks = await tx.officeTask.findMany({
+            where: { status: newStatus, id: { not: id } },
+            orderBy: { position: "asc" },
+        });
+
+        const clampedIndex = Math.max(0, Math.min(newIndex, targetTasks.length));
+        targetTasks.splice(clampedIndex, 0, { ...task, status: newStatus } as typeof task);
+
+        for (let i = 0; i < targetTasks.length; i++) {
+            const t = targetTasks[i];
+            await tx.officeTask.update({
+                where: { id: t.id },
+                data: { position: i, status: newStatus },
+            });
+        }
+
+        if (oldStatus !== newStatus) {
+            const sourceTasks = await tx.officeTask.findMany({
+                where: { status: oldStatus, id: { not: id } },
+                orderBy: { position: "asc" },
+            });
+            for (let i = 0; i < sourceTasks.length; i++) {
+                await tx.officeTask.update({
+                    where: { id: sourceTasks[i].id },
+                    data: { position: i },
+                });
+            }
+        }
+    });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function deleteOfficeTask(id: string) {
+    await assertOfficeTaskAccess();
+
+    await prisma.officeTask.delete({ where: { id } });
+
+    revalidatePath("/tasks");
+    return { success: true };
 }
 
 
