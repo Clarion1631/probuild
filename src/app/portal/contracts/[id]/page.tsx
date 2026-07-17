@@ -1,4 +1,4 @@
-import { getContractForPortal, getCompanySettings, getPortalVisibility, getExecutedContractPdf } from "@/lib/actions";
+import { getContractForPortal, getPublicCompanySettings, getPortalVisibility, getExecutedContractPdf } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import PortalContractClient from "./PortalContractClient";
 import Link from "next/link";
@@ -24,7 +24,7 @@ export default async function PortalContractPage({
         notFound();
     }
 
-    const settings = await getCompanySettings();
+    const settings = await getPublicCompanySettings();
 
     // Check portal visibility if contract belongs to a project
     if (contract!.projectId) {

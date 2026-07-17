@@ -1,5 +1,36 @@
 import { withAuth } from "next-auth/middleware";
+import { getToken } from "next-auth/jwt";
 import { NextResponse } from "next/server";
+import { isStaffAccountEnabled } from "@/lib/staff-status";
+
+// These shared web/mobile API handlers always call authenticateMobileOrSession,
+// so they can safely receive bearer requests without a browser session. Keep
+// this allowlist exact: a generic Bearer shortcut would bypass proxy auth for
+// pages and Server Actions that rely on this boundary.
+const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
+    /^\/api\/calendar\/sync\/?$/,
+    /^\/api\/manager\/dashboard\/?$/,
+    /^\/api\/manager\/(?:jobs|employees)(?:\/[^/]+)?\/?$/,
+    /^\/api\/time-entries(?:\/[^/]+)?\/?$/,
+    /^\/api\/files\/(?:signed-upload|register)\/?$/,
+    /^\/api\/(?:expenses|receipts\/parse)\/?$/,
+    /^\/api\/rooms\/scan-import\/?$/,
+    /^\/api\/rooms\/[^/]+\/(?:usdz|ai-furnish)\/?$/,
+    /^\/api\/projects\/?$/,
+    /^\/api\/projects\/[^/]+\/(?:cost-codes|buckets|estimate-items|estimates)\/?$/,
+];
+
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+
+function hasNextAuthSessionCookie(req: any) {
+    const requestCookies = req.cookies?.getAll?.() ?? [];
+    return requestCookies.some(({ name }: { name: string }) =>
+        name === "next-auth.session-token"
+        || name.startsWith("next-auth.session-token.")
+        || name === "__Secure-next-auth.session-token"
+        || name.startsWith("__Secure-next-auth.session-token.")
+    );
+}
 
 export default async function middleware(req: any, event: any) {
     // Bypass authentication entirely during development for local testing
@@ -9,11 +40,35 @@ export default async function middleware(req: any, event: any) {
         return NextResponse.next();
     }
 
-    // API requests carrying `Authorization: Bearer <jwt>` are mobile clients. Their
-    // route handlers verify the JWT via authenticateMobileOrSession themselves; redirecting
-    // them to /login (a browser flow) would 307-redirect every mobile API call.
+    const pathname = req.nextUrl?.pathname;
+    const isServerAction = typeof req.headers?.get?.("next-action") === "string";
+
+    // Public portal routes must remain reachable without a staff session, but a
+    // stale staff cookie must never use those routes to bypass the production
+    // auth matcher and replay a Server Action. Anonymous portal actions still
+    // authorize through their own client/token checks inside the action.
+    if (isServerAction && hasNextAuthSessionCookie(req)) {
+        const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+        if (!token?.email || (token as any).accountDisabled === true || !await isStaffAccountEnabled(token.email)) {
+            return new NextResponse("Forbidden", { status: 403 });
+        }
+    }
+
+    if (isServerAction && typeof pathname === "string" && PUBLIC_PROXY_BYPASS_PATTERN.test(pathname)) {
+        return NextResponse.next();
+    }
+
+    // Approved shared API routes verify mobile JWTs in their own handlers. Do not
+    // extend this to arbitrary Bearer requests: many web routes rely on Proxy as
+    // their authentication boundary.
     const authHeader = req.headers?.get?.("authorization");
-    if (typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")) {
+    const handlerVerifiesBearer = typeof pathname === "string"
+        && MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
+    if (
+        handlerVerifiesBearer
+        && typeof authHeader === "string"
+        && authHeader.toLowerCase().startsWith("bearer ")
+    ) {
         return NextResponse.next();
     }
 
@@ -22,6 +77,12 @@ export default async function middleware(req: any, event: any) {
         pages: {
             signIn: "/login",
         },
+        callbacks: {
+            async authorized({ token }) {
+                if (!token?.email || token.accountDisabled === true) return false;
+                return isStaffAccountEnabled(token.email);
+            },
+        },
     });
 
     return authMiddleware(req as any, event);
@@ -29,6 +90,10 @@ export default async function middleware(req: any, event: any) {
 
 export const config = {
     matcher: [
+        {
+            source: "/:path*",
+            has: [{ type: "header", key: "next-action" }],
+        },
         /*
          * Match all request paths except for the ones starting with:
          * - api/auth (NextAuth endpoints)

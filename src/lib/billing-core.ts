@@ -16,6 +16,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
+import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -215,10 +216,109 @@ export async function sendArDigest() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Invoice creation from a signed estimate, with the duplicate guard the raw
-// action lacks (it's also called by the customer signing flow, so it must stay
-// ungated and unmodified — the guard lives here).
+// Invoice creation from a signed estimate. The core is intentionally kept in
+// this non-Server-Action module so authenticated machine callers do not have to
+// bypass the staff-session guard on actions.ts's public wrapper.
 // ─────────────────────────────────────────────────────────────────────────────
+
+async function getDefaultSalesTaxRate(): Promise<number> {
+    const settings = await prisma.companySettings.findUnique({
+        where: { id: "singleton" },
+        select: { salesTaxes: true },
+    });
+    if (!settings?.salesTaxes) return 0;
+    try {
+        const taxes = JSON.parse(settings.salesTaxes) as Array<{ rate?: number; isDefault?: boolean }>;
+        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
+        const selected = taxes.find((tax) => tax.isDefault) || taxes[0];
+        return typeof selected.rate === "number" ? selected.rate : 0;
+    } catch {
+        return 0;
+    }
+}
+
+export async function createInvoiceFromEstimateCore(estimateId: string) {
+    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
+    if (!estimate) throw new Error("Estimate not found");
+
+    const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
+    if (!project) throw new Error("Project not found");
+
+    const total = toNum(estimate.totalAmount || 0);
+    const rate = estimate.taxRatePercent != null
+        ? Number(estimate.taxRatePercent)
+        : await getDefaultSalesTaxRate();
+    const tax = deriveInvoiceTaxFields(total, rate, !!estimate.taxExempt);
+
+    const invoice = await prisma.invoice.create({
+        data: {
+            code: "INV-TEMP",
+            projectId: estimate.projectId!,
+            clientId: project.clientId,
+            estimateId: estimate.id,
+            status: "Draft",
+            totalAmount: total,
+            balanceDue: total,
+            subtotal: tax.subtotal,
+            taxRate: tax.taxRate,
+            taxAmount: tax.taxAmount,
+        },
+    });
+
+    const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
+    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
+
+    const schedules = await prisma.estimatePaymentSchedule.findMany({
+        where: { estimateId },
+        orderBy: { order: "asc" },
+    });
+
+    let paidAmount = 0;
+    if (schedules.length > 0) {
+        for (const schedule of schedules) {
+            if (schedule.status === "Paid") paidAmount += toNum(schedule.amount);
+            await prisma.paymentSchedule.create({
+                data: {
+                    invoiceId: invoice.id,
+                    sourceScheduleId: schedule.id,
+                    name: schedule.name,
+                    amount: schedule.amount,
+                    status: schedule.status,
+                    dueDate: schedule.dueDate || null,
+                    paymentDate: schedule.paymentDate || null,
+                    paidAt: schedule.paidAt || null,
+                    stripeSessionId: schedule.stripeSessionId || null,
+                    stripePaymentIntentId: schedule.stripePaymentIntentId || null,
+                    paymentMethod: schedule.paymentMethod || null,
+                    referenceNumber: schedule.referenceNumber || null,
+                    notes: schedule.notes || null,
+                },
+            });
+        }
+    } else {
+        await prisma.paymentSchedule.create({
+            data: {
+                invoiceId: invoice.id,
+                name: "Initial Payment",
+                amount: estimate.totalAmount || 0,
+                status: "Pending",
+            },
+        });
+    }
+
+    const newBalanceDue = Math.max(0, total - paidAmount);
+    const invoiceStatus = paidAmount > 0
+        ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
+        : "Draft";
+
+    await prisma.invoice.update({
+        where: { id: invoice.id },
+        data: { code: invoiceCode, balanceDue: newBalanceDue, status: invoiceStatus },
+    });
+
+    revalidatePath(`/projects/${estimate.projectId}/invoices`);
+    return { id: invoice.id, projectId: estimate.projectId };
+}
 
 export async function createInvoiceFromEstimateGuarded(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
@@ -250,8 +350,7 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
     // concurrent call created an invoice first, delete ours (untouched, seconds
     // old, milestones cascade) and return the winner. Deterministic: earliest
     // createdAt wins, id breaks ties.
-    const { createInvoiceFromEstimate } = await import("./actions");
-    const created = await createInvoiceFromEstimate(estimateId);
+    const created = await createInvoiceFromEstimateCore(estimateId);
 
     const all = await prisma.invoice.findMany({
         where: { estimateId },

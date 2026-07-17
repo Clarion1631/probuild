@@ -7,6 +7,7 @@ const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
 const ESTIMATE_ID = "cmml6vtx7001dpwrh8n65xzy6";
 const TEST_CLIENT_ID = "test-client-do-not-delete";
 const ADMIN_EMAIL = "jadkins@goldentouchremodeling.com";
+const DEV_ADMIN_EMAIL = "gtrsupport@goldentouchremodeling.com";
 const SENTINEL_PATH = resolve(__dirname, ".anthropic-status");
 
 // Substrings that identify the LIVE database. The e2e suite creates leads,
@@ -64,6 +65,20 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
             },
         });
         console.log("[data.setup] admin user upserted:", { id: admin.id, email: admin.email });
+
+        // Development mode intentionally falls back to this known ADMIN.
+        // Keep it database-backed so permission and status guards exercise the
+        // same path as real staff while the local UI remains usable pre-login.
+        await prisma.user.upsert({
+            where: { email: DEV_ADMIN_EMAIL },
+            update: { role: "ADMIN", status: "ACTIVATED" },
+            create: {
+                email: DEV_ADMIN_EMAIL,
+                name: "GTR Support",
+                role: "ADMIN",
+                status: "ACTIVATED",
+            },
+        });
 
         const client = await prisma.client.upsert({
             where: { id: TEST_CLIENT_ID },

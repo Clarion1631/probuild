@@ -4,7 +4,15 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
-import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+
+async function assertTimeExpenseProjectAccess(projectId: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user && await canUseDevAuthFallback()) return;
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+    if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
+}
 
 // ─── Time Entry Actions ────────────────────────────────────────
 
@@ -229,6 +237,7 @@ export async function getExpenses(projectId: string) {
 // ─── Combined Data Fetching ───────────────────────────────────
 
 export async function getTimeExpenseData(projectId: string) {
+    await assertTimeExpenseProjectAccess(projectId);
     const timeEntries = await prisma.timeEntry.findMany({
         where: { projectId },
         include: {
