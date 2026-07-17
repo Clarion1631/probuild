@@ -15,7 +15,8 @@ import {
 import { inches } from "@/lib/studio/units";
 import { useStudio } from "../store";
 import { BUILDERS } from "./builders";
-import { resolveItem, deckTopYAt } from "./Items";
+import { deckTopYAt, isDeckPlatform } from "@/lib/studio/stacking";
+import { resolveItem } from "./Items";
 
 const GRID = inches(1);
 
@@ -120,7 +121,7 @@ function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem
     if (!p) return;
     // Deck auto-stack: floor items dropped on a deck platform start on its
     // top surface (decks themselves and wall/ceiling mounts are unaffected).
-    const deckY = placing.mount === "floor" && placing.id !== "deck-platform"
+    const deckY = placing.mount === "floor" && !isDeckPlatform(placing.id)
       ? deckTopYAt(doc.items, p)
       : undefined;
     addItem(placing.id, {
