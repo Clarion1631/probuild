@@ -15,6 +15,7 @@ import {
   pointInPolygon, roomHeightAt, type WallSeg, type OBB, type RoomShellInfo,
 } from "@/lib/studio/geometry";
 import { inches, formatFtIn } from "@/lib/studio/units";
+import { deckTopYAt, isDeckPlatform } from "@/lib/studio/stacking";
 import { useStudio } from "../store";
 import { useLibrary } from "../useLibrary";
 import { BUILDERS } from "./builders";
@@ -48,6 +49,7 @@ export function resolveItem(item: PlacedItem): ResolvedItem | null {
     finishes: { ...def.finishes, ...item.finishes },
   };
 }
+
 
 interface DragState {
   pointerId: number;
@@ -293,11 +295,18 @@ function ItemNode({
         Math.abs(drag.cur.z - item.z) > 1e-6 ||
         Math.abs(drag.cur.rotation - item.rotation) > 1e-6;
       if (changed) {
-        useStudio.getState().updateItem(item.id, {
+        const patch: Partial<PlacedItem> = {
           x: drag.cur.x,
           z: drag.cur.z,
           rotation: drag.cur.rotation,
-        });
+        };
+        // Deck auto-stack: floor items ride on top of a deck platform they
+        // land on and drop back to the floor when dragged off. Wall/ceiling/
+        // counter mounts and the decks themselves keep their own y.
+        if (def.mount === "floor" && !isDeckPlatform(def.id)) {
+          patch.y = deckTopYAt(allItems, { x: drag.cur.x, z: drag.cur.z }, item.id);
+        }
+        useStudio.getState().updateItem(item.id, patch);
       } else {
         // restore the transient three.js pose to the committed one
         const g = groupRef.current;
