@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { savePortalVisibility } from "@/lib/actions";
+import { toast } from "sonner";
+import { savePortalVisibility, setPaymentRemindersEnabled } from "@/lib/actions";
 
 type VisibilityState = {
     showSchedule: boolean;
@@ -14,6 +15,7 @@ type VisibilityState = {
     showSelections?: boolean;
     showMoodBoards?: boolean;
     isPortalEnabled: boolean;
+    paymentRemindersEnabled: boolean;
     lastSharedAt?: Date | null;
     lastShareEmailId?: string | null;
     lastShareEmailStatus?: string | null;
@@ -29,6 +31,7 @@ const TOGGLE_CONFIG: { key: keyof VisibilityState; label: string; description: s
     { key: "showFiles", label: "Files & Documents", description: "Client can browse project files and documents" },
     { key: "showDailyLogs", label: "Daily Logs", description: "Client can view daily project logs and notes" },
     { key: "showMessages", label: "Messages", description: "Client can send and receive messages" },
+    { key: "paymentRemindersEnabled", label: "Payment Reminders", description: "Automatically email the client when a payment is due soon or overdue" },
 ];
 
 export default function PortalVisibilityToggles({
@@ -40,7 +43,6 @@ export default function PortalVisibilityToggles({
 }) {
     const [state, setState] = useState<VisibilityState>(initialState);
     const [isPending, startTransition] = useTransition();
-    const [message, setMessage] = useState("");
 
     const handleToggle = (key: keyof VisibilityState) => {
         setState((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -49,12 +51,13 @@ export default function PortalVisibilityToggles({
     const handleSave = () => {
         startTransition(async () => {
             try {
-                await savePortalVisibility(projectId, state);
-                setMessage("Visibility settings saved!");
-                setTimeout(() => setMessage(""), 3000);
+                await Promise.all([
+                    savePortalVisibility(projectId, state),
+                    setPaymentRemindersEnabled(projectId, state.paymentRemindersEnabled),
+                ]);
+                toast.success("Visibility settings saved!");
             } catch {
-                setMessage("Failed to save settings");
-                setTimeout(() => setMessage(""), 3000);
+                toast.error("Failed to save settings");
             }
         });
     };
@@ -126,17 +129,6 @@ export default function PortalVisibilityToggles({
                 >
                     {isPending ? "Saving..." : "Save Settings"}
                 </button>
-                {message && (
-                    <span
-                        className={`text-sm font-medium ${
-                            message.includes("saved")
-                                ? "text-green-600"
-                                : "text-red-600"
-                        }`}
-                    >
-                        {message}
-                    </span>
-                )}
             </div>
         </div>
     );
