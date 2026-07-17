@@ -254,3 +254,173 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
     await expect(page.locator("text=/Invoice INV-\\d+ created/")).toBeVisible();
   });
 });
+
+/**
+ * Concurrency guard — the invoice-side lost update.
+ *
+ * Two payments settle DIFFERENT milestones of the SAME invoice at the same time.
+ * Each recordPayment claims its own schedule row (no mutual block) and recomputes
+ * Invoice.balanceDue from the sibling set. Without a parent-row lock, both read a
+ * stale sibling set and sequentially overwrite balanceDue — one payment's effect is
+ * silently lost, and because no deadlock fires, no retry masks it. The fix locks the
+ * parent Estimate→Invoice rows FOR UPDATE before recomputing, serializing the two.
+ *
+ * This drives the REAL server action through two concurrent browser submissions, so
+ * the two transactions genuinely overlap in the database. The assertion is the money
+ * invariant: final balanceDue == totalAmount - sum(all Paid milestones). Pre-fix this
+ * lands at 400 or 600 (one payment lost); post-fix it lands at 0.
+ *
+ * CI throwaway Postgres only — the same data.setup guard that protects the suite
+ * above protects this block (it never runs when DATABASE_URL looks like Supabase).
+ */
+const C = {
+  client: "mp2-e2e-client",
+  project: "mp2-e2e-project",
+  estimate: "mp2-e2e-estimate",
+  invoice: "mp2-e2e-invoice",
+  estDeposit: "mp2-e2e-eps-deposit",
+  estFinal: "mp2-e2e-eps-final",
+  invDeposit: "mp2-e2e-ps-deposit",
+  invFinal: "mp2-e2e-ps-final",
+};
+const C_NAME = "Money Race Drill - MP2TEST";
+const cPrisma = new PrismaClient();
+
+test.describe.serial("Money pipeline: concurrent payments never lose a balance update", () => {
+  // Reset both milestones (and the parent balances) to a clean pre-payment state so
+  // the race starts from full balance every run/retry.
+  async function seed() {
+    await cPrisma.client.upsert({
+      where: { id: C.client },
+      update: {},
+      create: { id: C.client, name: "MP2 Drill Client", initials: "M2" },
+    });
+    await cPrisma.project.upsert({
+      where: { id: C.project },
+      update: {},
+      create: { id: C.project, name: C_NAME, clientId: C.client, status: "In Progress" },
+    });
+    await cPrisma.estimate.upsert({
+      where: { id: C.estimate },
+      update: { status: "Invoiced", totalAmount: 1000, balanceDue: 1000, statusBeforePayment: null },
+      create: {
+        id: C.estimate, title: C_NAME, code: "EST-MP2TEST", projectId: C.project,
+        status: "Invoiced", taxExempt: true, totalAmount: 1000, balanceDue: 1000,
+      },
+    });
+    await cPrisma.estimatePaymentSchedule.upsert({
+      where: { id: C.estDeposit },
+      update: { status: "Pending", paidAt: null, paymentDate: null, paymentMethod: null, referenceNumber: null },
+      create: { id: C.estDeposit, estimateId: C.estimate, name: "MP2 Deposit", amount: 600, status: "Pending", order: 1 },
+    });
+    await cPrisma.estimatePaymentSchedule.upsert({
+      where: { id: C.estFinal },
+      update: { status: "Pending", paidAt: null, paymentDate: null, paymentMethod: null, referenceNumber: null },
+      create: { id: C.estFinal, estimateId: C.estimate, name: "MP2 Final", amount: 400, status: "Pending", order: 2 },
+    });
+    await cPrisma.invoice.upsert({
+      where: { id: C.invoice },
+      update: { status: "Issued", totalAmount: 1000, balanceDue: 1000 },
+      create: {
+        id: C.invoice, code: "INV-MP2TEST", projectId: C.project, clientId: C.client,
+        estimateId: C.estimate, status: "Issued", totalAmount: 1000, balanceDue: 1000,
+        issueDate: new Date(),
+      },
+    });
+    // Invoice-side copies mirror the estimate milestones (sourceScheduleId link) so
+    // recordPayment settles both sides, exactly like a converted estimate.
+    await cPrisma.paymentSchedule.upsert({
+      where: { id: C.invDeposit },
+      update: { status: "Pending", paidAt: null, paymentDate: null, paymentMethod: null, referenceNumber: null },
+      create: { id: C.invDeposit, invoiceId: C.invoice, name: "MP2 Deposit", amount: 600, status: "Pending", sourceScheduleId: C.estDeposit },
+    });
+    await cPrisma.paymentSchedule.upsert({
+      where: { id: C.invFinal },
+      update: { status: "Pending", paidAt: null, paymentDate: null, paymentMethod: null, referenceNumber: null },
+      create: { id: C.invFinal, invoiceId: C.invoice, name: "MP2 Final", amount: 400, status: "Pending", sourceScheduleId: C.estFinal },
+    });
+  }
+
+  test.beforeAll(seed);
+
+  test.afterAll(async () => {
+    try {
+      await cPrisma.activityLog.deleteMany({
+        where: { OR: [{ entityId: { in: [C.estimate, C.invoice] } }, { projectId: C.project }] },
+      });
+      await cPrisma.paymentSchedule.deleteMany({ where: { invoiceId: C.invoice } });
+      await cPrisma.invoice.deleteMany({ where: { id: C.invoice } });
+      await cPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: C.estimate } });
+      await cPrisma.estimate.deleteMany({ where: { id: C.estimate } });
+      await cPrisma.project.deleteMany({ where: { id: C.project } });
+      await cPrisma.client.deleteMany({ where: { id: C.client } });
+    } finally {
+      await cPrisma.$disconnect();
+    }
+  });
+
+  test("C1: two concurrent milestone payments both land — no lost balance update", async ({ browser }) => {
+    test.setTimeout(60_000);
+    const invoiceUrl = `/projects/${C.project}/invoices/${C.invoice}`;
+
+    // One authed context, two pages — they share the session cookie and hit the
+    // real server action over separate connections, so the transactions overlap.
+    const ctx = await browser.newContext({ storageState: "e2e/.auth/user.json" });
+
+    // Stage each modal up to (but not including) the submit, so the two submits can
+    // fire as close to simultaneously as possible.
+    async function stage(rowText: string, checkNo: string) {
+      const page = await ctx.newPage();
+      await page.goto(invoiceUrl, { waitUntil: "networkidle" });
+      const row = page.locator("tr", { hasText: rowText });
+      await row.locator('button:has-text("Record Payment")').click();
+      await page.locator('button:has-text("Check")').first().click();
+      await page.locator('input[placeholder="e.g. 1234"]').fill(checkNo);
+      return page;
+    }
+
+    const p1 = await stage("MP2 Deposit", "7001");
+    const p2 = await stage("MP2 Final", "7002");
+
+    // Fire both submits in parallel — the whole point of the test.
+    await Promise.all([
+      p1.locator('button:has-text("Record Payment")').last().click(),
+      p2.locator('button:has-text("Record Payment")').last().click(),
+    ]);
+
+    // Wait until both invoice-side milestones have settled in the DB.
+    await expect
+      .poll(
+        async () => {
+          const copies = await cPrisma.paymentSchedule.findMany({ where: { invoiceId: C.invoice } });
+          return copies.filter((s) => s.status === "Paid").length;
+        },
+        { timeout: 30_000, intervals: [500] }
+      )
+      .toBe(2);
+
+    await ctx.close();
+
+    // ── The money invariant: balanceDue == total - sum(all Paid) on BOTH sides ──
+    const invoice = await cPrisma.invoice.findUniqueOrThrow({ where: { id: C.invoice } });
+    const invCopies = await cPrisma.paymentSchedule.findMany({ where: { invoiceId: C.invoice } });
+    const invPaid = invCopies.filter((s) => s.status === "Paid").reduce((sum, s) => sum + Number(s.amount), 0);
+    const invExpectedBalance = Math.max(0, Math.round((Number(invoice.totalAmount) - invPaid) * 100) / 100);
+
+    expect(invPaid, "both milestones counted as paid").toBe(1000);
+    expect(Number(invoice.balanceDue), "invoice balanceDue == total - sum(paid), no lost update").toBe(invExpectedBalance);
+    expect(Number(invoice.balanceDue)).toBe(0);
+    expect(invoice.status).toBe("Paid");
+
+    // Estimate mirror must reflect the same — both estimate copies settled, balance 0.
+    const estimate = await cPrisma.estimate.findUniqueOrThrow({ where: { id: C.estimate } });
+    const estCopies = await cPrisma.estimatePaymentSchedule.findMany({ where: { estimateId: C.estimate } });
+    const estPaid = estCopies.filter((s) => s.status === "Paid").reduce((sum, s) => sum + Number(s.amount), 0);
+    const estExpectedBalance = Math.max(0, Math.round((Number(estimate.totalAmount) - estPaid) * 100) / 100);
+
+    expect(estPaid, "both estimate copies mirrored as paid").toBe(1000);
+    expect(Number(estimate.balanceDue), "estimate balanceDue mirrors with no lost update").toBe(estExpectedBalance);
+    expect(Number(estimate.balanceDue)).toBe(0);
+    expect(estimate.status).toBe("Paid");
+  });
+});

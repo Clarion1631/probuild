@@ -13,6 +13,7 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { coLineCents } from "./co-tax";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -2754,7 +2755,18 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // safeOnly re-runs the whole transaction writing only the always-present columns — see the
     // schema-drift fallback below the closure for why the retry has to happen at this level.
     const runSave = (safeOnly: boolean) => prisma.$transaction(async (tx) => {
-        // Preserve payment credits: subtract already-paid milestones from totalAmount
+        // Lock the Estimate row FIRST — before reading paid milestones — for two reasons:
+        //  (1) Canonical lock order (Estimate → Invoice → schedules), shared with the payment
+        //      flows, so no two money-path transactions can deadlock on inverse lock ordering.
+        //  (2) Serializes the balance computation on the Estimate row. A concurrent payment
+        //      either committed before we took this lock (so the paidSum read below reflects it)
+        //      or is blocked until we commit (so it recomputes against our new totalAmount).
+        //      Either way, no committed payment's balanceDue effect is silently overwritten.
+        await lockMoneyParents(tx, { estimateId });
+
+        // Preserve payment credits: subtract already-paid milestones from totalAmount.
+        // Read AFTER the lock above so paidSum reflects committed-and-locked state, not a stale
+        // snapshot taken before a racing payment committed.
         const paidMilestones = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId, status: "Paid" },
             select: { amount: true },
@@ -3015,10 +3027,10 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // Any other error (e.g. the linked-expense guard, deadlocks) propagates unchanged.
     let result;
     try {
-        result = await runSave(false);
+        result = await withTxRetry(() => runSave(false));
     } catch (e: any) {
         if (e?.code === "P2022") {
-            result = await runSave(true);
+            result = await withTxRetry(() => runSave(true));
         } else {
             throw e;
         }
@@ -3417,7 +3429,18 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await prisma.$transaction(async (t) => {
+    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Two concurrent payments on
+        // DIFFERENT milestones of the SAME invoice each claim their own schedule row (no mutual
+        // block), so without a parent lock they both read a stale sibling set and overwrite each
+        // other's Invoice.balanceDue — one payment's balance effect is silently lost, and no
+        // deadlock fires to trigger a retry. Locking the parent(s) first serializes the recompute:
+        // the second call blocks until the first commits, then recomputes against fresh state.
+        // Read the estimate link (non-locking) so we can lock Estimate BEFORE Invoice, matching
+        // recordEstimatePayment's mirror order so the two flows never invert and deadlock.
+        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+
         const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3500,7 +3523,7 @@ export async function recordPayment(
         }
 
         return { success: true as const, projectId: invoice.projectId };
-    });
+    }));
 
     if (!tx.success) return tx;
 
@@ -3687,7 +3710,20 @@ export async function recordEstimatePayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await prisma.$transaction(async (t) => {
+    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Lock the estimate first,
+        // then its (oldest) linked invoice if one exists, BEFORE any reads/writes below.
+        // This flow mirrors onto the invoice copy, so it must take the invoice lock in the
+        // same order recordPayment/the Stripe+QB settles do, or overlapping settles from both
+        // sides would deadlock on every collision (retry recovers, but the lock order avoids it).
+        await lockMoneyParents(t, { estimateId });
+        const lockInv = await t.invoice.findFirst({
+            where: { estimateId },
+            orderBy: { createdAt: "asc" },
+            select: { id: true },
+        });
+        if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
+
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3781,7 +3817,7 @@ export async function recordEstimatePayment(
             mirroredCopyId, paymentName: payment.name, newBalance,
             paymentAmount: input.amount != null ? input.amount : toNum(payment.amount),
         };
-    });
+    }));
 
     if (!tx.success) return tx;
 
@@ -3888,7 +3924,18 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This flow releases both the
+        // estimate milestone and its mirrored invoice copy, so lock the estimate first, then its
+        // (oldest) linked invoice, before recomputing either balance.
+        await lockMoneyParents(tx, { estimateId });
+        const lockInv = await tx.invoice.findFirst({
+            where: { estimateId },
+            orderBy: { createdAt: "asc" },
+            select: { id: true },
+        });
+        if (lockInv) await lockMoneyParents(tx, { invoiceId: lockInv.id });
+
         const payment = await tx.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
         if (payment.status !== "Paid") return null;
@@ -3960,7 +4007,7 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         }
 
         return { projectId: estimate.projectId, leadId: estimate.leadId };
-    });
+    }));
 
     if (!result) return { success: false };
 
@@ -4091,7 +4138,13 @@ export async function splitInvoiceMilestones(
 export async function unrecordPayment(paymentId: string, invoiceId: string) {
     await assertInvoicePermission();
 
-    const projectId = await prisma.$transaction(async (tx) => {
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This flow releases the invoice
+        // milestone and its mirrored estimate copy, so read the estimate link (non-locking), then
+        // lock Estimate before Invoice, before recomputing either balance.
+        const invLink = await tx.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(tx, { estimateId: invLink?.estimateId, invoiceId });
+
         const payment = await tx.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
         if (payment.status !== "Paid") return null;
@@ -4175,7 +4228,7 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
         }
 
         return invoice.projectId;
-    });
+    }));
 
     if (!projectId) return { success: false };
 
