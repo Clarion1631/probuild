@@ -225,11 +225,13 @@ function RoomSizeButton() {
     const base = shape === "l-shape"
       ? makeLShapeRoom(w, l, w * 0.45, l * 0.45, h)
       : makeRectRoom(w, l, h);
-    // slope only survives onto rect layouts; outdoor always survives
-    setRoomShape({ ...base, crown: doc.room.crown, outdoor: doc.room.outdoor, slope: shape === "rect" ? doc.room.slope : undefined });
+    // slope only survives onto rect layouts; outdoor + open boundary always survive
+    setRoomShape({ ...base, crown: doc.room.crown, outdoor: doc.room.outdoor, noWalls: doc.room.noWalls, slope: shape === "rect" ? doc.room.slope : undefined });
   };
 
   const setCrown = (on: boolean) => setRoomShape({ ...doc.room, crown: on || undefined });
+
+  const setFence = (on: boolean) => setRoomShape({ ...doc.room, noWalls: on ? undefined : true });
 
   const setSlopeSide = (idx: number | null) => {
     if (idx === null) {
@@ -296,17 +298,34 @@ function RoomSizeButton() {
             </div>
           </div>
 
-          <div className="mt-3 border-t border-slate-100 pt-2.5">
-            <label className="flex items-center justify-between">
-              <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Crown molding</span>
-              <input
-                type="checkbox"
-                checked={!!doc.room.crown}
-                onChange={(e) => setCrown(e.target.checked)}
-                className="h-4 w-4 accent-blue-600"
-              />
-            </label>
-          </div>
+          {doc.room.outdoor ? (
+            <div className="mt-3 border-t border-slate-100 pt-2.5">
+              <label className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Boundary fence / walls</span>
+                <input
+                  type="checkbox"
+                  checked={!doc.room.noWalls}
+                  onChange={(e) => setFence(e.target.checked)}
+                  className="h-4 w-4 accent-blue-600"
+                />
+              </label>
+              <div className="mt-1 text-[10px] leading-snug text-slate-400">
+                Off = open yard with no fence. The boundary still defines the ground area.
+              </div>
+            </div>
+          ) : (
+            <div className="mt-3 border-t border-slate-100 pt-2.5">
+              <label className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Crown molding</span>
+                <input
+                  type="checkbox"
+                  checked={!!doc.room.crown}
+                  onChange={(e) => setCrown(e.target.checked)}
+                  className="h-4 w-4 accent-blue-600"
+                />
+              </label>
+            </div>
+          )}
 
           <div className="mt-3 border-t border-slate-100 pt-2.5">
             <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">Slanted ceiling</div>

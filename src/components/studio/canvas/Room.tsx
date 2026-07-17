@@ -253,6 +253,7 @@ export function Room({ doc }: { doc: DesignDoc }) {
 
   const t = doc.room.wallThickness;
   const outdoor = !!doc.room.outdoor;
+  const hideWalls = outdoor && !!doc.room.noWalls;
 
   return (
     <group>
@@ -273,7 +274,8 @@ export function Room({ doc }: { doc: DesignDoc }) {
         </mesh>
       )}
 
-      {/* Walls */}
+      {/* Walls (outdoor rooms can drop them entirely for an open boundary) */}
+      {!hideWalls && (
       <group>
         {walls.map((w) => {
           const finish = getFinish(paintFor(w.index), WALL_FALLBACK);
@@ -323,6 +325,7 @@ export function Room({ doc }: { doc: DesignDoc }) {
           );
         })}
       </group>
+      )}
 
       {/* Ceiling - walk mode only so orbit/plan stay open; outdoor spaces have open sky */}
       {view === "walk" && !outdoor && (

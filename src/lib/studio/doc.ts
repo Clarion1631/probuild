@@ -55,6 +55,8 @@ export interface DesignDoc {
     slope?: RoomSlope;
     /** Outdoor space: walls read as fence/siding; no ceiling, baseboards, or crown. */
     outdoor?: boolean;
+    /** Outdoor only: open boundary - don't render the fence/walls at all. */
+    noWalls?: boolean;
   };
   surfaces: {
     floor: string;
