@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions } from "@/lib/permissions";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { toNum } from "@/lib/prisma-helpers";
 
 export const maxDuration = 60;
@@ -149,7 +150,11 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         }
 
         if (!dryRun) {
-            await prisma.$transaction(async (t) => {
+            await withTxRetry(() => prisma.$transaction(async (t) => {
+                // Lock the invoice FIRST (canonical Estimate → Invoice order; this branch touches
+                // only the invoice) so backfilling one session can't race a live webhook/QB settle
+                // on a sibling milestone and overwrite its balanceDue. Recompute after the lock.
+                await lockMoneyParents(t, { invoiceId });
                 await t.paymentSchedule.update({
                     where: { id: existing!.id },
                     data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
@@ -161,7 +166,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
                 const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
                 const newStatus = newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status;
                 await t.invoice.update({ where: { id: invoiceId }, data: { balanceDue: newBalance, status: newStatus } });
-            });
+            }));
         }
 
         details.push({ sessionId: session.id, type: "invoice", id: existing.id, action: "synced", ...context });
@@ -221,7 +226,11 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         }
 
         if (!dryRun) {
-            await prisma.$transaction(async (t) => {
+            await withTxRetry(() => prisma.$transaction(async (t) => {
+                // Lock the estimate FIRST (canonical Estimate → Invoice order; this branch touches
+                // only the estimate) so backfilling one session can't race a live settle on a
+                // sibling milestone and overwrite its balanceDue. Recompute after the lock.
+                await lockMoneyParents(t, { estimateId });
                 await t.estimatePaymentSchedule.update({
                     where: { id: existing!.id },
                     data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
@@ -232,7 +241,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
                 const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                 const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
                 await t.estimate.update({ where: { id: estimateId }, data: { balanceDue: newBalance } });
-            });
+            }));
         }
 
         details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "synced", ...context });
