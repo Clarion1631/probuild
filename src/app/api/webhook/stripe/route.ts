@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { after } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
@@ -65,7 +66,13 @@ async function processEvent(eventId: string) {
                     // the same invoice from each reading a stale sibling-set and racing each other's parent update.
                     const scheduleId = metadata.paymentScheduleId;
                     const invoiceId = metadata.invoiceId;
-                    const tx = await prisma.$transaction(async (t) => {
+                    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+                        // Lock the parent invoice FIRST (canonical Estimate → Invoice → schedules
+                        // order; this branch touches only the invoice). Two concurrent webhooks
+                        // settling different milestones of the same invoice would otherwise each
+                        // read a stale sibling set and overwrite each other's balanceDue — the lock
+                        // serializes the recompute so the second waits and reads fresh state.
+                        await lockMoneyParents(t, { invoiceId });
                         const claim = await t.paymentSchedule.updateMany({
                             where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
@@ -92,7 +99,7 @@ async function processEvent(eventId: string) {
                         });
                         const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
                         return { alreadyPaid, invoice, paidSchedule, newBalance };
-                    });
+                    }));
                     if (tx.invoice && tx.paidSchedule && !tx.alreadyPaid) {
                         await sendInvoicePaymentReceivedEmails({
                             invoice: tx.invoice,
@@ -113,7 +120,18 @@ async function processEvent(eventId: string) {
                     // Single transaction: claim + sibling-read + parent update. See invoice branch for rationale.
                     const scheduleId = metadata.estimatePaymentScheduleId;
                     const estimateId = metadata.estimateId;
-                    const tx = await prisma.$transaction(async (t) => {
+                    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+                        // Canonical lock order: Estimate → Invoice → schedules. Lock the estimate,
+                        // then its (oldest) linked invoice, before the claim + recompute + mirror.
+                        await lockMoneyParents(t, { estimateId });
+                        const lockInv = await t.invoice.findFirst({
+                            where: { estimateId },
+                            // id tiebreaker so the lock target == the mutation target below on a createdAt tie.
+                            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+                            select: { id: true },
+                        });
+                        if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
+
                         const claim = await t.estimatePaymentSchedule.updateMany({
                             where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
@@ -161,10 +179,12 @@ async function processEvent(eventId: string) {
                         // schedule — settle the matching copy too so the job can't be
                         // billed twice (estimate-side Stripe + invoice-side QB/manual).
                         if (!alreadyPaid) {
-                            const linkedInvoice = await t.invoice.findFirst({
-                                where: { estimateId },
-                                include: { payments: true },
-                            });
+                            // Fetch the SAME invoice we locked in the preamble by id — not a fresh
+                            // findFirst — so the mirror mutates exactly the locked row even if the
+                            // "oldest" ordering shifts concurrently between the two reads.
+                            const linkedInvoice = lockInv
+                                ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+                                : null;
                             if (linkedInvoice) {
                                 const copy = linkedInvoice.payments.find(p =>
                                     p.status !== "Paid" &&
@@ -196,7 +216,7 @@ async function processEvent(eventId: string) {
                             }
                         }
                         return { alreadyPaid, updatedSchedule, newBalance };
-                    });
+                    }));
                     if (!tx.alreadyPaid) {
                         await sendEstimatePaymentReceivedEmails({
                             estimate: tx.updatedSchedule.estimate,
@@ -276,25 +296,34 @@ async function processEvent(eventId: string) {
                     if (isFullyRefunded) {
                         // Full refund: reset the schedule and recompute the invoice in one transaction
                         // so we don't race with a concurrent payment settlement on a sibling schedule.
-                        await prisma.$transaction(async (t) => {
-                            await t.paymentSchedule.update({
-                                where: { id: invoiceSchedule.id },
-                                data: { status: "Pending", paidAt: null, paymentDate: null },
-                            });
-                            const siblings = await t.paymentSchedule.findMany({
-                                where: { invoiceId: invoiceSchedule.invoiceId },
-                            });
-                            const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                            const newBalance = Math.max(0, toNum(invoiceSchedule.invoice.totalAmount) - totalPaid);
-                            const newStatus = newBalance <= 0
-                                ? "Paid"
-                                : totalPaid > 0 ? "Partially Paid"
-                                : "Issued";
-                            await t.invoice.update({
-                                where: { id: invoiceSchedule.invoice.id },
-                                data: { balanceDue: newBalance, status: newStatus },
-                            });
-                        });
+                        await withTxRetry(() => prisma.$transaction(async (t) => {
+                            // Canonical Estimate → Invoice → schedules order; this branch touches
+                            // only the invoice. Lock it first so a concurrent settle on a sibling
+                            // milestone can't have its balanceDue effect lost to this recompute.
+                            await lockMoneyParents(t, { invoiceId: invoiceSchedule.invoiceId });
+                            // Re-read the parent AFTER the lock — the outer query's snapshot of
+                            // totalAmount/status may be stale if a concurrent flow changed it.
+                            const invoice = await t.invoice.findUnique({ where: { id: invoiceSchedule.invoiceId } });
+                            if (invoice) {
+                                await t.paymentSchedule.update({
+                                    where: { id: invoiceSchedule.id },
+                                    data: { status: "Pending", paidAt: null, paymentDate: null },
+                                });
+                                const siblings = await t.paymentSchedule.findMany({
+                                    where: { invoiceId: invoiceSchedule.invoiceId },
+                                });
+                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+                                const newStatus = newBalance <= 0
+                                    ? "Paid"
+                                    : totalPaid > 0 ? "Partially Paid"
+                                    : "Issued";
+                                await t.invoice.update({
+                                    where: { id: invoice.id },
+                                    data: { balanceDue: newBalance, status: newStatus },
+                                });
+                            }
+                        }));
                     }
 
                     const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -325,30 +354,39 @@ async function processEvent(eventId: string) {
 
                 if (estSchedule) {
                     if (isFullyRefunded) {
-                        await prisma.$transaction(async (t) => {
-                            await t.estimatePaymentSchedule.update({
-                                where: { id: estSchedule.id },
-                                data: { status: "Pending", paidAt: null, paymentDate: null },
-                            });
-                            const siblings = await t.estimatePaymentSchedule.findMany({
-                                where: { estimateId: estSchedule.estimateId },
-                            });
-                            const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                            const newBalance = Math.max(0, toNum(estSchedule.estimate.totalAmount) - totalPaid);
-                            const newStatus =
-                                totalPaid === 0 ? estSchedule.estimate.statusBeforePayment ?? "Approved"
-                                : newBalance <= 0 ? "Paid"
-                                : "Partially Paid";
+                        await withTxRetry(() => prisma.$transaction(async (t) => {
+                            // Canonical Estimate → Invoice → schedules order; this branch touches
+                            // only the estimate. Lock it first so a concurrent settle on a sibling
+                            // milestone can't have its balanceDue effect lost to this recompute.
+                            await lockMoneyParents(t, { estimateId: estSchedule.estimateId });
+                            // Re-read the parent AFTER the lock — the outer query's snapshot of
+                            // totalAmount/status may be stale if a concurrent flow changed it.
+                            const estimate = await t.estimate.findUnique({ where: { id: estSchedule.estimateId } });
+                            if (estimate) {
+                                await t.estimatePaymentSchedule.update({
+                                    where: { id: estSchedule.id },
+                                    data: { status: "Pending", paidAt: null, paymentDate: null },
+                                });
+                                const siblings = await t.estimatePaymentSchedule.findMany({
+                                    where: { estimateId: estSchedule.estimateId },
+                                });
+                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+                                const newStatus =
+                                    totalPaid === 0 ? estimate.statusBeforePayment ?? "Approved"
+                                    : newBalance <= 0 ? "Paid"
+                                    : "Partially Paid";
 
-                            await t.estimate.update({
-                                where: { id: estSchedule.estimateId },
-                                data: {
-                                    balanceDue: newBalance,
-                                    status: newStatus,
-                                    ...(totalPaid === 0 && { statusBeforePayment: null }),
-                                },
-                            });
-                        });
+                                await t.estimate.update({
+                                    where: { id: estimate.id },
+                                    data: {
+                                        balanceDue: newBalance,
+                                        status: newStatus,
+                                        ...(totalPaid === 0 && { statusBeforePayment: null }),
+                                    },
+                                });
+                            }
+                        }));
                     }
 
                     const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
