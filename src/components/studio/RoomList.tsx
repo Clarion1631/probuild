@@ -27,6 +27,7 @@ const ROOM_TYPE_OPTIONS: Array<{ value: RoomType; label: string }> = [
   { value: "bathroom", label: "Bathroom" },
   { value: "laundry", label: "Laundry" },
   { value: "bedroom", label: "Bedroom" },
+  { value: "outdoor", label: "Outdoor / Patio" },
   { value: "other", label: "Living / Other" },
 ];
 
@@ -68,7 +69,7 @@ export function RoomList({ ownerKind, ownerId }: RoomListProps) {
         <div>
           <h1 className="text-xl font-bold text-slate-800">Room Designer</h1>
           <p className="mt-0.5 text-sm text-slate-500">
-            Lay out kitchens, baths, and living spaces in 3D - then share them with your client.
+            Lay out kitchens, baths, living spaces, and outdoor areas in 3D - then share them with your client.
           </p>
         </div>
         <button

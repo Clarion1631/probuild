@@ -53,6 +53,8 @@ export interface DesignDoc {
     crown?: boolean;
     /** Slanted (shed) ceiling - only honored for 4-corner rectangular rooms. */
     slope?: RoomSlope;
+    /** Outdoor space: walls read as fence/siding; no ceiling, baseboards, or crown. */
+    outdoor?: boolean;
   };
   surfaces: {
     floor: string;
@@ -109,6 +111,20 @@ export function emptyDoc(): DesignDoc {
       floor: DEFAULT_SURFACES.floor,
       ceiling: DEFAULT_SURFACES.ceiling,
       walls: { all: DEFAULT_SURFACES.wall },
+    },
+    items: [],
+  };
+}
+
+/** Blank outdoor space: grass yard bounded by a 6ft cedar fence. */
+export function emptyOutdoorDoc(): DesignDoc {
+  return {
+    version: 2,
+    room: { ...makeRectRoom(feet(20), feet(16), feet(6)), outdoor: true },
+    surfaces: {
+      floor: "floor-grass",
+      ceiling: DEFAULT_SURFACES.ceiling,
+      walls: { all: "wood-cedar" },
     },
     items: [],
   };

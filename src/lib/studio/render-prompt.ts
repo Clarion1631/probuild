@@ -41,7 +41,8 @@ export function buildRenderPrompt(
   products: ProductInfo = new Map(),
 ): string {
   const bounds = polygonBounds(doc.room.points);
-  const dims = `${(bounds.width * M_TO_FT).toFixed(0)}ft x ${(bounds.length * M_TO_FT).toFixed(0)}ft, ${(doc.room.height * M_TO_FT).toFixed(0)}ft ceiling`;
+  const outdoor = !!doc.room.outdoor;
+  const dims = `${(bounds.width * M_TO_FT).toFixed(0)}ft x ${(bounds.length * M_TO_FT).toFixed(0)}ft, ${(doc.room.height * M_TO_FT).toFixed(0)}ft ${outdoor ? "fence/structure height" : "ceiling"}`;
 
   const floor = finishName(doc.surfaces.floor, libNames);
   const wallPaints = [...new Set(
@@ -69,19 +70,33 @@ export function buildRenderPrompt(
   for (const [key, n] of counted) lines.push(n > 1 ? `${n}x ${key}` : key);
 
   return [
-    "This is a flat-shaded 3D mockup of a real room. Re-render it as a REAL PHOTOGRAPH -",
-    "a professional interior-design magazine photo shot on a full-frame DSLR.",
-    "Keep the camera angle, room shape, and the position of every fixture EXACTLY as shown,",
+    outdoor
+      ? "This is a flat-shaded 3D mockup of a real outdoor living space. Re-render it as a REAL PHOTOGRAPH -"
+      : "This is a flat-shaded 3D mockup of a real room. Re-render it as a REAL PHOTOGRAPH -",
+    outdoor
+      ? "a professional landscape/exterior photo shot on a full-frame DSLR, golden-hour light, open sky overhead."
+      : "a professional interior-design magazine photo shot on a full-frame DSLR.",
+    outdoor
+      ? "Keep the camera angle, yard shape, and the position of every structure and plant EXACTLY as shown,"
+      : "Keep the camera angle, room shape, and the position of every fixture EXACTLY as shown,",
     "but completely replace the CG look: photorealistic materials with visible texture",
-    "(tile grout lines, painted drywall, wood grain, brushed metal, glass with real reflections),",
-    "global-illumination lighting with soft contact shadows, warm natural light, gentle vignette.",
+    outdoor
+      ? "(real grass blades, wood grain on decking and fences, stone pavers, dense foliage on trees and shrubs),"
+      : "(tile grout lines, painted drywall, wood grain, brushed metal, glass with real reflections),",
+    outdoor
+      ? "natural sunlight with soft contact shadows and a realistic sky."
+      : "global-illumination lighting with soft contact shadows, warm natural light, gentle vignette.",
     "",
-    `Room: ${roomType}, ${dims}.`,
-    floor ? `Floor: ${floor}.` : "",
-    wallPaints.length ? `Wall paint: ${wallPaints.join(", ")}.` : "",
+    `${outdoor ? "Outdoor space" : "Room"}: ${roomType}, ${dims}.`,
+    floor ? `${outdoor ? "Ground" : "Floor"}: ${floor}.` : "",
+    wallPaints.length ? `${outdoor ? "Fence/siding" : "Wall paint"}: ${wallPaints.join(", ")}.` : "",
     lines.length ? `Furnishings and fixtures (do not add, remove, or move any): ${lines.join("; ")}.` : "",
     "",
-    "Add only minimal staging consistent with a finished home (folded towels, a plant, small decor).",
-    "Do not change cabinets, fixtures, walls, doors, windows, or their colors.",
+    outdoor
+      ? "Add only minimal staging consistent with a finished landscape (throw pillows, a few potted plants)."
+      : "Add only minimal staging consistent with a finished home (folded towels, a plant, small decor).",
+    outdoor
+      ? "Do not change structures, furniture, fences, plantings, or their colors."
+      : "Do not change cabinets, fixtures, walls, doors, windows, or their colors.",
   ].filter(Boolean).join("\n");
 }

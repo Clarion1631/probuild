@@ -201,10 +201,13 @@ function RoomSizeButton() {
 
   // Scale the EXISTING polygon to the new bounding box - keeps custom and
   // angled shapes intact instead of resetting them.
+  // Outdoor "walls" are fences - allow them well below the indoor 7ft floor.
+  const minHeight = doc.room.outdoor ? feet(3) : feet(7);
+
   const applyDims = () => {
     const w = Math.min(feet(60), Math.max(feet(4), parseFtIn(wText) ?? bounds.width));
     const l = Math.min(feet(60), Math.max(feet(4), parseFtIn(lText) ?? bounds.length));
-    const h = Math.min(feet(16), Math.max(feet(7), parseFtIn(hText) ?? doc.room.height));
+    const h = Math.min(feet(16), Math.max(minHeight, parseFtIn(hText) ?? doc.room.height));
     const sx = bounds.width > 0 ? w / bounds.width : 1;
     const sz = bounds.length > 0 ? l / bounds.length : 1;
     const points = doc.room.points.map((p) => ({
@@ -218,12 +221,12 @@ function RoomSizeButton() {
   const resetLayout = (shape: "rect" | "l-shape") => {
     const w = Math.min(feet(60), Math.max(feet(4), parseFtIn(wText) ?? bounds.width));
     const l = Math.min(feet(60), Math.max(feet(4), parseFtIn(lText) ?? bounds.length));
-    const h = Math.min(feet(16), Math.max(feet(7), parseFtIn(hText) ?? doc.room.height));
+    const h = Math.min(feet(16), Math.max(minHeight, parseFtIn(hText) ?? doc.room.height));
     const base = shape === "l-shape"
       ? makeLShapeRoom(w, l, w * 0.45, l * 0.45, h)
       : makeRectRoom(w, l, h);
-    // slope only survives onto rect layouts
-    setRoomShape({ ...base, crown: doc.room.crown, slope: shape === "rect" ? doc.room.slope : undefined });
+    // slope only survives onto rect layouts; outdoor always survives
+    setRoomShape({ ...base, crown: doc.room.crown, outdoor: doc.room.outdoor, slope: shape === "rect" ? doc.room.slope : undefined });
   };
 
   const setCrown = (on: boolean) => setRoomShape({ ...doc.room, crown: on || undefined });

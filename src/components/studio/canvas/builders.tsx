@@ -5,6 +5,7 @@
 import type { ComponentType } from "react";
 import * as K from "./builders-kitchen";
 import * as L from "./builders-living";
+import * as O from "./builders-outdoor";
 
 export interface BuilderProps {
   /** Resolved dimensions (item overrides applied), meters. */
@@ -94,6 +95,26 @@ export const BUILDERS: Record<string, ComponentType<BuilderProps>> = {
   nightstand: L.Nightstand,
   desk: L.Desk,
   rug: L.Rug,
+  // outdoor
+  "deck-platform": O.DeckPlatform,
+  pergola: O.Pergola,
+  "gable-porch": O.GablePorch,
+  "garden-arbor": O.GardenArbor,
+  "fence-panel": O.FencePanel,
+  "planter-box": O.PlanterBox,
+  "patio-table": O.PatioTable,
+  "patio-chair": O.PatioChair,
+  adirondack: O.Adirondack,
+  "chaise-lounge": O.ChaiseLounge,
+  "outdoor-sofa": O.OutdoorSofa,
+  "fire-pit": O.FirePit,
+  grill: O.Grill,
+  umbrella: O.MarketUmbrella,
+  "tree-shade": O.TreeShade,
+  "tree-evergreen": O.TreeEvergreen,
+  shrub: O.Shrub,
+  hedge: O.Hedge,
+  "flower-bed": O.FlowerBed,
   // decor
   plant: L.Plant,
   "plant-small": L.PlantSmall,

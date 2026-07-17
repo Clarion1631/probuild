@@ -114,7 +114,7 @@ export async function PUT(req: Request, { params }: RouteParams) {
     }
     if (typeof body.name === "string" && body.name.trim()) updates.name = body.name.slice(0, 120);
     if (typeof body.roomType === "string") {
-        const validRoomTypes = ["kitchen", "bathroom", "laundry", "bedroom", "other"];
+        const validRoomTypes = ["kitchen", "bathroom", "laundry", "bedroom", "outdoor", "other"];
         if (!validRoomTypes.includes(body.roomType)) {
             return NextResponse.json({ error: "Invalid roomType" }, { status: 400 });
         }
