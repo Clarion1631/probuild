@@ -47,15 +47,28 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Too many items or cost codes" }, { status: 400 });
   }
 
-  const itemsList = items
-    .map((item, i) => {
-      const name = (item.name || "").trim().slice(0, 200);
-      const desc = (item.description || "").trim().slice(0, 500);
-      return `${i + 1}. ID: "${item.id}" | Name: "${name}"${desc ? ` | Description: "${desc}"` : ""}`;
-    })
+  // Normalize and cap every field that reaches the prompt — count caps alone
+  // don't bound prompt size, and null/non-string entries must not throw.
+  const str = (v: unknown, max: number) => String(v ?? "").trim().slice(0, max);
+  const safeItems = items
+    .filter((it) => !!it && typeof it === "object")
+    .map((it) => ({ id: str(it.id, 100), name: str(it.name, 200), description: str(it.description, 500) }))
+    .filter((it) => it.id);
+  const safeCostCodes = costCodes
+    .filter((cc) => !!cc && typeof cc === "object")
+    .map((cc) => ({ id: str(cc.id, 100), code: str(cc.code, 50), name: str(cc.name, 100) }))
+    .filter((cc) => cc.id);
+
+  if (safeItems.length === 0 || safeCostCodes.length === 0) {
+    return NextResponse.json({ error: "No valid items or cost codes" }, { status: 400 });
+  }
+
+  const itemsList = safeItems
+    .map((item, i) =>
+      `${i + 1}. ID: "${item.id}" | Name: "${item.name}"${item.description ? ` | Description: "${item.description}"` : ""}`)
     .join("\n");
 
-  const codesList = costCodes
+  const codesList = safeCostCodes
     .map((cc) => `- Code: "${cc.code}" | Name: "${cc.name}" | ID: "${cc.id}"`)
     .join("\n");
 
@@ -128,8 +141,8 @@ Rules:
 
     // Only trust IDs that were actually submitted — the model (or an injected
     // item description) must not be able to introduce arbitrary ids.
-    const validItemIds = new Set(items.map((i) => i.id));
-    const validCostCodeIds = new Set(costCodes.map((c) => c.id));
+    const validItemIds = new Set(safeItems.map((i) => i.id));
+    const validCostCodeIds = new Set(safeCostCodes.map((c) => c.id));
     const assignments = (parsed.assignments || [])
       .map((a: any) => ({
         id: String(a.id ?? ""),

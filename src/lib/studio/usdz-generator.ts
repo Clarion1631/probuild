@@ -257,9 +257,13 @@ export async function generateUsdzForRoom(
         return null;
     }
 
+    // Revision-specific path: concurrent exports can never overwrite each
+    // other's bytes; whichever revision wins the CAS below becomes the
+    // published URL.
+    const rev = room.updatedAt.getTime();
     const storagePath = room.projectId
-        ? `projects/${room.projectId}/rooms/${room.id}.usdz`
-        : `leads/${room.leadId}/rooms/${room.id}.usdz`;
+        ? `projects/${room.projectId}/rooms/${room.id}-${rev}.usdz`
+        : `leads/${room.leadId}/rooms/${room.id}-${rev}.usdz`;
 
     console.log(`Uploading USDZ export to Supabase: ${storagePath} (${buffer.byteLength} bytes)...`);
     const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, buffer, {
@@ -275,18 +279,34 @@ export async function generateUsdzForRoom(
     const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
     const url = urlData.publicUrl;
 
-    // Update RoomDesign — skip when unchanged (the URL is deterministic per
-    // room) so repeated exports don't churn updatedAt.
-    if (room.scanUsdzUrl !== url) {
-        await prisma.roomDesign.update({
-            where: { id: roomId },
-            data: { scanUsdzUrl: url },
-        });
+    // Publish via CAS on the revision this export was built from, using raw
+    // SQL so the URL write does NOT advance updatedAt (Prisma's @updatedAt
+    // would otherwise make every publish look like a layout change, cascading
+    // false staleness aborts and false AI-furnish 409s).
+    const published = await prisma.$executeRaw`
+        UPDATE "RoomDesign" SET "scanUsdzUrl" = ${url}
+        WHERE "id" = ${roomId} AND "updatedAt" = ${room.updatedAt}`;
+    if (published === 0) {
+        console.log(`USDZ export for ${roomId} lost the publish race — discarding upload`);
+        try { await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]); } catch {}
+        return null;
+    }
+
+    // Best-effort: drop the previously published revision's file.
+    if (room.scanUsdzUrl && room.scanUsdzUrl !== url) {
+        const marker = `/${STORAGE_BUCKET}/`;
+        const idx = room.scanUsdzUrl.indexOf(marker);
+        if (idx !== -1) {
+            const oldPath = decodeURIComponent(room.scanUsdzUrl.slice(idx + marker.length));
+            if (/^(projects|leads)\/.+\.usdz$/.test(oldPath) && oldPath !== storagePath) {
+                try { await supabase.storage.from(STORAGE_BUCKET).remove([oldPath]); } catch {}
+            }
+        }
     }
 
     // 6. Mirror to Google Drive if lead room — only on explicit generation
     // (AI furnish etc.), never from the autosave path: mirroring creates a
-    // new Drive file per call.
+    // new Drive file per call. Runs only after winning the publish CAS.
     if (opts.mirrorToDrive && room.leadId) {
         try {
             const { mirrorUrlToLeadFolder } = await import("@/lib/lead-drive");

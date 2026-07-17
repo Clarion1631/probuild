@@ -161,30 +161,34 @@ Return JSON in this exact shape:
         };
         const MAX_ITEMS = 80;
         const MAX_DIM = 15; // meters
-        const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v);
-        const dimOk = (v: unknown) => v === undefined || (finite(v) && (v as number) > 0.01 && (v as number) <= MAX_DIM);
+        // Validate the RAW model output before any coercion — a null entry or
+        // a missing/boolean coordinate must be rejected, not coerced to 0.
+        const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+        const optionalDim = (v: unknown) => v === undefined || (finite(v) && v > 0.01 && v <= MAX_DIM);
+        const roomHeight = finite(doc.room.height) ? doc.room.height : 4;
 
         const newItems: PlacedItem[] = (Array.isArray(parsed.items) ? parsed.items : [])
             .slice(0, MAX_ITEMS)
-            .map((it: any) => ({
-                id: newItemId(),
-                defId: String(it.defId),
-                x: Number(it.x ?? 0),
-                z: Number(it.z ?? 0),
-                y: it.y !== undefined ? Number(it.y) : undefined,
-                rotation: Number(it.rotation ?? 0),
-                w: it.w !== undefined ? Number(it.w) : undefined,
-                d: it.d !== undefined ? Number(it.d) : undefined,
-                h: it.h !== undefined ? Number(it.h) : undefined,
-            }))
-            .filter((it: PlacedItem) =>
-                allowedIds.has(it.defId) &&
+            .filter((it: any): boolean =>
+                !!it && typeof it === "object" &&
+                typeof it.defId === "string" && allowedIds.has(it.defId) &&
                 finite(it.x) && finite(it.z) && finite(it.rotation) &&
-                (it.y === undefined || (finite(it.y) && it.y >= 0 && it.y <= (doc.room.height ?? 4))) &&
+                (it.y === undefined || (finite(it.y) && it.y >= 0 && it.y <= roomHeight)) &&
                 it.x >= bounds.minX - 0.1 && it.x <= bounds.maxX + 0.1 &&
                 it.z >= bounds.minZ - 0.1 && it.z <= bounds.maxZ + 0.1 &&
-                dimOk(it.w) && dimOk(it.d) && dimOk(it.h)
-            );
+                optionalDim(it.w) && optionalDim(it.d) && optionalDim(it.h)
+            )
+            .map((it: any): PlacedItem => ({
+                id: newItemId(),
+                defId: it.defId,
+                x: it.x,
+                z: it.z,
+                y: it.y,
+                rotation: it.rotation,
+                w: it.w,
+                d: it.d,
+                h: it.h,
+            }));
 
         if (newItems.length === 0) {
             return NextResponse.json({ error: "AI response contained no valid placements — try rephrasing the prompt" }, { status: 422 });
