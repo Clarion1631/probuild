@@ -12,17 +12,16 @@ export const maxDuration = 60;
  * in one run. Delivery is idempotent, so overlapping with an inline drain is safe.
  */
 export async function GET(request: Request) {
-    // Fail CLOSED for a mail-sending endpoint: require a non-empty CRON_SECRET and an exact
-    // header match on every deployed environment (production AND preview), so a public preview
-    // URL or an empty secret ("Bearer undefined") can't drive the drainer. Only an explicit
-    // local dev run (not on Vercel, NODE_ENV !== production) is allowed through unauthenticated.
-    const isLocalDev = process.env.NODE_ENV !== "production" && !process.env.VERCEL;
-    if (!isLocalDev) {
-        const secret = process.env.CRON_SECRET;
-        const authHeader = request.headers.get("authorization");
-        if (!secret || authHeader !== `Bearer ${secret}`) {
-            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-        }
+    // Fail CLOSED for a mail-sending endpoint. Whenever a CRON_SECRET is configured it is
+    // ALWAYS required (exact Bearer match) — on production, preview, and even a non-Vercel host
+    // — so a public URL or an empty secret ("Bearer undefined") can't drive the drainer. The
+    // only unauthenticated path is a genuinely local dev run: not on Vercel AND no secret set.
+    const secret = process.env.CRON_SECRET;
+    const authHeader = request.headers.get("authorization");
+    const authed = !!secret && authHeader === `Bearer ${secret}`;
+    const isLocalDev = !process.env.VERCEL && process.env.NODE_ENV !== "production" && !secret;
+    if (!authed && !isLocalDev) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const total = { processed: 0, retried: 0, failed: 0 };

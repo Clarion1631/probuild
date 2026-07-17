@@ -158,7 +158,10 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
                     metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id, dedupeKey }),
                 },
             }).then(() => true).catch(() => false);
-            if (!logged) ok = false;
+            // Bail out BEFORE the emails if the activity write failed: retrying the whole
+            // delivery would otherwise re-send the (un-guarded) team alert every attempt. On
+            // the retry the activity write is re-attempted first, then the emails go once.
+            if (!logged) return { ok: false };
         }
 
         // 2. Team alert
@@ -283,7 +286,8 @@ export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { d
                     metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id, dedupeKey }),
                 },
             }).then(() => true).catch(() => false);
-            if (!logged) ok = false;
+            // Bail out BEFORE the emails if the activity write failed (see notifyMilestonePaid).
+            if (!logged) return { ok: false };
         }
 
         // 2. Team alert
