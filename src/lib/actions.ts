@@ -4006,6 +4006,17 @@ async function assertFinancialPermission() {
     return assertStaffPermission("financialReports");
 }
 
+function assertFinancialProjectScope(user: any, projectId: string) {
+    if (["ADMIN", "MANAGER", "FINANCE"].includes(user.role)) return;
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+}
+
+async function assertFinancialProjectAccess(projectId: string) {
+    const user = await assertFinancialPermission();
+    assertFinancialProjectScope(user, projectId);
+    return user;
+}
+
 async function assertCompanySettingsPermission() {
     return assertStaffPermission("companySettings");
 }
@@ -8084,7 +8095,7 @@ export async function deleteVendorTag(id: string) {
 // Purchase Orders
 // ==========================================
 export async function getPurchaseOrders(projectId: string) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
     return prisma.purchaseOrder.findMany({
         where: { projectId },
         include: { vendor: true, items: true },
@@ -8093,15 +8104,17 @@ export async function getPurchaseOrders(projectId: string) {
 }
 
 export async function getPurchaseOrder(id: string) {
-    await assertFinancialPermission();
-    return prisma.purchaseOrder.findUnique({
+    const user = await assertFinancialPermission();
+    const purchaseOrder = await prisma.purchaseOrder.findUnique({
         where: { id },
         include: { vendor: true, items: { include: { costCode: true } }, files: true, expenses: { include: { costCode: true } } }
     });
+    if (purchaseOrder) assertFinancialProjectScope(user, purchaseOrder.projectId);
+    return purchaseOrder;
 }
 
 export async function createPurchaseOrder(projectId: string, data: any) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
     const count = await prisma.purchaseOrder.count({ where: { projectId } });
     const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
     
@@ -8122,7 +8135,7 @@ export async function createPurchaseOrder(projectId: string, data: any) {
 }
 
 export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
     
     // Validate inputs
     if (!itemIds || itemIds.length === 0) throw new Error("No items selected");
@@ -8134,6 +8147,7 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     });
 
     if (!estimate) throw new Error("Estimate not found");
+    if (estimate.projectId !== projectId) throw new Error("Estimate does not belong to this project");
 
     const selectedItems = estimate.items.filter((item: any) => itemIds.includes(item.id));
     if (selectedItems.length === 0) throw new Error("No valid items found");
@@ -8181,7 +8195,10 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
 }
 
 export async function updatePurchaseOrder(id: string, data: any) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const { items, vendorId, ...poData } = data;
     
     let updateData: any = { ...poData };
@@ -8219,15 +8236,19 @@ export async function updatePurchaseOrder(id: string, data: any) {
 }
 
 export async function deletePurchaseOrder(id: string) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
     const po = await prisma.purchaseOrder.findUnique({ where: { id } });
     if (!po) return;
+    assertFinancialProjectScope(user, po.projectId);
     await prisma.purchaseOrder.delete({ where: { id } });
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
 }
 
 export async function updatePurchaseOrderStatus(id: string, status: string) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const po = await prisma.purchaseOrder.update({
         where: { id },
         data: { status }
@@ -8238,7 +8259,10 @@ export async function updatePurchaseOrderStatus(id: string, status: string) {
 }
 
 export async function approvePurchaseOrder(id: string, signatureName: string) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const approvedAt = new Date();
     const po = await prisma.purchaseOrder.update({
         where: { id },
@@ -8255,7 +8279,10 @@ export async function approvePurchaseOrder(id: string, signatureName: string) {
 }
 
 export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
 
@@ -8299,9 +8326,10 @@ export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData:
 }
 
 export async function deletePurchaseOrderFile(fileId: string) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
     const file = await prisma.purchaseOrderFile.findUnique({ where: { id: fileId }, include: { purchaseOrder: true } });
     if (!file) return;
+    assertFinancialProjectScope(user, file.purchaseOrder.projectId);
 
     await prisma.purchaseOrderFile.delete({ where: { id: fileId } });
     revalidatePath(`/projects/${file.purchaseOrder.projectId}/purchase-orders/${file.purchaseOrderId}`);
@@ -8313,7 +8341,10 @@ export async function uploadPurchaseOrderFileFromBuffer(
     projectId: string,
     formData: FormData
 ) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId }, select: { projectId: true } });
+    if (!existing || existing.projectId !== projectId) return;
+    assertFinancialProjectScope(user, existing.projectId);
 
     const file = formData.get("file") as File;
     if (!file) return;
@@ -8421,7 +8452,7 @@ export async function getEstimateFiles(estimateId: string) {
 
 
 export async function sendPurchaseOrder(id: string, toEmail: string, message: string) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
     const { sendNotification } = await import("./email");
     const { generatePurchaseOrderPdf } = await import("./pdf");
 
@@ -8430,6 +8461,7 @@ export async function sendPurchaseOrder(id: string, toEmail: string, message: st
         include: { project: true, vendor: true }
     });
     if (!po) throw new Error("PO not found");
+    assertFinancialProjectScope(user, po.projectId);
 
     const pdfBuffer = await generatePurchaseOrderPdf(id);
 
@@ -9020,7 +9052,7 @@ export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
 // ─── Bid Packages ─────────────────────────────────────────────────────────
 
 export async function getProjectBidPackages(projectId: string) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
     return prisma.bidPackage.findMany({
         where: { projectId },
         include: { scopes: { orderBy: { order: "asc" } }, invitations: true },
@@ -9029,7 +9061,7 @@ export async function getProjectBidPackages(projectId: string) {
 }
 
 export async function getBidPackage(id: string) {
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
     const pkg = await prisma.bidPackage.findUnique({
         where: { id },
         include: {
@@ -9040,6 +9072,7 @@ export async function getBidPackage(id: string) {
     });
 
     if (!pkg) return null;
+    assertFinancialProjectScope(user, pkg.projectId);
 
     return {
         ...pkg,
@@ -9061,7 +9094,7 @@ export async function createBidPackage(projectId: string, data: {
     dueDate?: Date | null;
     totalBudget?: number | null;
 }) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
     const pkg = await prisma.bidPackage.create({
         data: { projectId, ...data },
     });
@@ -9076,7 +9109,9 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     status?: string;
     totalBudget?: number | null;
 }) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidPackage.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing || existing.projectId !== projectId) throw new Error("Bid package not found");
     const pkg = await prisma.bidPackage.update({ where: { id }, data });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
@@ -9084,7 +9119,9 @@ export async function updateBidPackage(id: string, projectId: string, data: {
 }
 
 export async function deleteBidPackage(id: string, projectId: string) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidPackage.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing || existing.projectId !== projectId) throw new Error("Bid package not found");
     await prisma.bidPackage.delete({ where: { id } });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     return { success: true };
@@ -9095,7 +9132,9 @@ export async function addBidScope(packageId: string, projectId: string, data: {
     description?: string;
     budgetAmount?: number | null;
 }) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const pkg = await prisma.bidPackage.findUnique({ where: { id: packageId }, select: { projectId: true } });
+    if (!pkg || pkg.projectId !== projectId) throw new Error("Bid package not found");
     const scope = await prisma.bidScope.create({
         data: { packageId, ...data },
     });
@@ -9104,7 +9143,14 @@ export async function addBidScope(packageId: string, projectId: string, data: {
 }
 
 export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidScope.findUnique({
+        where: { id: scopeId },
+        select: { packageId: true, package: { select: { projectId: true } } },
+    });
+    if (!existing || existing.packageId !== packageId || existing.package.projectId !== projectId) {
+        throw new Error("Bid scope not found");
+    }
     await prisma.bidScope.delete({ where: { id: scopeId } });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return { success: true };
@@ -9114,7 +9160,9 @@ export async function inviteSubToBid(packageId: string, projectId: string, data:
     email: string;
     subcontractorId?: string;
 }) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const pkg = await prisma.bidPackage.findUnique({ where: { id: packageId }, select: { projectId: true } });
+    if (!pkg || pkg.projectId !== projectId) throw new Error("Bid package not found");
     const inv = await prisma.bidInvitation.create({
         data: { packageId, email: data.email, subcontractorId: data.subcontractorId || null, sentAt: new Date() },
     });
@@ -9127,7 +9175,14 @@ export async function recordBidResponse(invitationId: string, packageId: string,
     bidAmount?: number | null;
     notes?: string;
 }) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidInvitation.findUnique({
+        where: { id: invitationId },
+        select: { packageId: true, package: { select: { projectId: true } } },
+    });
+    if (!existing || existing.packageId !== packageId || existing.package.projectId !== projectId) {
+        throw new Error("Bid invitation not found");
+    }
     const inv = await prisma.bidInvitation.update({
         where: { id: invitationId },
         data: { ...data, respondedAt: new Date() },
@@ -9137,7 +9192,14 @@ export async function recordBidResponse(invitationId: string, packageId: string,
 }
 
 export async function awardBid(packageId: string, invitationId: string, projectId: string) {
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
+    const invitation = await prisma.bidInvitation.findUnique({
+        where: { id: invitationId },
+        select: { packageId: true, package: { select: { projectId: true } } },
+    });
+    if (!invitation || invitation.packageId !== packageId || invitation.package.projectId !== projectId) {
+        throw new Error("Bid invitation not found");
+    }
     await prisma.$transaction([
         prisma.bidInvitation.update({ where: { id: invitationId }, data: { status: "Awarded" } }),
         prisma.bidPackage.update({ where: { id: packageId }, data: { status: "Awarded" } }),
@@ -9407,8 +9469,7 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
 }
 
 export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrderId: string) {
-    "use server";
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
@@ -9416,6 +9477,7 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     });
     if (!item) throw new Error("Estimate item not found");
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
+    assertFinancialProjectScope(user, item.estimate.projectId);
 
     const po = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId } });
     if (!po) throw new Error("Purchase order not found");
@@ -9430,13 +9492,15 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
 }
 
 export async function unlinkPOFromEstimateItem(estimateItemId: string) {
-    "use server";
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
         include: { estimate: { select: { projectId: true } } },
     });
+    if (!item) throw new Error("Estimate item not found");
+    if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
+    assertFinancialProjectScope(user, item.estimate.projectId);
     await prisma.estimateItem.update({
         where: { id: estimateItemId },
         data: { purchaseOrderId: null },
@@ -9447,8 +9511,7 @@ export async function unlinkPOFromEstimateItem(estimateItemId: string) {
 }
 
 export async function quickCreatePOAndLink(estimateItemId: string, data: { vendorId: string; amount: number; notes?: string }) {
-    "use server";
-    await assertFinancialPermission();
+    const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
@@ -9458,6 +9521,7 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
 
     const projectId = item.estimate.projectId;
+    assertFinancialProjectScope(user, projectId);
 
     // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count
     let po: any;
@@ -9494,8 +9558,7 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
 }
 
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
-    "use server";
-    await assertFinancialPermission();
+    await assertFinancialProjectAccess(projectId);
 
     return prisma.purchaseOrder.findMany({
         where: { projectId },

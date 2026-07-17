@@ -46,16 +46,27 @@ test("all staff financial actions authorize inside the exported action", () => {
   const changeOrders = ["createChangeOrder", "getChangeOrders", "getChangeOrder", "deleteChangeOrder"];
   for (const name of changeOrders) expectGuardBeforeDatabase(source, name, "await assertChangeOrderPermission(");
 
-  const financialReports = [
-    "getPurchaseOrders", "getPurchaseOrder", "createPurchaseOrder", "createPurchaseOrderFromEstimate",
+  const projectScopedFinancialReports = [
+    "getPurchaseOrders", "createPurchaseOrder", "createPurchaseOrderFromEstimate",
+    "getProjectBidPackages", "createBidPackage", "updateBidPackage", "deleteBidPackage",
+    "addBidScope", "deleteBidScope", "inviteSubToBid", "recordBidResponse", "awardBid",
+    "getProjectPurchaseOrdersForLinking",
+  ];
+  for (const name of projectScopedFinancialReports) {
+    expectGuardBeforeDatabase(source, name, "await assertFinancialProjectAccess(");
+  }
+
+  const entityScopedFinancialReports = [
+    "getPurchaseOrder",
     "updatePurchaseOrder", "deletePurchaseOrder", "updatePurchaseOrderStatus", "approvePurchaseOrder",
     "uploadPurchaseOrderFile", "deletePurchaseOrderFile", "uploadPurchaseOrderFileFromBuffer",
-    "sendPurchaseOrder", "getProjectBidPackages", "getBidPackage", "createBidPackage",
-    "updateBidPackage", "deleteBidPackage", "addBidScope", "deleteBidScope", "inviteSubToBid",
-    "recordBidResponse", "awardBid", "linkPOToEstimateItem", "unlinkPOFromEstimateItem",
-    "quickCreatePOAndLink", "getProjectPurchaseOrdersForLinking",
+    "sendPurchaseOrder", "getBidPackage", "linkPOToEstimateItem", "unlinkPOFromEstimateItem",
+    "quickCreatePOAndLink",
   ];
-  for (const name of financialReports) expectGuardBeforeDatabase(source, name, "await assertFinancialPermission(");
+  for (const name of entityScopedFinancialReports) {
+    expectGuardBeforeDatabase(source, name, "await assertFinancialPermission(");
+    expect(exportSource(source, name)).toContain("assertFinancialProjectScope(");
+  }
 
   for (const name of ["getLeads", "getProjects", "getProject"]) {
     expectGuardBeforeDatabase(source, name, "await assertActiveStaff(");
