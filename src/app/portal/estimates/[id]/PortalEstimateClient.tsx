@@ -8,6 +8,7 @@ import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalPayInFullButton from "@/components/PortalPayInFullButton";
 import { formatCurrency } from "@/lib/utils";
+import { FALLBACK_SALES_TAX_RATE_PERCENT } from "@/lib/tax-constants";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
@@ -223,7 +224,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const defaultTax = salesTaxes.find((t: any) => t.isDefault) || salesTaxes[0] || null;
     const savedRate = initialEstimate.taxRatePercent != null ? Number(initialEstimate.taxRatePercent) : null;
     const savedName = initialEstimate.taxRateName || null;
-    const effectiveRate = savedRate ?? (defaultTax ? defaultTax.rate : 8.8);
+    const effectiveRate = savedRate ?? (defaultTax ? defaultTax.rate : FALLBACK_SALES_TAX_RATE_PERCENT);
     const effectiveRateDisplay = Number(parseFloat(String(effectiveRate)).toFixed(4));
     const effectiveName = savedName ?? (defaultTax ? defaultTax.name : "Tax");
     const taxRate = taxExempt ? 0 : effectiveRate / 100;
