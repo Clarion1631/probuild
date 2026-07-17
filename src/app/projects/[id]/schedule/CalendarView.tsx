@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { Task, PunchItem, EstimateSummary } from "./schedule-types";
 import ScheduleToolbar from "./ScheduleToolbar";
+import { useScheduleActions } from "./useScheduleActions";
 import {
     STATUS_OPTIONS,
     STATUS_COLORS,
@@ -59,6 +60,7 @@ function dayBucket(task: Task, day: Date): boolean {
 
 export default function CalendarView({ projectId, tasks, setTasks, estimates = [], initialPublished, viewMode, onViewModeChange, subMode, onSubModeChange }: Props) {
     const router = useRouter();
+    const actions = useScheduleActions(projectId, tasks, setTasks);
 
     const [anchor, setAnchor] = useState<Date>(() => todayUTC());
     const [isPending, startTransition] = useTransition();
@@ -217,7 +219,7 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
                 onToggleCriticalPath={() => {}}
                 linkMode={null}
                 onToggleLinkMode={() => {}}
-                onSyncCalendar={() => {}}
+                onSyncCalendar={actions.handleSyncCalendar}
                 isAiRisk={false}
                 onAiRisk={() => {}}
                 isImporting={false}
