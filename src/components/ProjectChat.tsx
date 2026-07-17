@@ -276,6 +276,7 @@ export default function ProjectChat({
                     <button
                         onClick={handleSend}
                         disabled={!newMessage.trim() || sending}
+                        aria-label="Send message"
                         className={`hui-btn shrink-0 h-10 w-10 flex items-center justify-center rounded-lg transition-all ${
                             newMessage.trim() && !sending
                                 ? "hui-btn-green"
