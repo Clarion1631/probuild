@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { createDailyLog, deleteDailyLog, deleteDailyLogPhoto, createChangeOrder, updateChangeOrder } from "@/lib/actions";
+import { createDailyLog, deleteDailyLog, deleteDailyLogPhoto, createSuggestedChangeOrder } from "@/lib/actions";
 import { toast } from "sonner";
 
 // Weather icons mapping
@@ -65,6 +65,7 @@ type DailyLog = {
 };
 
 type CoSuggestion = {
+    id: string;
     title: string;
     description: string;
     sourceLogDates: string[];
@@ -99,8 +100,10 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     const [coSuggestions, setCoSuggestions] = useState<CoSuggestion[]>([]);
     const [coMeta, setCoMeta] = useState<CoDetectMeta | null>(null);
     const [showCOModal, setShowCOModal] = useState(false);
-    const [creatingCoIndex, setCreatingCoIndex] = useState<number | null>(null);
-    const [createdCOs, setCreatedCOs] = useState<Record<number, { id: string; code: string }>>({});
+    const [creatingIds, setCreatingIds] = useState<Set<string>>(new Set());
+    const [createdCOs, setCreatedCOs] = useState<Record<string, { id: string; code: string }>>({});
+    const detectRunIdRef = useRef(0);
+    const isCreatingAny = creatingIds.size > 0;
 
     // Form state
     const [formDate, setFormDate] = useState(new Date().toISOString().split("T")[0]);
@@ -295,18 +298,43 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     };
 
     const handleDetectChangeOrders = async () => {
+        // Guard against out-of-order responses: if the user re-triggers detection
+        // (or a request is unusually slow) before this one resolves, only the
+        // most recently kicked-off run is allowed to write state.
+        const runId = ++detectRunIdRef.current;
         setIsDetectingCO(true);
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
         try {
-            const res = await fetch("/api/ai/change-order-detect", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ projectId }),
-            });
+            let res: Response;
+            try {
+                res = await fetch("/api/ai/change-order-detect", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ projectId }),
+                    signal: controller.signal,
+                });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+
+            if (runId !== detectRunIdRef.current) return; // superseded by a newer run
+
+            const contentType = res.headers.get("content-type") || "";
+            if (!contentType.includes("application/json")) {
+                const text = await res.text().catch(() => "");
+                throw new Error(text?.trim().slice(0, 200) || `Unexpected response from server (${res.status})`);
+            }
+
             const data = await res.json();
             if (!res.ok) {
                 throw new Error(data.error || "Failed to detect change orders");
             }
-            const suggestions: CoSuggestion[] = data.suggestions || [];
+
+            const rawSuggestions: Omit<CoSuggestion, "id">[] = data.suggestions || [];
+            const suggestions: CoSuggestion[] = rawSuggestions.map((s, i) => ({ ...s, id: `${runId}-${i}` }));
             setCoSuggestions(suggestions);
             setCoMeta({
                 targetEstimateId: data.targetEstimateId ?? null,
@@ -315,42 +343,49 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                 lookbackDays: data.lookbackDays ?? 30,
             });
             setCreatedCOs({});
+            setCreatingIds(new Set());
             setShowCOModal(true);
             if (suggestions.length === 0) {
                 toast.info(`No client-requested scope changes detected in the last ${data.lookbackDays ?? 30} days.`);
             }
         } catch (error: any) {
+            if (runId !== detectRunIdRef.current) return; // stale/aborted run — a newer one is authoritative
             console.error(error);
-            toast.error(error.message || "Failed to detect change orders. Try again.");
+            toast.error(error.name === "AbortError"
+                ? "Change order detection timed out. Try again."
+                : (error.message || "Failed to detect change orders. Try again."));
         } finally {
-            setIsDetectingCO(false);
+            if (runId === detectRunIdRef.current) setIsDetectingCO(false);
         }
     };
 
-    const handleCreateDraftCO = async (suggestion: CoSuggestion, index: number) => {
+    const handleCreateDraftCO = async (suggestion: CoSuggestion) => {
         if (!coMeta?.targetEstimateId) {
-            toast.error("This project has no estimate to attach a change order to. Create an estimate first.");
+            toast.error("This project has no approved estimate to attach a change order to. Create one first.");
             return;
         }
-        setCreatingCoIndex(index);
+        setCreatingIds(prev => new Set(prev).add(suggestion.id));
         try {
-            const { id } = await createChangeOrder(projectId, coMeta.targetEstimateId);
-            const updated = await updateChangeOrder(id, {
+            const result = await createSuggestedChangeOrder(projectId, {
                 title: suggestion.title,
                 description: suggestion.description,
             });
-            setCreatedCOs(prev => ({ ...prev, [index]: { id, code: updated.code } }));
-            toast.success(`Draft change order ${updated.code} created`, {
+            setCreatedCOs(prev => ({ ...prev, [suggestion.id]: result }));
+            toast.success(`Draft change order ${result.code} created`, {
                 action: {
                     label: "View CO",
-                    onClick: () => router.push(`/projects/${projectId}/change-orders/${id}`),
+                    onClick: () => router.push(`/projects/${projectId}/change-orders/${result.id}`),
                 },
             });
         } catch (error: any) {
             console.error(error);
             toast.error(error.message || "Failed to create draft change order.");
         } finally {
-            setCreatingCoIndex(null);
+            setCreatingIds(prev => {
+                const next = new Set(prev);
+                next.delete(suggestion.id);
+                return next;
+            });
         }
     };
 
@@ -895,7 +930,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                         <div className="p-5 overflow-y-auto flex-1 space-y-3">
                             {!coMeta?.targetEstimateId && (
                                 <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
-                                    This project has no estimate yet, so draft change orders can&apos;t be created until one exists.
+                                    This project has no approved estimate yet, so draft change orders can&apos;t be created until one exists.
                                 </div>
                             )}
                             {coSuggestions.length === 0 ? (
@@ -903,15 +938,16 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                     <p className="text-sm text-hui-textMuted">No client-requested scope changes detected.</p>
                                 </div>
                             ) : (
-                                coSuggestions.map((s, idx) => {
-                                    const created = createdCOs[idx];
+                                coSuggestions.map((s) => {
+                                    const created = createdCOs[s.id];
+                                    const isCreatingThis = creatingIds.has(s.id);
                                     const confidenceStyles = {
                                         high: "bg-green-100 text-green-800",
                                         medium: "bg-amber-100 text-amber-800",
                                         low: "bg-slate-100 text-slate-600",
                                     }[s.confidence];
                                     return (
-                                        <div key={idx} className="border border-hui-border rounded-lg p-4 hover:shadow-sm transition">
+                                        <div key={s.id} className="border border-hui-border rounded-lg p-4 hover:shadow-sm transition">
                                             <div className="flex items-start justify-between gap-3">
                                                 <div className="min-w-0 flex-1">
                                                     <div className="flex items-center gap-2 flex-wrap">
@@ -937,11 +973,11 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                                         </button>
                                                     ) : (
                                                         <button
-                                                            onClick={() => handleCreateDraftCO(s, idx)}
-                                                            disabled={creatingCoIndex === idx || !coMeta?.targetEstimateId}
+                                                            onClick={() => handleCreateDraftCO(s)}
+                                                            disabled={isCreatingAny || !coMeta?.targetEstimateId}
                                                             className="hui-btn hui-btn-primary text-xs whitespace-nowrap disabled:opacity-50"
                                                         >
-                                                            {creatingCoIndex === idx ? "Creating..." : "Create draft CO"}
+                                                            {isCreatingThis ? "Creating..." : "Create draft CO"}
                                                         </button>
                                                     )}
                                                 </div>

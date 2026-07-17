@@ -12,7 +12,7 @@ import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
-import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { coLineCents } from "./co-tax";
@@ -7361,6 +7361,71 @@ export async function createChangeOrder(projectId: string, estimateId: string, i
 
     revalidatePath(`/projects/${projectId}/change-orders`);
     return { id: changeOrder.id };
+}
+
+// AI-suggested change orders: ONE transactional creation path used by the
+// daily-logs "Create draft CO" flow. Deliberately self-contained (auth +
+// estimate resolution + title/description all in one call) rather than a
+// create-then-update pair — a two-call flow can leave an orphaned Draft CO
+// if the second call fails, and would require trusting a client-held
+// estimateId that could point at a different project's estimate.
+export async function createSuggestedChangeOrder(
+    projectId: string,
+    data: { title: string; description?: string }
+) {
+    "use server";
+
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "changeOrders")) throw new Error("Forbidden");
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const title = data.title?.trim();
+    if (!title) throw new Error("title is required");
+    const description = data.description?.trim() || null;
+
+    const changeOrder = await prisma.$transaction(async (tx) => {
+        // Re-resolve the estimate server-side — never trust a client-held
+        // estimateId. Only an Approved estimate qualifies; no "most recent"
+        // fallback, since an unsigned estimate isn't a real base scope yet.
+        const candidate = await tx.estimate.findFirst({
+            where: { projectId, status: "Approved", archivedAt: null },
+            select: { id: true },
+            orderBy: { createdAt: "desc" },
+        });
+        if (!candidate) {
+            throw new Error("This project has no approved estimate to attach a change order to — create one first.");
+        }
+        // Defense-in-depth: re-verify the resolved estimate still belongs to
+        // exactly this project (id + projectId together) before creating the
+        // CO — kills any cross-project pairing bug even if the resolution
+        // query above is ever refactored to accept an id from elsewhere.
+        const estimate = await tx.estimate.findFirst({
+            where: { id: candidate.id, projectId },
+            select: { id: true },
+        });
+        if (!estimate) {
+            throw new Error("Estimate no longer belongs to this project — try again.");
+        }
+
+        const created = await tx.changeOrder.create({
+            data: {
+                title,
+                description,
+                projectId,
+                estimateId: estimate.id,
+                code: "CO-TEMP",
+                status: "Draft",
+            },
+        });
+        return tx.changeOrder.update({
+            where: { id: created.id },
+            data: { code: `CO-${String(created.number).padStart(5, "0")}` },
+        });
+    });
+
+    revalidatePath(`/projects/${projectId}/change-orders`);
+    return { id: changeOrder.id, code: changeOrder.code };
 }
 
 export async function getChangeOrders(projectId: string) {
