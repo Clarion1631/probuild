@@ -19,7 +19,7 @@ export default async function ChangeOrderPage({
     }
 
     return (
-        <div className="flex h-[calc(100vh-64px)] -m-6 overflow-hidden">
+        <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
             <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
                 <ChangeOrderEditor
                     context={{

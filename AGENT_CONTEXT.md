@@ -33,7 +33,7 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 `getLeads` · `getLead` · `createLead` · `updateLeadStage` · `updateLeadMetadata` · `deleteLead` · `updateLeadAssignment` · `updateLeadInfo` · `getClients` · `getClient` · `createClient` · `updateClient` · `getLeadTasks` · `createLeadTask` · `updateLeadTask` · `deleteLeadTask` · `getLeadMeetings` · `createLeadMeeting` · `updateLeadMeeting` · `deleteLeadMeeting`
 
 ### Projects & Change Orders
-`getProjects` · `getProject` · `getProjectLead` · `createProject` · `convertLeadToProject` · `linkProjectToLead` · `getLeadsForLinking` · `updateProjectStatus` · `updateProjectColor` · `updateProjectTags` · `updateProjectName` · `deleteProjects`
+`getProjects` · `getProject` · `getProjectLead` · `convertLeadToProject` · `linkProjectToLead` · `getLeadsForLinking` · `updateProjectStatus` · `updateProjectColor` · `updateProjectTags` · `updateProjectName` · `deleteProjects`
 `createChangeOrder` · `getChangeOrders` · `getChangeOrder` · `updateChangeOrder` · `deleteChangeOrder` · `updateChangeOrderStatus` · `approveChangeOrder`
 
 ### Estimates

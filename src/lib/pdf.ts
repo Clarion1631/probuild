@@ -1,32 +1,125 @@
-import { PDFDocument, rgb, StandardFonts, PDFImage } from 'pdf-lib';
+import { PDFDocument, PDFPage, PDFFont, PDFImage, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
+import { toNum } from './prisma-helpers';
+import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
+import { isOwnSignatureStorageUrl } from './signature-storage';
+import { coTaxRate, coTaxLabel } from './co-tax';
+import { drawRichHtml, type RichTextCtx } from './pdf-richtext';
 
-async function fetchAndEmbedLogo(doc: PDFDocument, url: string): Promise<PDFImage | null> {
+/**
+ * Embed a signature image from either a legacy inline data-URL or a migrated http(s)
+ * Storage URL. Returns the embedded image, or null if it can't be loaded/decoded.
+ * pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so other types fall
+ * through to a PNG attempt and are caught.
+ */
+async function embedSignatureImage(doc: PDFDocument, value: string): Promise<PDFImage | null> {
     try {
-        // SSRF guard: only allow HTTPS URLs from known safe hosts
-        const parsed = new URL(url);
-        if (parsed.protocol !== 'https:') return null;
-        const allowedHosts = [
-            process.env.NEXT_PUBLIC_SUPABASE_URL ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).hostname : null,
-            'ghzdbzdnwjxazvmcefbh.supabase.co',
-        ].filter(Boolean);
-        const isAllowed = allowedHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`));
-        if (!isAllowed) {
-            console.warn('Logo URL blocked (not in allowlist):', parsed.hostname);
-            return null;
+        const dataUrlMatch = value.match(/^data:image\/(png|jpe?g|webp);base64,(.+)$/i);
+        if (dataUrlMatch) {
+            const bytes = Buffer.from(dataUrlMatch[2], 'base64');
+            return /^jpe?g$/i.test(dataUrlMatch[1]) ? await doc.embedJpg(bytes) : await doc.embedPng(bytes);
         }
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        const buffer = Buffer.from(await res.arrayBuffer());
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('png') || url.toLowerCase().endsWith('.png')) {
-            return await doc.embedPng(buffer);
+        if (/^https?:\/\//i.test(value)) {
+            // SSRF guard: only fetch URLs that point at our own Supabase Storage signatures
+            // dir. A DB-stored signature column must never be able to aim the server at an
+            // arbitrary host (e.g. cloud metadata). Anything else is treated as no image.
+            if (!isOwnSignatureStorageUrl(value)) return null;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            let res: Response;
+            try {
+                res = await fetch(value, { signal: controller.signal });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+            if (!res.ok) return null;
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            const contentType = (res.headers.get('content-type') || '').toLowerCase();
+            return contentType.includes('jpeg') || contentType.includes('jpg')
+                ? await doc.embedJpg(bytes)
+                : await doc.embedPng(bytes);
         }
-        return await doc.embedJpg(buffer);
+        return null;
     } catch (err) {
-        console.warn('Could not embed logo in PDF:', err);
+        console.warn('Could not embed signature image in PDF:', err);
         return null;
     }
+}
+
+/**
+ * Append a "Certificate of Execution" page to an existing (client-signed) contract PDF,
+ * recording the company countersignature alongside the client's. Returns the new PDF as a Buffer.
+ *
+ * The customer's browser already produced a PDF with the document body + their signature
+ * (the client-signed intermediate). At countersign time we load that PDF, stamp a final
+ * certificate page carrying both parties' attribution + audit metadata, and re-save — so the
+ * executed copy is a single PDF with both signatures. No headless browser required.
+ */
+export async function appendContractCountersignaturePage(
+    existingPdf: Uint8Array | Buffer,
+    opts: {
+        companyName: string;
+        contractTitle: string;
+        clientSignedBy?: string | null;
+        clientSignedAt?: Date | null;
+        clientIp?: string | null;
+        clientSignatureValue?: string | null; // data-URL or Storage URL
+        companySignedBy?: string | null;
+        companySignedAt?: Date | null;
+        companyIp?: string | null;
+        companySignatureValue?: string | null; // data-URL or Storage URL
+    }
+): Promise<Buffer> {
+    const doc = await PDFDocument.load(existingPdf);
+    const helv = await doc.embedFont(StandardFonts.Helvetica);
+    const helvBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const page = doc.addPage([612, 792]); // US Letter
+    const { width, height } = page.getSize();
+    const margin = 56;
+    const ink = rgb(0.06, 0.09, 0.16);
+    const muted = rgb(0.42, 0.45, 0.5);
+    const accent = rgb(0.31, 0.27, 0.9);
+    let y = height - margin;
+
+    page.drawText('Certificate of Execution', { x: margin, y, size: 20, font: helvBold, color: ink });
+    y -= 24;
+    page.drawText((opts.contractTitle || '').slice(0, 90), { x: margin, y, size: 11, font: helv, color: muted, maxWidth: width - margin * 2 });
+    y -= 14;
+    page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 1, color: accent });
+    y -= 36;
+
+    const drawParty = (heading: string, name: string, when?: Date | null, ip?: string | null, img?: PDFImage | null) => {
+        page.drawText(heading, { x: margin, y, size: 9, font: helvBold, color: muted });
+        y -= 17;
+        page.drawText((name || '—').slice(0, 70), { x: margin, y, size: 13, font: helvBold, color: ink, maxWidth: width - margin * 2 });
+        y -= 16;
+        if (when) { page.drawText(`Signed: ${when.toLocaleString()}`, { x: margin, y, size: 9, font: helv, color: muted }); y -= 13; }
+        if (ip) { page.drawText(`IP address: ${ip}`, { x: margin, y, size: 9, font: helv, color: muted }); y -= 13; }
+        if (img) {
+            const maxW = 180, maxH = 56;
+            const scale = Math.min(maxW / img.width, maxH / img.height, 1);
+            const w = img.width * scale, h = img.height * scale;
+            page.drawImage(img, { x: margin, y: y - h - 4, width: w, height: h });
+            y -= h + 10;
+        }
+        y -= 22;
+    };
+
+    const clientImg = opts.clientSignatureValue ? await embedSignatureImage(doc, opts.clientSignatureValue) : null;
+    drawParty('CLIENT', opts.clientSignedBy || '', opts.clientSignedAt, opts.clientIp, clientImg);
+    
+    if (opts.companySignedBy) {
+        const companyImg = opts.companySignatureValue ? await embedSignatureImage(doc, opts.companySignatureValue) : null;
+        drawParty(`COMPANY — ${opts.companyName}`, opts.companySignedBy, opts.companySignedAt, opts.companyIp, companyImg);
+    }
+
+    page.drawText(
+        'This certificate records the electronic signatures applied to this document under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA.',
+        { x: margin, y: margin, size: 8, font: helv, color: muted, maxWidth: width - margin * 2, lineHeight: 11 }
+    );
+
+    return Buffer.from(await doc.save());
 }
 
 // Color helpers
@@ -39,8 +132,101 @@ const colors = {
     white: rgb(1, 1, 1),
 };
 
+function hexToRgb(hex: string) {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.substring(0, 2), 16) / 255;
+    const g = parseInt(h.substring(2, 4), 16) / 255;
+    const b = parseInt(h.substring(4, 6), 16) / 255;
+    return rgb(r, g, b);
+}
+
 function formatCurrency(amount: number): string {
     return `$${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function drawLetterhead(
+    doc: PDFDocument,
+    page: PDFPage,
+    config: LetterheadConfig,
+    opts: { pageWidth: number; pageHeight: number; margin: number },
+    fonts: { regular: PDFFont; bold: PDFFont },
+): Promise<number> {
+    const { pageWidth, pageHeight, margin } = opts;
+    let y: number;
+
+    if (config.mode === 'custom_image' && config.customImageUrl) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            let res: Response;
+            try {
+                res = await fetch(config.customImageUrl, { signal: controller.signal });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+            const buf = new Uint8Array(await res.arrayBuffer());
+            const contentType = res.headers.get('content-type') || '';
+            const img = contentType.includes('png')
+                ? await doc.embedPng(buf)
+                : await doc.embedJpg(buf);
+            const scale = pageWidth / img.width;
+            const imgHeight = Math.min(img.height * scale, 150);
+            page.drawImage(img, { x: 0, y: pageHeight - imgHeight, width: pageWidth, height: imgHeight });
+            y = pageHeight - imgHeight - 20;
+        } catch {
+            // Fall back to built-in if image fetch fails
+            return drawBuiltInHeader(page, config, opts, fonts);
+        }
+        return y;
+    }
+
+    return drawBuiltInHeader(page, config, opts, fonts);
+}
+
+function drawBuiltInHeader(
+    page: PDFPage,
+    config: LetterheadConfig,
+    opts: { pageWidth: number; pageHeight: number; margin: number },
+    fonts: { regular: PDFFont; bold: PDFFont },
+): number {
+    const { pageWidth, pageHeight, margin } = opts;
+    let y: number;
+
+    if (config.showDivider) {
+        const barColor = hexToRgb(config.accentColor);
+        page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: barColor });
+    }
+    y = pageHeight - 40;
+
+    const fieldValues: string[] = [];
+    for (const f of config.fields) {
+        let v: string | null = null;
+        switch (f) {
+            case 'name': v = config.companyName; break;
+            case 'address': v = config.address; break;
+            case 'phone': v = config.phone; break;
+            case 'email': v = config.email; break;
+            case 'license': v = config.licenseNumber ? `Lic# ${config.licenseNumber}` : null; break;
+            case 'website': v = config.website; break;
+        }
+        if (v) fieldValues.push(v);
+    }
+
+    for (let i = 0; i < fieldValues.length; i++) {
+        if (i === 0) {
+            page.drawText(fieldValues[i].toUpperCase(), {
+                x: margin, y, size: 11, font: fonts.regular, color: colors.textMuted,
+            });
+        } else {
+            page.drawText(fieldValues[i], {
+                x: margin, y, size: 9, font: fonts.regular, color: colors.textMuted,
+            });
+        }
+        y -= 14;
+    }
+
+    y -= 6;
+    return y;
 }
 
 export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
@@ -65,6 +251,8 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     const doc = await PDFDocument.create();
     const helvetica = await doc.embedFont(StandardFonts.Helvetica);
     const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+    const helveticaOblique = await doc.embedFont(StandardFonts.HelveticaOblique);
+    const helveticaBoldOblique = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
 
     const pageWidth = 612; // Letter width in points
     const pageHeight = 792; // Letter height in points
@@ -81,62 +269,59 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         }
     }
 
-    // --- Header accent bar ---
-    page.drawRectangle({
-        x: 0, y: pageHeight - 6, width: pageWidth, height: 6,
-        color: colors.primary,
+    // Render a titled rich-text section (Project Overview / Notes & Assumptions) using
+    // the shared HTML-subset renderer, keeping the closure's page/y cursor in sync.
+    const richFonts = { regular: helvetica, bold: helveticaBold, italic: helveticaOblique, boldItalic: helveticaBoldOblique };
+    function drawRichSection(title: string, body: string, titleSize: number) {
+        checkNewPage(140);
+        page.drawText(title, { x: margin, y, size: titleSize, font: helveticaBold, color: colors.textMain });
+        y -= titleSize + 10;
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: richFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawRichHtml(body, ctx);
+        page = res.page;
+        y = res.y;
+    }
+
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
+
+    // --- Title ---
+    page.drawText(estimate.title || 'Estimate', {
+        x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
     });
-    y = pageHeight - 40;
 
-    // --- Logo + Company Name + Contact Info ---
-    let logoImage: PDFImage | null = null;
-    if (company?.logoUrl) {
-        logoImage = await fetchAndEmbedLogo(doc, company.logoUrl);
-    }
+    // --- Estimate Info ---
+    y -= 30;
 
-    let textX = margin;
-    if (logoImage) {
-        const maxLogoH = 40;
-        const maxLogoW = 120;
-        const scale = Math.min(maxLogoW / logoImage.width, maxLogoH / logoImage.height, 1);
-        const logoW = logoImage.width * scale;
-        const logoH = logoImage.height * scale;
-        page.drawImage(logoImage, {
-            x: margin, y: y - logoH + 12, width: logoW, height: logoH,
+    // Left: Client info
+    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
+    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
+
+    page.drawText('ESTIMATE TO', {
+        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
+    });
+
+    if (clientName) {
+        y -= 16;
+        page.drawText(clientName, {
+            x: margin, y, size: 11, font: helvetica, color: colors.textMain,
         });
-        textX = margin + logoW + 12;
     }
-
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), {
-            x: textX, y, size: 11, font: helveticaBold, color: colors.textMain,
+    if (clientEmail) {
+        y -= 14;
+        page.drawText(clientEmail, {
+            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
         });
     }
 
-    // Contact info
-    const contactLines: string[] = [];
-    if (company?.address) contactLines.push(company.address);
-    if (company?.phone) contactLines.push(company.phone);
-    if (company?.email) contactLines.push(company.email);
-    if (company?.licenseNumber) contactLines.push(`Lic# ${company.licenseNumber.replace(/[\r\n\t]/g, "").trim().slice(0, 50)}`);
-
-    let contactY = y;
-    for (const line of contactLines) {
-        contactY -= 12;
-        page.drawText(line, {
-            x: textX, y: contactY, size: 8, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    const headerTopY = Math.min(contactY, y) - 20;
-
-    // Right side header: "ESTIMATE" label (portal style, top-right)
+    // Right side: Estimate # / Date / Status
     const rightX = pageWidth - margin;
-    const estimateHeadLabel = 'ESTIMATE';
-    const estimateHeadWidth = helveticaBold.widthOfTextAtSize(estimateHeadLabel, 22);
-    page.drawText(estimateHeadLabel, {
-        x: rightX - estimateHeadWidth, y: headerTopY, size: 22, font: helveticaBold, color: colors.primary,
-    });
+    let ry = y + (clientEmail ? 30 : 16);
 
     const drawRightLabel = (label: string, value: string, yPos: number) => {
         page.drawText(label, {
@@ -148,68 +333,34 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         });
     };
 
-    let ry = headerTopY - 24;
     drawRightLabel('Estimate No.', estimate.code || '', ry);
     ry -= 16;
     drawRightLabel('Date', new Date(estimate.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
     ry -= 16;
     drawRightLabel('Status', estimate.status || 'Draft', ry);
 
-    // --- Client + Project section ---
-    y = headerTopY - 70;
-
-    // Left: "PREPARED FOR" + client info
-    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
-    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
-    const client = estimate.project?.client || estimate.lead?.client;
-    const clientAddress = client ? [client.addressLine1, client.city, client.state, client.zipCode].filter(Boolean).join(', ') : '';
-
-    page.drawText('PREPARED FOR', {
-        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
-    });
-
-    let leftY = y;
-    if (clientName) {
-        leftY -= 16;
-        page.drawText(clientName, {
-            x: margin, y: leftY, size: 11, font: helvetica, color: colors.textMain,
-        });
-    }
-    if (clientAddress) {
-        leftY -= 14;
-        page.drawText(clientAddress, {
-            x: margin, y: leftY, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-    if (clientEmail) {
-        leftY -= 14;
-        page.drawText(clientEmail, {
-            x: margin, y: leftY, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    // Right: "PROJECT" section
-    const halfX = margin + contentWidth * 0.5;
-    page.drawText('PROJECT', {
-        x: halfX, y, size: 9, font: helveticaBold, color: colors.textMuted,
-    });
-    const projectTitle = estimate.title || '';
-    let rightY = y;
-    if (projectTitle) {
-        rightY -= 16;
-        page.drawText(projectTitle, {
-            x: halfX, y: rightY, size: 11, font: helvetica, color: colors.textMain,
-        });
-    }
-
-    y = Math.min(leftY, rightY) - 24;
-
     // --- Separator ---
+    y -= 20;
     page.drawLine({
         start: { x: margin, y }, end: { x: pageWidth - margin, y },
         thickness: 0.5, color: colors.border,
     });
     y -= 20;
+
+    // --- Project Overview / Vision (client-facing, no pricing) ---
+    // Rendered after the header/client block, then the estimate details are forced
+    // onto a fresh page so pricing begins on the following page.
+    if (estimate.overviewEnabled && estimate.overviewBody) {
+        drawRichSection(estimate.overviewTitle || 'Project Overview', estimate.overviewBody, 15);
+        page = doc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - margin;
+    }
+
+    // --- Estimate Notes & Assumptions (placed before the line items) ---
+    if (estimate.notesEnabled && estimate.notesBody && estimate.notesPlacement === 'before') {
+        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', estimate.notesBody, 12);
+        y -= 12;
+    }
 
     // --- Table Header ---
     const cols = {
@@ -220,7 +371,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     };
 
     function drawTableHeader() {
-        page.drawText('DESCRIPTION', {
+        page.drawText('ITEM DESCRIPTION', {
             x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
         const qtyLabel = 'QTY';
@@ -228,12 +379,12 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         page.drawText(qtyLabel, {
             x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
-        const ucLabel = 'UNIT PRICE';
+        const ucLabel = 'UNIT COST';
         const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
         page.drawText(ucLabel, {
             x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
-        const totalLabel = 'AMOUNT';
+        const totalLabel = 'TOTAL';
         const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
         page.drawText(totalLabel, {
             x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
@@ -247,15 +398,30 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         y -= 14;
     }
 
+    // Guard against a before-placement Notes section leaving no room: keep the table
+    // header with at least the first row instead of stranding it at the page bottom.
+    checkNewPage(120);
     drawTableHeader();
 
     // --- Table Rows ---
     for (const item of estimate.items) {
         checkNewPage(100);
 
+        const isSection = !item.parentId && estimate.items.some(i => i.parentId === item.id);
         const isSubItem = !!item.parentId;
         const nameX = isSubItem ? cols.name + 16 : cols.name;
-        const nameFont = isSubItem ? helvetica : helveticaBold;
+        const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
+
+        if (isSection) {
+            // Draw a subtle slate background banner for the section header
+            page.drawRectangle({
+                x: margin - 6,
+                y: y - 4,
+                width: contentWidth + 12,
+                height: 18,
+                color: colors.bgLight,
+            });
+        }
 
         // Truncate long names
         let displayName = item.name || '';
@@ -268,51 +434,30 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             x: nameX, y, size: 10, font: nameFont, color: colors.textMain,
         });
 
-        // Qty
-        const qtyStr = String(item.quantity || 0);
-        const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
-        page.drawText(qtyStr, {
-            x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
-        });
+        if (!isSection) {
+            // Qty
+            const qtyStr = String(item.quantity || 0);
+            const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
+            page.drawText(qtyStr, {
+                x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+            });
 
-        // Unit cost
-        const ucStr = formatCurrency(item.unitCost || 0);
-        const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
-        page.drawText(ucStr, {
-            x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
-        });
+            // Unit cost
+            const ucStr = formatCurrency(toNum(item.unitCost));
+            const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
+            page.drawText(ucStr, {
+                x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
+            });
+        }
 
         // Total
-        const totalStr = formatCurrency(item.total || 0);
+        const totalStr = formatCurrency(toNum(item.total));
         const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
-            x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
+            x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: isSection ? colors.primary : colors.textMain,
         });
 
-        // Description (below name, word-wrapped in muted text)
-        if (item.description) {
-            y -= 14;
-            const descWords = item.description.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().split(' ');
-            let descLine = '';
-            for (const word of descWords) {
-                const testLine = descLine ? `${descLine} ${word}` : word;
-                if (helvetica.widthOfTextAtSize(testLine, 8) > maxNameWidth && descLine) {
-                    checkNewPage(14);
-                    page.drawText(descLine, { x: nameX, y, size: 8, font: helvetica, color: colors.textMuted });
-                    y -= 11;
-                    descLine = word;
-                } else {
-                    descLine = testLine;
-                }
-            }
-            if (descLine) {
-                checkNewPage(14);
-                page.drawText(descLine, { x: nameX, y, size: 8, font: helvetica, color: colors.textMuted });
-            }
-            y -= 14;
-        } else {
-            y -= 20;
-        }
+        y -= 20;
     }
 
     // --- Totals Section ---
@@ -325,9 +470,27 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((sum, item) => sum + Number(item.total || 0), 0);
-    const tax = subtotal * 0.088;
-    const total = subtotal + tax;
+    const subtotal = estimate.items.reduce((acc, item) => {
+        if (item.parentId) return acc + toNum(item.total);
+        if (!estimate.items.some(i => i.parentId === item.id)) return acc + toNum(item.total);
+        return acc;
+    }, 0);
+
+    const taxRatePercent = toNum(estimate.taxRatePercent);
+    const taxExempt = !!estimate.taxExempt;
+    const taxRate = taxExempt ? 0 : taxRatePercent / 100;
+    const tax = Math.round(subtotal * taxRate * 100) / 100;
+
+    const taxRateDisplay = Number(taxRatePercent.toFixed(4));
+    const taxName = taxExempt
+        ? "Tax Exempt"
+        : (estimate.taxRateName ? `${estimate.taxRateName} (${taxRateDisplay}%)` : `Estimated Tax (${taxRateDisplay}%)`);
+
+    const processingFeeMarkup = toNum(estimate.processingFeeMarkup);
+    const hideProcessingFee = estimate.hideProcessingFee ?? true;
+    const processingFee = processingFeeMarkup > 0 ? Math.round(subtotal * (processingFeeMarkup / 100) * 100) / 100 : 0;
+
+    const total = Math.round((subtotal + tax + processingFee) * 100) / 100;
 
     // Subtotal
     const labelX = cols.unitCost - 60;
@@ -342,7 +505,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     y -= 18;
 
     // Tax
-    page.drawText('Tax (8.8%)', {
+    page.drawText(taxName, {
         x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
     });
     const taxStr = formatCurrency(tax);
@@ -350,7 +513,20 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     page.drawText(taxStr, {
         x: cols.total - taxWidth, y, size: 10, font: helvetica, color: colors.textMain,
     });
-    y -= 22;
+    y -= 18;
+
+    // Processing Fee (only if not hidden)
+    if (!hideProcessingFee && processingFee > 0) {
+        page.drawText(`Processing Fee (${processingFeeMarkup}%)`, {
+            x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
+        });
+        const feeStr = formatCurrency(processingFee);
+        const feeWidth = helvetica.widthOfTextAtSize(feeStr, 10);
+        page.drawText(feeStr, {
+            x: cols.total - feeWidth, y, size: 10, font: helvetica, color: colors.textMain,
+        });
+        y -= 18;
+    }
 
     // Total line
     page.drawLine({
@@ -368,6 +544,12 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         x: cols.total - totalWidth2, y: y - 8, size: 14, font: helveticaBold, color: colors.primary,
     });
 
+    // --- Estimate Notes & Assumptions (placed immediately after the line items/totals) ---
+    if (estimate.notesEnabled && estimate.notesBody && estimate.notesPlacement !== 'before') {
+        y -= 30;
+        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', estimate.notesBody, 12);
+    }
+
     // --- Payment Schedule ---
     if (estimate.paymentSchedules.length > 0) {
         y -= 50;
@@ -381,75 +563,27 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         for (const sched of estimate.paymentSchedules) {
             checkNewPage(60);
 
-            const schedName = sched.percentage ? `${sched.name || ''} (${sched.percentage}%)` : (sched.name || '');
-            page.drawText(schedName, {
+            page.drawText(sched.name || '', {
                 x: margin, y, size: 9, font: helveticaBold, color: colors.textMain,
             });
 
-            if (sched.dueDate) {
-                const dateStr = new Date(sched.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                page.drawText(dateStr, {
-                    x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
-                });
-            }
+            const schedInfo: string[] = [];
+            if (sched.percentage) schedInfo.push(`${sched.percentage}%`);
+            if (sched.amount) schedInfo.push(formatCurrency(toNum(sched.amount)));
+            const schedText = schedInfo.join('  ');
 
-            if (sched.amount) {
-                const amtStr = formatCurrency(sched.amount);
-                const amtWidth = helveticaBold.widthOfTextAtSize(amtStr, 9);
-                page.drawText(amtStr, {
-                    x: cols.total - amtWidth, y, size: 9, font: helveticaBold, color: colors.textMain,
+            page.drawText(schedText, {
+                x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
+            });
+
+            if (sched.dueDate) {
+                const dateStr = new Date(sched.dueDate).toLocaleDateString();
+                const dateWidth = helvetica.widthOfTextAtSize(dateStr, 9);
+                page.drawText(dateStr, {
+                    x: cols.total - dateWidth, y, size: 9, font: helvetica, color: colors.textMuted,
                 });
             }
             y -= 18;
-        }
-    }
-
-    // --- Terms & Conditions ---
-    if ((estimate as any).termsAndConditions) {
-        y -= 40;
-        checkNewPage(120);
-
-        page.drawText('Terms & Conditions', {
-            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
-        });
-        y -= 18;
-
-        // Strip HTML tags and pre-compute wrapped lines
-        const rawTerms: string = (estimate as any).termsAndConditions;
-        const plainTerms = rawTerms.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        const tcPadding = 12;
-        const tcWidth = contentWidth - tcPadding * 2;
-        const tcLines: string[] = [];
-        let tcLine = '';
-        for (const word of plainTerms.split(' ')) {
-            const testLine = tcLine ? `${tcLine} ${word}` : word;
-            if (helvetica.widthOfTextAtSize(testLine, 9) > tcWidth && tcLine) {
-                tcLines.push(tcLine);
-                tcLine = word;
-            } else {
-                tcLine = testLine;
-            }
-        }
-        if (tcLine) tcLines.push(tcLine);
-
-        if (tcLines.length > 0) {
-            // Draw background box
-            const boxHeight = tcLines.length * 14 + tcPadding * 2;
-            checkNewPage(boxHeight + 20);
-            page.drawRectangle({
-                x: margin, y: y - boxHeight, width: contentWidth, height: boxHeight,
-                color: colors.bgLight,
-                borderColor: colors.border,
-                borderWidth: 1,
-            });
-
-            // Draw text inside box
-            let tcY = y - tcPadding;
-            for (const ln of tcLines) {
-                page.drawText(ln, { x: margin + tcPadding, y: tcY, size: 9, font: helvetica, color: colors.textMuted });
-                tcY -= 14;
-            }
-            y = tcY - tcPadding;
         }
     }
 
@@ -484,23 +618,18 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             });
         }
 
-        // Signature Image
-        if (estimate.signatureUrl && estimate.signatureUrl.startsWith('data:image/png;base64,')) {
-            try {
-                const base64Data = estimate.signatureUrl.replace('data:image/png;base64,', '');
-                const sigImageBytes = Buffer.from(base64Data, 'base64');
-                const embeddedSig = await doc.embedPng(sigImageBytes);
-                
+        // Signature Image — handles legacy inline data-URLs and migrated Storage URLs.
+        if (estimate.signatureUrl) {
+            const embeddedSig = await embedSignatureImage(doc, estimate.signatureUrl);
+            if (embeddedSig) {
                 // Scale signature down so it fits nicely
-                const sigDims = embeddedSig.scale(0.35); 
+                const sigDims = embeddedSig.scale(0.35);
                 page.drawImage(embeddedSig, {
                     x: pageWidth - margin - sigDims.width,
                     y: y, // draw next to metadata
                     width: sigDims.width,
                     height: sigDims.height,
                 });
-            } catch (err) {
-                console.warn("Could not embed signature image in PDF:", err);
             }
         }
         
@@ -556,22 +685,11 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         }
     }
 
-    // --- Header accent bar ---
-    page.drawRectangle({
-        x: 0, y: pageHeight - 6, width: pageWidth, height: 6,
-        color: colors.primary, // Using primary color for header bar
-    });
-    y -= 34;
-
-    // --- Company Name ---
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), {
-            x: margin, y, size: 11, font: helvetica, color: colors.textMuted,
-        });
-    }
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
     // --- Title ---
-    y -= 30;
     page.drawText('PURCHASE ORDER', {
         x: margin, y, size: 22, font: helveticaBold, color: colors.textMain,
     });
@@ -689,14 +807,14 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         });
 
         // Unit cost
-        const ucStr = formatCurrency(item.unitCost || 0);
+        const ucStr = formatCurrency(toNum(item.unitCost));
         const ucStrWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
         // Total
-        const totalStr = formatCurrency(item.total || 0);
+        const totalStr = formatCurrency(toNum(item.total));
         const totalStrWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalStrWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
@@ -715,7 +833,7 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     });
     y -= 25;
 
-    const total = po.totalAmount || 0;
+    const total = toNum(po.totalAmount);
 
     // Total line
     const labelX = cols.unitCost - 60;
@@ -782,14 +900,10 @@ export async function generateInvoicePdf(invoiceId: string): Promise<Buffer> {
         }
     }
 
-    page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: colors.primary });
-    y = pageHeight - 40;
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
-    }
-
-    y -= 30;
     page.drawText('INVOICE', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
 
     y -= 30;
@@ -930,14 +1044,10 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         }
     }
 
-    page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: colors.primary });
-    y = pageHeight - 40;
+    // --- Letterhead ---
+    const coLhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
-    if (company?.companyName) {
-        page.drawText(company.companyName.toUpperCase(), { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
-    }
-
-    y -= 30;
     page.drawText('CHANGE ORDER', { x: margin, y, size: 22, font: helveticaBold, color: colors.textMain });
 
     y -= 22;
@@ -1025,22 +1135,45 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     y -= 25;
 
     const coLabelX = coCols.unitCost - 60;
-    const coTotal = Number(co.totalAmount) || 0;
+    // co.totalAmount is the PRE-TAX subtotal (billChangeOrderCore semantic); show
+    // the same Subtotal / Tax / Revised Amount breakdown the customer signs on the
+    // portal page so the PDF and signature page never disagree.
+    const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
+    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100;
+    const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
 
-    page.drawText('Change Order Total', { x: coLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
-    const coTotalStr = formatCurrency(coTotal);
-    const coTotalW = helveticaBold.widthOfTextAtSize(coTotalStr, 14);
-    page.drawText(coTotalStr, { x: coCols.total - coTotalW, y, size: 14, font: helveticaBold, color: colors.primary });
+    const drawCoTotalRow = (label: string, value: string, size: number, font: PDFFont, color: ReturnType<typeof rgb>) => {
+        page.drawText(label, { x: coLabelX, y, size, font, color });
+        const vw = font.widthOfTextAtSize(value, size);
+        page.drawText(value, { x: coCols.total - vw, y, size, font, color });
+    };
 
-    // Signature
+    drawCoTotalRow('Subtotal', formatCurrency(coSubtotal), 10, helvetica, colors.textMain);
+    y -= 18;
+    drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
+    y -= 22;
+    checkNewPage(60);
+    drawCoTotalRow('Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
+
+    // Signatures — client approval and company countersignature are independent blocks.
     if (co.status === 'Approved' && co.approvedBy) {
         y -= 50;
         checkNewPage(100);
-        page.drawText('Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        page.drawText('Client Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
         y -= 20;
         page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 15;
         page.drawText(`Date: ${co.approvedAt ? new Date(co.approvedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+    }
+
+    if (co.companySignedBy) {
+        y -= 30;
+        checkNewPage(100);
+        page.drawText('Company Countersignature', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        y -= 20;
+        page.drawText(`Signed By: ${co.companySignedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 15;
+        page.drawText(`Date: ${co.companySignedAt ? new Date(co.companySignedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
     }
 
     const coFooterText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;

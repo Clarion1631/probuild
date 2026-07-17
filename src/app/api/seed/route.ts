@@ -4,8 +4,8 @@ import { prisma } from '@/lib/prisma';
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: Request) {
-    if (process.env.NODE_ENV !== 'development') {
-        return new Response(null, { status: 404 });
+    if (process.env.ALLOW_SEEDING !== 'true') {
+        return new Response('Seeding is disabled. Set ALLOW_SEEDING=true to enable.', { status: 403 });
     }
 
     try {
@@ -45,13 +45,13 @@ export async function GET(req: Request) {
                 name: 'Fisher water damage',
                 clientId: client2.id,
                 location: 'Vancouver, Washington',
-                status: 'Closed',
+                status: 'Closed Lost',
                 type: 'Water Damage Restoration',
                 code: '#1001'
             }
         });
 
-        await prisma.project.create({
+        const projectAdkinsKitchen = await prisma.project.create({
             data: {
                 name: 'Adkins Kitchen',
                 clientId: client3.id,
@@ -59,6 +59,43 @@ export async function GET(req: Request) {
                 status: 'In Progress',
                 type: 'Kitchen Remodel',
                 code: '#1002'
+            }
+        });
+
+        // Create Approved Estimate with Payment Schedules for Adkins Kitchen
+        await prisma.estimate.create({
+            data: {
+                title: 'Adkins Kitchen Renovation',
+                projectId: projectAdkinsKitchen.id,
+                code: 'EST-103',
+                status: 'Approved',
+                totalAmount: 10000,
+                balanceDue: 10000,
+                paymentSchedules: {
+                    create: [
+                        {
+                            name: 'DEPOSIT - UPON SIGNED CONTRACT',
+                            percentage: 60,
+                            amount: 6000,
+                            order: 0,
+                            status: 'Pending',
+                        },
+                        {
+                            name: 'ROUGH-IN COMPLETE',
+                            percentage: 30,
+                            amount: 3000,
+                            order: 1,
+                            status: 'Pending',
+                        },
+                        {
+                            name: 'FINAL COMPLETION',
+                            percentage: 10,
+                            amount: 1000,
+                            order: 2,
+                            status: 'Pending',
+                        }
+                    ]
+                }
             }
         });
 
@@ -85,7 +122,7 @@ export async function GET(req: Request) {
                 name: 'Parkin Laundry Room',
                 clientId: client4.id,
                 location: 'Vancouver, Washington',
-                status: 'Open',
+                status: 'In Progress',
                 type: 'Laundry Room',
                 code: '#1003'
             }
@@ -107,7 +144,7 @@ export async function GET(req: Request) {
                 name: 'Anspach Bedroom',
                 clientId: client6.id,
                 location: 'Vancouver, Washington',
-                status: 'Done',
+                status: 'Closed Complete',
                 type: 'Bedroom Remodel',
                 code: '#1005'
             }
@@ -118,7 +155,7 @@ export async function GET(req: Request) {
                 name: 'Atherton Kitchen',
                 clientId: client7.id,
                 location: 'Vancouver, Washington',
-                status: 'Paid, Ready to Start',
+                status: 'In Progress',
                 type: 'Kitchen Remodel',
                 code: '#1006'
             }
@@ -129,7 +166,7 @@ export async function GET(req: Request) {
                 name: 'OHaver Garage Conversion',
                 clientId: client8.id,
                 location: 'Portland, Oregon',
-                status: 'Open',
+                status: 'Substantial Completion',
                 type: 'Garage Conversion',
                 code: '#1007'
             }

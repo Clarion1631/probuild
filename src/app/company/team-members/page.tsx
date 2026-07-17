@@ -11,16 +11,18 @@ type User = {
     name: string | null;
     email: string;
     role: string;
+    status: string;
     hourlyRate: number;
     burdenRate: number;
     hasPin: boolean;
+    projectAccess?: { projectId: string }[];
 };
 
 export default function TeamPage() {
     const [users, setUsers] = useState<User[]>([]);
     const [loading, setLoading] = useState(true);
     const [isAddingUser, setIsAddingUser] = useState(false);
-    const [addForm, setAddForm] = useState<Partial<User>>({ role: 'EMPLOYEE' });
+    const [addForm, setAddForm] = useState<Partial<User>>({ role: 'FIELD_CREW' });
     const [searchQuery, setSearchQuery] = useState("");
     const [statusFilter, setStatusFilter] = useState("All");
 
@@ -50,7 +52,7 @@ export default function TeamPage() {
         if (res.ok) {
             const data = await res.json();
             setIsAddingUser(false);
-            setAddForm({ role: 'EMPLOYEE', email: '' });
+            setAddForm({ role: 'FIELD_CREW', email: '' });
 
             if (data.warning) {
                 toast.warning(data.warning);
@@ -67,6 +69,7 @@ export default function TeamPage() {
     };
 
     const getStatus = (user: User) => {
+        if (user.status === "DISABLED") return "Disabled";
         if (!user.name) return "Pending";
         return "Activated";
     };
@@ -136,6 +139,7 @@ export default function TeamPage() {
                                     <th className="px-6 py-4 font-normal">Email</th>
                                     <th className="px-6 py-4 font-normal">Role</th>
                                     <th className="px-6 py-4 font-normal">Status</th>
+                                    <th className="px-6 py-4 font-normal hidden sm:table-cell">Projects</th>
                                     <th className="px-6 py-4 font-normal hidden sm:table-cell">Hourly Rate</th>
                                     <th className="px-6 py-4 font-normal text-right">Actions</th>
                                 </tr>
@@ -177,7 +181,7 @@ export default function TeamPage() {
                                                 {user.email}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
-                                                {user.role === 'EMPLOYEE' ? 'Field Crew' :
+                                                {(user.role === 'FIELD_CREW' || user.role === 'EMPLOYEE') ? 'Field Crew' :
                                                     user.role === 'MANAGER' ? 'Manager' :
                                                         user.role === 'FINANCE' ? 'Finance' :
                                                             'Admin'}
@@ -189,12 +193,20 @@ export default function TeamPage() {
                                                 </span>
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
+                                                {user.role === "ADMIN" || user.role === "MANAGER"
+                                                    ? "All"
+                                                    : new Set([
+                                                        ...(user.projectAccess?.map(pa => pa.projectId) || []),
+                                                        ...((user as any).assignedProjects?.map((p: any) => p.id) || []),
+                                                    ]).size}
+                                            </td>
+                                            <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
                                                 {formatCurrency(user.hourlyRate ?? 0)}
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <Link
                                                     href={`/company/team-members/${user.id}`}
-                                                    className="text-blue-600 hover:text-blue-800 font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                                                    className="text-blue-600 hover:text-blue-800 font-medium opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition"
                                                 >
                                                     Edit
                                                 </Link>
@@ -232,7 +244,7 @@ export default function TeamPage() {
                             <div>
                                 <label className="block font-medium text-hui-textMain mb-1">Role</label>
                                 <select className="hui-input w-full" value={addForm.role} onChange={e => setAddForm({ ...addForm, role: e.target.value })}>
-                                    <option value="EMPLOYEE">Field Crew</option>
+                                    <option value="FIELD_CREW">Field Crew</option>
                                     <option value="MANAGER">Manager</option>
                                     <option value="FINANCE">Finance</option>
                                     <option value="ADMIN">Admin</option>

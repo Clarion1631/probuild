@@ -3,18 +3,25 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, useMemo, useRef, useEffect } from "react";
-import AddLeadModal from "@/app/leads/AddLeadModal";
+import NewProjectModal from "./NewProjectModal";
 import { toast } from "sonner";
 import { updateProjectStatus, deleteProjects, updateProjectTags } from "@/lib/actions";
 import { CustomizeStatusModal, ManageStatusModal, ProjectStatus } from "./StatusModals";
 import ProjectsKanbanBoard from "./ProjectsKanbanBoard";
+import BulkActionBar, { DeleteIcon } from "@/components/BulkActionBar";
+import { PROJECT_STATUSES, OPEN_PROJECT_STATUSES, projectStatusRank } from "@/lib/project-status";
 
-const DEFAULT_PROJECT_STATUSES: ProjectStatus[] = [
-    { value: "Open", label: "Open", color: "bg-blue-100 text-blue-700", dot: "bg-blue-500", rawColor: "#3b82f6", isActive: true },
-    { value: "In Progress", label: "In Progress", color: "bg-green-100 text-green-700", dot: "bg-green-500", rawColor: "#22c55e", isActive: true },
-    { value: "Done", label: "Done", color: "bg-teal-100 text-teal-700", dot: "bg-teal-600", rawColor: "#0d9488", isActive: true },
-    { value: "Closed", label: "Closed", color: "bg-amber-100 text-amber-700", dot: "bg-amber-400", rawColor: "#fbbf24", isActive: true },
-    { value: "Paid, Ready to Start", label: "Paid, Ready to Start", color: "bg-cyan-100 text-cyan-700", dot: "bg-cyan-400", rawColor: "#22d3ee", isActive: true },
+const DEFAULT_PROJECT_STATUSES: ProjectStatus[] = PROJECT_STATUSES;
+
+const SORTABLE_COLUMNS: { key: string; label: string }[] = [
+    { key: "name", label: "Project Name" },
+    { key: "client", label: "Client Name" },
+    { key: "createdAt", label: "Created" },
+    { key: "location", label: "Location" },
+    { key: "status", label: "Status" },
+    { key: "type", label: "Type" },
+    { key: "code", label: "#Code" },
+    { key: "tags", label: "Tags" },
 ];
 
 function getStatusColor(status: string, statuses: ProjectStatus[]) {
@@ -29,7 +36,8 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     const router = useRouter();
     const [projects, setProjects] = useState(initialProjects);
     const [statuses, setStatuses] = useState<ProjectStatus[]>(initialStatuses || DEFAULT_PROJECT_STATUSES);
-    const [statusFilter, setStatusFilter] = useState<string>("all-active");
+    const [selectedStatuses, setSelectedStatuses] = useState<string[]>(OPEN_PROJECT_STATUSES);
+    const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" } | null>(null);
     const [search, setSearch] = useState("");
     const [showModal, setShowModal] = useState(false);
     const [updatingId, setUpdatingId] = useState<string | null>(null);
@@ -116,12 +124,10 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
         }
     }
 
+    // Checkbox status filter — empty selection means no status filter (show all),
+    // same convention as the global tracker report filters.
     const filteredProjects = projects.filter((p: any) => {
-        if (statusFilter === "all-active") {
-            if (p.status === "Closed" || p.status === "Archived") return false;
-        } else if (statusFilter !== "all") {
-            if (p.status !== statusFilter) return false;
-        }
+        if (selectedStatuses.length > 0 && !selectedStatuses.includes(p.status)) return false;
         if (search.trim()) {
             const q = search.toLowerCase();
             const name = (p.name || "").toLowerCase();
@@ -131,25 +137,74 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
         return true;
     });
 
+    const sortedProjects = useMemo(() => {
+        if (!sort) return filteredProjects;
+        const dir = sort.dir === "asc" ? 1 : -1;
+        const val = (p: any) => {
+            switch (sort.key) {
+                case "client": return p.client?.name || "";
+                case "status": return projectStatusRank(p.status);
+                case "createdAt": return new Date(p.createdAt).getTime();
+                default: return p[sort.key] || "";
+            }
+        };
+        return [...filteredProjects].sort((a, b) => {
+            const av = val(a), bv = val(b);
+            if (typeof av === "number" && typeof bv === "number") return (av - bv) * dir;
+            return String(av).localeCompare(String(bv), undefined, { sensitivity: "base" }) * dir;
+        });
+    }, [filteredProjects, sort]);
+
+    function toggleSort(key: string) {
+        setSort(prev => {
+            if (!prev || prev.key !== key) return { key, dir: "asc" };
+            if (prev.dir === "asc") return { key, dir: "desc" };
+            return null; // third click restores default (recently viewed) order
+        });
+    }
+
+    function toggleStatusFilter(value: string) {
+        setSelectedStatuses(prev => prev.includes(value) ? prev.filter(v => v !== value) : [...prev, value]);
+    }
+
     const statusCounts: Record<string, number> = {};
     projects.forEach((p: any) => {
-        const s = p.status || "Open";
-        statusCounts[s] = (statusCounts[s] || 0) + 1;
+        statusCounts[p.status] = (statusCounts[p.status] || 0) + 1;
     });
-    const activeCount = projects.filter((p: any) => p.status !== "Closed" && p.status !== "Archived").length;
 
+    const visibleStatuses = selectedStatuses.length > 0
+        ? activeStatuses.filter(s => selectedStatuses.includes(s.value))
+        : activeStatuses;
 
     // Stat card computations
     const totalCount = projects.length;
-    const inProgressCount = projects.filter((p: any) => p.status === "In Progress" || p.status === "Open").length;
-    const completedCount = projects.filter((p: any) => p.status === "Done" || p.status === "Closed").length;
+    const inProgressCount = statusCounts["In Progress"] || 0;
+    const substantialCount = statusCounts["Substantial Completion"] || 0;
+    const APPROVED_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
     const totalRevenue = projects.reduce((sum: number, p: any) => {
-        const est = (p.estimates || []).reduce((s: number, e: any) => s + Number(e.totalAmount || 0), 0);
+        const est = (p.estimates || [])
+            .filter((e: any) => APPROVED_STATUSES.includes(e.status))
+            .reduce((s: number, e: any) => s + Number(e.totalAmount || 0), 0);
         return sum + est;
     }, 0);
 
     return (
         <div className="max-w-screen-2xl mx-auto px-4 md:px-8 pb-10">
+            {viewMode === "list" && (
+                <BulkActionBar
+                    count={selectedIds.length}
+                    onClear={() => setSelectedIds([])}
+                    actions={[
+                        {
+                            label: "Delete",
+                            icon: DeleteIcon,
+                            onClick: handleDeleteSelected,
+                            variant: "danger",
+                            disabled: isDeleting,
+                        },
+                    ]}
+                />
+            )}
             {/* Stat Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-6 mb-6">
                 <div className="hui-card p-4">
@@ -161,8 +216,8 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                     <p className="text-3xl font-bold text-blue-600 mt-1">{inProgressCount}</p>
                 </div>
                 <div className="hui-card p-4">
-                    <p className="text-xs text-hui-textMuted font-medium">Completed</p>
-                    <p className="text-3xl font-bold text-green-600 mt-1">{completedCount}</p>
+                    <p className="text-xs text-hui-textMuted font-medium">Substantial Completion</p>
+                    <p className="text-3xl font-bold text-amber-600 mt-1">{substantialCount}</p>
                 </div>
                 <div className="hui-card p-4">
                     <p className="text-xs text-hui-textMuted font-medium">Total Revenue</p>
@@ -193,7 +248,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
 
             {/* Shared Filters Toolbar */}
             <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
-                <div className="flex items-center gap-3 bg-white p-1 rounded-lg border border-slate-200 shadow-sm">
+                <div className="flex flex-wrap items-center gap-3 bg-white p-1 rounded-lg border border-slate-200 shadow-sm">
                     <div className="relative w-48 sm:w-64">
                         <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
                         <input
@@ -205,17 +260,21 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                         />
                     </div>
                     <div className="h-5 w-px bg-slate-200"></div>
-                    <select
-                        value={statusFilter}
-                        onChange={e => setStatusFilter(e.target.value)}
-                        className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-700 font-medium"
-                    >
-                        <option value="all-active">Status: Active</option>
-                        <option value="all">Status: All</option>
+                    <div className="flex items-center gap-1 flex-wrap px-1">
                         {activeStatuses.map(s => (
-                            <option key={s.value} value={s.value}>{s.label}</option>
+                            <label key={s.value} className="flex items-center gap-1.5 px-2 py-1.5 rounded-md cursor-pointer hover:bg-slate-50 text-sm font-medium text-slate-700 select-none whitespace-nowrap">
+                                <input
+                                    type="checkbox"
+                                    checked={selectedStatuses.includes(s.value)}
+                                    onChange={() => toggleStatusFilter(s.value)}
+                                    className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                />
+                                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: s.rawColor }} />
+                                {s.label}
+                                <span className="text-xs text-slate-400">({statusCounts[s.value] || 0})</span>
+                            </label>
                         ))}
-                    </select>
+                    </div>
                     <div className="h-5 w-px bg-slate-200"></div>
                     <select className="text-sm border-0 bg-transparent py-1.5 pl-2 pr-8 focus:ring-0 text-slate-700 font-medium">
                         <option>Tags: None</option>
@@ -226,28 +285,13 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                     </select>
                 </div>
 
-                {/* Bulk Actions Toolbar for List View */}
-                {viewMode === "list" && selectedIds.length > 0 && (
-                    <div className="flex items-center gap-3 bg-red-50 text-red-700 px-4 py-2 rounded-lg border border-red-200 animate-in fade-in slide-in-from-bottom-2">
-                        <span className="text-sm font-semibold">{selectedIds.length} selected</span>
-                        <div className="h-4 w-px bg-red-200"></div>
-                        <button 
-                            onClick={handleDeleteSelected}
-                            disabled={isDeleting}
-                            className="text-sm font-semibold flex items-center gap-1.5 hover:text-red-800 disabled:opacity-50"
-                        >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                            Delete
-                        </button>
-                    </div>
-                )}
             </div>
 
             {/* Kanban View */}
             {viewMode === "kanban" && (
-                <ProjectsKanbanBoard 
-                    projects={filteredProjects} 
-                    statuses={activeStatuses} 
+                <ProjectsKanbanBoard
+                    projects={filteredProjects}
+                    statuses={visibleStatuses}
                     onStatusChange={handleStatusChange} 
                     onCustomizeClick={() => setShowCustomizeModal(true)} 
                 />
@@ -256,8 +300,58 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
             {/* List View */}
             {viewMode === "list" && (
                 <>
-                    {/* Table */}
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    {/* Mobile card list (< lg) — the 10-column table is unreadable on touch */}
+                    <div className="lg:hidden space-y-3">
+                        {sortedProjects.map((project: any) => (
+                            <div key={project.id} className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+                                <div className="flex items-start gap-3">
+                                    <div className="w-1.5 self-stretch min-h-[2.5rem] rounded-full" style={{ backgroundColor: project.color || getStatusColor(project.status || "In Progress", statuses).replace("bg-", "").split("-")[0] }} />
+                                    <div className="flex-1 min-w-0">
+                                        <Link href={`/projects/${project.id}`} className="font-semibold text-slate-800 hover:text-indigo-600 transition block truncate">
+                                            {project.name}
+                                        </Link>
+                                        <div className="mt-1 flex items-center gap-2 text-sm text-slate-600">
+                                            <div className="w-5 h-5 rounded-full bg-[#34d399] flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                                                {(project.client?.name || "?")[0].toUpperCase()}
+                                            </div>
+                                            <span className="truncate">{project.client?.name || "No Client"}</span>
+                                        </div>
+                                        <div className="mt-1 text-xs text-slate-500">
+                                            {project.location ? `${project.location} · ` : ""}{new Date(project.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="mt-3">
+                                    <select
+                                        value={project.status || "In Progress"}
+                                        onChange={e => handleStatusChange(project.id, e.target.value)}
+                                        disabled={updatingId === project.id}
+                                        className={`w-full text-xs font-semibold rounded-full px-3 py-2 border border-slate-200 focus:ring-2 focus:ring-indigo-200 transition disabled:opacity-50 appearance-none bg-white ${getStatusColor(project.status || "In Progress", statuses).replace("bg-", "text-").replace("100", "700")}`}
+                                    >
+                                        {activeStatuses.map(s => (
+                                            <option key={s.value} value={s.value}>• {s.label}</option>
+                                        ))}
+                                        <option disabled>────────</option>
+                                        <option value="Manage Status">⚙ Manage Status</option>
+                                    </select>
+                                </div>
+                            </div>
+                        ))}
+                        {sortedProjects.length === 0 && (
+                            <div className="bg-white rounded-xl shadow-sm border border-slate-200 py-16 text-center">
+                                <div className="flex flex-col items-center gap-3">
+                                    <div className="w-14 h-14 bg-gradient-to-br from-slate-100 to-slate-50 rounded-2xl flex items-center justify-center">
+                                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                                    </div>
+                                    <p className="text-sm font-medium text-slate-400">No projects match your filters</p>
+                                    <button onClick={() => { setSelectedStatuses(OPEN_PROJECT_STATUSES); setSearch(""); }} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">Reset filters</button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Table (>= lg) */}
+                    <div className="hidden lg:block bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
                         <table className="w-full text-left bg-white text-sm">
                             <thead>
                                 <tr className="border-b border-slate-200">
@@ -272,19 +366,31 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                             }}
                                         />
                                     </th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Project Name</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Client Name</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Created</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Location</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Status</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Type</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">#Code</th>
-                                    <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Tags</th>
+                                    {SORTABLE_COLUMNS.map(col => (
+                                        <th key={col.key} className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">
+                                            <button
+                                                onClick={() => toggleSort(col.key)}
+                                                className="group/sort flex items-center gap-1 hover:text-slate-800 transition"
+                                                title={`Sort by ${col.label}`}
+                                            >
+                                                {col.label}
+                                                {sort?.key === col.key ? (
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-indigo-600 shrink-0">
+                                                        {sort.dir === "asc" ? <path d="M18 15l-6-6-6 6"/> : <path d="M6 9l6 6 6-6"/>}
+                                                    </svg>
+                                                ) : (
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="shrink-0 opacity-0 group-hover/sort:opacity-40 [@media(hover:none)]:opacity-30 transition">
+                                                        <path d="M8 9l4-4 4 4M8 15l4 4 4-4"/>
+                                                    </svg>
+                                                )}
+                                            </button>
+                                        </th>
+                                    ))}
                                     <th className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">Managers</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {filteredProjects.map((project: any) => (
+                                {sortedProjects.map((project: any) => (
                                     <tr key={project.id} className={`hover:bg-slate-50/70 transition-colors group ${selectedIds.includes(project.id) ? "bg-indigo-50/30" : ""}`}>
                                         <td className="py-4 px-4 text-center">
                                             <input 
@@ -299,7 +405,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                         </td>
                                         <td className="py-4 px-4">
                                             <div className="flex items-center gap-3">
-                                                <div className="w-1.5 h-6 rounded-full" style={{ backgroundColor: project.color || getStatusColor(project.status || "Open", statuses).replace("bg-", "").split("-")[0] }} />
+                                                <div className="w-1.5 h-6 rounded-full" style={{ backgroundColor: project.color || getStatusColor(project.status || "In Progress", statuses).replace("bg-", "").split("-")[0] }} />
                                                 <Link href={`/projects/${project.id}`} className="font-medium text-slate-800 hover:text-indigo-600 transition">
                                                     {project.name}
                                                 </Link>
@@ -321,10 +427,10 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                         </td>
                                         <td className="py-4 px-4">
                                             <select
-                                                value={project.status || "Open"}
+                                                value={project.status || "In Progress"}
                                                 onChange={e => handleStatusChange(project.id, e.target.value)}
                                                 disabled={updatingId === project.id}
-                                                className={`text-xs font-semibold rounded-full px-3 py-1.5 border border-slate-200 cursor-pointer focus:ring-2 focus:ring-indigo-200 transition disabled:opacity-50 appearance-none bg-white pr-8 bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2212%22%20height%3D%2212%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22M4%205l4%204%204-4%22%20fill%3D%22none%22%20stroke%3D%22%23666%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E')] bg-no-repeat bg-[position:right_8px_center] ${getStatusColor(project.status || "Open", statuses).replace("bg-", "text-").replace("100", "700")}`}
+                                                className={`text-xs font-semibold rounded-full px-3 py-1.5 border border-slate-200 cursor-pointer focus:ring-2 focus:ring-indigo-200 transition disabled:opacity-50 appearance-none bg-white pr-8 bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2212%22%20height%3D%2212%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22M4%205l4%204%204-4%22%20fill%3D%22none%22%20stroke%3D%22%23666%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E')] bg-no-repeat bg-[position:right_8px_center] ${getStatusColor(project.status || "In Progress", statuses).replace("bg-", "text-").replace("100", "700")}`}
                                             >
                                                 {activeStatuses.map(s => (
                                                     <option key={s.value} value={s.value}>• {s.label}</option>
@@ -373,7 +479,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                         </td>
                                     </tr>
                                 ))}
-                                {filteredProjects.length === 0 && (
+                                {sortedProjects.length === 0 && (
                                     <tr>
                                         <td colSpan={10} className="py-16 text-center">
                                             <div className="flex flex-col items-center gap-3">
@@ -381,7 +487,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
                                                 </div>
                                                 <p className="text-sm font-medium text-slate-400">No projects match your filters</p>
-                                                <button onClick={() => { setStatusFilter("all-active"); setSearch(""); }} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">Reset filters</button>
+                                                <button onClick={() => { setSelectedStatuses(OPEN_PROJECT_STATUSES); setSearch(""); }} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">Reset filters</button>
                                             </div>
                                         </td>
                                     </tr>
@@ -392,7 +498,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                 </>
             )}
 
-            {showModal && <AddLeadModal onClose={() => setShowModal(false)} />}
+            {showModal && <NewProjectModal statusOptions={activeStatuses.map(s => s.label)} onClose={() => setShowModal(false)} />}
             {showCustomizeModal && (
                 <CustomizeStatusModal 
                     statuses={statuses} 

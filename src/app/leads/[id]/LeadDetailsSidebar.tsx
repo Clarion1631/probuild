@@ -9,6 +9,8 @@ import LeadStageDropdown from "./LeadStageDropdown";
 import EditLeadModal from "./EditLeadModal";
 import GoogleMapPreview from "@/components/GoogleMapPreview";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
+import ManagerAssignRow from "@/components/ManagerAssignRow";
+import TaxExemptCertCard from "@/components/TaxExemptCertCard";
 
 interface LeadDetailsSidebarProps {
     leadId: string;
@@ -22,18 +24,25 @@ interface LeadDetailsSidebarProps {
     clientId: string;
     clientName: string;
     clientEmail: string | null;
+    clientAdditionalEmail: string | null;
     clientPhone: string | null;
     clientAddress: string | null;
     clientCity: string | null;
     clientState: string | null;
     clientZip: string | null;
+    clientTaxExemptCertUrl?: string | null;
+    clientTaxExemptCertExpiresAt?: string | null;
+    clientTaxExemptCertNote?: string | null;
     initialMessage: string | null;
+    managerId?: string | null;
+    managerName?: string | null;
 }
 
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
-    clientId, clientName, clientEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
-    initialMessage,
+    clientId, clientName, clientEmail, clientAdditionalEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
+    clientTaxExemptCertUrl = null, clientTaxExemptCertExpiresAt = null, clientTaxExemptCertNote = null,
+    initialMessage, managerId, managerName,
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
 
@@ -41,6 +50,7 @@ export default function LeadDetailsSidebar({
     const [editingClient, setEditingClient] = useState(false);
     const [cName, setCName] = useState(clientName);
     const [cEmail, setCEmail] = useState(clientEmail || "");
+    const [cAdditionalEmail, setCAdditionalEmail] = useState(clientAdditionalEmail || "");
     const [cPhone, setCPhone] = useState(clientPhone || "");
     const [cAddr, setCAddr] = useState(clientAddress || "");
     const [cCity, setCCity] = useState(clientCity || "");
@@ -112,6 +122,7 @@ export default function LeadDetailsSidebar({
         addressLine1: clientAddress,
         city: clientCity,
         state: clientState,
+        zipCode: clientZip,
     };
 
     const handleSaveClient = async () => {
@@ -120,6 +131,7 @@ export default function LeadDetailsSidebar({
             await updateClient(clientId, {
                 name: cName,
                 email: cEmail || undefined,
+                additionalEmail: cAdditionalEmail || undefined,
                 primaryPhone: cPhone || undefined,
                 addressLine1: cAddr || undefined,
                 city: cCity || undefined,
@@ -155,10 +167,19 @@ export default function LeadDetailsSidebar({
         return parts.length > 0 ? parts.join(", ") : null;
     };
 
-    const maskEmail = (email: string) => {
-        const [user, domain] = email.split("@");
-        if (!domain) return email;
-        return `${user[0]}${"*".repeat(Math.min(user.length - 1, 5))}@${domain}`;
+    // Normalize a Google formatted_address to strip country suffix before comparing
+    const normalizeAddress = (addr: string) =>
+        addr.replace(/,\s*(USA|United States|US)$/i, "").trim();
+
+    // True when job site and client contact address are the same (suppress duplicate map)
+    const addressesMatch = !!formatAddress() && !!location &&
+        normalizeAddress(location) === normalizeAddress(formatAddress()!);
+
+    const formatPhone = (phone: string) => {
+        const digits = phone.replace(/\D/g, "");
+        if (digits.length === 10) return `(${digits.slice(0,3)}) ${digits.slice(3,6)}-${digits.slice(6)}`;
+        if (digits.length === 11 && digits[0] === "1") return `+1 (${digits.slice(1,4)}) ${digits.slice(4,7)}-${digits.slice(7)}`;
+        return phone;
     };
 
     const DetailRow = ({ label, value, fieldKey, type = "text" }: { label: string; value: string | null; fieldKey?: string; type?: string }) => {
@@ -244,6 +265,10 @@ export default function LeadDetailsSidebar({
                             <input type="email" value={cEmail} onChange={e => setCEmail(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
                         <div>
+                            <label className="text-xs text-slate-500 block mb-1">Email 2 <span className="text-slate-400">(spouse / partner)</span></label>
+                            <input type="email" value={cAdditionalEmail} onChange={e => setCAdditionalEmail(e.target.value)} className="hui-input w-full text-sm" placeholder="Optional" />
+                        </div>
+                        <div>
                             <label className="text-xs text-slate-500 block mb-1">Phone</label>
                             <input type="tel" value={cPhone} onChange={e => setCPhone(e.target.value)} className="hui-input w-full text-sm" />
                         </div>
@@ -284,7 +309,11 @@ export default function LeadDetailsSidebar({
                         </div>
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Email</span>
-                            <span className="text-sm text-green-600">{clientEmail ? maskEmail(clientEmail) : <span className="text-slate-400 italic">Not set</span>}</span>
+                            <span className="text-sm text-green-600">{clientEmail ? clientEmail : <span className="text-slate-400 italic">Not set</span>}</span>
+                        </div>
+                        <div className="flex items-center justify-between py-2 border-b border-slate-50">
+                            <span className="text-sm text-slate-600">Email 2</span>
+                            <span className="text-sm text-green-600">{clientAdditionalEmail ? clientAdditionalEmail : <span className="text-slate-400 italic">Not set</span>}</span>
                         </div>
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
                             <span className="text-sm text-slate-600">Phone Number</span>
@@ -292,33 +321,41 @@ export default function LeadDetailsSidebar({
                                 {clientPhone ? (
                                     <>
                                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
-                                        {clientPhone}
+                                        {formatPhone(clientPhone)}
                                     </>
                                 ) : <span className="text-slate-400 italic">Not set</span>}
                             </span>
                         </div>
                         <div className="flex flex-col py-2">
-                            <div className="flex items-center justify-between mb-2">
-                                <span className="text-sm text-slate-600">Client Address</span>
-                                <span className="text-sm text-hui-textMain flex items-center justify-end gap-1.5 text-right w-2/3">
-                                    {formatAddress() ? (
-                                        <>
-                                            <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition" title="Directions">
-                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                                            </a>
-                                            <span className="truncate">{formatAddress()}</span>
-                                        </>
-                                    ) : <span className="text-slate-400 italic">Not set</span>}
-                                </span>
-                            </div>
-                            {formatAddress() && (
-                                <div className="mt-1 w-[280px]">
+                            <span className="text-sm text-slate-600 mb-1">Client Contact Address</span>
+                            <span className="text-sm text-hui-textMain flex items-start gap-1.5 min-w-0">
+                                {formatAddress() ? (
+                                    <>
+                                        <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(formatAddress()!)}`} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-green-600 transition shrink-0 mt-0.5" title="Directions">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                        </a>
+                                        <span className="break-words min-w-0">{formatAddress()}</span>
+                                    </>
+                                ) : <span className="text-slate-400 italic">Not set</span>}
+                            </span>
+                            {formatAddress() && !addressesMatch && (
+                                <div className="mt-2 w-full">
                                     <GoogleMapPreview address={formatAddress()!} />
                                 </div>
                             )}
                         </div>
                     </div>
                 )}
+            </div>
+
+            {/* Tax Exemption Certificate */}
+            <div className="p-5 border-b border-hui-border">
+                <TaxExemptCertCard
+                    clientId={clientId}
+                    certUrl={clientTaxExemptCertUrl}
+                    certExpiresAt={clientTaxExemptCertExpiresAt}
+                    certNote={clientTaxExemptCertNote}
+                />
             </div>
 
             {/* Lead Details - Collapsible */}
@@ -341,30 +378,13 @@ export default function LeadDetailsSidebar({
 
                 {showLeadDetails && (
                     <div className="px-5 pb-4 space-y-0">
-                        {/* Team avatars */}
-                        <div className="flex items-center justify-between py-2 border-b border-slate-50">
-                            <span className="text-sm text-slate-600">Team</span>
-                            <div className="flex -space-x-2">
-                                {["G", "WB", "R", "SB", "VB"].map((initials, i) => (
-                                    <div key={i} className={`w-7 h-7 rounded-full border-2 border-white flex items-center justify-center text-[9px] font-bold text-white ${
-                                        ["bg-amber-500", "bg-slate-600", "bg-red-500", "bg-blue-500", "bg-purple-500"][i]
-                                    }`}>
-                                        {initials}
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-
-                        {/* Managers */}
-                        <div className="flex items-center justify-between py-2 border-b border-slate-50">
-                            <span className="text-sm text-slate-600">Managers</span>
-                            <div className="flex items-center gap-1.5">
-                                <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center">
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                                </div>
-                                <span className="text-sm text-green-600 font-medium">Assign</span>
-                            </div>
-                        </div>
+                        {/* Manager */}
+                        <ManagerAssignRow
+                            entityType="lead"
+                            entityId={leadId}
+                            currentManagerId={managerId || null}
+                            currentManagerName={managerName || null}
+                        />
 
                         {/* Lead Stage */}
                         <div className="flex items-center justify-between py-2 border-b border-slate-50">
@@ -403,7 +423,7 @@ export default function LeadDetailsSidebar({
                             <p className="text-green-600 font-medium">{clientName}</p>
                         </div>
                         <div>
-                            <p className="text-slate-500 text-xs font-medium mb-0.5">Project Location</p>
+                            <p className="text-slate-500 text-xs font-medium mb-0.5">Job Site</p>
                             <p className="text-hui-textMain mb-2">{location || "Not specified"}</p>
                             {location && <GoogleMapPreview address={location} />}
                         </div>

@@ -3,59 +3,26 @@
 import Link from "next/link";
 import { useState } from "react";
 import { usePermissions } from "@/components/PermissionsProvider";
+import FieldUpdatesNavItem from "@/components/FieldUpdatesNavItem";
+import { NAV_ITEMS, SearchIcon } from "@/components/nav/navItems";
+import SearchPanel from "@/components/nav/SearchPanel";
 
 export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const { permissions, loaded } = usePermissions();
 
-    // Permission-gated nav items
-    const can = (key: string) => !loaded || !!permissions[key];
+    const can = (key: string) => !!permissions[key];
+    const projects = NAV_ITEMS.find((i) => i.key === "projects")!;
 
     return (
-        <aside className="w-20 bg-hui-sidebar text-white flex flex-col min-h-screen items-center py-4 relative z-50">
+        // Desktop / iPad-landscape icon rail. Hidden below lg — the mobile drawer
+        // (MobileNavDrawer) takes over there. Keeping this rail untouched at >= lg
+        // preserves the existing desktop layout pixel-for-pixel.
+        <aside className="hidden lg:flex w-20 bg-hui-sidebar text-white flex-col min-h-screen items-center py-4 relative z-50">
             {/* Search Flyout */}
             {isSearchOpen && (
                 <div className="absolute left-20 top-0 w-64 bg-slate-50 min-h-screen shadow-xl border-r border-slate-200 text-slate-800 flex flex-col z-40">
-                    <div className="p-4 border-b border-slate-200 bg-white">
-                        <h2 className="font-bold text-lg mb-4">Search</h2>
-                        <input type="text" placeholder="Search Projects" className="w-full border border-slate-300 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-slate-400" />
-                    </div>
-                    <div className="flex-1 overflow-y-auto w-full p-4 space-y-6">
-                        {/* Planning */}
-                        {(can("contracts") || can("estimates") || can("takeoffs") || can("floorPlans")) && (
-                            <div>
-                                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Planning</h3>
-                                <ul className="space-y-2 text-sm">
-                                    {can("contracts") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Contracts</Link></li>}
-                                    {can("estimates") && <li><Link href="/estimates" className="hover:text-hui-primary block transition">All Estimates</Link></li>}
-                                    {can("takeoffs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Takeoffs</Link></li>}
-                                    {can("floorPlans") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All 3D Floor Plans</Link></li>}
-                                </ul>
-                            </div>
-                        )}
-                        {/* Management */}
-                        {(can("schedules") || can("dailyLogs") || can("timeClock")) && (
-                            <div>
-                                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Management</h3>
-                                <ul className="space-y-2 text-sm">
-                                    {can("schedules") && <li><Link href="/manager/schedule" className="hover:text-hui-primary block transition">Schedule Overview</Link></li>}
-                                    {can("dailyLogs") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Daily Logs</Link></li>}
-                                    {can("timeClock") && <li><Link href="/time-clock" className="hover:text-hui-primary block transition">Time &amp; Expenses</Link></li>}
-                                </ul>
-                            </div>
-                        )}
-                        {/* Finance */}
-                        {(can("invoices") || can("changeOrders")) && (
-                            <div>
-                                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Finance</h3>
-                                <ul className="space-y-2 text-sm">
-                                    {can("invoices") && <li><Link href="/invoices" className="hover:text-hui-primary block transition">All Invoices</Link></li>}
-                                    {can("changeOrders") && <li><Link href="/projects" className="hover:text-hui-primary block transition">All Change Orders</Link></li>}
-                                    {can("invoices") && <li><Link href="/manager/receipts" className="hover:text-hui-primary block transition">Receipt Queue</Link></li>}
-                                </ul>
-                            </div>
-                        )}
-                    </div>
+                    <SearchPanel />
                 </div>
             )}
 
@@ -79,55 +46,42 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                     onClick={() => setIsSearchOpen(!isSearchOpen)}
                     className={`flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] transition ${isSearchOpen ? 'text-white bg-[#2a2a2a]' : 'text-slate-400'}`}
                 >
-                    <svg className="w-5 h-5 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                    <SearchIcon className="w-5 h-5 mb-1" />
                     <span className="text-[10px] uppercase font-semibold">Search</span>
                 </button>
 
                 {/* Projects — always visible (filtered by ProjectAccess on the API side) */}
-                <Link href="/projects" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
-                    <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                <Link href={projects.href} className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
+                    <projects.Icon className="w-5 h-5 mb-1 group-hover:text-white" />
                     <span className="text-[10px] uppercase font-semibold">Projects</span>
                 </Link>
 
-                {/* Leads — gated by leadAccess */}
-                {can("leadAccess") && (
-                    <Link href="/leads" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
-                        <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>
-                        <span className="text-[10px] uppercase font-semibold">Leads</span>
-                    </Link>
-                )}
-
-
-                {/* Financials — gated by invoices or financialReports */}
-                {(can("invoices") || can("financialReports")) && (
-                    <Link href="/invoices" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
-                        <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                        <span className="text-[10px] uppercase font-semibold text-center leading-tight">Financials</span>
-                    </Link>
-                )}
-
-                {/* Time Clock — gated by timeClock */}
-                {can("timeClock") && (
-                    <Link href="/time-clock" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
-                        <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                        <span className="text-[10px] uppercase font-semibold text-center leading-tight">Time Clock</span>
-                    </Link>
-                )}
-
-                {/* Company — gated by manageTeamMembers or companySettings */}
-                {(can("manageTeamMembers") || can("companySettings")) && (
-                    <Link href="/company/team-members" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
-                        <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
-                        <span className="text-[10px] uppercase font-semibold text-center leading-tight">Company</span>
-                    </Link>
-                )}
-
-                {/* Settings — gated by companySettings */}
-                {can("companySettings") && (
-                    <Link href="/settings/company" className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group">
-                        <svg className="w-5 h-5 mb-1 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-                        <span className="text-[10px] uppercase font-semibold text-center leading-tight">Settings</span>
-                    </Link>
+                {loaded ? (
+                    NAV_ITEMS.filter((item) => item.key !== "projects" && item.show(can)).map((item) =>
+                        item.custom === "fieldUpdates" ? (
+                            <FieldUpdatesNavItem key={item.key} />
+                        ) : (
+                            <Link
+                                key={item.key}
+                                href={item.href}
+                                className="flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] text-slate-400 hover:text-white transition group"
+                            >
+                                <item.Icon className="w-5 h-5 mb-1 group-hover:text-white" />
+                                <span className="text-[10px] uppercase font-semibold text-center leading-tight">{item.label}</span>
+                            </Link>
+                        )
+                    )
+                ) : (
+                    Array.from({ length: 5 }).map((_, i) => (
+                        <div
+                            key={i}
+                            aria-hidden
+                            className="flex flex-col items-center justify-center w-full py-3"
+                        >
+                            <div className="w-6 h-6 mb-1 rounded bg-slate-700/60 animate-pulse" />
+                            <div className="w-10 h-2 rounded bg-slate-700/60 animate-pulse" />
+                        </div>
+                    ))
                 )}
             </nav>
 

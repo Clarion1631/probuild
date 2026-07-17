@@ -64,7 +64,7 @@ Parent Item: "${itemName}"
 ${projectName ? `Project: "${projectName}"` : ""}
 ${existingNames ? `Already exists in estimate: ${existingNames}` : ""}
 
-Return ONLY a JSON array of objects with "name", "description", and "costType" (one of: Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other).
+Return ONLY a JSON array of objects with "name", "description", and "costType" (one of: Labor, Material, Allowance, Subcontractor, Equipment, Other).
 
 Example for "Bathroom Tile":
 [

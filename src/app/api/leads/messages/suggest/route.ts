@@ -25,6 +25,9 @@ export async function POST(request: Request) {
                 orderBy: { createdAt: "desc" },
             },
             clientMessages: {
+                // Exclude SYSTEM activity banners (contract sent/signed etc.) —
+                // they'd otherwise show up in AI prompts as fake client utterances.
+                where: { direction: { in: ["INBOUND", "OUTBOUND"] } },
                 orderBy: { createdAt: "asc" },
                 take: 20,
             },

@@ -25,18 +25,38 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
     }
 
     try {
-        // Disconnect all existing crew and connect only the provided ones.
+        const oldCrew = await prisma.project.findUnique({
+            where: { id: projectId },
+            select: { crew: { select: { id: true } } },
+        });
+        const oldCrewIds = oldCrew?.crew.map(c => c.id) ?? [];
+
         const project = await prisma.project.update({
             where: { id: projectId },
             data: {
                 crew: {
-                    set: crewIds.map(id => ({ id }))
+                    set: crewIds.map((id: string) => ({ id }))
                 }
             },
             include: {
                 crew: true
             }
         });
+
+        const removedIds = oldCrewIds.filter((id: string) => !crewIds.includes(id));
+        const ops = [];
+        if (removedIds.length > 0) {
+            ops.push(prisma.projectAccess.deleteMany({
+                where: { projectId, userId: { in: removedIds } },
+            }));
+        }
+        if (crewIds.length > 0) {
+            ops.push(prisma.projectAccess.createMany({
+                data: crewIds.map((userId: string) => ({ userId, projectId })),
+                skipDuplicates: true,
+            }));
+        }
+        if (ops.length > 0) await prisma.$transaction(ops);
 
         return NextResponse.json(project.crew);
     } catch (error) {

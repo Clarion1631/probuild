@@ -6,7 +6,7 @@ import { toast } from "sonner";
 interface Note {
     id: string;
     content: string;
-    createdBy: string;
+    createdBy: string | null;
     createdAt: Date;
 }
 
@@ -66,7 +66,7 @@ export default function LeadNotesPageClient({ leadId, initialNotes, userName }: 
                         <div key={note.id} className="hui-card p-4">
                             <p className="text-sm text-hui-textMain whitespace-pre-wrap">{note.content}</p>
                             <div className="flex items-center gap-2 mt-3 text-xs text-hui-textMuted">
-                                <span className="font-medium">{note.createdBy}</span>
+                                <span className="font-medium">{note.createdBy || "Team Member"}</span>
                                 <span>·</span>
                                 <span>{new Date(note.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
                             </div>

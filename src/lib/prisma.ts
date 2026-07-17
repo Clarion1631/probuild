@@ -5,16 +5,30 @@ const globalForPrisma = globalThis as unknown as {
 }
 
 function buildPrismaClient(): PrismaClient {
-    let dbUrl = process.env.DATABASE_URL;
-    if (dbUrl && !dbUrl.includes("connection_limit")) {
-        dbUrl += (dbUrl.includes("?") ? "&" : "?") + "connection_limit=1";
+    const dbUrl = process.env.DATABASE_URL;
+    if (!dbUrl) {
+        throw new Error("DATABASE_URL is not set. Configure it in Vercel project settings.");
     }
-    if (dbUrl) {
-        return new PrismaClient({
-            datasources: { db: { url: dbUrl } }
-        });
+    let url: URL;
+    try {
+        url = new URL(dbUrl);
+    } catch {
+        throw new Error("DATABASE_URL is not a valid URL. Check the value in Vercel project settings.");
     }
-    return new PrismaClient();
+    if (url.searchParams.get("pgbouncer") !== "true") {
+        throw new Error(
+            `DATABASE_URL must include the query param pgbouncer=true ` +
+            `(required for Supabase transaction pooler on port 6543). ` +
+            `Host detected: ${url.hostname}:${url.port || "(none)"}. ` +
+            `To fix: update DATABASE_URL in Vercel project settings.`
+        );
+    }
+    if (!url.searchParams.has("connection_limit")) {
+        url.searchParams.set("connection_limit", "5");
+    }
+    return new PrismaClient({
+        datasources: { db: { url: url.toString() } }
+    });
 }
 
 // Lazy singleton: only create PrismaClient when it's actually used at runtime,

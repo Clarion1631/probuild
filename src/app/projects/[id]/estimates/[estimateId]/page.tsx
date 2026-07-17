@@ -1,4 +1,4 @@
-import { getEstimate, getProject, getCompanySettings } from "@/lib/actions";
+import { getEstimate, getProject, getCompanySettings, getEstimateActivity } from "@/lib/actions";
 import EstimateEditor from "./EstimateEditor";
 import { notFound } from "next/navigation";
 
@@ -10,10 +10,11 @@ export default async function EstimatePage({
     params: Promise<{ id: string; estimateId: string }>
 }) {
     const resolvedParams = await params;
-    const [project, estimate, settings] = await Promise.all([
+    const [project, estimate, settings, activityEvents] = await Promise.all([
         getProject(resolvedParams.id),
         getEstimate(resolvedParams.estimateId),
         getCompanySettings(),
+        getEstimateActivity(resolvedParams.estimateId),
     ]);
 
     if (!project) return <div>Project not found</div>;
@@ -22,14 +23,13 @@ export default async function EstimatePage({
     }
 
     // Parse sales taxes from company settings
-    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
+    let salesTaxes: { id?: string; name: string; rate: number; isDefault: boolean }[] = [];
     try {
         salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
     } catch { /* ignore parse errors */ }
-    const defaultTax = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
 
     return (
-        <div className="flex h-[calc(100vh-64px)] -m-6 overflow-hidden">
+        <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
             <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
                 <EstimateEditor
                     context={{
@@ -38,10 +38,14 @@ export default async function EstimatePage({
                         name: project.name,
                         clientName: project.client.name,
                         clientEmail: project.client.email || undefined,
-                        location: project.location || undefined
+                        location: project.location || undefined,
+                        clientTaxExemptCertUrl: (project.client as any)?.taxExemptCertUrl || null,
+                        clientTaxExemptCertExpiresAt: (project.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null
                     }}
                     initialEstimate={JSON.parse(JSON.stringify(estimate))}
-                    defaultTax={defaultTax}
+                    salesTaxes={salesTaxes}
+                    settings={settings}
+                    activityEvents={activityEvents}
                 />
             </div>
         </div>

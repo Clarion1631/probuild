@@ -16,8 +16,14 @@ export default defineConfig({
   },
   projects: [
     {
+      name: "data",
+      testMatch: /data\.setup\.ts/,
+    },
+    {
       name: "setup",
-      testMatch: /auth\.setup\.ts/,
+      testMatch: /(^|[\\/])auth\.setup\.ts$/,
+      // data first: on a fresh test DB the admin user must exist before login
+      dependencies: ["data"],
     },
     {
       name: "chromium",
@@ -25,7 +31,7 @@ export default defineConfig({
         ...devices["Desktop Chrome"],
         storageState: "e2e/.auth/user.json",
       },
-      dependencies: ["setup"],
+      dependencies: ["data", "setup"],
     },
   ],
   webServer: {

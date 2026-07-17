@@ -1,28 +1,227 @@
 "use client";
 
-import { useState } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes } from "@/lib/actions";
+import { useState, useEffect, useRef } from "react";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
+import RecordPaymentModal from "@/components/RecordPaymentModal";
+import BulkActionBar from "@/components/BulkActionBar";
+import SendMilestonesModal from "@/components/SendMilestonesModal";
+import UndoPaymentModal from "@/components/UndoPaymentModal";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 
+const METHOD_LABELS: Record<string, string> = {
+    card: "Card",
+    ach: "ACH",
+    check: "Check",
+    cash: "Cash",
+    quickbooks: "QuickBooks",
+};
+
+function formatPaymentMethod(method: string | null | undefined, ref: string | null | undefined): string {
+    if (!method) return "";
+    const label = METHOD_LABELS[method] ?? method.toUpperCase();
+    if (method === "check" && ref) return `Check #${ref}`;
+    if (ref) return `${label} · ${ref}`;
+    return label;
+}
+
 export default function InvoiceEditor({ project, initialInvoice }: { project: any, initialInvoice: any }) {
     const router = useRouter();
-    const [isRecording, setIsRecording] = useState<string | null>(null);
     const [isIssuing, setIsIssuing] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [showSendModal, setShowSendModal] = useState(false);
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [showSendMilestonesModal, setShowSendMilestonesModal] = useState(false);
     const [notes, setNotes] = useState(initialInvoice.notes || "");
     const [isSavingNotes, setIsSavingNotes] = useState(false);
-    const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
+    const [showAddMilestone, setShowAddMilestone] = useState(false);
+    const [milestoneName, setMilestoneName] = useState("");
+    const [milestoneAmount, setMilestoneAmount] = useState("");
+    const [milestoneDueDate, setMilestoneDueDate] = useState<string>("");
+    const [isAddingMilestone, setIsAddingMilestone] = useState(false);
+    const [undoPaymentTarget, setUndoPaymentTarget] = useState<any | null>(null);
+    const [recordingFor, setRecordingFor] = useState<{ id: string; name: string; amount: number } | null>(null);
+    const [isSendingReceipt, setIsSendingReceipt] = useState<string | null>(null);
+    const [qbBusy, setQbBusy] = useState<string | null>(null);
+    const [isEmailingCopy, setIsEmailingCopy] = useState(false);
 
-    async function handleRecordPayment(paymentId: string) {
-        setIsRecording(paymentId);
-        await recordPayment(paymentId, initialInvoice.id, new Date(selectedDate).getTime());
-        setIsRecording(null);
-        router.refresh();
+    // On view: if any pending milestone is on the QuickBooks rail, pull settled
+    // payments right now (the hourly cron is the backstop, this is the fast path).
+    const qbCheckedRef = useRef(false);
+    useEffect(() => {
+        if (qbCheckedRef.current) return;
+        const hasQBPending = (initialInvoice.payments || []).some((p: any) => p.status === "Pending" && p.qbInvoiceId);
+        if (!hasQBPending) return;
+        qbCheckedRef.current = true;
+        refreshQBPayments(initialInvoice.id)
+            .then((res) => {
+                if (res.settled > 0) {
+                    toast.success(`Payment received via QuickBooks (${res.settled} milestone${res.settled > 1 ? "s" : ""} settled)`);
+                    router.refresh();
+                }
+            })
+            .catch(() => { /* cron will catch up */ });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [initialInvoice.id]);
+
+    async function handleQBLink(payment: { id: string; qbInvoiceLink?: string | null }) {
+        // Already pushed → just copy the live link.
+        if (payment.qbInvoiceLink) {
+            await navigator.clipboard.writeText(payment.qbInvoiceLink).catch(() => {});
+            toast.success("QuickBooks pay link copied to clipboard");
+            return;
+        }
+        setQbBusy(payment.id);
+        try {
+            const res = await createQBPaymentLink(payment.id);
+            if (!res.success) {
+                toast.error(res.error || "QuickBooks push failed");
+            } else if (res.payLink) {
+                await navigator.clipboard.writeText(res.payLink).catch(() => {});
+                toast.success("QuickBooks invoice created — pay link copied to clipboard");
+                router.refresh();
+            } else {
+                toast.warning("QuickBooks invoice created, but no pay link — enable QuickBooks Payments in QBO to accept cards/ACH.");
+                router.refresh();
+            }
+        } finally {
+            setQbBusy(null);
+        }
+    }
+
+    // Recover a milestone whose QuickBooks invoice was voided/deleted: clear the
+    // stale link so it can be re-created fresh. Money state is untouched.
+    async function handleBreakQBLink(payment: { id: string; name: string }) {
+        const ok = window.confirm(
+            `Break the QuickBooks link for "${payment.name}"?\n\n` +
+            `Use this when the QuickBooks invoice was voided or deleted and this milestone ` +
+            `is stuck on "Pending". It clears the QuickBooks link in ProBuild so you can ` +
+            `re-create it fresh with "QuickBooks Link".\n\n` +
+            `It does NOT change the paid/unpaid status, and does NOT delete the invoice in QuickBooks.`
+        );
+        if (!ok) return;
+        setQbBusy(payment.id);
+        try {
+            const res = await breakQBInvoiceLink(payment.id);
+            if (!res.success) {
+                toast.error(res.error);
+                return;
+            }
+            if (res.warning) toast.warning(res.warning);
+            else toast.success("QuickBooks link cleared — you can now re-create it.");
+            router.refresh();
+        } finally {
+            setQbBusy(null);
+        }
+    }
+
+    // Split payments state
+    type SplitRow = { id: number; name: string; amount: string };
+    let splitNextId = 1;
+    const [showSplit, setShowSplit] = useState(false);
+    const [splitRows, setSplitRows] = useState<SplitRow[]>([{ id: splitNextId++, name: "", amount: "" }]);
+    const [isSplitting, setIsSplitting] = useState(false);
+
+    async function handleSendReceipt(paymentId: string) {
+        setIsSendingReceipt(paymentId);
+        try {
+            const result = await sendPaymentReceipt(paymentId);
+            if (result.success) {
+                toast.success("Receipt sent");
+                router.refresh();
+            } else {
+                toast.error(result.error || "Failed to send receipt");
+            }
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to send receipt");
+        } finally {
+            setIsSendingReceipt(null);
+        }
+    }
+
+    async function handleEmailMeCopy() {
+        setIsEmailingCopy(true);
+        try {
+            const res = await emailInvoiceCopyToMe(initialInvoice.id);
+            if (res.success) {
+                toast.success(`Copy emailed to ${res.sentTo}`);
+            } else {
+                toast.error(res.error || "Failed to email copy");
+            }
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to email copy");
+        } finally {
+            setIsEmailingCopy(false);
+        }
+    }
+
+    async function handleAddMilestone() {
+        const amount = Number(milestoneAmount);
+        if (!milestoneName.trim()) {
+            toast.error("Milestone name is required");
+            return;
+        }
+        if (!Number.isFinite(amount) || amount <= 0) {
+            toast.error("Amount must be greater than zero");
+            return;
+        }
+        setIsAddingMilestone(true);
+        try {
+            await addInvoiceMilestone(initialInvoice.id, {
+                name: milestoneName.trim(),
+                amount,
+                dueDate: milestoneDueDate || null,
+            });
+            toast.success("Milestone added");
+            setMilestoneName("");
+            setMilestoneAmount("");
+            setMilestoneDueDate("");
+            setShowAddMilestone(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to add milestone");
+        } finally {
+            setIsAddingMilestone(false);
+        }
+    }
+
+    async function handleSplit() {
+        const valid = splitRows.filter((r) => r.name.trim() && parseFloat(r.amount) > 0);
+        if (!valid.length) return;
+        setIsSplitting(true);
+        try {
+            await splitInvoiceMilestones(
+                initialInvoice.id,
+                valid.map((r) => ({ name: r.name.trim(), amount: parseFloat(r.amount) })),
+            );
+            toast.success("Payment schedule updated");
+            setShowSplit(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to update payment schedule");
+        } finally {
+            setIsSplitting(false);
+        }
+    }
+
+    async function handleUnrecord(paymentId: string) {
+        try {
+            const res = await unrecordPayment(paymentId, initialInvoice.id);
+            if (!res?.success) {
+                toast.error("Nothing to unrecord — the payment may have already been undone");
+                setUndoPaymentTarget(null);
+                router.refresh();
+                return;
+            }
+            toast("Payment unrecorded");
+            setUndoPaymentTarget(null);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to unrecord payment");
+        }
     }
 
     async function handleIssueInvoice() {
@@ -80,6 +279,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
     const paidCount = (initialInvoice.payments || []).filter((p: any) => p.status === "Paid").length;
     const totalCount = (initialInvoice.payments || []).length;
+    const sendablePayments = (initialInvoice.payments || []).filter((p: any) => p.status !== "Paid" && p.status !== "Canceled");
     const canDelete = initialInvoice.status === "Draft" || (initialInvoice.status === "Issued" && paidCount === 0);
 
     return (
@@ -110,25 +310,34 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         Preview
                     </button>
 
-                    {/* PDF buttons */}
-                    <a
-                        href={`/api/pdf/invoices/${initialInvoice.id}?inline=true`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="hui-btn hui-btn-secondary flex items-center gap-2"
-                    >
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
-                        Preview PDF
-                    </a>
+                    {/* Download PDF */}
                     <a
                         href={`/api/pdf/invoices/${initialInvoice.id}`}
                         target="_blank"
-                        rel="noreferrer"
+                        rel="noopener noreferrer"
                         className="hui-btn hui-btn-secondary flex items-center gap-2"
                     >
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
+                        </svg>
                         Download PDF
                     </a>
+
+                    {/* Email me a copy */}
+                    <button
+                        onClick={handleEmailMeCopy}
+                        disabled={isEmailingCopy}
+                        className="hui-btn hui-btn-secondary flex items-center gap-2 disabled:opacity-50"
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+                            <polyline points="22,6 12,13 2,6" />
+                        </svg>
+                        {isEmailingCopy ? "Sending..." : "Email me a copy"}
+                    </button>
+
 
                     {/* Delete - only if Draft/Issued with no payments */}
                     {canDelete && (
@@ -164,7 +373,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                 </div>
             </div>
 
-            <div className="flex-1 overflow-auto p-8 flex justify-center">
+            <div className="flex-1 overflow-auto p-4 lg:p-8 flex justify-center">
                 <div className="w-full max-w-5xl space-y-6">
 
                     {/* Document Header */}
@@ -181,7 +390,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </div>
                             </div>
 
-                            <div className="flex gap-12 text-sm">
+                            <div className="flex flex-col sm:flex-row gap-6 sm:gap-12 text-sm">
                                 <div>
                                     <p className="text-[11px] font-semibold tracking-widest uppercase text-slate-400 mb-2">Bill To</p>
                                     <p className="font-semibold text-base text-hui-textMain">{clientName}</p>
@@ -222,7 +431,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
                             <div className="h-px w-full bg-hui-border my-4"></div>
 
-                            <div className="flex justify-between items-center bg-slate-50 p-5 rounded-lg border border-hui-border">
+                            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 bg-slate-50 p-5 rounded-lg border border-hui-border">
                                 <div>
                                     <p className="text-hui-textMuted text-sm mb-1">Total Amount</p>
                                     <p className="text-2xl font-bold text-hui-textMain">{formatCurrency(initialInvoice.totalAmount)}</p>
@@ -269,13 +478,153 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg>
                                 Payment Schedule
                             </h2>
-                            <span className="text-xs text-hui-textMuted">
-                                {paidCount} of {totalCount} paid
-                            </span>
+                            <div className="flex items-center gap-3">
+                                <span className="text-xs text-hui-textMuted">
+                                    {paidCount} of {totalCount} paid
+                                </span>
+                                <button
+                                    onClick={() => { setShowSplit(v => !v); setShowAddMilestone(false); }}
+                                    className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
+                                >
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+                                    {showSplit ? "Cancel" : "Split payments"}
+                                </button>
+                                <button
+                                    onClick={() => { setShowAddMilestone(v => !v); setShowSplit(false); }}
+                                    className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
+                                >
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
+                                    {showAddMilestone ? "Cancel" : "Add extra charge"}
+                                </button>
+                            </div>
                         </div>
-                        <table className="w-full text-sm text-left">
+                        {showSplit && (
+                            <div className="px-6 py-4 border-b border-hui-border bg-blue-50/40">
+                                <p className="text-xs text-hui-textMuted mb-3">
+                                    Define how the balance is split into payment installments. Replaces existing pending milestones and recalculates the invoice total.
+                                </p>
+                                <div className="space-y-2 mb-3">
+                                    <div className="grid grid-cols-[1fr_140px_32px] gap-2 px-1">
+                                        <span className="text-[11px] uppercase tracking-wide text-hui-textMuted">Description</span>
+                                        <span className="text-[11px] uppercase tracking-wide text-hui-textMuted">Amount</span>
+                                        <span />
+                                    </div>
+                                    {splitRows.map((row) => (
+                                        <div key={row.id} className="grid grid-cols-[1fr_140px_32px] gap-2 items-center">
+                                            <input
+                                                type="text"
+                                                placeholder="e.g. Deposit, Final Payment"
+                                                value={row.name}
+                                                onChange={(e) => setSplitRows(prev => prev.map(r => r.id === row.id ? { ...r, name: e.target.value } : r))}
+                                                className="hui-input text-sm"
+                                            />
+                                            <div className="relative">
+                                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-hui-textMuted text-sm">$</span>
+                                                <input
+                                                    type="number"
+                                                    min="0"
+                                                    step="0.01"
+                                                    placeholder="0.00"
+                                                    value={row.amount}
+                                                    onChange={(e) => setSplitRows(prev => prev.map(r => r.id === row.id ? { ...r, amount: e.target.value } : r))}
+                                                    className="hui-input text-sm pl-6 w-full"
+                                                />
+                                            </div>
+                                            <button
+                                                onClick={() => setSplitRows(prev => prev.filter(r => r.id !== row.id))}
+                                                disabled={splitRows.length === 1}
+                                                className="p-1 rounded text-hui-textMuted hover:text-red-500 hover:bg-red-50 disabled:opacity-30 transition"
+                                            >
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="flex items-center justify-between">
+                                    <button
+                                        onClick={() => setSplitRows(prev => [...prev, { id: Date.now(), name: "", amount: "" }])}
+                                        className="text-xs text-hui-primary hover:underline flex items-center gap-1"
+                                    >
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>
+                                        Add row
+                                    </button>
+                                    <button
+                                        onClick={handleSplit}
+                                        disabled={isSplitting || !splitRows.some(r => r.name.trim() && parseFloat(r.amount) > 0)}
+                                        className="hui-btn hui-btn-primary text-sm disabled:opacity-50"
+                                    >
+                                        {isSplitting ? "Saving..." : "Apply schedule"}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                        {showAddMilestone && (
+                            <div className="px-6 py-4 border-b border-hui-border bg-amber-50/40">
+                                <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 sm:items-end">
+                                    <div className="col-span-5">
+                                        <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Description</label>
+                                        <input
+                                            type="text"
+                                            value={milestoneName}
+                                            onChange={e => setMilestoneName(e.target.value)}
+                                            placeholder="e.g. Final Payment"
+                                            className="hui-input w-full text-sm"
+                                        />
+                                    </div>
+                                    <div className="col-span-3">
+                                        <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Amount ($)</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            step="0.01"
+                                            value={milestoneAmount}
+                                            onChange={e => setMilestoneAmount(e.target.value)}
+                                            placeholder="0.00"
+                                            className="hui-input w-full text-sm"
+                                        />
+                                    </div>
+                                    <div className="col-span-3">
+                                        <label className="block text-[11px] uppercase tracking-wide text-hui-textMuted mb-1">Due Date (optional)</label>
+                                        <input
+                                            type="date"
+                                            value={milestoneDueDate}
+                                            onChange={e => setMilestoneDueDate(e.target.value)}
+                                            className="hui-input w-full text-sm"
+                                        />
+                                    </div>
+                                    <div className="col-span-1">
+                                        <button
+                                            onClick={handleAddMilestone}
+                                            disabled={isAddingMilestone}
+                                            className="hui-btn hui-btn-primary text-sm w-full disabled:opacity-50"
+                                        >
+                                            {isAddingMilestone ? "..." : "Add"}
+                                        </button>
+                                    </div>
+                                </div>
+                                <p className="text-[11px] text-hui-textMuted mt-2">
+                                    Adds a new payment milestone and increases the invoice total by this amount.
+                                </p>
+                            </div>
+                        )}
+                        <div className="overflow-x-auto">
+                        <table className="w-full min-w-[34rem] text-sm text-left">
                             <thead className="bg-white text-hui-textMuted border-b border-hui-border">
                                 <tr>
+                                    <th className="px-4 py-3 w-10 text-center">
+                                        <input
+                                            type="checkbox"
+                                            checked={sendablePayments.length > 0 && sendablePayments.every((p: any) => selectedIds.has(p.id))}
+                                            onChange={(e) => {
+                                                if (e.target.checked) {
+                                                    setSelectedIds(new Set(sendablePayments.map((p: any) => p.id)));
+                                                } else {
+                                                    setSelectedIds(new Set());
+                                                }
+                                            }}
+                                            className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500 h-4 w-4 cursor-pointer"
+                                        />
+                                    </th>
                                     <th className="px-6 py-3 font-medium">Description</th>
                                     <th className="px-6 py-3 font-medium">Due Date</th>
                                     <th className="px-6 py-3 font-medium">Status</th>
@@ -287,7 +636,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                             <tbody className="divide-y divide-hui-border">
                                 {(!initialInvoice.payments || initialInvoice.payments.length === 0) && (
                                     <tr>
-                                        <td colSpan={6} className="px-6 py-12 text-center text-hui-textMuted">
+                                        <td colSpan={7} className="px-6 py-12 text-center text-hui-textMuted">
                                             <div className="flex flex-col items-center">
                                                 <svg className="w-10 h-10 mb-2 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                                 <p className="font-medium text-hui-textMain">No payment schedule</p>
@@ -298,9 +647,46 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 )}
                                 {initialInvoice.payments?.map((payment: any) => {
                                     const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && payment.status !== "Paid";
+                                    const methodLabel = formatPaymentMethod(payment.paymentMethod, payment.referenceNumber);
+                                    const receiptSentLabel = payment.receiptSentAt
+                                        ? `Last sent ${new Date(payment.receiptSentAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
+                                        : undefined;
+                                    const isSendable = payment.status !== "Paid" && payment.status !== "Canceled";
+                                    const sentLabel = payment.qbInvoiceSentAt
+                                        ? `Sent · ${new Date(payment.qbInvoiceSentAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
+                                        : null;
                                     return (
                                         <tr key={payment.id} className={`hover:bg-slate-50 transition ${isPastDue ? 'bg-red-50/30' : ''}`}>
-                                            <td className="px-6 py-4 font-medium text-hui-textMain">{payment.name}</td>
+                                            <td className="px-4 py-4 w-10 text-center">
+                                                {isSendable ? (
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedIds.has(payment.id)}
+                                                        onChange={(e) => {
+                                                            const newSet = new Set(selectedIds);
+                                                            if (e.target.checked) {
+                                                                newSet.add(payment.id);
+                                                            } else {
+                                                                newSet.delete(payment.id);
+                                                            }
+                                                            setSelectedIds(newSet);
+                                                        }}
+                                                        className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500 h-4 w-4 cursor-pointer"
+                                                    />
+                                                ) : null}
+                                            </td>
+                                            <td className="px-6 py-4 font-medium text-hui-textMain">
+                                                <div>{payment.name}</div>
+                                                {payment.status === 'Paid' && methodLabel && (
+                                                    <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{methodLabel}</div>
+                                                )}
+                                                {payment.status !== 'Paid' && sentLabel && (
+                                                    <div className="text-[11px] text-emerald-600 font-semibold mt-0.5 flex items-center gap-1">
+                                                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                                                        {sentLabel}
+                                                    </div>
+                                                )}
+                                            </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
                                                 {payment.dueDate ? (
                                                     <span className={isPastDue ? 'text-red-600 font-medium' : ''}>
@@ -310,7 +696,17 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 ) : 'Upon receipt'}
                                             </td>
                                             <td className="px-6 py-4">
-                                                <StatusBadge status={payment.status} />
+                                                <div className="flex items-center gap-2">
+                                                    <StatusBadge status={payment.status} />
+                                                    {payment.status !== 'Paid' && payment.qbSyncError && (
+                                                        <span
+                                                            className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
+                                                            title="The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                        >
+                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : 'voided'}
+                                                        </span>
+                                                    )}
+                                                </div>
                                             </td>
                                             <td className="px-6 py-4 text-right font-medium text-hui-textMain">
                                                 {formatCurrency(payment.amount)}
@@ -320,36 +716,77 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                     ? new Date(payment.paymentDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
                                                     : '—'}
                                             </td>
-                                            <td className="px-6 py-4 text-right flex items-center justify-end gap-2">
-                                                {payment.status !== 'Paid' && (
-                                                    <>
-                                                        <input
-                                                            type="date"
-                                                            className="hui-input py-1 px-2 text-xs w-auto h-8"
-                                                            value={selectedDate}
-                                                            onChange={(e) => setSelectedDate(e.target.value)}
-                                                        />
+                                            <td className="px-6 py-4 text-right">
+                                                <div className="flex items-center justify-end gap-2 flex-wrap">
+                                                    {payment.status !== 'Paid' && (
+                                                        <>
                                                         <button
-                                                            onClick={() => handleRecordPayment(payment.id)}
-                                                            disabled={isRecording === payment.id}
-                                                            className="hui-btn hui-btn-primary py-1 px-3 text-xs w-auto h-8 disabled:opacity-50 flex items-center justify-center whitespace-nowrap"
+                                                            onClick={() => handleQBLink(payment)}
+                                                            disabled={qbBusy === payment.id}
+                                                            title={payment.qbInvoiceLink ? "Copy the QuickBooks pay link" : "Create a QuickBooks invoice with a hosted pay link (card/ACH)"}
+                                                            className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap disabled:opacity-50"
                                                         >
-                                                            {isRecording === payment.id ? "Recording..." : "Record Payment"}
+                                                            {qbBusy === payment.id ? "Pushing…" : payment.qbInvoiceLink ? "Copy QB Link" : "QuickBooks Link"}
                                                         </button>
-                                                    </>
-                                                )}
-                                                {payment.status === 'Paid' && (
-                                                    <span className="text-xs text-emerald-600 font-medium flex items-center gap-1">
-                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6 9 17l-5-5" /></svg>
-                                                        Paid
-                                                    </span>
-                                                )}
+                                                        {isSendable && (
+                                                            <button
+                                                                onClick={() => {
+                                                                    setSelectedIds(new Set([payment.id]));
+                                                                    setShowSendMilestonesModal(true);
+                                                                }}
+                                                                className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
+                                                                title={payment.qbInvoiceSentAt ? "Resend invoice email via QuickBooks" : "Send invoice email via QuickBooks"}
+                                                            >
+                                                                {payment.qbInvoiceSentAt ? "Resend" : "Send"}
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            onClick={() => setRecordingFor({ id: payment.id, name: payment.name, amount: Number(payment.amount) })}
+                                                            className="hui-btn hui-btn-primary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
+                                                        >
+                                                            Record Payment
+                                                        </button>
+                                                        {payment.qbInvoiceId && (
+                                                            <button
+                                                                onClick={() => handleBreakQBLink(payment)}
+                                                                disabled={qbBusy === payment.id}
+                                                                title="QuickBooks invoice voided or deleted? Clear the link so you can re-create it."
+                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2 disabled:opacity-50 whitespace-nowrap"
+                                                            >
+                                                                {qbBusy === payment.id ? "Working…" : "Break QB Link"}
+                                                            </button>
+                                                        )}
+                                                        </>
+                                                    )}
+                                                    {payment.status === 'Paid' && (
+                                                        <>
+                                                            <button
+                                                                onClick={() => handleSendReceipt(payment.id)}
+                                                                disabled={isSendingReceipt === payment.id}
+                                                                title={receiptSentLabel}
+                                                                className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 disabled:opacity-50 flex items-center justify-center whitespace-nowrap"
+                                                            >
+                                                                {isSendingReceipt === payment.id
+                                                                    ? "Sending..."
+                                                                    : payment.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => setUndoPaymentTarget(payment)}
+                                                                className="text-xs text-hui-textMuted hover:text-red-600 underline underline-offset-2"
+                                                                title="Mark as unpaid"
+                                                            >
+                                                                Undo
+                                                            </button>
+                                                        </>
+                                                    )}
+                                                </div>
                                             </td>
                                         </tr>
                                     );
                                 })}
                             </tbody>
                         </table>
+                        </div>
                     </div>
 
                 </div>
@@ -361,6 +798,81 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                     invoiceId={initialInvoice.id}
                     clientEmail={clientEmail}
                     onClose={() => { setShowSendModal(false); router.refresh(); }}
+                />
+            )}
+
+            {/* Record Payment Modal */}
+            {recordingFor && (
+                <RecordPaymentModal
+                    milestoneName={recordingFor.name}
+                    amount={recordingFor.amount}
+                    onClose={() => setRecordingFor(null)}
+                    onSubmit={async (input) => {
+                        const result = await recordPayment(recordingFor.id, initialInvoice.id, { ...input, method: input.method as string });
+                        if (result.success) router.refresh();
+                        return { success: result.success, error: (result as any).error };
+                    }}
+                />
+            )}
+
+            {/* Undo Payment Modal */}
+            {undoPaymentTarget && (() => {
+                const payments = initialInvoice.payments || [];
+                const invoiceTotal = Number(initialInvoice.totalAmount) || 0;
+                const paidSchedules = payments.filter((p: any) => p.status === "Paid");
+                const paidSum = paidSchedules.reduce((sum: number, p: any) => sum + (Number(p.amount) || 0), 0);
+                const currentBalance = Math.max(0, invoiceTotal - paidSum);
+                return (
+                    <UndoPaymentModal
+                        milestoneName={undoPaymentTarget.name || "Payment"}
+                        amount={Number(undoPaymentTarget.amount) || 0}
+                        paymentMethod={undoPaymentTarget.paymentMethod || null}
+                        referenceNumber={undoPaymentTarget.referenceNumber || null}
+                        paidAt={undoPaymentTarget.paidAt || null}
+                        paymentDate={undoPaymentTarget.paymentDate || null}
+                        hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
+                        hasQbPayment={undoPaymentTarget.paymentMethod === "quickbooks"}
+                        entityLabel="invoice"
+                        currentBalance={currentBalance}
+                        estimateTotal={invoiceTotal}
+                        currentStatus={initialInvoice.status}
+                        otherPaidCount={paidSchedules.filter((p: any) => p.id !== undoPaymentTarget.id).length}
+                        statusBeforePayment={null}
+                        onClose={() => setUndoPaymentTarget(null)}
+                        onConfirm={() => handleUnrecord(undoPaymentTarget.id)}
+                    />
+                );
+            })()}
+
+            {selectedIds.size > 0 && (
+                <BulkActionBar
+                    count={selectedIds.size}
+                    onClear={() => setSelectedIds(new Set())}
+                    actions={[
+                        {
+                            label: "Send to client",
+                            icon: (
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                                </svg>
+                            ),
+                            onClick: () => setShowSendMilestonesModal(true),
+                        },
+                    ]}
+                />
+            )}
+
+            {showSendMilestonesModal && (
+                <SendMilestonesModal
+                    invoiceId={initialInvoice.id}
+                    clientEmail={clientEmail}
+                    selectedPaymentIds={Array.from(selectedIds)}
+                    selectedPayments={initialInvoice.payments?.filter((p: any) => selectedIds.has(p.id)) || []}
+                    onClose={() => {
+                        setShowSendMilestonesModal(false);
+                        setSelectedIds(new Set());
+                        router.refresh();
+                    }}
                 />
             )}
         </div>

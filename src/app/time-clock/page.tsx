@@ -1,7 +1,7 @@
 "use client";
 export const dynamic = "force-dynamic";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 
 export default function TimeClockPage() {
@@ -21,21 +21,38 @@ export default function TimeClockPage() {
     const [timeEntriesError, setTimeEntriesError] = useState<string>("");
     const [bucketsError, setBucketsError] = useState<string>("");
 
-    useEffect(() => {
-        // Fetch only projects the current user is assigned to
-        fetch('/api/projects?assigned=true')
-            .then(res => res.json())
+    const activeProjectsController = useRef<AbortController | null>(null);
+
+    const loadProjects = useCallback(() => {
+        activeProjectsController.current?.abort();
+        const controller = new AbortController();
+        activeProjectsController.current = controller;
+
+        fetch('/api/projects?assigned=true', { signal: controller.signal })
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then(data => {
                 if (Array.isArray(data)) {
                     setProjects(data);
+                    setProjectsError("");
+                    setSelectedProject(prev => {
+                        if (!prev) return prev;
+                        return data.some((p: any) => p.id === prev) ? prev : "";
+                    });
                 }
             })
             .catch(e => {
+                if (e.name === "AbortError") return;
                 console.error("Could not fetch projects", e);
                 setProjectsError("Failed to load projects");
             });
+    }, []);
 
-        // Fetch active time entry
+    useEffect(() => {
+        loadProjects();
+
         fetch('/api/time-entries')
             .then(res => res.json())
             .then(data => {
@@ -51,7 +68,24 @@ export default function TimeClockPage() {
                 console.error("Could not fetch time entries", e);
                 setTimeEntriesError("Failed to load time entries");
             });
-    }, []);
+
+    }, [loadProjects]);
+
+    useEffect(() => {
+        if (status === "Clocked In") return;
+
+        const interval = setInterval(loadProjects, 30_000);
+
+        const onVisibility = () => {
+            if (document.visibilityState === "visible") loadProjects();
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+
+        return () => {
+            clearInterval(interval);
+            document.removeEventListener("visibilitychange", onVisibility);
+        };
+    }, [loadProjects, status]);
 
     useEffect(() => {
         if (!selectedProject) {

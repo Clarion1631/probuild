@@ -1,43 +1,46 @@
 import { NextResponse } from "next/server";
+import { after } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-outbox";
 import { sendNotification } from "@/lib/email";
+import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
-import { findOrCreateClientThread } from "@/lib/actions";
 
-export async function POST(req: Request) {
-    const payload = await req.text();
-    const sig = req.headers.get("Stripe-Signature");
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-    if (!sig || !webhookSecret) {
-        return new NextResponse("Missing Stripe Signature or Webhook Secret", { status: 400 });
-    }
-
-    let event;
-
+// Helper function to process a single event by eventId asynchronously
+async function processEvent(eventId: string) {
     try {
-        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
-    } catch (err: any) {
-        console.error("Webhook signature verification failed:", err.message);
-        return new NextResponse(`Webhook Error: ${err.message}`, { status: 400 });
-    }
+        const stripeEvent = await prisma.stripeEvent.findUnique({
+            where: { id: eventId }
+        });
+        
+        if (!stripeEvent) {
+            console.error(`StripeEvent not found for ID: ${eventId}`);
+            return;
+        }
 
-    try {
+        // If it's already processed, skip
+        if (stripeEvent.status === "PROCESSED") {
+            return;
+        }
+
+        const event = JSON.parse(stripeEvent.payload);
+
         switch (event.type) {
             case "checkout.session.completed":
             case "checkout.session.async_payment_succeeded": {
                 const session = event.data.object as any;
-                
+
                 // If it's a synchronous payment (card) OR a successful async payment (ACH)
                 if (event.type === "checkout.session.completed" && session.payment_status !== "paid") {
                     // It's likely an async payment that will trigger async_payment_succeeded later
-                    break; 
+                    break;
                 }
 
                 const metadata = session.metadata;
 
-                // Get payment intent to determine the method used
+                // Determine payment method from Stripe PaymentIntent
                 let paymentMethod = "unknown";
                 if (session.payment_intent) {
                     try {
@@ -53,12 +56,22 @@ export async function POST(req: Request) {
                     }
                 }
 
-                // ── Estimate payment branch ──────────────────────────────────
-                if (metadata?.estimatePaymentScheduleId) {
-                    // Atomic idempotency: updateMany with status != "Paid" closes TOCTOU race
-                    const updatedEstSchedule = await prisma.$transaction(async (tx) => {
-                        const result = await tx.estimatePaymentSchedule.updateMany({
-                            where: { id: metadata.estimatePaymentScheduleId, status: { not: "Paid" } },
+                // ── Invoice payment branch ──────────────────────────────────
+                if (metadata?.paymentScheduleId && metadata?.invoiceId) {
+                    // One transaction: claim Pending→Paid, re-read sibling schedules, and update the parent
+                    // invoice balance/status. This prevents two concurrent webhooks on different schedules of
+                    // the same invoice from each reading a stale sibling-set and racing each other's parent update.
+                    const scheduleId = metadata.paymentScheduleId;
+                    const invoiceId = metadata.invoiceId;
+                    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+                        // Lock the parent invoice FIRST (canonical Estimate → Invoice → schedules
+                        // order; this branch touches only the invoice). Two concurrent webhooks
+                        // settling different milestones of the same invoice would otherwise each
+                        // read a stale sibling set and overwrite each other's balanceDue — the lock
+                        // serializes the recompute so the second waits and reads fresh state.
+                        await lockMoneyParents(t, { invoiceId });
+                        const claim = await t.paymentSchedule.updateMany({
+                            where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
                                 status: "Paid",
                                 stripePaymentIntentId: session.payment_intent as string | null,
@@ -67,157 +80,144 @@ export async function POST(req: Request) {
                                 paidAt: new Date(),
                             },
                         });
-                        if (result.count === 0) return null;
-
-                        const schedule = await tx.estimatePaymentSchedule.findUnique({
-                            where: { id: metadata.estimatePaymentScheduleId },
-                            include: { estimate: true },
-                        });
-
-                        const estimate = schedule!.estimate;
-                        const newBalance = Math.max(0, Number(estimate.balanceDue || 0) - Number(schedule!.amount));
-                        const newStatus = newBalance <= 0 ? "Paid" : estimate.status;
-
-                        await tx.estimate.update({
-                            where: { id: estimate.id },
+                        const alreadyPaid = claim.count === 0;
+                        const siblings = await t.paymentSchedule.findMany({ where: { invoiceId } });
+                        const invoice = await t.invoice.findUnique({ where: { id: invoiceId }, include: { client: true } });
+                        if (!invoice) return { alreadyPaid, invoice: null as null, paidSchedule: null as null, newBalance: 0 };
+                        const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+                        const newStatus = newBalance <= 0
+                            ? "Paid"
+                            : totalPaid > 0 ? "Partially Paid"
+                            : invoice.status;
+                        await t.invoice.update({
+                            where: { id: invoiceId },
                             data: { balanceDue: newBalance, status: newStatus },
                         });
-
-                        return schedule;
-                    });
-
-                    if (!updatedEstSchedule) {
-                        console.log(`[webhook] EstimatePaymentSchedule ${metadata.estimatePaymentScheduleId} already paid — skipping duplicate event ${event.id}`);
-                        break;
-                    }
-
-                    const estimate = updatedEstSchedule.estimate;
-                    const newEstBalance = Math.max(0, Number(estimate.balanceDue || 0) - Number(updatedEstSchedule.amount));
-
-                    const estSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                    if (estSettings?.notificationEmail) {
-                        await sendNotification(
-                            estSettings.notificationEmail,
-                            `Estimate Payment Received: ${updatedEstSchedule.name} - ${estimate.code}`,
-                            `<div style="font-family: sans-serif; padding: 20px;">
-                                <h2>Estimate Payment Received! 🎉</h2>
-                                <p>A payment of <strong>${formatCurrency(updatedEstSchedule.amount)}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Estimate #${estimate.code}.</p>
-                                <p>Milestone: ${updatedEstSchedule.name}</p>
-                                <p>Remaining Estimate Balance: ${formatCurrency(newEstBalance)}</p>
-                            </div>`
-                        );
-                    }
-
-                    // Post activity to message thread if project-linked
-                    const projectId = estimate.projectId;
-                    if (projectId) {
-                        try {
-                            let thread = await prisma.messageThread.findFirst({
-                                where: { projectId, subcontractorId: null },
-                            });
-                            if (!thread) {
-                                thread = await prisma.messageThread.create({
-                                    data: { projectId, subcontractorId: null },
-                                });
-                            }
-                            await prisma.message.create({
-                                data: {
-                                    threadId: thread.id,
-                                    senderType: "CLIENT",
-                                    senderName: "System",
-                                    body: `💰 Estimate payment received: ${formatCurrency(updatedEstSchedule.amount)} via ${paymentMethod.toUpperCase()} for Estimate #${estimate.code} — ${updatedEstSchedule.name}`,
-                                },
-                            });
-                        } catch (e) {
-                            console.error("[webhook] Failed to post estimate payment activity:", e);
+                        // Durable notification enqueued in-tx (delivered by the drainer below).
+                        if (!alreadyPaid) {
+                            await enqueueMilestonePaid(t, { scheduleId, scheduleType: "invoice" });
                         }
+                        const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
+                        return { alreadyPaid, invoice, paidSchedule, newBalance };
+                    }));
+                    if (!tx.alreadyPaid) {
+                        await drainPaymentNotifications({ scheduleId }).catch(() => {});
                     }
-                    break;
                 }
-
-                // ── Invoice payment branch ───────────────────────────────────
-                if (!metadata?.paymentScheduleId || !metadata?.invoiceId) {
-                    console.error("Missing metadata in session:", session.id);
-                    break;
-                }
-
-                // Idempotency: skip if already paid (duplicate webhook delivery)
-                const existingSchedule = await prisma.paymentSchedule.findUnique({
-                    where: { id: metadata.paymentScheduleId },
-                    select: { status: true, stripePaymentIntentId: true }
-                });
-                if (existingSchedule?.status === "Paid") {
-                    console.log(`[webhook] PaymentSchedule ${metadata.paymentScheduleId} already paid — skipping duplicate event ${event.id}`);
-                    break;
-                }
-
-                // Atomic: update schedule and invoice together
-                const [updatedSchedule] = await prisma.$transaction(async (tx) => {
-                    const schedule = await tx.paymentSchedule.update({
-                        where: { id: metadata.paymentScheduleId },
-                        data: {
-                            status: "Paid",
-                            stripePaymentIntentId: session.payment_intent as string | null,
-                            paymentMethod: paymentMethod,
-                            paymentDate: new Date(),
-                            paidAt: new Date(),
-                        },
-                        include: { invoice: true }
-                    });
-
-                    const invoice = schedule.invoice;
-                    const newBalance = Math.max(0, Number(invoice.balanceDue || 0) - Number(schedule.amount));
-                    const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
-
-                    await tx.invoice.update({
-                        where: { id: invoice.id },
-                        data: { balanceDue: newBalance, status: newStatus }
-                    });
-
-                    return [schedule];
-                });
-
-                const invoice = updatedSchedule.invoice;
-                const newBalance = Math.max(0, Number(invoice.balanceDue || 0) - Number(updatedSchedule.amount));
-                const newStatus = newBalance <= 0 ? "Paid" : invoice.status;
-
-                // Send notification email
-                const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                if (settings?.notificationEmail) {
-                    await sendNotification(
-                        settings.notificationEmail,
-                        `Payment Received: ${updatedSchedule.name} - ${invoice.code}`,
-                        `<div style="font-family: sans-serif; padding: 20px;">
-                            <h2>Payment Received! 🎉</h2>
-                            <p>A payment of <strong>${formatCurrency(updatedSchedule.amount)}</strong> has been successfully processed via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code}.</p>
-                            <p>Milestone: ${updatedSchedule.name}</p>
-                            <p>Remaining Invoice Balance: ${formatCurrency(newBalance)}</p>
-                        </div>`
-                    );
-                }
-
-                // Post payment activity to message thread
-                if (invoice.projectId) {
-                    try {
-                        let thread = await prisma.messageThread.findFirst({
-                            where: { projectId: invoice.projectId, subcontractorId: null },
+                // ── Estimate payment branch ─────────────────────────────────
+                else if (metadata?.estimatePaymentScheduleId && metadata?.estimateId) {
+                    // Single transaction: claim + sibling-read + parent update. See invoice branch for rationale.
+                    const scheduleId = metadata.estimatePaymentScheduleId;
+                    const estimateId = metadata.estimateId;
+                    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+                        // Canonical lock order: Estimate → Invoice → schedules. Lock the estimate,
+                        // then its (oldest) linked invoice, before the claim + recompute + mirror.
+                        await lockMoneyParents(t, { estimateId });
+                        const lockInv = await t.invoice.findFirst({
+                            where: { estimateId },
+                            // id tiebreaker so the lock target == the mutation target below on a createdAt tie.
+                            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+                            select: { id: true },
                         });
-                        if (!thread) {
-                            thread = await prisma.messageThread.create({
-                                data: { projectId: invoice.projectId, subcontractorId: null },
-                            });
-                        }
-                        await prisma.message.create({
+                        if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
+
+                        const claim = await t.estimatePaymentSchedule.updateMany({
+                            where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
-                                threadId: thread.id,
-                                senderType: "CLIENT",
-                                senderName: "System",
-                                body: `💰 Payment received: ${formatCurrency(updatedSchedule.amount)} via ${paymentMethod.toUpperCase()} for Invoice #${invoice.code} — ${updatedSchedule.name}`,
+                                status: "Paid",
+                                stripePaymentIntentId: session.payment_intent as string | null,
+                                paymentMethod,
+                                paymentDate: new Date(),
+                                paidAt: new Date(),
                             },
                         });
-                    } catch (e) {
-                        console.error("[webhook] Failed to post payment activity:", e);
+                        const alreadyPaid = claim.count === 0;
+                        const siblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId } });
+                        const updatedSchedule = await t.estimatePaymentSchedule.findUniqueOrThrow({
+                            where: { id: scheduleId },
+                            include: {
+                                estimate: {
+                                    include: {
+                                        project: { include: { client: true } },
+                                        lead: { include: { client: true } },
+                                    },
+                                },
+                            },
+                        });
+                        const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                        const estimateTotal = toNum(updatedSchedule.estimate.totalAmount);
+                        const newBalance = Math.max(0, estimateTotal - totalPaid);
+                        
+                        // If this is the first payment being logged, track statusBeforePayment
+                        const isFirstPayment = !updatedSchedule.estimate.statusBeforePayment;
+                        const newStatus = newBalance <= 0
+                            ? "Paid"
+                            : totalPaid > 0 ? "Partially Paid"
+                            : updatedSchedule.estimate.status;
+
+                        await t.estimate.update({
+                            where: { id: estimateId },
+                            data: {
+                                balanceDue: newBalance,
+                                status: newStatus,
+                                ...(isFirstPayment && { statusBeforePayment: updatedSchedule.estimate.status }),
+                            },
+                        });
+
+                        // Signing auto-creates an invoice whose milestones mirror this
+                        // schedule — settle the matching copy too so the job can't be
+                        // billed twice (estimate-side Stripe + invoice-side QB/manual).
+                        if (!alreadyPaid) {
+                            // Fetch the SAME invoice we locked in the preamble by id — not a fresh
+                            // findFirst — so the mirror mutates exactly the locked row even if the
+                            // "oldest" ordering shifts concurrently between the two reads.
+                            const linkedInvoice = lockInv
+                                ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+                                : null;
+                            if (linkedInvoice) {
+                                const copy = linkedInvoice.payments.find(p =>
+                                    p.status !== "Paid" &&
+                                    p.name === updatedSchedule.name &&
+                                    toNum(p.amount) === toNum(updatedSchedule.amount)
+                                );
+                                if (copy) {
+                                    await t.paymentSchedule.update({
+                                        where: { id: copy.id },
+                                        data: {
+                                            status: "Paid",
+                                            paymentMethod,
+                                            paymentDate: new Date(),
+                                            paidAt: new Date(),
+                                            stripePaymentIntentId: (session.payment_intent as string | null) ?? null,
+                                        },
+                                    });
+                                    const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                                    const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                    const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                                    await t.invoice.update({
+                                        where: { id: linkedInvoice.id },
+                                        data: {
+                                            balanceDue: invBalance,
+                                            status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                        // Durable notification enqueued in-tx (estimate-side, matching the
+                        // pre-outbox behavior for a deposit paid before/at signing).
+                        if (!alreadyPaid) {
+                            await enqueueMilestonePaid(t, { scheduleId, scheduleType: "estimate" });
+                        }
+                        return { alreadyPaid, updatedSchedule, newBalance };
+                    }));
+                    if (!tx.alreadyPaid) {
+                        await drainPaymentNotifications({ scheduleId }).catch(() => {});
                     }
+                }
+                else {
+                    console.error("Missing metadata in session:", session.id);
                 }
                 break;
             }
@@ -225,38 +225,32 @@ export async function POST(req: Request) {
                 const session = event.data.object as any;
                 const metadata = session.metadata;
 
-                // Estimate branch
-                if (metadata?.estimatePaymentScheduleId) {
-                    await prisma.estimatePaymentSchedule.updateMany({
-                        where: { id: metadata.estimatePaymentScheduleId, status: { not: "Paid" } },
-                        data: { status: "Pending", stripeSessionId: null },
+                // Invoice payment failure
+                if (metadata?.paymentScheduleId) {
+                    await prisma.paymentSchedule.update({
+                        where: { id: metadata.paymentScheduleId },
+                        data: { status: "Pending" }
                     });
-                    const estFailSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                    if (estFailSettings?.notificationEmail) {
-                        await sendNotification(
-                            estFailSettings.notificationEmail,
-                            `🚨 ACH Estimate Payment Failed`,
-                            `<p>An ACH payment for estimate milestone <strong>${metadata.estimatePaymentScheduleId}</strong> has failed to settle.</p>
-                             <p>Please check your Stripe dashboard for details.</p>`
-                        );
-                    }
+                }
+                // Estimate payment failure
+                else if (metadata?.estimatePaymentScheduleId) {
+                    await prisma.estimatePaymentSchedule.update({
+                        where: { id: metadata.estimatePaymentScheduleId },
+                        data: { status: "Pending" }
+                    });
+                }
+                else {
                     break;
                 }
 
-                // Invoice branch
-                if (!metadata?.paymentScheduleId) break;
-
-                await prisma.paymentSchedule.update({
-                    where: { id: metadata.paymentScheduleId },
-                    data: { status: "Pending" }
-                });
-
-                const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                if (settings?.notificationEmail) {
+                const failSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                if (failSettings?.notificationEmail) {
+                    const milestoneId = metadata.paymentScheduleId || metadata.estimatePaymentScheduleId;
+                    const docType = metadata.paymentScheduleId ? "invoice" : "estimate";
                     await sendNotification(
-                        settings.notificationEmail,
-                        `🚨 ACH Payment Failed`,
-                        `<p>An ACH payment for milestone <strong>${metadata.paymentScheduleId}</strong> has failed to settle.</p>
+                        failSettings.notificationEmail,
+                        `ACH Payment Failed`,
+                        `<p>An ACH payment for ${docType} milestone <strong>${milestoneId}</strong> has failed to settle.</p>
                          <p>Please check your Stripe dashboard for details.</p>`
                     );
                 }
@@ -267,72 +261,133 @@ export async function POST(req: Request) {
                 const paymentIntentId: string | null = charge.payment_intent ?? null;
                 if (!paymentIntentId) break;
 
-                // Use this-event refund amount (not cumulative amount_refunded)
-                const refundedAmount = (charge.refunds?.data?.[0]?.amount ?? charge.amount_refunded ?? 0) / 100;
+                const chargeAmount = (charge.amount ?? 0) / 100;
+                const refundedAmount = (charge.amount_refunded ?? 0) / 100;
+                // Only reset the schedule to Pending when the charge is FULLY refunded.
+                // Partial refunds leave the schedule Paid and notify the office so the
+                // bookkeeper can reconcile manually; Stripe's `charge.refunded` fires on
+                // every partial refund and on the final full refund.
+                const isFullyRefunded = chargeAmount > 0
+                    && Math.abs(chargeAmount - refundedAmount) < 0.005;
 
-                // Check estimate payment schedule first
+                // Try invoice payment schedule first
+                const invoiceSchedule = await prisma.paymentSchedule.findFirst({
+                    where: { stripePaymentIntentId: paymentIntentId },
+                    include: { invoice: true },
+                });
+
+                if (invoiceSchedule) {
+                    if (isFullyRefunded) {
+                        // Full refund: reset the schedule and recompute the invoice in one transaction
+                        // so we don't race with a concurrent payment settlement on a sibling schedule.
+                        await withTxRetry(() => prisma.$transaction(async (t) => {
+                            // Canonical Estimate → Invoice → schedules order; this branch touches
+                            // only the invoice. Lock it first so a concurrent settle on a sibling
+                            // milestone can't have its balanceDue effect lost to this recompute.
+                            await lockMoneyParents(t, { invoiceId: invoiceSchedule.invoiceId });
+                            // Re-read the parent AFTER the lock — the outer query's snapshot of
+                            // totalAmount/status may be stale if a concurrent flow changed it.
+                            const invoice = await t.invoice.findUnique({ where: { id: invoiceSchedule.invoiceId } });
+                            if (invoice) {
+                                await t.paymentSchedule.update({
+                                    where: { id: invoiceSchedule.id },
+                                    data: { status: "Pending", paidAt: null, paymentDate: null },
+                                });
+                                const siblings = await t.paymentSchedule.findMany({
+                                    where: { invoiceId: invoiceSchedule.invoiceId },
+                                });
+                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+                                const newStatus = newBalance <= 0
+                                    ? "Paid"
+                                    : totalPaid > 0 ? "Partially Paid"
+                                    : "Issued";
+                                await t.invoice.update({
+                                    where: { id: invoice.id },
+                                    data: { balanceDue: newBalance, status: newStatus },
+                                });
+                            }
+                        }));
+                    }
+
+                    const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                    if (refundSettings?.notificationEmail) {
+                        // `charge.amount_refunded` is the CUMULATIVE refund total, so this message reflects
+                        // total-refunded-so-far, not this delivery's delta. We frame it that way explicitly.
+                        const summary = isFullyRefunded
+                            ? `The schedule has been reset to Pending and the invoice balance restored.`
+                            : `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile the invoice balance manually in the Stripe dashboard.`;
+                        await sendNotification(
+                            refundSettings.notificationEmail,
+                            `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: Invoice ${invoiceSchedule.invoice.code}`,
+                            `<div style="font-family: sans-serif; padding: 20px;">
+                                <h2>Refund Processed</h2>
+                                <p>Total refunded to date: <strong>${formatCurrency(refundedAmount)}</strong> of ${formatCurrency(chargeAmount)} on Invoice #${invoiceSchedule.invoice.code} (milestone: ${invoiceSchedule.name}).</p>
+                                <p>${summary}</p>
+                            </div>`
+                        );
+                    }
+                    break;
+                }
+
+                // Try estimate payment schedule
                 const estSchedule = await prisma.estimatePaymentSchedule.findFirst({
                     where: { stripePaymentIntentId: paymentIntentId },
                     include: { estimate: true },
                 });
+
                 if (estSchedule) {
-                    if (estSchedule.status !== "Paid") break;
-                    await prisma.$transaction(async (tx) => {
-                        await tx.estimatePaymentSchedule.update({
-                            where: { id: estSchedule.id },
-                            data: { status: "Pending", paidAt: null },
-                        });
-                        await tx.estimate.update({
-                            where: { id: estSchedule.estimate.id },
-                            data: {
-                                balanceDue: Number(estSchedule.estimate.balanceDue || 0) + refundedAmount,
-                                status: "Approved",
-                            },
-                        });
-                    });
-                    break;
-                }
+                    if (isFullyRefunded) {
+                        await withTxRetry(() => prisma.$transaction(async (t) => {
+                            // Canonical Estimate → Invoice → schedules order; this branch touches
+                            // only the estimate. Lock it first so a concurrent settle on a sibling
+                            // milestone can't have its balanceDue effect lost to this recompute.
+                            await lockMoneyParents(t, { estimateId: estSchedule.estimateId });
+                            // Re-read the parent AFTER the lock — the outer query's snapshot of
+                            // totalAmount/status may be stale if a concurrent flow changed it.
+                            const estimate = await t.estimate.findUnique({ where: { id: estSchedule.estimateId } });
+                            if (estimate) {
+                                await t.estimatePaymentSchedule.update({
+                                    where: { id: estSchedule.id },
+                                    data: { status: "Pending", paidAt: null, paymentDate: null },
+                                });
+                                const siblings = await t.estimatePaymentSchedule.findMany({
+                                    where: { estimateId: estSchedule.estimateId },
+                                });
+                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+                                const newStatus =
+                                    totalPaid === 0 ? estimate.statusBeforePayment ?? "Approved"
+                                    : newBalance <= 0 ? "Paid"
+                                    : "Partially Paid";
 
-                // Find the payment schedule tied to this payment intent and reverse it
-                const schedule = await prisma.paymentSchedule.findFirst({
-                    where: { stripePaymentIntentId: paymentIntentId },
-                    include: { invoice: true },
-                });
-                if (!schedule) break;
+                                await t.estimate.update({
+                                    where: { id: estimate.id },
+                                    data: {
+                                        balanceDue: newBalance,
+                                        status: newStatus,
+                                        ...(totalPaid === 0 && { statusBeforePayment: null }),
+                                    },
+                                });
+                            }
+                        }));
+                    }
 
-                // Idempotency: skip if already reversed
-                if (schedule.status === "Pending" || schedule.status === "Refunded") {
-                    console.log(`[webhook] Schedule ${schedule.id} already reversed — skipping duplicate refund event ${event.id}`);
-                    break;
-                }
-
-                // Atomic: reverse schedule and restore invoice together
-                await prisma.$transaction(async (tx) => {
-                    await tx.paymentSchedule.update({
-                        where: { id: schedule.id },
-                        data: { status: "Pending", paidAt: null },
-                    });
-
-                    await tx.invoice.update({
-                        where: { id: schedule.invoice.id },
-                        data: {
-                            balanceDue: Number(schedule.invoice.balanceDue || 0) + refundedAmount,
-                            status: "Sent",
-                        },
-                    });
-                });
-
-                const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                if (refundSettings?.notificationEmail) {
-                    await sendNotification(
-                        refundSettings.notificationEmail,
-                        `Refund Issued: Invoice ${schedule.invoice.code}`,
-                        `<div style="font-family: sans-serif; padding: 20px;">
-                            <h2>Refund Processed</h2>
-                            <p>A refund of <strong>${formatCurrency(refundedAmount)}</strong> was issued for Invoice #${schedule.invoice.code} (milestone: ${schedule.name}).</p>
-                            <p>The payment schedule has been reset to Pending and the invoice balance restored.</p>
-                        </div>`
-                    );
+                    const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                    if (refundSettings?.notificationEmail) {
+                        const summary = isFullyRefunded
+                            ? `The schedule has been reset to Pending and the estimate balance restored.`
+                            : `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile manually.`;
+                        await sendNotification(
+                            refundSettings.notificationEmail,
+                            `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: Estimate ${estSchedule.estimate.code}`,
+                            `<div style="font-family: sans-serif; padding: 20px;">
+                                <h2>Refund Processed</h2>
+                                <p>Total refunded to date: <strong>${formatCurrency(refundedAmount)}</strong> of ${formatCurrency(chargeAmount)} on Estimate #${estSchedule.estimate.code} (milestone: ${estSchedule.name}).</p>
+                                <p>${summary}</p>
+                            </div>`
+                        );
+                    }
                 }
                 break;
             }
@@ -357,18 +412,10 @@ export async function POST(req: Request) {
             case "checkout.session.expired": {
                 const expired = event.data.object as any;
                 const expiredMeta = expired.metadata;
+                const milestoneId = expiredMeta?.paymentScheduleId || expiredMeta?.estimatePaymentScheduleId;
+                if (!milestoneId) break;
 
-                // Estimate branch: clear stale session ID so client can retry
-                if (expiredMeta?.estimatePaymentScheduleId) {
-                    await prisma.estimatePaymentSchedule.updateMany({
-                        where: { id: expiredMeta.estimatePaymentScheduleId, status: { not: "Paid" } },
-                        data: { stripeSessionId: null },
-                    }).catch(() => {});
-                    break;
-                }
-
-                if (!expiredMeta?.paymentScheduleId) break;
-
+                const docType = expiredMeta?.paymentScheduleId ? "invoice" : "estimate";
                 const expiredSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
                 if (expiredSettings?.notificationEmail) {
                     await sendNotification(
@@ -376,8 +423,8 @@ export async function POST(req: Request) {
                         `Checkout Session Expired`,
                         `<div style="font-family: sans-serif; padding: 20px;">
                             <h2>Checkout Session Expired</h2>
-                            <p>A customer did not complete their payment for milestone ID <strong>${expiredMeta.paymentScheduleId}</strong>.</p>
-                            <p>The checkout link has expired. You may resend the invoice if needed.</p>
+                            <p>A customer did not complete their ${docType} payment for milestone ID <strong>${milestoneId}</strong>.</p>
+                            <p>The checkout link has expired. You may resend the ${docType} if needed.</p>
                         </div>`
                     );
                 }
@@ -387,9 +434,74 @@ export async function POST(req: Request) {
                 // Intentionally unhandled — Stripe sends many event types
                 break;
         }
-    } catch (error) {
-        console.error("Error processing webhook:", error);
-        return new NextResponse("Webhook Handler Error", { status: 500 });
+
+        // Mark as successfully processed
+        await prisma.stripeEvent.update({
+            where: { id: eventId },
+            data: {
+                status: "PROCESSED",
+                processedAt: new Date(),
+                error: null
+            }
+        });
+    } catch (err: any) {
+        console.error(`Error processing StripeEvent ${eventId}:`, err);
+        // Mark as failed and store error
+        await prisma.stripeEvent.update({
+            where: { id: eventId },
+            data: {
+                status: "FAILED",
+                error: err.message || String(err)
+            }
+        });
+    }
+}
+
+export async function POST(req: Request) {
+    const payload = await req.text();
+    const sig = req.headers.get("Stripe-Signature");
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!sig || !webhookSecret) {
+        return new NextResponse("Missing Stripe Signature or Webhook Secret", { status: 400 });
+    }
+
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
+    } catch (err: any) {
+        console.error("Webhook signature verification failed:", err.message);
+        return new NextResponse(`Webhook Error: ${err.message}`, { status: 400 });
+    }
+
+    try {
+        // Record raw verified event into the StripeEvent table for idempotency and durability
+        const stripeEvent = await prisma.stripeEvent.upsert({
+            where: { id: event.id },
+            create: {
+                id: event.id,
+                type: event.type,
+                payload: JSON.stringify(event),
+                status: "PENDING"
+            },
+            update: {} // If it already exists, don't change its state
+        });
+
+        // If the event has already been successfully processed, just return immediately
+        if (stripeEvent.status === "PROCESSED") {
+            return new NextResponse(JSON.stringify({ received: true, alreadyProcessed: true }), { status: 200 });
+        }
+
+        // Schedule background processing of the event using Next.js after() to immediately release the webhook thread
+        after(async () => {
+            await processEvent(event.id);
+        });
+
+    } catch (error: any) {
+        console.error("Error storing StripeEvent:", error);
+        // If we fail to even store the event (e.g. database connection issue), we return 500 so Stripe retries it
+        return new NextResponse("Webhook Database Queueing Error", { status: 500 });
     }
 
     return new NextResponse(JSON.stringify({ received: true }), { status: 200 });

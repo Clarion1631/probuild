@@ -1,5 +1,8 @@
 export type StatusType =
     | "In Progress"
+    | "Substantial Completion"
+    | "Closed Complete"
+    | "Closed Lost"
     | "Closed"
     | "Paid, Ready to Start"
     | "Invoiced"
@@ -20,6 +23,9 @@ interface StatusBadgeProps {
 
 const STATUS_MAP: Record<string, { bg: string; text: string; dot: string }> = {
     "In Progress": { bg: "bg-green-50", text: "text-green-800", dot: "bg-green-500" },
+    "Substantial Completion": { bg: "bg-amber-50", text: "text-amber-800", dot: "bg-amber-500" },
+    "Closed Complete": { bg: "bg-slate-100", text: "text-slate-700", dot: "bg-slate-500" },
+    "Closed Lost": { bg: "bg-rose-50", text: "text-rose-800", dot: "bg-rose-500" },
     "Closed": { bg: "bg-amber-50", text: "text-amber-800", dot: "bg-amber-500" },
     "Paid, Ready to Start": { bg: "bg-slate-100", text: "text-slate-800", dot: "bg-slate-400" },
     "Invoiced": { bg: "bg-emerald-50", text: "text-emerald-800", dot: "bg-emerald-500" },

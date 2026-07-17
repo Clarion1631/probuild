@@ -1,10 +1,39 @@
 import { getEstimateForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import PortalEstimateClient from "./PortalEstimateClient";
 import Link from "next/link";
+import { prisma } from "@/lib/prisma";
 
 export default async function PortalEstimatePage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
+    
+    // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
+    const isNumeric = (str: string) => /^\d+$/.test(str);
+    if (isNumeric(resolvedParams.id)) {
+        const est = await prisma.estimate.findFirst({
+            where: { number: parseInt(resolvedParams.id, 10) },
+            select: { id: true }
+        });
+        if (est) {
+            redirect(`/portal/estimates/${est.id}`);
+        } else {
+            return notFound();
+        }
+    }
+
+    // Self-healing payment state: if a milestone on this estimate's invoice is
+    // still Pending but lives on the QuickBooks rail, pull settled payments NOW
+    // so a client returning from the Intuit pay page sees "Paid" immediately
+    // (the hourly cron remains the backstop).
+    const pendingQB = await prisma.paymentSchedule.findFirst({
+        where: { status: "Pending", qbInvoiceId: { not: null }, invoice: { estimateId: resolvedParams.id } },
+        select: { invoiceId: true },
+    });
+    if (pendingQB) {
+        const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
+        await syncQuickBooksPayments({ invoiceId: pendingQB.invoiceId }).catch(() => {});
+    }
+
     const estimate = await getEstimateForPortal(resolvedParams.id);
     const settings = await getCompanySettings();
 

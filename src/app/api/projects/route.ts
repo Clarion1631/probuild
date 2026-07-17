@@ -1,54 +1,41 @@
 import { NextResponse } from "next/server";
 export const dynamic = 'force-dynamic';
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 
 export async function GET(req: Request) {
-    const session = await getServerSession(authOptions);
-    let user;
-
-    const authHeader = req.headers.get("authorization");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.split(" ")[1];
-        user = await prisma.user.findUnique({ where: { id: token } });
-    }
-
-    if (!user && session?.user?.email) {
-        user = await prisma.user.findUnique({ where: { email: session.user.email } });
-    }
-
-    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const auth = await authenticateMobileOrSession(req);
+    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+    const { user } = auth;
 
     let projects;
 
     if (user.role === 'MANAGER' || user.role === 'ADMIN') {
-        // Admins and Managers see all projects
         projects = await prisma.project.findMany({
-            orderBy: { createdAt: 'desc' }
+            where: { status: { not: "Closed" } },
+            orderBy: { createdAt: 'desc' },
         });
     } else {
-        // Other roles: filter by ProjectAccess records
-        const accessRecords = await prisma.projectAccess.findMany({
-            where: { userId: user.id },
-            select: { projectId: true },
-        });
-        const allowedIds = accessRecords.map(a => a.projectId);
+        const [accessRecords, crewProjects] = await Promise.all([
+            prisma.projectAccess.findMany({
+                where: { userId: user.id },
+                select: { projectId: true },
+            }),
+            prisma.project.findMany({
+                where: { crew: { some: { id: user.id } } },
+                select: { id: true },
+            }),
+        ]);
 
-        if (allowedIds.length === 0) {
-            // Fall back to crew assignment if no ProjectAccess records exist yet
-            projects = await prisma.project.findMany({
-                where: {
-                    crew: { some: { id: user.id } }
-                },
-                orderBy: { createdAt: 'desc' }
-            });
-        } else {
-            projects = await prisma.project.findMany({
-                where: { id: { in: allowedIds } },
-                orderBy: { createdAt: 'desc' }
-            });
-        }
+        const allIds = [...new Set([
+            ...accessRecords.map(a => a.projectId),
+            ...crewProjects.map(p => p.id),
+        ])];
+
+        projects = allIds.length === 0 ? [] : await prisma.project.findMany({
+            where: { id: { in: allIds }, status: { not: "Closed" } },
+            orderBy: { createdAt: 'desc' },
+        });
     }
 
     return NextResponse.json(projects);

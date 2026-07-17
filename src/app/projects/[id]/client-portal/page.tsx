@@ -20,15 +20,20 @@ export default async function ClientPortalPage({ params }: Props) {
     const [project, visibility] = await Promise.all([
         prisma.project.findUnique({
             where: { id },
-            include: { client: { select: { name: true, email: true } } },
+            include: { client: { select: { id: true, name: true, email: true } } },
         }),
         getPortalVisibility(id),
     ]);
 
     if (!project) return <div className="p-8 text-red-500">Project not found.</div>;
 
-    const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild-amber.vercel.app"}/portal/projects/${id}`;
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
     const clientEmail = project.client?.email ?? null;
+    // Staff preview opens the bare page (staff are authed via NextAuth).
+    const previewUrl = `${appUrl}/portal/projects/${id}`;
+    // The link we hand to the client must carry the one-click login token.
+    const { buildClientPortalUrl } = await import("@/lib/client-portal-auth");
+    const portalUrl = await buildClientPortalUrl(project.client?.id, clientEmail, `/portal/projects/${id}`);
 
     const initialState = {
         isPortalEnabled: visibility?.isPortalEnabled ?? true,
@@ -57,7 +62,7 @@ export default async function ClientPortalPage({ params }: Props) {
                     </p>
                 </div>
                 <Link
-                    href={portalUrl}
+                    href={previewUrl}
                     target="_blank"
                     className="hui-btn hui-btn-secondary text-sm flex items-center gap-2"
                 >

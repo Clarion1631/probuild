@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { sendEstimateToClient, getDocumentTemplates } from "@/lib/actions";
+import { useState, useEffect, useRef } from "react";
+import DOMPurify from "dompurify";
+import { sendEstimateToClient, getDocumentTemplates, generatePdfUploadToken } from "@/lib/actions";
 import { toast } from "sonner";
 
 type Template = { id: string; name: string; type: string; body: string; isDefault: boolean };
@@ -13,9 +14,18 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
     const [previewBody, setPreviewBody] = useState("");
     const [sendToEmail, setSendToEmail] = useState(clientEmail || "");
     const [ccEmails, setCcEmails] = useState("");
+    const [ccError, setCcError] = useState("");
     const [customMessage, setCustomMessage] = useState("");
 
+    // P1.5 — capture state
+    const [capturedPdfUrl, setCapturedPdfUrl] = useState<string | null>(null);
+    const [captureReady, setCaptureReady] = useState(false);
+    const [uploadToken, setUploadToken] = useState<string>("");
+    const iframeRef = useRef<HTMLIFrameElement>(null);
+    const captureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
     useEffect(() => {
+        // Load templates
         getDocumentTemplates().then((data: any[]) => {
             const termsTemplates = data.filter(t => t.type === "terms");
             setTemplates(termsTemplates);
@@ -25,16 +35,94 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                 setPreviewBody(defaultT.body);
             }
         });
-    }, []);
+        // Generate upload token for the capture iframe
+        generatePdfUploadToken(estimateId).then(setUploadToken).catch(console.warn);
+        // C4 — 15 second fallback: if capture hasn't reported back, unblock the Send button
+        captureTimeoutRef.current = setTimeout(() => {
+            setCaptureReady(prev => {
+                if (!prev) console.warn("PDF capture timed out — falling back to server-side generation");
+                return true;
+            });
+        }, 15_000);
+        return () => {
+            if (captureTimeoutRef.current) clearTimeout(captureTimeoutRef.current);
+        };
+    }, [estimateId]);
 
     useEffect(() => {
         const t = templates.find(t => t.id === selectedTemplateId);
         setPreviewBody(t?.body || "");
     }, [selectedTemplateId, templates]);
 
+    // Listen for the capture postMessage from the hidden iframe
+    useEffect(() => {
+        async function handleMessage(e: MessageEvent) {
+            if (e.origin !== window.location.origin) return;
+            if (e.data?.type !== "estimate-capture-done") return;
+
+            // Cancel the 15s timeout — we got a response
+            if (captureTimeoutRef.current) {
+                clearTimeout(captureTimeoutRef.current);
+                captureTimeoutRef.current = null;
+            }
+
+            if (e.data.error || !e.data.dataUrl) {
+                console.warn("PDF capture failed:", e.data.error);
+                // Fallback: allow sending without captured PDF (server-side fallback will be used)
+                setCaptureReady(true);
+                return;
+            }
+
+            try {
+                // Convert dataUrl → blob → upload to pdf-upload route
+                const res = await fetch(e.data.dataUrl);
+                const blob = await res.blob();
+                const formData = new FormData();
+                formData.append("pdf", blob, `Estimate_${estimateId}.pdf`);
+
+                // Include the HMAC upload token from e.data or fall back to the one we generated
+                const token = e.data.uploadToken || uploadToken;
+                const uploadRes = await fetch(`/api/portal/estimates/${estimateId}/pdf-upload`, {
+                    method: "POST",
+                    headers: token ? { "x-upload-token": token } : {},
+                    body: formData,
+                });
+
+                if (uploadRes.ok) {
+                    const json = await uploadRes.json();
+                    setCapturedPdfUrl(json.url);
+                } else {
+                    console.warn("PDF upload failed, falling back to server-side generation");
+                }
+            } catch (err) {
+                console.warn("PDF capture upload error:", err);
+            } finally {
+                setCaptureReady(true);
+            }
+        }
+
+        window.addEventListener("message", handleMessage);
+        return () => window.removeEventListener("message", handleMessage);
+    }, [estimateId, uploadToken]);
+
+    function validateCc(raw: string): string {
+        if (!raw.trim()) return "";
+        const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        const parts = raw.split(",").map(e => e.trim()).filter(Boolean);
+        if (parts.length > 20) return "Too many CC recipients (max 20).";
+        const invalid = parts.filter(e => !EMAIL_REGEX.test(e));
+        if (invalid.length > 0) return `Invalid: ${invalid.join(", ")}`;
+        return "";
+    }
+
     async function handleSend() {
         if (!sendToEmail.trim()) {
             toast.error("Please enter an email address.");
+            return;
+        }
+        const ccValidation = validateCc(ccEmails);
+        if (ccValidation) {
+            toast.error(ccValidation);
             return;
         }
         setIsSending(true);
@@ -45,19 +133,35 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                 selectedTemplateId || undefined,
                 sendToEmail.trim(),
                 ccList.length > 0 ? ccList : undefined,
-                customMessage.trim() || undefined
+                customMessage.trim() || undefined,
+                capturedPdfUrl || undefined
             );
+            if (!result.success) {
+                toast.error(result.error || "Failed to send estimate");
+                return;
+            }
             toast.success(`Estimate sent to ${result.sentTo}`);
             onClose();
         } catch (e: any) {
-            toast.error(e.message || "Failed to send estimate");
+            toast.error("An unexpected error occurred. Please try again.");
         } finally {
             setIsSending(false);
         }
     }
 
+    const isConfirmDisabled = isSending || !sendToEmail.trim() || !!ccError || !captureReady;
+
     return (
         <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
+            {/* Hidden capture iframe — loads portal estimate in capture mode */}
+            <iframe
+                ref={iframeRef}
+                src={uploadToken ? `/portal/estimates/${estimateId}?capture=1&upload_token=${encodeURIComponent(uploadToken)}` : undefined}
+                title="pdf-capture"
+                style={{ position: "fixed", top: -9999, left: -9999, width: 960, height: 1400, opacity: 0, pointerEvents: "none" }}
+                aria-hidden="true"
+            />
+
             <div className="bg-white rounded-xl shadow-xl max-w-lg w-full overflow-hidden border border-hui-border max-h-[85vh] flex flex-col">
                 <div className="px-6 py-4 border-b border-hui-border flex justify-between items-center shrink-0">
                     <div>
@@ -93,11 +197,13 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                             <input
                                 type="text"
                                 value={ccEmails}
-                                onChange={e => setCcEmails(e.target.value)}
+                                onChange={e => { setCcEmails(e.target.value); setCcError(validateCc(e.target.value)); }}
+                                onBlur={e => setCcError(validateCc(e.target.value))}
                                 placeholder="email1@example.com, email2@example.com"
                                 className="flex-1 text-sm text-hui-textMain bg-transparent focus:outline-none"
                             />
                         </div>
+                        {ccError && <p className="text-xs text-red-500 mt-1">{ccError}</p>}
                     </div>
 
                     {/* Custom Message */}
@@ -133,15 +239,35 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
                             <label className="block text-sm font-medium text-hui-textMain mb-1">Preview</label>
                             <div
                                 className="bg-slate-50 rounded-lg border border-hui-border p-4 text-sm text-slate-700 max-h-48 overflow-y-auto prose prose-sm"
-                                dangerouslySetInnerHTML={{ __html: previewBody }}
+                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(previewBody) }}
                             />
+                        </div>
+                    )}
+
+                    {/* Capture status */}
+                    {!captureReady && (
+                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                            <svg className="animate-spin w-3.5 h-3.5 text-indigo-500 shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                            Generating PDF attachment…
+                        </div>
+                    )}
+                    {captureReady && capturedPdfUrl && (
+                        <div className="flex items-center gap-2 text-xs text-green-700">
+                            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                            PDF ready — will be attached to the email.
+                        </div>
+                    )}
+                    {captureReady && !capturedPdfUrl && (
+                        <div className="flex items-center gap-2 text-xs text-amber-700">
+                            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                            PDF will be generated from template (portal capture unavailable).
                         </div>
                     )}
                 </div>
 
                 <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 shrink-0 bg-slate-50">
                     <button onClick={onClose} className="hui-btn hui-btn-secondary" disabled={isSending}>Cancel</button>
-                    <button onClick={handleSend} disabled={isSending || !sendToEmail.trim()} className="hui-btn hui-btn-green flex items-center gap-2">
+                    <button onClick={handleSend} disabled={isConfirmDisabled} className="hui-btn hui-btn-green flex items-center gap-2 disabled:opacity-50">
                         {isSending ? (
                             <>
                                 <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>

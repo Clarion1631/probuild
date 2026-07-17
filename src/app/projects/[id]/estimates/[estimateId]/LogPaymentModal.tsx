@@ -8,7 +8,7 @@ interface LogPaymentModalProps {
     estimateId: string;
     balanceDue: number;
     onClose: () => void;
-    onSaved: () => void;
+    onSaved: (result: any) => void;
 }
 
 export default function LogPaymentModal({ estimateId, balanceDue, onClose, onSaved }: LogPaymentModalProps) {
@@ -27,14 +27,14 @@ export default function LogPaymentModal({ estimateId, balanceDue, onClose, onSav
         setIsSaving(true);
         try {
             const { logEstimatePayment } = await import("@/lib/actions");
-            await logEstimatePayment(estimateId, {
+            const result = await logEstimatePayment(estimateId, {
                 amount: parseFloat(amount),
                 paymentMethod,
                 date: new Date(date).toISOString(),
                 referenceNumber: referenceNumber || undefined,
             });
             toast.success("Payment logged");
-            onSaved();
+            onSaved(result);
             onClose();
         } catch (err: any) {
             toast.error(err.message || "Failed to log payment");

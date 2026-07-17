@@ -1,7 +1,7 @@
 import { getProject, getProjectInvoices } from "@/lib/actions";
 import InvoiceListClient from "./InvoiceListClient";
 
-export default async function ProjectInvoices({ params }: { params: { id: string } }) {
+export default async function ProjectInvoices({ params }: { params: Promise<{ id: string }> }) {
     const { id } = await params;
     const project = await getProject(id);
     if (!project) return <div className="p-6 text-hui-textMain">Project not found</div>;

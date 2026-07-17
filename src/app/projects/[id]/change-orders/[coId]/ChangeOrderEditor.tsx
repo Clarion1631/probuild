@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, approveChangeOrder } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
 
 export default function ChangeOrderEditor({ context, initialData }: { context: any, initialData: any }) {
     const router = useRouter();
@@ -20,52 +21,75 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [showSignModal, setShowSignModal] = useState(false);
     const [signName, setSignName] = useState("");
     const [isSigning, setIsSigning] = useState(false);
+    const [isSending, setIsSending] = useState(false);
 
-    const subtotal = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const tax = subtotal * 0.088;
-    const total = subtotal + tax;
+    // A signed CO is a contract: its items are locked (the server rejects item
+    // writes on Approved COs; only title/description remain editable).
+    const isApproved = initialData.status === "Approved";
+
+    // Same integer-cents math as the server's item sync and billChangeOrderCore,
+    // so the Revised Amount shown here is exactly what billing will charge.
+    // Tax follows the estimate's treatment (tax-exempt customers pay none) — kept
+    // in sync with the portal signature page and billChangeOrderCore via lib/co-tax.
+    const subtotal = coItemsSubtotal(items);
+    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    const total = Math.round((subtotal + tax) * 100) / 100;
+    const taxLabel = coTaxLabel(initialData.estimate);
 
     async function handleSign() {
         if (!signName.trim()) { toast.error("Please enter a name to sign"); return; }
         setIsSigning(true);
         try {
-            await approveChangeOrder(initialData.id, signName.trim(), "", navigator.userAgent);
-            toast.success("Change order signed");
+            // Company countersignature — writes only the company fields and never
+            // touches the customer's approval (see countersignChangeOrderAsCompany).
+            await countersignChangeOrderAsCompany(initialData.id, signName.trim());
+            toast.success("Change order countersigned");
             setShowSignModal(false);
             router.refresh();
-        } catch {
-            toast.error("Failed to sign change order");
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to countersign change order");
         } finally {
             setIsSigning(false);
         }
     }
 
-    async function handleSave() {
-        if (isDeleting) return; // Prevent saving if we are in the middle of deleting
+    // Returns whether the save persisted — the send flow must not email the client
+    // a signature request when the save failed (they'd sign the stale amounts).
+    async function handleSave(): Promise<boolean> {
+        if (isDeleting) return false; // Prevent saving if we are in the middle of deleting
         setIsSaving(true);
         const mappedItems = items.map((item, index) => ({
-            ...item,
+            id: item.id,
+            name: item.name,
+            description: item.description || null,
+            type: item.type,
+            quantity: parseFloat(item.quantity) || 0,
+            unitCost: parseFloat(item.unitCost) || 0,
             order: index,
-            total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
+            costCodeId: item.costCodeId || null,
+            costTypeId: item.costTypeId || null,
         }));
-        
-        // Use standard update behavior (just save the primitive fields for now, items sync require robust backend diff logic similar to estimates)
-        // Since our backend `updateChangeOrder` primarily saves primitive fields, we will adapt it.
-        // For line items, ideally we sync them. But for simplicity let's assume they were created correctly and we just update amounts/names.
+
         try {
+            // The server syncs the items and recomputes totalAmount from them as the
+            // PRE-TAX subtotal (billing adds the estimate's tax on top) — sending a
+            // tax-inclusive total here is what inflated billed amounts before.
+            // Status is never sent: sendChangeOrderToClientCore owns Draft -> Sent,
+            // and Approved/Declined belong to the signature flows.
             await updateChangeOrder(initialData.id, {
                 title,
                 description,
-                status,
-                totalAmount: total,
-                balanceDue: total // simplistic approach
+                ...(isApproved ? {} : { items: mappedItems }),
             });
             toast.success("Change Order saved");
             router.refresh();
-        } catch(e) {
-            toast.error("Failed to save CO");
+            return true;
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to save CO");
+            return false;
+        } finally {
+            setIsSaving(false);
         }
-        setIsSaving(false);
     }
 
     async function handleDelete() {
@@ -167,15 +191,35 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                         Delete
                     </button>
                     <button
-                        onClick={() => {
-                            if (confirm("Mark as Sent and lock editing?")) {
-                                setStatus("Sent");
-                                handleSave();
+                        disabled={isSending}
+                        onClick={async () => {
+                            if (!confirm("Save and send this change order to the client for approval?")) return;
+                            setIsSending(true);
+                            try {
+                                // Save first, then send email. A failed save must
+                                // abort the send — otherwise the client is asked to
+                                // sign amounts that never persisted. The Sent status
+                                // is owned by sendChangeOrderToClientCore; the local
+                                // badge only updates after a confirmed send.
+                                const saved = await handleSave();
+                                if (!saved) return;
+                                const result = await sendChangeOrderToClient(initialData.id);
+                                if (result.success) {
+                                    setStatus("Sent");
+                                    toast.success(`Change order sent to ${result.sentTo}`);
+                                    router.refresh();
+                                } else {
+                                    toast.error(result.error || "Failed to send");
+                                }
+                            } catch {
+                                toast.error("Failed to send change order");
+                            } finally {
+                                setIsSending(false);
                             }
                         }}
-                        className="hui-btn hui-btn-secondary bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200"
+                        className="hui-btn hui-btn-secondary bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200 disabled:opacity-50"
                     >
-                        Send for Approval
+                        {isSending ? "Sending..." : "Send for Approval"}
                     </button>
                     <button
                         onClick={handleSave}
@@ -230,13 +274,14 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
 
                                 <div className="divide-y divide-slate-100">
                                     {items.map((item, index) => {
-                                        const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
+                                        const itemTotal = coLineCents(parseFloat(item.quantity) || 0, parseFloat(item.unitCost) || 0) / 100;
                                         return (
                                             <div key={item.id} className="flex items-center px-8 py-3 bg-white group hover:bg-slate-50 transition border-transparent border-l-2">
                                                 <div className="flex-1">
                                                     <input
                                                         type="text"
                                                         value={item.name}
+                                                        disabled={isApproved}
                                                         onChange={e => updateItem(index, "name", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm font-medium text-hui-textMain"
                                                     />
@@ -245,6 +290,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     <input
                                                         type="number"
                                                         value={item.quantity}
+                                                        disabled={isApproved}
                                                         onChange={e => updateItem(index, "quantity", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                     />
@@ -254,6 +300,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     <input
                                                         type="number"
                                                         value={item.unitCost}
+                                                        disabled={isApproved}
                                                         onChange={e => updateItem(index, "unitCost", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                     />
@@ -262,9 +309,11 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     {formatCurrency(itemTotal)}
                                                 </div>
                                                 <div className="w-10 pt-1.5 flex justify-end">
-                                                    <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
-                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                    </button>
+                                                    {!isApproved && (
+                                                        <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                        </button>
+                                                    )}
                                                 </div>
                                             </div>
                                         );
@@ -274,14 +323,16 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     )}
                                 </div>
 
-                                <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={addItem}>
-                                    <button className="text-sm font-semibold text-amber-600 group-hover:text-amber-700 flex items-center gap-2 transition">
-                                        <span className="bg-amber-50 text-amber-600 group-hover:bg-amber-100 rounded p-1">
-                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-                                        </span>
-                                        Add New Item
-                                    </button>
-                                </div>
+                                {!isApproved && (
+                                    <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={addItem}>
+                                        <button className="text-sm font-semibold text-amber-600 group-hover:text-amber-700 flex items-center gap-2 transition">
+                                            <span className="bg-amber-50 text-amber-600 group-hover:bg-amber-100 rounded p-1">
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                                            </span>
+                                            Add New Item
+                                        </button>
+                                    </div>
+                                )}
                             </div>
 
                             <div className="bg-slate-50 p-10 flex justify-end border-t border-slate-200">
@@ -291,7 +342,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
                                     <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>Estimated Tax (8.8%)</span>
+                                        <span>{taxLabel}</span>
                                         <span className="text-slate-800">{formatCurrency(tax)}</span>
                                     </div>
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
@@ -364,9 +415,21 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
 
                                 <div className="border border-slate-200 rounded-lg p-6 bg-slate-50/50">
                                     <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">Company Signature</h4>
-                                    {initialData.companySignatureUrl ? (
-                                        <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
-                                            <img src={initialData.companySignatureUrl} alt="Signature" className="max-h-16 opacity-80" />
+                                    {initialData.companySignedBy ? (
+                                        <div className="space-y-4">
+                                            <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
+                                                {initialData.companySignatureUrl ? (
+                                                    <img src={initialData.companySignatureUrl} alt="Signature" className="max-h-16 opacity-80" />
+                                                ) : (
+                                                    <span className="font-editorial text-2xl italic text-slate-800">{initialData.companySignedBy}</span>
+                                                )}
+                                            </div>
+                                            <div className="text-sm text-slate-600">
+                                                <p><strong>Signed By:</strong> {initialData.companySignedBy}</p>
+                                                {initialData.companySignedAt && (
+                                                    <p><strong>Signed At:</strong> {new Date(initialData.companySignedAt).toLocaleString()}</p>
+                                                )}
+                                            </div>
                                         </div>
                                     ) : (
                                         <div className="bg-white border border-slate-200 rounded p-8 text-center flex flex-col items-center justify-center gap-3">

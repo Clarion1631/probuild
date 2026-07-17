@@ -1,6 +1,8 @@
 "use client";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
+import { useState } from "react";
 import Link from "next/link";
+import { formatLocalDateString } from "@/lib/report-utils";
 
 interface TimeEntry {
     id: string;
@@ -13,14 +15,28 @@ interface TimeEntry {
     costCode: { code: string; name: string } | null;
 }
 
+type Option = { id: string; name: string | null };
+
 interface Props {
     entries: TimeEntry[];
     groupBy: string;
+    filterFrom: string;
+    filterTo: string;
+    filterUserId: string;
+    filterProjectId: string;
+    users: Option[];
+    projects: Option[];
 }
 
-export default function TimeBillingClient({ entries, groupBy }: Props) {
+export default function TimeBillingClient({ entries, groupBy, filterFrom, filterTo, filterUserId, filterProjectId, users, projects }: Props) {
     const router = useRouter();
     const pathname = usePathname();
+    const searchParams = useSearchParams();
+
+    const [from, setFrom] = useState(filterFrom);
+    const [to, setTo] = useState(filterTo);
+    const [userId, setUserId] = useState(filterUserId);
+    const [projectId, setProjectId] = useState(filterProjectId);
 
     const totalHours = entries.reduce((s, e) => s + (e.durationHours ?? 0), 0);
     const totalCost = entries.reduce((s, e) => s + (e.laborCost ?? 0), 0);
@@ -28,7 +44,53 @@ export default function TimeBillingClient({ entries, groupBy }: Props) {
     const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0 });
     const fmtH = (n: number) => `${n.toFixed(1)}h`;
 
-    // Group entries
+    function applyFilters(overrides?: { from?: string; to?: string }) {
+        const sp = new URLSearchParams(searchParams.toString());
+        sp.set("from", overrides?.from ?? from);
+        sp.set("to", overrides?.to ?? to);
+        if (userId) sp.set("userId", userId); else sp.delete("userId");
+        if (projectId) sp.set("projectId", projectId); else sp.delete("projectId");
+        router.push(`${pathname}?${sp.toString()}`);
+    }
+
+    function applyPreset(preset: "thisMonth" | "lastMonth" | "thisQuarter" | "lastQuarter" | "ytd") {
+        const now = new Date();
+        let fromDate: Date, toDate: Date;
+        switch (preset) {
+            case "thisMonth":
+                fromDate = new Date(now.getFullYear(), now.getMonth(), 1);
+                toDate = new Date(now.getFullYear(), now.getMonth() + 1, 0); break;
+            case "lastMonth":
+                fromDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+                toDate = new Date(now.getFullYear(), now.getMonth(), 0); break;
+            case "thisQuarter": {
+                const q = Math.floor(now.getMonth() / 3);
+                fromDate = new Date(now.getFullYear(), q * 3, 1);
+                toDate = new Date(now.getFullYear(), q * 3 + 3, 0); break;
+            }
+            case "lastQuarter": {
+                const q = Math.floor(now.getMonth() / 3);
+                const startMonth = q === 0 ? 9 : (q - 1) * 3;
+                const startYear = q === 0 ? now.getFullYear() - 1 : now.getFullYear();
+                fromDate = new Date(startYear, startMonth, 1);
+                toDate = new Date(startYear, startMonth + 3, 0); break;
+            }
+            case "ytd":
+                fromDate = new Date(now.getFullYear(), 0, 1);
+                toDate = now; break;
+        }
+        const fromStr = formatLocalDateString(fromDate!);
+        const toStr = formatLocalDateString(toDate!);
+        setFrom(fromStr); setTo(toStr);
+        applyFilters({ from: fromStr, to: toStr });
+    }
+
+    function switchGroupBy(newGroupBy: string) {
+        const sp = new URLSearchParams(searchParams.toString());
+        sp.set("groupBy", newGroupBy);
+        router.push(`${pathname}?${sp.toString()}`);
+    }
+
     const groups: Record<string, TimeEntry[]> = {};
     for (const e of entries) {
         const key = groupBy === "project" ? e.project.name : (e.user.name ?? "Unknown");
@@ -42,21 +104,59 @@ export default function TimeBillingClient({ entries, groupBy }: Props) {
             <div className="flex items-center justify-between">
                 <div>
                     <h1 className="text-2xl font-bold text-hui-textMain">Time & Billing</h1>
-                    <p className="text-sm text-hui-textMuted mt-1">All time entries with labor cost summary.</p>
+                    <p className="text-sm text-hui-textMuted mt-1">Time entries with labor cost summary · {from} → {to}</p>
                 </div>
                 <div className="flex gap-2">
-                    <button
-                        onClick={() => router.push(`${pathname}?groupBy=employee`)}
-                        className={`hui-btn text-sm ${groupBy === "employee" ? "hui-btn-primary" : "hui-btn-secondary"}`}
-                    >
+                    <button onClick={() => switchGroupBy("employee")}
+                        className={`hui-btn text-sm ${groupBy === "employee" ? "hui-btn-primary" : "hui-btn-secondary"}`}>
                         By Employee
                     </button>
-                    <button
-                        onClick={() => router.push(`${pathname}?groupBy=project`)}
-                        className={`hui-btn text-sm ${groupBy === "project" ? "hui-btn-primary" : "hui-btn-secondary"}`}
-                    >
+                    <button onClick={() => switchGroupBy("project")}
+                        className={`hui-btn text-sm ${groupBy === "project" ? "hui-btn-primary" : "hui-btn-secondary"}`}>
                         By Project
                     </button>
+                </div>
+            </div>
+
+            {/* Filter form */}
+            <div className="hui-card p-4 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mr-2">Quick ranges</span>
+                    {(["thisMonth", "lastMonth", "thisQuarter", "lastQuarter", "ytd"] as const).map(p => (
+                        <button key={p} type="button" onClick={() => applyPreset(p)}
+                            className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-100 text-hui-textMain hover:bg-slate-200 transition">
+                            {{ thisMonth: "This Month", lastMonth: "Last Month", thisQuarter: "This Quarter", lastQuarter: "Last Quarter", ytd: "YTD" }[p]}
+                        </button>
+                    ))}
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                    <div>
+                        <label className="block text-xs text-hui-textMuted mb-1">From</label>
+                        <input type="date" value={from} onChange={e => setFrom(e.target.value)} className="hui-input w-full" />
+                    </div>
+                    <div>
+                        <label className="block text-xs text-hui-textMuted mb-1">To</label>
+                        <input type="date" value={to} onChange={e => setTo(e.target.value)} className="hui-input w-full" />
+                    </div>
+                    <div>
+                        <label className="block text-xs text-hui-textMuted mb-1">Employee</label>
+                        <select value={userId} onChange={e => setUserId(e.target.value)} className="hui-input w-full">
+                            <option value="">All employees</option>
+                            {users.map(u => <option key={u.id} value={u.id}>{u.name ?? u.id}</option>)}
+                        </select>
+                    </div>
+                    <div>
+                        <label className="block text-xs text-hui-textMuted mb-1">Project</label>
+                        <select value={projectId} onChange={e => setProjectId(e.target.value)} className="hui-input w-full">
+                            <option value="">All projects</option>
+                            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                        </select>
+                    </div>
+                </div>
+                <div className="flex justify-end gap-2 pt-2 border-t border-hui-border">
+                    <button type="button" onClick={() => { setUserId(""); setProjectId(""); const sp = new URLSearchParams(); sp.set("from", from); sp.set("to", to); sp.set("groupBy", groupBy); router.push(`${pathname}?${sp.toString()}`); }}
+                        className="hui-btn hui-btn-secondary text-sm">Clear</button>
+                    <button type="button" onClick={() => applyFilters()} className="hui-btn hui-btn-primary text-sm">Apply</button>
                 </div>
             </div>
 
@@ -78,7 +178,7 @@ export default function TimeBillingClient({ entries, groupBy }: Props) {
 
             {/* Groups */}
             {entries.length === 0 ? (
-                <div className="hui-card p-12 text-center text-hui-textMuted text-sm">No time entries recorded yet.</div>
+                <div className="hui-card p-12 text-center text-hui-textMuted text-sm">No time entries in this period.</div>
             ) : (
                 groupKeys.map(key => {
                     const groupEntries = groups[key];

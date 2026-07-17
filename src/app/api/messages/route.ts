@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
 import { sendSMS } from "@/lib/sms";
+import { logActivity } from "@/lib/actions";
 
 // GET /api/messages?projectId=X&subcontractorId=Y — list messages for a project thread
 export async function GET(request: Request) {
@@ -81,6 +82,18 @@ export async function POST(request: Request) {
         },
     });
 
+    // Log client message to activity feed
+    if (senderType === "CLIENT" && !subcontractorId) {
+        await logActivity({
+            projectId,
+            actorType: "CLIENT",
+            actorName: resolvedName,
+            action: "sent_message",
+            entityType: "message",
+            entityId: message.id,
+        });
+    }
+
     // Send email notification
     try {
         const project = await prisma.project.findUnique({
@@ -92,11 +105,13 @@ export async function POST(request: Request) {
         const companyName = settings?.companyName || "Your Contractor";
         const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
+        const msgToggleOn = !settings?.notificationToggles || (() => { try { return JSON.parse(settings.notificationToggles!).messageReceived !== false; } catch { return true; } })();
+
         // Logic for Subcontractor Thread Notifications
         if (subcontractorId) {
             const sub = await prisma.subcontractor.findUnique({ where: { id: subcontractorId } });
-            
-            if (senderType === "SUBCONTRACTOR" && settings?.notificationEmail) {
+
+            if (senderType === "SUBCONTRACTOR" && settings?.notificationEmail && msgToggleOn) {
                 // Sub sent a message → notify the team
                 await sendNotification(
                     settings.notificationEmail,
@@ -149,7 +164,7 @@ export async function POST(request: Request) {
             }
         } else {
             // Client Thread Notifications
-            if (senderType === "CLIENT" && settings?.notificationEmail) {
+            if (senderType === "CLIENT" && settings?.notificationEmail && msgToggleOn) {
                 // Client sent a message → notify the team
                 await sendNotification(
                     settings.notificationEmail,
@@ -176,6 +191,10 @@ export async function POST(request: Request) {
                 );
             } else if (senderType === "TEAM" && project?.client?.email) {
                 // Team sent a message → notify the client
+                const clientAdditionalEmail = (project.client as any)?.additionalEmail as string | undefined;
+                const msgCc = clientAdditionalEmail && clientAdditionalEmail.toLowerCase() !== project.client.email.toLowerCase()
+                    ? [clientAdditionalEmail]
+                    : undefined;
                 await sendNotification(
                     project.client?.email,
                     `${companyName} sent you a message — ${project.name}`,
@@ -197,7 +216,9 @@ export async function POST(request: Request) {
                                 </a>
                             </div>
                         </div>
-                    </body></html>`
+                    </body></html>`,
+                    undefined,
+                    msgCc ? { cc: msgCc } : undefined
                 );
             }
             // Send SMS notification

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import bcrypt from "bcryptjs";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -21,6 +22,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
                 permissions: true,
                 projectAccess: {
                     include: { project: { select: { id: true, name: true, client: { select: { name: true } }, createdAt: true } } }
+                },
+                assignedProjects: {
+                    select: { id: true },
                 },
             },
         });
@@ -53,41 +57,86 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         const { id } = await params;
         const body = await req.json();
-        const { permissions, projectIds, userInfo } = body;
+        const { permissions, projectIds, userInfo, pinCode } = body;
 
         // Update user info if provided
-        if (userInfo) {
+        if (userInfo || pinCode !== undefined) {
             const data: any = {};
-            if (userInfo.name !== undefined) data.name = userInfo.name;
-            if (userInfo.role !== undefined) data.role = userInfo.role;
-            if (userInfo.status !== undefined) data.status = userInfo.status;
-            if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
-            if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+            if (userInfo) {
+                if (userInfo.name !== undefined) data.name = userInfo.name;
+                if (userInfo.role !== undefined) data.role = userInfo.role;
+                if (userInfo.status !== undefined) data.status = userInfo.status;
+                if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
+                if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+            }
+            if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
             if (Object.keys(data).length > 0) {
                 await prisma.user.update({ where: { id }, data });
             }
         }
 
-        // Update permissions if provided
+        // Update permissions if provided (allowlisted fields only)
         if (permissions) {
-            await prisma.userPermission.upsert({
-                where: { userId: id },
-                create: { userId: id, ...permissions },
-                update: permissions,
-            });
-        }
-
-        // Update project access if provided
-        if (projectIds !== undefined) {
-            // Delete all existing access
-            await prisma.projectAccess.deleteMany({ where: { userId: id } });
-            // Re-create with new list
-            if (projectIds.length > 0) {
-                await prisma.projectAccess.createMany({
-                    data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
-                    skipDuplicates: true,
+            const ALLOWED_PERMISSION_FIELDS = [
+                "manageTeamMembers", "manageSubs", "manageVendors", "companySettings",
+                "costCodesCategories", "schedules", "estimates", "invoices", "contracts",
+                "roomDesigner", "changeOrders", "financialReports", "timeClock",
+                "dailyLogs", "files", "takeoffs", "autoGrantNewProjects",
+            ] as const;
+            const sanitized: Record<string, boolean> = {};
+            for (const key of ALLOWED_PERMISSION_FIELDS) {
+                if (key in permissions && typeof permissions[key] === "boolean") {
+                    sanitized[key] = permissions[key];
+                }
+            }
+            if (Object.keys(sanitized).length > 0) {
+                await prisma.userPermission.upsert({
+                    where: { userId: id },
+                    create: { userId: id, ...sanitized },
+                    update: sanitized,
                 });
             }
+        }
+
+        // Update project access AND crew assignments if provided
+        if (projectIds !== undefined) {
+            const newIdSet = new Set(projectIds as string[]);
+
+            // Read current state to compute diffs
+            const currentUser = await prisma.user.findUnique({
+                where: { id },
+                select: {
+                    projectAccess: { select: { projectId: true } },
+                    assignedProjects: { select: { id: true } },
+                },
+            });
+            const oldAccessIds = new Set(currentUser?.projectAccess.map(pa => pa.projectId) || []);
+            const oldCrewIds = new Set(currentUser?.assignedProjects.map(p => p.id) || []);
+
+            // Compute crew diffs: only connect/disconnect what changed via Team Access
+            const toConnect = projectIds.filter((pid: string) => !oldCrewIds.has(pid));
+            const toDisconnect = [...oldAccessIds].filter(pid => !newIdSet.has(pid) && oldCrewIds.has(pid));
+
+            await prisma.$transaction([
+                prisma.projectAccess.deleteMany({ where: { userId: id } }),
+                ...(projectIds.length > 0
+                    ? [prisma.projectAccess.createMany({
+                        data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
+                        skipDuplicates: true,
+                    })]
+                    : []),
+                ...(toConnect.length > 0 || toDisconnect.length > 0
+                    ? [prisma.user.update({
+                        where: { id },
+                        data: {
+                            assignedProjects: {
+                                connect: toConnect.map((pid: string) => ({ id: pid })),
+                                disconnect: toDisconnect.map(pid => ({ id: pid })),
+                            },
+                        },
+                    })]
+                    : []),
+            ]);
         }
 
         // Fetch updated user
@@ -97,6 +146,9 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 permissions: true,
                 projectAccess: {
                     include: { project: { select: { id: true, name: true, client: { select: { name: true } }, createdAt: true } } }
+                },
+                assignedProjects: {
+                    select: { id: true },
                 },
             },
         });
@@ -124,6 +176,15 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
         // Can't delete yourself
         if (id === currentUser.id) {
             return NextResponse.json({ error: "Cannot delete your own account" }, { status: 400 });
+        }
+
+        // Only ADMIN can delete other ADMIN accounts
+        const targetUser = await prisma.user.findUnique({ where: { id }, select: { role: true } });
+        if (!targetUser) {
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
+        }
+        if (targetUser.role === "ADMIN" && currentUser.role !== "ADMIN") {
+            return NextResponse.json({ error: "Only admins can delete admin accounts" }, { status: 403 });
         }
 
         await prisma.user.delete({ where: { id } });

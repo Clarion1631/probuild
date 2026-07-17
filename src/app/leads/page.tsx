@@ -3,12 +3,13 @@ export const dynamic = "force-dynamic";
 
 import { useState, useMemo, useEffect } from "react";
 import Avatar from "@/components/Avatar";
-import { getLeads } from "@/lib/actions";
+import { getLeads, deleteLead, deleteLeads, copyLeads } from "@/lib/actions";
 import Link from "next/link";
 import AddLeadButton from "./AddLeadButton";
 import LeadStageDropdown from "./[id]/LeadStageDropdown";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import BulkActionBar, { DeleteIcon, CopyIcon } from "@/components/BulkActionBar";
 
 type SortKey = "name" | "stage" | "client" | "source" | "projectType" | "targetRevenue" | "lastActivity";
 type SortDir = "asc" | "desc";
@@ -18,7 +19,7 @@ type TabKey = "All" | "New" | "Hot" | "Qualified" | "Won" | "Lost" | "Snoozed" |
 const HOT_STAGES = ["Connected", "Estimate Sent"];
 const QUALIFIED_STAGES = ["Followed Up", "Connected"];
 const WON_STAGE = "Won";
-const LOST_STAGE = "Closed";
+const LOST_STAGE = "Closed Lost";
 const NEW_STAGE = "New";
 
 function TabButton({ active, onClick, count, children }: {
@@ -60,8 +61,6 @@ function SortIcon({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; s
     );
 }
 
-type ScoreResult = { score: number; rating: string; summary: string; topFactors: string[] };
-
 export default function LeadsPage() {
     const [leads, setLeads] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
@@ -72,7 +71,9 @@ export default function LeadsPage() {
     const [sortDir, setSortDir] = useState<SortDir>("desc");
     const [sourceFilter, setSourceFilter] = useState("");
     const [typeFilter, setTypeFilter] = useState("");
-    const [scores, setScores] = useState<Record<string, ScoreResult | "loading">>({});
+    const [deletingId, setDeletingId] = useState<string | null>(null);
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const [isBulking, setIsBulking] = useState(false);
 
     useEffect(() => {
         getLeads().then(data => {
@@ -94,22 +95,72 @@ export default function LeadsPage() {
         }
     }
 
-    async function scoreLead(leadId: string, e: React.MouseEvent) {
+    async function handleDelete(lead: any, e: React.MouseEvent) {
         e.stopPropagation();
-        setScores(prev => ({ ...prev, [leadId]: "loading" }));
+        if (lead.project) {
+            toast.error("This lead has a linked project. Delete the project first before deleting the lead.");
+            return;
+        }
+        if (!confirm(`Delete "${lead.name}"? This cannot be undone.`)) return;
+        setDeletingId(lead.id);
         try {
-            const res = await fetch(`/api/leads/${leadId}/score`, { method: "POST" });
-            if (!res.ok) throw new Error("Score failed");
-            const data: ScoreResult = await res.json();
-            setScores(prev => ({ ...prev, [leadId]: data }));
-            toast.success(`Lead scored: ${data.score}/100 (${data.rating})`);
-        } catch {
-            setScores(prev => {
-                const next = { ...prev };
-                delete next[leadId];
-                return next;
-            });
-            toast.error("Scoring failed. Try again.");
+            await deleteLead(lead.id);
+            setLeads(prev => prev.filter(l => l.id !== lead.id));
+            toast.success("Lead deleted");
+        } catch (err: any) {
+            toast.error(err?.message || "Failed to delete lead");
+        } finally {
+            setDeletingId(null);
+        }
+    }
+
+    async function refreshLeads() {
+        try {
+            const data = await getLeads();
+            setLeads(data);
+        } catch (err) {
+            console.error("[Leads] Failed to refresh:", err);
+        }
+    }
+
+    async function handleBulkDelete() {
+        if (selectedIds.length === 0) return;
+        if (!confirm(`Delete ${selectedIds.length} lead${selectedIds.length === 1 ? "" : "s"}? This cannot be undone.`)) return;
+        setIsBulking(true);
+        try {
+            const res = await deleteLeads(selectedIds);
+            setSelectedIds([]);
+            await refreshLeads();
+            if (res.skipped.length > 0) {
+                toast.success(`Deleted ${res.deleted} · ${res.skipped.length} skipped (${res.skipped[0].reason})`);
+            } else {
+                toast.success(`Deleted ${res.deleted} lead${res.deleted === 1 ? "" : "s"}`);
+            }
+        } catch (err: any) {
+            toast.error(err?.message || "Failed to delete leads");
+        } finally {
+            setIsBulking(false);
+        }
+    }
+
+    async function handleBulkCopy() {
+        if (selectedIds.length === 0) return;
+        setIsBulking(true);
+        try {
+            const res = await copyLeads(selectedIds);
+            setSelectedIds([]);
+            await refreshLeads();
+            if (res.created.length === 0) {
+                toast.error("No leads were copied");
+            } else if (res.skipped.length > 0) {
+                toast.success(`Copied ${res.created.length} lead${res.created.length === 1 ? "" : "s"} · ${res.skipped.length} skipped`);
+            } else {
+                toast.success(`Copied ${res.created.length} lead${res.created.length === 1 ? "" : "s"}`);
+            }
+        } catch (err: any) {
+            toast.error(err?.message || "Failed to copy leads");
+        } finally {
+            setIsBulking(false);
         }
     }
 
@@ -207,6 +258,25 @@ export default function LeadsPage() {
 
     return (
         <div className="max-w-7xl mx-auto py-8 px-6">
+            <BulkActionBar
+                count={selectedIds.length}
+                onClear={() => setSelectedIds([])}
+                actions={[
+                    {
+                        label: "Copy",
+                        icon: CopyIcon,
+                        onClick: handleBulkCopy,
+                        disabled: isBulking,
+                    },
+                    {
+                        label: "Delete",
+                        icon: DeleteIcon,
+                        onClick: handleBulkDelete,
+                        variant: "danger",
+                        disabled: isBulking,
+                    },
+                ]}
+            />
             {/* Header */}
             <div className="flex justify-between items-center mb-6">
                 <div>
@@ -244,60 +314,60 @@ export default function LeadsPage() {
                 </div>
             </div>
 
-            {/* Tabs + Search */}
-            <div className="flex items-end justify-between border-b border-hui-border mb-4">
-                <div className="flex gap-0 overflow-x-auto">
-                    {(["All", "New", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
-                        <TabButton
-                            key={tab}
-                            active={activeTab === tab}
-                            onClick={() => setActiveTab(tab)}
-                            count={tabCounts[tab]}
-                        >
-                            {tab}
-                        </TabButton>
-                    ))}
-                    <div className="w-px bg-slate-200 mx-1 my-2" />
-                    {(["Snoozed", "Archived"] as TabKey[]).map(tab => (
-                        <TabButton
-                            key={tab}
-                            active={activeTab === tab}
-                            onClick={() => setActiveTab(tab)}
-                            count={tabCounts[tab]}
-                        >
-                            {tab}
-                        </TabButton>
-                    ))}
-                </div>
-                <div className="flex items-center gap-2 pb-2">
-                    <input
-                        type="text"
-                        placeholder="Search leads..."
-                        value={searchTerm}
-                        onChange={e => setSearchTerm(e.target.value)}
-                        className="hui-input w-52"
-                    />
-                    {sources.length > 0 && (
-                        <select
-                            value={sourceFilter}
-                            onChange={e => setSourceFilter(e.target.value)}
-                            className="hui-input w-auto"
-                        >
-                            <option value="">All Sources</option>
-                            {sources.map(s => <option key={s} value={s}>{s}</option>)}
-                        </select>
-                    )}
-                    {types.length > 0 && (
-                        <select
-                            value={typeFilter}
-                            onChange={e => setTypeFilter(e.target.value)}
-                            className="hui-input w-auto"
-                        >
-                            <option value="">All Types</option>
-                            {types.map(t => <option key={t} value={t}>{t}</option>)}
-                        </select>
-                    )}
-                </div>
+            {/* Tabs */}
+            <div className="flex gap-0 overflow-x-auto scrollbar-none border-b border-hui-border" style={{ scrollbarWidth: "none" }}>
+                {(["All", "New", "Hot", "Qualified", "Won", "Lost"] as TabKey[]).map(tab => (
+                    <TabButton
+                        key={tab}
+                        active={activeTab === tab}
+                        onClick={() => setActiveTab(tab)}
+                        count={tabCounts[tab]}
+                    >
+                        {tab}
+                    </TabButton>
+                ))}
+                <div className="w-px bg-slate-200 mx-1 my-2" />
+                {(["Snoozed", "Archived"] as TabKey[]).map(tab => (
+                    <TabButton
+                        key={tab}
+                        active={activeTab === tab}
+                        onClick={() => setActiveTab(tab)}
+                        count={tabCounts[tab]}
+                    >
+                        {tab}
+                    </TabButton>
+                ))}
+            </div>
+
+            {/* Search + Filters */}
+            <div className="flex items-center gap-2 mt-3 mb-4">
+                <input
+                    type="text"
+                    placeholder="Search leads..."
+                    value={searchTerm}
+                    onChange={e => setSearchTerm(e.target.value)}
+                    className="hui-input w-52"
+                />
+                {sources.length > 0 && (
+                    <select
+                        value={sourceFilter}
+                        onChange={e => setSourceFilter(e.target.value)}
+                        className="hui-input w-auto"
+                    >
+                        <option value="">All Sources</option>
+                        {sources.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                )}
+                {types.length > 0 && (
+                    <select
+                        value={typeFilter}
+                        onChange={e => setTypeFilter(e.target.value)}
+                        className="hui-input w-auto"
+                    >
+                        <option value="">All Types</option>
+                        {types.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                )}
             </div>
 
             {/* Table */}
@@ -334,6 +404,17 @@ export default function LeadsPage() {
                     <table className="w-full text-sm">
                         <thead className="bg-slate-50 border-b border-hui-border">
                             <tr>
+                                <th scope="col" className="px-4 py-3 w-10 text-center" onClick={e => e.stopPropagation()}>
+                                    <input
+                                        type="checkbox"
+                                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                        checked={filtered.length > 0 && filtered.every((l: any) => selectedIds.includes(l.id))}
+                                        onChange={e => {
+                                            if (e.target.checked) setSelectedIds(filtered.map((l: any) => l.id));
+                                            else setSelectedIds([]);
+                                        }}
+                                    />
+                                </th>
                                 <SORT_HEADER col="name">Lead Name</SORT_HEADER>
                                 <SORT_HEADER col="stage">Stage</SORT_HEADER>
                                 <SORT_HEADER col="client">Client</SORT_HEADER>
@@ -341,21 +422,29 @@ export default function LeadsPage() {
                                 <SORT_HEADER col="targetRevenue">Revenue</SORT_HEADER>
                                 <SORT_HEADER col="source">Source</SORT_HEADER>
                                 <SORT_HEADER col="lastActivity">Last Activity</SORT_HEADER>
-                                <th scope="col" className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider text-center">AI Score</th>
+                                <th scope="col" className="px-6 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider text-center"></th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                             {filtered.map((l: any) => {
-                                const scoreResult = scores[l.id];
-                                const isScoring = scoreResult === "loading";
-                                const scored = scoreResult && scoreResult !== "loading" ? scoreResult as ScoreResult : null;
-
+                                const isSelected = selectedIds.includes(l.id);
                                 return (
                                     <tr
                                         key={l.id}
-                                        className="hover:bg-slate-50 transition cursor-pointer group"
+                                        className={`hover:bg-slate-50 cursor-pointer transition group ${isSelected ? "bg-indigo-50/30" : ""}`}
                                         onClick={() => window.location.href = `/leads/${l.id}`}
                                     >
+                                        <td className="px-4 py-4 text-center" onClick={e => e.stopPropagation()}>
+                                            <input
+                                                type="checkbox"
+                                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                                checked={isSelected}
+                                                onChange={e => {
+                                                    if (e.target.checked) setSelectedIds([...selectedIds, l.id]);
+                                                    else setSelectedIds(selectedIds.filter(id => id !== l.id));
+                                                }}
+                                            />
+                                        </td>
                                         <td className="px-6 py-4 font-medium text-hui-textMain group-hover:text-hui-primary transition">
                                             {l.name}
                                         </td>
@@ -376,36 +465,21 @@ export default function LeadsPage() {
                                         <td className="px-6 py-4 text-hui-textMuted text-xs">
                                             {new Date(l.lastActivityAt || l.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
                                         </td>
-                                        <td className="px-6 py-4 text-center" onClick={e => e.stopPropagation()}>
-                                            {scored ? (
-                                                <div className="flex flex-col items-center gap-1" title={scored.summary}>
-                                                    <span className={`text-sm font-bold ${scored.score >= 70 ? "text-green-600" : scored.score >= 40 ? "text-amber-600" : "text-slate-500"}`}>
-                                                        {scored.score}
-                                                    </span>
-                                                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                                                        scored.rating === "Hot" ? "bg-red-100 text-red-700"
-                                                        : scored.rating === "Warm" ? "bg-amber-100 text-amber-700"
-                                                        : "bg-slate-100 text-slate-600"
-                                                    }`}>
-                                                        {scored.rating}
-                                                    </span>
-                                                </div>
-                                            ) : (
-                                                <button
-                                                    onClick={e => scoreLead(l.id, e)}
-                                                    disabled={isScoring}
-                                                    className="text-xs font-semibold text-purple-600 bg-purple-50 hover:bg-purple-100 px-2.5 py-1 rounded-md transition disabled:opacity-50 flex items-center gap-1 mx-auto"
-                                                >
-                                                    {isScoring ? (
-                                                        <span className="w-3 h-3 border-2 border-purple-200 border-t-purple-600 rounded-full animate-spin" />
-                                                    ) : (
-                                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                                        </svg>
-                                                    )}
-                                                    {isScoring ? "Scoring..." : "AI Score"}
-                                                </button>
-                                            )}
+                                        <td className="px-3 py-4 text-center" onClick={e => e.stopPropagation()}>
+                                            <button
+                                                onClick={e => handleDelete(l, e)}
+                                                disabled={deletingId === l.id}
+                                                title={l.project ? "Delete project first" : "Delete lead"}
+                                                className={`opacity-0 group-hover:opacity-100 transition p-1.5 rounded hover:bg-red-50 disabled:opacity-40 ${l.project ? "text-slate-300 cursor-not-allowed" : "text-slate-400 hover:text-red-600"}`}
+                                            >
+                                                {deletingId === l.id ? (
+                                                    <span className="w-4 h-4 border-2 border-slate-300 border-t-red-500 rounded-full animate-spin block" />
+                                                ) : (
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                                    </svg>
+                                                )}
+                                            </button>
                                         </td>
                                     </tr>
                                 );

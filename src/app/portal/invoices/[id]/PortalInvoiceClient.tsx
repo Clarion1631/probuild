@@ -4,23 +4,93 @@ import React, { useState, useEffect } from "react";
 import { markInvoiceViewed } from "@/lib/actions";
 import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
+import DocumentLetterhead from "@/components/DocumentLetterhead";
+import { buildLetterheadConfig } from "@/lib/letterhead";
 
-export default function PortalInvoiceClient({ initialInvoice, companySettings }: { initialInvoice: any, companySettings?: any }) {
+class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
+    constructor(props: { children: React.ReactNode }) {
+        super(props);
+        this.state = { hasError: false };
+    }
+    static getDerivedStateFromError() {
+        return { hasError: true };
+    }
+    componentDidCatch(error: Error, info: React.ErrorInfo) {
+        console.error("[payment-section-error]", { message: error.message, stack: error.stack, info });
+    }
+    render() {
+        if (this.state.hasError) {
+            return (
+                <div className="px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
+                    Something went wrong loading the payment section. Please refresh the page or contact us to complete your payment.
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
+export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
 
     useEffect(() => {
         markInvoiceViewed(initialInvoice.id).catch(console.error);
     }, [initialInvoice.id]);
 
+    // Telemetry: log Pay-button DOM state on mount so we can confirm visibility on iPhone customers
+    useEffect(() => {
+        const t = setTimeout(() => {
+            try {
+                const buttons = document.querySelectorAll('[data-pay-button]');
+                const report = Array.from(buttons).map(el => {
+                    const cs = window.getComputedStyle(el);
+                    const r = (el as HTMLElement).getBoundingClientRect();
+                    return {
+                        visible: r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) > 0,
+                        bg: cs.backgroundColor,
+                        color: cs.color,
+                        rect: { w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top), left: Math.round(r.left) },
+                        tag: el.tagName.toLowerCase(),
+                    };
+                });
+                console.info("[pay-button-render]", {
+                    page: "invoice",
+                    invoiceId: initialInvoice.id,
+                    ua: navigator.userAgent,
+                    viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
+                    buttonCount: buttons.length,
+                    buttons: report,
+                });
+                if ((window as any).Sentry?.addBreadcrumb) {
+                    (window as any).Sentry.addBreadcrumb({ category: "pay-button", level: "info", data: { page: "invoice", ua: navigator.userAgent, buttonCount: buttons.length, buttons: report } });
+                }
+            } catch (err) {
+                console.error("[pay-button-render] telemetry failed:", err);
+            }
+        }, 250);
+        return () => clearTimeout(t);
+    }, [initialInvoice.id]);
+
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
+    const companyLicense = companySettings?.licenseNumber || "";
     const isPaid = initialInvoice.status === "Paid";
     const totalPaid = Number(initialInvoice.totalAmount || 0) - Number(initialInvoice.balanceDue || 0);
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
+            {/* Payment success banner */}
+            {paymentSuccess && (
+                <div className="bg-green-50 border-b border-green-200 px-6 py-3 flex items-center gap-2 print:hidden">
+                    <svg className="w-5 h-5 text-green-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <p className="text-sm font-medium text-green-800">Payment received! Thank you — a receipt has been sent to your email.</p>
+                </div>
+            )}
+
             {/* Top Bar */}
             <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between print:hidden">
                 <div className="flex items-center gap-3">
@@ -41,19 +111,9 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                 <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
-                    <div className="px-10 pt-10 pb-8 border-b border-slate-200">
-                        <div className="flex justify-between items-start">
-                            <div>
-                                {companySettings?.logoUrl ? (
-                                    <img src={companySettings.logoUrl} alt={companyName} className="h-14 w-auto object-contain mb-3" />
-                                ) : (
-                                    <img src="/logo.png" alt={companyName} className="h-14 w-auto object-contain mb-3" />
-                                )}
-                                <h2 className="text-lg font-bold text-slate-800">{companyName}</h2>
-                                {companyAddress && <p className="text-sm text-slate-500">{companyAddress}</p>}
-                                {companyPhone && <p className="text-sm text-slate-500">{companyPhone}</p>}
-                                {companyEmail && <p className="text-sm text-slate-500">{companyEmail}</p>}
-                            </div>
+                    <DocumentLetterhead
+                        config={buildLetterheadConfig(companySettings)}
+                        rightContent={
                             <div className="text-right">
                                 <h1 className="text-2xl font-bold text-slate-800 tracking-tight">INVOICE</h1>
                                 <div className="mt-2 space-y-1 text-sm">
@@ -77,20 +137,20 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                                     )}
                                 </div>
                             </div>
-                        </div>
+                        }
+                    />
 
-                        {/* Bill To */}
-                        <div className="mt-8 pt-6 border-t border-slate-100">
-                            <div className="grid grid-cols-2 gap-8">
-                                <div>
-                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Bill To</p>
-                                    <p className="text-sm font-semibold text-slate-800">{initialInvoice.clientName}</p>
-                                    {initialInvoice.clientEmail && <p className="text-sm text-slate-500">{initialInvoice.clientEmail}</p>}
-                                </div>
-                                <div>
-                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
-                                    <p className="text-sm font-semibold text-slate-800">{initialInvoice.projectName || "Project"}</p>
-                                </div>
+                    {/* Bill To */}
+                    <div className="px-10 pt-6 pb-0">
+                        <div className="grid grid-cols-2 gap-8">
+                            <div>
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Bill To</p>
+                                <p className="text-sm font-semibold text-slate-800">{initialInvoice.clientName}</p>
+                                {initialInvoice.clientEmail && <p className="text-sm text-slate-500">{initialInvoice.clientEmail}</p>}
+                            </div>
+                            <div>
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
+                                <p className="text-sm font-semibold text-slate-800">{initialInvoice.projectName || "Project"}</p>
                             </div>
                         </div>
                     </div>
@@ -125,6 +185,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
 
                     {/* Payment Schedule */}
                     {initialInvoice.payments && initialInvoice.payments.length > 0 && (
+                        <PaymentSectionErrorBoundary>
                         <div className="px-10 py-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-4">Payment Schedule</h2>
                             <div className="space-y-3">
@@ -173,6 +234,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                                                         amount={payment.amount}
                                                         label="Pay Now"
                                                         settings={companySettings}
+                                                        qbPayLink={payment.status === "Pending" && !payment.qbSyncError ? (payment.qbInvoiceLink || null) : null}
                                                     />
                                                 )}
                                                 {isPaidItem && (
@@ -186,12 +248,13 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings }:
                                 })}
                             </div>
                         </div>
+                        </PaymentSectionErrorBoundary>
                     )}
 
                     {/* Footer */}
                     <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
-                            This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
+                            This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`} {companyLicense && `License # ${companyLicense}.`}
                         </p>
                     </div>
                 </div>

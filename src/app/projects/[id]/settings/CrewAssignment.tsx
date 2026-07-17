@@ -57,8 +57,18 @@ export default function CrewAssignment({
                             onChange={() => toggleAssignment(emp.id)}
                             className="w-5 h-5 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
                         />
-                        <div>
-                            <div className="font-medium text-slate-800">{emp.name || emp.email}</div>
+                        <div className="flex-1">
+                            <div className="font-medium text-slate-800 flex items-center gap-2">
+                                {emp.name || emp.email}
+                                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                                    emp.role === 'ADMIN' ? 'bg-purple-100 text-purple-700' :
+                                    emp.role === 'MANAGER' ? 'bg-blue-100 text-blue-700' :
+                                    emp.role === 'FINANCE' ? 'bg-green-100 text-green-700' :
+                                    'bg-slate-100 text-slate-600'
+                                }`}>
+                                    {emp.role === 'ADMIN' ? 'Admin' : emp.role === 'MANAGER' ? 'Manager' : emp.role === 'FINANCE' ? 'Finance' : 'Field Crew'}
+                                </span>
+                            </div>
                             <div className="text-xs text-slate-500">{emp.email}</div>
                         </div>
                     </label>
