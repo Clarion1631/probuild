@@ -769,17 +769,31 @@ const handler = createMcpHandler(
                     return { ...textResult({ error: `File is ${(buffer.length / 1_000_000).toFixed(1)} MB — the connector accepts up to ~3 MB. Upload larger files in ProBuild directly.` }), isError: true };
                 }
 
+                // Always store an EXPLICIT visibility (never null/inherit): the portal
+                // shows null-visibility files inside shared folders, so inheriting
+                // could silently expose a file this tool just reported as internal.
+                const fileVisibility = visibility ?? "team";
+
                 let folderId: string | null = null;
                 const folderName = folder?.trim();
                 if (folderName) {
                     const scope = { projectId: projectId ?? null, leadId: leadId ?? null, parentId: null };
                     const existing = await prisma.fileFolder.findFirst({
                         where: { ...scope, name: { equals: folderName, mode: "insensitive" } },
-                        select: { id: true },
+                        select: { id: true, name: true, visibility: true },
                     });
+                    // The portal only traverses SHARED folders — a shared file inside a
+                    // team folder would be unreachable by the customer. Refuse the
+                    // combination rather than silently flipping an existing folder to
+                    // shared (that would expose everything already in it).
+                    if (existing && fileVisibility === "shared" && existing.visibility !== "shared") {
+                        return { ...textResult({ error: `Folder "${existing.name}" is not a shared folder, so the customer could never see a shared file inside it. Upload the shared file without a folder, use a folder that is already shared, or drop visibility to keep it internal.` }), isError: true };
+                    }
                     folderId = existing
                         ? existing.id
-                        : (await prisma.fileFolder.create({ data: { name: folderName, ...scope }, select: { id: true } })).id;
+                        // A folder created for a shared upload is created shared (it
+                        // contains only what this tool puts in it); otherwise team.
+                        : (await prisma.fileFolder.create({ data: { name: folderName, ...scope, visibility: fileVisibility === "shared" ? "shared" : "team" }, select: { id: true } })).id;
                 }
 
                 const saved = await saveProjectFile({
@@ -789,8 +803,7 @@ const handler = createMcpHandler(
                     projectId: projectId ?? null,
                     leadId: leadId ?? null,
                     folderId,
-                    // null = inherit the folder's visibility (default "team"), same as the app.
-                    visibility: visibility ?? null,
+                    visibility: fileVisibility,
                 });
                 if (!saved.ok) return { ...textResult({ error: saved.error }), isError: true };
 
@@ -802,10 +815,10 @@ const handler = createMcpHandler(
                     name: saved.file.name,
                     sizeBytes: saved.file.size,
                     folder: folderName ?? null,
-                    visibility: visibility ?? "team (inherited)",
+                    visibility: fileVisibility,
                     url: filesUrl,
-                    note: visibility === "shared"
-                        ? "This file IS visible to the customer in their portal."
+                    note: fileVisibility === "shared"
+                        ? "This file IS visible to the customer (in the client portal, once the job has a project with the portal's Files section enabled)."
                         : "Internal file — the customer cannot see it.",
                 });
             },

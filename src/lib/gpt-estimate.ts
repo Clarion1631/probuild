@@ -352,7 +352,7 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
         // recomputeMilestones below so items and tax share one total path.
         transformed = transformPhasesToItems({ phases }, costCodes, costTypes);
         if (transformed.totalEstimate === 0) {
-            warnings.push("Estimate total is $0 — every line item is quantity 0 (all optional). Give at least one line a real quantity unless a $0 estimate is intentional; milestones on a $0 total are all $0.");
+            warnings.push("Estimate total is $0. Verify line-item quantities and unit costs unless a $0 estimate is intentional; milestones on a $0 total are all $0.");
         }
         idMap = new Map<string, string>();
         for (const item of transformed.items) idMap.set(item.id, randomUUID());
@@ -583,7 +583,7 @@ export async function createEstimateFromPhases(input: CreateEstimateInput): Prom
         costTypes,
     );
     if (transformed.totalEstimate === 0) {
-        warnings.push("Estimate total is $0 — every line item is quantity 0 (all optional). Give at least one line a real quantity unless a $0 estimate is intentional; milestones on a $0 total are all $0.");
+        warnings.push("Estimate total is $0. Verify line-item quantities and unit costs unless a $0 estimate is intentional; milestones on a $0 total are all $0.");
     }
 
     // The transform emits placeholder ids (imp_<ts>_p0, ...) with parentId references;

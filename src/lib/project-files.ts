@@ -76,19 +76,26 @@ export async function saveProjectFile(input: SaveProjectFileInput): Promise<Save
     }
 
     const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-    const record = await prisma.projectFile.create({
-        data: {
-            name: input.fileName,
-            url: urlData?.publicUrl || storagePath,
-            size: input.buffer.length,
-            mimeType: input.mimeType,
-            ...(input.visibility && { visibility: input.visibility }),
-            ...(input.projectId && { projectId: input.projectId }),
-            ...(input.leadId && { leadId: input.leadId }),
-            ...(input.folderId && { folderId: input.folderId }),
-            uploadedById: input.uploadedById ?? null,
-        },
-        select: { id: true, name: true, size: true, url: true },
-    });
-    return { ok: true, file: record };
+    try {
+        const record = await prisma.projectFile.create({
+            data: {
+                name: input.fileName,
+                url: urlData?.publicUrl || storagePath,
+                size: input.buffer.length,
+                mimeType: input.mimeType,
+                ...(input.visibility && { visibility: input.visibility }),
+                ...(input.projectId && { projectId: input.projectId }),
+                ...(input.leadId && { leadId: input.leadId }),
+                ...(input.folderId && { folderId: input.folderId }),
+                uploadedById: input.uploadedById ?? null,
+            },
+            select: { id: true, name: true, size: true, url: true },
+        });
+        return { ok: true, file: record };
+    } catch (err: any) {
+        // The object is already in storage; without the DB row it would be
+        // orphaned and invisible everywhere — best-effort delete before failing.
+        await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]).catch(() => {});
+        return { ok: false, error: `File record creation failed: ${err?.message ?? "unknown error"}` };
+    }
 }
