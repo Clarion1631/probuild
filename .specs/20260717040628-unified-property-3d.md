@@ -22,14 +22,20 @@ Key architectural fact that makes this cheap: every `DesignDoc` is self-containe
 6. **Mobile AR Quick Look.** gtr-probuild-mobile gains a "View in AR" action (Designs tab / property entry) that fetches the exported USDZ and opens iOS AR Quick Look. (Android: out of scope v1, see Non-Goals.)
 7. **Property share link.** `/share/property/[token]` public read-only property view (mirrors `/share/room/[token]`: public in BOTH AppLayout and src/proxy.ts matcher), token stored on Project.
 
-## Non-Goals
+## Non-Goals (v1 scope line — see Roadmap below; these ARE planned, just not in this build)
 
-- Live ARKit anchoring/overlay ("stand in the room, see the design in place") — later phase; AR Quick Look tabletop/room-scale placement only.
+- Live ARKit anchoring/overlay ("stand in the room, see the design in place") — AR Quick Look tabletop/room-scale placement only in v1.
 - Shared-wall deduplication or geometry merging between adjacent rooms (two abutting walls simply coexist; thickness overlap is visually acceptable v1).
-- Cross-room item editing in the property view (rooms remain editable only in their own editor; property view is compose + arrange + walk).
+- Cross-room item editing in the property view (v1: rooms remain editable in their own editor; property view is compose + arrange + walk).
 - Multi-floor UI beyond an integer `placementLevel` rendered at `level * 3.0m` elevation.
-- Android AR (Scene Viewer requires GLB; consider a GLB twin-export later).
-- Estimate/selection rollups across the property.
+- Android AR (Scene Viewer requires GLB, not USDZ).
+- Estimate/selection rollups across the property (money-path work; needs its own spec and review rigor).
+
+## Roadmap — later phases (intended, sequenced)
+
+- **Phase 2 — property editing depth:** cross-room item editing directly in the property view; floor-switcher UI for multi-level homes (per-room `room.height` drives level elevation instead of the fixed 3.0m); shared-wall merge/cleanup pass for presentation-quality exterior shots.
+- **Phase 3 — AR everywhere:** GLB twin-export so Android gets Scene Viewer AR alongside iOS Quick Look; live ARKit anchoring in the mobile app (persistent anchors from the original RoomPlan scan so the design overlays the real room in place). Quick Look (Goal 6) is the proving step for the model pipeline both of these reuse.
+- **Phase 4 — property-level business layer:** estimate/selection rollups across all rooms of a property (separate spec; touches money paths, so codex review + money-pipeline e2e gates apply).
 
 ## Approach
 
