@@ -9074,8 +9074,26 @@ export async function deleteRetainer(id: string) {
 // ========== DOCUMENT COMMENTS ==========
 
 export async function getDocumentComments(documentType: string, documentId: string) {
+    // Read-side gating mirrors the write side: staff sessions see both
+    // visibilities, portal clients see client-visible comments only, and
+    // anyone else (server actions are callable by any authenticated-or-not
+    // client) gets nothing back — otherwise an anonymous/portal caller who
+    // knows a documentId (e.g. from a portal URL) could read TEAM-visibility
+    // comments.
+    const staffUser = await getCurrentUserWithPermissions();
+    if (staffUser) {
+        return prisma.documentComment.findMany({
+            where: { documentType, documentId },
+            orderBy: { createdAt: "asc" },
+            include: { author: { select: { id: true, name: true, email: true } } },
+        });
+    }
+
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return [];
+
     return prisma.documentComment.findMany({
-        where: { documentType, documentId },
+        where: { documentType, documentId, visibility: "client" },
         orderBy: { createdAt: "asc" },
         include: { author: { select: { id: true, name: true, email: true } } },
     });
