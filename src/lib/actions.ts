@@ -2788,6 +2788,13 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                     ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
                     ...(data.memo !== undefined && { memo: data.memo }),
                     ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+                    ...(data.overviewEnabled !== undefined && { overviewEnabled: !!data.overviewEnabled }),
+                    ...(data.overviewTitle !== undefined && { overviewTitle: data.overviewTitle }),
+                    ...(data.overviewBody !== undefined && { overviewBody: data.overviewBody }),
+                    ...(data.notesEnabled !== undefined && { notesEnabled: !!data.notesEnabled }),
+                    ...(data.notesTitle !== undefined && { notesTitle: data.notesTitle }),
+                    ...(data.notesBody !== undefined && { notesBody: data.notesBody }),
+                    ...(data.notesPlacement !== undefined && { notesPlacement: data.notesPlacement === "before" ? "before" : "after" }),
                 },
             });
         } catch {

@@ -455,6 +455,28 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </div>
                     )}
 
+                    {/* Project Overview / Vision — after the header/client info, before pricing */}
+                    {initialEstimate.overviewEnabled && initialEstimate.overviewBody && (
+                        <>
+                            <PortalRichSection
+                                variant="overview"
+                                title={initialEstimate.overviewTitle || "Project Overview"}
+                                html={initialEstimate.overviewBody}
+                            />
+                            {/* Force the priced line items onto a fresh PDF page */}
+                            <div data-pdf-break aria-hidden="true" className="h-0" />
+                        </>
+                    )}
+
+                    {/* Notes & Assumptions — before the line items */}
+                    {initialEstimate.notesEnabled && initialEstimate.notesBody && initialEstimate.notesPlacement === "before" && (
+                        <PortalRichSection
+                            variant="notes"
+                            title={initialEstimate.notesTitle || "Estimate Notes & Assumptions"}
+                            html={initialEstimate.notesBody}
+                        />
+                    )}
+
                     {/* Line Items — editor-matched layout */}
                     <div className="bg-white">
                         {/* Column headers */}
@@ -531,6 +553,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                             </div>
                         </div>
                     </div>
+
+                    {/* Notes & Assumptions — after the line items */}
+                    {initialEstimate.notesEnabled && initialEstimate.notesBody && initialEstimate.notesPlacement !== "before" && (
+                        <PortalRichSection
+                            variant="notes"
+                            title={initialEstimate.notesTitle || "Estimate Notes & Assumptions"}
+                            html={initialEstimate.notesBody}
+                        />
+                    )}
 
                     {/* Pay in Full — hidden in capture mode */}
                     {showPayInFull && !isCapture && (
@@ -769,6 +800,55 @@ function TermsAndConditions({ html }: { html: string }) {
                 />
             ) : (
                 /* Legacy plain-text path — rendered as JSX to avoid markup injection */
+                <div data-pdf-row="true" className={contentClassName}>
+                    <p className="whitespace-pre-wrap">{html}</p>
+                </div>
+            )}
+        </div>
+    );
+}
+
+/**
+ * Client-facing rich-text section for the estimate Project Overview and Notes &
+ * Assumptions. Mirrors the TermsAndConditions rich-HTML path: detect editor HTML,
+ * sanitize, and tag each top-level block with data-pdf-row so the screenshot PDF
+ * paginator can break between paragraphs instead of splitting one.
+ * "overview" renders a prominent proposal-style title; "notes" a compact heading.
+ */
+function PortalRichSection({ title, html, variant }: { title: string; html: string; variant: "overview" | "notes" }) {
+    const ref = useRef<HTMLDivElement>(null);
+
+    const trimmed = (html || "").trimStart();
+    const isRichHtml =
+        trimmed.startsWith("<p") ||
+        trimmed.startsWith("<h") ||
+        trimmed.startsWith("<ul") ||
+        trimmed.startsWith("<ol") ||
+        trimmed.startsWith("<div");
+
+    const sanitized = isRichHtml ? DOMPurify.sanitize(html) : "";
+
+    useEffect(() => {
+        if (!ref.current || !isRichHtml) return;
+        Array.from(ref.current.children).forEach(child => {
+            (child as HTMLElement).setAttribute("data-pdf-row", "true");
+        });
+    }, [sanitized, isRichHtml]);
+
+    const contentClassName = "prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2";
+
+    return (
+        <div className="px-10 pt-8 pb-8 border-t border-slate-100">
+            <div data-pdf-row="true" className="mb-4">
+                {variant === "overview" ? (
+                    <h2 className="text-xl font-bold text-slate-800 tracking-tight">{title}</h2>
+                ) : (
+                    <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{title}</h2>
+                )}
+            </div>
+            {isRichHtml ? (
+                <div ref={ref} className={contentClassName} dangerouslySetInnerHTML={{ __html: sanitized }} />
+            ) : (
                 <div data-pdf-row="true" className={contentClassName}>
                     <p className="whitespace-pre-wrap">{html}</p>
                 </div>
