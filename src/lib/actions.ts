@@ -136,7 +136,10 @@ function isAllowedCapturedPdfUrl(url: string): boolean {
  * where <expiry> is a Unix timestamp (seconds) and <sig> is HMAC-SHA256.
  */
 export async function generatePdfUploadToken(estimateId: string): Promise<string> {
-    const secret = process.env.NEXTAUTH_SECRET || "probuild-pdf-token-secret";
+    const secret = process.env.NEXTAUTH_SECRET;
+    if (!secret) {
+        throw new Error("NEXTAUTH_SECRET is not configured");
+    }
     const expiry = Math.floor(Date.now() / 1000) + 300; // 5 min
     const payload = `${estimateId}:${expiry}`;
     const sig = createHmac("sha256", secret).update(payload).digest("hex");
