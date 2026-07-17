@@ -2751,7 +2751,9 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
-    const result = await (async (tx) => {
+    // safeOnly re-runs the whole transaction writing only the always-present columns — see the
+    // schema-drift fallback below the closure for why the retry has to happen at this level.
+    const runSave = (safeOnly: boolean) => prisma.$transaction(async (tx) => {
         // Preserve payment credits: subtract already-paid milestones from totalAmount
         const paidMilestones = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId, status: "Paid" },
@@ -2778,7 +2780,15 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
         };
 
-        try {
+        // On the safeOnly retry, write only the always-present columns. A failed update inside an
+        // interactive transaction aborts the whole transaction (Postgres 25P02), so we cannot catch
+        // a missing-column error and retry within the same tx — the retry is driven from outside.
+        // select: { id: true } keeps the UPDATE ... RETURNING clause off the optional columns, so a
+        // DB missing one of them fails only when it is actually being SET — which routes to the
+        // safeOnly retry — rather than on every write via RETURNING.
+        if (safeOnly) {
+            await tx.estimate.update({ where: { id: estimateId }, data: safeData, select: { id: true } });
+        } else {
             await tx.estimate.update({
                 where: { id: estimateId },
                 data: {
@@ -2788,10 +2798,16 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                     ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
                     ...(data.memo !== undefined && { memo: data.memo }),
                     ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+                    ...(data.overviewEnabled !== undefined && { overviewEnabled: !!data.overviewEnabled }),
+                    ...(data.overviewTitle !== undefined && { overviewTitle: data.overviewTitle }),
+                    ...(data.overviewBody !== undefined && { overviewBody: data.overviewBody }),
+                    ...(data.notesEnabled !== undefined && { notesEnabled: !!data.notesEnabled }),
+                    ...(data.notesTitle !== undefined && { notesTitle: data.notesTitle }),
+                    ...(data.notesBody !== undefined && { notesBody: data.notesBody }),
+                    ...(data.notesPlacement !== undefined && { notesPlacement: data.notesPlacement === "before" ? "before" : "after" }),
                 },
+                select: { id: true },
             });
-        } catch {
-            await tx.estimate.update({ where: { id: estimateId }, data: safeData });
         }
 
         // 1. Differential Item Upsert
@@ -2985,7 +3001,28 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         }
 
         return { success: true };
-    })(prisma);
+    }, {
+        // A full estimate save fans out to ~12 + itemCount + scheduleCount sequential statements;
+        // the default 5s interactive-transaction limit is too tight for large estimates that
+        // previously committed under autocommit. Give the batch room without being unbounded.
+        maxWait: 10000,
+        timeout: 30000,
+    });
+
+    // Schema-drift fallback (preserves the original "fallback to safe fields if columns missing"
+    // behavior). If the deployed DB is missing an optional column, Prisma throws P2022 and the
+    // transaction rolls back cleanly; re-run the whole transaction writing only the safe columns.
+    // Any other error (e.g. the linked-expense guard, deadlocks) propagates unchanged.
+    let result;
+    try {
+        result = await runSave(false);
+    } catch (e: any) {
+        if (e?.code === "P2022") {
+            result = await runSave(true);
+        } else {
+            throw e;
+        }
+    }
 
     if (contextType === "project") {
         revalidatePath(`/projects/${contextId}/estimates`);
@@ -7892,15 +7929,22 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
             memos: "",
             terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
             items: {
-                create: selectedItems.map((item: any, idx: number) => ({
-                    description: item.name + (item.description ? ` - ${item.description}` : ""),
-                    quantity: parseFloat(item.quantity) || 1,
-                    unitCost: parseFloat(item.unitCost) || 0,
-                    total: (parseFloat(item.quantity) || 1) * (parseFloat(item.unitCost) || 0),
-                    order: idx,
-                    costCodeId: item.costCodeId,
-                    costTypeId: item.costTypeId
-                }))
+                create: selectedItems.map((item: any, idx: number) => {
+                    // Preserve an explicit zero quantity (optional/alternate estimate
+                    // lines are shown at $0) — only a missing/unparseable quantity
+                    // falls back to 1. `|| 1` would reprice a $0 option into the PO.
+                    const parsedQty = parseFloat(item.quantity);
+                    const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
+                    return {
+                        description: item.name + (item.description ? ` - ${item.description}` : ""),
+                        quantity: qty,
+                        unitCost: parseFloat(item.unitCost) || 0,
+                        total: qty * (parseFloat(item.unitCost) || 0),
+                        order: idx,
+                        costCodeId: item.costCodeId,
+                        costTypeId: item.costTypeId
+                    };
+                })
             }
         }
     });
