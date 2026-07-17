@@ -126,7 +126,8 @@ async function processEvent(eventId: string) {
                         await lockMoneyParents(t, { estimateId });
                         const lockInv = await t.invoice.findFirst({
                             where: { estimateId },
-                            orderBy: { createdAt: "asc" },
+                            // id tiebreaker so the lock target == the mutation target below on a createdAt tie.
+                            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
                             select: { id: true },
                         });
                         if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
@@ -180,7 +181,7 @@ async function processEvent(eventId: string) {
                         if (!alreadyPaid) {
                             const linkedInvoice = await t.invoice.findFirst({
                                 where: { estimateId },
-                                orderBy: { createdAt: "asc" },
+                                orderBy: [{ createdAt: "asc" }, { id: "asc" }],
                                 include: { payments: true },
                             });
                             if (linkedInvoice) {
@@ -299,23 +300,28 @@ async function processEvent(eventId: string) {
                             // only the invoice. Lock it first so a concurrent settle on a sibling
                             // milestone can't have its balanceDue effect lost to this recompute.
                             await lockMoneyParents(t, { invoiceId: invoiceSchedule.invoiceId });
-                            await t.paymentSchedule.update({
-                                where: { id: invoiceSchedule.id },
-                                data: { status: "Pending", paidAt: null, paymentDate: null },
-                            });
-                            const siblings = await t.paymentSchedule.findMany({
-                                where: { invoiceId: invoiceSchedule.invoiceId },
-                            });
-                            const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                            const newBalance = Math.max(0, toNum(invoiceSchedule.invoice.totalAmount) - totalPaid);
-                            const newStatus = newBalance <= 0
-                                ? "Paid"
-                                : totalPaid > 0 ? "Partially Paid"
-                                : "Issued";
-                            await t.invoice.update({
-                                where: { id: invoiceSchedule.invoice.id },
-                                data: { balanceDue: newBalance, status: newStatus },
-                            });
+                            // Re-read the parent AFTER the lock — the outer query's snapshot of
+                            // totalAmount/status may be stale if a concurrent flow changed it.
+                            const invoice = await t.invoice.findUnique({ where: { id: invoiceSchedule.invoiceId } });
+                            if (invoice) {
+                                await t.paymentSchedule.update({
+                                    where: { id: invoiceSchedule.id },
+                                    data: { status: "Pending", paidAt: null, paymentDate: null },
+                                });
+                                const siblings = await t.paymentSchedule.findMany({
+                                    where: { invoiceId: invoiceSchedule.invoiceId },
+                                });
+                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+                                const newStatus = newBalance <= 0
+                                    ? "Paid"
+                                    : totalPaid > 0 ? "Partially Paid"
+                                    : "Issued";
+                                await t.invoice.update({
+                                    where: { id: invoice.id },
+                                    data: { balanceDue: newBalance, status: newStatus },
+                                });
+                            }
                         }));
                     }
 
@@ -352,28 +358,33 @@ async function processEvent(eventId: string) {
                             // only the estimate. Lock it first so a concurrent settle on a sibling
                             // milestone can't have its balanceDue effect lost to this recompute.
                             await lockMoneyParents(t, { estimateId: estSchedule.estimateId });
-                            await t.estimatePaymentSchedule.update({
-                                where: { id: estSchedule.id },
-                                data: { status: "Pending", paidAt: null, paymentDate: null },
-                            });
-                            const siblings = await t.estimatePaymentSchedule.findMany({
-                                where: { estimateId: estSchedule.estimateId },
-                            });
-                            const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                            const newBalance = Math.max(0, toNum(estSchedule.estimate.totalAmount) - totalPaid);
-                            const newStatus =
-                                totalPaid === 0 ? estSchedule.estimate.statusBeforePayment ?? "Approved"
-                                : newBalance <= 0 ? "Paid"
-                                : "Partially Paid";
+                            // Re-read the parent AFTER the lock — the outer query's snapshot of
+                            // totalAmount/status may be stale if a concurrent flow changed it.
+                            const estimate = await t.estimate.findUnique({ where: { id: estSchedule.estimateId } });
+                            if (estimate) {
+                                await t.estimatePaymentSchedule.update({
+                                    where: { id: estSchedule.id },
+                                    data: { status: "Pending", paidAt: null, paymentDate: null },
+                                });
+                                const siblings = await t.estimatePaymentSchedule.findMany({
+                                    where: { estimateId: estSchedule.estimateId },
+                                });
+                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                                const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
+                                const newStatus =
+                                    totalPaid === 0 ? estimate.statusBeforePayment ?? "Approved"
+                                    : newBalance <= 0 ? "Paid"
+                                    : "Partially Paid";
 
-                            await t.estimate.update({
-                                where: { id: estSchedule.estimateId },
-                                data: {
-                                    balanceDue: newBalance,
-                                    status: newStatus,
-                                    ...(totalPaid === 0 && { statusBeforePayment: null }),
-                                },
-                            });
+                                await t.estimate.update({
+                                    where: { id: estimate.id },
+                                    data: {
+                                        balanceDue: newBalance,
+                                        status: newStatus,
+                                        ...(totalPaid === 0 && { statusBeforePayment: null }),
+                                    },
+                                });
+                            }
                         }));
                     }
 

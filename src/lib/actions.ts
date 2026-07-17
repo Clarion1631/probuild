@@ -3719,7 +3719,8 @@ export async function recordEstimatePayment(
         await lockMoneyParents(t, { estimateId });
         const lockInv = await t.invoice.findFirst({
             where: { estimateId },
-            orderBy: { createdAt: "asc" },
+            // id tiebreaker so the lock target == the mutation target below even on a createdAt tie.
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
             select: { id: true },
         });
         if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
@@ -3737,7 +3738,7 @@ export async function recordEstimatePayment(
         let mirroredCopyId: string | null = null;
         const linkedInvoice = await t.invoice.findFirst({
             where: { estimateId },
-            orderBy: { createdAt: "asc" },
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
             include: { payments: true },
         });
         if (linkedInvoice) {
@@ -3931,7 +3932,8 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         await lockMoneyParents(tx, { estimateId });
         const lockInv = await tx.invoice.findFirst({
             where: { estimateId },
-            orderBy: { createdAt: "asc" },
+            // id tiebreaker so the lock target == the mutation target below even on a createdAt tie.
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
             select: { id: true },
         });
         if (lockInv) await lockMoneyParents(tx, { invoiceId: lockInv.id });
@@ -3978,7 +3980,7 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         // Unwind the mirrored invoice copy too — a payment recorded on either
         // side settles both, so unrecording must release both. Oldest linked
         // invoice; name+amount fallback only when it matches exactly one row.
-        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, orderBy: { createdAt: "asc" }, include: { payments: true } });
+        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], include: { payments: true } });
         if (linkedInvoice) {
             const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid");
             const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
@@ -4147,6 +4149,9 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
 
         const payment = await tx.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
+        // Guard BEFORE mutating: a mismatched invoiceId would leave the payment's real
+        // parent stale and recompute the wrong (locked) invoice. Mirrors recordPayment.
+        if (payment.invoiceId !== invoiceId) throw new Error("Payment/invoice mismatch");
         if (payment.status !== "Paid") return null;
 
         await tx.paymentSchedule.update({
