@@ -6,7 +6,7 @@
 // to generate tokens yet, so accepting them from the client would silently
 // flip a room to shared state.
 
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -150,14 +150,20 @@ export async function PUT(req: Request, { params }: RouteParams) {
                 });
             }
         }
+        return updated;
     });
-    
-    // Re-generate the USDZ walkthrough on every manual design update
-    try {
-        const { generateUsdzForRoom } = await import("@/lib/studio/usdz-generator");
-        await generateUsdzForRoom(id);
-    } catch (e) {
-        console.error("USDZ auto-generation failed during room save:", e);
+
+    // Keep the AR walkthrough fresh: re-generate the USDZ whenever the layout
+    // changed, after the response is sent so autosaves stay fast.
+    if (updates.layoutJson !== undefined || assetsInput) {
+        after(async () => {
+            try {
+                const { generateUsdzForRoom } = await import("@/lib/studio/usdz-generator");
+                await generateUsdzForRoom(id);
+            } catch (e) {
+                console.error("USDZ auto-generation failed during room save:", e);
+            }
+        });
     }
 
     return NextResponse.json(result);
