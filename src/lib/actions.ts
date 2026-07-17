@@ -9086,17 +9086,48 @@ export async function addDocumentComment(
     documentId: string,
     text: string,
     visibility: "team" | "client",
-    authorId?: string,
-    authorName?: string,
 ) {
+    // Derive the author from the session — never trust a client-supplied
+    // authorId/authorName (the old signature accepted both as plain args).
+    // Team-visible comments are internal-only and require a signed-in staff
+    // user. Client-visible comments may come from staff posting on the
+    // client's behalf, or from a logged-in portal client.
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Comment text is required");
+
+    let authorId: string | null = null;
+    let authorName: string | null = null;
+
+    const staffUser = await getCurrentUserWithPermissions();
+    if (staffUser) {
+        authorId = staffUser.id;
+        authorName = staffUser.name || staffUser.email;
+    } else if (visibility === "team") {
+        throw new Error("Unauthorized");
+    } else {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) throw new Error("Unauthorized");
+        const client = await prisma.client.findUnique({ where: { id: sessionClientId }, select: { name: true } });
+        authorName = client?.name || "Client";
+    }
+
     const comment = await prisma.documentComment.create({
-        data: { documentType, documentId, text, visibility, authorId: authorId || null, authorName: authorName || null },
+        data: { documentType, documentId, text: trimmed, visibility, authorId, authorName },
         include: { author: { select: { id: true, name: true, email: true } } },
     });
     return comment;
 }
 
 export async function deleteDocumentComment(commentId: string) {
+    // Only the comment's own author, or an ADMIN/MANAGER, may delete it.
+    const staffUser = await getCurrentUserWithPermissions();
+    const comment = await prisma.documentComment.findUnique({ where: { id: commentId }, select: { authorId: true } });
+    if (!comment) return { success: true };
+
+    const isOwnComment = !!staffUser && comment.authorId === staffUser.id;
+    const isAdminOrManager = !!staffUser && ["ADMIN", "MANAGER"].includes(staffUser.role);
+    if (!isOwnComment && !isAdminOrManager) throw new Error("Unauthorized");
+
     await prisma.documentComment.delete({ where: { id: commentId } });
     return { success: true };
 }

@@ -3245,8 +3245,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             <DocumentComments
                                 documentType="estimate"
                                 documentId={initialEstimate.id}
-                                currentUserId={undefined}
-                                currentUserName={undefined}
                                 showClientTab={true}
                             />
                         </div>
