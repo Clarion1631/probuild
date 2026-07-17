@@ -8,7 +8,11 @@ export const maxDuration = 60;
  * Daily client payment-reminder sweep: emails clients about payment-schedule
  * milestones due soon or recently overdue (see sendPaymentReminders for the
  * exact selection/throttle rules). Idempotent and safe on retries — each
- * milestone is sent+updated independently.
+ * milestone is claimed before it's sent, so overlapping/retried runs can't
+ * double-send.
+ *
+ * ?dryRun=1 (or PAYMENT_REMINDERS_DRY_RUN=1) runs the full selection and
+ * reports what would happen without sending any email or writing lastReminderAt.
  */
 export async function GET(request: Request) {
     // Any deployed environment (production or preview) requires the cron secret,
@@ -18,7 +22,11 @@ export async function GET(request: Request) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const result = await sendPaymentReminders();
+    const { searchParams } = new URL(request.url);
+    const dryRunParam = searchParams.get("dryRun");
+    const dryRun = dryRunParam === null ? undefined : dryRunParam === "1" || dryRunParam === "true";
+
+    const result = await sendPaymentReminders({ dryRun });
     console.log("[cron/payment-reminders]", JSON.stringify(result));
     return NextResponse.json(result);
 }

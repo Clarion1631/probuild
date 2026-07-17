@@ -51,10 +51,20 @@ export default function PortalVisibilityToggles({
     const handleSave = () => {
         startTransition(async () => {
             try {
-                await Promise.all([
-                    savePortalVisibility(projectId, state),
-                    setPaymentRemindersEnabled(projectId, state.paymentRemindersEnabled),
-                ]);
+                // Sequential, not Promise.all: setPaymentRemindersEnabled returns
+                // { success, error } rather than throwing, so a parallel call could
+                // silently report "saved" even when the permission check failed. Check
+                // each result.
+                const visResult = await savePortalVisibility(projectId, state);
+                if (!visResult?.success) {
+                    toast.error("Failed to save visibility settings");
+                    return;
+                }
+                const remindersResult = await setPaymentRemindersEnabled(projectId, state.paymentRemindersEnabled);
+                if (!remindersResult?.success) {
+                    toast.error(remindersResult?.error || "Failed to save payment reminders setting");
+                    return;
+                }
                 toast.success("Visibility settings saved!");
             } catch {
                 toast.error("Failed to save settings");

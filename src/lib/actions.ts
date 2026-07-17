@@ -12,7 +12,7 @@ import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
-import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { coLineCents } from "./co-tax";
@@ -7196,6 +7196,11 @@ export async function savePortalVisibility(projectId: string, data: {
 }
 
 export async function setPaymentRemindersEnabled(projectId: string, enabled: boolean) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    if (!canAccessProject(user, projectId)) return { success: false, error: "Forbidden" };
+
     await prisma.project.update({
         where: { id: projectId },
         data: { paymentRemindersEnabled: enabled },
