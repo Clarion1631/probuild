@@ -298,6 +298,18 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     };
 
     const handleDetectChangeOrders = async () => {
+        // A create is still in flight for a suggestion from the CURRENT
+        // results — starting a new detect would replace coSuggestions/coMeta
+        // out from under it and let the (now-orphaned) creatingIds entry
+        // re-enable a duplicate "Create draft CO" click on a fresh suggestion
+        // while the old create is still running. Simplest safe rule: block a
+        // rescan until every in-flight creation has settled, rather than
+        // trying to key pending state across runs.
+        if (isCreatingAny) {
+            toast.error("Wait for the current change order to finish creating before scanning again.");
+            return;
+        }
+
         // Guard against out-of-order responses: if the user re-triggers detection
         // (or a request is unusually slow) before this one resolves, only the
         // most recently kicked-off run is allowed to write state.
@@ -305,20 +317,19 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
         setIsDetectingCO(true);
 
         const controller = new AbortController();
+        // Intentionally NOT cleared until the whole try/catch below (including
+        // the body read) settles — clearing right after fetch() resolves would
+        // only guard the headers phase; a body that stalls mid-stream must
+        // still be aborted by this timer.
         const timeoutId = setTimeout(() => controller.abort(), 60_000);
 
         try {
-            let res: Response;
-            try {
-                res = await fetch("/api/ai/change-order-detect", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ projectId }),
-                    signal: controller.signal,
-                });
-            } finally {
-                clearTimeout(timeoutId);
-            }
+            const res = await fetch("/api/ai/change-order-detect", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+                signal: controller.signal,
+            });
 
             if (runId !== detectRunIdRef.current) return; // superseded by a newer run
 
@@ -343,7 +354,8 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                 lookbackDays: data.lookbackDays ?? 30,
             });
             setCreatedCOs({});
-            setCreatingIds(new Set());
+            // creatingIds is intentionally not reset here — the guard above
+            // already guarantees it's empty before a new run can start.
             setShowCOModal(true);
             if (suggestions.length === 0) {
                 toast.info(`No client-requested scope changes detected in the last ${data.lookbackDays ?? 30} days.`);
@@ -355,6 +367,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                 ? "Change order detection timed out. Try again."
                 : (error.message || "Failed to detect change orders. Try again."));
         } finally {
+            clearTimeout(timeoutId);
             if (runId === detectRunIdRef.current) setIsDetectingCO(false);
         }
     };
@@ -411,7 +424,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                 <div className="flex items-center gap-3">
                     <button
                         onClick={handleDetectChangeOrders}
-                        disabled={isDetectingCO || logs.length === 0}
+                        disabled={isDetectingCO || isCreatingAny || logs.length === 0}
                         className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border transition bg-gradient-to-r from-orange-50 to-amber-50 text-orange-700 border-orange-200 hover:from-orange-100 hover:to-amber-100 disabled:opacity-50"
                     >
                         {isDetectingCO ? (
