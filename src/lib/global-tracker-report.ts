@@ -1,7 +1,8 @@
 import { prisma } from "@/lib/prisma";
 import { type SearchParamMap, getParam, getAllParams } from "./report-utils";
+import { PROJECT_STATUS_VALUES } from "@/lib/project-status";
 
-const ALL_STATUSES = ["In Progress", "Closed", "Paid Ready to Start"];
+const ALL_STATUSES = PROJECT_STATUS_VALUES;
 
 export type GlobalTrackerFilters = {
     statuses: string[];

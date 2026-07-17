@@ -4,8 +4,6 @@ import Link from "next/link";
 import { useState, useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { usePermissions } from "@/components/PermissionsProvider";
-import { RoomDesignerNavContent } from "@/components/room-designer/RoomDesignerNavContent";
-
 interface ProjectInnerSidebarProps {
     projectId: string;
     projectName?: string;
@@ -103,6 +101,10 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
         }));
     };
 
+    // The Room Studio editor brings its own full chrome (catalog, inspector,
+    // top bar) - hide the project rail entirely so the canvas gets the width.
+    if (isRoomEditor) return null;
+
     return (
         <>
         {/* Outer sizer: position:relative for toggle button; NO overflow here so button isn't clipped */}
@@ -142,11 +144,6 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
         <div style={{ overflowX: "hidden", width: "100%", height: "100%" }}>
         {/* Inner sidebar: always 224px wide, clipped by inner wrapper when collapsed. */}
         <div id="project-inner-sidebar" className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
-
-            {/* Room editor mode: swap entire sidebar content for the room-designer rail. */}
-            {!sidebarCollapsed && isRoomEditor && (
-                <RoomDesignerNavContent backHref={`/projects/${projectId}/room-designer`} />
-            )}
 
             {/* Top bar — back link (hidden when collapsed or when in room editor) */}
             {!sidebarCollapsed && !isRoomEditor && (

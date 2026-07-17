@@ -120,8 +120,8 @@ export function CopyToProjectModal(props: ModalProps) {
                         </h2>
                         <p className="text-xs text-hui-textMuted mt-0.5">Copies all line items and payment schedule as a Draft.</p>
                     </div>
-                    <button onClick={onClose} className="text-hui-textMuted hover:text-hui-textMain ml-4 shrink-0">
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                    <button onClick={onClose} aria-label="Close modal" className="text-hui-textMuted hover:text-hui-textMain ml-4 shrink-0">
+                        <svg aria-hidden="true" className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                     </button>
                 </div>
 
@@ -231,10 +231,11 @@ export default function CopyToProjectButton({
         <>
             <button
                 title="Copy to another project"
+                aria-label="Copy to another project"
                 onClick={() => setOpen(true)}
                 className="text-slate-300 hover:text-slate-600 hover:bg-slate-100 rounded p-1.5 transition opacity-0 group-hover:opacity-100"
             >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                     <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
                 </svg>

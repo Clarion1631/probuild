@@ -203,7 +203,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                 <div>
                     <h2 className="text-lg font-bold text-hui-textMain mb-6 border-b border-hui-border pb-2">Internal Notifications</h2>
                     <div className="space-y-6">
-                        <p className="text-xs text-hui-textMuted mb-2">This email will receive alerts when a client views or signs an estimate.</p>
+                        <p className="text-xs text-hui-textMuted mb-2">Receives internal alerts (e.g. when a client views or signs an estimate) <strong>and is BCC&apos;d a copy of every document sent to a client</strong> — estimates, invoices, contracts, change orders, selections, portal shares. Use a shared inbox/group (e.g. notifications@yourcompany.com) so the whole team gets copies.</p>
                         <div className="relative">
                             <input
                                 id="notificationEmail"

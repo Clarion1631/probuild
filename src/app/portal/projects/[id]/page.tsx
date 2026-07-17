@@ -37,6 +37,19 @@ export default async function PortalProjectDetail(props: {
         projectWhere = { id: projectId, clientId: sessionClientId };
     }
 
+    // Self-healing payment state: if any milestone on this project is still
+    // Pending but lives on the QuickBooks rail, pull settled payments NOW so a
+    // client returning from the Intuit pay page sees "Paid" immediately
+    // (the hourly cron remains the backstop).
+    const pendingQB = await prisma.paymentSchedule.findFirst({
+        where: { status: "Pending", qbInvoiceId: { not: null }, invoice: { projectId } },
+        select: { id: true },
+    });
+    if (pendingQB) {
+        const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
+        await syncQuickBooksPayments({ projectId }).catch(() => {});
+    }
+
     const project = await prisma.project.findFirst({
         where: projectWhere,
         include: {
@@ -74,10 +87,15 @@ export default async function PortalProjectDetail(props: {
 
     if (!project) return notFound();
 
-    const [settings, visibility, scheduleTasks] = await Promise.all([
+    const [settings, visibility, scheduleTasks, sharedRooms] = await Promise.all([
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
         getPortalVisibility(projectId),
         getScheduleTasks(projectId).catch(() => [] as any[]),
+        prisma.roomDesign.findMany({
+            where: { projectId, shareEnabled: true, shareToken: { not: null } },
+            select: { id: true, name: true, shareToken: true, thumbnail: true, updatedAt: true },
+            orderBy: { updatedAt: "desc" },
+        }),
     ]);
 
     if (!visibility.isPortalEnabled) {
@@ -100,7 +118,7 @@ export default async function PortalProjectDetail(props: {
     }
 
     // ---- Compute counts and tab config ----
-    const estimateCount = project.estimates.length;
+    const estimateCount = project.estimates.filter((e: any) => e.approvedAt || ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(e.status)).length;
     const invoiceCount = project.invoices.length;
     const updateCount = (project.dailyLogs || []).length;
     const changeOrderCount = (project.changeOrders || []).length;
@@ -133,7 +151,7 @@ export default async function PortalProjectDetail(props: {
         { id: "updates", label: "Updates", count: updateCount, visible: visibility.showDailyLogs && updateCount > 0 },
         { id: "files", label: "Files", visible: visibility.showFiles },
         { id: "selections", label: "Selections", visible: visibility.showSelections },
-        { id: "designs", label: "Designs", visible: visibility.showMoodBoards },
+        { id: "designs", label: "Designs", visible: visibility.showMoodBoards || sharedRooms.length > 0 },
         { id: "change-orders", label: "Change Orders", count: changeOrderCount, visible: showChangeOrders && changeOrderCount > 0 },
     ];
 
@@ -245,6 +263,7 @@ export default async function PortalProjectDetail(props: {
                                                 amount={Number(pendingPayments[0].payment.amount)}
                                                 label="Pay Now"
                                                 settings={settings}
+                                                qbPayLink={pendingPayments[0].payment.qbInvoiceLink || null}
                                             />
                                         ) : (
                                             <Link
@@ -369,20 +388,30 @@ export default async function PortalProjectDetail(props: {
 
                 {activeTab === "estimates" && (
                     <div className="space-y-3">
-                        {project.estimates.map(est => (
+                        {project.estimates
+                            .filter(est => est.approvedAt || ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(est.status))
+                            .map(est => {
+                                const isSigned = !!est.approvedAt;
+                            return (
                             <Link href={`/portal/estimates/${est.id}`} key={est.id} className="block hui-card p-4 hover:border-blue-300 hover:shadow-sm transition">
                                 <div className="flex justify-between items-start mb-2 gap-2">
                                     <h3 className="font-semibold text-hui-textMain truncate">{est.title}</h3>
-                                    <span className={`text-xs px-2 py-1 rounded-full font-medium shrink-0 ${est.status === 'Approved' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
-                                        {est.status}
+                                    <span className={`text-xs px-2 py-1 rounded-full font-medium shrink-0 ${isSigned || ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(est.status) ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
+                                        {isSigned && est.status === 'Invoiced' ? 'Signed' : est.status}
                                     </span>
                                 </div>
+                                {isSigned && (
+                                    <p className="text-xs text-green-700 flex items-center gap-1 mb-2">
+                                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                        Signed by {est.approvedBy} on {new Date(est.approvedAt!).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}
+                                    </p>
+                                )}
                                 <div className="flex justify-between text-sm text-hui-textMuted">
                                     <span>Total: {formatCurrency(est.totalAmount)}</span>
                                     <span>{new Date(est.createdAt).toLocaleDateString()}</span>
                                 </div>
                             </Link>
-                        ))}
+                        );})}
                     </div>
                 )}
 
@@ -470,7 +499,7 @@ export default async function PortalProjectDetail(props: {
                                                         {payment.status === 'Paid' && (
                                                             <span className="inline-flex items-center text-xs text-green-600 bg-green-50 px-1.5 py-0.5 rounded-full border border-green-200">
                                                                 <svg className="w-3 h-3 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                                Paid {payment.paymentMethod ? `via ${payment.paymentMethod.toUpperCase()}` : ''}
+                                                                Paid{payment.paymentMethod ? ` via ${payment.paymentMethod === 'quickbooks' ? 'QuickBooks' : payment.paymentMethod.toUpperCase()}` : ''}{(payment.paidAt || payment.paymentDate) ? ` · ${new Date(payment.paidAt || payment.paymentDate).toLocaleDateString()}` : ''}
                                                             </span>
                                                         )}
                                                         {payment.status === 'Processing' && (
@@ -491,6 +520,7 @@ export default async function PortalProjectDetail(props: {
                                                             amount={Number(payment.amount)}
                                                             label="Pay Now"
                                                             settings={settings}
+                                                            qbPayLink={payment.qbInvoiceLink || null}
                                                         />
                                                     ) : (
                                                         <span className="text-sm font-medium text-hui-textMain">{formatCurrency(payment.amount)}</span>
@@ -599,15 +629,46 @@ export default async function PortalProjectDetail(props: {
                 )}
 
                 {activeTab === "designs" && (
-                    <Link href={`/portal/projects/${projectId}/mood-boards`} className="block hui-card p-6 hover:border-indigo-500 hover:shadow-md transition text-center border-dashed">
-                        <div className="w-12 h-12 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-3">
-                            <svg className="w-6 h-6 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
-                            </svg>
-                        </div>
-                        <h3 className="text-base font-bold text-slate-800">View Design Concepts</h3>
-                        <p className="text-sm text-slate-500 mt-1">Explore visual layouts and material choices for your space.</p>
-                    </Link>
+                    <div className="space-y-4">
+                        {sharedRooms.length > 0 && (
+                            <div>
+                                <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500 mb-2">3D Room Designs</h3>
+                                <div className="grid gap-3 sm:grid-cols-2">
+                                    {sharedRooms.map((room) => (
+                                        <a
+                                            key={room.id}
+                                            href={`/share/room/${room.shareToken}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="block hui-card overflow-hidden hover:border-blue-400 hover:shadow-md transition"
+                                        >
+                                            {room.thumbnail ? (
+                                                // eslint-disable-next-line @next/next/no-img-element
+                                                <img src={room.thumbnail} alt={room.name} className="h-36 w-full object-cover bg-slate-100" />
+                                            ) : (
+                                                <div className="h-36 w-full bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center text-slate-400 text-sm">
+                                                    3D preview
+                                                </div>
+                                            )}
+                                            <div className="p-3">
+                                                <div className="font-semibold text-slate-800 text-sm">{room.name}</div>
+                                                <div className="text-xs text-slate-400 mt-0.5">Tap to explore in 3D</div>
+                                            </div>
+                                        </a>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                        <Link href={`/portal/projects/${projectId}/mood-boards`} className="block hui-card p-6 hover:border-indigo-500 hover:shadow-md transition text-center border-dashed">
+                            <div className="w-12 h-12 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-3">
+                                <svg className="w-6 h-6 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
+                                </svg>
+                            </div>
+                            <h3 className="text-base font-bold text-slate-800">View Design Concepts</h3>
+                            <p className="text-sm text-slate-500 mt-1">Explore visual layouts and material choices for your space.</p>
+                        </Link>
+                    </div>
                 )}
 
                 {activeTab === "change-orders" && (

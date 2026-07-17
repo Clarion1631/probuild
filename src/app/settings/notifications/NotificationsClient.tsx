@@ -11,6 +11,7 @@ const NOTIFICATION_EVENTS = [
     { key: "invoiceViewed", label: "Invoice Viewed", description: "When a client opens an invoice" },
     { key: "paymentReceived", label: "Payment Received", description: "When a client makes a payment" },
     { key: "messageReceived", label: "New Message", description: "When a client or subcontractor sends a message" },
+    { key: "quickbooksSyncIssue", label: "QuickBooks Sync Issue", description: "When a QuickBooks invoice is voided or deleted and a milestone needs to be re-issued" },
 ];
 
 function parseToggles(raw: string | null): Record<string, boolean> {

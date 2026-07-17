@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { canonicalProjectStatus } from "@/lib/project-status";
 
 const SELECT = {
     id: true,
@@ -55,11 +56,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const data: Record<string, unknown> = {};
     if (typeof body.name === "string" && body.name.trim()) data.name = body.name.trim();
     if (typeof body.status === "string") {
-        const allowed = new Set(["In Progress", "Closed", "Paid Ready to Start"]);
-        if (!allowed.has(body.status)) {
+        // Accept legacy labels from older mobile builds and map them onto the canonical set.
+        const canonical = canonicalProjectStatus(body.status);
+        if (!canonical) {
             return NextResponse.json({ error: `Invalid status: ${body.status}` }, { status: 400 });
         }
-        data.status = body.status;
+        data.status = canonical;
     }
     if (body.location === null || typeof body.location === "string") data.location = body.location;
     if (body.locationLat === null) {

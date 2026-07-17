@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { hasPermission } from "@/lib/permissions";
 import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
+import { ALLOWED_FILE_EXTENSIONS } from "@/lib/project-files";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
@@ -143,14 +144,9 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "No files selected" }, { status: 400 });
         }
 
-        const ALLOWED_EXTENSIONS = new Set([
-            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv",
-            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic",
-            ".txt", ".rtf", ".dwg", ".dxf",
-        ]);
         for (const file of files) {
             const ext = file.name.includes(".") ? `.${file.name.split(".").pop()!.toLowerCase()}` : "";
-            if (!ALLOWED_EXTENSIONS.has(ext)) {
+            if (!ALLOWED_FILE_EXTENSIONS.has(ext)) {
                 return NextResponse.json({ error: `File type not allowed: ${ext || "(no extension)"}. Allowed: PDF, Word, Excel, images.` }, { status: 400 });
             }
         }

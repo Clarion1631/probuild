@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState, useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { usePermissions } from "@/components/PermissionsProvider";
-import { RoomDesignerNavContent } from "@/components/room-designer/RoomDesignerNavContent";
+import SendPortalLinkButton from "@/components/SendPortalLinkButton";
 import { toast } from "sonner";
 
 interface EntitySidebarProps {
@@ -121,7 +121,10 @@ export default function EntitySidebar({
     const backLabel = entity.type === "project" ? "All Projects" : "All Leads";
     const overviewHref = entity.type === "project" ? `/projects/${id}` : `/leads/${id}`;
     const overviewLabel = entity.type === "project" ? "Project Overview" : "Lead Overview";
-    const roomDesignerBackHref = `/${entity.type === "project" ? "projects" : "leads"}/${id}/room-designer`;
+
+    // The Room Studio editor brings its own full chrome (catalog, inspector,
+    // top bar) - hide the entity rail entirely so the canvas gets the width.
+    if (isRoomEditor) return null;
 
     return (
         <>
@@ -152,10 +155,6 @@ export default function EntitySidebar({
         </button>
         <div style={{ overflowX: "hidden", width: "100%", height: "100%" }}>
         <div className="w-56 bg-hui-background border-r border-hui-border flex flex-col h-full">
-
-            {!sidebarCollapsed && isRoomEditor && (
-                <RoomDesignerNavContent backHref={roomDesignerBackHref} />
-            )}
 
             {!sidebarCollapsed && !isRoomEditor && (
                 <div className="flex items-center border-b border-hui-border px-2 py-2 shrink-0">
@@ -200,7 +199,7 @@ export default function EntitySidebar({
             )}
 
             {entity.type === "project" && (
-                <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0">
+                <div className="p-3 border-b border-hui-border bg-slate-50 shrink-0 space-y-2">
                     <Link
                         href={`/portal/projects/${id}`}
                         target="_blank"
@@ -211,6 +210,7 @@ export default function EntitySidebar({
                         </svg>
                         View Client Portal
                     </Link>
+                    <SendPortalLinkButton projectId={id} clientName={entity.clientName} />
                 </div>
             )}
 

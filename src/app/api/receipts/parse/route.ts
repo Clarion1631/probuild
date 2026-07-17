@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
 Analyze this receipt image and extract the following information as JSON:
@@ -23,6 +24,23 @@ Analyze this receipt image and extract the following information as JSON:
 Return ONLY valid JSON, no markdown, no explanation.`;
 
 const ALLOWED_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const EXT_BY_MIME: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+};
+
+// Derive the image type from the file's magic bytes — the client-claimed `file.type`
+// is attacker-controlled and this upload lands in a public bucket. Returns null for
+// anything that isn't one of the four supported formats (including empty files).
+function sniffImageMime(buf: Buffer): keyof typeof EXT_BY_MIME | null {
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+    if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+    if (buf.length >= 4 && buf.subarray(0, 4).toString("ascii") === "GIF8") return "image/gif";
+    if (buf.length >= 12 && buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+    return null;
+}
 const MAX_RECEIPT_BYTES = 10 * 1024 * 1024; // 10 MB
 const RECEIPT_FETCH_TIMEOUT_MS = 8_000;
 
@@ -54,6 +72,17 @@ function isAllowedReceiptHost(url: string): boolean {
 //                                                        first, then references the URL)
 // In mode 3 the server fetches the bytes itself so the model receives base64 either way.
 export async function POST(req: NextRequest) {
+    // Track the uploaded storage object outside the try block so failure paths
+    // (missing API key, AI errors) can delete it instead of orphaning it in the bucket.
+    let storagePath: string | null = null;
+    const cleanupUpload = async () => {
+        if (!storagePath) return;
+        const sb = getSupabase();
+        if (sb) {
+            try { await sb.storage.from(STORAGE_BUCKET).remove([storagePath]); } catch { /* best effort */ }
+        }
+        storagePath = null;
+    };
     try {
         const auth = await authenticateMobileOrSession(req);
         if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
@@ -64,15 +93,51 @@ export async function POST(req: NextRequest) {
         let imageBase64: string | null = null;
         let mimeType = "image/jpeg";
         let projectId: string | null = null;
+        let receiptUrl: string | null = null;
+        let storageError: string | null = null;
 
         if (contentType.includes("multipart/form-data")) {
             const formData = await req.formData();
             const file = formData.get("file") as File | null;
             projectId = (formData.get("projectId") as string) || null;
             if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
-            const buffer = await file.arrayBuffer();
-            imageBase64 = Buffer.from(buffer).toString("base64");
-            mimeType = file.type || "image/jpeg";
+            if (file.size > MAX_RECEIPT_BYTES) {
+                return NextResponse.json(
+                    { error: `Receipt image too large (>${MAX_RECEIPT_BYTES} bytes)` },
+                    { status: 400 }
+                );
+            }
+            const buffer = Buffer.from(await file.arrayBuffer());
+            const sniffedMime = sniffImageMime(buffer);
+            if (!sniffedMime) {
+                return NextResponse.json(
+                    { error: "Unsupported receipt image type. Use JPEG, PNG, GIF, or WebP." },
+                    { status: 400 }
+                );
+            }
+            imageBase64 = buffer.toString("base64");
+            mimeType = sniffedMime;
+
+            // Persist the original to Supabase Storage so the expense can link to a
+            // durable receipt image (the old /api/expenses/parse wrote into `public/`,
+            // which is read-only and non-durable on Vercel). Storage failure is not
+            // fatal — parsing is the primary job — but it is surfaced to the caller.
+            const supabase = getSupabase();
+            if (supabase) {
+                const candidate = `receipts/${Date.now()}-${Math.random().toString(36).slice(2, 9)}.${EXT_BY_MIME[mimeType]}`;
+                const { error: uploadError } = await supabase.storage
+                    .from(STORAGE_BUCKET)
+                    .upload(candidate, buffer, { contentType: mimeType, upsert: false });
+                if (uploadError) {
+                    storageError = uploadError.message;
+                } else {
+                    storagePath = candidate;
+                    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(candidate);
+                    receiptUrl = urlData.publicUrl;
+                }
+            } else {
+                storageError = "Storage not configured";
+            }
         } else {
             const body = await req.json();
             projectId = body.projectId || null;
@@ -164,6 +229,7 @@ export async function POST(req: NextRequest) {
         }
 
         if (!process.env.ANTHROPIC_API_KEY) {
+            await cleanupUpload();
             return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
         }
 
@@ -193,6 +259,7 @@ export async function POST(req: NextRequest) {
         try {
             parsed = JSON.parse(text);
         } catch {
+            await cleanupUpload();
             return NextResponse.json({ error: "AI returned invalid JSON", raw: text }, { status: 500 });
         }
 
@@ -242,11 +309,14 @@ export async function POST(req: NextRequest) {
             amount: typeof parsed.total === "number" ? parsed.total : undefined,
             date: typeof parsed.date === "string" ? parsed.date : undefined,
             parsed,
+            ...(receiptUrl ? { receiptUrl } : {}),
+            ...(storageError ? { storageError } : {}),
             expenseCreated,
             ...(expenseId ? { expenseId } : {}),
             ...(expenseSkipReason ? { expenseSkipReason } : {}),
         });
     } catch (err) {
+        await cleanupUpload();
         const msg = err instanceof Error ? err.message : "Parse failed";
         return NextResponse.json({ error: msg }, { status: 500 });
     }

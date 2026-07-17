@@ -57,9 +57,9 @@ export default async function GlobalTrackerPage({
     const totalBalance = rows.reduce((s, r) => s + r.balance, 0);
 
     const statusColor = (s: string) => {
-        if (s === "In Progress") return "bg-blue-100 text-blue-700";
-        if (s === "Closed") return "bg-gray-100 text-gray-600";
-        if (s === "Paid Ready to Start") return "bg-green-100 text-green-700";
+        if (s === "In Progress") return "bg-green-100 text-green-700";
+        if (s === "Substantial Completion") return "bg-amber-100 text-amber-700";
+        if (s === "Closed Lost") return "bg-rose-100 text-rose-700";
         return "bg-gray-100 text-gray-600";
     };
 

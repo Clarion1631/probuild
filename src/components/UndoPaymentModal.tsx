@@ -11,6 +11,8 @@ interface UndoPaymentModalProps {
     paidAt: string | null;
     paymentDate: string | null;
     hasStripeIntent: boolean;
+    hasQbPayment?: boolean;
+    entityLabel?: "estimate" | "invoice";
     currentBalance: number;
     estimateTotal: number;
     currentStatus: string;
@@ -23,7 +25,7 @@ interface UndoPaymentModalProps {
 const METHOD_LABELS: Record<string, string> = {
     card: "Card", ach: "ACH", check: "Check", cash: "Cash",
     zelle: "Zelle", venmo: "Venmo", credit_card: "Credit Card",
-    wire: "Wire Transfer", other: "Other",
+    wire: "Wire Transfer", quickbooks: "QuickBooks", other: "Other",
 };
 
 function formatMethod(method: string | null, ref: string | null): string {
@@ -37,6 +39,7 @@ function formatMethod(method: string | null, ref: string | null): string {
 export default function UndoPaymentModal({
     milestoneName, amount, paymentMethod, referenceNumber,
     paidAt, paymentDate, hasStripeIntent,
+    hasQbPayment = false, entityLabel = "estimate",
     currentBalance, estimateTotal, currentStatus,
     otherPaidCount, statusBeforePayment,
     onClose, onConfirm,
@@ -46,9 +49,13 @@ export default function UndoPaymentModal({
 
     const paidDate = paidAt || paymentDate;
     const newBalance = Math.min(estimateTotal, currentBalance + amount);
+    // Mirrors unrecordPayment's status ladder: invoices keep Overdue when the
+    // last payment is undone and the invoice was already Overdue.
     const newStatus = otherPaidCount > 0
         ? (newBalance <= 0 ? "Paid" : "Partially Paid")
-        : (statusBeforePayment || "Approved");
+        : entityLabel === "invoice"
+            ? (currentStatus === "Overdue" ? "Overdue" : "Issued")
+            : (statusBeforePayment || "Approved");
     const taxImpact = estimateTotal > 0
         ? Math.round((amount / estimateTotal) * 100)
         : 0;
@@ -56,7 +63,7 @@ export default function UndoPaymentModal({
     const canConfirm = confirmText.toUpperCase() === "UNDO";
 
     async function handleConfirm() {
-        if (!canConfirm) return;
+        if (!canConfirm || isSubmitting) return;
         setIsSubmitting(true);
         try {
             await onConfirm();
@@ -113,6 +120,22 @@ export default function UndoPaymentModal({
                     </div>
                 )}
 
+                {/* QuickBooks warning */}
+                {hasQbPayment && (
+                    <div className="mx-6 mt-4 rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 flex gap-3">
+                        <svg className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                        </svg>
+                        <div>
+                            <p className="text-sm font-semibold text-amber-800">QuickBooks payment detected</p>
+                            <p className="text-xs text-amber-700 mt-0.5">
+                                Undoing only changes ProBuild — it does <strong>not</strong> void or refund the payment in QuickBooks Online.
+                                Void or refund it in QuickBooks as well; if it stays applied there, the hourly QuickBooks sync will mark this milestone paid again.
+                            </p>
+                        </div>
+                    </div>
+                )}
+
                 {/* Cascading effects */}
                 <div className="mx-6 mt-4 space-y-2">
                     <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide">This will:</p>
@@ -137,7 +160,7 @@ export default function UndoPaymentModal({
                                     <path strokeLinecap="round" strokeLinejoin="round" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
                                 </svg>
                                 <span>
-                                    Change estimate status from <strong className="capitalize">{currentStatus}</strong> to <strong className="capitalize">{newStatus}</strong>
+                                    Change {entityLabel} status from <strong className="capitalize">{currentStatus}</strong> to <strong className="capitalize">{newStatus}</strong>
                                 </span>
                             </li>
                         )}

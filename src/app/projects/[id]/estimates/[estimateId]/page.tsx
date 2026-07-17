@@ -1,4 +1,4 @@
-import { getEstimate, getProject, getCompanySettings } from "@/lib/actions";
+import { getEstimate, getProject, getCompanySettings, getEstimateActivity } from "@/lib/actions";
 import EstimateEditor from "./EstimateEditor";
 import { notFound } from "next/navigation";
 
@@ -10,10 +10,11 @@ export default async function EstimatePage({
     params: Promise<{ id: string; estimateId: string }>
 }) {
     const resolvedParams = await params;
-    const [project, estimate, settings] = await Promise.all([
+    const [project, estimate, settings, activityEvents] = await Promise.all([
         getProject(resolvedParams.id),
         getEstimate(resolvedParams.estimateId),
         getCompanySettings(),
+        getEstimateActivity(resolvedParams.estimateId),
     ]);
 
     if (!project) return <div>Project not found</div>;
@@ -37,11 +38,14 @@ export default async function EstimatePage({
                         name: project.name,
                         clientName: project.client.name,
                         clientEmail: project.client.email || undefined,
-                        location: project.location || undefined
+                        location: project.location || undefined,
+                        clientTaxExemptCertUrl: (project.client as any)?.taxExemptCertUrl || null,
+                        clientTaxExemptCertExpiresAt: (project.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null
                     }}
                     initialEstimate={JSON.parse(JSON.stringify(estimate))}
                     salesTaxes={salesTaxes}
                     settings={settings}
+                    activityEvents={activityEvents}
                 />
             </div>
         </div>

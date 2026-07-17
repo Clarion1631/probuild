@@ -3,10 +3,11 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import type { GlobalTrackerFilters } from "@/lib/global-tracker-report";
+import { PROJECT_STATUS_VALUES } from "@/lib/project-status";
 
 type Option = { id: string; name: string };
 
-const STATUS_OPTIONS = ["In Progress", "Closed", "Paid Ready to Start"];
+const STATUS_OPTIONS = PROJECT_STATUS_VALUES;
 
 export default function GlobalTrackerFiltersForm({
     filters,

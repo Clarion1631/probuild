@@ -30,6 +30,30 @@ export async function buildPdf(
     const cssToMm = pageW / element.offsetWidth;
     const totalHeightMm = element.offsetHeight * cssToMm;
 
+    // Degenerate measurement guard: a detached/hidden element has offsetWidth 0, which
+    // makes cssToMm/totalHeightMm Infinity and the pagination loop below never terminate.
+    // Render a single fitted page instead of hanging.
+    if (!(element.offsetWidth > 0) || !isFinite(cssToMm) || !isFinite(totalHeightMm) || totalHeightMm <= 0) {
+        const imgDataSingle = await toJpeg(element, {
+            quality,
+            pixelRatio,
+            // JPEG has no alpha channel — without a background, transparent areas (e.g. the
+            // triangles outside the document card's rounded corners) encode as black. Fill white.
+            backgroundColor: "#ffffff",
+            filter: (node: HTMLElement) =>
+                !(node.nodeType === 1 && node.hasAttribute && node.hasAttribute("data-pdf-skip")),
+        });
+        const imgSingle = new Image();
+        imgSingle.src = imgDataSingle;
+        await new Promise<void>((resolve, reject) => {
+            imgSingle.onload = () => resolve();
+            imgSingle.onerror = () => reject(new Error("img load failed"));
+        });
+        const fittedH = imgSingle.width > 0 ? Math.min((imgSingle.height / imgSingle.width) * pageW, usableH) : usableH;
+        pdf.addImage(imgDataSingle, "JPEG", 0, 0, pageW, fittedH);
+        return pdf;
+    }
+
     const allRowEls = Array.from(element.querySelectorAll("[data-pdf-row]")) as HTMLElement[];
     const rowEls = allRowEls.filter(el => {
         if (el.closest("[data-pdf-skip]")) return false;
@@ -48,11 +72,28 @@ export async function buildPdf(
         };
     });
 
+    // Mandatory breaks: content at/after a [data-pdf-break] marker MUST begin a new
+    // page (e.g. the estimate line items start fresh after the Project Overview).
+    const forcedBreaksMm = (Array.from(element.querySelectorAll("[data-pdf-break]")) as HTMLElement[])
+        .map(el => (el.getBoundingClientRect().top + window.scrollY - elTop) * cssToMm)
+        .filter(mm => mm > 0.5 && mm < totalHeightMm)
+        .sort((a, b) => a - b);
+
     // Step 2: Find safe page-break points (always between rows)
     const breaks: number[] = [0];
     let cursor = 0;
     while (cursor < totalHeightMm) {
         const limit = cursor + effectiveH;
+        if (limit >= totalHeightMm && forcedBreaksMm.every(f => f <= cursor + 0.5)) break;
+
+        // A forced break within this page window wins — advance exactly to it so the
+        // following content (line items) lands at the top of the next page.
+        const forced = forcedBreaksMm.find(f => f > cursor + 0.5 && f <= limit);
+        if (forced !== undefined) {
+            breaks.push(forced);
+            cursor = forced;
+            continue;
+        }
         if (limit >= totalHeightMm) break;
 
         let safeBreak = limit;
@@ -82,6 +123,9 @@ export async function buildPdf(
     const imgData = await toJpeg(element, {
         quality,
         pixelRatio,
+        // JPEG has no alpha channel — without a background, transparent areas (e.g. the
+        // triangles outside the document card's rounded corners) encode as black. Fill white.
+        backgroundColor: "#ffffff",
         filter: (node: HTMLElement) =>
             !(node.nodeType === 1 && node.hasAttribute && node.hasAttribute("data-pdf-skip")),
     });

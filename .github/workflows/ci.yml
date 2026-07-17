@@ -72,9 +72,28 @@ jobs:
     name: Playwright E2E Tests
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    # E2E runs against a throwaway Postgres service container — NEVER the live
+    # Supabase DB. (This job used to point at prod and filled /leads with QA
+    # artifacts — see docs/TESTING.md.)
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: probuild
+          POSTGRES_PASSWORD: probuild
+          POSTGRES_DB: probuild_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DIRECT_URL: ${{ secrets.DIRECT_URL }}
+      # pgbouncer=true is required by src/lib/prisma.ts's URL check; on vanilla
+      # Postgres it just disables prepared statements (harmless).
+      DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_e2e?pgbouncer=true
+      DIRECT_URL: postgresql://probuild:probuild@localhost:5432/probuild_e2e
       NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
       NEXTAUTH_URL: http://localhost:3000
       NEXT_PUBLIC_APP_URL: http://localhost:3000
@@ -112,6 +131,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Create schema in throwaway Postgres
+        run: npx prisma db push --skip-generate
+
       - name: Build application
         run: npm run build
         env:
@@ -124,7 +146,7 @@ jobs:
         run: npx playwright test
 
       - name: Upload test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: playwright-report
@@ -137,3 +159,4 @@ jobs:
           echo "## Playwright E2E Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Server:** localhost:3000 (production build)" >> $GITHUB_STEP_SUMMARY
+          echo "**Database:** throwaway Postgres service container (no live data)" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Send to ProBuild",
+  "version": "1.0.0",
+  "description": "Right-click any product page or selection and send it to the ProBuild Design Catalog importer.",
+  "permissions": ["contextMenus", "scripting", "activeTab", "notifications"],
+  "host_permissions": [
+    "https://probuild.goldentouchremodeling.com/*",
+    "http://localhost:3000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

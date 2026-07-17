@@ -2,6 +2,7 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import Sidebar from "./Sidebar";
+import MobileNavDrawer from "./nav/MobileNavDrawer";
 import Header from "./Header";
 import { useSession, signOut } from "next-auth/react";
 import { useEffect } from "react";
@@ -29,7 +30,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
 
     useEffect(() => {
         if (status === 'authenticated') {
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname === '/login';
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login';
 
             // If an authenticated user suddenly has no role, they were likely deleted.
             // Force sign out to clear the stale session so they can try again.
@@ -43,14 +44,14 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
             }
         }
         if (status === 'unauthenticated' && process.env.NODE_ENV !== 'development') { // Bypass only if NOT in development
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname === '/login';
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login';
             if (!isPublicRoute) {
                 router.replace('/login');
             }
         }
     }, [status, role, pathname, router, session]);
 
-    const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname === '/login';
+    const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login';
 
     if (status === 'authenticated' && !role && !isPublicRoute) {
         return <div className="min-h-screen bg-hui-background flex items-center justify-center text-slate-500">Signing out...</div>;
@@ -65,11 +66,12 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     }
 
     return (
-        <div className="flex h-screen bg-hui-background overflow-hidden">
+        <div className="flex h-[100dvh] bg-hui-background overflow-hidden">
             <Sidebar />
+            <MobileNavDrawer />
             <div className="flex-1 flex flex-col overflow-hidden">
                 <Header />
-                <main className="flex-1 p-6 overflow-y-auto overflow-x-hidden">
+                <main className="flex-1 overflow-y-auto overflow-x-hidden px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom))] lg:p-6">
                     {children}
                 </main>
             </div>

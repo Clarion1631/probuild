@@ -6,11 +6,11 @@
 // to generate tokens yet, so accepting them from the client would silently
 // flip a room to shared state.
 
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import type { DbRoomAsset } from "@/lib/room-designer/blueprint3d-adapter";
+import type { ApiRoomAsset } from "@/lib/studio/doc";
 
 export const dynamic = "force-dynamic";
 
@@ -81,12 +81,12 @@ export async function PUT(req: Request, { params }: RouteParams) {
 
     let body: {
         layoutJson?: unknown;
-        assets?: Array<Partial<DbRoomAsset> & { id?: string }>;
+        assets?: Array<Partial<ApiRoomAsset> & { id?: string }>;
         name?: string;
         roomType?: string;
-        // TODO (Stage 4): `shareToken` and `shareEnabled` are explicitly stripped
-        // here. Only a dedicated /api/rooms/[id]/share endpoint (not yet built)
-        // should mutate those fields.
+        thumbnail?: string;
+        // `shareToken` and `shareEnabled` are explicitly stripped here. Only
+        // the dedicated /api/rooms/[id]/share endpoints mutate those fields.
     };
     try {
         body = await req.json();
@@ -98,11 +98,23 @@ export async function PUT(req: Request, { params }: RouteParams) {
         layoutJson?: any;
         name?: string;
         roomType?: string;
+        thumbnail?: string;
     } = {};
     if (body.layoutJson !== undefined) updates.layoutJson = body.layoutJson as any;
+    // Small raster data-URL preview for room cards. Strict prefix (no SVG -
+    // it can carry script) and a size cap so a hostile client can't balloon
+    // the row. Invalid thumbnails are dropped rather than failing the save:
+    // the layout payload matters more than a cosmetic preview.
+    if (
+        typeof body.thumbnail === "string" &&
+        /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(body.thumbnail) &&
+        body.thumbnail.length < 400_000
+    ) {
+        updates.thumbnail = body.thumbnail;
+    }
     if (typeof body.name === "string" && body.name.trim()) updates.name = body.name.slice(0, 120);
     if (typeof body.roomType === "string") {
-        const validRoomTypes = ["kitchen", "bathroom", "laundry", "bedroom", "other"];
+        const validRoomTypes = ["kitchen", "bathroom", "laundry", "bedroom", "outdoor", "other"];
         if (!validRoomTypes.includes(body.roomType)) {
             return NextResponse.json({ error: "Invalid roomType" }, { status: 400 });
         }
@@ -140,6 +152,19 @@ export async function PUT(req: Request, { params }: RouteParams) {
         }
         return updated;
     });
+
+    // Keep the AR walkthrough fresh: re-generate the USDZ whenever the layout
+    // changed, after the response is sent so autosaves stay fast.
+    if (updates.layoutJson !== undefined || assetsInput) {
+        after(async () => {
+            try {
+                const { generateUsdzForRoom } = await import("@/lib/studio/usdz-generator");
+                await generateUsdzForRoom(id);
+            } catch (e) {
+                console.error("USDZ auto-generation failed during room save:", e);
+            }
+        });
+    }
 
     return NextResponse.json(result);
 }

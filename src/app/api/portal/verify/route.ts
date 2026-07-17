@@ -14,8 +14,13 @@ export async function GET(req: NextRequest) {
     }
 
     const rawNext = req.nextUrl.searchParams.get("next") || "/portal";
-    const resolved = new URL(rawNext, req.url);
-    if (!resolved.pathname.startsWith("/portal")) resolved.pathname = "/portal";
+    // Open-redirect guard: only allow same-origin paths under /portal. Anything
+    // else (absolute URLs, //host, /portalish, /portal/../escape) falls back to /portal.
+    const candidate = new URL(rawNext, req.url);
+    const isSafeNext =
+        candidate.origin === req.nextUrl.origin &&
+        (candidate.pathname === "/portal" || candidate.pathname.startsWith("/portal/"));
+    const resolved = new URL(isSafeNext ? candidate.pathname + candidate.search : "/portal", req.url);
 
     const response = NextResponse.redirect(resolved);
     response.cookies.set("client_portal_token", token, {
@@ -23,7 +28,7 @@ export async function GET(req: NextRequest) {
         secure: process.env.NODE_ENV === "production",
         sameSite: "lax",
         path: "/",
-        maxAge: 60 * 60 * 24 * 7,
+        maxAge: 60 * 60 * 24 * 365,
     });
 
     return response;

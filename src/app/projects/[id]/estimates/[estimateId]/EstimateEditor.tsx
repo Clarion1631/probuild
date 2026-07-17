@@ -42,7 +42,8 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
+import RichTextEditor from "@/components/RichTextEditor";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -72,6 +73,7 @@ function formatEstPaymentMethod(method: string | null | undefined, ref: string |
 }
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { getTaxCertStatus, formatCertExpiry } from "@/lib/tax-cert";
 
 const ReusableSignaturePad = dynamic(() => import("@/components/ReusableSignaturePad"), { ssr: false });
 
@@ -83,23 +85,60 @@ const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), 
 
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 
-export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any }) {
+// Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
+// Mirrors the JSON shape that /api/ai-estimate/import + transformPhasesToItems expect.
+const CHATGPT_ESTIMATE_PROMPT = `You are a residential remodeling estimator. Produce a detailed construction estimate for the project described below as VALID JSON ONLY (no markdown, no commentary), in exactly this structure:
+
+{
+  "phases": [
+    {
+      "phaseName": "string (e.g. Demolition)",
+      "phaseCode": "string (optional)",
+      "items": [
+        { "name": "string", "description": "string", "costType": "Labor | Material | Allowance | Subcontractor | Equipment | Other", "quantity": number, "unit": "string e.g. sq ft, hr, each, job, linear ft", "unitCost": number }
+      ]
+    }
+  ],
+  "paymentMilestones": [ { "name": "string", "percentage": number } ]
+}
+
+Rules:
+- Organize into 6-12 logical construction phases, 2-5 line items each.
+- "unitCost" is the FINAL price charged to the client per unit (cost + markup already included). Line total = quantity x unitCost.
+- "costType" must be exactly one of the listed values. Use "Allowance" for customer selections (fixtures, finishes, appliances).
+- Use realistic Vancouver, WA / Pacific Northwest 2024-2025 market rates.
+- Provide 3-4 payment milestones whose percentages sum to 100.
+- Output ONLY the JSON object — no backticks, no explanation.
+
+PROJECT: <describe the scope of work, square footage, finishes, etc.>`;
+
+type ActivityEvent = { id: string; ts: string; kind: "created" | "sent" | "viewed" | "signed" | "invoice" | "payment" | "other"; title: string; detail?: string | null };
+
+export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings, activityEvents }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string, clientTaxExemptCertUrl?: string | null, clientTaxExemptCertExpiresAt?: string | null }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any, activityEvents?: ActivityEvent[] }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
     const [status, setStatus] = useState(initialEstimate.status);
     const [items, setItems] = useState<any[]>(initialEstimate.items || []);
     const [paymentSchedules, setPaymentSchedules] = useState<any[]>(initialEstimate.paymentSchedules || []);
+    // Invoice generated from this estimate (if any) — milestone edits here do not
+    // cascade to it, so the schedule UI warns when one exists.
+    const linkedInvoice: { id: string; code: string; status: string } | null =
+        initialEstimate.invoices?.[0] || null;
     const [isSaving, setIsSaving] = useState(false);
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [activeTab, setActiveTab] = useState("builder"); // builder | expenses
     const [showSendModal, setShowSendModal] = useState(false);
     const [costCodes, setCostCodes] = useState<any[]>([]);
-    const [costTypes, setCostTypes] = useState<any[]>([]);
+    // Cost types are an expense concept; estimate lines carry a plain type label instead.
+    const ITEM_TYPE_LABELS = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
     const [showAiModal, setShowAiModal] = useState(false);
     const [aiPrompt, setAiPrompt] = useState("");
     const [isGenerating, setIsGenerating] = useState(false);
+    const [showImportModal, setShowImportModal] = useState(false);
+    const [importJson, setImportJson] = useState("");
+    const [isImporting, setIsImporting] = useState(false);
     const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [viewMode, setViewMode] = useState<"internal" | "client">("client");
     const [showTemplateModal, setShowTemplateModal] = useState(false);
@@ -135,6 +174,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         initialEstimate.taxRateName ?? defaultTaxRate?.name ?? null
     );
     const [isAiFilling, setIsAiFilling] = useState(false);
+    const [isAiAssigningPhases, setIsAiAssigningPhases] = useState(false);
     const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
     const [overwriteExisting, setOverwriteExisting] = useState(false);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
@@ -144,6 +184,21 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [showTerms, setShowTerms] = useState(false);
     const [termsTemplates, setTermsTemplates] = useState<{id: string; name: string; body: string; isDefault: boolean}[]>([]);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
+    // Project Overview / Vision (client-facing cover section, no pricing)
+    const [overviewEnabled, setOverviewEnabled] = useState<boolean>(initialEstimate.overviewEnabled ?? false);
+    const [overviewTitle, setOverviewTitle] = useState<string>(initialEstimate.overviewTitle || "");
+    const [overviewBody, setOverviewBody] = useState<string>(initialEstimate.overviewBody || "");
+    const [showOverview, setShowOverview] = useState<boolean>(!!initialEstimate.overviewEnabled);
+    const [overviewTemplates, setOverviewTemplates] = useState<{ id: string; name: string; body: string; isDefault: boolean }[]>([]);
+    // Estimate Notes & Assumptions (client-facing, placed before/after line items)
+    const [notesEnabled, setNotesEnabled] = useState<boolean>(initialEstimate.notesEnabled ?? false);
+    const [notesTitle, setNotesTitle] = useState<string>(initialEstimate.notesTitle || "");
+    const [notesBody, setNotesBody] = useState<string>(initialEstimate.notesBody || "");
+    const [notesPlacement, setNotesPlacement] = useState<"before" | "after">(initialEstimate.notesPlacement === "before" ? "before" : "after");
+    const [showNotes, setShowNotes] = useState<boolean>(!!initialEstimate.notesEnabled);
+    const [notesTemplates, setNotesTemplates] = useState<{ id: string; name: string; body: string; isDefault: boolean }[]>([]);
+    const [isSavingOverviewTpl, setIsSavingOverviewTpl] = useState(false);
+    const [isSavingNotesTpl, setIsSavingNotesTpl] = useState(false);
     const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
     const [isUploadingFile, setIsUploadingFile] = useState(false);
     const [signatureUrl, setSignatureUrl] = useState<string | null>(initialEstimate.signatureUrl || null);
@@ -194,6 +249,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 parentId: item.parentId || null,
                 name: item.name || "",
                 description: item.description || "",
+                type: item.type || "Material",
                 quantity: String(item.quantity || "0"),
                 unitCost: String(item.unitCost || "0"),
                 costCodeId: item.costCodeId || null,
@@ -227,6 +283,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
             memo: memo || null,
             termsAndConditions: termsAndConditions || null,
+            overviewEnabled: !!overviewEnabled,
+            overviewTitle: overviewTitle || null,
+            overviewBody: overviewBody || null,
+            notesEnabled: !!notesEnabled,
+            notesTitle: notesTitle || null,
+            notesBody: notesBody || null,
+            notesPlacement,
             signatureUrl: signatureUrl || null,
             targetMarginPercent: parseFloat(targetMargin) || 25,
             taxExempt: !!taxExempt,
@@ -237,7 +300,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         };
     }, [
         title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
-        memo, termsAndConditions, signatureUrl, targetMargin, taxExempt, selectedTaxName,
+        memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
+        notesEnabled, notesTitle, notesBody, notesPlacement,
+        signatureUrl, targetMargin, taxExempt, selectedTaxName,
         taxOptions, defaultTaxRate, items, paymentSchedules
     ]);
 
@@ -273,7 +338,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         setAiSuggestingDesc(item.id);
         try {
             const parent = item.parentId ? items.find((i: any) => i.id === item.parentId) : null;
-            const costType = costTypes.find((ct: any) => ct.id === item.costTypeId);
             const res = await fetch("/api/ai-estimate/suggest", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -282,7 +346,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     itemName: item.name,
                     parentName: parent?.name,
                     projectName: context.name,
-                    costType: costType?.name || item.type,
+                    costType: item.type,
                 }),
             });
             if (res.ok) {
@@ -341,8 +405,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function acceptSubitemSuggestions(parentId: string, suggestions: any[]) {
-        const typeMap: Record<string, string> = {};
-        for (const ct of costTypes) typeMap[ct.name] = ct.id;
         const newItems = suggestions.map((s: any) => ({
             id: generateId(),
             name: s.name,
@@ -355,7 +417,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             total: 0,
             parentId,
             costCodeId: null,
-            costTypeId: typeMap[s.costType] || null,
+            costTypeId: null,
         }));
         setItems([...items, ...newItems]);
         setShowSubitemSuggestions(null);
@@ -377,6 +439,36 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             }
         }).catch((err) => console.error("[EstimateEditor] Failed to load T&C templates:", err));
     }, []);
+
+    useEffect(() => {
+        getDocumentTemplates("overview").then((data: any[]) => setOverviewTemplates(data))
+            .catch((err) => console.error("[EstimateEditor] Failed to load overview templates:", err));
+        getDocumentTemplates("notes").then((data: any[]) => setNotesTemplates(data))
+            .catch((err) => console.error("[EstimateEditor] Failed to load notes templates:", err));
+    }, []);
+
+    async function handleSaveDocTemplate(type: "overview" | "notes", body: string) {
+        const label = type === "overview" ? "Project Overview" : "Notes & Assumptions";
+        if (!body || !body.trim()) {
+            toast.error(`Add some ${label} content before saving a template.`);
+            return;
+        }
+        const name = window.prompt(`Save this ${label} as a reusable template. Template name:`)?.trim();
+        if (!name) return;
+        const setBusy = type === "overview" ? setIsSavingOverviewTpl : setIsSavingNotesTpl;
+        setBusy(true);
+        try {
+            await createDocumentTemplate({ name, type, body });
+            const refreshed = await getDocumentTemplates(type);
+            if (type === "overview") setOverviewTemplates(refreshed as any);
+            else setNotesTemplates(refreshed as any);
+            toast.success(`Saved "${name}" template.`);
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to save template.");
+        } finally {
+            setBusy(false);
+        }
+    }
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const file = e.target.files?.[0];
@@ -469,21 +561,49 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     function handleInsertAssembly(assembly: any) {
         const newItems = [...items];
-        const sectionId = generateId();
-        newItems.push({
-            id: sectionId, name: assembly.name, description: "", type: "Section",
-            quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
-            parentId: null, costCodeId: null, costTypeId: null, isSection: true,
-        });
-        for (const tItem of assembly.items) {
+        const tItems: any[] = assembly.items || [];
+        const hasSections = tItems.some((t: any) => t.type === "Section");
+
+        if (hasSections) {
+            // Multi-phase template: keep its Section grouping. Grouping is rebuilt by
+            // walking items in order (a Section row starts a group; the CHILD rows after
+            // it belong to it). Stored parentId values reference rows of whatever
+            // estimate the template was saved from and can't be trusted — but
+            // null-vs-set still marks a row as top-level vs child.
+            let currentSectionId: string | null = null;
+            for (const tItem of tItems) {
+                const isSection = tItem.type === "Section";
+                const newId = generateId();
+                newItems.push({
+                    id: newId, name: tItem.name, description: tItem.description || "",
+                    type: tItem.type, quantity: tItem.quantity,
+                    baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                    unitCost: Number(tItem.unitCost) || 0,
+                    total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                    parentId: isSection || tItem.parentId == null ? null : currentSectionId,
+                    costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                    ...(isSection ? { isSection: true } : {}),
+                });
+                if (isSection) currentSectionId = newId;
+            }
+        } else {
+            // Flat template: wrap its items in a new section named after the template.
+            const sectionId = generateId();
             newItems.push({
-                id: generateId(), name: tItem.name, description: tItem.description || "",
-                type: tItem.type, quantity: tItem.quantity,
-                baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
-                unitCost: Number(tItem.unitCost) || 0,
-                total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
-                parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                id: sectionId, name: assembly.name, description: "", type: "Section",
+                quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
+                parentId: null, costCodeId: null, costTypeId: null, isSection: true,
             });
+            for (const tItem of tItems) {
+                newItems.push({
+                    id: generateId(), name: tItem.name, description: tItem.description || "",
+                    type: tItem.type, quantity: tItem.quantity,
+                    baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                    unitCost: Number(tItem.unitCost) || 0,
+                    total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                    parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                });
+            }
         }
         setItems(newItems);
         setShowAssemblyDropdown(false);
@@ -589,10 +709,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             .then(res => res.json())
             .then(data => { if (Array.isArray(data)) setCostCodes(data); })
             .catch((err) => console.error("[EstimateEditor] Failed to load cost codes:", err));
-        fetch('/api/cost-types?active=true')
-            .then(res => res.json())
-            .then(data => { if (Array.isArray(data)) setCostTypes(data); })
-            .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
     // Subtotal from leaf items only (sections would double-count)
@@ -605,6 +721,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
     const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
     const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
+    // WA DOR: exempt sales need a reseller permit / exemption certificate on the client record
+    const taxCertStatus = getTaxCertStatus({ url: context.clientTaxExemptCertUrl, expiresAt: context.clientTaxExemptCertExpiresAt });
+    const showTaxCertWarning = taxExempt && taxCertStatus !== "valid";
+    const taxCertFixHref = context.type === "lead" ? `/leads/${context.id}` : "/settings/contacts";
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
@@ -677,6 +797,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
                 memo: memo || null,
                 termsAndConditions: termsAndConditions || null,
+                overviewEnabled,
+                overviewTitle: overviewTitle || null,
+                overviewBody: overviewBody || null,
+                notesEnabled,
+                notesTitle: notesTitle || null,
+                notesBody: notesBody || null,
+                notesPlacement,
                 signatureUrl: signatureUrl || null,
                 targetMarginPercent: parseFloat(targetMargin) || 25,
                 taxExempt,
@@ -875,7 +1002,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     description: aiPrompt,
                     location: context.location || 'Vancouver, WA',
                     costCodes,
-                    costTypes,
                 }),
             });
 
@@ -886,113 +1012,178 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             }
 
             const data = await res.json();
-            if (data.items && data.items.length > 0) {
-                const newItems = [...items, ...data.items];
-                const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
-                    ? [...paymentSchedules, ...data.paymentMilestones]
-                    : paymentSchedules;
-
-                // Close modal and update UI immediately — don't wait for save
-                setItems(newItems);
-                if (data.paymentMilestones && data.paymentMilestones.length > 0) {
-                    setPaymentSchedules(newSchedules);
-                }
-                setShowAiModal(false);
-                setAiPrompt("");
-                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
-
-                // Auto-save in background — set isSaving to block concurrent blur-triggered save
-                setIsSaving(true);
-                try {
-                    // Recompute section header totals from children before saving
-                    const aiChildTotals = new Map<string, number>();
-                    for (const item of newItems) {
-                        if (item.parentId) {
-                            aiChildTotals.set(item.parentId, (aiChildTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-                        }
-                    }
-                    const mappedItems = newItems.map((item: any, index: number) => {
-                        const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
-                        const ct = isSect ? (aiChildTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                        return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
-                    });
-                    const mappedSchedules = newSchedules.map((schedule, index) => ({
-                        ...schedule,
-                        order: index
-                    }));
-                    // Subtotal from leaf items only (sections would double-count)
-                    const newSubtotal = newItems.reduce((acc: number, item: any) => {
-                        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                        if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                        return acc;
-                    }, 0);
-                    const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
-                    await saveEstimate(initialEstimate.id, context.id, context.type, {
-                        title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
-                        taxRateName: taxExempt ? null : (activeTax?.name || null),
-                        taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-                    }, mappedItems);
-                    toast.success("Estimate auto-saved");
-
-                    // Update lastSavedStateRef so subsequent blur saves are skipped
-                    const aiSnapshot = {
-                        title: title || "",
-                        code: code || "",
-                        status: status || "Draft",
-                        processingFeeMarkup: Number(processingFeeMarkup) || 0,
-                        hideProcessingFee: !!hideProcessingFee,
-                        expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
-                        memo: memo || null,
-                        termsAndConditions: termsAndConditions || null,
-                        signatureUrl: signatureUrl || null,
-                        targetMarginPercent: parseFloat(targetMargin) || 25,
-                        taxExempt: !!taxExempt,
-                        taxRateName: taxExempt ? null : (activeTax?.name || null),
-                        taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-                        items: mappedItems.map((item: any, index: number) => ({
-                            id: item.id || null,
-                            parentId: item.parentId || null,
-                            name: item.name || "",
-                            description: item.description || "",
-                            quantity: String(item.quantity || "0"),
-                            unitCost: String(item.unitCost || "0"),
-                            costCodeId: item.costCodeId || null,
-                            costTypeId: item.costTypeId || null,
-                            vendorId: item.vendorId || null,
-                            approvalStatus: item.approvalStatus || null,
-                            order: index,
-                            total: item.total,
-                        })),
-                        paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
-                            id: schedule.id || null,
-                            name: schedule.name || "",
-                            amount: String(schedule.amount || "0"),
-                            dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
-                            status: schedule.status || "Pending",
-                            paymentMethod: schedule.paymentMethod || null,
-                            paymentReference: schedule.paymentReference || null,
-                            percentage: String(schedule.percentage || "0"),
-                            type: schedule.type || null,
-                            order: index
-                        })),
-                    };
-                    lastSavedStateRef.current = JSON.stringify(aiSnapshot);
-
-                    router.refresh();
-                } catch (saveErr) {
-                    console.error("Auto-save after AI generate failed:", saveErr);
-                    toast.error("Items added — but auto-save failed. Click Save to persist.");
-                } finally {
-                    setIsSaving(false);
-                }
-            } else {
-                toast.error('AI returned no items');
-            }
+            await applyGeneratedEstimate(data, {
+                verb: "AI generated",
+                onMerged: () => { setShowAiModal(false); setAiPrompt(""); },
+            });
         } catch (err: any) {
             console.error('AI Generate error:', err);
             toast.error(err?.message || 'Failed to generate estimate — check console');
         } finally {
             setIsGenerating(false);
+        }
+    }
+
+    /**
+     * Shared merge + auto-save path for a generated OR imported estimate payload
+     * ({ items, paymentMilestones, count, totalEstimate }). Appends to existing items,
+     * recomputes section-header totals, persists, and syncs the saved-state ref so blur
+     * saves are skipped. Used by both AI generate and ChatGPT import.
+     */
+    async function applyGeneratedEstimate(
+        data: { items?: any[]; paymentMilestones?: any[]; count?: number; totalEstimate?: number },
+        { verb = "Added", onMerged }: { verb?: string; onMerged?: () => void } = {},
+    ) {
+        if (!data.items || data.items.length === 0) {
+            toast.error('No line items found to add');
+            return;
+        }
+        const newItems = [...items, ...data.items];
+        const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
+            ? [...paymentSchedules, ...data.paymentMilestones]
+            : paymentSchedules;
+
+        // Update UI immediately — don't wait for save
+        setItems(newItems);
+        if (data.paymentMilestones && data.paymentMilestones.length > 0) {
+            setPaymentSchedules(newSchedules);
+        }
+        onMerged?.();
+        toast.success(`${verb} ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
+
+        // Auto-save in background — set isSaving to block concurrent blur-triggered save
+        setIsSaving(true);
+        try {
+            // Recompute section header totals from children before saving
+            const childTotals = new Map<string, number>();
+            for (const item of newItems) {
+                if (item.parentId) {
+                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                }
+            }
+            const mappedItems = newItems.map((item: any, index: number) => {
+                const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
+                const ct = isSect ? (childTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
+            });
+            const mappedSchedules = newSchedules.map((schedule, index) => ({
+                ...schedule,
+                order: index
+            }));
+            // Subtotal from leaf items only (sections would double-count)
+            const newSubtotal = newItems.reduce((acc: number, item: any) => {
+                if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return acc;
+            }, 0);
+            const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
+            await saveEstimate(initialEstimate.id, context.id, context.type, {
+                title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            }, mappedItems);
+            toast.success("Estimate auto-saved");
+
+            // Update lastSavedStateRef so subsequent blur saves are skipped
+            const savedSnapshot = {
+                title: title || "",
+                code: code || "",
+                status: status || "Draft",
+                processingFeeMarkup: Number(processingFeeMarkup) || 0,
+                hideProcessingFee: !!hideProcessingFee,
+                expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
+                memo: memo || null,
+                termsAndConditions: termsAndConditions || null,
+                overviewEnabled,
+                overviewTitle: overviewTitle || null,
+                overviewBody: overviewBody || null,
+                notesEnabled,
+                notesTitle: notesTitle || null,
+                notesBody: notesBody || null,
+                notesPlacement,
+                signatureUrl: signatureUrl || null,
+                targetMarginPercent: parseFloat(targetMargin) || 25,
+                taxExempt: !!taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+                items: mappedItems.map((item: any, index: number) => ({
+                    id: item.id || null,
+                    parentId: item.parentId || null,
+                    name: item.name || "",
+                    description: item.description || "",
+                    type: item.type || "Material",
+                    quantity: String(item.quantity || "0"),
+                    unitCost: String(item.unitCost || "0"),
+                    costCodeId: item.costCodeId || null,
+                    costTypeId: item.costTypeId || null,
+                    vendorId: item.vendorId || null,
+                    approvalStatus: item.approvalStatus || null,
+                    order: index,
+                    total: item.total,
+                })),
+                paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
+                    id: schedule.id || null,
+                    name: schedule.name || "",
+                    amount: String(schedule.amount || "0"),
+                    dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
+                    status: schedule.status || "Pending",
+                    paymentMethod: schedule.paymentMethod || null,
+                    paymentReference: schedule.paymentReference || null,
+                    percentage: String(schedule.percentage || "0"),
+                    type: schedule.type || null,
+                    order: index
+                })),
+            };
+            lastSavedStateRef.current = JSON.stringify(savedSnapshot);
+
+            router.refresh();
+        } catch (saveErr) {
+            console.error("Auto-save after estimate merge failed:", saveErr);
+            toast.error("Items added — but auto-save failed. Click Save to persist.");
+        } finally {
+            setIsSaving(false);
+        }
+    }
+
+    async function handleImportEstimate() {
+        const raw = importJson.trim();
+        if (!raw) {
+            toast.error("Paste the JSON from ChatGPT first");
+            return;
+        }
+        let parsed: any;
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            toast.error("That doesn't look like valid JSON. Paste ChatGPT's full output — it should start with { and end with }.");
+            return;
+        }
+        setIsImporting(true);
+        try {
+            const res = await fetch('/api/ai-estimate/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    phases: parsed.phases,
+                    paymentMilestones: parsed.paymentMilestones,
+                    costCodes,
+                }),
+            });
+            if (!res.ok) {
+                const d = await res.json().catch(() => ({}));
+                toast.error(d.error || 'Import failed — check the JSON format');
+                return;
+            }
+            const data = await res.json();
+            await applyGeneratedEstimate(data, {
+                verb: "Imported",
+                onMerged: () => { setShowImportModal(false); setImportJson(""); },
+            });
+        } catch (err: any) {
+            console.error('Import estimate error:', err);
+            toast.error(err?.message || 'Failed to import estimate');
+        } finally {
+            setIsImporting(false);
         }
     }
 
@@ -1241,6 +1432,72 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         toast.success("Budgets cleared — PO-committed items kept");
     }
 
+    async function handleAiAssignPhases() {
+        const eligibleItems = items.filter(item => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            return !isSection;
+        });
+
+        if (eligibleItems.length === 0) {
+            toast.info("No items found to assign phases.");
+            return;
+        }
+
+        setIsAiAssigningPhases(true);
+        try {
+            const payloadItems = eligibleItems.map(item => ({
+                id: item.id,
+                name: item.name,
+                description: item.description || ""
+            }));
+
+            const payloadCostCodes = costCodes.map(cc => ({
+                id: cc.id,
+                code: cc.code,
+                name: cc.name
+            }));
+
+            const res = await fetch("/api/ai-estimate/assign-phases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: payloadItems,
+                    costCodes: payloadCostCodes
+                })
+            });
+
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.error || "Failed to auto-assign phases");
+            }
+
+            const { assignments } = await res.json();
+            if (!assignments || !Array.isArray(assignments)) {
+                throw new Error("Invalid response from server");
+            }
+
+            let assignedCount = 0;
+            setItems(prev => {
+                const next = [...prev];
+                for (const ass of assignments) {
+                    const idx = next.findIndex(item => item.id === ass.id);
+                    if (idx >= 0 && ass.costCodeId !== undefined) {
+                        next[idx] = { ...next[idx], costCodeId: ass.costCodeId };
+                        assignedCount++;
+                    }
+                }
+                return next;
+            });
+
+            toast.success(`Successfully matched and assigned phases to ${assignedCount} items.`);
+        } catch (err: any) {
+            console.error("Auto-assign phases error:", err);
+            toast.error(err.message || "Failed to auto-assign phases");
+        } finally {
+            setIsAiAssigningPhases(false);
+        }
+    }
+
     function addPaymentSchedule() {
         setPaymentSchedules([...paymentSchedules, {
             id: generateId(),
@@ -1282,6 +1539,16 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function removePaymentSchedule(index: number) {
+        // Invoice-side milestones are snapshots — deleting the estimate copy does
+        // NOT remove it from an already-generated invoice.
+        if (linkedInvoice) {
+            const ok = window.confirm(
+                `This estimate has already been invoiced (${linkedInvoice.code}). ` +
+                `Deleting this milestone will NOT remove it from the invoice — ` +
+                `the invoice must be adjusted separately. Delete anyway?`
+            );
+            if (!ok) return;
+        }
         const newSchedules = [...paymentSchedules];
         newSchedules.splice(index, 1);
         setPaymentSchedules(newSchedules);
@@ -1332,13 +1599,14 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu && !isSaving) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving) {
                     handleSave();
                 }
             }}
         >
             {/* Top Navigation / Action Bar */}
-            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-10 sticky top-0">
+            {/* z-30: must beat the sidebar's sticky tab bar (z-10, later in DOM) so the ⋮ dropdown isn't painted under it */}
+            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-30 sticky top-0">
                 <div className="flex items-center gap-3">
                     <button onClick={() => {
                         if (context.type === "project") {
@@ -1368,6 +1636,16 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             <option key={s} value={s}>{s}</option>
                         ))}
                     </select>
+                    {showTaxCertWarning && (
+                        <button
+                            onClick={() => router.push(taxCertFixHref)}
+                            title="This estimate is tax-exempt but the client has no valid exemption certificate on file. WA DOR requires one for every exempt sale. Click to open the client record."
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold border transition ${taxCertStatus === "expired" ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
+                        >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                            {taxCertStatus === "expired" ? "Tax-exempt cert expired" : "No tax-exempt cert on file"}
+                        </button>
+                    )}
                 </div>
 
                 {/* Tabs Middle */}
@@ -1422,6 +1700,21 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     >
                                         <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
                                         AI Generate
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowImportModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700"
+                                    >
+                                        <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
+                                        Import from ChatGPT
+                                    </button>
+                                    <button
+                                        onClick={() => { handleAiAssignPhases(); setShowMoreMenu(false); }}
+                                        disabled={isAiAssigningPhases}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700 disabled:opacity-50"
+                                    >
+                                        <svg className={`w-4 h-4 text-purple-500 ${isAiAssigningPhases ? "animate-pulse" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        {isAiAssigningPhases ? "Assigning..." : "Auto-assign Phases"}
                                     </button>
                                     <button
                                         onClick={() => { handleHistoricalPricing(); setShowMoreMenu(false); }}
@@ -1634,7 +1927,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             {/* Assembly Name Modal */}
             {showAssemblyNameModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" onClick={() => setShowAssemblyNameModal(false)}>
-                    <div className="bg-white rounded-xl shadow-2xl p-6 w-96" onClick={e => e.stopPropagation()}>
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm mx-4" onClick={e => e.stopPropagation()}>
                         <h3 className="text-lg font-bold text-slate-800 mb-1">Save Assembly</h3>
                         <p className="text-sm text-slate-500 mb-4">Name this bundle so you can reuse it across estimates (e.g., &quot;Standard Bathroom Demo&quot;).</p>
                         <input
@@ -1656,8 +1949,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 </div>
             )}
 
-            <div className="flex-1 flex overflow-hidden">
-            <div className="flex-1 p-8 flex justify-center pb-24 overflow-y-auto">
+            <div className="flex-1 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
+            <div className="flex-1 p-4 lg:p-8 flex justify-center pb-24 overflow-visible lg:overflow-y-auto">
                 {activeTab === "builder" && (
                     <div className="w-full max-w-5xl">
                         {/* Premium Document Wrapper */}
@@ -1702,6 +1995,15 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     >
                                         <svg className={`w-4 h-4 ${isAiFilling ? "animate-pulse" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
                                         {isAiFilling ? "Filling…" : "AI fill budgets"}
+                                    </button>
+                                    <button
+                                        onClick={handleAiAssignPhases}
+                                        disabled={isAiAssigningPhases || isAiFilling}
+                                        className="hui-btn hui-btn-secondary text-sm flex items-center gap-2 disabled:opacity-50"
+                                        title="Auto-assign phases using AI."
+                                    >
+                                        <svg className={`w-4 h-4 text-purple-500 ${isAiAssigningPhases ? "animate-pulse" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        {isAiAssigningPhases ? "Assigning..." : "Auto-assign Phases"}
                                     </button>
                                     <button
                                         onClick={handleClearBudgets}
@@ -1973,21 +2275,22 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                             ))}
                                                                         </select>
                                                                         <select
-                                                                            value={item.costTypeId || ""}
+                                                                            value={ITEM_TYPE_LABELS.includes(item.type) ? item.type : ""}
                                                                             onChange={e => {
-                                                                                updateItem(index, "costTypeId", e.target.value || null);
-                                                                                const ct = costTypes.find(c => c.id === e.target.value);
-                                                                                if (ct) updateItem(index, "type", ct.name);
+                                                                                const label = e.target.value;
+                                                                                if (!label) return;
+                                                                                // One atomic update: set the label and drop any stale CostType link.
+                                                                                setItems(prev => prev.map((it, i) => i === index ? { ...it, type: label, costTypeId: null } : it));
                                                                             }}
                                                                             className={`hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition ${
-                                                                                costTypes.find(c => c.id === item.costTypeId)?.name === 'Allowance'
+                                                                                item.type === 'Allowance'
                                                                                     ? 'bg-amber-100 text-amber-700 font-semibold'
                                                                                     : 'bg-slate-100 text-hui-textMuted'
                                                                             }`}
                                                                         >
                                                                             <option value="">Type</option>
-                                                                            {costTypes.map(ct => (
-                                                                                <option key={ct.id} value={ct.id}>{ct.name}</option>
+                                                                            {ITEM_TYPE_LABELS.map(label => (
+                                                                                <option key={label} value={label}>{label}</option>
                                                                             ))}
                                                                         </select>
                                                                         <span className="w-px h-3 bg-slate-200"></span>
@@ -2129,6 +2432,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                 <div className="flex items-center justify-between bg-slate-50/50 border-b border-slate-100 px-8 py-5">
                                     <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
                                 </div>
+                                {linkedInvoice && (
+                                    <div className="flex items-start gap-2.5 bg-amber-50 border-b border-amber-200 px-8 py-3">
+                                        <svg className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                                        </svg>
+                                        <p className="text-xs text-amber-800">
+                                            <span className="font-semibold">This estimate has been invoiced ({linkedInvoice.code}).</span>{" "}
+                                            Adding, editing, or deleting milestones here does <strong>not</strong> update the invoice — align the invoice&apos;s payment schedule separately.
+                                        </p>
+                                    </div>
+                                )}
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-white border-b border-slate-100 px-8 py-3 uppercase tracking-wider">
                                     <div className="flex-1">Payment Name</div>
                                     <div className="w-32">Percentage</div>
@@ -2387,6 +2701,22 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                             </label>
                                         </div>
                                     )}
+                                    {viewMode === "internal" && showTaxCertWarning && (
+                                        <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
+                                            <div className="flex items-start gap-2">
+                                                <svg className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                                                <div className="text-xs">
+                                                    <p className="font-bold text-amber-800">
+                                                        {taxCertStatus === "expired"
+                                                            ? `Exemption certificate expired${context.clientTaxExemptCertExpiresAt ? ` ${formatCertExpiry(context.clientTaxExemptCertExpiresAt)}` : ""}`
+                                                            : "No exemption certificate on file"}
+                                                    </p>
+                                                    <p className="text-amber-700 mt-0.5">WA DOR requires a reseller permit or exemption certificate on file for every tax-exempt sale. Signing is not blocked.</p>
+                                                    <a href={taxCertFixHref} className="inline-block mt-1 font-semibold text-amber-800 underline hover:text-amber-900">Add it on the client record →</a>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
                                     {/* Processing Fee Markup — hidden from client view by default */}
                                     {(viewMode === "internal" || !hideProcessingFee) && (
                                         <div className="flex justify-between items-center text-slate-500 font-medium">
@@ -2469,6 +2799,113 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                 <button onClick={addPaymentSchedule} className="hui-btn hui-btn-secondary text-indigo-700 border-indigo-200 hover:bg-indigo-100 bg-white transition shadow-sm text-xs py-1.5 px-3">
                                     + Add milestone
                                 </button>
+                            </div>
+                        </div>
+
+                        {/* Project Overview / Vision Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowOverview(!showOverview)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Project Overview</span>
+                                        {overviewEnabled && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">On</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showOverview ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showOverview && (
+                                    <div className="px-6 pb-5 border-t border-slate-100 space-y-3">
+                                        <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                                            <input type="checkbox" checked={overviewEnabled} onChange={e => setOverviewEnabled(e.target.checked)} className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                                            <span className="text-sm text-slate-600">Include a Project Overview page (shown after the header/client info, before pricing, with a page break so the line items begin on the next page).</span>
+                                        </label>
+                                        <div>
+                                            <label className="text-xs font-medium text-slate-500 mb-1 block">Page title</label>
+                                            <input value={overviewTitle} onChange={e => setOverviewTitle(e.target.value)} placeholder="Project Overview" className="hui-input w-full text-sm" />
+                                        </div>
+                                        {overviewTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm"
+                                                value=""
+                                                onChange={e => { const t = overviewTemplates.find(t => t.id === e.target.value); if (t) setOverviewBody(t.body); }}
+                                            >
+                                                <option value="" disabled>Load a saved overview template...</option>
+                                                {overviewTemplates.map(t => <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>)}
+                                            </select>
+                                        )}
+                                        <RichTextEditor
+                                            value={overviewBody}
+                                            onChange={setOverviewBody}
+                                            placeholder="Describe the overall project vision, the major areas of work, and how the scopes fit together. No pricing here."
+                                        />
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => handleSaveDocTemplate("overview", overviewBody)} disabled={isSavingOverviewTpl} className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                                                {isSavingOverviewTpl ? "Saving…" : "Save as template"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Estimate Notes & Assumptions Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowNotes(!showNotes)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Notes &amp; Assumptions</span>
+                                        {notesEnabled && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">On</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showNotes ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showNotes && (
+                                    <div className="px-6 pb-5 border-t border-slate-100 space-y-3">
+                                        <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                                            <input type="checkbox" checked={notesEnabled} onChange={e => setNotesEnabled(e.target.checked)} className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                                            <span className="text-sm text-slate-600">Include a Notes &amp; Assumptions section for exclusions, allowances, and estimating assumptions.</span>
+                                        </label>
+                                        <div className="grid grid-cols-2 gap-3">
+                                            <div>
+                                                <label className="text-xs font-medium text-slate-500 mb-1 block">Section title</label>
+                                                <input value={notesTitle} onChange={e => setNotesTitle(e.target.value)} placeholder="Estimate Notes & Assumptions" className="hui-input w-full text-sm" />
+                                            </div>
+                                            <div>
+                                                <label className="text-xs font-medium text-slate-500 mb-1 block">Placement</label>
+                                                <select value={notesPlacement} onChange={e => setNotesPlacement(e.target.value === "before" ? "before" : "after")} className="hui-input w-full text-sm">
+                                                    <option value="before">Before the line items</option>
+                                                    <option value="after">After the line items</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        {notesTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm"
+                                                value=""
+                                                onChange={e => { const t = notesTemplates.find(t => t.id === e.target.value); if (t) setNotesBody(t.body); }}
+                                            >
+                                                <option value="" disabled>Load a saved notes template...</option>
+                                                {notesTemplates.map(t => <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>)}
+                                            </select>
+                                        )}
+                                        <RichTextEditor
+                                            value={notesBody}
+                                            onChange={setNotesBody}
+                                            placeholder="Exclusions, allowances, and assumptions behind this estimate..."
+                                        />
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => handleSaveDocTemplate("notes", notesBody)} disabled={isSavingNotesTpl} className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                                                {isSavingNotesTpl ? "Saving…" : "Save as template"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
 
@@ -2619,7 +3056,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
             {/* Right Sidebar */}
             {showSidebar && (
-                <div className="w-96 border-l border-slate-200 bg-white flex flex-col overflow-y-auto overflow-x-hidden shrink-0">
+                <div className="w-full lg:w-96 border-t lg:border-t-0 lg:border-l border-slate-200 bg-white flex flex-col overflow-visible lg:overflow-y-auto overflow-x-hidden lg:shrink-0">
                     {/* Sidebar Tabs */}
                     <div className="flex border-b border-slate-200 sticky top-0 bg-white z-10">
                         <button
@@ -2749,56 +3186,48 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         </div>
                     )}
 
-                    {sidebarTab === "activity" && (
-                        <div className="p-5">
-                            <div className="space-y-4">
-                                {/* Activity Timeline */}
+                    {sidebarTab === "activity" && (() => {
+                        // Append-only feed from the server (every send/resend, view, signature,
+                        // invoice lifecycle, settled payments). Falls back to the legacy
+                        // single-timestamp rendering only if the prop is missing.
+                        const events: ActivityEvent[] = activityEvents ?? [
+                            { id: "created", ts: initialEstimate.createdAt, kind: "created", title: "Estimate created" },
+                            ...(initialEstimate.sentAt ? [{ id: "sent", ts: initialEstimate.sentAt, kind: "sent" as const, title: "Sent to client" }] : []),
+                            ...(initialEstimate.viewedAt ? [{ id: "viewed", ts: initialEstimate.viewedAt, kind: "viewed" as const, title: "Viewed by client" }] : []),
+                            ...(initialEstimate.approvedAt ? [{ id: "signed", ts: initialEstimate.approvedAt, kind: "signed" as const, title: `Approved${initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ""}` }] : []),
+                        ];
+                        const iconFor = (kind: ActivityEvent["kind"]) => {
+                            switch (kind) {
+                                case "created": return { bg: "bg-slate-200", fg: "text-slate-500", path: "M12 6v6m0 0v6m0-6h6m-6 0H6" };
+                                case "sent": return { bg: "bg-amber-100", fg: "text-amber-600", path: "M12 19l9 2-9-18-9 18 9-2zm0 0v-8" };
+                                case "viewed": return { bg: "bg-blue-100", fg: "text-blue-600", path: "M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7zM15 12a3 3 0 11-6 0 3 3 0 016 0z" };
+                                case "signed": return { bg: "bg-green-100", fg: "text-green-600", path: "M5 13l4 4L19 7" };
+                                case "invoice": return { bg: "bg-indigo-100", fg: "text-indigo-600", path: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" };
+                                case "payment": return { bg: "bg-emerald-100", fg: "text-emerald-600", path: "M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" };
+                                default: return { bg: "bg-slate-100", fg: "text-slate-500", path: "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" };
+                            }
+                        };
+                        return (
+                            <div className="p-5">
                                 <div className="relative">
-                                    <div className="absolute left-[11px] top-6 bottom-0 w-0.5 bg-slate-200"></div>
+                                    <div className="absolute left-[11px] top-6 bottom-3 w-0.5 bg-slate-200"></div>
                                     <div className="space-y-4">
-                                        <div className="flex items-start gap-3 relative">
-                                            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center shrink-0 z-10">
-                                                <svg className="w-3 h-3 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
-                                            </div>
-                                            <div>
-                                                <p className="text-sm font-medium text-slate-800">Estimate created</p>
-                                                <p className="text-xs text-slate-500">{new Date(initialEstimate.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                            </div>
-                                        </div>
-                                        {initialEstimate.sentAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-amber-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                                        {events.map(ev => {
+                                            const icon = iconFor(ev.kind);
+                                            return (
+                                                <div key={ev.id} className="flex items-start gap-3 relative">
+                                                    <div className={`w-6 h-6 rounded-full ${icon.bg} flex items-center justify-center shrink-0 z-10`}>
+                                                        <svg className={`w-3 h-3 ${icon.fg}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={icon.path} /></svg>
+                                                    </div>
+                                                    <div className="min-w-0">
+                                                        <p className="text-sm font-medium text-slate-800">{ev.title}</p>
+                                                        {ev.detail && <p className="text-xs text-slate-500 truncate" title={ev.detail}>{ev.detail}</p>}
+                                                        <p className="text-xs text-slate-400">{new Date(ev.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                    </div>
                                                 </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Sent to client</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.sentAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {initialEstimate.viewedAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-blue-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
-                                                </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Viewed by client</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.viewedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {initialEstimate.approvedAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-green-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Approved{initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ''}</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.approvedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {!initialEstimate.sentAt && !initialEstimate.viewedAt && !initialEstimate.approvedAt && (
+                                            );
+                                        })}
+                                        {events.length <= 1 && (
                                             <div className="mt-4 text-center py-6">
                                                 <svg className="w-10 h-10 text-slate-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                                 <p className="text-sm text-slate-500">No activity yet</p>
@@ -2808,8 +3237,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     </div>
                                 </div>
                             </div>
-                        </div>
-                    )}
+                        );
+                    })()}
 
                     {sidebarTab === "comments" && (
                         <div className="flex-1 flex flex-col min-h-0">
@@ -2986,6 +3415,93 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 </div>
             )}
 
+            {/* Import from ChatGPT Modal */}
+            {showImportModal && (
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full overflow-hidden border border-purple-200">
+                        <div className="px-6 py-4 border-b border-purple-100 bg-gradient-to-r from-purple-50 to-indigo-50 flex justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="w-8 h-8 rounded-lg bg-purple-100 flex items-center justify-center">
+                                    <svg className="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
+                                </div>
+                                <div>
+                                    <h2 className="text-lg font-bold text-hui-textMain">Import from ChatGPT</h2>
+                                    <p className="text-xs text-purple-600">Paste JSON • builds phases + line items + milestones</p>
+                                </div>
+                            </div>
+                            <button onClick={() => setShowImportModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-6 space-y-4">
+                            <div className="bg-slate-50 rounded-lg p-3 text-xs text-slate-600 space-y-1.5">
+                                <div className="font-semibold text-slate-700">How to use:</div>
+                                <div>1. Click <strong>Copy ChatGPT prompt</strong> below and paste it into ChatGPT, then describe your project.</div>
+                                <div>2. Copy ChatGPT&apos;s JSON reply and paste it into the box below.</div>
+                                <div>3. Click <strong>Import</strong> — phases become collapsible groups with line items beneath them.</div>
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        try {
+                                            await navigator.clipboard.writeText(CHATGPT_ESTIMATE_PROMPT);
+                                            toast.success("Prompt copied — paste it into ChatGPT");
+                                        } catch {
+                                            toast.error("Couldn't copy — select the prompt manually");
+                                        }
+                                    }}
+                                    className="mt-1 inline-flex items-center gap-1.5 text-purple-700 hover:text-purple-900 font-medium"
+                                >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                    Copy ChatGPT prompt
+                                </button>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-hui-textMain mb-2">Paste ChatGPT&apos;s JSON</label>
+                                <textarea
+                                    value={importJson}
+                                    onChange={e => setImportJson(e.target.value)}
+                                    placeholder={'{\n  "phases": [ { "phaseName": "Demolition", "items": [ { "name": "...", "costType": "Labor", "quantity": 1, "unit": "job", "unitCost": 1800 } ] } ],\n  "paymentMilestones": [ { "name": "Deposit", "percentage": 25 } ]\n}'}
+                                    className="hui-input w-full h-40 resize-none font-mono text-xs"
+                                    disabled={isImporting}
+                                />
+                            </div>
+                            {items.length > 0 && (
+                                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
+                                    <strong>Note:</strong> Imported items will be appended to your existing {items.length} item(s).
+                                </div>
+                            )}
+                        </div>
+                        <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50">
+                            <button
+                                type="button"
+                                onClick={() => setShowImportModal(false)}
+                                disabled={isImporting}
+                                className="hui-btn hui-btn-secondary"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleImportEstimate}
+                                disabled={isImporting || !importJson.trim()}
+                                className="hui-btn bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 disabled:opacity-50 flex items-center gap-2"
+                            >
+                                {isImporting ? (
+                                    <>
+                                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Importing...
+                                    </>
+                                ) : (
+                                    <>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19l3 3m0 0l3-3m-3 3V10M5 8a4 4 0 014-4h6a4 4 0 014 4" /></svg>
+                                        Import
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Historical Pricing Modal */}
             {showHistoricalPricing && (
                 <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -3119,6 +3635,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         paidAt={undoPaymentTarget.paidAt || null}
                         paymentDate={undoPaymentTarget.paymentDate || null}
                         hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
+                        hasQbPayment={undoPaymentTarget.paymentMethod === "quickbooks"}
                         currentBalance={currentBalance}
                         estimateTotal={total}
                         currentStatus={status}

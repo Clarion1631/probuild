@@ -2,25 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
-
-type CostCode = { id: string; code: string; name: string };
-type CostType = { id: string; name: string };
-type AiPhaseItem = {
-    name?: string;
-    description?: string;
-    costType?: string;
-    quantity?: number;
-    unit?: string;
-    unitCost?: number;
-};
-type AiPhase = {
-    phaseName?: string;
-    phaseCode?: string;
-    items?: AiPhaseItem[];
-};
-type AiMilestone = { name?: string; percentage?: number };
-type AiData = { phases: AiPhase[]; paymentMilestones: AiMilestone[] };
-type EstimateItem = ReturnType<typeof makeItem>;
+import { transformPhasesToItems, type AiData, type CostCode, type CostType } from "@/lib/ai-estimate-transform";
 
 export const maxDuration = 300; // 5 min — Claude needs time for large estimates
 
@@ -49,7 +31,7 @@ AVAILABLE PHASES (use the code field exactly as shown):
 ${phasesList || "Use standard construction phases"}
 
 AVAILABLE COST TYPES (use exactly as shown):
-${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}
+${typesList || "Labor, Material, Allowance, Subcontractor, Equipment, Other"}
 
 INSTRUCTIONS:
 - Organize the estimate into 6-12 phases that apply to this project
@@ -90,7 +72,7 @@ Return ONLY a valid JSON object with this exact structure:
         {
           "name": string,
           "description": string,
-          "costType": string (exactly one of: ${typesList || "Labor, Material, Subcontractor, Equipment, Unit, Allowance, Other"}),
+          "costType": string (exactly one of: ${typesList || "Labor, Material, Allowance, Subcontractor, Equipment, Other"}),
           "quantity": number,
           "unit": string (e.g. "sq ft", "hr", "each", "job", "linear ft"),
           "unitCost": number
@@ -143,97 +125,12 @@ Sort phases in logical construction order. Make the estimate thorough and profes
             }
         }
 
-        const aiPhases: AiPhase[] = aiData.phases || [];
-        const aiMilestones: AiMilestone[] = aiData.paymentMilestones || [];
-
-        // Map cost codes and cost types to IDs
-        const codeMap: Record<string, string> = {};
-        for (const cc of (costCodes || [])) {
-            if (cc.code) codeMap[cc.code] = cc.id;
-        }
-        const typeMap: Record<string, string> = {};
-        for (const ct of (costTypes || [])) {
-            if (ct.name) typeMap[ct.name] = ct.id;
-        }
-
         // Transform AI phases into the grouped estimate-item structure the editor expects.
-        const ts = Date.now();
-        let order = 0;
-        const estimateItems: EstimateItem[] = [];
-
-        for (let pi = 0; pi < aiPhases.length; pi++) {
-            const phase = aiPhases[pi];
-            const parentId = `ai_${ts}_p${pi}`;
-            const phaseItems = phase.items || [];
-            const phaseTotal = phaseItems.reduce((s, it) => s + (it.quantity || 1) * (it.unitCost || 0), 0);
-
-            // Parent row — phase header (type "Section" so editor renders it as a collapsible group)
-            // unitCost = phaseTotal so that qty(1) * unitCost = total survives the
-            // save-path recomputation in EstimateEditor (which does qty * unitCost for all rows)
-            estimateItems.push(makeItem({
-                id: parentId,
-                name: phase.phaseName || `Phase ${pi + 1}`,
-                description: "",
-                type: "Section",
-                quantity: 1,
-                unitCost: phaseTotal,
-                total: phaseTotal,
-                parentId: null,
-                costCodeId: phase.phaseCode ? (codeMap[phase.phaseCode] ?? null) : null,
-                costTypeId: null,
-                order: order++,
-            }));
-
-            // Child rows
-            for (let ii = 0; ii < phaseItems.length; ii++) {
-                const item = phaseItems[ii];
-                const qty = item.quantity || 1;
-                const uc = item.unitCost || 0;
-                estimateItems.push(makeItem({
-                    id: `ai_${ts}_p${pi}_i${ii}`,
-                    name: item.name || "Item",
-                    description: item.description || "",
-                    type: item.costType || "Material",
-                    quantity: qty,
-                    unitCost: uc,
-                    total: qty * uc,
-                    parentId,
-                    costCodeId: phase.phaseCode ? (codeMap[phase.phaseCode] ?? null) : null,
-                    costTypeId: item.costType ? (typeMap[item.costType] ?? null) : null,
-                    order: order++,
-                }));
-            }
-        }
-
-        const totalEstimate = estimateItems
-            .filter(i => !i.parentId) // sum phase totals only
-            .reduce((s, i) => s + i.total, 0);
-
-        const paymentMilestones = aiMilestones.map((m, idx) => ({
-            id: `pm_${ts}_${idx}`,
-            name: m.name || `Payment ${idx + 1}`,
-            percentage: String(m.percentage || 0),
-            amount: ((m.percentage || 0) / 100 * totalEstimate).toFixed(2),
-            dueDate: "",
-        }));
-
-        return NextResponse.json({
-            items: estimateItems,
-            paymentMilestones,
-            count: estimateItems.length,
-            totalEstimate,
-        });
+        const result = transformPhasesToItems(aiData, costCodes || [], costTypes || []);
+        return NextResponse.json(result);
     } catch (err) {
         console.error("AI Estimate error:", err);
         const message = err instanceof Error ? err.message : "Internal error";
         return NextResponse.json({ error: message }, { status: 500 });
     }
-}
-
-function makeItem(i: {
-    id: string; name: string; description: string; type: string;
-    quantity: number; unitCost: number; total: number;
-    parentId: string | null; costCodeId: string | null; costTypeId: string | null; order: number;
-}) {
-    return { ...i, markupPercent: 25, baseCost: null };
 }

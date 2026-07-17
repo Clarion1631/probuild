@@ -5,8 +5,8 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
-import { buildTemplateSeed, parseTemplateKey } from "@/lib/room-designer/templates";
+import { emptyDoc, emptyOutdoorDoc, toApiPayload } from "@/lib/studio/doc";
+import { resolveTemplate, type RoomType } from "@/lib/studio/templates";
 
 export const dynamic = "force-dynamic";
 
@@ -112,17 +112,18 @@ export async function POST(req: Request) {
     // Resolve template (if any). Template-provided roomType overrides the
     // body roomType so pickers can't land a "master_bath" template into a
     // kitchen slot by accident.
-    const tKey = parseTemplateKey(templateKey);
-    const seed = tKey ? buildTemplateSeed(tKey) : null;
+    const template = resolveTemplate(templateKey);
 
-    const validRoomTypes: RoomType[] = ["kitchen", "bathroom", "laundry", "bedroom", "other"];
-    const rt: RoomType = seed
-        ? seed.roomType
+    const validRoomTypes: RoomType[] = ["kitchen", "bathroom", "laundry", "bedroom", "outdoor", "other"];
+    const rt: RoomType = template
+        ? template.roomType
         : roomType && validRoomTypes.includes(roomType)
             ? roomType
             : "kitchen";
 
-    const layoutJson = seed ? seed.layout : buildDefaultLayout();
+    // Blank outdoor rooms start as a fenced grass yard, not an indoor box.
+    const seedDoc = template ? template.build() : rt === "outdoor" ? emptyOutdoorDoc() : emptyDoc();
+    const payload = toApiPayload(seedDoc);
 
     // Nested create + createMany keeps the insert atomic at the driver level
     // without an interactive $transaction callback (incompatible with the
@@ -133,20 +134,20 @@ export async function POST(req: Request) {
             roomType: rt,
             projectId: projectId ?? null,
             leadId: leadId ?? null,
-            layoutJson: layoutJson as any,
-            assets: seed && seed.assets.length > 0
+            layoutJson: payload.layoutJson as any,
+            assets: payload.assets.length > 0
                 ? {
                     createMany: {
-                        data: seed.assets.map((a) => ({
+                        data: payload.assets.map((a) => ({
                             assetType: a.assetType,
                             assetId: a.assetId,
-                            positionX: a.position.x,
-                            positionY: a.position.y,
-                            positionZ: a.position.z,
+                            positionX: a.positionX,
+                            positionY: a.positionY,
+                            positionZ: a.positionZ,
                             rotationY: a.rotationY,
-                            scaleX: a.scale.x,
-                            scaleY: a.scale.y,
-                            scaleZ: a.scale.z,
+                            scaleX: a.scaleX,
+                            scaleY: a.scaleY,
+                            scaleZ: a.scaleZ,
                             // Prisma InputJsonValue rejects plain Record<string, unknown>;
                             // mirrors the layoutJson cast above.
                             metadata: (a.metadata ?? undefined) as any,

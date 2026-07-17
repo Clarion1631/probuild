@@ -50,7 +50,7 @@ export default function ProjectsKanbanBoard({ projects: initialProjects, statuse
         <DragDropContext onDragEnd={onDragEnd}>
             <div className="flex gap-6 pb-8 overflow-x-auto min-h-[500px] items-start">
                 {statuses.map(status => {
-                    const colProjects = projects.filter((p: any) => (p.status || "Open") === status.value);
+                    const colProjects = projects.filter((p: any) => (p.status || "In Progress") === status.value);
                     
                     return (
                         <div key={status.value} className="w-[320px] flex-shrink-0 flex flex-col bg-slate-50 border border-slate-200 rounded-xl overflow-hidden p-3">
@@ -61,7 +61,7 @@ export default function ProjectsKanbanBoard({ projects: initialProjects, statuse
                                     {status.label}
                                     <span className="text-slate-400 font-medium ml-1">({colProjects.length})</span>
                                 </h3>
-                                <button onClick={onCustomizeClick} className="text-slate-400 hover:text-slate-700 transition">
+                                <button onClick={onCustomizeClick} aria-label="Customize status" title="Customize status" className="text-slate-400 hover:text-slate-700 transition">
                                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
                                 </button>
                             </div>
@@ -92,8 +92,10 @@ export default function ProjectsKanbanBoard({ projects: initialProjects, statuse
                                                                 <div className="font-bold text-slate-800 mb-0.5 hover:text-indigo-600 transition-colors text-[15px] leading-tight line-clamp-2">
                                                                     {project.name}
                                                                 </div>
-                                                                <button 
+                                                                <button
                                                                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); /* Future menu logic */ }}
+                                                                    aria-label="Project actions"
+                                                                    title="Project actions"
                                                                     className="text-slate-300 hover:text-slate-600 opacity-0 group-hover:opacity-100 transition-opacity p-1 -mt-1 -mr-1 rounded shrink-0"
                                                                 >
                                                                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>

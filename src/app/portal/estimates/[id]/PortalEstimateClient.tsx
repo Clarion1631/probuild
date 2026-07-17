@@ -11,6 +11,7 @@ import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
+import { getTaxCertStatus } from "@/lib/tax-cert";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -229,13 +230,33 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
     const taxLabel = taxExempt ? null : `${effectiveName} (${effectiveRateDisplay}%)`;
     const tax = Math.round(subtotal * taxRate * 100) / 100;
     const total = subtotal + tax;
-    // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update
-    const isApproved = approvedOverride ?? (initialEstimate.status === "Approved");
+    // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update.
+    // Signing auto-invoices the estimate, so post-approval statuses (Invoiced/Partially Paid/Paid)
+    // and a stored signature all count as approved.
+    const isApproved = approvedOverride ?? (
+        ["Approved", "Invoiced", "Partially Paid", "Paid"].includes(initialEstimate.status) || !!initialEstimate.approvedAt
+    );
     const stripeEnabled = companySettings?.stripeEnabled !== false;
-    const schedules: any[] = initialEstimate.paymentSchedules || [];
+    // Signing auto-creates an invoice from this estimate; once it exists, ITS
+    // milestones are the payable source of truth (QuickBooks pay links live there,
+    // and paying estimate-side copies would double-bill the job).
+    const linkedInvoice: any = (initialEstimate.invoices && initialEstimate.invoices[0]) || null;
+    const schedules: any[] = linkedInvoice?.payments?.length
+        ? linkedInvoice.payments
+        : (initialEstimate.paymentSchedules || []);
+    const files: any[] = initialEstimate.files || [];
+    // WA DOR: a tax-exempt sale needs the client's reseller permit / exemption
+    // certificate on file. Warn (never block signing) until a valid one exists.
+    const portalClientRecord = initialEstimate.project?.client ?? initialEstimate.lead?.client ?? null;
+    const taxCertStatus = getTaxCertStatus({
+        url: portalClientRecord?.taxExemptCertUrl,
+        expiresAt: portalClientRecord?.taxExemptCertExpiresAt,
+    });
+    const showTaxCertBanner = taxExempt && taxCertStatus !== "valid";
     // Show pay-in-full when: no schedules at all, OR the auto-created "Payment in Full" row exists but isn't paid and has no active Stripe session (handles abandoned checkouts)
     // Suppress immediately after a successful payment redirect — webhook may not have updated status yet
-    const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && (
+    // (and always once the invoice exists — its milestones carry the pay buttons instead)
+    const showPayInFull = paymentStatus !== "success" && isApproved && stripeEnabled && !linkedInvoice && (
         schedules.length === 0 ||
         schedules.some(s => s.name === "Payment in Full" && s.status !== "Paid" && !s.stripeSessionId)
     );
@@ -330,6 +351,35 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 </div>
             )}
 
+            {/* Tax-exemption certificate notice — outside the document wrapper so it
+                never lands in the captured/signed PDF; informational only, signing stays enabled */}
+            {showTaxCertBanner && !isCapture && (
+                <div className="max-w-6xl mx-auto px-4 pt-4 print:hidden">
+                    <div className="bg-amber-50 border border-amber-300 rounded-lg px-5 py-3 flex items-start gap-3">
+                        <svg className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                        <div>
+                            <p className="text-sm font-semibold text-amber-800">
+                                {taxCertStatus === "expired"
+                                    ? "The tax-exemption certificate we have on file for you has expired"
+                                    : "Tax-exemption certificate needed"}
+                            </p>
+                            <p className="text-sm text-amber-800/90 mt-0.5">
+                                This estimate is tax-exempt, and Washington State requires us to keep a current reseller
+                                permit or exemption certificate on file. Please send {taxCertStatus === "expired" ? "an updated" : "a"} copy to{" "}
+                                {companySettings?.email ? (
+                                    <a href={`mailto:${companySettings.email}?subject=${encodeURIComponent(`Tax exemption certificate — Estimate ${initialEstimate.code || ""}`)}`} className="font-semibold underline hover:text-amber-900">
+                                        {companySettings.email}
+                                    </a>
+                                ) : (
+                                    "us"
+                                )}
+                                {isApproved ? "." : " — you can still review and sign in the meantime."}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Document Container */}
             <div className={`max-w-6xl mx-auto py-8 px-4 print:py-0 print:px-0${isCapture ? " py-0 px-0" : ""}`}>
                 <div id="estimate-document-wrapper" ref={documentRef} className="bg-white rounded-lg shadow-sm overflow-hidden print:shadow-none print:rounded-none">
@@ -403,6 +453,28 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                 </div>
                             )}
                         </div>
+                    )}
+
+                    {/* Project Overview / Vision — after the header/client info, before pricing */}
+                    {initialEstimate.overviewEnabled && initialEstimate.overviewBody && (
+                        <>
+                            <PortalRichSection
+                                variant="overview"
+                                title={initialEstimate.overviewTitle || "Project Overview"}
+                                html={initialEstimate.overviewBody}
+                            />
+                            {/* Force the priced line items onto a fresh PDF page */}
+                            <div data-pdf-break aria-hidden="true" className="h-0" />
+                        </>
+                    )}
+
+                    {/* Notes & Assumptions — before the line items */}
+                    {initialEstimate.notesEnabled && initialEstimate.notesBody && initialEstimate.notesPlacement === "before" && (
+                        <PortalRichSection
+                            variant="notes"
+                            title={initialEstimate.notesTitle || "Estimate Notes & Assumptions"}
+                            html={initialEstimate.notesBody}
+                        />
                     )}
 
                     {/* Line Items — editor-matched layout */}
@@ -482,6 +554,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </div>
                     </div>
 
+                    {/* Notes & Assumptions — after the line items */}
+                    {initialEstimate.notesEnabled && initialEstimate.notesBody && initialEstimate.notesPlacement !== "before" && (
+                        <PortalRichSection
+                            variant="notes"
+                            title={initialEstimate.notesTitle || "Estimate Notes & Assumptions"}
+                            html={initialEstimate.notesBody}
+                        />
+                    )}
+
                     {/* Pay in Full — hidden in capture mode */}
                     {showPayInFull && !isCapture && (
                         <PaymentSectionErrorBoundary>
@@ -523,13 +604,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                 {paymentStatus === "success" && !isPaid && p.stripeSessionId ? (
                                                     <span className="text-xs text-slate-500 italic">Payment processing…</span>
                                                 ) : (
-                                                    isApproved && !isPaid && stripeEnabled && Number(p.amount) > 0 && (
+                                                    isApproved && !isPaid && Number(p.amount) > 0 && (p.qbInvoiceLink || stripeEnabled) && (
                                                         <PortalPayButton
                                                             paymentScheduleId={p.id}
-                                                            estimateId={initialEstimate.id}
+                                                            {...(linkedInvoice ? { invoiceId: linkedInvoice.id } : { estimateId: initialEstimate.id })}
                                                             amount={Number(p.amount)}
                                                             label="Pay Now"
                                                             settings={companySettings}
+                                                            qbPayLink={p.qbInvoiceLink || null}
                                                         />
                                                     )
                                                 )}
@@ -624,9 +706,42 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                         </p>
                     </div>
                 </div>
+
+                {/* Attachments — interactive download links, shown only in the live portal (not in the captured PDF) */}
+                {!isCapture && files.length > 0 && (
+                    <div className="bg-white rounded-lg shadow-sm mt-6 print:hidden">
+                        <div className="px-10 py-5 border-b border-slate-100">
+                            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Attachments</h2>
+                        </div>
+                        <ul className="divide-y divide-slate-100">
+                            {files.map((f: any) => (
+                                <li key={f.id}>
+                                    <a
+                                        href={f.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="flex items-center gap-3 px-10 py-3 hover:bg-slate-50 transition group"
+                                    >
+                                        <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                                        <span className="flex-1 text-sm font-medium text-slate-700 group-hover:text-indigo-600 truncate">{f.name}</span>
+                                        <span className="text-xs text-slate-400 flex-shrink-0">{formatFileSize(f.size)}</span>
+                                        <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                    </a>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
             </div>
         </div>
     );
+}
+
+function formatFileSize(bytes: number): string {
+    if (!bytes || bytes <= 0) return "—";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function TermsAndConditions({ html }: { html: string }) {
@@ -685,6 +800,55 @@ function TermsAndConditions({ html }: { html: string }) {
                 />
             ) : (
                 /* Legacy plain-text path — rendered as JSX to avoid markup injection */
+                <div data-pdf-row="true" className={contentClassName}>
+                    <p className="whitespace-pre-wrap">{html}</p>
+                </div>
+            )}
+        </div>
+    );
+}
+
+/**
+ * Client-facing rich-text section for the estimate Project Overview and Notes &
+ * Assumptions. Mirrors the TermsAndConditions rich-HTML path: detect editor HTML,
+ * sanitize, and tag each top-level block with data-pdf-row so the screenshot PDF
+ * paginator can break between paragraphs instead of splitting one.
+ * "overview" renders a prominent proposal-style title; "notes" a compact heading.
+ */
+function PortalRichSection({ title, html, variant }: { title: string; html: string; variant: "overview" | "notes" }) {
+    const ref = useRef<HTMLDivElement>(null);
+
+    const trimmed = (html || "").trimStart();
+    const isRichHtml =
+        trimmed.startsWith("<p") ||
+        trimmed.startsWith("<h") ||
+        trimmed.startsWith("<ul") ||
+        trimmed.startsWith("<ol") ||
+        trimmed.startsWith("<div");
+
+    const sanitized = isRichHtml ? DOMPurify.sanitize(html) : "";
+
+    useEffect(() => {
+        if (!ref.current || !isRichHtml) return;
+        Array.from(ref.current.children).forEach(child => {
+            (child as HTMLElement).setAttribute("data-pdf-row", "true");
+        });
+    }, [sanitized, isRichHtml]);
+
+    const contentClassName = "prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2";
+
+    return (
+        <div className="px-10 pt-8 pb-8 border-t border-slate-100">
+            <div data-pdf-row="true" className="mb-4">
+                {variant === "overview" ? (
+                    <h2 className="text-xl font-bold text-slate-800 tracking-tight">{title}</h2>
+                ) : (
+                    <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{title}</h2>
+                )}
+            </div>
+            {isRichHtml ? (
+                <div ref={ref} className={contentClassName} dangerouslySetInnerHTML={{ __html: sanitized }} />
+            ) : (
                 <div data-pdf-row="true" className={contentClassName}>
                     <p className="whitespace-pre-wrap">{html}</p>
                 </div>

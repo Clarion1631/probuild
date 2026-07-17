@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
 
 // Manager wrapper around `Project`. The mobile app uses these to list / create / edit
 // jobs; the response shape matches `ManagerJob` in the mobile `lib/api-types.ts`.
@@ -20,7 +21,7 @@ export async function GET(req: Request) {
     }
 
     const projects = await prisma.project.findMany({
-        where: { status: { not: "Closed" } },
+        where: { status: { in: OPEN_PROJECT_STATUSES } },
         orderBy: { name: "asc" },
         select: {
             id: true,
@@ -133,6 +134,20 @@ export async function POST(req: Request) {
             clientId: true,
         },
     });
+
+    // Maintain the 1-1 Project↔Lead invariant — the web app relies on every project
+    // having a backing lead. Create one and link it (no client-facing side effects).
+    const jobLead = await prisma.lead.create({
+        data: {
+            name,
+            clientId,
+            location: typeof body.location === "string" ? body.location : null,
+            source: "Direct project (mobile)",
+            stage: "Won",
+            isUnread: false,
+        },
+    });
+    await prisma.project.update({ where: { id: created.id }, data: { leadId: jobLead.id } });
 
     // Auto-grant access to eligible team members
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");

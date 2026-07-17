@@ -37,13 +37,18 @@ export const config = {
          * - api/webhook (Stripe webhooks)
          * - api/payments (Client portal payment sessions)
          * - api/portal (Public backend handlers for documents)
+         * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
+         * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
+         * - api/version (Deployment-id probe for the stale-tab refresh banner)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
          * - sub-portal (Subcontractor portal, magic-link auth)
+         * - share (Public token-gated room design viewer)
          * - _next/static (Static files)
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
+         * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

@@ -21,6 +21,19 @@ export default async function PortalEstimatePage({ params }: { params: Promise<{
         }
     }
 
+    // Self-healing payment state: if a milestone on this estimate's invoice is
+    // still Pending but lives on the QuickBooks rail, pull settled payments NOW
+    // so a client returning from the Intuit pay page sees "Paid" immediately
+    // (the hourly cron remains the backstop).
+    const pendingQB = await prisma.paymentSchedule.findFirst({
+        where: { status: "Pending", qbInvoiceId: { not: null }, invoice: { estimateId: resolvedParams.id } },
+        select: { invoiceId: true },
+    });
+    if (pendingQB) {
+        const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
+        await syncQuickBooksPayments({ invoiceId: pendingQB.invoiceId }).catch(() => {});
+    }
+
     const estimate = await getEstimateForPortal(resolvedParams.id);
     const settings = await getCompanySettings();
 

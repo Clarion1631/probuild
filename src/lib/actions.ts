@@ -3,17 +3,30 @@
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
+import { after } from "next/server";
 import { cache } from "react";
 import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
-import { safeEstimateSelect, toNum } from "./prisma-helpers";
+import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
-import { buildDefaultLayout, type RoomType } from "@/components/room-designer/types";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
+import { coLineCents } from "./co-tax";
+import { emptyDoc } from "@/lib/studio/doc";
+import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
+import { headers } from "next/headers";
+import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
+import { appendContractCountersignaturePage } from "./pdf";
+import { defaultTaxForNewEstimate } from "./wa-tax";
+import { geocodeJobSiteAddress } from "./geocode";
+import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -27,12 +40,33 @@ function isNotificationEnabled(settings: { notificationToggles?: string | null }
     }
 }
 
-// Build a CC array for a secondary client email (spouse/partner).
-// Returns undefined when additionalEmail is absent, empty, or identical to the primary (case-insensitive).
-function buildCc(primaryEmail: string, additionalEmail?: string | null): string[] | undefined {
-    if (!additionalEmail) return undefined;
-    if (additionalEmail.toLowerCase() === primaryEmail.toLowerCase()) return undefined;
-    return [additionalEmail];
+// Build a CC array from any number of candidate addresses (spouse/partner, lead manager,
+// send-time extras). Drops blanks, the primary recipient, and case-insensitive duplicates.
+// Returns undefined when nothing is left to CC.
+function buildCc(primaryEmail: string, ...candidates: (string | null | undefined)[]): string[] | undefined {
+    const primary = (primaryEmail || "").trim().toLowerCase();
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of candidates) {
+        const e = c?.trim();
+        if (!e) continue;
+        const key = e.toLowerCase();
+        if (key === primary || seen.has(key)) continue;
+        seen.add(key);
+        out.push(e);
+    }
+    return out.length ? out : undefined;
+}
+
+// Best-effort client IP for the e-signature audit trail. Server actions can read request
+// headers via next/headers; behind Vercel the client IP is the first x-forwarded-for hop.
+async function getRequestIp(): Promise<string | null> {
+    try {
+        const h = await headers();
+        return h.get("x-forwarded-for")?.split(",")[0]?.trim() || h.get("x-real-ip") || null;
+    } catch {
+        return null;
+    }
 }
 
 // Safe estimate include that omits columns not yet migrated to the database.
@@ -104,7 +138,10 @@ function isAllowedCapturedPdfUrl(url: string): boolean {
  * where <expiry> is a Unix timestamp (seconds) and <sig> is HMAC-SHA256.
  */
 export async function generatePdfUploadToken(estimateId: string): Promise<string> {
-    const secret = process.env.NEXTAUTH_SECRET || "probuild-pdf-token-secret";
+    const secret = process.env.NEXTAUTH_SECRET;
+    if (!secret) {
+        throw new Error("NEXTAUTH_SECRET is not configured");
+    }
     const expiry = Math.floor(Date.now() / 1000) + 300; // 5 min
     const payload = `${estimateId}:${expiry}`;
     const sig = createHmac("sha256", secret).update(payload).digest("hex");
@@ -245,11 +282,15 @@ export async function createLead(data: { name: string; clientName: string; clien
     });
     if (existing) return { id: existing.id };
 
+    // Normalize the job-site address (autocomplete isn't enforced client-side,
+    // so hand-typed text reaches here); fail-soft keeps the raw string.
+    const geo = await geocodeJobSiteAddress(data.location);
+
     const lead = await prisma.lead.create({
         data: {
             name: data.name,
             clientId: client.id,
-            location: data.location || null,
+            location: geo?.formattedAddress ?? (data.location || null),
             source: data.source || null,
             projectType: data.projectType || null,
             message: data.message || null,
@@ -401,10 +442,17 @@ export async function updateLeadInfo(id: string, data: any) {
     const lead = await prisma.lead.findUnique({ where: { id }});
     if (!lead) return;
 
+    // Normalize the job-site address before the transaction (external call).
+    // EditLeadModal sends the whole form, so skip the lookup when unchanged.
+    const geo = data.location && data.location !== lead.location
+        ? await geocodeJobSiteAddress(data.location)
+        : null;
+    const location = geo?.formattedAddress ?? data.location;
+
     const updateData: any = {
         source: data.source,
         stage: data.stage,
-        location: data.location,
+        location,
         tags: data.tags,
         targetRevenue: data.targetRevenue ? parseFloat(data.targetRevenue) : null,
         expectedProfit: data.expectedProfit ? parseFloat(data.expectedProfit) : null,
@@ -424,7 +472,18 @@ export async function updateLeadInfo(id: string, data: any) {
         if (data.location !== undefined) {
             const linked = await tx.project.findUnique({ where: { leadId: id }, select: { id: true } });
             if (linked) {
-                await tx.project.update({ where: { id: linked.id }, data: { location: data.location || null } });
+                await tx.project.update({
+                    where: { id: linked.id },
+                    data: {
+                        location: location || null,
+                        // Precise geocode also refreshes the time-clock geofence;
+                        // clearing the address clears it; coarse/failed lookups
+                        // leave existing coordinates alone.
+                        ...(geo?.lat != null && geo?.lng != null
+                            ? { locationLat: geo.lat, locationLng: geo.lng }
+                            : !location ? { locationLat: null, locationLng: null } : {}),
+                    },
+                });
                 linkedProjectId = linked.id;
             }
         }
@@ -535,12 +594,151 @@ export async function updateClient(clientId: string, data: { name?: string; emai
     return client;
 }
 
+// ── Client tax-exemption certificate (WA DOR: a reseller permit / exemption
+// certificate must be on file for every tax-exempt sale) ──────────────────────
+
+const TAX_CERT_ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+const TAX_CERT_ALLOWED_EXTENSIONS = ["pdf", "jpg", "jpeg", "png", "webp", "heic", "heif"];
+const TAX_CERT_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Map a public storage URL back to its bucket path, but only within tax-certs/ —
+ *  never derive a deletable path from anything else. */
+function taxCertStoragePathFromUrl(url: string | null, bucket: string): string | null {
+    if (!url) return null;
+    try {
+        const pathname = new URL(url).pathname;
+        const marker = `/storage/v1/object/public/${bucket}/`;
+        if (!pathname.startsWith(marker)) return null;
+        const path = decodeURIComponent(pathname.slice(marker.length));
+        return path.startsWith("tax-certs/") ? path : null;
+    } catch {
+        return null; // malformed URL or bad % escape — skip cleanup rather than guess
+    }
+}
+
+async function revalidateClientCertSurfaces(clientId: string) {
+    const [linkedProjects, linkedLeads] = await Promise.all([
+        prisma.project.findMany({ where: { clientId }, select: { id: true } }),
+        prisma.lead.findMany({ where: { clientId }, select: { id: true } }),
+    ]);
+    for (const p of linkedProjects) revalidatePath(`/projects/${p.id}`, "layout");
+    for (const l of linkedLeads) revalidatePath(`/leads/${l.id}`, "layout");
+    revalidatePath("/settings/contacts");
+}
+
+/** Upload/update the client's tax-exemption certificate. `file` is optional when a
+ *  certificate is already on file (metadata-only edit); expiresAt is "YYYY-MM-DD" or "". */
+export async function saveClientTaxExemptCert(clientId: string, formData: FormData) {
+    "use server";
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+
+    const client = await prisma.client.findUnique({ where: { id: clientId }, select: { taxExemptCertUrl: true } });
+    if (!client) throw new Error("Client not found");
+
+    const file = formData.get("file");
+    const expiresAtRaw = String(formData.get("expiresAt") ?? "").trim();
+    const note = String(formData.get("note") ?? "").trim();
+
+    let certUrl = client.taxExemptCertUrl;
+    if (file instanceof File && file.size > 0) {
+        if (file.size > TAX_CERT_MAX_BYTES) throw new Error("Certificate file is too large (10 MB max)");
+        // MIME is client-controlled and may be empty — require BOTH a known type and extension.
+        const ext = (file.name.split(".").pop() || "").toLowerCase();
+        if (!TAX_CERT_ALLOWED_TYPES.includes(file.type) || !TAX_CERT_ALLOWED_EXTENSIONS.includes(ext)) {
+            throw new Error("Certificate must be a PDF or image");
+        }
+
+        const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+        const supabase = getSupabase();
+        if (!supabase) throw new Error("Storage not configured");
+
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const storagePath = `tax-certs/${clientId}/${Date.now()}_${safeName}`;
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const { error: uploadError } = await supabase.storage
+            .from(STORAGE_BUCKET)
+            .upload(storagePath, buffer, { contentType: file.type || "application/octet-stream", upsert: false });
+        if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+        const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+        certUrl = urlData?.publicUrl || storagePath;
+    }
+    if (!certUrl) throw new Error("Attach a certificate file");
+
+    let expiresAt: Date | null = null;
+    if (expiresAtRaw) {
+        // Round-trip the UTC parts: JS silently normalizes impossible dates
+        // (2026-02-31 -> Mar 3), which would store a different date than submitted.
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expiresAtRaw);
+        expiresAt = m ? new Date(`${expiresAtRaw}T00:00:00.000Z`) : null;
+        const valid = !!m && !!expiresAt && !isNaN(expiresAt.getTime()) &&
+            expiresAt.getUTCFullYear() === Number(m[1]) &&
+            expiresAt.getUTCMonth() + 1 === Number(m[2]) &&
+            expiresAt.getUTCDate() === Number(m[3]);
+        if (!valid) throw new Error("Invalid expiration date");
+    }
+
+    const updated = await prisma.client.update({
+        where: { id: clientId },
+        data: {
+            taxExemptCertUrl: certUrl,
+            taxExemptCertExpiresAt: expiresAt,
+            taxExemptCertNote: note || null,
+        },
+        select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
+    });
+
+    await revalidateClientCertSurfaces(clientId);
+    return JSON.parse(JSON.stringify(updated));
+}
+
+export async function removeClientTaxExemptCert(clientId: string) {
+    "use server";
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+
+    const client = await prisma.client.findUnique({ where: { id: clientId }, select: { taxExemptCertUrl: true } });
+    if (!client) throw new Error("Client not found");
+
+    // Conditional clear: only wins if the cert wasn't concurrently replaced, so we
+    // never delete an object the row stopped pointing at (superseded certs are kept).
+    const { count } = await prisma.client.updateMany({
+        where: { id: clientId, taxExemptCertUrl: client.taxExemptCertUrl },
+        data: { taxExemptCertUrl: null, taxExemptCertExpiresAt: null, taxExemptCertNote: null },
+    });
+
+    // Best-effort: explicit "Remove" should not leave the file publicly reachable.
+    if (count === 1) {
+        try {
+            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+            const supabase = getSupabase();
+            const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
+            if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+        } catch (e) {
+            console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
+        }
+    }
+
+    const updated = await prisma.client.findUnique({
+        where: { id: clientId },
+        select: { taxExemptCertUrl: true, taxExemptCertExpiresAt: true, taxExemptCertNote: true },
+    });
+    if (!updated) throw new Error("Client not found");
+
+    await revalidateClientCertSurfaces(clientId);
+    return JSON.parse(JSON.stringify(updated));
+}
+
 export async function updateLead(leadId: string, data: { name?: string; source?: string; expectedStartDate?: string | null; targetRevenue?: number | null; location?: string; projectType?: string }) {
     "use server";
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.source !== undefined) updateData.source = data.source;
-    if (data.location !== undefined) updateData.location = data.location;
+    let locationGeo: Awaited<ReturnType<typeof geocodeJobSiteAddress>> = null;
+    if (data.location !== undefined) {
+        locationGeo = await geocodeJobSiteAddress(data.location);
+        updateData.location = locationGeo?.formattedAddress ?? data.location;
+    }
     if (data.projectType !== undefined) updateData.projectType = data.projectType;
     if (data.expectedStartDate !== undefined) updateData.expectedStartDate = data.expectedStartDate ? new Date(data.expectedStartDate) : null;
     if (data.targetRevenue !== undefined) updateData.targetRevenue = data.targetRevenue;
@@ -550,13 +748,26 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
         data: updateData,
     });
 
-    // Sync name to linked project when lead name changes
-    if (data.name !== undefined) {
+    // Sync name/location to linked project so they stay a single source of truth
+    if (data.name !== undefined || data.location !== undefined) {
         const linkedProject = await prisma.project.findUnique({ where: { leadId } });
         if (linkedProject) {
             await prisma.project.update({
                 where: { id: linkedProject.id },
-                data: { name: data.name },
+                data: {
+                    ...(data.name !== undefined ? { name: data.name } : {}),
+                    ...(data.location !== undefined
+                        ? {
+                            location: updateData.location || null,
+                            // Precise geocode also refreshes the time-clock geofence;
+                            // clearing the address clears it; coarse/failed lookups
+                            // leave existing coordinates alone.
+                            ...(locationGeo?.lat != null && locationGeo?.lng != null
+                                ? { locationLat: locationGeo.lat, locationLng: locationGeo.lng }
+                                : !updateData.location ? { locationLat: null, locationLng: null } : {}),
+                        }
+                        : {}),
+                },
             });
             revalidatePath(`/projects`);
             revalidatePath(`/projects/${linkedProject.id}`, 'layout');
@@ -714,7 +925,7 @@ END:VCALENDAR`;
                 `Meeting Scheduled: ${data.title}`,
                 `<p>Hi ${lead.client.name},<br><br>We have scheduled a meeting to discuss your project: ${data.title}.<br>Time: ${startDate.toLocaleString()}<br><br>Please see the attached calendar invite.<br><br>Thanks,<br>Golden Touch Remodeling</p>`,
                 attachments,
-                meetingCc ? { cc: meetingCc } : undefined
+                { cc: meetingCc, copyToInternal: true }
             );
         }
     } catch (e) {
@@ -832,13 +1043,19 @@ export async function convertLeadToProject(leadId: string) {
     const existingProject = await prisma.project.findUnique({ where: { leadId } });
     if (existingProject) return { id: existingProject.id };
 
+    // Normalize the job-site address (outside the transaction — external call).
+    // Also catches legacy leads saved before geocode-on-save existed; a precise
+    // match seeds the project's time-clock geofence coordinates.
+    const geo = await geocodeJobSiteAddress(lead.location);
+
     // Wrap entire conversion in a transaction for atomicity
     const project = await prisma.$transaction(async (tx) => {
         const project = await tx.project.create({
             data: {
                 name: lead.name,
                 clientId: lead.clientId,
-                location: lead.location,
+                location: geo?.formattedAddress ?? lead.location,
+                ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
                 status: "In Progress",
                 type: lead.projectType || "Unknown",
                 managerId: lead.managerId || null,
@@ -900,7 +1117,85 @@ export async function convertLeadToProject(leadId: string) {
     return { id: project.id };
 }
 
+// Create a project directly (e.g. a repeat customer with another job).
+// Maintains the 1-1 Project↔Lead invariant: every project is backed by a lead.
+// Pass `clientId` to tie the project to an EXISTING customer, or `clientName`
+// (+ optional contact details) to create a new one.
+export async function createProject(data: {
+    name: string;
+    clientId?: string;
+    clientName?: string;
+    clientEmail?: string;
+    clientPhone?: string;
+    location?: string;
+    addressLine1?: string;
+    city?: string;
+    state?: string;
+    zipCode?: string;
+    projectType?: string;
+    status?: string;
+}) {
+    if (!data.name?.trim()) throw new Error("Project name is required.");
+
+    // Resolve the customer: prefer an existing client by id; otherwise find-or-create by name.
+    let clientId: string | undefined = data.clientId;
+    if (clientId) {
+        const exists = await prisma.client.findUnique({ where: { id: clientId }, select: { id: true } });
+        if (!exists) clientId = undefined;
+    }
+    if (!clientId) {
+        const clientName = (data.clientName || "").trim();
+        if (!clientName) throw new Error("A customer is required to create a project.");
+        let client = await prisma.client.findFirst({ where: { name: clientName } });
+        if (!client) {
+            const initials = clientName.split(" ").map((n) => n[0]).join("").toUpperCase().slice(0, 2);
+            client = await prisma.client.create({
+                data: {
+                    name: clientName,
+                    initials,
+                    email: data.clientEmail || null,
+                    primaryPhone: data.clientPhone || null,
+                    primaryPhoneE164: normalizeE164(data.clientPhone),
+                    addressLine1: data.addressLine1 || null,
+                    city: data.city || null,
+                    state: data.state || null,
+                    zipCode: data.zipCode || null,
+                },
+            });
+        }
+        clientId = client.id;
+    }
+
+    // Back the project with a lead, then reuse the conversion path so the project is
+    // created + linked 1-1 (also provisions Drive and grants team access).
+    const lead = await prisma.lead.create({
+        data: {
+            name: data.name.trim(),
+            clientId,
+            location: data.location || null,
+            projectType: data.projectType || null,
+            source: "Direct project",
+            stage: "New",
+            isUnread: false,
+        },
+    });
+
+    const { id: projectId } = await convertLeadToProject(lead.id);
+
+    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
+    if (data.status && data.status !== "In Progress") {
+        await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
+    }
+
+    revalidatePath("/projects");
+    revalidatePath("/leads");
+    return { id: projectId };
+}
+
 export async function createDraftEstimate(projectId: string) {
+    // WA is destination-based: default the rate from the job-site address,
+    // falling back to the company default (null fields) when unresolvable.
+    const taxDefault = await defaultTaxForNewEstimate({ projectId });
     const estimate = await prisma.estimate.create({
         data: {
             title: "Draft Estimate",
@@ -910,6 +1205,7 @@ export async function createDraftEstimate(projectId: string) {
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
+            ...(taxDefault ?? {}),
         },
     });
 
@@ -922,6 +1218,7 @@ export async function createDraftEstimate(projectId: string) {
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
+    const taxDefault = await defaultTaxForNewEstimate({ leadId });
     const estimate = await prisma.estimate.create({
         data: {
             title: "Draft Estimate",
@@ -931,6 +1228,7 @@ export async function createDraftLeadEstimate(leadId: string) {
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
+            ...(taxDefault ?? {}),
         },
     });
 
@@ -1017,7 +1315,7 @@ export async function createDraftRoom(opts: {
             roomType: roomType ?? "kitchen",
             projectId: projectId ?? null,
             leadId: leadId ?? null,
-            layoutJson: buildDefaultLayout() as any,
+            layoutJson: emptyDoc() as any,
         },
     });
     if (projectId) revalidatePath(`/projects/${projectId}/room-designer`);
@@ -1129,6 +1427,7 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
                 files: { orderBy: { createdAt: "desc" } },
+                invoices: { select: { id: true, code: true, status: true } },
             },
         });
     } catch {
@@ -1159,16 +1458,43 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
+                invoices: { select: { id: true, code: true, status: true } },
             },
         });
     }
 });
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
-    await prisma.estimate.update({
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+
+    const VALID_STATUSES = ["Draft", "Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid", "Declined", "Expired", "Archived"];
+    if (!VALID_STATUSES.includes(status)) throw new Error("Invalid status");
+
+    const before = await prisma.estimate.findUnique({
         where: { id },
-        data: { status }
+        select: { status: true, code: true, title: true, projectId: true, leadId: true },
     });
+    if (!before) throw new Error("Estimate not found");
+
+    if (before.status !== status) {
+        await prisma.estimate.update({
+            where: { id },
+            data: { status }
+        });
+        await logActivity({
+            projectId: before.projectId,
+            leadId: before.leadId,
+            actorType: "TEAM",
+            actorName: user.name || "Team",
+            action: "estimate_status_changed",
+            entityType: "estimate",
+            entityId: id,
+            entityName: `Estimate ${before.code || before.title || ""}`.trim(),
+            metadata: { from: before.status, to: status },
+        });
+    }
     if (leadId) revalidatePath(`/leads/${leadId}`);
     if (projectId) revalidatePath(`/projects/${projectId}`);
     revalidatePath(`/leads/${leadId}/estimates/${id}`);
@@ -1205,6 +1531,23 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                     lead: { include: { client: true } },
                     items: { orderBy: { order: "asc" } },
                     paymentSchedules: { orderBy: { order: "asc" } },
+                    files: { orderBy: { createdAt: "desc" } },
+                    // Auto-created invoice (signing) — its milestones are the payable source of truth
+                    invoices: {
+                        select: {
+                            id: true, code: true, status: true,
+                            payments: {
+                                select: {
+                                    id: true, name: true, amount: true, status: true, dueDate: true,
+                                    paidAt: true, paymentDate: true, paymentMethod: true,
+                                    stripeSessionId: true, qbInvoiceLink: true,
+                                },
+                                orderBy: { createdAt: "asc" },
+                            },
+                        },
+                        orderBy: { createdAt: "asc" },
+                        take: 1,
+                    },
                 },
             });
         } catch (err) {
@@ -1230,7 +1573,23 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                                 costCodeId: true, costTypeId: true, createdAt: true,
                             },
                         },
+                        files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
                         paymentSchedules: { orderBy: { order: "asc" } },
+                        invoices: {
+                            select: {
+                                id: true, code: true, status: true,
+                                payments: {
+                                    select: {
+                                        id: true, name: true, amount: true, status: true, dueDate: true,
+                                        paidAt: true, paymentDate: true, paymentMethod: true,
+                                        stripeSessionId: true, qbInvoiceLink: true,
+                                    },
+                                    orderBy: { createdAt: "asc" },
+                                },
+                            },
+                            orderBy: { createdAt: "asc" },
+                            take: 1,
+                        },
                     },
                 });
             } catch (fallbackErr) {
@@ -1260,6 +1619,22 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                 lead: { include: { client: true } },
                 items: { orderBy: { order: "asc" } },
                 paymentSchedules: { orderBy: { order: "asc" } },
+                files: { orderBy: { createdAt: "desc" } },
+                invoices: {
+                    select: {
+                        id: true, code: true, status: true,
+                        payments: {
+                            select: {
+                                id: true, name: true, amount: true, status: true, dueDate: true,
+                                paidAt: true, paymentDate: true, paymentMethod: true,
+                                stripeSessionId: true, qbInvoiceLink: true,
+                            },
+                            orderBy: { createdAt: "asc" },
+                        },
+                    },
+                    orderBy: { createdAt: "asc" },
+                    take: 1,
+                },
             },
         });
     } catch (err) {
@@ -1284,7 +1659,23 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
                             costCodeId: true, costTypeId: true, createdAt: true,
                         },
                     },
+                    files: { select: { id: true, name: true, url: true, size: true, type: true, createdAt: true }, orderBy: { createdAt: "desc" } },
                     paymentSchedules: { orderBy: { order: "asc" } },
+                    invoices: {
+                        select: {
+                            id: true, code: true, status: true,
+                            payments: {
+                                select: {
+                                    id: true, name: true, amount: true, status: true, dueDate: true,
+                                    paidAt: true, paymentDate: true, paymentMethod: true,
+                                    stripeSessionId: true, qbInvoiceLink: true,
+                                },
+                                orderBy: { createdAt: "asc" },
+                            },
+                        },
+                        orderBy: { createdAt: "asc" },
+                        take: 1,
+                    },
                 },
             });
         } catch (fallbackErr) {
@@ -1407,6 +1798,7 @@ export async function findOrCreateClientThread(projectId: string) {
 
 export async function logActivity({
     projectId,
+    leadId,
     actorType,
     actorName,
     action,
@@ -1415,7 +1807,8 @@ export async function logActivity({
     entityName,
     metadata,
 }: {
-    projectId: string;
+    projectId?: string | null;
+    leadId?: string | null;
     actorType: string;
     actorName: string;
     action: string;
@@ -1427,7 +1820,8 @@ export async function logActivity({
     try {
         await prisma.activityLog.create({
             data: {
-                projectId,
+                projectId: projectId ?? null,
+                leadId: leadId ?? null,
                 actorType,
                 actorName,
                 action,
@@ -1526,16 +1920,36 @@ async function postActivityToThread(leadId: string | null, projectId: string | n
 }
 
 export async function markEstimateViewed(estimateId: string) {
+    // Staff previews must never register as client views.
+    const staffSession = await getServerSession(authOptions);
+    if ((staffSession?.user as { role?: string } | undefined)?.role) return;
+
+    // Same ownership shape as getEstimateForPortal: only the owning portal
+    // client can trip the first-view signal.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return;
+
+    // Atomic first-view claim — two simultaneous opens produce exactly one
+    // notification and one activity event.
+    const claim = await prisma.estimate.updateMany({
+        where: {
+            id: estimateId,
+            viewedAt: null,
+            OR: [
+                { project: { is: { clientId: sessionClientId } } },
+                { lead: { is: { clientId: sessionClientId } } },
+            ],
+        },
+        data: { viewedAt: new Date() },
+    });
+    if (claim.count === 0) return;
+
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { viewedAt: true, title: true, code: true, projectId: true, leadId: true, project: { select: { name: true, client: { select: { name: true } } } }, lead: { select: { name: true, client: { select: { name: true } } } } },
     });
 
-    if (estimate && !estimate.viewedAt) {
-        await prisma.estimate.update({
-            where: { id: estimateId },
-            data: { viewedAt: new Date() },
-        });
+    if (estimate) {
 
         const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || "A client";
         const projectName = estimate.project?.name || estimate.lead?.name || "";
@@ -1560,19 +1974,129 @@ export async function markEstimateViewed(estimateId: string) {
             `👁️ ${clientName} viewed estimate ${estimate.title || estimate.code}`
         );
 
-        // Log to activity feed
-        if (estimate.projectId) {
-            await logActivity({
-                projectId: estimate.projectId,
-                actorType: "CLIENT",
-                actorName: clientName,
-                action: "viewed_estimate",
-                entityType: "estimate",
-                entityId: estimateId,
-                entityName: `Estimate ${estimate.code || estimate.title}`,
+        // Log to activity feed (lead-stage estimates log against the lead)
+        await logActivity({
+            projectId: estimate.projectId,
+            leadId: estimate.leadId,
+            actorType: "CLIENT",
+            actorName: clientName,
+            action: "viewed_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+        });
+    }
+}
+
+export type EstimateActivityEvent = {
+    id: string;
+    ts: string; // ISO timestamp
+    kind: "created" | "sent" | "viewed" | "signed" | "invoice" | "payment" | "other";
+    title: string;
+    detail?: string | null;
+};
+
+/**
+ * Append-only activity feed for one estimate: ActivityLog events (every send,
+ * incl. resends), legacy single-timestamp baselines for estimates that predate
+ * the log, plus the linked invoice's lifecycle and settled payments read live —
+ * so payment history is always complete without any extra logging.
+ */
+export async function getEstimateActivity(estimateId: string): Promise<EstimateActivityEvent[]> {
+    const [estimate, logs, invoice] = await Promise.all([
+        prisma.estimate.findUnique({
+            where: { id: estimateId },
+            select: { createdAt: true, sentAt: true, viewedAt: true, approvedAt: true, approvedBy: true },
+        }),
+        prisma.activityLog.findMany({
+            where: { entityType: "estimate", entityId: estimateId },
+            orderBy: { createdAt: "asc" },
+        }),
+        prisma.invoice.findFirst({
+            where: { estimateId },
+            select: {
+                code: true, createdAt: true, sentAt: true, viewedAt: true,
+                payments: {
+                    select: { id: true, name: true, amount: true, status: true, paidAt: true, paymentDate: true, paymentMethod: true, referenceNumber: true, sourceScheduleId: true },
+                    orderBy: { createdAt: "asc" },
+                },
+            },
+        }),
+    ]);
+    if (!estimate) return [];
+
+    const events: EstimateActivityEvent[] = [
+        { id: "created", ts: estimate.createdAt.toISOString(), kind: "created", title: "Estimate created" },
+    ];
+    // Legacy baselines from the single-timestamp columns. Hidden only when a log
+    // event of the same action sits within 5 minutes (i.e. it IS that same send —
+    // sends made after the activity log shipped write both). An older baseline
+    // (e.g. the original Oct send) always stays even after later resends.
+    const hasLogNear = (action: string, at: Date) =>
+        logs.some(l => l.action === action && Math.abs(l.createdAt.getTime() - at.getTime()) < 5 * 60 * 1000);
+    if (estimate.sentAt && !hasLogNear("sent_estimate", estimate.sentAt)) {
+        events.push({ id: "sentAt", ts: estimate.sentAt.toISOString(), kind: "sent", title: "Sent to client" });
+    }
+    if (estimate.viewedAt && !hasLogNear("viewed_estimate", estimate.viewedAt)) {
+        events.push({ id: "viewedAt", ts: estimate.viewedAt.toISOString(), kind: "viewed", title: "Viewed by client" });
+    }
+    if (estimate.approvedAt && !hasLogNear("signed_estimate", estimate.approvedAt)) {
+        events.push({ id: "approvedAt", ts: estimate.approvedAt.toISOString(), kind: "signed", title: estimate.approvedBy ? `Signed by ${estimate.approvedBy}` : "Signed & approved" });
+    }
+
+    for (const l of logs) {
+        let meta: Record<string, unknown> = {};
+        try { meta = l.metadata ? JSON.parse(l.metadata) : {}; } catch { /* ignore */ }
+        const ts = l.createdAt.toISOString();
+        if (l.action === "sent_estimate") {
+            const by = l.actorName && l.actorName !== "Team" ? `by ${l.actorName}` : null;
+            events.push({ id: l.id, ts, kind: "sent", title: meta.resend ? "Resent to client" : "Sent to client", detail: [typeof meta.to === "string" ? `to ${meta.to}` : null, by].filter(Boolean).join(" · ") || null });
+        } else if (l.action === "viewed_estimate") {
+            events.push({ id: l.id, ts, kind: "viewed", title: "Viewed by client", detail: l.actorName && l.actorName !== "A client" ? l.actorName : null });
+        } else if (l.action === "signed_estimate") {
+            events.push({ id: l.id, ts, kind: "signed", title: `Signed by ${l.actorName}` });
+        } else if (l.action === "estimate_status_changed") {
+            const from = typeof meta.from === "string" ? meta.from : "?";
+            const to = typeof meta.to === "string" ? meta.to : "?";
+            events.push({ id: l.id, ts, kind: "other", title: `Status changed: ${from} → ${to}`, detail: l.actorName && l.actorName !== "Team" ? `by ${l.actorName}` : null });
+        } else if (l.action === "payment_received") {
+            // Pre-invoice estimate payments (deposits) log against the estimate
+            // itself. If an invoice was created later, its copied paid milestone
+            // renders the same payment from live data — skip the older log then.
+            // Identity match via scheduleId; name match only for legacy logs
+            // that predate the scheduleId metadata.
+            const milestone = typeof meta.milestone === "string" ? meta.milestone : null;
+            const scheduleId = typeof meta.scheduleId === "string" ? meta.scheduleId : null;
+            const coveredByInvoiceCopy = !!invoice?.payments.some(p =>
+                p.status === "Paid" &&
+                (scheduleId ? p.sourceScheduleId === scheduleId : (!!milestone && p.name === milestone))
+            );
+            if (coveredByInvoiceCopy) continue;
+            events.push({ id: l.id, ts, kind: "payment", title: "Payment received", detail: [milestone, typeof meta.method === "string" ? meta.method.replace(/_/g, " ") : null, typeof meta.referenceNumber === "string" ? `#${meta.referenceNumber}` : null].filter(Boolean).join(" · ") || null });
+        } else {
+            events.push({ id: l.id, ts, kind: "other", title: l.action.replace(/_/g, " "), detail: l.entityName });
+        }
+    }
+
+    if (invoice) {
+        events.push({ id: "inv-created", ts: invoice.createdAt.toISOString(), kind: "invoice", title: `Invoice ${invoice.code} created` });
+        if (invoice.sentAt) events.push({ id: "inv-sent", ts: invoice.sentAt.toISOString(), kind: "invoice", title: `Invoice ${invoice.code} sent to client` });
+        if (invoice.viewedAt) events.push({ id: "inv-viewed", ts: invoice.viewedAt.toISOString(), kind: "viewed", title: `Invoice ${invoice.code} viewed by client` });
+        for (const p of invoice.payments) {
+            if (p.status !== "Paid") continue;
+            const ts = (p.paidAt || p.paymentDate || invoice.createdAt).toISOString();
+            const amt = toNum(p.amount).toLocaleString("en-US", { style: "currency", currency: "USD" });
+            const method = p.paymentMethod ? p.paymentMethod.replace(/_/g, " ") : null;
+            events.push({
+                id: `pay-${p.id}`, ts, kind: "payment",
+                title: `Payment received — ${amt}`,
+                detail: [p.name, method, p.referenceNumber ? `#${p.referenceNumber}` : null].filter(Boolean).join(" · ") || null,
             });
         }
     }
+
+    events.sort((a, b) => a.ts.localeCompare(b.ts));
+    return events;
 }
 
 export async function markContractViewed(contractId: string, accessToken?: string) {
@@ -1641,6 +2165,121 @@ export async function markContractViewed(contractId: string, accessToken?: strin
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Signed estimate → project + invoice + QuickBooks deposit pay link.
+// Signing is the moment a lead becomes a project — and the first time anything
+// is allowed to touch QuickBooks (keeps QBO free of unsold estimates).
+// Every step is fail-soft: a QBO outage can never block a client's signature.
+// ─────────────────────────────────────────────────────────────────────────────
+interface PostApprovalInfo {
+    projectId: string;
+    invoiceId: string;
+    invoiceCode: string;
+    depositName: string | null;
+    depositAmount: number | null;
+    payLink: string | null;
+}
+
+async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Promise<PostApprovalInfo | null> {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { id: true, projectId: true, leadId: true },
+    });
+    if (!estimate) return null;
+
+    // 1) Ensure a project exists (idempotent — conversion returns the existing one).
+    let projectId = estimate.projectId;
+    if (!projectId && estimate.leadId) {
+        const converted = await convertLeadToProject(estimate.leadId);
+        projectId = converted.id;
+    }
+    if (!projectId) return null;
+
+    // 1.5) Tax integrity: if the estimate never had a tax rate chosen, the portal
+    // DISPLAY adds the default rate on top while the stored total excludes it —
+    // the client would see more than they get billed. Snapshot the default rate
+    // and gross the totals (and pending milestones) up to match what was shown,
+    // exactly once, before any invoice is created from it.
+    const taxCheck = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { taxRatePercent: true, taxExempt: true, totalAmount: true, balanceDue: true },
+    });
+    if (taxCheck && !taxCheck.taxExempt && taxCheck.taxRatePercent == null) {
+        const defaultRate = await getDefaultSalesTaxRate();
+        if (defaultRate > 0) {
+            const factor = 1 + defaultRate / 100;
+            await prisma.estimate.update({
+                where: { id: estimateId },
+                data: {
+                    taxRatePercent: defaultRate,
+                    totalAmount: Math.round(toNum(taxCheck.totalAmount) * factor * 100) / 100,
+                    balanceDue: Math.round(toNum(taxCheck.balanceDue) * factor * 100) / 100,
+                },
+            });
+            await prisma.$executeRaw`UPDATE "EstimatePaymentSchedule" SET amount = ROUND(amount * ${factor}::numeric, 2) WHERE "estimateId" = ${estimateId} AND status = 'Pending'`;
+        }
+    }
+
+    // 2) One invoice per signed estimate (idempotent on re-approval).
+    let invoice = await prisma.invoice.findFirst({
+        where: { estimateId },
+        select: { id: true, code: true },
+    });
+    if (!invoice) {
+        const created = await createInvoiceFromEstimate(estimateId);
+        invoice = await prisma.invoice.update({
+            where: { id: created.id },
+            data: { status: "Issued", issueDate: new Date() },
+            select: { id: true, code: true },
+        });
+    }
+    // The money now lives on the invoice — flip the estimate to Invoiced so
+    // financial forecasts don't count the same dollars twice. Runs outside the
+    // creation branch so a re-approval can't leave the status stuck on Approved,
+    // and never downgrades a payment-driven status (Partially Paid / Paid).
+    await prisma.estimate.updateMany({
+        where: { id: estimateId, status: { in: ["Sent", "Viewed", "Approved"] } },
+        data: { status: "Invoiced" },
+    });
+
+    // 3) Every pending milestone → its own QuickBooks invoice + hosted pay link,
+    //    so the portal can default to QuickBooks for all of them. The first one
+    //    (the deposit) also rides the approval email.
+    let payLink: string | null = null;
+    const pendingMilestones = await prisma.paymentSchedule.findMany({
+        where: { invoiceId: invoice.id, status: "Pending" },
+        orderBy: { createdAt: "asc" },
+        select: { id: true, name: true, amount: true },
+    });
+    const deposit = pendingMilestones[0] || null;
+    if (pendingMilestones.length > 0) {
+        try {
+            const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+            for (const milestone of pendingMilestones) {
+                const pushed = await pushMilestoneToQuickBooks(milestone.id);
+                if (milestone.id === deposit?.id) payLink = pushed.payLink;
+            }
+        } catch (e) {
+            // QuickBooks not connected or unreachable — Stripe portal payment and
+            // manual recording still work; the PM can push links later.
+            console.warn("[approveEstimate] QuickBooks milestone push skipped:", e instanceof Error ? e.message : e);
+        }
+    }
+
+    revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+
+    return {
+        projectId,
+        invoiceId: invoice.id,
+        invoiceCode: invoice.code,
+        depositName: deposit?.name || null,
+        depositAmount: deposit ? toNum(deposit.amount) : null,
+        payLink,
+    };
+}
+
 export async function approveEstimate(estimateId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, capturedPdfUrl?: string) {
     // Auth: internal admins skip ownership check; portal clients must prove ownership.
     const session = await getServerSession(authOptions);
@@ -1689,6 +2328,29 @@ export async function approveEstimate(estimateId: string, signatureName: string,
             project: { select: { id: true, name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
             lead: { select: { name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
         },
+    });
+
+    // ─── 0. The job is won: ensure project + invoice + QuickBooks deposit link ───
+    let postApproval: PostApprovalInfo | null = null;
+    try {
+        postApproval = await ensureProjectAndDepositInvoiceForEstimate(estimateId);
+        if (postApproval && estimate && !estimate.projectId) {
+            // Conversion just created the project — let the signed-PDF filing below see it.
+            (estimate as { projectId: string | null }).projectId = postApproval.projectId;
+        }
+    } catch (e) {
+        console.error("[approveEstimate] post-approval automation failed:", e);
+    }
+
+    await logActivity({
+        projectId: estimate?.projectId,
+        leadId: estimate?.leadId,
+        actorType: "CLIENT",
+        actorName: signatureName,
+        action: "signed_estimate",
+        entityType: "estimate",
+        entityId: estimateId,
+        entityName: `Estimate ${estimate?.code || estimateId}`,
     });
 
     const settings = await getCompanySettings();
@@ -1745,6 +2407,14 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;">
                         <p style="margin: 0; color: #166534; font-size: 13px;">✓ A signed copy of your estimate is attached to this email for your records.</p>
                     </div>
+                    ${postApproval?.depositAmount ? `
+                    <div style="background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 16px 18px; margin-bottom: 20px;">
+                        <p style="margin: 0 0 10px; color: #312e81; font-size: 14px; font-weight: 600;">Next step — ${postApproval.depositName || "Deposit"}: ${formatCurrency(postApproval.depositAmount)}</p>
+                        ${postApproval.payLink
+                            ? `<a href="${postApproval.payLink}" style="display: inline-block; background: #4f46e5; color: #ffffff; font-size: 14px; font-weight: 600; padding: 11px 24px; border-radius: 8px; text-decoration: none;">Pay Securely Online</a>
+                               <p style="margin: 10px 0 0; color: #6366f1; font-size: 12px;">Card, debit, or bank transfer on QuickBooks' secure page · Invoice ${postApproval.invoiceCode}</p>`
+                            : `<p style="margin: 0; color: #4338ca; font-size: 13px;">Invoice ${postApproval.invoiceCode} has been created for your project — we'll follow up with payment instructions.</p>`}
+                    </div>` : ""}
                     <p style="color: #64748b; font-size: 13px; line-height: 1.6; margin: 0;">
                         If you have any questions, feel free to reach out to us${settings.phone ? ` at ${settings.phone}` : ""}${settings.email ? ` or ${settings.email}` : ""}.
                     </p>
@@ -1752,7 +2422,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                 <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;">${companyName}${settings.address ? ` • ${settings.address}` : ""}</p>
             </div>`,
             attachments,
-            { fromName: companyName, replyTo: settings.email || undefined, cc: approvedCc }
+            { fromName: companyName, replyTo: settings.email || undefined, cc: approvedCc, copyToInternal: true }
         );
     }
 
@@ -1834,18 +2504,8 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         );
     }
 
-    // Log to activity feed
-    if (estimate?.projectId) {
-        await logActivity({
-            projectId: estimate.projectId,
-            actorType: "CLIENT",
-            actorName: signatureName,
-            action: "signed_estimate",
-            entityType: "estimate",
-            entityId: estimateId,
-            entityName: `Estimate ${estimate.code || estimate.title}`,
-        });
-    }
+    // (signing is already logged to the activity feed right after post-approval
+    //  automation — that entry also covers lead-stage estimates)
 
     if (estimate?.projectId) {
         const existingBudget = await prisma.budget.findUnique({ where: { estimateId } });
@@ -1909,102 +2569,27 @@ export async function updateInvoiceNotes(invoiceId: string, notes: string) {
 }
 
 export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: string) {
-    const invoice = await prisma.invoice.findUnique({
-        where: { id: invoiceId },
-        include: {
-            project: { include: { client: true } },
-            client: true,
-        },
-    });
-    if (!invoice) throw new Error("Invoice not found");
+    // Customer-facing send from the UI — require the invoices permission (this
+    // export is a remotely invokable server action). Core logic lives in
+    // billing-core.ts so the shared-secret-gated MCP connector can reuse it.
+    await assertInvoicePermission();
+    const { sendInvoiceToClientCore } = await import("./billing-core");
+    return sendInvoiceToClientCore(invoiceId, overrideEmail);
+}
 
-    const recipientEmail = overrideEmail || invoice.client?.email;
-    if (!recipientEmail) throw new Error("No email address provided");
-
-    if (invoice.status === "Draft") {
-        await prisma.invoice.update({
-            where: { id: invoiceId },
-            data: { status: "Issued", issueDate: new Date(), sentAt: new Date() },
-        });
-    } else {
-        await prisma.invoice.update({
-            where: { id: invoiceId },
-            data: { sentAt: new Date() },
-        });
-    }
-
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
-    const clientId = invoice.clientId || invoice.project?.clientId;
-    let portalUrl: string;
-    if (clientId) {
-        const { signClientPortalToken } = await import("./client-portal-auth");
-        const token = await signClientPortalToken(clientId, recipientEmail.toLowerCase());
-        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/invoices/${invoiceId}`)}`;
-    } else {
-        portalUrl = `${appUrl}/portal/invoices/${invoiceId}`;
-    }
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Your Contractor";
-
-    const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
-    const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
-    await sendNotification(
-        recipientEmail,
-        `${companyName} sent you an invoice — ${invoice.code}`,
-        `<!DOCTYPE html>
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            <div style="text-align: center; margin-bottom: 32px;">
-                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
-            </div>
-            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${invoice.code}</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${invoice.client?.name || 'there'},</p>
-                <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
-                    Please click the button below to view the details and make a payment.
-                </p>
-                <div style="text-align: center; margin: 32px 0;">
-                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        View & Pay Invoice
-                    </a>
-                </div>
-                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center;">
-                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(invoice.balanceDue)}</div>
-                </div>
-                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
-                    Or copy this link: ${portalUrl}
-                </p>
-            </div>
-            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
-                Sent via ProBuild • ${companyName}
-            </p>
-        </body>
-        </html>`,
-        undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc }
-    );
-
-    // Log to activity feed (project-scoped only)
-    if (invoice.projectId) {
-        await logActivity({
-            projectId: invoice.projectId,
-            actorType: "TEAM",
-            actorName: companyName,
-            action: "sent_invoice",
-            entityType: "invoice",
-            entityId: invoiceId,
-            entityName: `Invoice ${invoice.code}`,
-        });
-    }
-
-    if (invoice.projectId) {
-        revalidatePath(`/projects/${invoice.projectId}/invoices`);
-        revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
-    }
-    revalidatePath(`/invoices`);
-    return { success: true, sentTo: recipientEmail };
+export async function sendMilestoneInvoices(
+    invoiceId: string,
+    paymentScheduleIds: string[],
+    overrideEmail?: string,
+    // Per-milestone reconcile intents the user explicitly confirmed in the review
+    // step: scheduleId -> the QBO total they saw and approved.
+    opts?: { reconcile?: Record<string, number> },
+) {
+    // Permission gate stays here (remotely invokable server action); the send
+    // logic lives in billing-core.ts, shared with the MCP connector.
+    const actor = await assertInvoicePermission();
+    const { sendMilestoneInvoicesCore } = await import("./billing-core");
+    return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "");
 }
 
 export async function getInvoiceForPortal(id: string) {
@@ -2069,7 +2654,7 @@ export async function markInvoiceViewed(invoiceId: string) {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         select: {
-            viewedAt: true, code: true,
+            viewedAt: true, code: true, projectId: true,
             project: { select: { name: true, client: { select: { name: true } } } },
             client: { select: { name: true } },
         },
@@ -2081,29 +2666,111 @@ export async function markInvoiceViewed(invoiceId: string) {
         });
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
-        const settings = await getCompanySettings();
-        if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
-            await sendNotification(
-                settings.notificationEmail,
-                `👁️ Invoice Viewed — ${invoice.code}`,
-                `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
-                    <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
-                        <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
-                        <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
-                    </div>
-                </div>`
-            );
+        try {
+            const settings = await getCompanySettings();
+            if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
+                const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+                const editorUrl = invoice.projectId ? `${appUrl}/projects/${invoice.projectId}/invoices/${invoiceId}` : `${appUrl}/invoices`;
+
+                let attachments: { filename: string; content: Buffer }[] | undefined = undefined;
+                try {
+                    const { generateInvoicePdf } = await import("./pdf");
+                    const pdfBuffer = await generateInvoicePdf(invoiceId);
+                    if (pdfBuffer) {
+                        attachments = [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }];
+                    }
+                } catch (e) {
+                    console.error("[markInvoiceViewed] PDF generation failed; sending without attachment:", e);
+                }
+
+                await sendNotification(
+                    settings.notificationEmail,
+                    `👁️ Invoice Viewed — ${invoice.code}`,
+                    `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+                        <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
+                            <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
+                            <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                            <div style="text-align: center; margin: 16px 0;">
+                                <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
+                                    View Invoice
+                                </a>
+                            </div>
+                            ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of this invoice is attached.</p>` : ""}
+                        </div>
+                    </div>`,
+                    attachments
+                );
+            }
+        } catch (e) {
+            console.error("[markInvoiceViewed] Notification block failed:", e);
         }
+        await logActivity({
+            projectId: invoice.projectId,
+            actorType: "CLIENT",
+            actorName: clientName,
+            action: "viewed_invoice",
+            entityType: "invoice",
+            entityId: invoiceId,
+            entityName: `Invoice ${invoice.code}`,
+        });
     }
+}
+
+export async function emailInvoiceCopyToMe(
+    invoiceId: string
+): Promise<{ success: boolean; sentTo?: string; error?: string }> {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    if (!user.email) return { success: false, error: "Your account has no email address" };
+
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: { code: true },
+    });
+    if (!invoice) return { success: false, error: "Invoice not found" };
+
+    let pdfBuffer: Buffer;
+    try {
+        const { generateInvoicePdf } = await import("./pdf");
+        pdfBuffer = await generateInvoicePdf(invoiceId);
+    } catch (e) {
+        console.error("[emailInvoiceCopyToMe] PDF generation failed:", e);
+        return { success: false, error: "Failed to generate invoice PDF" };
+    }
+
+    const result = await sendNotification(
+        user.email,
+        `Your copy — Invoice ${invoice.code}`,
+        `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
+            <p>Here is the copy of invoice <strong>${invoice.code}</strong> you requested. The PDF is attached.</p>
+        </div>`,
+        [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }]
+    );
+    if (!result.success) return { success: false, error: "Failed to send email" };
+    return { success: true, sentTo: user.email };
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
-    const result = await (async (tx) => {
-        // Preserve payment credits: subtract already-paid milestones from totalAmount
+    // safeOnly re-runs the whole transaction writing only the always-present columns — see the
+    // schema-drift fallback below the closure for why the retry has to happen at this level.
+    const runSave = (safeOnly: boolean) => prisma.$transaction(async (tx) => {
+        // Lock the Estimate row FIRST — before reading paid milestones — for two reasons:
+        //  (1) Canonical lock order (Estimate → Invoice → schedules), shared with the payment
+        //      flows, so no two money-path transactions can deadlock on inverse lock ordering.
+        //  (2) Serializes the balance computation on the Estimate row. A concurrent payment
+        //      either committed before we took this lock (so the paidSum read below reflects it)
+        //      or is blocked until we commit (so it recomputes against our new totalAmount).
+        //      Either way, no committed payment's balanceDue effect is silently overwritten.
+        await lockMoneyParents(tx, { estimateId });
+
+        // Preserve payment credits: subtract already-paid milestones from totalAmount.
+        // Read AFTER the lock above so paidSum reflects committed-and-locked state, not a stale
+        // snapshot taken before a racing payment committed.
         const paidMilestones = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId, status: "Paid" },
             select: { amount: true },
@@ -2129,7 +2796,15 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             ...(data.taxRatePercent !== undefined && { taxRatePercent: data.taxRatePercent }),
         };
 
-        try {
+        // On the safeOnly retry, write only the always-present columns. A failed update inside an
+        // interactive transaction aborts the whole transaction (Postgres 25P02), so we cannot catch
+        // a missing-column error and retry within the same tx — the retry is driven from outside.
+        // select: { id: true } keeps the UPDATE ... RETURNING clause off the optional columns, so a
+        // DB missing one of them fails only when it is actually being SET — which routes to the
+        // safeOnly retry — rather than on every write via RETURNING.
+        if (safeOnly) {
+            await tx.estimate.update({ where: { id: estimateId }, data: safeData, select: { id: true } });
+        } else {
             await tx.estimate.update({
                 where: { id: estimateId },
                 data: {
@@ -2139,10 +2814,16 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
                     ...(data.expirationDate !== undefined && { expirationDate: data.expirationDate }),
                     ...(data.memo !== undefined && { memo: data.memo }),
                     ...(data.termsAndConditions !== undefined && { termsAndConditions: data.termsAndConditions }),
+                    ...(data.overviewEnabled !== undefined && { overviewEnabled: !!data.overviewEnabled }),
+                    ...(data.overviewTitle !== undefined && { overviewTitle: data.overviewTitle }),
+                    ...(data.overviewBody !== undefined && { overviewBody: data.overviewBody }),
+                    ...(data.notesEnabled !== undefined && { notesEnabled: !!data.notesEnabled }),
+                    ...(data.notesTitle !== undefined && { notesTitle: data.notesTitle }),
+                    ...(data.notesBody !== undefined && { notesBody: data.notesBody }),
+                    ...(data.notesPlacement !== undefined && { notesPlacement: data.notesPlacement === "before" ? "before" : "after" }),
                 },
+                select: { id: true },
             });
-        } catch {
-            await tx.estimate.update({ where: { id: estimateId }, data: safeData });
         }
 
         // 1. Differential Item Upsert
@@ -2336,7 +3017,28 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         }
 
         return { success: true };
-    })(prisma);
+    }, {
+        // A full estimate save fans out to ~12 + itemCount + scheduleCount sequential statements;
+        // the default 5s interactive-transaction limit is too tight for large estimates that
+        // previously committed under autocommit. Give the batch room without being unbounded.
+        maxWait: 10000,
+        timeout: 30000,
+    });
+
+    // Schema-drift fallback (preserves the original "fallback to safe fields if columns missing"
+    // behavior). If the deployed DB is missing an optional column, Prisma throws P2022 and the
+    // transaction rolls back cleanly; re-run the whole transaction writing only the safe columns.
+    // Any other error (e.g. the linked-expense guard, deadlocks) propagates unchanged.
+    let result;
+    try {
+        result = await withTxRetry(() => runSave(false));
+    } catch (e: any) {
+        if (e?.code === "P2022") {
+            result = await withTxRetry(() => runSave(true));
+        } else {
+            throw e;
+        }
+    }
 
     if (contextType === "project") {
         revalidatePath(`/projects/${contextId}/estimates`);
@@ -2350,46 +3052,56 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
 
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
-    if (!estimate) throw new Error("Estimate not found");
+    // One transaction, estimate locked FIRST (canonical Estimate → Invoice order; this flow
+    // touches only the estimate). Without the lock two concurrent logs each read the same
+    // balanceDue and each write balanceDue − amount, losing one decrement. The lock serializes
+    // them so the second reads the already-decremented balance. withTxRetry recovers a deadlock.
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { estimateId });
+        const estimate = await tx.estimate.findUnique({ where: { id: estimateId } });
+        if (!estimate) throw new Error("Estimate not found");
 
-    const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
-    const scheduleCount = await prisma.estimatePaymentSchedule.count({ where: { estimateId } });
+        const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
+        const scheduleCount = await tx.estimatePaymentSchedule.count({ where: { estimateId } });
 
-    const createdSchedule = await prisma.estimatePaymentSchedule.create({
-        data: {
-            estimateId,
-            name: `Payment — ${data.paymentMethod} (${refNum})`,
-            amount: data.amount,
-            dueDate: new Date(data.date),
-            order: scheduleCount,
-            status: "Paid",
-            paidAt: new Date(),
-            paymentDate: new Date(data.date),
-            paymentMethod: data.paymentMethod.toLowerCase(),
-            referenceNumber: refNum,
-        },
-    });
+        const createdSchedule = await tx.estimatePaymentSchedule.create({
+            data: {
+                estimateId,
+                name: `Payment — ${data.paymentMethod} (${refNum})`,
+                amount: data.amount,
+                dueDate: new Date(data.date),
+                order: scheduleCount,
+                status: "Paid",
+                paidAt: new Date(),
+                paymentDate: new Date(data.date),
+                paymentMethod: data.paymentMethod.toLowerCase(),
+                referenceNumber: refNum,
+            },
+        });
 
-    // Update balance — round to 2 decimal places to avoid floating-point drift
-    const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
-    const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
-    const isFirstPayment = !estimate.statusBeforePayment;
-    const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
+        // Update balance — round to 2 decimal places to avoid floating-point drift.
+        // Read from the locked estimate row above, so no concurrent decrement is lost.
+        const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
+        const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
+        const isFirstPayment = !estimate.statusBeforePayment;
+        const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
 
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: {
-            balanceDue: newBalance,
-            status: newStatus,
-            statusBeforePayment,
-        },
-    });
+        await tx.estimate.update({
+            where: { id: estimateId },
+            data: {
+                balanceDue: newBalance,
+                status: newStatus,
+                statusBeforePayment,
+            },
+        });
 
-    if (estimate.projectId) {
-        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+        return { createdSchedule, newStatus, newBalance, projectId: estimate.projectId };
+    }));
+
+    if (result.projectId) {
+        revalidatePath(`/projects/${result.projectId}/estimates/${estimateId}`);
     }
-    return { success: true, schedule: createdSchedule, newStatus, newBalance };
+    return { success: true, schedule: result.createdSchedule, newStatus: result.newStatus, newBalance: result.newBalance };
 }
 
 export async function archiveEstimate(estimateId: string) {
@@ -2449,18 +3161,6 @@ async function getDefaultSalesTaxRate(): Promise<number> {
     }
 }
 
-// Reverse-out tax from a total (total = subtotal + subtotal * rate/100).
-// If exempt or rate <= 0, the whole amount is subtotal and taxAmount is 0.
-function deriveInvoiceTaxFields(totalAmount: number, ratePercent: number, isExempt: boolean) {
-    if (isExempt || ratePercent <= 0) {
-        return { subtotal: totalAmount, taxRate: 0, taxAmount: 0 };
-    }
-    const factor = ratePercent / (100 + ratePercent);
-    const taxAmount = Math.round(totalAmount * factor * 100) / 100;
-    const subtotal = Math.round((totalAmount - taxAmount) * 100) / 100;
-    return { subtotal, taxRate: ratePercent, taxAmount };
-}
-
 export async function createInvoiceFromEstimate(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
@@ -2479,6 +3179,7 @@ export async function createInvoiceFromEstimate(estimateId: string) {
             code: "INV-TEMP",
             projectId: estimate.projectId!,
             clientId: project.clientId,
+            estimateId: estimate.id,
             status: "Draft",
             totalAmount: total,
             balanceDue: total,
@@ -2507,6 +3208,7 @@ export async function createInvoiceFromEstimate(estimateId: string) {
             await prisma.paymentSchedule.create({
                 data: {
                     invoiceId: invoice.id,
+                    sourceScheduleId: schedule.id,
                     name: schedule.name,
                     amount: schedule.amount,
                     status: schedule.status,
@@ -2726,7 +3428,7 @@ export async function recordPayment(
 ) {
     await assertInvoicePermission();
 
-    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "other"];
+    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
     if (!VALID_METHODS.includes(method)) {
         return { success: false, error: "Invalid payment method" as const };
@@ -2741,7 +3443,18 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await prisma.$transaction(async (t) => {
+    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Two concurrent payments on
+        // DIFFERENT milestones of the SAME invoice each claim their own schedule row (no mutual
+        // block), so without a parent lock they both read a stale sibling set and overwrite each
+        // other's Invoice.balanceDue — one payment's balance effect is silently lost, and no
+        // deadlock fires to trigger a retry. Locking the parent(s) first serializes the recompute:
+        // the second call blocks until the first commits, then recomputes against fresh state.
+        // Read the estimate link (non-locking) so we can lock Estimate BEFORE Invoice, matching
+        // recordEstimatePayment's mirror order so the two flows never invert and deadlock.
+        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+
         const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -2779,10 +3492,61 @@ export async function recordPayment(
             data: { balanceDue: newBalance, status: newStatus },
         });
 
+        // Mirror to the estimate-side milestone copy so the estimate editor and
+        // its balance don't drift from the invoice that actually got paid.
+        // Link-first (this milestone's sourceScheduleId points at its estimate
+        // original); name+amount fallback only when exactly one row matches.
+        if (invoice.estimateId) {
+            let estCopy: { id: string } | null = null;
+            if (payment.sourceScheduleId) {
+                estCopy = await t.estimatePaymentSchedule.findFirst({
+                    where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
+                });
+            } else {
+                const candidates = await t.estimatePaymentSchedule.findMany({
+                    where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: payment.name },
+                    take: 2,
+                });
+                const matching = candidates.filter(c => toNum(c.amount) === toNum(payment.amount));
+                estCopy = matching.length === 1 ? matching[0] : null;
+            }
+            if (estCopy) {
+                const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
+                    where: { id: estCopy.id, status: { not: "Paid" } },
+                    data: { status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber },
+                });
+                if (mirrorClaim.count > 0) {
+                    const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
+                    if (estimate) {
+                        const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
+                        const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                        const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
+                        const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
+                        await t.estimate.update({
+                            where: { id: invoice.estimateId },
+                            data: {
+                                balanceDue: estBalance,
+                                status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
+                                // Captured so unrecording can restore the pre-payment status
+                                ...(estFirstPayment && { statusBeforePayment: estimate.status }),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
+        // Durable notification: enqueue INSIDE the tx so it commits atomically with the
+        // settle — a crash before delivery can't drop the team alert / receipt / activity log.
+        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice" });
         return { success: true as const, projectId: invoice.projectId };
-    });
+    }));
 
     if (!tx.success) return tx;
+
+    // Inline fast-path delivery of the just-enqueued notification (single canonical writer,
+    // via the outbox). Best-effort — the cron backstop redelivers anything left pending.
+    await drainPaymentNotifications({ scheduleId: paymentId }).catch(() => {});
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -2794,6 +3558,143 @@ export async function recordPayment(
     revalidatePath(`/reports/transactions`);
 
     return { success: true };
+}
+
+/** Set company monthly overhead (profitability report). ADMIN/FINANCE only. */
+export async function updateMonthlyOverhead(amount: number) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "FINANCE"].includes(caller.role)) {
+        return { success: false as const, error: "Only Admin or Finance can set overhead" };
+    }
+    if (!Number.isFinite(amount) || amount < 0 || amount > 10_000_000) {
+        return { success: false as const, error: "Invalid amount" };
+    }
+    await prisma.companySettings.update({
+        where: { id: "singleton" },
+        data: { monthlyOverhead: amount },
+    });
+    revalidatePath("/reports/profitability");
+    return { success: true as const };
+}
+
+// ─── QuickBooks payment-rail actions (used by InvoiceEditor + portal refresh) ───
+
+/** Create (or fetch) the QuickBooks invoice + hosted pay link for one milestone. */
+export async function createQBPaymentLink(paymentId: string) {
+    await assertInvoicePermission();
+    try {
+        const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+        const res = await pushMilestoneToQuickBooks(paymentId);
+        const schedule = await prisma.paymentSchedule.findUnique({
+            where: { id: paymentId },
+            select: { invoiceId: true, invoice: { select: { projectId: true } } },
+        });
+        if (schedule) {
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+        }
+        return { success: true as const, payLink: res.payLink, qbInvoiceId: res.qbInvoiceId };
+    } catch (e) {
+        return { success: false as const, error: e instanceof Error ? e.message : "QuickBooks push failed" };
+    }
+}
+
+/** Pull settled QuickBooks payments for one invoice right now (on-view refresh). */
+export async function refreshQBPayments(invoiceId: string) {
+    await assertInvoicePermission();
+    const { syncQuickBooksPayments } = await import("./quickbooks-payments");
+    const result = await syncQuickBooksPayments({ invoiceId });
+    if (result.settled > 0) {
+        const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
+        if (inv) {
+            revalidatePath(`/projects/${inv.projectId}/invoices/${invoiceId}`);
+            revalidatePath(`/invoices`);
+            revalidatePath(`/portal`);
+        }
+    }
+    return result;
+}
+
+/**
+ * Break a milestone's link to a voided/deleted QuickBooks invoice so it can be
+ * re-sent from scratch. Clears the QB tracking fields ONLY — never touches money
+ * state. The Paid/qbPaymentId refusal guards are the money-path safety boundary:
+ * clearing these fields on a Pending milestone changes no status, fires no
+ * notifyMilestonePaid, and doesn't touch the estimate mirror (which has no QB fields).
+ *
+ * `deleteInQBO` is wired for a future "also delete in QuickBooks" toggle but defaults
+ * OFF — we never issue a destructive QBO write (voided invoices are often kept as a
+ * deliberate audit record; a deleted one is already gone).
+ */
+export async function breakQBInvoiceLink(
+    paymentId: string,
+    opts?: { deleteInQBO?: boolean },
+): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
+    await assertInvoicePermission();
+
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentId },
+        select: {
+            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            invoiceId: true, invoice: { select: { projectId: true } },
+        },
+    });
+    if (!schedule) return { success: false, error: "Milestone not found" };
+    if (schedule.status === "Paid") {
+        return { success: false, error: "This milestone is already paid — unlinking is blocked. Use Undo first if you need to reverse it." };
+    }
+    if (schedule.qbPaymentId) {
+        return { success: false, error: "A QuickBooks payment is recorded against this milestone. Refusing to unlink." };
+    }
+    if (!schedule.qbInvoiceId) {
+        return { success: false, error: "This milestone has no QuickBooks link to break." };
+    }
+
+    // Claim the unlink atomically: the guard fields go in the WHERE, so if the QB
+    // sync settles this milestone (status→Paid, qbPaymentId set) between the read
+    // above and this write, the claim matches 0 rows and we never strip QB fields
+    // off a now-paid row. `qbInvoiceId` is pinned to the value we read so a
+    // concurrent re-push (new id) can't be clobbered either.
+    const cleared = await prisma.paymentSchedule.updateMany({
+        where: {
+            id: schedule.id,
+            status: { not: "Paid" },
+            qbPaymentId: null,
+            qbInvoiceId: schedule.qbInvoiceId,
+        },
+        data: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            qbInvoiceSentAt: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+        },
+    });
+    if (cleared.count !== 1) {
+        return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+    }
+
+    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
+    // Default OFF — we never issue a destructive QBO write unless asked.
+    let warning: string | undefined;
+    if (opts?.deleteInQBO === true) {
+        try {
+            const { getFreshQBTokens } = await import("./quickbooks-payments");
+            const { deleteQBInvoice } = await import("./quickbooks");
+            const tokens = await getFreshQBTokens();
+            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
+            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
+        } catch {
+            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
+        }
+    }
+
+    revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    return { success: true, warning };
 }
 
 export async function recordEstimatePayment(
@@ -2811,7 +3712,7 @@ export async function recordEstimatePayment(
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
 
-    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "other"];
+    const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
     if (!VALID_METHODS.includes(method)) {
         return { success: false, error: "Invalid payment method" as const };
@@ -2826,11 +3727,72 @@ export async function recordEstimatePayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await prisma.$transaction(async (t) => {
+    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Lock the estimate first,
+        // then its (oldest) linked invoice if one exists, BEFORE any reads/writes below.
+        // This flow mirrors onto the invoice copy, so it must take the invoice lock in the
+        // same order recordPayment/the Stripe+QB settles do, or overlapping settles from both
+        // sides would deadlock on every collision (retry recovers, but the lock order avoids it).
+        await lockMoneyParents(t, { estimateId });
+        const lockInv = await t.invoice.findFirst({
+            where: { estimateId },
+            // id tiebreaker so the lock target == the mutation target below even on a createdAt tie.
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+            select: { id: true },
+        });
+        if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
+
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
         if (payment.estimateId !== estimateId) return { success: false as const, error: "Milestone/estimate mismatch" as const };
+
+        // When a linked invoice exists, its milestone copy is the CANONICAL claim
+        // target — claim it FIRST so a concurrent settle on the invoice/QBO side
+        // can't race this one into double side effects. Oldest invoice wins when
+        // several link back (manual re-invoicing); name+amount fallback only
+        // fires when it matches exactly one candidate.
+        let mirroredCopyId: string | null = null;
+        // Fetch the SAME invoice we locked above by id — not a fresh findFirst — so the mirror
+        // mutates exactly the locked row even if a concurrent insert/delete/re-timestamp shifts
+        // which invoice is "oldest" between the two reads (READ COMMITTED).
+        const linkedInvoice = lockInv
+            ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+            : null;
+        if (linkedInvoice) {
+            const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId);
+            const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
+                !p.sourceScheduleId &&
+                p.name === payment.name &&
+                toNum(p.amount) === toNum(payment.amount)
+            );
+            const copy = linked ?? (fallbackCandidates.length === 1 ? fallbackCandidates[0] : null);
+            if (copy) {
+                // Already settled from the invoice/QBO side → this is a conflict,
+                // not a fresh payment. Refuse rather than double-record.
+                const mirrorClaim = await t.paymentSchedule.updateMany({
+                    where: { id: copy.id, status: { not: "Paid" } },
+                    data: {
+                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
+                        // Keep both sides agreeing on what was actually paid when the
+                        // recorded amount overrides the milestone amount.
+                        ...(input.amount != null && { amount: input.amount }),
+                    },
+                });
+                if (mirrorClaim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
+                const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                await t.invoice.update({
+                    where: { id: linkedInvoice.id },
+                    data: {
+                        balanceDue: invBalance,
+                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                    },
+                });
+                mirroredCopyId = copy.id;
+            }
+        }
 
         const claim = await t.estimatePaymentSchedule.updateMany({
             where: { id: paymentId, status: { not: "Paid" } },
@@ -2869,14 +3831,33 @@ export async function recordEstimatePayment(
             },
         });
 
-        return { success: true as const, projectId: estimate.projectId, leadId: estimate.leadId };
-    });
+        // Durable notification, enqueued in-tx. When the payment settled the mirrored INVOICE
+        // copy, notify the invoice side (matches the pre-outbox behavior); otherwise it's a
+        // pre-invoice estimate deposit, so notify the estimate side.
+        const notifyScheduleId = mirroredCopyId ?? paymentId;
+        await enqueueMilestonePaid(t, {
+            scheduleId: notifyScheduleId,
+            scheduleType: mirroredCopyId ? "invoice" : "estimate",
+        });
+
+        return {
+            success: true as const, projectId: estimate.projectId, leadId: estimate.leadId,
+            mirroredCopyId, notifyScheduleId, paymentName: payment.name, newBalance,
+            paymentAmount: input.amount != null ? input.amount : toNum(payment.amount),
+        };
+    }));
 
     if (!tx.success) return tx;
+
+    // Inline fast-path delivery via the outbox's single canonical writer (notifyMilestonePaid
+    // for an invoice copy, notifyEstimateMilestonePaid for an estimate deposit — the latter
+    // now writes the payment_received activity entry the inline path used to log here).
+    await drainPaymentNotifications({ scheduleId: tx.notifyScheduleId }).catch(() => {});
 
     if (tx.projectId) {
         revalidatePath(`/projects/${tx.projectId}/estimates`);
         revalidatePath(`/projects/${tx.projectId}/estimates/${estimateId}`);
+        revalidatePath(`/projects/${tx.projectId}/invoices`);
     }
     if (tx.leadId) {
         revalidatePath(`/leads/${tx.leadId}/estimates`);
@@ -2936,7 +3917,19 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This flow releases both the
+        // estimate milestone and its mirrored invoice copy, so lock the estimate first, then its
+        // (oldest) linked invoice, before recomputing either balance.
+        await lockMoneyParents(tx, { estimateId });
+        const lockInv = await tx.invoice.findFirst({
+            where: { estimateId },
+            // id tiebreaker so the lock target == the mutation target below even on a createdAt tie.
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+            select: { id: true },
+        });
+        if (lockInv) await lockMoneyParents(tx, { invoiceId: lockInv.id });
+
         const payment = await tx.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
         if (payment.status !== "Paid") return null;
@@ -2976,8 +3969,42 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
             },
         });
 
+        // Unwind the mirrored invoice copy too — a payment recorded on either
+        // side settles both, so unrecording must release both. Oldest linked
+        // invoice; name+amount fallback only when it matches exactly one row.
+        // Fetch the SAME invoice we locked above by id (see recordEstimatePayment for rationale).
+        const linkedInvoice = lockInv
+            ? await tx.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+            : null;
+        if (linkedInvoice) {
+            const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid");
+            const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
+                !p.sourceScheduleId &&
+                p.status === "Paid" &&
+                p.name === payment.name &&
+                toNum(p.amount) === toNum(payment.amount)
+            );
+            const copy = linked ?? (fallbackCandidates.length === 1 ? fallbackCandidates[0] : null);
+            if (copy) {
+                await tx.paymentSchedule.update({
+                    where: { id: copy.id },
+                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
+                });
+                const allCopies = await tx.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
+                const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
+                await tx.invoice.update({
+                    where: { id: linkedInvoice.id },
+                    data: {
+                        balanceDue: invBalance,
+                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : "Issued",
+                    },
+                });
+            }
+        }
+
         return { projectId: estimate.projectId, leadId: estimate.leadId };
-    });
+    }));
 
     if (!result) return { success: false };
 
@@ -3064,26 +4091,53 @@ export async function splitInvoiceMilestones(
         return { name, amount, dueDate: m.dueDate || null };
     });
 
-    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    if (!invoice) throw new Error("Invoice not found");
-
     const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
 
-    // Recalculate balanceDue: paid amount stays the same, only pending changes
-    const paidAmount = Math.round(
-        (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
-    ) / 100;
-    const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-    const newStatus =
-        newBalance <= 0 ? "Paid"
-        : invoice.status === "Draft" ? "Draft"
-        : invoice.status === "Overdue" ? "Overdue"
-        : "Issued";
+    // Interactive tx, invoice locked FIRST (canonical Estimate → Invoice order; this flow touches
+    // only the invoice). The paid portion is re-read from the LOCKED invoice, so a concurrent
+    // settle on a surviving Paid milestone can't leave paidAmount stale and get its balance
+    // overwritten. Arithmetic is otherwise unchanged from the original array-form transaction.
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) throw new Error("Invoice not found");
 
-    // Array-form transaction — atomic with pgbouncer, no interactive session needed
-    await prisma.$transaction([
-        prisma.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } }),
-        prisma.paymentSchedule.createMany({
+        // Refuse to re-split while a payment is in flight on a non-Paid milestone. The delete
+        // below drops every non-Paid schedule; if one has an open Stripe checkout or a sent
+        // QuickBooks invoice, a settlement landing afterward would find no row to claim and the
+        // customer would be charged with nothing to reconcile against. Checked under the invoice
+        // lock so a checkout/QB-send starting concurrently can't slip in after this guard.
+        const inFlight = await tx.paymentSchedule.findFirst({
+            where: {
+                invoiceId,
+                status: { not: "Paid" },
+                OR: [
+                    { stripeSessionId: { not: null } },
+                    { stripePaymentIntentId: { not: null } },
+                    { qbInvoiceId: { not: null } },
+                ],
+            },
+            select: { name: true },
+        });
+        if (inFlight) {
+            throw new Error(
+                `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
+            );
+        }
+
+        // Recalculate balanceDue: paid amount stays the same, only pending changes
+        const paidAmount = Math.round(
+            (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
+        ) / 100;
+        const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
+        const newStatus =
+            newBalance <= 0 ? "Paid"
+            : invoice.status === "Draft" ? "Draft"
+            : invoice.status === "Overdue" ? "Overdue"
+            : "Issued";
+
+        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
+        await tx.paymentSchedule.createMany({
             data: validated.map((m) => ({
                 invoiceId,
                 name: m.name,
@@ -3091,15 +4145,16 @@ export async function splitInvoiceMilestones(
                 status: "Pending",
                 dueDate: m.dueDate ? new Date(m.dueDate) : null,
             })),
-        }),
-        prisma.invoice.update({
+        });
+        await tx.invoice.update({
             where: { id: invoiceId },
             data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
-        }),
-    ]);
+        });
+        return invoice.projectId;
+    }));
 
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
 
     return { success: true };
@@ -3108,9 +4163,18 @@ export async function splitInvoiceMilestones(
 export async function unrecordPayment(paymentId: string, invoiceId: string) {
     await assertInvoicePermission();
 
-    const projectId = await prisma.$transaction(async (tx) => {
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This flow releases the invoice
+        // milestone and its mirrored estimate copy, so read the estimate link (non-locking), then
+        // lock Estimate before Invoice, before recomputing either balance.
+        const invLink = await tx.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(tx, { estimateId: invLink?.estimateId, invoiceId });
+
         const payment = await tx.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
+        // Guard BEFORE mutating: a mismatched invoiceId would leave the payment's real
+        // parent stale and recompute the wrong (locked) invoice. Mirrors recordPayment.
+        if (payment.invoiceId !== invoiceId) throw new Error("Payment/invoice mismatch");
         if (payment.status !== "Paid") return null;
 
         await tx.paymentSchedule.update({
@@ -3150,8 +4214,49 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
             data: { balanceDue: newBalance, status: newStatus },
         });
 
+        // Unwind the mirrored estimate-side copy too (link-first, fallback by
+        // name+amount) so the estimate doesn't keep claiming money the invoice
+        // no longer shows as received.
+        if (invoice.estimateId) {
+            let estCopy: { id: string; amount: unknown } | null = null;
+            if (payment.sourceScheduleId) {
+                estCopy = await tx.estimatePaymentSchedule.findFirst({
+                    where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: "Paid" },
+                });
+            } else {
+                const candidates = await tx.estimatePaymentSchedule.findMany({
+                    where: { estimateId: invoice.estimateId, status: "Paid", name: payment.name },
+                    take: 2,
+                });
+                const matching = candidates.filter(c => toNum(c.amount) === toNum(payment.amount));
+                estCopy = matching.length === 1 ? matching[0] : null;
+            }
+            if (estCopy) {
+                await tx.estimatePaymentSchedule.update({
+                    where: { id: estCopy.id },
+                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
+                });
+                const estimate = await tx.estimate.findUnique({ where: { id: invoice.estimateId } });
+                if (estimate) {
+                    const estSiblings = await tx.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
+                    const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                    const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
+                    await tx.estimate.update({
+                        where: { id: invoice.estimateId },
+                        data: {
+                            balanceDue: estBalance,
+                            status: estPaid === 0 ? estimate.statusBeforePayment ?? "Invoiced"
+                                : estBalance <= 0 ? "Paid"
+                                : "Partially Paid",
+                            ...(estPaid === 0 && { statusBeforePayment: null }),
+                        },
+                    });
+                }
+            }
+        }
+
         return invoice.projectId;
-    });
+    }));
 
     if (!projectId) return { success: false };
 
@@ -3492,44 +4597,59 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
     });
     if (!estimate) throw new Error("Estimate not found");
 
+    const itemRows = estimate.items.map((item) => ({
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: item.quantity,
+        baseCost: item.baseCost,
+        markupPercent: item.markupPercent,
+        unitCost: item.unitCost,
+        order: item.order,
+        parentId: item.parentId,
+        costCodeId: item.costCodeId,
+        costTypeId: item.costTypeId,
+    }));
+
+    // Saving under an existing name replaces that template's contents (keeping its
+    // id/source and bumping updatedAt) instead of piling up same-name duplicates.
+    const existing = await prisma.estimateTemplate.findFirst({
+        where: { name: { equals: templateName, mode: "insensitive" } },
+        select: { id: true },
+    });
+    if (existing) {
+        const template = await prisma.$transaction(async tx => {
+            await tx.estimateTemplateItem.deleteMany({ where: { templateId: existing.id } });
+            return tx.estimateTemplate.update({
+                where: { id: existing.id },
+                data: { name: templateName, items: { create: itemRows } },
+            });
+        });
+        return { id: template.id, name: template.name, updated: true };
+    }
+
     const template = await prisma.estimateTemplate.create({
-        data: {
-            name: templateName,
-            items: {
-                create: estimate.items.map((item) => ({
-                    name: item.name,
-                    description: item.description || "",
-                    type: item.type,
-                    quantity: item.quantity,
-                    baseCost: item.baseCost,
-                    markupPercent: item.markupPercent,
-                    unitCost: item.unitCost,
-                    order: item.order,
-                    parentId: item.parentId,
-                    costCodeId: item.costCodeId,
-                    costTypeId: item.costTypeId,
-                })),
-            },
-        },
+        data: { name: templateName, items: { create: itemRows } },
     });
 
-    return { id: template.id, name: template.name };
+    return { id: template.id, name: template.name, updated: false };
 }
 
 export async function getEstimateTemplates() {
     return await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
-        include: { items: { orderBy: { order: "asc" } } },
+        include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
     const template = await prisma.estimateTemplate.findUnique({
         where: { id: templateId },
-        include: { items: { orderBy: { order: "asc" } } },
+        include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
     if (!template) throw new Error("Template not found");
 
+    const taxDefault = await defaultTaxForNewEstimate({ projectId });
     const estimate = await prisma.estimate.create({
         data: {
             title: template.name,
@@ -3539,15 +4659,25 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
             totalAmount: 0,
             balanceDue: 0,
             privacy: "Shared",
+            ...(taxDefault ?? {}),
         },
     });
 
     const templateCode = `EST-${String(estimate.number).padStart(5, "0")}`;
     await prisma.estimate.update({ where: { id: estimate.id }, data: { code: templateCode } });
 
+    // Rebuild grouping by walking items in order: a Section row starts a group and
+    // the child rows after it belong to that group. Stored template parentId VALUES
+    // can't be copied — they reference rows in whatever estimate the template was
+    // saved from, and EstimateItem.parentId is a self-FK, so a raw copy fails or
+    // dangles — but null-vs-set still reliably marks a row as top-level vs child.
+    let currentSectionId: string | null = null;
     for (const item of template.items) {
+        const isSection = item.type === "Section";
+        const newId = crypto.randomUUID();
         await prisma.estimateItem.create({
             data: {
+                id: newId,
                 estimateId: estimate.id,
                 name: item.name,
                 description: item.description || "",
@@ -3558,11 +4688,12 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
                 unitCost: item.unitCost,
                 total: toNum(item.quantity) * toNum(item.unitCost),
                 order: item.order,
-                parentId: item.parentId,
+                parentId: isSection || item.parentId == null ? null : currentSectionId,
                 costCodeId: item.costCodeId,
                 costTypeId: item.costTypeId,
             },
         });
+        if (isSection) currentSectionId = newId;
     }
 
     revalidatePath(`/projects/${projectId}/estimates`);
@@ -3574,28 +4705,43 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
 // =============================================
 
 export async function saveItemsAsAssembly(name: string, items: { name: string; description?: string; type: string; quantity: number; baseCost: number; markupPercent: number; unitCost: number; order: number; parentId?: string | null; costCodeId?: string | null; costTypeId?: string | null; isSection?: boolean }[]) {
+    const itemRows = items.map((item, idx) => ({
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: item.quantity,
+        baseCost: item.baseCost || 0,
+        markupPercent: item.markupPercent,
+        unitCost: item.unitCost || 0,
+        order: idx,
+        parentId: item.parentId || null,
+        costCodeId: item.costCodeId || null,
+        costTypeId: item.costTypeId || null,
+    }));
+
+    // Same-name save replaces the existing template (keeps id/source, bumps
+    // updatedAt) so the library doesn't accumulate duplicates.
+    const existing = await prisma.estimateTemplate.findFirst({
+        where: { name: { equals: name, mode: "insensitive" } },
+        select: { id: true },
+    });
+    if (existing) {
+        const template = await prisma.$transaction(async tx => {
+            await tx.estimateTemplateItem.deleteMany({ where: { templateId: existing.id } });
+            return tx.estimateTemplate.update({
+                where: { id: existing.id },
+                data: { name, items: { create: itemRows } },
+                include: { items: true },
+            });
+        });
+        return { id: template.id, name: template.name, itemCount: template.items.length, updated: true };
+    }
+
     const template = await prisma.estimateTemplate.create({
-        data: {
-            name,
-            items: {
-                create: items.map((item, idx) => ({
-                    name: item.name,
-                    description: item.description || "",
-                    type: item.type,
-                    quantity: item.quantity,
-                    baseCost: item.baseCost || 0,
-                    markupPercent: item.markupPercent,
-                    unitCost: item.unitCost || 0,
-                    order: idx,
-                    parentId: item.parentId || null,
-                    costCodeId: item.costCodeId || null,
-                    costTypeId: item.costTypeId || null,
-                })),
-            },
-        },
+        data: { name, items: { create: itemRows } },
         include: { items: true },
     });
-    return { id: template.id, name: template.name, itemCount: template.items.length };
+    return { id: template.id, name: template.name, itemCount: template.items.length, updated: false };
 }
 
 export async function deleteAssembly(templateId: string) {
@@ -3799,6 +4945,54 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         // Do not block the email send — matches approveEstimate() pattern
     }
 
+    // Also attach any files uploaded to the estimate, capped so the email stays deliverable.
+    // Anything skipped here is still viewable in the client portal.
+    let attachedFileCount = 0;
+    try {
+        const estimateFiles = await prisma.estimateFile.findMany({
+            where: { estimateId },
+            orderBy: { createdAt: "desc" },
+        });
+        if (estimateFiles.length > 0) {
+            const MAX_SINGLE_FILE_BYTES = 8 * 1024 * 1024;  // 8 MB per file
+            const MAX_TOTAL_EMAIL_BYTES = 18 * 1024 * 1024; // 18 MB total raw (PDF + files); ~25 MB once base64-encoded
+            // Seed the budget with whatever is already attached (the estimate PDF) so we don't exceed Resend's payload limit.
+            let usedBytes = (emailAttachments || []).reduce((sum, a) => sum + a.content.length, 0);
+            const skipped: string[] = [];
+            for (const f of estimateFiles) {
+                if (f.size > MAX_SINGLE_FILE_BYTES) { skipped.push(`${f.name} (exceeds per-file limit)`); continue; }
+                if (usedBytes + f.size > MAX_TOTAL_EMAIL_BYTES) { skipped.push(`${f.name} (over total size budget)`); continue; }
+                // Defense-in-depth: only fetch our own Supabase storage URLs, never an arbitrary host (SSRF guard).
+                let parsedUrl: URL;
+                try { parsedUrl = new URL(f.url); } catch { skipped.push(`${f.name} (invalid url)`); continue; }
+                if (parsedUrl.protocol !== "https:" || !parsedUrl.hostname.endsWith(".supabase.co")) {
+                    skipped.push(`${f.name} (untrusted url host)`);
+                    continue;
+                }
+                try {
+                    const res = await fetch(f.url, { signal: AbortSignal.timeout(15_000) });
+                    if (!res.ok) { skipped.push(`${f.name} (fetch ${res.status})`); continue; }
+                    const buf = Buffer.from(await res.arrayBuffer());
+                    // Re-check against the real downloaded size in case the stored metadata was wrong.
+                    if (buf.length > MAX_SINGLE_FILE_BYTES) { skipped.push(`${f.name} (exceeds per-file limit)`); continue; }
+                    if (usedBytes + buf.length > MAX_TOTAL_EMAIL_BYTES) { skipped.push(`${f.name} (over total size budget)`); continue; }
+                    emailAttachments = emailAttachments || [];
+                    emailAttachments.push({ filename: f.name, content: buf });
+                    usedBytes += buf.length;
+                    attachedFileCount++;
+                } catch (err) {
+                    skipped.push(`${f.name} (download error)`);
+                }
+            }
+            if (skipped.length > 0) {
+                console.warn(`[sendEstimateToClient] ${skipped.length} estimate file(s) not attached (still viewable in the client portal):`, skipped);
+            }
+        }
+    } catch (e) {
+        console.error("[sendEstimateToClient] Failed to attach estimate files:", e);
+        // Do not block the send — files remain viewable in the portal
+    }
+
     // Send email notification to client
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     let portalUrl: string;
@@ -3829,6 +5023,12 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
            </div>`
         : '';
 
+    const attachmentsNote = attachedFileCount > 0
+        ? `<div style="background: #f8fafc; border-left: 3px solid #4f46e5; padding: 12px 16px; margin: 0 0 24px; border-radius: 0 8px 8px 0;">
+               <p style="color: #334155; margin: 0; font-size: 13px; font-weight: 600;">📎 ${attachedFileCount} additional file${attachedFileCount > 1 ? 's' : ''} attached. You can also view ${attachedFileCount > 1 ? 'them' : 'it'} anytime in your portal.</p>
+           </div>`
+        : '';
+
     const sendResult = await sendNotification(
         recipientEmail,
         `${companyName} sent you an estimate`,
@@ -3843,6 +5043,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
                 <p style="color: #666; margin: 0 0 24px;">Hi ${client?.name || 'there'},</p>
                 ${personalNote}
                 ${pdfNote}
+                ${attachmentsNote}
                 <p style="color: #666; line-height: 1.6;">
                     ${companyName} has sent you an estimate for review and approval.
                     Please click the button below to view the details, terms and conditions, and approve if you'd like to proceed.
@@ -3862,7 +5063,7 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         </body>
         </html>`,
         emailAttachments,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: ccEmails, copyToInternal: true }
     );
 
     if (!sendResult.success) {
@@ -3870,10 +5071,51 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     }
 
     const updatedStatus = ["Draft", "Sent", "Viewed"].includes(estimate.status) ? "Sent" : estimate.status;
+    const isResend = !!estimate.sentAt;
     await prisma.estimate.update({
         where: { id: estimateId },
         data: { sentAt: new Date(), status: updatedStatus },
     });
+
+    // Append-only send trail — every send (incl. resends) gets its own event.
+    {
+        // Legacy preservation: the first new-style resend overwrites sentAt (the
+        // only record of the original send), so freeze that timestamp into the
+        // log before it's gone. Runs at most once per estimate.
+        if (isResend && estimate.sentAt) {
+            const priorSendLogs = await prisma.activityLog.count({
+                where: { entityType: "estimate", entityId: estimateId, action: "sent_estimate" },
+            });
+            if (priorSendLogs === 0) {
+                await prisma.activityLog.create({
+                    data: {
+                        projectId: estimate.project?.id ?? null,
+                        leadId: estimate.lead?.id ?? null,
+                        actorType: "TEAM",
+                        actorName: "Team",
+                        action: "sent_estimate",
+                        entityType: "estimate",
+                        entityId: estimateId,
+                        entityName: `Estimate ${estimate.code || estimate.title}`,
+                        metadata: JSON.stringify({ resend: false, backfilled: true }),
+                        createdAt: estimate.sentAt,
+                    },
+                }).catch(() => {});
+            }
+        }
+        const session = await getServerSession(authOptions).catch(() => null);
+        await logActivity({
+            projectId: estimate.project?.id,
+            leadId: estimate.lead?.id,
+            actorType: "TEAM",
+            actorName: session?.user?.name || session?.user?.email || "Team",
+            action: "sent_estimate",
+            entityType: "estimate",
+            entityId: estimateId,
+            entityName: `Estimate ${estimate.code || estimate.title}`,
+            metadata: { to: recipientEmail, cc: ccEmails && ccEmails.length > 0 ? ccEmails : undefined, resend: isResend },
+        });
+    }
 
     // Store as message in the appropriate thread
     const messageBody = customMessage
@@ -3916,18 +5158,8 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         revalidatePath(`/projects/${estimate.projectId}/messages`);
     }
 
-    // Log to activity feed (project-scoped only)
-    if (estimate.projectId) {
-        await logActivity({
-            projectId: estimate.projectId,
-            actorType: "TEAM",
-            actorName: companyName,
-            action: "sent_estimate",
-            entityType: "estimate",
-            entityId: estimateId,
-            entityName: `Estimate ${estimate.code || estimate.title}`,
-        });
-    }
+    // (send is already logged to the activity feed right after sentAt is set —
+    //  richer entry with recipient + resend flag, and it covers lead estimates too)
 
     // GAP-1: Auto-update lead stage to "Estimate Sent" if applicable
     if (estimate.leadId) {
@@ -3966,6 +5198,17 @@ function resolveMergeFields(template: string, data: Record<string, string>): str
 
 function bodyHasContractorBlock(body: string): boolean {
     return /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|data-merge-field=["']CONTRACTOR_SIGNATURE_BLOCK["']/i.test(body || "");
+}
+
+// Save-time guard for the author↔portal signing-field handshake.
+// The portal and PDF rendering locate signing blocks by grepping for the raw {{KEY}} form.
+// If an un-normalized TipTap <span data-merge-field="KEY">…</span> ever reaches the saved
+// body (editor bug, pasted content, template drift), the portal would find nothing and the
+// signature fields would silently vanish for the customer. Normalizing any remaining
+// merge-field spans back to {{KEY}} on save closes that failure class. (Data merge fields are
+// already resolved to values before this runs; only unresolved/signing keys remain as spans.)
+function normalizeContractBody(body: string): string {
+    return (body || "").replace(/<span[^>]*data-merge-field=["'](\w+)["'][^>]*>[\s\S]*?<\/span>/g, "{{$1}}");
 }
 
 function escapeEmailHtml(s: string): string {
@@ -4210,12 +5453,16 @@ export async function createContractFromTemplate(
         context.type === "lead" ? context.id : null
     );
 
-    const resolvedBody = resolveMergeFields(template.body, mergeData);
+    const resolvedBody = normalizeContractBody(resolveMergeFields(template.body, mergeData));
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
 
     const contract = await prisma.contract.create({
         data: {
             title: titleOverride || template.name,
             body: resolvedBody,
+            // Recurring docs (e.g. lien releases) cycle status back to "Sent" each period and never
+            // reach a stable "Signed" state, so they can't support countersign — force it off.
+            requiresCountersign: (recurringDays && recurringDays > 0) ? false : (coSettings?.requireContractCountersign ?? false),
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
             ...(recurringDays && recurringDays > 0 ? {
                 recurringDays,
@@ -4240,12 +5487,14 @@ export async function createContractBlank(
         context.type === "lead" ? context.id : null
     );
 
-    const resolvedBody = resolveMergeFields(body, mergeData);
+    const resolvedBody = normalizeContractBody(resolveMergeFields(body, mergeData));
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
 
     const contract = await prisma.contract.create({
         data: {
             title,
             body: resolvedBody,
+            requiresCountersign: coSettings?.requireContractCountersign ?? false,
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
         }
     });
@@ -4256,8 +5505,48 @@ export async function createContractBlank(
     return contract;
 }
 
-export async function updateContract(id: string, data: { title?: string; body?: string; status?: string }) {
-    const contract = await prisma.contract.update({ where: { id }, data });
+export async function createContractFromPdf(
+    context: { type: "project" | "lead"; id: string },
+    title: string,
+    originalPdfPath: string
+) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || !["ADMIN", "MANAGER"].includes(user.role)) throw new Error("Forbidden");
+
+    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
+
+    const contract = await prisma.contract.create({
+        data: {
+            title,
+            body: "", // Empty HTML body for PDF contracts
+            originalPdfPath,
+            requiresCountersign: coSettings?.requireContractCountersign ?? false,
+            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
+            status: "Draft",
+        }
+    });
+
+    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
+    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
+
+    return contract;
+}
+
+export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    const existing = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
+    if (existing && ["Signed", "Finalized"].includes(existing.status)) {
+        if (data.title !== undefined || data.body !== undefined) {
+            throw new Error("Cannot edit a contract that has already been signed or finalized");
+        }
+    }
+
+    // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
+    // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
+    const safeData = { ...data };
+    if (typeof safeData.body === "string") safeData.body = normalizeContractBody(safeData.body);
+    const contract = await prisma.contract.update({ where: { id }, data: safeData });
     revalidatePath(`/`);
     return contract;
 }
@@ -4269,12 +5558,12 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
-            project: { include: { client: true } },
-            lead: { include: { client: true } },
+            project: { include: { client: true, manager: { select: { email: true } } } },
+            lead: { include: { client: true, manager: { select: { email: true } } } },
         }
     });
 
@@ -4344,7 +5633,12 @@ export async function sendContractToClient(contractId: string) {
     const logoHtml = companyLogo ? `<img src="${encodeURI(companyLogo)}" alt="${safeCompany}" style="max-height:56px;width:auto;margin:0 auto 8px;display:block;" />` : "";
     const licenseHtml = safeLicense ? `<p style="font-size:12px;color:#64748b;margin:4px 0 0;">Lic# ${safeLicense}</p>` : "";
 
-    const contractCc = buildCc(client.email, (client as any).additionalEmail);
+    // CC: an explicit send-time override if the user edited it, otherwise the durable
+    // auto-set — the client's additional email (spouse) + the assigned lead/project manager.
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const contractCc = ccOverride !== undefined
+        ? buildCc(client.email, ...ccOverride)
+        : buildCc(client.email, (client as any).additionalEmail, managerEmail);
     await sendNotification(
         client.email,
         `${companyName} sent you a contract to review`,
@@ -4361,7 +5655,7 @@ export async function sendContractToClient(contractId: string) {
             '</div></body></html>',
         ].join(''),
         undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: contractCc }
+        { fromName: companyName, replyTo: settings?.email || undefined, cc: contractCc, copyToInternal: true }
     );
 
     // Log to activity feed — project side uses ActivityLog, lead side uses the client message thread.
@@ -4388,6 +5682,29 @@ export async function sendContractToClient(contractId: string) {
     return { success: true, sentTo: client.email, clientName: client.name };
 }
 
+// Prefill for the "Send contract" dialog: the primary recipient + the default CC set
+// (additional client email + assigned manager) that the user can edit before sending.
+export async function getContractSendDefaults(contractId: string): Promise<{ toEmail: string | null; autoCc: string[] }> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER", "FINANCE"].includes(caller.role)) throw new Error("Forbidden");
+
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: { select: { email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+            lead: { include: { client: { select: { email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+        },
+    });
+    if (!contract) throw new Error("Contract not found");
+    const client = contract.project?.client || contract.lead?.client;
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const autoCc = buildCc(client?.email || "", client?.additionalEmail, managerEmail) || [];
+    return { toEmail: client?.email || null, autoCc };
+}
+
 export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -4405,21 +5722,143 @@ export async function signContractAsContractor(contractId: string, signerName: s
     const existing = await prisma.contract.findUnique({ where: { id: contractId }, select: { id: true } });
     if (!existing) throw new Error("Contract not found");
 
-    // Atomic idempotency guard — updateMany only matches rows where contractorSignedAt IS NULL,
-    // so two concurrent requests can't both succeed (eliminates TOCTOU race)
-    const result = await prisma.contract.updateMany({
-        where: { id: contractId, contractorSignedAt: null },
-        data: {
-            contractorSignedBy: signerName,
-            contractorSignedAt: new Date(),
-            contractorSignatureUrl: signatureDataUrl,
-        },
+    // Move the signature image out of the DB column into Supabase Storage (avoids the
+    // PgBouncer pooler message-size error on large high-DPI data-URLs). Falls back to the
+    // raw data-URL when Storage isn't configured. See persistSignature().
+    const contractorSignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    const ip = await getRequestIp();
+    const signedAt = new Date();
+
+    // Atomic idempotency guard + audit insert share a transaction so a failed audit insert rolls
+    // the signature write back too — a retry then redoes BOTH (never leaves contractorSignedAt set
+    // with no audit row). updateMany only matches rows where contractorSignedAt IS NULL, so two
+    // concurrent requests can't both succeed (eliminates TOCTOU race).
+    await prisma.$transaction(async (tx) => {
+        const guard = await tx.contract.updateMany({
+            where: { id: contractId, contractorSignedAt: null },
+            data: {
+                contractorSignedBy: signerName,
+                contractorSignedAt: signedAt,
+                contractorSignatureUrl,
+            },
+        });
+        if (guard.count === 0) throw new Error("Contract already signed by contractor");
+        // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
+        await tx.contractSigningRecord.create({
+            data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+        });
     });
-    if (result.count === 0) throw new Error("Contract already signed by contractor");
+
+    try {
+        await updateExecutedPdfIfFinalized(contractId, ip);
+    } catch (err) {
+        console.error("[signContractAsContractor] failed to update executed PDF:", err);
+    }
 
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
     return { success: true };
+}
+
+async function updateExecutedPdfIfFinalized(contractId: string, ip: string | null) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true, manager: true } },
+            lead: { include: { client: true, manager: true } },
+        },
+    });
+
+    if (!contract || contract.status !== "Finalized" || !contract.originalPdfPath) {
+        return;
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    // 1. Download original PDF
+    const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
+    if (dlErr || !dl) throw new Error("Could not load original PDF contract");
+    const originalBuffer = Buffer.from(await dl.arrayBuffer());
+
+    // 2. Generate updated PDF
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    
+    // Decide company/contractor values to show on Certificate of Execution.
+    // We prefer the company countersignature if it exists, otherwise fall back to contractor signature.
+    const companySignedBy = contract.companySignedBy || contract.contractorSignedBy;
+    const companySignedAt = contract.companySignedAt || contract.contractorSignedAt;
+    const companySignatureUrl = contract.companySignatureUrl || contract.contractorSignatureUrl;
+    const companyIp = contract.companySignedAt ? "Stored" : (contract.contractorSignedAt ? (ip || "0.0.0.0") : undefined);
+
+    const updatedPdfBuffer = await appendContractCountersignaturePage(originalBuffer, {
+        companyName: settings?.companyName || "Company",
+        contractTitle: contract.title,
+        clientSignedBy: contract.approvedBy,
+        clientSignedAt: contract.approvedAt,
+        clientIp: contract.approvalIp || "0.0.0.0",
+        clientSignatureValue: contract.signatureUrl,
+        companySignedBy: companySignedBy || undefined,
+        companySignedAt: companySignedAt || undefined,
+        companyIp: companyIp || undefined,
+        companySignatureValue: companySignatureUrl || undefined,
+    });
+
+    // 3. Find the existing executed file
+    const fileName = `Executed_Contract_${contract.id}.pdf`;
+    const existingFile = await prisma.projectFile.findFirst({
+        where: {
+            name: fileName,
+            ...(contract.projectId ? { projectId: contract.projectId } : { leadId: contract.leadId }),
+        },
+        orderBy: { createdAt: "desc" },
+    });
+
+    // 4. Delete the old file from Storage if it exists
+    if (existingFile?.url) {
+        const match = existingFile.url.match(/\/project-files\/(.+)$/);
+        if (match) {
+            const oldStoragePath = decodeURIComponent(match[1]);
+            try {
+                await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+            } catch (removeErr) {
+                console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+            }
+        }
+        // Delete the old DB record
+        await prisma.projectFile.delete({
+            where: { id: existingFile.id }
+        });
+    }
+
+    // 5. Archive the new PDF (creates a new ProjectFile record and uploads it)
+    const archived = await archiveExecutedContractPdf(
+        { id: contract.id, title: contract.title, projectId: contract.projectId, leadId: contract.leadId },
+        updatedPdfBuffer
+    );
+
+    // 6. Send the executed contract emails with the new PDF (best-effort)
+    const client = contract.project?.client || contract.lead?.client;
+    const managerEmail = contract.project?.manager?.email || contract.lead?.manager?.email || null;
+    const cc = buildCc(client?.email || "", client?.additionalEmail, managerEmail);
+    const companyEmail = settings?.notificationEmail || settings?.email;
+
+    try {
+        await sendExecutedContractEmails({
+            contractTitle: contract.title,
+            buffer: updatedPdfBuffer,
+            fileName: archived.fileName,
+            publicUrl: archived.publicUrl,
+            clientEmail: client?.email,
+            clientName: client?.name,
+            cc,
+            companyName: settings?.companyName || "ProBuild",
+            companyEmail,
+            replyTo: settings?.email,
+        });
+    } catch (emailErr) {
+        console.error("[updateExecutedPdfIfFinalized] failed to send executed email:", emailErr);
+    }
 }
 
 export async function approveContract(contractId: string, signatureName: string, userAgent: string, signatureDataUrl?: string, accessToken?: string) {
@@ -4477,6 +5916,12 @@ export async function approveContract(contractId: string, signatureName: string,
         ? new Date(contract.nextDueDate.getTime() - (contract.recurringDays || 30) * 86400000)
         : contract.sentAt || contract.createdAt;
 
+    // Persist the signature image to Storage BEFORE the transaction so the network upload
+    // stays out of the DB tx. The same URL is written to both the Contract and the
+    // ContractSigningRecord audit row. Falls back to the data-URL when Storage is absent.
+    const signatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const ip = await getRequestIp();
+
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
             const transition = await tx.contract.updateMany({
@@ -4489,7 +5934,8 @@ export async function approveContract(contractId: string, signatureName: string,
                     approvedBy: signatureName,
                     approvedAt: now,
                     approvalUserAgent: userAgent,
-                    signatureUrl: signatureDataUrl || null,
+                    approvalIp: ip,
+                    signatureUrl,
                 },
             });
             if (transition.count === 0) {
@@ -4507,7 +5953,8 @@ export async function approveContract(contractId: string, signatureName: string,
                     approvedBy: signatureName,
                     approvedAt: now,
                     approvalUserAgent: userAgent,
-                    signatureUrl: signatureDataUrl || null,
+                    approvalIp: ip,
+                    signatureUrl,
                     status: "Sent", // Reset to Sent so it can be signed again next cycle
                     viewedAt: null,
                     nextDueDate: nextDue,
@@ -4522,8 +5969,9 @@ export async function approveContract(contractId: string, signatureName: string,
                 contractId,
                 signedBy: signatureName,
                 signedAt: now,
-                signatureUrl: signatureDataUrl || null,
+                signatureUrl,
                 userAgent,
+                ipAddress: ip,
                 periodStart,
                 periodEnd: now,
             }
@@ -4585,6 +6033,200 @@ export async function getContractSigningHistory(contractId: string) {
         where: { contractId },
         orderBy: { signedAt: "desc" },
     });
+}
+
+/**
+ * Company countersignature — executed AFTER the client signs (see plan B).
+ *
+ * Flow when contract.requiresCountersign is true:
+ *   client signs (approveContract → "Signed") → the finalize route stores the client-signed
+ *   PDF privately on contract.signedPdfPath (status stays "Signed") → an ADMIN/MANAGER calls
+ *   this action → we record the company signature, load the intermediate PDF, append a
+ *   "Certificate of Execution" page carrying both signatures, archive it as the shared
+ *   executed PDF, flip the contract to "Finalized", and email both parties.
+ *
+ * Idempotent + atomic: the company-signature write and the Signed→Finalized claim are each
+ * guarded updateMany's, and the archive step rolls the status back on failure so a retry is safe.
+ */
+export async function countersignContractAsCompany(contractId: string, signerName: string, signatureDataUrl?: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    if (!signerName?.trim()) throw new Error("Signer name is required");
+    // pdf-lib can only embed PNG/JPEG on the certificate page, so restrict to those.
+    if (signatureDataUrl && !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format (PNG or JPEG required)");
+    }
+
+    const contract = await prisma.contract.findUnique({ where: { id: contractId } });
+    if (!contract) throw new Error("Contract not found");
+
+    // Already finalized → return the executed file idempotently. If status is Finalized but the
+    // file isn't archived yet (a concurrent call is mid-archive), tell the admin to retry rather
+    // than returning a false success with no file.
+    if (contract.status === "Finalized") {
+        const existing = await getExecutedContractPdf(contract);
+        if (existing) return { success: true, file: existing, alreadyFinalized: true };
+        throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
+    }
+    if (contract.status !== "Signed" || !contract.approvedAt) {
+        throw new Error("The client must sign this contract before the company can countersign.");
+    }
+    if (!contract.signedPdfPath) {
+        throw new Error("The signed contract PDF isn't ready yet. Please wait a moment and try again.");
+    }
+
+    const ip = await getRequestIp();
+    const now = new Date();
+
+    // Record the company signature once. On a retry where it's already recorded (companySignedAt
+    // set), reuse the stored value and skip a duplicate upload. The signature write and audit
+    // record share a transaction so a failed audit insert rolls the signature back too — a retry
+    // then redoes BOTH (never leaves companySignedAt set with no audit row).
+    if (!contract.companySignedAt) {
+        const companySignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/company`);
+        await prisma.$transaction(async (tx) => {
+            const guard = await tx.contract.updateMany({
+                where: { id: contractId, status: "Signed", companySignedAt: null },
+                data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
+            });
+            if (guard.count > 0) {
+                await tx.contractSigningRecord.create({
+                    data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
+                });
+            }
+        });
+    }
+
+    // Canonical state (covers a retry that recorded the signature but failed before finalizing).
+    const after = await prisma.contract.findUnique({
+        where: { id: contractId },
+        include: {
+            project: { include: { client: true, manager: true } },
+            lead: { include: { client: true, manager: true } },
+        },
+    });
+    if (!after) throw new Error("Contract not found");
+    if (after.status === "Finalized") {
+        return { success: true, file: await getExecutedContractPdf(after), alreadyFinalized: true };
+    }
+    if (after.status !== "Signed" || !after.companySignedAt || !after.signedPdfPath) {
+        throw new Error("Contract is not in a countersignable state.");
+    }
+
+    // Atomically claim the finalize transition so concurrent calls can't double-archive.
+    const flip = await prisma.contract.updateMany({
+        where: { id: contractId, status: "Signed" },
+        data: { status: "Finalized" },
+    });
+    if (flip.count === 0) {
+        // Lost the race. Report success only if the executed file actually exists yet — otherwise
+        // the winner is still archiving (or rolled back), so tell the admin to retry rather than
+        // returning a false success with no file.
+        const fresh = await prisma.contract.findUnique({ where: { id: contractId } });
+        const existing = fresh?.status === "Finalized" ? await getExecutedContractPdf(fresh) : null;
+        if (existing) return { success: true, file: existing, alreadyFinalized: true };
+        throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
+    }
+
+    // Build + archive the executed PDF. This is the commit point: on failure we roll status back to
+    // "Signed" and archiveExecutedContractPdf removes its own storage object, so a retry is clean.
+    // Emails happen AFTER (best-effort) — an email hiccup must not undo a successfully executed doc.
+    let executedRecord: any = null;
+    let executedBuffer: Buffer | null = null;
+    let archivedMeta: { publicUrl: string; fileName: string } | null = null;
+    try {
+        const supabase = getSupabase();
+        if (!supabase) throw new Error("Storage not configured.");
+
+        const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(after.signedPdfPath);
+        if (dlErr || !dl) throw new Error("Could not load the signed contract PDF.");
+        const clientPdf = Buffer.from(await dl.arrayBuffer());
+
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        executedBuffer = await appendContractCountersignaturePage(clientPdf, {
+            companyName: settings?.companyName || "Company",
+            contractTitle: after.title,
+            clientSignedBy: after.approvedBy,
+            clientSignedAt: after.approvedAt,
+            clientIp: after.approvalIp,
+            clientSignatureValue: after.originalPdfPath ? after.signatureUrl : null, // client signature url for PDF contracts
+            companySignedBy: after.companySignedBy!,
+            companySignedAt: after.companySignedAt!,
+            companyIp: ip,
+            companySignatureValue: after.companySignatureUrl,
+        });
+
+        const archived = await archiveExecutedContractPdf(
+            { id: after.id, title: after.title, projectId: after.projectId, leadId: after.leadId },
+            executedBuffer
+        );
+        executedRecord = archived.record;
+        archivedMeta = { publicUrl: archived.publicUrl, fileName: archived.fileName };
+
+        // Drop the now-superseded private intermediate (best-effort).
+        try { await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]); } catch {}
+    } catch (e: any) {
+        // Roll back the finalize claim so the admin can retry. companySignedAt stays set (the
+        // company DID sign); the retry re-claims and re-archives.
+        await prisma.contract.updateMany({ where: { id: contractId, status: "Finalized" }, data: { status: "Signed" } });
+        console.error("[countersignContractAsCompany] finalize step failed:", e);
+        throw new Error(`Couldn't generate the executed PDF: ${e?.message || e}. Your signature was saved — please retry.`);
+    }
+
+    // Best-effort notifications — a failure here does NOT undo the executed contract.
+    try {
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const client = after.project?.client || after.lead?.client;
+        const managerEmail = after.project?.manager?.email || after.lead?.manager?.email || null;
+        const cc = buildCc(client?.email || "", (client as any)?.additionalEmail, managerEmail);
+        if (executedBuffer && archivedMeta) {
+            await sendExecutedContractEmails({
+                contractTitle: after.title,
+                buffer: executedBuffer,
+                fileName: archivedMeta.fileName,
+                publicUrl: archivedMeta.publicUrl,
+                clientEmail: client?.email,
+                clientName: client?.name,
+                cc,
+                companyName: settings?.companyName || "ProBuild",
+                companyEmail: settings?.notificationEmail || settings?.email,
+                replyTo: settings?.email,
+            });
+        }
+    } catch (e) {
+        console.error("[countersignContractAsCompany] executed-doc email failed (non-fatal):", e);
+    }
+
+    // Post-commit activity logging is best-effort — the contract is already executed + archived,
+    // so a logging hiccup must not surface to the admin as a failure.
+    try {
+        if (after.projectId) {
+            await logActivity({
+                projectId: after.projectId,
+                actorType: "TEAM",
+                actorName: signerName,
+                action: "countersigned_contract",
+                entityType: "contract",
+                entityId: contractId,
+                entityName: `Contract "${after.title}"`,
+            });
+        }
+        await postActivityToThread(
+            after.leadId ?? null,
+            after.projectId ?? null,
+            `🖋️ ${signerName} countersigned contract "${after.title}" on ${now.toLocaleDateString()} — fully executed.`
+        );
+    } catch (e) {
+        console.error("[countersignContractAsCompany] post-commit activity log failed (non-fatal):", e);
+    }
+
+    revalidatePath(`/projects/[id]/contracts`, "page");
+    revalidatePath(`/leads/[id]/contracts`, "page");
+    revalidatePath("/");
+    return { success: true, file: executedRecord };
 }
 
 // ────────────────────────────────────────────────
@@ -5385,9 +7027,17 @@ export async function updateProjectLocation(projectId: string, location: string)
         ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
         : null;
     if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const geo = await geocodeJobSiteAddress(location);
     await prisma.project.update({
         where: { id: projectId },
-        data: { location: location || null }
+        data: {
+            location: geo?.formattedAddress ?? (location || null),
+            // Precise geocode also refreshes the time-clock geofence; clearing
+            // the address clears it; coarse/failed lookups leave it alone.
+            ...(geo?.lat != null && geo?.lng != null
+                ? { locationLat: geo.lat, locationLng: geo.lng }
+                : !location ? { locationLat: null, locationLng: null } : {}),
+        }
     });
     revalidatePath(`/projects/${projectId}`, 'layout');
     return { success: true };
@@ -5559,9 +7209,9 @@ export async function emailPortalLinkToClient(projectId: string) {
         return { success: false, error: "Client email not found on project." };
     }
     
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL || "http://localhost:3000";
-    const portalUrl = `${appUrl}/portal/projects/${projectId}`;
-    
+    const { buildClientPortalUrl } = await import("./client-portal-auth");
+    const portalUrl = await buildClientPortalUrl(project.client.id, project.client.email, `/portal/projects/${projectId}`);
+
     // Send email using our enhanced library fn
     const { sendNotification } = await import('@/lib/email');
     const portalCc = buildCc(project.client.email, (project.client as any).additionalEmail);
@@ -5570,7 +7220,7 @@ export async function emailPortalLinkToClient(projectId: string) {
         `Your Dashboard for ${project.name} is Ready`,
         `<p>Hi ${project.client.name},</p><p>We have updated the portal for your project: <strong>${project.name}</strong>.</p><p><a href="${portalUrl}" style="display:inline-block;padding:10px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:5px;">Access Your Client Dashboard</a></p><p>From here you can view estimates, invoices, updates, and more.</p><br/>Thanks,<br/>Golden Touch Remodeling`,
         undefined,
-        portalCc ? { cc: portalCc } : undefined
+        { cc: portalCc, copyToInternal: true }
     );
     
     if (result.success && result.id) {
@@ -5728,7 +7378,7 @@ export async function getChangeOrder(id: string) {
         where: { id },
         include: {
             project: { include: { client: true } },
-            estimate: { select: { title: true, code: true } },
+            estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
             paymentSchedules: { orderBy: { order: "asc" } }
         }
@@ -5737,18 +7387,26 @@ export async function getChangeOrder(id: string) {
 
 export async function getChangeOrderForPortal(id: string) {
     "use server";
-    // IDOR-4 fix: gate by portal session's clientId
-    const sessionClientId = await resolveSessionClientId();
-    if (!sessionClientId) return null;
+    // Staff (ADMIN/MANAGER) may preview any change order — mirrors getInvoiceForPortal.
+    const staffSession = await getServerSession(authOptions);
+    const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
+
+    // IDOR-4 fix: portal clients are gated by their session's clientId
+    let clientFilter = {};
+    if (!isStaff) {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) return null;
+        clientFilter = { project: { clientId: sessionClientId } };
+    }
 
     return await prisma.changeOrder.findFirst({
         where: {
             id,
-            project: { clientId: sessionClientId },
+            ...clientFilter,
         },
         include: {
             project: { include: { client: true } },
-            estimate: { select: { title: true, code: true } },
+            estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
             paymentSchedules: { orderBy: { order: "asc" } }
         }
@@ -5757,10 +7415,97 @@ export async function getChangeOrderForPortal(id: string) {
 
 export async function updateChangeOrder(id: string, data: any) {
     "use server";
-    const co = await prisma.changeOrder.update({
-        where: { id },
-        data
-    });
+    // Money-path: this is a remotely invokable server action — gate it like
+    // sendChangeOrderToClient and whitelist fields so callers can't write
+    // approval/signature/audit columns or arbitrary amounts.
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "changeOrders")) throw new Error("Forbidden");
+
+    const items: any[] | undefined = Array.isArray(data.items) ? data.items : undefined;
+
+    const co = await prisma.$transaction(async (tx) => {
+        // Row lock (same style as billChangeOrderCore): a concurrent approval or
+        // billing run serializes on this row, so we can't read a stale status and
+        // re-price a CO that gets approved mid-save — approve/bill writers block
+        // until this transaction commits, and vice versa.
+        const locked = await tx.$queryRaw<Array<{ status: string; totalAmount: unknown }>>`
+            SELECT "status", "totalAmount" FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
+        const current = locked[0];
+        if (!current) throw new Error("Change order not found");
+
+        const scalarData: Record<string, unknown> = {};
+        if (data.title !== undefined) scalarData.title = data.title;
+        if (data.description !== undefined) scalarData.description = data.description;
+        if (data.status !== undefined && data.status !== current.status) {
+            // The editor only moves Draft <-> Sent. Approved/Declined are owned by
+            // the signature/decline flows (approveChangeOrder drives billing) — a
+            // raw status write in either direction would bypass them.
+            if (!["Draft", "Sent"].includes(data.status) || !["Draft", "Sent"].includes(current.status)) {
+                throw new Error(`Status can only move between Draft and Sent here — "${current.status}" is owned by the signature flow.`);
+            }
+            scalarData.status = data.status;
+        }
+
+        if (items) {
+            // Integer-cents line math (mirrors createChangeOrderDraft) so float dust
+            // can't mis-round a line. totalAmount is the PRE-TAX subtotal — billing
+            // (billChangeOrderCore) adds the estimate's tax on top when invoicing —
+            // and is recomputed here from the items, never trusted from the client.
+            let totalCents = 0;
+            const rows = items.map((item: any, idx: number) => {
+                const quantity = parseFloat(item.quantity) || 0;
+                const unitCost = parseFloat(item.unitCost) || 0;
+                const unitCents = Math.round(unitCost * 100);
+                const lineCents = coLineCents(quantity, unitCost);
+                totalCents += lineCents;
+                return {
+                    id: item.id || undefined,
+                    name: item.name || "",
+                    description: item.description || null,
+                    ...(item.type ? { type: item.type } : {}),
+                    quantity,
+                    unitCost: unitCents / 100,
+                    total: lineCents / 100,
+                    order: item.order ?? idx,
+                    costCodeId: item.costCodeId || null,
+                    costTypeId: item.costTypeId || null,
+                };
+            });
+
+            // An Approved CO's items are what the customer signed and what billing
+            // put on the invoice — any item write here (amounts, quantities, cost
+            // codes) would desync the signed document from the billed milestone.
+            // Title/description edits stay allowed via the scalar path.
+            if (current.status === "Approved") {
+                throw new Error("This change order is approved and billed — its items are locked. Create a new change order for additional work.");
+            }
+
+            // Differential item sync (same pattern as saveEstimate): delete rows the
+            // editor removed, update surviving rows, create new ones.
+            const existing = await tx.changeOrderItem.findMany({ where: { changeOrderId: id }, select: { id: true } });
+            const existingIds = new Set(existing.map(i => i.id));
+            const incomingIds = new Set(rows.map(r => r.id).filter(Boolean));
+            const toDelete = existing.filter(i => !incomingIds.has(i.id)).map(i => i.id);
+            if (toDelete.length > 0) {
+                await tx.changeOrderItem.deleteMany({ where: { id: { in: toDelete }, changeOrderId: id } });
+            }
+            for (const row of rows) {
+                const { id: itemId, ...itemData } = row;
+                if (itemId && existingIds.has(itemId)) {
+                    await tx.changeOrderItem.update({ where: { id: itemId }, data: itemData });
+                } else {
+                    await tx.changeOrderItem.create({ data: { ...itemData, ...(itemId ? { id: itemId } : {}), changeOrderId: id } });
+                }
+            }
+
+            scalarData.totalAmount = totalCents / 100;
+            scalarData.balanceDue = totalCents / 100;
+        }
+
+        return tx.changeOrder.update({ where: { id }, data: scalarData });
+    }, { timeout: 15_000 });
+
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
@@ -5774,15 +7519,10 @@ export async function deleteChangeOrder(id: string) {
     revalidatePath(`/projects/${co.projectId}/change-orders`);
 }
 
-export async function updateChangeOrderStatus(id: string, status: string, projectId: string) {
-    "use server";
-    await prisma.changeOrder.update({
-        where: { id },
-        data: { status }
-    });
-    revalidatePath(`/projects/${projectId}/change-orders/${id}`);
-    revalidatePath(`/projects/${projectId}/change-orders`);
-}
+// updateChangeOrderStatus was removed: it had no callers and, as an unauthenticated
+// remotely-invokable server action, let anyone flip CO statuses — bypassing both the
+// signature flow and the approval automation. Rebuild with auth + the approval hook
+// if a raw status setter is ever actually needed.
 
 export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
     "use server";
@@ -5806,97 +7546,109 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         if (!owned) return null;
     }
 
+    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
+    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
+    const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
+
+    // Atomic transition: only the FIRST approval flips the status (a concurrent
+    // or repeated signing matches zero rows), which also preserves the original
+    // signer's audit trail instead of overwriting it.
     const approvedAt = new Date();
-    const co = await prisma.changeOrder.update({
-        where: { id },
+    const transition = await prisma.changeOrder.updateMany({
+        where: { id, status: { not: "Approved" } },
         data: {
             status: "Approved",
             approvedBy: signatureName,
             approvedAt,
-            clientSignatureUrl: signatureDataUrl || null,
+            clientSignatureUrl,
         },
     });
-    
+    const co = await prisma.changeOrder.findUnique({ where: { id } });
+    if (!co) return null;
+
+    // Exactly-once post-approval automation: bill the CO onto the invoice and send
+    // the payment link (the signature on the exact amount is the approval), with a
+    // team notification either way. Scheduled AFTER the response so the customer's
+    // signing screen never waits on QuickBooks; falls back to inline best-effort
+    // outside a request context.
+    if (transition.count === 1) {
+        const runAutomation = async () => {
+            try {
+                const { handleChangeOrderApproved } = await import("./billing-core");
+                await handleChangeOrderApproved(id);
+            } catch (err) {
+                console.error("[approveChangeOrder] post-approval automation failed:", err);
+            }
+        };
+        try {
+            after(runAutomation);
+        } catch {
+            await runAutomation();
+        }
+    }
+
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
 }
 
+// Company-side countersignature. Distinct from approveChangeOrder (the customer's
+// approval) so that signing on behalf of the company NEVER overwrites the client's
+// approvedBy/approvedAt/clientSignatureUrl audit trail. Writes ONLY company fields
+// and leaves status untouched (the customer's approval still drives Approved).
+// Auth mirrors signContractAsContractor; signatureDataUrl is optional because the
+// editor's "Sign Now" flow captures a typed name rather than a drawn signature.
+export async function countersignChangeOrderAsCompany(id: string, signerName: string, signatureDataUrl?: string) {
+    "use server";
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    // Role gate — only ADMIN/MANAGER can countersign on behalf of the company.
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    if (!signerName.trim()) throw new Error("Signer name is required");
+
+    // Validate the data URL is a safe image type before storing (only when provided).
+    if (signatureDataUrl && !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(signatureDataUrl)) {
+        throw new Error("Invalid signature format");
+    }
+
+    // Verify the change order exists (clear 404-style error) and grab projectId for revalidation.
+    const existing = await prisma.changeOrder.findUnique({ where: { id }, select: { id: true, projectId: true } });
+    if (!existing) throw new Error("Change order not found");
+
+    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
+    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
+    const companySignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/company`);
+
+    // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
+    // so two concurrent requests can't both succeed (eliminates TOCTOU race).
+    const result = await prisma.changeOrder.updateMany({
+        where: { id, companySignedAt: null },
+        data: {
+            companySignedBy: signerName.trim(),
+            companySignedAt: new Date(),
+            companySignatureUrl,
+        },
+    });
+    if (result.count === 0) throw new Error("Change order already countersigned by company");
+
+    revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${existing.projectId}/change-orders`);
+    return { success: true };
+}
+
 export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     "use server";
-    const co = await prisma.changeOrder.findUnique({
-        where: { id: changeOrderId },
-        include: {
-            project: { include: { client: true } },
-            items: { orderBy: { order: "asc" } },
-        }
-    });
-
-    if (!co) return { success: false, error: "Change order not found" };
-    const client = co.project?.client;
-    if (!client?.email) return { success: false, error: "Client has no email address" };
-
-    // Update status to Sent (only if still in Draft or Sent state)
-    await prisma.changeOrder.updateMany({
-        where: { id: changeOrderId, status: { in: ["Draft", "Sent"] } },
-        data: { status: "Sent", sentAt: new Date() }
-    });
-
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-    const portalUrl = `${appUrl}/portal/change-orders/${changeOrderId}`;
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Your Contractor";
-
-    const changeOrderCc = buildCc(client.email, (client as any).additionalEmail);
-    await sendNotification(
-        client.email,
-        `${companyName} sent you a change order to review`,
-        `<!DOCTYPE html>
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                <h2 style="font-size: 20px; margin: 0 0 8px;">Change Order for Your Review</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
-                <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you a change order titled "<strong>${co.title}</strong>" for project <strong>${co.project?.name || "your project"}</strong>.
-                    Please review the scope changes and approve or decline.
-                </p>
-                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
-                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(co.totalAmount)}</div>
-                </div>
-                <div style="text-align: center; margin: 32px 0;">
-                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        Review Change Order
-                    </a>
-                </div>
-                <p style="color: #999; font-size: 13px; text-align: center;">
-                    Or copy this link: ${portalUrl}
-                </p>
-            </div>
-            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
-                Sent via ProBuild &bull; ${companyName}
-            </p>
-        </body>
-        </html>`,
-        undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc }
-    );
-
-    // Log activity
-    await logActivity({
-        projectId: co.projectId,
-        actorType: "TEAM",
-        actorName: companyName,
-        action: "sent_change_order",
-        entityType: "change_order",
-        entityId: changeOrderId,
-        entityName: `Change Order ${co.code || co.title}`,
-    });
-
-    revalidatePath(`/projects/${co.projectId}/change-orders/${changeOrderId}`);
-    revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return { success: true, sentTo: client.email };
+    // Customer-facing send from the UI — require the changeOrders permission
+    // (this export is a remotely invokable server action). Core logic lives in
+    // billing-core.ts so the shared-secret-gated MCP connector can reuse it.
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "changeOrders")) return { success: false, error: "Forbidden" };
+    const { sendChangeOrderToClientCore } = await import("./billing-core");
+    return sendChangeOrderToClientCore(changeOrderId);
 }
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
@@ -6258,15 +8010,22 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
             memos: "",
             terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
             items: {
-                create: selectedItems.map((item: any, idx: number) => ({
-                    description: item.name + (item.description ? ` - ${item.description}` : ""),
-                    quantity: parseFloat(item.quantity) || 1,
-                    unitCost: parseFloat(item.unitCost) || 0,
-                    total: (parseFloat(item.quantity) || 1) * (parseFloat(item.unitCost) || 0),
-                    order: idx,
-                    costCodeId: item.costCodeId,
-                    costTypeId: item.costTypeId
-                }))
+                create: selectedItems.map((item: any, idx: number) => {
+                    // Preserve an explicit zero quantity (optional/alternate estimate
+                    // lines are shown at $0) — only a missing/unparseable quantity
+                    // falls back to 1. `|| 1` would reprice a $0 option into the PO.
+                    const parsedQty = parseFloat(item.quantity);
+                    const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
+                    return {
+                        description: item.name + (item.description ? ` - ${item.description}` : ""),
+                        quantity: qty,
+                        unitCost: parseFloat(item.unitCost) || 0,
+                        total: qty * (parseFloat(item.unitCost) || 0),
+                        order: idx,
+                        costCodeId: item.costCodeId,
+                        costTypeId: item.costTypeId
+                    };
+                })
             }
         }
     });
@@ -6710,7 +8469,8 @@ export async function sendSelectionBoardToClient(boardId: string) {
     const clientEmail = board.project.client?.email;
     if (clientEmail) {
         const settings = await getCompanySettings();
-        const portalUrl = `https://probuild.goldentouchremodeling.com/portal/projects/${board.projectId}/selections`;
+        const { buildClientPortalUrl } = await import("./client-portal-auth");
+        const portalUrl = await buildClientPortalUrl(board.project.client?.id, clientEmail, `/portal/projects/${board.projectId}/selections`);
         const selectionCc = buildCc(clientEmail, (board.project.client as any)?.additionalEmail);
         await sendNotification(
             clientEmail,
@@ -6724,7 +8484,7 @@ export async function sendSelectionBoardToClient(boardId: string) {
                 <p style="color:#666;font-size:13px;">— ${settings.companyName || 'Your Project Team'}</p>
             </div>`,
             undefined,
-            selectionCc ? { cc: selectionCc } : undefined
+            { cc: selectionCc, copyToInternal: true }
         );
     }
 
@@ -7485,8 +9245,28 @@ export async function createEstimateFromRoomDesign(roomId: string) {
     const ownerId = isProject ? room.projectId : room.leadId;
     if (!ownerId) throw new Error("Room Design is not associated with any Lead or Project");
 
-    // Dynamic import to avoid circular dependency
-    const { ASSET_REGISTRY } = await import("@/lib/room-designer/asset-registry");
+    // Dynamic imports to avoid circular dependency
+    const { getItemDef } = await import("@/lib/studio/catalog");
+    const { getFinish } = await import("@/lib/studio/materials");
+    const { toInches } = await import("@/lib/studio/units");
+
+    const costCodes = await prisma.costCode.findMany({ where: { isActive: true } });
+    const costCodeMap = new Map(costCodes.map((cc) => [cc.code, cc.id]));
+
+    const getCostCodeId = (def: any, assetId: string) => {
+        const cat = def?.category;
+        if (cat === "cabinets") return costCodeMap.get("11-CABINET") ?? null;
+        if (cat === "appliances") return costCodeMap.get("18-APPLIANCE") ?? null;
+        if (cat === "doors-windows") return costCodeMap.get("14-DOOR") ?? null;
+        if (assetId === "fireplace") return costCodeMap.get("25-FIREPLACE") ?? costCodeMap.get("19-FIXTURE") ?? null;
+        if (assetId === "pony-wall" || assetId === "interior-wall" || assetId === "interior-wall-doorway") {
+            return costCodeMap.get("02-FRAME") ?? null;
+        }
+        if (cat === "fixtures") return costCodeMap.get("19-FIXTURE") ?? null;
+        if (cat === "lighting") return costCodeMap.get("19-FIXTURE") ?? costCodeMap.get("04-ELEC") ?? null;
+        if (cat === "furniture" || cat === "decor") return costCodeMap.get("19-FIXTURE") ?? null;
+        return null;
+    };
 
     const items: Array<{
         name: string;
@@ -7497,111 +9277,96 @@ export async function createEstimateFromRoomDesign(roomId: string) {
         markupPercent: number;
         unitCost: number;
         total: number;
+        costCodeId: string | null;
     }> = [];
 
     let totalEstimate = 0;
 
+    // Rough budgetary pricing per builder recipe; width-scaled for millwork.
+    const MESH_BASE_COST: Record<string, number> = {
+        "cabinet-base": 350, "cabinet-drawers": 420, "cabinet-sink": 480, "cabinet-corner": 480,
+        "cabinet-cooktop": 460, island: 1450, "island-overhang": 1750, "cabinet-wall": 280,
+        "cabinet-wall-glass": 360, "open-shelves": 180, "cabinet-tall": 650, "cabinet-oven-tower": 780,
+        vanity: 620, "vanity-double": 1150,
+        "fridge-french": 2199, "fridge-side": 1599, range: 1299, "range-pro": 3499, hood: 549,
+        dishwasher: 799, microwave: 399, "wine-fridge": 899, washer: 899, dryer: 849,
+        "sink-farmhouse": 650, toilet: 385, tub: 1850, "tub-alcove": 620, shower: 2400,
+        "pedestal-sink": 320, fireplace: 2800,
+        recessed: 95, pendant: 185, "pendant-glass": 220, "pendant-trio": 540, chandelier: 690,
+        "flush-mount": 140, sconce: 160, "floor-lamp": 210, "table-lamp": 120, track: 260,
+        door: 380, "door-double": 720, "door-sliding": 1650, doorway: 250,
+        window: 480, "window-double": 880, "window-picture": 1350,
+        sofa: 1400, sectional: 2400, armchair: 700, "coffee-table": 380, "side-table": 180,
+        "tv-console": 650, "dining-table": 950, "dining-chair": 160, stool: 140, bookshelf: 420,
+        bed: 1300, dresser: 850, nightstand: 280, desk: 520, rug: 450,
+        plant: 120, "plant-small": 35, mirror: 220, art: 150, vase: 40,
+    };
+
+    // Real vendor products placed from the library price by their actual
+    // price/SKU instead of the budgetary table.
+    const productIds = room.assets
+        .filter((a) => a.assetId.startsWith("prod-"))
+        .map((a) => a.assetId.slice(5));
+    const libraryProducts = productIds.length
+        ? await prisma.catalogProduct.findMany({ where: { id: { in: productIds } } })
+        : [];
+    const productById = new Map(libraryProducts.map((p) => [p.id, p]));
+
+    // Library finishes referenced in placed items, for naming in line items.
+    const libraryFinishes = await prisma.catalogFinish.findMany({
+        select: { id: true, name: true, vendor: true },
+    });
+    const libFinishName = new Map(
+        libraryFinishes.map((f) => [`lib-${f.id}`, f.vendor ? `${f.name} (${f.vendor})` : f.name]),
+    );
+
     for (let idx = 0; idx < room.assets.length; idx++) {
         const asset = room.assets[idx];
-        const reg = ASSET_REGISTRY.find((a) => a.id === asset.assetId);
-
-        let baseCost = 250; // fallback base cost
+        const product = asset.assetId.startsWith("prod-")
+            ? productById.get(asset.assetId.slice(5))
+            : undefined;
+        const def = getItemDef(asset.assetId);
         const markupPercent = 25;
-        const name = reg?.name || `${asset.assetType.charAt(0).toUpperCase() + asset.assetType.slice(1)}`;
+        const name = product?.name ?? def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
 
         const metadata = (asset.metadata ?? {}) as Record<string, any>;
-        const cabinet = (metadata.cabinet ?? {}) as Record<string, any>;
-        const appliance = (metadata.appliance ?? {}) as Record<string, any>;
-        const fixture = (metadata.fixture ?? {}) as Record<string, any>;
+        const studio = (metadata.studio ?? {}) as Record<string, any>;
+        const finishes = { ...(def?.finishes ?? {}), ...((studio.finishes ?? {}) as Record<string, string>) };
 
-        const detailsArray: string[] = [];
+        let baseCost = def ? MESH_BASE_COST[def.mesh] ?? 250 : 250;
+        if (product?.price != null) baseCost = Number(product.price);
+        else if (product) baseCost = MESH_BASE_COST[product.mesh] ?? 250;
 
-        if (asset.assetType === "cabinet") {
-            // pricing based on cabinet subcategory
-            if (reg?.subcategory === "wall") baseCost = 280;
-            else if (reg?.subcategory === "tall") baseCost = 650;
-            else if (reg?.subcategory === "corner") baseCost = 480;
-            else if (reg?.subcategory === "island") baseCost = 750;
-            else baseCost = 350; // base base cabinet
+        const wM = typeof studio.w === "number" ? studio.w : def?.w ?? 0.6;
+        const hM = typeof studio.h === "number" ? studio.h : def?.h ?? 0.76;
+        const dM = typeof studio.d === "number" ? studio.d : def?.d ?? 0.6;
+        const wIn = Math.round(toInches(wM));
 
-            // Adjust based on custom overrides (width, height, depth) if provided
-            const wVal = cabinet.width ? Math.round(cabinet.width * 39.3701) : Math.round((reg?.dimensions?.width ?? 0.6) * 39.3701);
-            const hVal = cabinet.height ? Math.round(cabinet.height * 39.3701) : Math.round((reg?.dimensions?.height ?? 0.8) * 39.3701);
-            const dVal = cabinet.depth ? Math.round(cabinet.depth * 39.3701) : Math.round((reg?.dimensions?.depth ?? 0.6) * 39.3701);
-
-            detailsArray.push(`Size: ${wVal}"W x ${hVal}"H x ${dVal}"D`);
-
-            if (cabinet.doorStyle) {
-                detailsArray.push(`Door Style: ${cabinet.doorStyle.charAt(0).toUpperCase() + cabinet.doorStyle.slice(1)}`);
-                if (cabinet.doorStyle === "glass") baseCost += 75;
-                if (cabinet.doorStyle === "raised") baseCost += 40;
-            }
-            if (cabinet.finish) {
-                detailsArray.push(`Finish: ${cabinet.finish.charAt(0).toUpperCase() + cabinet.finish.slice(1)}`);
-                if (["navy", "green", "wood", "walnut"].includes(cabinet.finish)) {
-                    baseCost += 50;
-                }
-            }
-            if (cabinet.hardware) {
-                detailsArray.push(`Hardware: ${cabinet.hardware.charAt(0).toUpperCase() + cabinet.hardware.slice(1)}`);
-                if (cabinet.hardware !== "none") baseCost += 15;
-            }
-            if (cabinet.interior) {
-                detailsArray.push(`Interior: ${cabinet.interior.charAt(0).toUpperCase() + cabinet.interior.slice(1)}`);
-                if (cabinet.interior === "lazy-susan") baseCost += 150;
-                if (cabinet.interior === "drawer-org") baseCost += 80;
-                if (cabinet.interior === "pullout") baseCost += 95;
-                if (cabinet.interior === "trash") baseCost += 60;
-            }
-
-            // Generate SKU
-            const finishCode = String(cabinet.finish || "std").substring(0, 3).toUpperCase();
-            const styleCode = String(cabinet.doorStyle || "std").substring(0, 3).toUpperCase();
-            const sku = `RTA-CAB-${styleCode}-${finishCode}-${wVal}${hVal}${dVal}`;
-            detailsArray.unshift(`SKU: ${sku}`);
-
-        } else if (asset.assetType === "appliance") {
-            if (asset.assetId.includes("refrigerator")) baseCost = 1599;
-            else if (asset.assetId.includes("range") || asset.assetId.includes("stove")) baseCost = 1299;
-            else if (asset.assetId.includes("dishwasher")) baseCost = 799;
-            else if (asset.assetId.includes("microwave")) baseCost = 399;
-            else baseCost = 699;
-
-            if (appliance.brand) detailsArray.push(`Brand: ${appliance.brand}`);
-            if (appliance.finish) {
-                detailsArray.push(`Finish: ${appliance.finish.charAt(0).toUpperCase() + appliance.finish.slice(1)}`);
-                if (["stainless", "black-ss"].includes(appliance.finish)) baseCost += 100;
-            }
-
-            const brandCode = String(appliance.brand || "GEN").substring(0, 3).toUpperCase();
-            const finishCode = String(appliance.finish || "SS").substring(0, 3).toUpperCase();
-            const sku = `APP-${brandCode}-${finishCode}-${idx + 100}`;
-            detailsArray.unshift(`SKU: ${sku}`);
-
-        } else if (asset.assetType === "fixture") {
-            if (asset.assetId.includes("faucet")) baseCost = 199;
-            else if (asset.assetId.includes("sink")) baseCost = 450;
-            else baseCost = 150;
-
-            if (fixture.finish) {
-                detailsArray.push(`Finish: ${fixture.finish.charAt(0).toUpperCase() + fixture.finish.slice(1)}`);
-                if (["matte-black", "brass"].includes(fixture.finish)) baseCost += 40;
-            }
-
-            const finishCode = String(fixture.finish || "CH").substring(0, 2).toUpperCase();
-            const sku = `FIX-${finishCode}-${idx + 100}`;
-            detailsArray.unshift(`SKU: ${sku}`);
-
-        } else {
-            if (asset.assetType === "window") baseCost = 250;
-            else if (asset.assetType === "door") baseCost = 300;
-            else if (asset.assetType === "lighting") baseCost = 120;
-            else baseCost = 45;
+        // Millwork scales by width vs the catalog default (24" base assumption)
+        // - but never rescale a real product's actual price.
+        if (!product?.price && def?.category === "cabinets" && def.resizable) {
+            const defaultIn = Math.max(1, Math.round(toInches(def.w)));
+            baseCost = Math.round(baseCost * Math.max(0.6, wIn / defaultIn));
         }
+
+        const detailsArray: string[] = [
+            `Size: ${wIn}"W x ${Math.round(toInches(hM))}"H x ${Math.round(toInches(dM))}"D`,
+        ];
+        if (product?.vendor) detailsArray.push(`Vendor: ${product.vendor}`);
+        for (const [slot, finishId] of Object.entries(finishes)) {
+            if (!finishId) continue;
+            const finishName = libFinishName.get(finishId) ?? getFinish(finishId, "cab-white").name;
+            detailsArray.push(`${slot.charAt(0).toUpperCase()}${slot.slice(1)}: ${finishName}`);
+        }
+        const sku = product?.sku
+            ?? `GTR-${(def?.category ?? "item").slice(0, 3).toUpperCase()}-${(def?.id ?? asset.assetId).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 10)}-${wIn}`;
+        detailsArray.unshift(`SKU: ${sku}`);
 
         const unitCost = Math.round(baseCost * (1 + markupPercent / 100));
         const total = unitCost * 1;
         totalEstimate += total;
+
+        const costCodeId = getCostCodeId(def, asset.assetId);
 
         items.push({
             name,
@@ -7612,6 +9377,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             markupPercent,
             unitCost,
             total,
+            costCodeId,
         });
     }
 
@@ -7647,6 +9413,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
                 unitCost: item.unitCost,
                 total: item.total,
                 order: idx,
+                costCodeId: item.costCodeId,
             },
         });
     }
@@ -7714,6 +9481,344 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
     revalidatePath(`/projects/${projectId}/estimates`);
 
     return item;
+}
+
+// =============================================
+// Office Tasks (internal kanban board — ADMIN/MANAGER only)
+// =============================================
+
+async function assertOfficeTaskAccess() {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionEmail = session?.user?.email as string | null | undefined;
+    const sessionRole = ((session?.user as any)?.role as string | null) ?? null;
+
+    // Dev-fallback session with no backing User row (see buildDevSession in
+    // auth.ts) — same shape getFieldUpdatesFeed trusts: no id, but a synthetic
+    // ADMIN/MANAGER role. There's no DB row to re-check in that case.
+    const isSyntheticDevAccess = !sessionUserId && (sessionRole === "ADMIN" || sessionRole === "MANAGER");
+    if (isSyntheticDevAccess) {
+        return { id: null as string | null, role: sessionRole as string };
+    }
+
+    // Otherwise, re-resolve the caller from the DB instead of trusting the
+    // session's role/id: auth.ts's jwt() callback leaves token.role/userId
+    // untouched when the DB lookup finds no user (deleted user, live token),
+    // and never encodes `status` into the token at all — so a disabled user's
+    // token would still read role: ADMIN until it expires.
+    const user = sessionUserId
+        ? await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true, role: true, status: true } })
+        : sessionEmail
+            ? await prisma.user.findUnique({ where: { email: sessionEmail }, select: { id: true, role: true, status: true } })
+            : null;
+
+    if (!user || !["ADMIN", "MANAGER"].includes(user.role) || user.status === "DISABLED") {
+        throw new Error("Forbidden");
+    }
+    return { id: user.id, role: user.role };
+}
+
+export async function getOfficeTasksBoard() {
+    await assertOfficeTaskAccess();
+
+    const [columns, tasks, archived, users] = await Promise.all([
+        prisma.officeBoardColumn.findMany({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] }),
+        prisma.officeTask.findMany({
+            where: { archivedAt: null },
+            orderBy: [{ columnId: "asc" }, { position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        }),
+        prisma.officeTask.findMany({
+            where: { archivedAt: { not: null } },
+            orderBy: { archivedAt: "desc" },
+            take: 100,
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        }),
+        prisma.user.findMany({
+            where: { role: { in: ["ADMIN", "MANAGER"] }, status: "ACTIVATED" },
+            select: { id: true, name: true, email: true },
+        }),
+    ]);
+
+    return { columns, tasks, archived, users };
+}
+
+export async function createBoardColumn(name: string) {
+    await assertOfficeTaskAccess();
+
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Column name is required");
+
+    const column = await prisma.$transaction(async (tx) => {
+        const dup = await tx.officeBoardColumn.findFirst({
+            where: { name: { equals: trimmed, mode: "insensitive" } },
+            select: { id: true },
+        });
+        if (dup) throw new Error("A column with that name already exists");
+
+        const last = await tx.officeBoardColumn.findFirst({
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }],
+            select: { position: true },
+        });
+
+        return tx.officeBoardColumn.create({
+            data: { name: trimmed, position: (last?.position ?? -1) + 1 },
+        });
+    });
+
+    revalidatePath("/tasks");
+    return column;
+}
+
+// isDoneColumn is optional here rather than a separate action — a rename
+// dialog checkbox for it is trivial to wire alongside the name field.
+export async function renameBoardColumn(id: string, name: string, isDoneColumn?: boolean) {
+    await assertOfficeTaskAccess();
+
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Column name is required");
+
+    const column = await prisma.$transaction(async (tx) => {
+        const dup = await tx.officeBoardColumn.findFirst({
+            where: { name: { equals: trimmed, mode: "insensitive" }, id: { not: id } },
+            select: { id: true },
+        });
+        if (dup) throw new Error("A column with that name already exists");
+
+        const data: { name: string; isDoneColumn?: boolean } = { name: trimmed };
+        if (isDoneColumn !== undefined) data.isDoneColumn = isDoneColumn;
+
+        return tx.officeBoardColumn.update({ where: { id }, data });
+    });
+
+    revalidatePath("/tasks");
+    return column;
+}
+
+export async function reorderBoardColumn(id: string, newIndex: number) {
+    await assertOfficeTaskAccess();
+
+    await prisma.$transaction(async (tx) => {
+        const columns = await tx.officeBoardColumn.findMany({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
+        const idx = columns.findIndex((c) => c.id === id);
+        if (idx === -1) throw new Error("Column not found");
+
+        const [moved] = columns.splice(idx, 1);
+        const clampedIndex = Math.max(0, Math.min(newIndex, columns.length));
+        columns.splice(clampedIndex, 0, moved);
+
+        for (let i = 0; i < columns.length; i++) {
+            await tx.officeBoardColumn.update({ where: { id: columns[i].id }, data: { position: i } });
+        }
+    });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function deleteBoardColumn(id: string) {
+    await assertOfficeTaskAccess();
+
+    // Checks and the delete run inside one transaction, with counts re-read
+    // inside it, so a concurrent create/move can't slip a task into this
+    // column between the check and the delete (which would otherwise orphan
+    // it to columnId NULL via the FK's ON DELETE SET NULL).
+    await prisma.$transaction(async (tx) => {
+        const [taskCount, columnCount] = await Promise.all([
+            tx.officeTask.count({ where: { columnId: id, archivedAt: null } }),
+            tx.officeBoardColumn.count(),
+        ]);
+
+        if (taskCount > 0) throw new Error("Move or archive all tasks out of this column before deleting it");
+        if (columnCount <= 1) throw new Error("The board must have at least one column");
+
+        await tx.officeBoardColumn.delete({ where: { id } });
+    });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function createOfficeTask(data: {
+    title: string;
+    columnId?: string;
+    assigneeId?: string | null;
+    dueDate?: string | null;
+}) {
+    const caller = await assertOfficeTaskAccess();
+
+    const task = await prisma.$transaction(async (tx) => {
+        const column = data.columnId
+            ? await tx.officeBoardColumn.findUnique({ where: { id: data.columnId } })
+            : await tx.officeBoardColumn.findFirst({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
+        if (!column) throw new Error("No board column available");
+
+        const last = await tx.officeTask.findFirst({
+            where: { columnId: column.id, archivedAt: null },
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }, { id: "desc" }],
+            select: { position: true },
+        });
+
+        return tx.officeTask.create({
+            data: {
+                title: data.title,
+                columnId: column.id,
+                status: column.name, // TRANSITIONAL COMPAT — see OfficeTask.status
+                position: (last?.position ?? -1) + 1,
+                assigneeId: data.assigneeId || null,
+                dueDate: data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null,
+                createdById: caller.id,
+            },
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        });
+    });
+
+    revalidatePath("/tasks");
+    return task;
+}
+
+export async function updateOfficeTask(id: string, data: {
+    title?: string;
+    notes?: string | null;
+    dueDate?: string | null;
+    assigneeId?: string | null;
+    aiPrompt?: string | null;
+    automationGap?: string | null;
+}) {
+    await assertOfficeTaskAccess();
+
+    const updateData: any = {};
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.notes !== undefined) updateData.notes = data.notes || null;
+    if (data.dueDate !== undefined) updateData.dueDate = data.dueDate ? parseOfficeTaskDateOnly(data.dueDate) : null;
+    if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId || null;
+    if (data.aiPrompt !== undefined) updateData.aiPrompt = data.aiPrompt || null;
+    if (data.automationGap !== undefined) updateData.automationGap = data.automationGap || null;
+
+    const task = await prisma.officeTask.update({
+        where: { id },
+        data: updateData,
+        include: { assignee: { select: { id: true, name: true, email: true } } },
+    });
+
+    revalidatePath("/tasks");
+    return task;
+}
+
+export async function moveOfficeTask(id: string, columnId: string, newIndex: number) {
+    await assertOfficeTaskAccess();
+    await assertColumnExists(columnId);
+
+    await prisma.$transaction(async (tx) => {
+        const task = await tx.officeTask.findUnique({ where: { id } });
+        if (!task) throw new Error("Task not found");
+
+        const column = await tx.officeBoardColumn.findUnique({ where: { id: columnId }, select: { name: true } });
+        if (!column) throw new Error("Invalid column");
+
+        const oldColumnId = task.columnId;
+
+        const targetTasks = await tx.officeTask.findMany({
+            where: { columnId, archivedAt: null, id: { not: id } },
+            orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+        });
+
+        const clampedIndex = Math.max(0, Math.min(newIndex, targetTasks.length));
+        targetTasks.splice(clampedIndex, 0, { ...task, columnId } as typeof task);
+
+        // Renumbering must touch position only — status is legacy-compat and
+        // should only be rewritten for the task that actually moved, not for
+        // unrelated tasks that were already sitting in the target column.
+        for (let i = 0; i < targetTasks.length; i++) {
+            const t = targetTasks[i];
+            if (t.id === id) {
+                await tx.officeTask.update({
+                    where: { id: t.id },
+                    data: { position: i, columnId, status: column.name }, // TRANSITIONAL COMPAT — see OfficeTask.status
+                });
+            } else {
+                await tx.officeTask.update({
+                    where: { id: t.id },
+                    data: { position: i },
+                });
+            }
+        }
+
+        if (oldColumnId && oldColumnId !== columnId) {
+            const sourceTasks = await tx.officeTask.findMany({
+                where: { columnId: oldColumnId, archivedAt: null, id: { not: id } },
+                orderBy: [{ position: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+            });
+            for (let i = 0; i < sourceTasks.length; i++) {
+                await tx.officeTask.update({
+                    where: { id: sourceTasks[i].id },
+                    data: { position: i },
+                });
+            }
+        }
+    });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function deleteOfficeTask(id: string) {
+    await assertOfficeTaskAccess();
+
+    await prisma.officeTask.delete({ where: { id } });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function archiveOfficeTask(id: string) {
+    await assertOfficeTaskAccess();
+
+    await prisma.officeTask.update({ where: { id }, data: { archivedAt: new Date() } });
+
+    revalidatePath("/tasks");
+    return { success: true };
+}
+
+export async function restoreOfficeTask(id: string) {
+    await assertOfficeTaskAccess();
+
+    const task = await prisma.$transaction(async (tx) => {
+        const existing = await tx.officeTask.findUnique({ where: { id } });
+        if (!existing) throw new Error("Task not found");
+
+        // The task's column may have been deleted while it was archived (FK
+        // ON DELETE SET NULL), or it may never have had one — in either case
+        // fall back to the first-position column rather than restoring into
+        // a NULL columnId.
+        let column = existing.columnId
+            ? await tx.officeBoardColumn.findUnique({ where: { id: existing.columnId } })
+            : null;
+        if (!column) {
+            column = await tx.officeBoardColumn.findFirst({ orderBy: [{ position: "asc" }, { createdAt: "asc" }] });
+        }
+        if (!column) throw new Error("No board column available");
+
+        const last = await tx.officeTask.findFirst({
+            where: { columnId: column.id, archivedAt: null, id: { not: id } },
+            orderBy: [{ position: "desc" }, { createdAt: "desc" }, { id: "desc" }],
+            select: { position: true },
+        });
+
+        return tx.officeTask.update({
+            where: { id },
+            data: {
+                archivedAt: null,
+                columnId: column.id,
+                status: column.name, // TRANSITIONAL COMPAT — see OfficeTask.status
+                position: (last?.position ?? -1) + 1,
+            },
+            include: { assignee: { select: { id: true, name: true, email: true } } },
+        });
+    });
+
+    revalidatePath("/tasks");
+    return task;
 }
 
 

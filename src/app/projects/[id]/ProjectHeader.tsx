@@ -86,11 +86,11 @@ export default function ProjectHeader({ projectId, name, clientName, location, s
         if (e.key === "Escape") { setValue(name); setEditing(false); }
     };
 
-    const statusLabel = status || "Active";
+    const statusLabel = status || "In Progress";
     const statusClass =
         statusLabel === "Active" || statusLabel === "In Progress" ? "bg-green-100 text-green-700" :
-        statusLabel === "Completed" ? "bg-purple-100 text-purple-700" :
-        statusLabel === "On Hold" ? "bg-amber-100 text-amber-700" :
+        statusLabel === "Substantial Completion" ? "bg-amber-100 text-amber-700" :
+        statusLabel === "Closed Lost" ? "bg-rose-100 text-rose-700" :
         "bg-slate-100 text-slate-600";
 
     return (

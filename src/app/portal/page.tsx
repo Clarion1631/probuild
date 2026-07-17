@@ -33,6 +33,7 @@ export default async function PortalDashboard() {
             where: { status: { in: ["Sent", "Viewed", "Signed", "Finalized"] } },
             select: {
                 id: true, title: true, status: true, sentAt: true, approvedAt: true,
+                requiresCountersign: true, companySignedAt: true,
                 lead: { select: { name: true } }, project: { select: { name: true } },
             },
             orderBy: { sentAt: "desc" },
@@ -85,6 +86,7 @@ export default async function PortalDashboard() {
             },
             select: {
                 id: true, title: true, status: true, sentAt: true, approvedAt: true,
+                requiresCountersign: true, companySignedAt: true,
                 accessToken: true, lead: { select: { name: true } }, project: { select: { name: true } },
             },
             orderBy: { sentAt: "desc" },
@@ -193,6 +195,7 @@ export default async function PortalDashboard() {
                             const href = (!isStaff && c.accessToken)
                                 ? `/portal/contracts/${c.id}?token=${c.accessToken}`
                                 : `/portal/contracts/${c.id}`;
+                            const awaitingCountersign = (c as any).requiresCountersign && c.status === "Signed" && !(c as any).companySignedAt;
                             const isSigned = c.status === "Signed" || c.status === "Finalized";
                             return (
                                 <Link
@@ -227,7 +230,7 @@ export default async function PortalDashboard() {
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-2 text-sm text-blue-600 font-medium flex-shrink-0 ml-4">
-                                        {isSigned ? "View & Download" : "Review"}
+                                        {awaitingCountersign ? "View" : isSigned ? "View & Download" : "Review"}
                                         <svg className="w-4 h-4 transform group-hover:translate-x-1 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                                         </svg>
