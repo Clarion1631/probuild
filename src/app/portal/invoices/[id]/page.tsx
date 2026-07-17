@@ -10,11 +10,13 @@ import { sendInvoicePaymentReceivedEmails } from "@/lib/payment-notifications";
 
 // Fallback settlement for when the client lands back on the portal invoice page with a
 // Stripe session_id before the webhook has processed it. Mirrors the webhook's invoice
-// branch exactly: parent locked first, CLAIMED update (status not Paid), recompute after
-// the lock, and — only when THIS call won the claim — the same receipt/team-alert writer
-// the webhook uses. The claim gate makes settlement + notification exactly-once across the
-// two Stripe paths (whichever loses the claim stays silent), so no second lifecycle writer
-// is introduced and no sibling payment's balance update is lost.
+// branch exactly: parent locked first, CLAIMED update (status not Paid, scoped to this
+// invoice), recompute after the lock, and — only when THIS call won the claim — the same
+// receipt/team-alert writer the webhook uses. The claim gate makes settlement + notification
+// AT MOST ONCE across the two Stripe paths (whichever loses the claim stays silent), so no
+// second lifecycle writer is introduced and no sibling payment's balance update is lost.
+// (Guaranteed *delivery* — surviving a crash between commit and email — needs the durable
+// outbox tracked as the deferred robustness item; the claim only prevents double sends.)
 async function verifyStripeSession(sessionId: string, invoiceId: string): Promise<void> {
     try {
         const existing = await prisma.paymentSchedule.findFirst({
@@ -46,7 +48,7 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
         const result = await withTxRetry(() => prisma.$transaction(async (t) => {
             await lockMoneyParents(t, { invoiceId });
             const claim = await t.paymentSchedule.updateMany({
-                where: { id: scheduleId, status: { not: "Paid" } },
+                where: { id: scheduleId, invoiceId, status: { not: "Paid" } },
                 data: {
                     status: "Paid",
                     stripeSessionId: sessionId,
