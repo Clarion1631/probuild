@@ -87,7 +87,13 @@ export function transformPhasesToItems(
         const children: ReturnType<typeof makeItem>[] = [];
         for (let ii = 0; ii < phaseItems.length; ii++) {
             const item = phaseItems[ii];
-            const qty = toNum(item.quantity) || 1;
+            // An explicit zero quantity is meaningful — it's how estimators show
+            // optional/alternate lines at $0 without pricing them into the total —
+            // so only a missing or unparseable quantity defaults to 1.
+            const rawQty = toNum(item.quantity);
+            const explicitZero = rawQty === 0
+                && (typeof item.quantity === "number" || (typeof item.quantity === "string" && /\d/.test(item.quantity)));
+            const qty = rawQty || (explicitZero ? 0 : 1);
             const uc = toCents(toNum(item.unitCost));
             children.push(makeItem({
                 id: `imp_${ts}_p${pi}_i${ii}`,

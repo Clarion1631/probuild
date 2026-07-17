@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
+import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -53,7 +54,7 @@ const phaseItemSchema = z.object({
     description: z.string().max(2000).optional(),
     costCode: z.string().max(50).optional().describe("ProBuild cost code (the 'code' value from get_estimating_codes, e.g. '01-DEMO'). Set on every item."),
     costType: z.string().max(50).optional().describe("ProBuild cost type name from get_estimating_codes, e.g. 'Labor' or 'Material'."),
-    quantity: z.number().positive().max(1_000_000).describe("Quantity in the given unit"),
+    quantity: z.number().min(0).max(1_000_000).describe("Quantity in the given unit. 0 is allowed and marks an optional/alternate line shown at $0 — it adds nothing to the estimate total."),
     unit: z.string().max(30).optional().describe("e.g. 'sq ft', 'hours', 'job'"),
     unitCost: z.number().min(0).max(10_000_000).describe("Sell price per unit in USD"),
 });
@@ -717,9 +718,101 @@ const handler = createMcpHandler(
                 return textResult(result);
             },
         );
+
+        server.registerTool(
+            "upload_file",
+            {
+                title: "Upload a document to a job's Files tab",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Parks a document (RFQ, RFI, spec sheet, spreadsheet, photo) on a project's or lead's Files tab in ProBuild. " +
+                    "Send the file's raw bytes base64-encoded — max ~3 MB per file; larger files must be uploaded in ProBuild directly. " +
+                    "Files are INTERNAL by default; visibility 'shared' makes the file visible to the CUSTOMER in their portal — only use it when the user explicitly asks. " +
+                    "Optionally group files into a named top-level folder (created if it doesn't exist, e.g. 'RFQs').",
+                inputSchema: {
+                    projectId: z.string().max(50).optional().describe("Target project id from list_projects / find_job (omit if using leadId)"),
+                    leadId: z.string().max(50).optional().describe("Target lead id from list_leads / find_job (omit if using projectId)"),
+                    fileName: z.string().min(1).max(200).describe("File name WITH extension, e.g. 'RFQ-plumbing-sub.pdf'. Allowed: pdf, doc/docx, xls/xlsx, csv, jpg/png/gif/webp/heic, txt, rtf, dwg, dxf"),
+                    contentBase64: z.string().min(1).max(4_400_000).describe("The file's raw bytes, standard base64-encoded (no data: URL prefix). Max ~3 MB decoded."),
+                    folder: z.string().max(120).optional().describe("Optional top-level folder name on the job's Files tab, e.g. 'RFQs' — found case-insensitively or created"),
+                    visibility: z.enum(["team", "shared"]).optional().describe("'team' = internal only (default); 'shared' = the customer sees it in their portal"),
+                },
+            },
+            async ({ projectId, leadId, fileName, contentBase64, folder, visibility }) => {
+                if ((projectId ? 1 : 0) + (leadId ? 1 : 0) !== 1) {
+                    return { ...textResult({ error: "Provide exactly one of projectId or leadId (use find_job / list_projects / list_leads to resolve the target)." }), isError: true };
+                }
+                const ext = fileExtension(fileName);
+                if (!ALLOWED_FILE_EXTENSIONS.has(ext)) {
+                    return { ...textResult({ error: `File type "${ext || "(no extension)"}" not allowed. Allowed: ${[...ALLOWED_FILE_EXTENSIONS].join(", ")}.` }), isError: true };
+                }
+                // Closed/won jobs are accepted on purpose — find_job surfaces them and
+                // parking documents on a finished job is a normal filing action.
+                if (projectId) {
+                    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+                    if (!project) return { ...textResult({ error: `No project with id ${projectId}. Use find_job or list_projects.` }), isError: true };
+                } else {
+                    const lead = await prisma.lead.findUnique({ where: { id: leadId! }, select: { id: true } });
+                    if (!lead) return { ...textResult({ error: `No lead with id ${leadId}. Use find_job or list_leads.` }), isError: true };
+                }
+
+                const b64 = contentBase64.replace(/\s+/g, "");
+                if (b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+                    return { ...textResult({ error: "contentBase64 is not valid base64 — send the file's raw bytes standard-base64-encoded, without a data: URL prefix." }), isError: true };
+                }
+                const buffer = Buffer.from(b64, "base64");
+                if (buffer.length === 0) {
+                    return { ...textResult({ error: "contentBase64 decoded to 0 bytes." }), isError: true };
+                }
+                const MAX_UPLOAD_BYTES = 3_300_000; // stays under Vercel's 4.5 MB request cap after base64 expansion
+                if (buffer.length > MAX_UPLOAD_BYTES) {
+                    return { ...textResult({ error: `File is ${(buffer.length / 1_000_000).toFixed(1)} MB — the connector accepts up to ~3 MB. Upload larger files in ProBuild directly.` }), isError: true };
+                }
+
+                let folderId: string | null = null;
+                const folderName = folder?.trim();
+                if (folderName) {
+                    const scope = { projectId: projectId ?? null, leadId: leadId ?? null, parentId: null };
+                    const existing = await prisma.fileFolder.findFirst({
+                        where: { ...scope, name: { equals: folderName, mode: "insensitive" } },
+                        select: { id: true },
+                    });
+                    folderId = existing
+                        ? existing.id
+                        : (await prisma.fileFolder.create({ data: { name: folderName, ...scope }, select: { id: true } })).id;
+                }
+
+                const saved = await saveProjectFile({
+                    buffer,
+                    fileName,
+                    mimeType: mimeTypeForFileName(fileName),
+                    projectId: projectId ?? null,
+                    leadId: leadId ?? null,
+                    folderId,
+                    // null = inherit the folder's visibility (default "team"), same as the app.
+                    visibility: visibility ?? null,
+                });
+                if (!saved.ok) return { ...textResult({ error: saved.error }), isError: true };
+
+                const filesUrl = projectId
+                    ? `https://probuild.goldentouchremodeling.com/projects/${projectId}/files`
+                    : `https://probuild.goldentouchremodeling.com/leads/${leadId}/files`;
+                return textResult({
+                    fileId: saved.file.id,
+                    name: saved.file.name,
+                    sizeBytes: saved.file.size,
+                    folder: folderName ?? null,
+                    visibility: visibility ?? "team (inherited)",
+                    url: filesUrl,
+                    note: visibility === "shared"
+                        ? "This file IS visible to the customer in their portal."
+                        : "Internal file — the customer cannot see it.",
+                });
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.5.0" },
+        serverInfo: { name: "probuild", version: "1.6.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -728,6 +821,7 @@ const handler = createMcpHandler(
             "4) confirm the target with list_projects / list_leads, 5) create_estimate. " +
             "Every line item needs a costCode from get_estimating_codes. costType is just a line label (Labor / Material / Allowance / Subcontractor / Equipment / Other) — " +
             "the user estimates with allowances and lump-sum labor, so keep those labels accurate. " +
+            "Quantity 0 is valid and is how the user presents OPTIONAL/alternate scope: the line shows at $0 and adds nothing to the total — preserve such lines when revising an estimate. " +
             "All prices are USD sell prices. Estimates arrive as private drafts for review in ProBuild. " +
             "ESTIMATE lifecycle: create_estimate (draft) → [get_estimate to read, update_estimate to revise in place while still Draft/Sent] → send_estimate (preview + user approval; customer signs via portal, which auto-creates the invoice). "
             + "update_estimate edits an existing unsigned estimate (line items, tax jurisdiction/rate, title, terms); once signed or invoiced, revisions go through a change order. " +
@@ -738,6 +832,8 @@ const handler = createMcpHandler(
             "always run the preview step, show the user exactly what will be sent and to whom, and only echo back the preview's confirmToken after their explicit approval. Never self-confirm. " +
             "Change-order lifecycle: create_change_order (draft) → send_change_order (preview + user approval; customer signs via portal) → " +
             "once Approved, bill_change_order puts it on the invoice → send_milestone_invoice emails the payment link. " +
+            "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
+            "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },
     { basePath: "/api/mcp", maxDuration: 60 },
