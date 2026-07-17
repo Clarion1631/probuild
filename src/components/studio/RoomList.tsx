@@ -131,7 +131,7 @@ export function RoomList({ ownerKind, ownerId }: RoomListProps) {
                     e.stopPropagation();
                     remove(room);
                   }}
-                  className="rounded-lg p-2 text-slate-300 opacity-0 transition group-hover:opacity-100 hover:bg-red-50 hover:text-red-500 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:outline-none"
+                  className="rounded-lg p-2 text-slate-300 opacity-0 transition group-hover:opacity-100 hover:bg-red-50 hover:text-red-500 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:outline-none [@media(hover:none)]:opacity-100"
                   title="Delete room"
                   aria-label={"Delete " + room.name}
                 >
