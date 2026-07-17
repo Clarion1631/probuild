@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import Anthropic from "@anthropic-ai/sdk";
+import { extractJsonObject } from "@/lib/ai-json";
 
 type ItemInput = {
   id: string;
@@ -127,16 +128,9 @@ Rules:
       return NextResponse.json({ error: "No response from AI" }, { status: 502 });
     }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      const objMatch = rawText.match(/\{[\s\S]*\}/);
-      if (objMatch) {
-        parsed = JSON.parse(objMatch[0]);
-      } else {
-        return NextResponse.json({ error: "Could not parse AI response" }, { status: 502 });
-      }
+    const parsed = extractJsonObject<any>(rawText);
+    if (!parsed) {
+      return NextResponse.json({ error: "Could not parse AI response" }, { status: 502 });
     }
 
     // Only trust IDs that were actually submitted — the model (or an injected

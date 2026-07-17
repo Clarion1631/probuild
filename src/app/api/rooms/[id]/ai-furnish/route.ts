@@ -6,6 +6,7 @@ import { getAnthropicText } from "@/lib/anthropic";
 import { CABINETS, APPLIANCES, FIXTURES, LIGHTING, FURNITURE, getItemDef } from "@/lib/studio/catalog";
 import type { DesignDoc, PlacedItem, ApiRoomAsset } from "@/lib/studio/doc";
 import { newItemId, toApiPayload } from "@/lib/studio/doc";
+import { extractJsonObject } from "@/lib/ai-json";
 import { generateUsdzForRoom } from "@/lib/studio/usdz-generator";
 
 export const maxDuration = 120;
@@ -137,16 +138,9 @@ Return JSON in this exact shape:
         });
 
         const rawText = getAnthropicText(response.content).trim();
-        let parsed: { items: any[] };
-        try {
-            parsed = JSON.parse(rawText);
-        } catch {
-            const objMatch = rawText.match(/\{[\s\S]*\}/);
-            if (objMatch) {
-                parsed = JSON.parse(objMatch[0]);
-            } else {
-                throw new Error("Could not parse JSON from AI response");
-            }
+        const parsed = extractJsonObject<{ items: any[] }>(rawText);
+        if (!parsed) {
+            throw new Error("Could not parse JSON from AI response");
         }
 
         // Validate model output before it touches the database: only known
