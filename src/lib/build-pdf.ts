@@ -37,6 +37,9 @@ export async function buildPdf(
         const imgDataSingle = await toJpeg(element, {
             quality,
             pixelRatio,
+            // JPEG has no alpha channel — without a background, transparent areas (e.g. the
+            // triangles outside the document card's rounded corners) encode as black. Fill white.
+            backgroundColor: "#ffffff",
             filter: (node: HTMLElement) =>
                 !(node.nodeType === 1 && node.hasAttribute && node.hasAttribute("data-pdf-skip")),
         });
@@ -120,6 +123,9 @@ export async function buildPdf(
     const imgData = await toJpeg(element, {
         quality,
         pixelRatio,
+        // JPEG has no alpha channel — without a background, transparent areas (e.g. the
+        // triangles outside the document card's rounded corners) encode as black. Fill white.
+        backgroundColor: "#ffffff",
         filter: (node: HTMLElement) =>
             !(node.nodeType === 1 && node.hasAttribute && node.hasAttribute("data-pdf-skip")),
     });
