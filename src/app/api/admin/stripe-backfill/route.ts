@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions } from "@/lib/permissions";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { toNum } from "@/lib/prisma-helpers";
 
 export const maxDuration = 60;
@@ -149,9 +150,17 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         }
 
         if (!dryRun) {
-            await prisma.$transaction(async (t) => {
-                await t.paymentSchedule.update({
-                    where: { id: existing!.id },
+            await withTxRetry(() => prisma.$transaction(async (t) => {
+                // Lock the invoice FIRST (canonical Estimate → Invoice order; this branch touches
+                // only the invoice) so backfilling one session can't race a live webhook/QB settle
+                // on a sibling milestone and overwrite its balanceDue. Recompute after the lock.
+                await lockMoneyParents(t, { invoiceId });
+                // Claimed update (status guard + parent id in the WHERE) so a concurrent
+                // webhook/portal settle that already marked this Paid between the pre-lock check
+                // and this write isn't overwritten with backfilled metadata, and a schedule that
+                // doesn't belong to this invoice (paymentIntent-fallback lookup) is never touched.
+                await t.paymentSchedule.updateMany({
+                    where: { id: existing!.id, invoiceId, status: { not: "Paid" } },
                     data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
                 });
                 const siblings = await t.paymentSchedule.findMany({ where: { invoiceId } });
@@ -161,7 +170,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
                 const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
                 const newStatus = newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status;
                 await t.invoice.update({ where: { id: invoiceId }, data: { balanceDue: newBalance, status: newStatus } });
-            });
+            }));
         }
 
         details.push({ sessionId: session.id, type: "invoice", id: existing.id, action: "synced", ...context });
@@ -221,9 +230,14 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
         }
 
         if (!dryRun) {
-            await prisma.$transaction(async (t) => {
-                await t.estimatePaymentSchedule.update({
-                    where: { id: existing!.id },
+            await withTxRetry(() => prisma.$transaction(async (t) => {
+                // Lock the estimate FIRST (canonical Estimate → Invoice order; this branch touches
+                // only the estimate) so backfilling one session can't race a live settle on a
+                // sibling milestone and overwrite its balanceDue. Recompute after the lock.
+                await lockMoneyParents(t, { estimateId });
+                // Claimed update (status guard + parent id) — see the invoice branch above.
+                await t.estimatePaymentSchedule.updateMany({
+                    where: { id: existing!.id, estimateId, status: { not: "Paid" } },
                     data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
                 });
                 const siblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId } });
@@ -232,7 +246,7 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
                 const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                 const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
                 await t.estimate.update({ where: { id: estimateId }, data: { balanceDue: newBalance } });
-            });
+            }));
         }
 
         details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "synced", ...context });

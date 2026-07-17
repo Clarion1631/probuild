@@ -12,6 +12,7 @@ function revalidatePath(path: string) {
     }
 }
 import { prisma } from "@/lib/prisma";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel } from "./co-tax";
@@ -710,7 +711,7 @@ export async function billChangeOrderCore(changeOrderId: string) {
     // CO (SELECT ... FOR UPDATE): concurrent bill calls serialize on the row,
     // and concurrent status writers (approve/decline use plain updates) block
     // until this transaction commits, so a just-declined CO can't be billed.
-    const outcome = await prisma.$transaction(async (tx): Promise<BillChangeOrderOutcome> => {
+    const outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<BillChangeOrderOutcome> => {
         const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; projectId: string; estimateId: string }>>`
             SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
@@ -765,22 +766,31 @@ export async function billChangeOrderCore(changeOrderId: string) {
             return { kind: "error", error: "This project has no invoice yet — create the invoice from the signed estimate in ProBuild first, then bill the change order." };
         }
 
+        // Lock the target invoice (canonical order: this tx already holds the ChangeOrder row lock,
+        // now takes the Invoice row) and re-read its status under the lock. Totals move via atomic
+        // increments (concurrency-safe on their own), but `status` was read via the non-locking
+        // findFirst above — a concurrent settle could otherwise leave it "Paid" with a positive
+        // balanceDue after this bump. Reading it under the lock closes that window.
+        await lockMoneyParents(tx, { invoiceId: invoice.id });
+        const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+        const curStatus = lockedInvoice?.status ?? invoice.status;
+
         const created = await tx.paymentSchedule.create({
             data: { invoiceId: invoice.id, name: milestoneName, amount, status: "Pending" },
         });
         // Same totals math as addInvoiceMilestone: bump invoice totals; a fully
         // Paid invoice becomes Partially Paid when new work lands on it.
-        const nextStatus = invoice.status === "Paid" ? "Partially Paid" : invoice.status;
+        const nextStatus = curStatus === "Paid" ? "Partially Paid" : curStatus;
         await tx.invoice.update({
             where: { id: invoice.id },
             data: {
                 totalAmount: { increment: amount },
                 balanceDue: { increment: amount },
-                ...(nextStatus !== invoice.status ? { status: nextStatus } : {}),
+                ...(nextStatus !== curStatus ? { status: nextStatus } : {}),
             },
         });
         return { kind: "created", milestoneId: created.id, milestoneName, amount, subtotal, taxAmount, taxLabel: coTaxLabel(estimateTax), invoiceId: invoice.id, invoiceCode: invoice.code, projectId: co.projectId, coCode: co.code };
-    }, { timeout: 15_000 });
+    }, { timeout: 15_000 }));
 
     if (outcome.kind === "error") return { ok: false as const, error: outcome.error };
     if (outcome.kind === "duplicate") {

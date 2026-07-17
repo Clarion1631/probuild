@@ -5,7 +5,18 @@ import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
 import { toNum } from "@/lib/prisma-helpers";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
+import { sendInvoicePaymentReceivedEmails } from "@/lib/payment-notifications";
 
+// Fallback settlement for when the client lands back on the portal invoice page with a
+// Stripe session_id before the webhook has processed it. Mirrors the webhook's invoice
+// branch exactly: parent locked first, CLAIMED update (status not Paid, scoped to this
+// invoice), recompute after the lock, and — only when THIS call won the claim — the same
+// receipt/team-alert writer the webhook uses. The claim gate makes settlement + notification
+// AT MOST ONCE across the two Stripe paths (whichever loses the claim stays silent), so no
+// second lifecycle writer is introduced and no sibling payment's balance update is lost.
+// (Guaranteed *delivery* — surviving a crash between commit and email — needs the durable
+// outbox tracked as the deferred robustness item; the claim only prevents double sends.)
 async function verifyStripeSession(sessionId: string, invoiceId: string): Promise<void> {
     try {
         const existing = await prisma.paymentSchedule.findFirst({
@@ -22,6 +33,8 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
         // Ownership check: ensure this Stripe session belongs to the invoice being viewed
         if (metadata.invoiceId !== invoiceId) return;
 
+        const scheduleId = metadata.paymentScheduleId;
+
         let paymentMethod = "card";
         if (session.payment_intent) {
             try {
@@ -32,29 +45,48 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
             } catch {}
         }
 
-        await prisma.paymentSchedule.update({
-            where: { id: metadata.paymentScheduleId },
-            data: {
-                status: "Paid",
-                stripePaymentIntentId: session.payment_intent as string | null,
-                paymentMethod,
-                paymentDate: new Date(),
-                paidAt: new Date(),
-            },
-        });
-
-        const allSchedules = await prisma.paymentSchedule.findMany({
-            where: { invoiceId: metadata.invoiceId },
-        });
-        const invoice = await prisma.invoice.findUnique({ where: { id: metadata.invoiceId } });
-        if (invoice) {
+        const result = await withTxRetry(() => prisma.$transaction(async (t) => {
+            await lockMoneyParents(t, { invoiceId });
+            const claim = await t.paymentSchedule.updateMany({
+                where: { id: scheduleId, invoiceId, status: { not: "Paid" } },
+                data: {
+                    status: "Paid",
+                    stripeSessionId: sessionId,
+                    stripePaymentIntentId: session.payment_intent as string | null,
+                    paymentMethod,
+                    paymentDate: new Date(),
+                    paidAt: new Date(),
+                },
+            });
+            const won = claim.count > 0;
+            const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
+            const invoice = await t.invoice.findUnique({ where: { id: invoiceId }, include: { client: true } });
+            if (!invoice) return { won: false, invoice: null as null, schedule: null as null, newBalance: 0 };
             const totalPaid = allSchedules
                 .filter(s => s.status === "Paid")
                 .reduce((sum, s) => sum + toNum(s.amount), 0);
             const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-            await prisma.invoice.update({
+            const newStatus = newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status;
+            await t.invoice.update({
                 where: { id: invoice.id },
-                data: { balanceDue: newBalance, status: newBalance <= 0 ? "Paid" : invoice.status },
+                data: { balanceDue: newBalance, status: newStatus },
+            });
+            const schedule = allSchedules.find(s => s.id === scheduleId) ?? null;
+            return { won, invoice, schedule, newBalance };
+        }));
+
+        if (result.won && result.invoice && result.schedule) {
+            await sendInvoicePaymentReceivedEmails({
+                invoice: result.invoice,
+                schedule: {
+                    id: result.schedule.id,
+                    name: result.schedule.name,
+                    amount: toNum(result.schedule.amount),
+                    referenceNumber: result.schedule.referenceNumber,
+                },
+                method: paymentMethod,
+                newBalance: result.newBalance,
+                referenceNumber: result.schedule.referenceNumber,
             });
         }
     } catch (e) {

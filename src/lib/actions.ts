@@ -3051,46 +3051,56 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
 
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
-    if (!estimate) throw new Error("Estimate not found");
+    // One transaction, estimate locked FIRST (canonical Estimate → Invoice order; this flow
+    // touches only the estimate). Without the lock two concurrent logs each read the same
+    // balanceDue and each write balanceDue − amount, losing one decrement. The lock serializes
+    // them so the second reads the already-decremented balance. withTxRetry recovers a deadlock.
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { estimateId });
+        const estimate = await tx.estimate.findUnique({ where: { id: estimateId } });
+        if (!estimate) throw new Error("Estimate not found");
 
-    const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
-    const scheduleCount = await prisma.estimatePaymentSchedule.count({ where: { estimateId } });
+        const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
+        const scheduleCount = await tx.estimatePaymentSchedule.count({ where: { estimateId } });
 
-    const createdSchedule = await prisma.estimatePaymentSchedule.create({
-        data: {
-            estimateId,
-            name: `Payment — ${data.paymentMethod} (${refNum})`,
-            amount: data.amount,
-            dueDate: new Date(data.date),
-            order: scheduleCount,
-            status: "Paid",
-            paidAt: new Date(),
-            paymentDate: new Date(data.date),
-            paymentMethod: data.paymentMethod.toLowerCase(),
-            referenceNumber: refNum,
-        },
-    });
+        const createdSchedule = await tx.estimatePaymentSchedule.create({
+            data: {
+                estimateId,
+                name: `Payment — ${data.paymentMethod} (${refNum})`,
+                amount: data.amount,
+                dueDate: new Date(data.date),
+                order: scheduleCount,
+                status: "Paid",
+                paidAt: new Date(),
+                paymentDate: new Date(data.date),
+                paymentMethod: data.paymentMethod.toLowerCase(),
+                referenceNumber: refNum,
+            },
+        });
 
-    // Update balance — round to 2 decimal places to avoid floating-point drift
-    const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
-    const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
-    const isFirstPayment = !estimate.statusBeforePayment;
-    const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
+        // Update balance — round to 2 decimal places to avoid floating-point drift.
+        // Read from the locked estimate row above, so no concurrent decrement is lost.
+        const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
+        const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
+        const isFirstPayment = !estimate.statusBeforePayment;
+        const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
 
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: {
-            balanceDue: newBalance,
-            status: newStatus,
-            statusBeforePayment,
-        },
-    });
+        await tx.estimate.update({
+            where: { id: estimateId },
+            data: {
+                balanceDue: newBalance,
+                status: newStatus,
+                statusBeforePayment,
+            },
+        });
 
-    if (estimate.projectId) {
-        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+        return { createdSchedule, newStatus, newBalance, projectId: estimate.projectId };
+    }));
+
+    if (result.projectId) {
+        revalidatePath(`/projects/${result.projectId}/estimates/${estimateId}`);
     }
-    return { success: true, schedule: createdSchedule, newStatus, newBalance };
+    return { success: true, schedule: result.createdSchedule, newStatus: result.newStatus, newBalance: result.newBalance };
 }
 
 export async function archiveEstimate(estimateId: string) {
@@ -4103,26 +4113,30 @@ export async function splitInvoiceMilestones(
         return { name, amount, dueDate: m.dueDate || null };
     });
 
-    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    if (!invoice) throw new Error("Invoice not found");
-
     const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
 
-    // Recalculate balanceDue: paid amount stays the same, only pending changes
-    const paidAmount = Math.round(
-        (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
-    ) / 100;
-    const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-    const newStatus =
-        newBalance <= 0 ? "Paid"
-        : invoice.status === "Draft" ? "Draft"
-        : invoice.status === "Overdue" ? "Overdue"
-        : "Issued";
+    // Interactive tx, invoice locked FIRST (canonical Estimate → Invoice order; this flow touches
+    // only the invoice). The paid portion is re-read from the LOCKED invoice, so a concurrent
+    // settle on a surviving Paid milestone can't leave paidAmount stale and get its balance
+    // overwritten. Arithmetic is otherwise unchanged from the original array-form transaction.
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) throw new Error("Invoice not found");
 
-    // Array-form transaction — atomic with pgbouncer, no interactive session needed
-    await prisma.$transaction([
-        prisma.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } }),
-        prisma.paymentSchedule.createMany({
+        // Recalculate balanceDue: paid amount stays the same, only pending changes
+        const paidAmount = Math.round(
+            (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
+        ) / 100;
+        const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
+        const newStatus =
+            newBalance <= 0 ? "Paid"
+            : invoice.status === "Draft" ? "Draft"
+            : invoice.status === "Overdue" ? "Overdue"
+            : "Issued";
+
+        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
+        await tx.paymentSchedule.createMany({
             data: validated.map((m) => ({
                 invoiceId,
                 name: m.name,
@@ -4130,15 +4144,16 @@ export async function splitInvoiceMilestones(
                 status: "Pending",
                 dueDate: m.dueDate ? new Date(m.dueDate) : null,
             })),
-        }),
-        prisma.invoice.update({
+        });
+        await tx.invoice.update({
             where: { id: invoiceId },
             data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
-        }),
-    ]);
+        });
+        return invoice.projectId;
+    }));
 
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
 
     return { success: true };
