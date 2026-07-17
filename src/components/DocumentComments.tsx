@@ -12,6 +12,8 @@ type Comment = {
     authorName: string | null;
     author: { id: string; name: string | null; email: string } | null;
     createdAt: string;
+    // Computed server-side (author-or-admin) — never derived client-side.
+    canDelete: boolean;
 };
 
 export default function DocumentComments({
@@ -171,15 +173,16 @@ export default function DocumentComments({
                                 <div className="flex items-baseline gap-2">
                                     <span className="text-xs font-semibold text-slate-700">{getAuthorDisplay(c)}</span>
                                     <span className="text-[10px] text-slate-400">{formatTime(c.createdAt)}</span>
-                                    {/* Visible affordance for every comment; the server is the
-                                        source of truth and rejects deletes that aren't the
-                                        author's own comment or an ADMIN/MANAGER. */}
-                                    <button
-                                        onClick={() => handleDelete(c.id)}
-                                        className="text-[10px] text-slate-300 hover:text-red-500 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition ml-auto"
-                                    >
-                                        Delete
-                                    </button>
+                                    {/* canDelete is computed server-side (author-or-admin); the
+                                        server still enforces it independently on delete. */}
+                                    {c.canDelete && (
+                                        <button
+                                            onClick={() => handleDelete(c.id)}
+                                            className="text-[10px] text-slate-300 hover:text-red-500 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition ml-auto"
+                                        >
+                                            Delete
+                                        </button>
+                                    )}
                                 </div>
                                 <p className="text-sm text-slate-600 mt-0.5 whitespace-pre-wrap break-words">{c.text}</p>
                             </div>
