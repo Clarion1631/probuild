@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { createDailyLog, deleteDailyLog, deleteDailyLogPhoto } from "@/lib/actions";
+import { createDailyLog, deleteDailyLog, deleteDailyLogPhoto, createSuggestedChangeOrder } from "@/lib/actions";
 import { toast } from "sonner";
 
 // Weather icons mapping
@@ -64,6 +64,21 @@ type DailyLog = {
     updatedAt: string;
 };
 
+type CoSuggestion = {
+    id: string;
+    title: string;
+    description: string;
+    sourceLogDates: string[];
+    confidence: "high" | "medium" | "low";
+};
+
+type CoDetectMeta = {
+    targetEstimateId: string | null;
+    targetEstimateCode: string | null;
+    logCount: number;
+    lookbackDays: number;
+};
+
 interface Props {
     projectId: string;
     projectName: string;
@@ -82,8 +97,13 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     const [exporting, setExporting] = useState(false);
     const [isGeneratingAI, setIsGeneratingAI] = useState(false);
     const [isDetectingCO, setIsDetectingCO] = useState(false);
-    const [coDetections, setCoDetections] = useState<string | null>(null);
+    const [coSuggestions, setCoSuggestions] = useState<CoSuggestion[]>([]);
+    const [coMeta, setCoMeta] = useState<CoDetectMeta | null>(null);
     const [showCOModal, setShowCOModal] = useState(false);
+    const [creatingIds, setCreatingIds] = useState<Set<string>>(new Set());
+    const [createdCOs, setCreatedCOs] = useState<Record<string, { id: string; code: string }>>({});
+    const detectRunIdRef = useRef(0);
+    const isCreatingAny = creatingIds.size > 0;
 
     // Form state
     const [formDate, setFormDate] = useState(new Date().toISOString().split("T")[0]);
@@ -278,25 +298,107 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
     };
 
     const handleDetectChangeOrders = async () => {
+        // A create is still in flight for a suggestion from the CURRENT
+        // results — starting a new detect would replace coSuggestions/coMeta
+        // out from under it and let the (now-orphaned) creatingIds entry
+        // re-enable a duplicate "Create draft CO" click on a fresh suggestion
+        // while the old create is still running. Simplest safe rule: block a
+        // rescan until every in-flight creation has settled, rather than
+        // trying to key pending state across runs.
+        if (isCreatingAny) {
+            toast.error("Wait for the current change order to finish creating before scanning again.");
+            return;
+        }
+
+        // Guard against out-of-order responses: if the user re-triggers detection
+        // (or a request is unusually slow) before this one resolves, only the
+        // most recently kicked-off run is allowed to write state.
+        const runId = ++detectRunIdRef.current;
         setIsDetectingCO(true);
+
+        const controller = new AbortController();
+        // Intentionally NOT cleared until the whole try/catch below (including
+        // the body read) settles — clearing right after fetch() resolves would
+        // only guard the headers phase; a body that stalls mid-stream must
+        // still be aborted by this timer.
+        const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
         try {
             const res = await fetch("/api/ai/change-order-detect", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ projectId }),
+                signal: controller.signal,
             });
+
+            if (runId !== detectRunIdRef.current) return; // superseded by a newer run
+
+            const contentType = res.headers.get("content-type") || "";
+            if (!contentType.includes("application/json")) {
+                const text = await res.text().catch(() => "");
+                throw new Error(text?.trim().slice(0, 200) || `Unexpected response from server (${res.status})`);
+            }
+
+            const data = await res.json();
             if (!res.ok) {
-                const data = await res.json();
                 throw new Error(data.error || "Failed to detect change orders");
             }
-            const data = await res.json();
-            setCoDetections(data.detections);
+
+            const rawSuggestions: Omit<CoSuggestion, "id">[] = data.suggestions || [];
+            const suggestions: CoSuggestion[] = rawSuggestions.map((s, i) => ({ ...s, id: `${runId}-${i}` }));
+            setCoSuggestions(suggestions);
+            setCoMeta({
+                targetEstimateId: data.targetEstimateId ?? null,
+                targetEstimateCode: data.targetEstimateCode ?? null,
+                logCount: data.logCount ?? 0,
+                lookbackDays: data.lookbackDays ?? 30,
+            });
+            setCreatedCOs({});
+            // creatingIds is intentionally not reset here — the guard above
+            // already guarantees it's empty before a new run can start.
             setShowCOModal(true);
+            if (suggestions.length === 0) {
+                toast.info(`No client-requested scope changes detected in the last ${data.lookbackDays ?? 30} days.`);
+            }
+        } catch (error: any) {
+            if (runId !== detectRunIdRef.current) return; // stale/aborted run — a newer one is authoritative
+            console.error(error);
+            toast.error(error.name === "AbortError"
+                ? "Change order detection timed out. Try again."
+                : (error.message || "Failed to detect change orders. Try again."));
+        } finally {
+            clearTimeout(timeoutId);
+            if (runId === detectRunIdRef.current) setIsDetectingCO(false);
+        }
+    };
+
+    const handleCreateDraftCO = async (suggestion: CoSuggestion) => {
+        if (!coMeta?.targetEstimateId) {
+            toast.error("This project has no approved estimate to attach a change order to. Create one first.");
+            return;
+        }
+        setCreatingIds(prev => new Set(prev).add(suggestion.id));
+        try {
+            const result = await createSuggestedChangeOrder(projectId, {
+                title: suggestion.title,
+                description: suggestion.description,
+            });
+            setCreatedCOs(prev => ({ ...prev, [suggestion.id]: result }));
+            toast.success(`Draft change order ${result.code} created`, {
+                action: {
+                    label: "View CO",
+                    onClick: () => router.push(`/projects/${projectId}/change-orders/${result.id}`),
+                },
+            });
         } catch (error: any) {
             console.error(error);
-            toast.error(error.message || "Failed to detect change orders. Try again.");
+            toast.error(error.message || "Failed to create draft change order.");
         } finally {
-            setIsDetectingCO(false);
+            setCreatingIds(prev => {
+                const next = new Set(prev);
+                next.delete(suggestion.id);
+                return next;
+            });
         }
     };
 
@@ -322,7 +424,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                 <div className="flex items-center gap-3">
                     <button
                         onClick={handleDetectChangeOrders}
-                        disabled={isDetectingCO || logs.length === 0}
+                        disabled={isDetectingCO || isCreatingAny || logs.length === 0}
                         className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border transition bg-gradient-to-r from-orange-50 to-amber-50 text-orange-700 border-orange-200 hover:from-orange-100 hover:to-amber-100 disabled:opacity-50"
                     >
                         {isDetectingCO ? (
@@ -335,7 +437,7 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                         {isDetectingCO ? (
                             <span className="animate-pulse">Scanning Logs...</span>
                         ) : (
-                            "AI Detect Change Orders"
+                            "AI: Detect Change Orders"
                         )}
                     </button>
                     <button
@@ -818,23 +920,85 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
             )}
 
             {/* AI Change Order Detection Modal */}
-            {showCOModal && coDetections && (
+            {showCOModal && (
                 <div className="fixed inset-0 z-[200] flex items-center justify-center">
                     <div className="fixed inset-0 bg-black/40" onClick={() => setShowCOModal(false)} />
                     <div className="relative bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col">
                         <div className="flex items-center justify-between p-5 border-b border-hui-border">
                             <div className="flex items-center gap-2">
                                 <span className="text-xl">📋</span>
-                                <h2 className="font-bold text-hui-textMain text-lg">AI Change Order Detection</h2>
+                                <div>
+                                    <h2 className="font-bold text-hui-textMain text-lg">AI Change Order Detection</h2>
+                                    {coMeta && (
+                                        <p className="text-xs text-hui-textMuted mt-0.5">
+                                            Scanned {coMeta.logCount} log{coMeta.logCount === 1 ? "" : "s"} from the last {coMeta.lookbackDays} days
+                                        </p>
+                                    )}
+                                </div>
                             </div>
                             <button onClick={() => setShowCOModal(false)} className="text-hui-textMuted hover:text-hui-textMain">
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                             </button>
                         </div>
-                        <div className="p-5 overflow-y-auto flex-1">
-                            <div className="prose prose-sm max-w-none text-hui-textMain whitespace-pre-wrap text-sm leading-relaxed">
-                                {coDetections}
-                            </div>
+                        <div className="p-5 overflow-y-auto flex-1 space-y-3">
+                            {!coMeta?.targetEstimateId && (
+                                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
+                                    This project has no approved estimate yet, so draft change orders can&apos;t be created until one exists.
+                                </div>
+                            )}
+                            {coSuggestions.length === 0 ? (
+                                <div className="text-center py-8">
+                                    <p className="text-sm text-hui-textMuted">No client-requested scope changes detected.</p>
+                                </div>
+                            ) : (
+                                coSuggestions.map((s) => {
+                                    const created = createdCOs[s.id];
+                                    const isCreatingThis = creatingIds.has(s.id);
+                                    const confidenceStyles = {
+                                        high: "bg-green-100 text-green-800",
+                                        medium: "bg-amber-100 text-amber-800",
+                                        low: "bg-slate-100 text-slate-600",
+                                    }[s.confidence];
+                                    return (
+                                        <div key={s.id} className="border border-hui-border rounded-lg p-4 hover:shadow-sm transition">
+                                            <div className="flex items-start justify-between gap-3">
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="flex items-center gap-2 flex-wrap">
+                                                        <h3 className="text-sm font-semibold text-hui-textMain">{s.title}</h3>
+                                                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide ${confidenceStyles}`}>
+                                                            {s.confidence} confidence
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-xs text-hui-textMuted mt-1.5">{s.description}</p>
+                                                    {s.sourceLogDates.length > 0 && (
+                                                        <p className="text-[10px] text-hui-textMuted mt-2">
+                                                            From log{s.sourceLogDates.length > 1 ? "s" : ""}: {s.sourceLogDates.join(", ")}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                                <div className="shrink-0">
+                                                    {created ? (
+                                                        <button
+                                                            onClick={() => router.push(`/projects/${projectId}/change-orders/${created.id}`)}
+                                                            className="hui-btn hui-btn-secondary text-xs whitespace-nowrap"
+                                                        >
+                                                            View {created.code}
+                                                        </button>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => handleCreateDraftCO(s)}
+                                                            disabled={isCreatingAny || !coMeta?.targetEstimateId}
+                                                            className="hui-btn hui-btn-primary text-xs whitespace-nowrap disabled:opacity-50"
+                                                        >
+                                                            {isCreatingThis ? "Creating..." : "Create draft CO"}
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })
+                            )}
                         </div>
                         <div className="p-4 border-t border-hui-border">
                             <button onClick={() => setShowCOModal(false)} className="hui-btn hui-btn-secondary text-sm">Close</button>

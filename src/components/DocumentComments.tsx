@@ -12,19 +12,17 @@ type Comment = {
     authorName: string | null;
     author: { id: string; name: string | null; email: string } | null;
     createdAt: string;
+    // Computed server-side (author-or-admin) — never derived client-side.
+    canDelete: boolean;
 };
 
 export default function DocumentComments({
     documentType,
     documentId,
-    currentUserId,
-    currentUserName,
     showClientTab = true,
 }: {
     documentType: string;
     documentId: string;
-    currentUserId?: string;
-    currentUserName?: string;
     showClientTab?: boolean;
 }) {
     const [comments, setComments] = useState<Comment[]>([]);
@@ -51,8 +49,6 @@ export default function DocumentComments({
                 documentId,
                 text,
                 activeTab,
-                currentUserId,
-                currentUserName,
             );
             setComments((prev) => [...prev, { ...comment, createdAt: (comment as any).createdAt?.toISOString?.() || String((comment as any).createdAt) }]);
             setNewText("");
@@ -177,10 +173,12 @@ export default function DocumentComments({
                                 <div className="flex items-baseline gap-2">
                                     <span className="text-xs font-semibold text-slate-700">{getAuthorDisplay(c)}</span>
                                     <span className="text-[10px] text-slate-400">{formatTime(c.createdAt)}</span>
-                                    {c.authorId === currentUserId && (
+                                    {/* canDelete is computed server-side (author-or-admin); the
+                                        server still enforces it independently on delete. */}
+                                    {c.canDelete && (
                                         <button
                                             onClick={() => handleDelete(c.id)}
-                                            className="text-[10px] text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition ml-auto"
+                                            className="text-[10px] text-slate-300 hover:text-red-500 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition ml-auto"
                                         >
                                             Delete
                                         </button>

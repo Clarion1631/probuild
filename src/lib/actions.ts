@@ -12,7 +12,7 @@ import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
-import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { coLineCents } from "./co-tax";
@@ -7195,6 +7195,21 @@ export async function savePortalVisibility(projectId: string, data: {
     return { success: true };
 }
 
+export async function setPaymentRemindersEnabled(projectId: string, enabled: boolean) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    if (!canAccessProject(user, projectId)) return { success: false, error: "Forbidden" };
+
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { paymentRemindersEnabled: enabled },
+    });
+    revalidatePath(`/projects/${projectId}/client-portal`);
+    revalidatePath(`/projects/${projectId}/settings`);
+    return { success: true };
+}
+
 // =============================================
 // Portal Dashboard Shared Actions
 // =============================================
@@ -7361,6 +7376,71 @@ export async function createChangeOrder(projectId: string, estimateId: string, i
 
     revalidatePath(`/projects/${projectId}/change-orders`);
     return { id: changeOrder.id };
+}
+
+// AI-suggested change orders: ONE transactional creation path used by the
+// daily-logs "Create draft CO" flow. Deliberately self-contained (auth +
+// estimate resolution + title/description all in one call) rather than a
+// create-then-update pair — a two-call flow can leave an orphaned Draft CO
+// if the second call fails, and would require trusting a client-held
+// estimateId that could point at a different project's estimate.
+export async function createSuggestedChangeOrder(
+    projectId: string,
+    data: { title: string; description?: string }
+) {
+    "use server";
+
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "changeOrders")) throw new Error("Forbidden");
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const title = data.title?.trim();
+    if (!title) throw new Error("title is required");
+    const description = data.description?.trim() || null;
+
+    const changeOrder = await prisma.$transaction(async (tx) => {
+        // Re-resolve the estimate server-side — never trust a client-held
+        // estimateId. Only an Approved estimate qualifies; no "most recent"
+        // fallback, since an unsigned estimate isn't a real base scope yet.
+        const candidate = await tx.estimate.findFirst({
+            where: { projectId, status: "Approved", archivedAt: null },
+            select: { id: true },
+            orderBy: { createdAt: "desc" },
+        });
+        if (!candidate) {
+            throw new Error("This project has no approved estimate to attach a change order to — create one first.");
+        }
+        // Defense-in-depth: re-verify the resolved estimate still belongs to
+        // exactly this project (id + projectId together) before creating the
+        // CO — kills any cross-project pairing bug even if the resolution
+        // query above is ever refactored to accept an id from elsewhere.
+        const estimate = await tx.estimate.findFirst({
+            where: { id: candidate.id, projectId },
+            select: { id: true },
+        });
+        if (!estimate) {
+            throw new Error("Estimate no longer belongs to this project — try again.");
+        }
+
+        const created = await tx.changeOrder.create({
+            data: {
+                title,
+                description,
+                projectId,
+                estimateId: estimate.id,
+                code: "CO-TEMP",
+                status: "Draft",
+            },
+        });
+        return tx.changeOrder.update({
+            where: { id: created.id },
+            data: { code: `CO-${String(created.number).padStart(5, "0")}` },
+        });
+    });
+
+    revalidatePath(`/projects/${projectId}/change-orders`);
+    return { id: changeOrder.id, code: changeOrder.code };
 }
 
 export async function getChangeOrders(projectId: string) {
@@ -9073,12 +9153,105 @@ export async function deleteRetainer(id: string) {
 
 // ========== DOCUMENT COMMENTS ==========
 
+// documentType is a free-typed string coming from a server action, i.e.
+// untrusted at runtime regardless of the TS signature — whitelist it.
+// Portal (non-staff) access is only wired up for "estimate" and "invoice"
+// below; the other two are staff-only surfaces (no portal ownership shape
+// resolved for them yet).
+const DOCUMENT_COMMENT_TYPES = ["estimate", "invoice", "change-order", "purchase-order", "contract"] as const;
+type DocumentCommentType = (typeof DOCUMENT_COMMENT_TYPES)[number];
+
+function assertValidDocumentType(documentType: string): asserts documentType is DocumentCommentType {
+    if (!(DOCUMENT_COMMENT_TYPES as readonly string[]).includes(documentType)) {
+        throw new Error("Invalid documentType");
+    }
+}
+
+function assertValidVisibility(visibility: string): asserts visibility is "team" | "client" {
+    if (visibility !== "team" && visibility !== "client") {
+        throw new Error("Invalid visibility");
+    }
+}
+
+// A staff session whose User row has flipped to DISABLED must not be trusted
+// here. getCurrentUserWithPermissions() doesn't filter on status (NextAuth's
+// jwt() callback only re-checks `role` on token refresh, not `status` — see
+// signIn() in lib/auth.ts, which only rejects DISABLED at initial login), so
+// an existing session survives a disable until the token expires. That's a
+// pre-existing gap in the shared helper across the whole app, not something
+// safe to fix here — see the PR body for the follow-up. Scoped locally:
+function activeStaffUser<T extends { status: string }>(user: T | null): T | null {
+    return user && user.status !== "DISABLED" ? user : null;
+}
+
+// Resolves the Client that owns a given document, for portal ownership
+// checks. Returns null for document types with no portal-ownership shape
+// (change-order, purchase-order, contract) or when the document isn't found.
+async function resolveDocumentOwnerClientId(documentType: DocumentCommentType, documentId: string): Promise<string | null> {
+    if (documentType === "estimate") {
+        const estimate = await prisma.estimate.findUnique({
+            where: { id: documentId },
+            select: {
+                project: { select: { clientId: true } },
+                lead: { select: { clientId: true } },
+            },
+        });
+        return estimate?.project?.clientId ?? estimate?.lead?.clientId ?? null;
+    }
+    if (documentType === "invoice") {
+        const invoice = await prisma.invoice.findUnique({
+            where: { id: documentId },
+            select: { clientId: true },
+        });
+        return invoice?.clientId ?? null;
+    }
+    return null;
+}
+
+function withCanDelete<T extends { authorId: string | null }>(
+    comments: T[],
+    staffUser: { id: string; role: string } | null,
+): (T & { canDelete: boolean })[] {
+    if (!staffUser) return comments.map((c) => ({ ...c, canDelete: false }));
+    const isAdminOrManager = ["ADMIN", "MANAGER"].includes(staffUser.role);
+    return comments.map((c) => ({ ...c, canDelete: isAdminOrManager || c.authorId === staffUser.id }));
+}
+
 export async function getDocumentComments(documentType: string, documentId: string) {
-    return prisma.documentComment.findMany({
-        where: { documentType, documentId },
+    assertValidDocumentType(documentType);
+
+    // Read-side gating mirrors the write side: staff sessions see both
+    // visibilities, portal clients see client-visible comments only for a
+    // document their session-resolved Client actually owns, and anyone else
+    // (server actions are callable by any authenticated-or-not client) gets
+    // nothing back — otherwise a caller who merely knows a documentId (e.g.
+    // from a portal URL) could read another client's, or TEAM-visibility,
+    // comments.
+    const staffUser = activeStaffUser(await getCurrentUserWithPermissions());
+    if (staffUser) {
+        const comments = await prisma.documentComment.findMany({
+            where: { documentType, documentId },
+            orderBy: { createdAt: "asc" },
+            include: { author: { select: { id: true, name: true, email: true } } },
+        });
+        return withCanDelete(comments, staffUser);
+    }
+
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return [];
+
+    const ownerClientId = await resolveDocumentOwnerClientId(documentType, documentId);
+    if (!ownerClientId || ownerClientId !== sessionClientId) return [];
+
+    const comments = await prisma.documentComment.findMany({
+        where: { documentType, documentId, visibility: "client" },
         orderBy: { createdAt: "asc" },
         include: { author: { select: { id: true, name: true, email: true } } },
     });
+    // No portal mount exists for this component yet, so portal-authored
+    // deletes stay admin-only (deleteDocumentComment already enforces that —
+    // see its comment below) — canDelete is always false from this branch.
+    return withCanDelete(comments, null);
 }
 
 export async function addDocumentComment(
@@ -9086,17 +9259,62 @@ export async function addDocumentComment(
     documentId: string,
     text: string,
     visibility: "team" | "client",
-    authorId?: string,
-    authorName?: string,
 ) {
+    assertValidDocumentType(documentType);
+    assertValidVisibility(visibility);
+
+    // Derive the author from the session — never trust a client-supplied
+    // authorId/authorName (the old signature accepted both as plain args).
+    // Team-visible comments are internal-only and require a signed-in staff
+    // user. Client-visible comments may come from staff posting on the
+    // client's behalf, or from a logged-in portal client whose
+    // session-resolved Client actually owns this document.
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Comment text is required");
+
+    let authorId: string | null = null;
+    let authorName: string | null = null;
+
+    const staffUser = activeStaffUser(await getCurrentUserWithPermissions());
+    if (staffUser) {
+        authorId = staffUser.id;
+        authorName = staffUser.name || staffUser.email;
+    } else if (visibility === "team") {
+        throw new Error("Unauthorized");
+    } else {
+        const sessionClientId = await resolveSessionClientId();
+        if (!sessionClientId) throw new Error("Unauthorized");
+
+        const ownerClientId = await resolveDocumentOwnerClientId(documentType, documentId);
+        if (!ownerClientId || ownerClientId !== sessionClientId) throw new Error("Unauthorized");
+
+        const client = await prisma.client.findUnique({ where: { id: sessionClientId }, select: { name: true } });
+        authorName = client?.name || "Client";
+    }
+
     const comment = await prisma.documentComment.create({
-        data: { documentType, documentId, text, visibility, authorId: authorId || null, authorName: authorName || null },
+        data: { documentType, documentId, text: trimmed, visibility, authorId, authorName },
         include: { author: { select: { id: true, name: true, email: true } } },
     });
-    return comment;
+    // The caller can always delete the comment they just created if they're
+    // staff (matches withCanDelete's authorId === staffUser.id branch);
+    // portal-authored comments stay non-deletable from the client's own view.
+    return { ...comment, canDelete: !!staffUser };
 }
 
 export async function deleteDocumentComment(commentId: string) {
+    // Only the comment's own author, or an ADMIN/MANAGER, may delete it.
+    // Non-staff (portal) callers never satisfy either check today — there's
+    // no portal mount for this component yet, so portal-authored comments
+    // are deliberately admin-only to delete for now (see getDocumentComments).
+    const staffUser = activeStaffUser(await getCurrentUserWithPermissions());
+    const comment = await prisma.documentComment.findUnique({ where: { id: commentId }, select: { authorId: true } });
+    if (!comment) return { success: true };
+
+    const isOwnComment = !!staffUser && comment.authorId === staffUser.id;
+    const isAdminOrManager = !!staffUser && ["ADMIN", "MANAGER"].includes(staffUser.role);
+    if (!isOwnComment && !isAdminOrManager) throw new Error("Unauthorized");
+
     await prisma.documentComment.delete({ where: { id: commentId } });
     return { success: true };
 }

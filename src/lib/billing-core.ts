@@ -47,6 +47,13 @@ async function logActivityLazy(entry: Parameters<typeof import("./actions").logA
     return logActivity(entry);
 }
 
+// Shared HTML-escaping for values interpolated into email templates below —
+// titles, names, and project names are user/AI supplied and must not be able
+// to inject markup into an email we control the "from" address of.
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Read: everything ChatGPT needs to find the right invoice/milestone for a job.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -901,7 +908,7 @@ export async function handleChangeOrderApproved(changeOrderId: string, opts?: { 
     // Team notification (System Notification Email in Settings → Company).
     if (opts?.notify === false) return summary;
     try {
-        const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        const esc = escapeHtml;
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, companyName: true, email: true } });
         const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
         if (to) {
@@ -959,6 +966,15 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
         // since the caller checked must not get a signature request.
         if (co.status !== "Draft" && co.status !== "Sent") {
             return { kind: "error", error: `Change order ${co.code} is no longer in a sendable state (now "${co.status}") — refresh and retry.` };
+        }
+
+        // An unpriced draft (e.g. an AI-suggested CO the PM hasn't priced yet)
+        // must never reach the client for signature at $0 — once approved it
+        // bills and locks, and a $0 approved CO can't be repaired.
+        const itemCount = await tx.changeOrderItem.count({ where: { changeOrderId } });
+        const rawSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
+        if (itemCount === 0 || rawSubtotal <= 0) {
+            return { kind: "error", error: `Change order ${co.code} has no priced items yet — add pricing before sending it to the client.` };
         }
 
         const project = await tx.project.findUnique({
@@ -1024,15 +1040,15 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
             <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
                 <h2 style="font-size: 20px; margin: 0 0 8px;">Change Order for Your Review</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${client.name},</p>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${escapeHtml(client.name)},</p>
                 <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you a change order titled "<strong>${title}</strong>" for project <strong>${projectName || "your project"}</strong>.
+                    ${escapeHtml(companyName)} has sent you a change order titled "<strong>${escapeHtml(title)}</strong>" for project <strong>${escapeHtml(projectName || "your project")}</strong>.
                     Please review the scope changes and approve or decline.
                 </p>
                 <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
                     <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
                     <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>
-                    ${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${taxLabel}</div>` : ""}
+                    ${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${escapeHtml(taxLabel)}</div>` : ""}
                 </div>
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
@@ -1044,7 +1060,7 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
                 </p>
             </div>
             <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
-                Sent via ProBuild &bull; ${companyName}
+                Sent via ProBuild &bull; ${escapeHtml(companyName)}
             </p>
         </body>
         </html>`,

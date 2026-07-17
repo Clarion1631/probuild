@@ -46,6 +46,7 @@ export default async function ClientPortalPage({ params }: Props) {
         showFiles: visibility?.showFiles ?? false,
         showDailyLogs: visibility?.showDailyLogs ?? false,
         showMessages: visibility?.showMessages ?? true,
+        paymentRemindersEnabled: project.paymentRemindersEnabled ?? false,
         lastSharedAt: visibility?.lastSharedAt ?? null,
         lastShareEmailId: visibility?.lastShareEmailId ?? null,
         lastShareEmailStatus: visibility?.lastShareEmailStatus ?? null,
