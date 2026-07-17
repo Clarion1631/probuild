@@ -9,6 +9,7 @@ import RecordPaymentModal from "@/components/RecordPaymentModal";
 import BulkActionBar from "@/components/BulkActionBar";
 import SendMilestonesModal from "@/components/SendMilestonesModal";
 import UndoPaymentModal from "@/components/UndoPaymentModal";
+import DocumentComments from "@/components/DocumentComments";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 
@@ -469,6 +470,17 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                             placeholder="Add internal notes or payment instructions that will be visible to the client..."
                             className="hui-input w-full h-24 resize-none text-sm"
                         />
+                    </div>
+
+                    {/* Comments */}
+                    <div className="hui-card p-6">
+                        <h2 className="font-semibold text-hui-textMain flex items-center gap-2 mb-3">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                            Comments
+                        </h2>
+                        <div className="h-96 border border-hui-border rounded-lg overflow-hidden">
+                            <DocumentComments documentType="invoice" documentId={initialInvoice.id} showClientTab={true} />
+                        </div>
                     </div>
 
                     {/* Payments Schedule */}
