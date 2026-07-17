@@ -158,6 +158,15 @@ export const FLOORS: Finish[] = [
   F("floor-tile-marble", "Marble Tile", "#E6E4DF", 0.25, "#DBD9D3"),
   F("floor-concrete", "Polished Concrete", "#9D9B96", 0.4),
   F("floor-lvp-coastal", "Coastal LVP", "#C9B795", 0.58, "#BFAD8A"),
+  // Outdoor ground + decking (grass/paver/brick ids drive the procedural
+  // ground textures in canvas/Room.tsx).
+  F("floor-grass", "Lawn Grass", "#7A9B5A", 0.95, "#69884C"),
+  F("floor-paver-stone", "Stone Pavers", "#B7AE9E", 0.8, "#A39A89"),
+  F("floor-bluestone", "Bluestone Patio", "#6E7A80", 0.75, "#5F6B71"),
+  F("floor-brick-red", "Brick Pavers", "#A56A52", 0.8, "#96604A"),
+  F("floor-concrete-patio", "Broom Concrete", "#B0ACA2", 0.85, "#A5A198"),
+  F("floor-deck-cedar", "Cedar Decking", "#A9744C", 0.7, "#9A6942"),
+  F("floor-deck-composite", "Composite Deck", "#8A7A6A", 0.7, "#7C6E60"),
 ];
 
 // ─────────────────────────── Countertops (10) ───────────────────────────
@@ -234,6 +243,10 @@ export const WOODS: Finish[] = [
   { id: "wood-walnut", name: "Walnut", kind: "wood", hex: "#5F452F", roughness: 0.5 },
   { id: "wood-black", name: "Black Stain", kind: "wood", hex: "#2E2A26", roughness: 0.55 },
   { id: "wood-white", name: "White", kind: "wood", hex: "#E9E6DE", roughness: 0.55 },
+  // Exterior species (decks, fences, pergolas, outdoor furniture).
+  { id: "wood-cedar", name: "Cedar", kind: "wood", hex: "#9C6B43", roughness: 0.65 },
+  { id: "wood-teak", name: "Teak", kind: "wood", hex: "#A87F4F", roughness: 0.6 },
+  { id: "wood-weathered", name: "Weathered Gray", kind: "wood", hex: "#8D8578", roughness: 0.75 },
 ];
 
 export const TILES: Finish[] = [

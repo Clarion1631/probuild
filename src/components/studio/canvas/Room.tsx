@@ -40,8 +40,31 @@ function floorTexture(finishId: string): THREE.CanvasTexture | null {
   ctx.fillStyle = base;
   ctx.fillRect(0, 0, 512, 512);
 
-  const isTile = finishId.includes("tile") || finishId.includes("concrete");
-  if (isTile) {
+  const isGrass = finishId.includes("grass");
+  const isTile =
+    finishId.includes("tile") || finishId.includes("concrete") ||
+    finishId.includes("paver") || finishId.includes("bluestone") || finishId.includes("brick");
+  if (isGrass) {
+    // Mottled lawn: layered soft blotches + short blade strokes.
+    for (let i = 0; i < 260; i++) {
+      ctx.globalAlpha = 0.1;
+      ctx.fillStyle = i % 2 ? accent : blend(base, "#8FAE68", 0.5);
+      const s = 8 + Math.random() * 26;
+      ctx.fillRect(Math.random() * 512, Math.random() * 512, s, s);
+    }
+    ctx.globalAlpha = 0.16;
+    ctx.strokeStyle = blend(accent, "#3E5230", 0.5);
+    ctx.lineWidth = 1.2;
+    for (let i = 0; i < 220; i++) {
+      const x = Math.random() * 512;
+      const y = Math.random() * 512;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + (Math.random() - 0.5) * 5, y - 4 - Math.random() * 6);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  } else if (isTile) {
     // 2x2 tile grid with grout lines (texture covers 2ft x 2ft world space).
     ctx.fillStyle = accent;
     for (let i = 0; i < 24; i++) {
@@ -229,6 +252,7 @@ export function Room({ doc }: { doc: DesignDoc }) {
   };
 
   const t = doc.room.wallThickness;
+  const outdoor = !!doc.room.outdoor;
 
   return (
     <group>
@@ -276,13 +300,15 @@ export function Room({ doc }: { doc: DesignDoc }) {
                 roughness={finish.roughness ?? 0.94}
                 onClick={(e) => onWallClick(e, w.index)}
               />
-              {/* baseboard on the interior face */}
-              <mesh position={[w.length / 2, 0.057, inwardZ * 0.011]} receiveShadow raycast={() => null}>
-                <boxGeometry args={[w.length, 0.114, 0.022]} />
-                <meshStandardMaterial color="#eceae3" roughness={0.7} />
-              </mesh>
+              {/* baseboard on the interior face (indoor rooms only) */}
+              {!outdoor && (
+                <mesh position={[w.length / 2, 0.057, inwardZ * 0.011]} receiveShadow raycast={() => null}>
+                  <boxGeometry args={[w.length, 0.114, 0.022]} />
+                  <meshStandardMaterial color="#eceae3" roughness={0.7} />
+                </mesh>
+              )}
               {/* crown molding - level walls only (sloped tops skip it) */}
-              {doc.room.crown && level && (
+              {doc.room.crown && level && !outdoor && (
                 <mesh
                   position={[w.length / 2, hStart - 0.045, inwardZ * 0.019]}
                   rotation={[inwardZ * Math.PI / 4, 0, 0]}
@@ -298,8 +324,8 @@ export function Room({ doc }: { doc: DesignDoc }) {
         })}
       </group>
 
-      {/* Ceiling - walk mode only so orbit/plan stay open */}
-      {view === "walk" && (
+      {/* Ceiling - walk mode only so orbit/plan stay open; outdoor spaces have open sky */}
+      {view === "walk" && !outdoor && (
         <CeilingMesh
           shell={shell}
           color={getFinish(doc.surfaces.ceiling, "paint-pure-white").hex}
