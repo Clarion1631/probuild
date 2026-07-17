@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
+import { cookies } from "next/headers";
 import { authOptions } from "@/lib/auth";
 
 export type PermissionKey =
@@ -20,8 +21,27 @@ export async function getCurrentUserWithPermissions() {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) return null;
 
+    return getUserWithPermissionsByEmail(session.user.email);
+}
+
+export async function canUseDevAuthFallback() {
+    if (process.env.NODE_ENV !== "development") return false;
+    try {
+        const cookieStore = await cookies();
+        return !cookieStore.getAll().some(({ name }) =>
+            name === "next-auth.session-token"
+            || name.startsWith("next-auth.session-token.")
+            || name === "__Secure-next-auth.session-token"
+            || name.startsWith("__Secure-next-auth.session-token.")
+        );
+    } catch {
+        return false;
+    }
+}
+
+export async function getUserWithPermissionsByEmail(email: string) {
     const user = await prisma.user.findUnique({
-        where: { email: session.user.email },
+        where: { email: email.toLowerCase() },
         include: {
             permissions: true,
             projectAccess: { select: { projectId: true } },
@@ -29,7 +49,7 @@ export async function getCurrentUserWithPermissions() {
         },
     });
 
-    return user;
+    return user?.status === "DISABLED" ? null : user;
 }
 
 // Check if user has a specific permission

@@ -4,7 +4,7 @@ import "./globals.css";
 import Providers from "@/components/Providers";
 import AppLayout from "@/components/AppLayout";
 import { Toaster } from "sonner";
-import { getCompanySettings } from "@/lib/actions";
+import { getPublicCompanySettings } from "@/lib/actions";
 import { getSessionOrDev } from "@/lib/auth";
 import HelpChatWidgetWrapper from "@/components/HelpChatWidgetWrapper";
 import VersionWatcher from "@/components/VersionWatcher";
@@ -48,7 +48,7 @@ export default async function RootLayout({
   let settings = null;
   let session: any = null;
   try {
-    settings = await getCompanySettings();
+    settings = await getPublicCompanySettings();
     session = await getSessionOrDev();
   } catch {
     // During build-time static generation, DATABASE_URL may not exist — gracefully skip.

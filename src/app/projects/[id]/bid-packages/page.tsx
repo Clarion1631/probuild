@@ -3,6 +3,7 @@ import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { getProjectBidPackages } from "@/lib/actions";
 import { prisma } from "@/lib/prisma";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import BidPackagesClient from "./BidPackagesClient";
 
 interface Props {
@@ -14,6 +15,11 @@ export default async function BidPackagesPage({ params }: Props) {
 
     const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
+    const user = await getCurrentUserWithPermissions();
+    const devAllowed = await canUseDevAuthFallback();
+    if ((!user || !hasPermission(user, "financialReports")) && !devAllowed) {
+        return redirect(`/projects/${id}`);
+    }
 
     const [packages, project] = await Promise.all([
         getProjectBidPackages(id),

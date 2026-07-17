@@ -70,7 +70,7 @@ export default function EntitySidebar({
                     { label: "Room Designer", href: `/projects/${id}/room-designer`, permission: "roomDesigner" },
                     { label: "Mood Boards", href: `/projects/${id}/mood-boards` },
                     { label: "Selection Boards", href: `/projects/${id}/selections` },
-                    { label: "Bids", href: `/projects/${id}/bid-packages` },
+                    { label: "Bids", href: `/projects/${id}/bid-packages`, permission: "financialReports" },
                 ],
             },
             {

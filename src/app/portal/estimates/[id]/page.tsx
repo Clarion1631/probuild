@@ -1,4 +1,4 @@
-import { getEstimateForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
+import { getEstimateForPortal, getPublicCompanySettings, getPortalVisibility } from "@/lib/actions";
 import { notFound, redirect } from "next/navigation";
 import PortalEstimateClient from "./PortalEstimateClient";
 import Link from "next/link";
@@ -35,7 +35,7 @@ export default async function PortalEstimatePage({ params }: { params: Promise<{
     }
 
     const estimate = await getEstimateForPortal(resolvedParams.id);
-    const settings = await getCompanySettings();
+    const settings = await getPublicCompanySettings();
 
     if (!estimate) {
         return notFound();
