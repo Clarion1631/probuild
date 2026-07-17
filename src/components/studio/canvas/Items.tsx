@@ -49,6 +49,37 @@ export function resolveItem(item: PlacedItem): ResolvedItem | null {
   };
 }
 
+/**
+ * Deck platforms act as raised floors: return the top-surface Y of the deck
+ * under `p`, or undefined when `p` is over the plain floor. Floor-mounted
+ * items commit this as their `y` so they sit on the deck instead of
+ * intersecting it (drops back to undefined when dragged off).
+ */
+export function deckTopYAt(
+  items: PlacedItem[],
+  p: { x: number; z: number },
+  excludeId?: string,
+): number | undefined {
+  let top: number | undefined;
+  for (const it of items) {
+    if (it.defId !== "deck-platform" || it.id === excludeId) continue;
+    const r = resolveItem(it);
+    if (!r) continue;
+    // Express p in the deck's local frame (inverse of the three.js Y rotation)
+    // and test against the half-extents of its footprint.
+    const dx = p.x - it.x;
+    const dz = p.z - it.z;
+    const cos = Math.cos(it.rotation);
+    const sin = Math.sin(it.rotation);
+    const lx = dx * cos - dz * sin;
+    const lz = dx * sin + dz * cos;
+    if (Math.abs(lx) > r.w / 2 || Math.abs(lz) > r.d / 2) continue;
+    const t = r.y + r.h;
+    if (top === undefined || t > top) top = t;
+  }
+  return top;
+}
+
 interface DragState {
   pointerId: number;
   moved: boolean;
@@ -293,11 +324,18 @@ function ItemNode({
         Math.abs(drag.cur.z - item.z) > 1e-6 ||
         Math.abs(drag.cur.rotation - item.rotation) > 1e-6;
       if (changed) {
-        useStudio.getState().updateItem(item.id, {
+        const patch: Partial<PlacedItem> = {
           x: drag.cur.x,
           z: drag.cur.z,
           rotation: drag.cur.rotation,
-        });
+        };
+        // Deck auto-stack: floor items ride on top of a deck platform they
+        // land on and drop back to the floor when dragged off. Wall/ceiling/
+        // counter mounts and the decks themselves keep their own y.
+        if (def.mount === "floor" && def.id !== "deck-platform") {
+          patch.y = deckTopYAt(allItems, { x: drag.cur.x, z: drag.cur.z }, item.id);
+        }
+        useStudio.getState().updateItem(item.id, patch);
       } else {
         // restore the transient three.js pose to the committed one
         const g = groupRef.current;
