@@ -8117,16 +8117,28 @@ export async function createPurchaseOrder(projectId: string, data: any) {
     await assertFinancialProjectAccess(projectId);
     const count = await prisma.purchaseOrder.count({ where: { projectId } });
     const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
-    
-    const { items, ...poData } = data;
+    const items = data.items;
     
     const po = await prisma.purchaseOrder.create({
         data: {
-            ...poData,
             projectId,
             code,
+            vendorId: data.vendorId,
+            status: data.status,
+            totalAmount: data.totalAmount,
+            notes: data.notes,
+            memos: data.memos,
+            terms: data.terms,
             items: {
-                create: items || []
+                create: (items || []).map((item: any) => ({
+                    description: item.description,
+                    quantity: item.quantity,
+                    unitCost: item.unitCost,
+                    total: item.total,
+                    order: item.order,
+                    costCodeId: item.costCodeId,
+                    costTypeId: item.costTypeId,
+                })),
             }
         }
     });
@@ -8199,10 +8211,15 @@ export async function updatePurchaseOrder(id: string, data: any) {
     const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
     if (!existing) throw new Error("Purchase order not found");
     assertFinancialProjectScope(user, existing.projectId);
-    const { items, vendorId, ...poData } = data;
-    
-    let updateData: any = { ...poData };
-    if (vendorId) updateData.vendorId = vendorId;
+    const items = data.items;
+    const updateData = {
+        ...(data.vendorId ? { vendorId: data.vendorId } : {}),
+        status: data.status,
+        totalAmount: data.totalAmount,
+        notes: data.notes,
+        memos: data.memos,
+        terms: data.terms,
+    };
 
     const po = await prisma.purchaseOrder.update({
         where: { id },
@@ -9096,7 +9113,13 @@ export async function createBidPackage(projectId: string, data: {
 }) {
     await assertFinancialProjectAccess(projectId);
     const pkg = await prisma.bidPackage.create({
-        data: { projectId, ...data },
+        data: {
+            projectId,
+            title: data.title,
+            description: data.description,
+            dueDate: data.dueDate,
+            totalBudget: data.totalBudget,
+        },
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     return pkg;
@@ -9112,7 +9135,16 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     await assertFinancialProjectAccess(projectId);
     const existing = await prisma.bidPackage.findUnique({ where: { id }, select: { projectId: true } });
     if (!existing || existing.projectId !== projectId) throw new Error("Bid package not found");
-    const pkg = await prisma.bidPackage.update({ where: { id }, data });
+    const pkg = await prisma.bidPackage.update({
+        where: { id },
+        data: {
+            title: data.title,
+            description: data.description,
+            dueDate: data.dueDate,
+            status: data.status,
+            totalBudget: data.totalBudget,
+        },
+    });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
     return pkg;
@@ -9136,7 +9168,12 @@ export async function addBidScope(packageId: string, projectId: string, data: {
     const pkg = await prisma.bidPackage.findUnique({ where: { id: packageId }, select: { projectId: true } });
     if (!pkg || pkg.projectId !== projectId) throw new Error("Bid package not found");
     const scope = await prisma.bidScope.create({
-        data: { packageId, ...data },
+        data: {
+            packageId,
+            name: data.name,
+            description: data.description,
+            budgetAmount: data.budgetAmount,
+        },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return scope;
@@ -9185,7 +9222,12 @@ export async function recordBidResponse(invitationId: string, packageId: string,
     }
     const inv = await prisma.bidInvitation.update({
         where: { id: invitationId },
-        data: { ...data, respondedAt: new Date() },
+        data: {
+            status: data.status,
+            bidAmount: data.bidAmount,
+            notes: data.notes,
+            respondedAt: new Date(),
+        },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return inv;
