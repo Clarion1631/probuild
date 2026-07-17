@@ -102,6 +102,14 @@ test("standalone financial data actions enforce permission and project access", 
   expectGuardBeforeDatabase(timeExpenseSource, "getTimeExpenseData", "await assertTimeExpenseProjectAccess(");
 });
 
+test("financial action payloads cannot override authorized relationship keys", () => {
+  const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
+  for (const name of ["createPurchaseOrder", "updatePurchaseOrder", "createBidPackage", "updateBidPackage", "addBidScope", "recordBidResponse"]) {
+    const action = exportSource(source, name);
+    expect(action, `${name} must not spread an untrusted data object into Prisma`).not.toMatch(/\.\.\.(?:data|poData)\b/);
+  }
+});
+
 test("company settings split public branding from status-aware staff configuration", () => {
   const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
   const publicSelectStart = source.indexOf("const publicCompanySettingsSelect");
