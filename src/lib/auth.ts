@@ -21,9 +21,10 @@ if (process.env.PLAYWRIGHT_TEST_SECRET) {
             },
             async authorize(credentials) {
                 if (credentials?.secret !== process.env.PLAYWRIGHT_TEST_SECRET) return null;
-                if (!credentials.email) return null;
+                const email = credentials?.email;
+                if (!email) return null;
                 const user = await prisma.user.findUnique({
-                    where: { email: credentials.email.toLowerCase() },
+                    where: { email: email.toLowerCase() },
                 });
                 if (!user) return null;
                 return { id: user.id, name: user.name, email: user.email };
@@ -52,6 +53,10 @@ export const authOptions: NextAuthOptions = {
                     return "/login?error=AccessDenied";
                 }
 
+                if (existingUser.status === "DISABLED") {
+                    return "/login?error=AccessDenied";
+                }
+
                 // Activate user on first sign-in
                 if (existingUser.status === "PENDING") {
                     await prisma.user.update({
@@ -63,20 +68,26 @@ export const authOptions: NextAuthOptions = {
             return true;
         },
         async jwt({ token, user, trigger }) {
-            // Always read the latest role from DB (picks up admin role changes)
+            // Always read the latest role + DB id from DB.
+            // token.sub on Google sign-ins is the OAuth subject, NOT the local
+            // User.id, so anything storing token.sub as a User foreign key fails.
             if (token.email) {
                 const dbUser = await prisma.user.findUnique({
-                    where: { email: (token.email as string).toLowerCase() }
+                    where: { email: (token.email as string).toLowerCase() },
+                    select: { id: true, role: true },
                 });
                 if (dbUser) {
                     token.role = dbUser.role;
+                    (token as any).userId = dbUser.id;
                 }
             }
             return token;
         },
         async session({ session, token }) {
             if (session?.user) {
-                (session.user as any).id = token.sub;
+                // Only expose the local DB User.id. token.sub is the OAuth subject
+                // (Google sub for Google sign-ins) and is NOT a valid User.id.
+                (session.user as any).id = (token as any).userId ?? null;
                 (session.user as any).role = token.role;
             }
             return session;
@@ -85,10 +96,34 @@ export const authOptions: NextAuthOptions = {
     secret: process.env.NEXTAUTH_SECRET,
 };
 
-const DEV_SESSION = {
-    user: { name: "Dev User", email: "gtrsupport@goldentouchremodeling.com", image: "", role: "ADMIN" },
-    expires: new Date(Date.now() + 86400_000).toISOString(),
-};
+const DEV_USER_EMAIL = "gtrsupport@goldentouchremodeling.com";
+let cachedDevSession: any = null;
+let warnedNoDevUser = false;
+
+async function buildDevSession() {
+    if (cachedDevSession) return cachedDevSession;
+    const dev = await prisma.user.findUnique({
+        where: { email: DEV_USER_EMAIL },
+        select: { id: true, name: true, email: true, role: true },
+    });
+    if (!dev) {
+        if (!warnedNoDevUser) {
+            warnedNoDevUser = true;
+            console.warn(
+                `[auth] Dev session: no User row for ${DEV_USER_EMAIL}. Server actions that store the session user as a foreign key will fail. Seed this user in your local DB.`
+            );
+        }
+        return {
+            user: { id: null, name: "Dev User", email: DEV_USER_EMAIL, image: "", role: "ADMIN" },
+            expires: new Date(Date.now() + 86400_000).toISOString(),
+        };
+    }
+    cachedDevSession = {
+        user: { id: dev.id, name: dev.name ?? "Dev User", email: dev.email, image: "", role: dev.role ?? "ADMIN" },
+        expires: new Date(Date.now() + 86400_000).toISOString(),
+    };
+    return cachedDevSession;
+}
 
 /**
  * Like getServerSession but returns a mock ADMIN session in development
@@ -97,7 +132,7 @@ const DEV_SESSION = {
  */
 export async function getDevSession() {
     if (process.env.NODE_ENV !== "development") return null;
-    return DEV_SESSION as any;
+    return await buildDevSession();
 }
 
 export async function getSessionOrDev() {
@@ -107,6 +142,6 @@ export async function getSessionOrDev() {
     } catch {
         // getServerSession can throw when NEXTAUTH_SECRET is missing, etc.
     }
-    if (process.env.NODE_ENV === "development") return DEV_SESSION as any;
+    if (process.env.NODE_ENV === "development") return await buildDevSession();
     return null;
 }

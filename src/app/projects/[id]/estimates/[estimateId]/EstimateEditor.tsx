@@ -3,36 +3,142 @@
 /** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
 const rm = (n: number) => Math.round(n * 100) / 100;
 
-import { useState, useEffect, useRef, useCallback } from "react";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval } from "@/lib/actions";
+/** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
+function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
+    const cloned = schedules.map(s => ({ ...s }));
+    const unpaid = cloned.filter(s => s.status !== "Paid");
+    if (unpaid.length === 0) return cloned;
+
+    const paidSum = cloned.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const available = rm(total - paidSum);
+    const lastUnpaid = unpaid[unpaid.length - 1];
+
+    if (unpaid.length === 1) {
+        lastUnpaid.amount = String(Math.max(0, available));
+        const pct = parseFloat(lastUnpaid.percentage) || 0;
+        if (pct > 0 && Math.abs(available - rm(total * (pct / 100))) > 0.01) {
+            lastUnpaid.percentage = "";
+        }
+        return cloned;
+    }
+
+    for (const s of unpaid) {
+        if (s === lastUnpaid) continue;
+        const pct = parseFloat(s.percentage) || 0;
+        if (pct > 0) s.amount = String(rm(total * (pct / 100)));
+    }
+
+    const othersSum = unpaid.filter(s => s !== lastUnpaid).reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const residual = rm(available - othersSum);
+    lastUnpaid.amount = String(Math.max(0, residual));
+
+    const lastPct = parseFloat(lastUnpaid.percentage) || 0;
+    if (lastPct > 0 && Math.abs(residual - rm(total * (lastPct / 100))) > 0.01) {
+        lastUnpaid.percentage = "";
+    }
+
+    return cloned;
+}
+
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import dynamic from "next/dynamic";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
+import RichTextEditor from "@/components/RichTextEditor";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
-import SendEstimateModal from "@/components/SendEstimateModal";
-import SelectVendorModal from "./SelectVendorModal";
-import LogPaymentModal from "./LogPaymentModal";
+
+const SendEstimateModal = dynamic(() => import("@/components/SendEstimateModal"), { ssr: false });
+const SelectVendorModal = dynamic(() => import("./SelectVendorModal"), { ssr: false });
+const LogPaymentModal = dynamic(() => import("./LogPaymentModal"), { ssr: false });
+const RecordPaymentModal = dynamic(() => import("@/components/RecordPaymentModal"), { ssr: false });
+
+const EST_METHOD_LABELS: Record<string, string> = {
+    card: "Card",
+    ach: "ACH",
+    check: "Check",
+    cash: "Cash",
+    zelle: "Zelle",
+    venmo: "Venmo",
+    credit_card: "Credit Card",
+    wire: "Wire Transfer",
+    other: "Other",
+};
+function formatEstPaymentMethod(method: string | null | undefined, ref: string | null | undefined): string {
+    if (!method) return "";
+    const label = EST_METHOD_LABELS[method] ?? method.toUpperCase();
+    if (method === "check" && ref) return `Check #${ref}`;
+    if (ref) return `${label} · ${ref}`;
+    return label;
+}
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import ReusableSignaturePad from "@/components/ReusableSignaturePad";
-import DocumentComments from "@/components/DocumentComments";
+import { getTaxCertStatus, formatCertExpiry } from "@/lib/tax-cert";
 
-export default function EstimateEditor({ context, initialEstimate, defaultTax }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string }, initialEstimate: any, defaultTax?: { name: string; rate: number; isDefault?: boolean } | null }) {
+const ReusableSignaturePad = dynamic(() => import("@/components/ReusableSignaturePad"), { ssr: false });
+
+import DocumentComments from "@/components/DocumentComments";
+import BudgetStrip from "./BudgetStrip";
+
+const POQuickCreateModal = dynamic(() => import("./POQuickCreateModal"), { ssr: false });
+const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), { ssr: false });
+
+import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
+
+// Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
+// Mirrors the JSON shape that /api/ai-estimate/import + transformPhasesToItems expect.
+const CHATGPT_ESTIMATE_PROMPT = `You are a residential remodeling estimator. Produce a detailed construction estimate for the project described below as VALID JSON ONLY (no markdown, no commentary), in exactly this structure:
+
+{
+  "phases": [
+    {
+      "phaseName": "string (e.g. Demolition)",
+      "phaseCode": "string (optional)",
+      "items": [
+        { "name": "string", "description": "string", "costType": "Labor | Material | Allowance | Subcontractor | Equipment | Other", "quantity": number, "unit": "string e.g. sq ft, hr, each, job, linear ft", "unitCost": number }
+      ]
+    }
+  ],
+  "paymentMilestones": [ { "name": "string", "percentage": number } ]
+}
+
+Rules:
+- Organize into 6-12 logical construction phases, 2-5 line items each.
+- "unitCost" is the FINAL price charged to the client per unit (cost + markup already included). Line total = quantity x unitCost.
+- "costType" must be exactly one of the listed values. Use "Allowance" for customer selections (fixtures, finishes, appliances).
+- Use realistic Vancouver, WA / Pacific Northwest 2024-2025 market rates.
+- Provide 3-4 payment milestones whose percentages sum to 100.
+- Output ONLY the JSON object — no backticks, no explanation.
+
+PROJECT: <describe the scope of work, square footage, finishes, etc.>`;
+
+type ActivityEvent = { id: string; ts: string; kind: "created" | "sent" | "viewed" | "signed" | "invoice" | "payment" | "other"; title: string; detail?: string | null };
+
+export default function EstimateEditor({ context, initialEstimate, salesTaxes = [], settings, activityEvents }: { context: { type: "project" | "lead", id: string, name: string, clientName: string, clientEmail?: string, location?: string, clientTaxExemptCertUrl?: string | null, clientTaxExemptCertExpiresAt?: string | null }, initialEstimate: any, salesTaxes?: { id?: string; name: string; rate: number; isDefault?: boolean }[], settings?: any, activityEvents?: ActivityEvent[] }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
     const [status, setStatus] = useState(initialEstimate.status);
     const [items, setItems] = useState<any[]>(initialEstimate.items || []);
     const [paymentSchedules, setPaymentSchedules] = useState<any[]>(initialEstimate.paymentSchedules || []);
+    // Invoice generated from this estimate (if any) — milestone edits here do not
+    // cascade to it, so the schedule UI warns when one exists.
+    const linkedInvoice: { id: string; code: string; status: string } | null =
+        initialEstimate.invoices?.[0] || null;
     const [isSaving, setIsSaving] = useState(false);
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [activeTab, setActiveTab] = useState("builder"); // builder | expenses
     const [showSendModal, setShowSendModal] = useState(false);
     const [costCodes, setCostCodes] = useState<any[]>([]);
-    const [costTypes, setCostTypes] = useState<any[]>([]);
+    // Cost types are an expense concept; estimate lines carry a plain type label instead.
+    const ITEM_TYPE_LABELS = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
     const [showAiModal, setShowAiModal] = useState(false);
     const [aiPrompt, setAiPrompt] = useState("");
     const [isGenerating, setIsGenerating] = useState(false);
+    const [showImportModal, setShowImportModal] = useState(false);
+    const [importJson, setImportJson] = useState("");
+    const [isImporting, setIsImporting] = useState(false);
     const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [viewMode, setViewMode] = useState<"internal" | "client">("client");
     const [showTemplateModal, setShowTemplateModal] = useState(false);
@@ -45,14 +151,54 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [isCreatingPO, setIsCreatingPO] = useState(false);
     const [isSyncingQB, setIsSyncingQB] = useState(false);
     const [showPaymentModal, setShowPaymentModal] = useState(false);
+    const [recordingEstPayment, setRecordingEstPayment] = useState<{ id: string; name: string; amount: number } | null>(null);
+    const [isSendingEstReceipt, setIsSendingEstReceipt] = useState<string | null>(null);
+    const [isUndoingEstPayment, setIsUndoingEstPayment] = useState<string | null>(null);
+    const [undoPaymentTarget, setUndoPaymentTarget] = useState<any | null>(null);
+    const savedScheduleIds = useMemo(() => new Set((initialEstimate.paymentSchedules || []).map((s: any) => s.id)), [initialEstimate.paymentSchedules]);
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
+    const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
+    const defaultTaxRate = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
+    // Preserve the originally saved rate even if it was renamed/removed from settings,
+    // so we don't silently overwrite it with the default on next save.
+    const orphanedRate = useMemo(() => {
+        const savedName = initialEstimate.taxRateName;
+        const savedPct = initialEstimate.taxRatePercent;
+        if (!savedName || savedPct == null) return null;
+        if (salesTaxes.some(t => t.name === savedName && Number(t.rate) === Number(savedPct))) return null;
+        return { name: savedName, rate: Number(savedPct), isDefault: false, orphaned: true as const };
+    }, [initialEstimate.taxRateName, initialEstimate.taxRatePercent, salesTaxes]);
+    const taxOptions = orphanedRate ? [...salesTaxes, orphanedRate] : salesTaxes;
+    const [selectedTaxName, setSelectedTaxName] = useState<string | null>(
+        initialEstimate.taxRateName ?? defaultTaxRate?.name ?? null
+    );
+    const [isAiFilling, setIsAiFilling] = useState(false);
+    const [isAiAssigningPhases, setIsAiAssigningPhases] = useState(false);
+    const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
+    const [overwriteExisting, setOverwriteExisting] = useState(false);
     const [expirationDate, setExpirationDate] = useState<string>(initialEstimate.expirationDate ? new Date(initialEstimate.expirationDate).toISOString().split("T")[0] : "");
     const [showSidebar, setShowSidebar] = useState(false);
-    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments">("overview");
+    const [sidebarTab, setSidebarTab] = useState<"overview" | "activity" | "comments" | "history">("overview");
     const [termsAndConditions, setTermsAndConditions] = useState<string>(initialEstimate.termsAndConditions || "");
     const [showTerms, setShowTerms] = useState(false);
+    const [termsTemplates, setTermsTemplates] = useState<{id: string; name: string; body: string; isDefault: boolean}[]>([]);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
+    // Project Overview / Vision (client-facing cover section, no pricing)
+    const [overviewEnabled, setOverviewEnabled] = useState<boolean>(initialEstimate.overviewEnabled ?? false);
+    const [overviewTitle, setOverviewTitle] = useState<string>(initialEstimate.overviewTitle || "");
+    const [overviewBody, setOverviewBody] = useState<string>(initialEstimate.overviewBody || "");
+    const [showOverview, setShowOverview] = useState<boolean>(!!initialEstimate.overviewEnabled);
+    const [overviewTemplates, setOverviewTemplates] = useState<{ id: string; name: string; body: string; isDefault: boolean }[]>([]);
+    // Estimate Notes & Assumptions (client-facing, placed before/after line items)
+    const [notesEnabled, setNotesEnabled] = useState<boolean>(initialEstimate.notesEnabled ?? false);
+    const [notesTitle, setNotesTitle] = useState<string>(initialEstimate.notesTitle || "");
+    const [notesBody, setNotesBody] = useState<string>(initialEstimate.notesBody || "");
+    const [notesPlacement, setNotesPlacement] = useState<"before" | "after">(initialEstimate.notesPlacement === "before" ? "before" : "after");
+    const [showNotes, setShowNotes] = useState<boolean>(!!initialEstimate.notesEnabled);
+    const [notesTemplates, setNotesTemplates] = useState<{ id: string; name: string; body: string; isDefault: boolean }[]>([]);
+    const [isSavingOverviewTpl, setIsSavingOverviewTpl] = useState(false);
+    const [isSavingNotesTpl, setIsSavingNotesTpl] = useState(false);
     const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
     const [isUploadingFile, setIsUploadingFile] = useState(false);
     const [signatureUrl, setSignatureUrl] = useState<string | null>(initialEstimate.signatureUrl || null);
@@ -69,6 +215,114 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     const [aiSubitemSuggestions, setAiSubitemSuggestions] = useState<any[]>([]);
     const [showSubitemSuggestions, setShowSubitemSuggestions] = useState<string | null>(null);
     const [selectedSuggestionIndices, setSelectedSuggestionIndices] = useState<Set<number>>(new Set());
+    const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => {
+        const initialItems = initialEstimate.items || [];
+        const parentIds = initialItems.filter((i: any) => i.parentId).map((i: any) => i.parentId);
+        return new Set(parentIds);
+    });
+    const [history, setHistory] = useState<Array<{ ts: number; label: string; snapshot: any[] }>>([]);
+    const [showHistory, setShowHistory] = useState(false);
+    const [expandedHistoryTs, setExpandedHistoryTs] = useState<number | null>(null);
+    const [poCreateItemId, setPOCreateItemId] = useState<string | null>(null);
+    const [poLinkItemId, setPOLinkItemId] = useState<string | null>(null);
+    const [projectPOs, setProjectPOs] = useState<any[]>([]);
+    const [loadingPOs, setLoadingPOs] = useState(false);
+
+    const lastSavedStateRef = useRef<string>("");
+
+    const getEstimateSnapshot = useCallback(() => {
+        const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
+
+        const childTotals = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        const mappedItems = items.map((item, index) => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            const computedTotal = isSection
+                ? (childTotals.get(item.id) || 0)
+                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+            return {
+                id: item.id || null,
+                parentId: item.parentId || null,
+                name: item.name || "",
+                description: item.description || "",
+                type: item.type || "Material",
+                quantity: String(item.quantity || "0"),
+                unitCost: String(item.unitCost || "0"),
+                costCodeId: item.costCodeId || null,
+                costTypeId: item.costTypeId || null,
+                vendorId: item.vendorId || null,
+                approvalStatus: item.approvalStatus || null,
+                order: index,
+                total: computedTotal,
+            };
+        });
+
+        const mappedSchedules = paymentSchedules.map((schedule, index) => ({
+            id: schedule.id || null,
+            name: schedule.name || "",
+            amount: String(schedule.amount || "0"),
+            dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
+            status: schedule.status || "Pending",
+            paymentMethod: schedule.paymentMethod || null,
+            paymentReference: schedule.paymentReference || null,
+            percentage: String(schedule.percentage || "0"),
+            type: schedule.type || null,
+            order: index
+        }));
+
+        return {
+            title: title || "",
+            code: code || "",
+            status: status || "Draft",
+            processingFeeMarkup: Number(processingFeeMarkup) || 0,
+            hideProcessingFee: !!hideProcessingFee,
+            expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
+            memo: memo || null,
+            termsAndConditions: termsAndConditions || null,
+            overviewEnabled: !!overviewEnabled,
+            overviewTitle: overviewTitle || null,
+            overviewBody: overviewBody || null,
+            notesEnabled: !!notesEnabled,
+            notesTitle: notesTitle || null,
+            notesBody: notesBody || null,
+            notesPlacement,
+            signatureUrl: signatureUrl || null,
+            targetMarginPercent: parseFloat(targetMargin) || 25,
+            taxExempt: !!taxExempt,
+            taxRateName: taxExempt ? null : (activeTax?.name || null),
+            taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            items: mappedItems,
+            paymentSchedules: mappedSchedules,
+        };
+    }, [
+        title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
+        memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
+        notesEnabled, notesTitle, notesBody, notesPlacement,
+        signatureUrl, targetMargin, taxExempt, selectedTaxName,
+        taxOptions, defaultTaxRate, items, paymentSchedules
+    ]);
+
+    useEffect(() => {
+        lastSavedStateRef.current = JSON.stringify(getEstimateSnapshot());
+    }, []);
+
+    // Derived: sum of children totals per section header
+    const sectionTotals = useMemo(() => {
+        const map = new Map<string, number>();
+        for (const item of items) {
+            if (item.parentId) {
+                map.set(item.parentId, (map.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+            }
+        }
+        return map;
+    }, [items]);
+
+    // A row is a section header if it has no parentId and at least one child references it
+    const sectionIds = useMemo(() => new Set(items.filter(i => i.parentId).map((i: any) => i.parentId)), [items]);
 
     // Auto-expand textarea ref handler
     const autoExpand = useCallback((el: HTMLTextAreaElement | null) => {
@@ -84,7 +338,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         setAiSuggestingDesc(item.id);
         try {
             const parent = item.parentId ? items.find((i: any) => i.id === item.parentId) : null;
-            const costType = costTypes.find((ct: any) => ct.id === item.costTypeId);
             const res = await fetch("/api/ai-estimate/suggest", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -93,7 +346,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     itemName: item.name,
                     parentName: parent?.name,
                     projectName: context.name,
-                    costType: costType?.name || item.type,
+                    costType: item.type,
                 }),
             });
             if (res.ok) {
@@ -152,8 +405,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     }
 
     function acceptSubitemSuggestions(parentId: string, suggestions: any[]) {
-        const typeMap: Record<string, string> = {};
-        for (const ct of costTypes) typeMap[ct.name] = ct.id;
         const newItems = suggestions.map((s: any) => ({
             id: generateId(),
             name: s.name,
@@ -166,7 +417,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             total: 0,
             parentId,
             costCodeId: null,
-            costTypeId: typeMap[s.costType] || null,
+            costTypeId: null,
         }));
         setItems([...items, ...newItems]);
         setShowSubitemSuggestions(null);
@@ -178,6 +429,46 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     useEffect(() => {
         getEstimateTemplates().then(setAssemblies).catch((err) => console.error("[EstimateEditor] Failed to load templates:", err));
     }, []);
+
+    useEffect(() => {
+        getDocumentTemplates("terms").then((data: any[]) => {
+            setTermsTemplates(data);
+            if (!initialEstimate.termsAndConditions) {
+                const defaultT = data.find((t: any) => t.isDefault);
+                if (defaultT) setTermsAndConditions(defaultT.body);
+            }
+        }).catch((err) => console.error("[EstimateEditor] Failed to load T&C templates:", err));
+    }, []);
+
+    useEffect(() => {
+        getDocumentTemplates("overview").then((data: any[]) => setOverviewTemplates(data))
+            .catch((err) => console.error("[EstimateEditor] Failed to load overview templates:", err));
+        getDocumentTemplates("notes").then((data: any[]) => setNotesTemplates(data))
+            .catch((err) => console.error("[EstimateEditor] Failed to load notes templates:", err));
+    }, []);
+
+    async function handleSaveDocTemplate(type: "overview" | "notes", body: string) {
+        const label = type === "overview" ? "Project Overview" : "Notes & Assumptions";
+        if (!body || !body.trim()) {
+            toast.error(`Add some ${label} content before saving a template.`);
+            return;
+        }
+        const name = window.prompt(`Save this ${label} as a reusable template. Template name:`)?.trim();
+        if (!name) return;
+        const setBusy = type === "overview" ? setIsSavingOverviewTpl : setIsSavingNotesTpl;
+        setBusy(true);
+        try {
+            await createDocumentTemplate({ name, type, body });
+            const refreshed = await getDocumentTemplates(type);
+            if (type === "overview") setOverviewTemplates(refreshed as any);
+            else setNotesTemplates(refreshed as any);
+            toast.success(`Saved "${name}" template.`);
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to save template.");
+        } finally {
+            setBusy(false);
+        }
+    }
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const file = e.target.files?.[0];
@@ -270,21 +561,49 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
     function handleInsertAssembly(assembly: any) {
         const newItems = [...items];
-        const sectionId = generateId();
-        newItems.push({
-            id: sectionId, name: assembly.name, description: "", type: "Section",
-            quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
-            parentId: null, costCodeId: null, costTypeId: null, isSection: true,
-        });
-        for (const tItem of assembly.items) {
+        const tItems: any[] = assembly.items || [];
+        const hasSections = tItems.some((t: any) => t.type === "Section");
+
+        if (hasSections) {
+            // Multi-phase template: keep its Section grouping. Grouping is rebuilt by
+            // walking items in order (a Section row starts a group; the CHILD rows after
+            // it belong to it). Stored parentId values reference rows of whatever
+            // estimate the template was saved from and can't be trusted — but
+            // null-vs-set still marks a row as top-level vs child.
+            let currentSectionId: string | null = null;
+            for (const tItem of tItems) {
+                const isSection = tItem.type === "Section";
+                const newId = generateId();
+                newItems.push({
+                    id: newId, name: tItem.name, description: tItem.description || "",
+                    type: tItem.type, quantity: tItem.quantity,
+                    baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                    unitCost: Number(tItem.unitCost) || 0,
+                    total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                    parentId: isSection || tItem.parentId == null ? null : currentSectionId,
+                    costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                    ...(isSection ? { isSection: true } : {}),
+                });
+                if (isSection) currentSectionId = newId;
+            }
+        } else {
+            // Flat template: wrap its items in a new section named after the template.
+            const sectionId = generateId();
             newItems.push({
-                id: generateId(), name: tItem.name, description: tItem.description || "",
-                type: tItem.type, quantity: tItem.quantity,
-                baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
-                unitCost: Number(tItem.unitCost) || 0,
-                total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
-                parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                id: sectionId, name: assembly.name, description: "", type: "Section",
+                quantity: 1, baseCost: 0, markupPercent: 0, unitCost: 0, total: 0,
+                parentId: null, costCodeId: null, costTypeId: null, isSection: true,
             });
+            for (const tItem of tItems) {
+                newItems.push({
+                    id: generateId(), name: tItem.name, description: tItem.description || "",
+                    type: tItem.type, quantity: tItem.quantity,
+                    baseCost: Number(tItem.baseCost) || 0, markupPercent: tItem.markupPercent,
+                    unitCost: Number(tItem.unitCost) || 0,
+                    total: (tItem.quantity || 0) * (Number(tItem.unitCost) || 0),
+                    parentId: sectionId, costCodeId: tItem.costCodeId, costTypeId: tItem.costTypeId,
+                });
+            }
         }
         setItems(newItems);
         setShowAssemblyDropdown(false);
@@ -390,47 +709,126 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             .then(res => res.json())
             .then(data => { if (Array.isArray(data)) setCostCodes(data); })
             .catch((err) => console.error("[EstimateEditor] Failed to load cost codes:", err));
-        fetch('/api/cost-types?active=true')
-            .then(res => res.json())
-            .then(data => { if (Array.isArray(data)) setCostTypes(data); })
-            .catch((err) => console.error("[EstimateEditor] Failed to load cost types:", err));
     }, []);
 
-    const subtotal = items.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-    const taxRate = defaultTax ? defaultTax.rate / 100 : 0.088;
-    const taxName = defaultTax ? `${defaultTax.name} (${defaultTax.rate}%)` : "Estimated Tax (8.8%)";
+    // Subtotal from leaf items only (sections would double-count)
+    const subtotal = items.reduce((acc, item) => {
+        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+        if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+        return acc;
+    }, 0);
+    const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
+    const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
+    const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
+    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
+    // WA DOR: exempt sales need a reseller permit / exemption certificate on the client record
+    const taxCertStatus = getTaxCertStatus({ url: context.clientTaxExemptCertUrl, expiresAt: context.clientTaxExemptCertExpiresAt });
+    const showTaxCertWarning = taxExempt && taxCertStatus !== "valid";
+    const taxCertFixHref = context.type === "lead" ? `/leads/${context.id}` : "/settings/contacts";
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     const total = rm(subtotal + tax + processingFee);
+    const paidMilestonesSum = paymentSchedules
+        .filter(s => s.status === "Paid")
+        .reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+    const dynamicBalanceDue = rm(total - paidMilestonesSum);
+
+    // Auto-recalculate percentage-based milestones when total changes (last absorbs rounding residual)
+    useEffect(() => {
+        setPaymentSchedules(prev => {
+            if (prev.length === 0) return prev;
+            const updated = recalcMilestoneAmounts(prev, total);
+            const changed = updated.some((s, i) => s.amount !== prev[i].amount);
+            return changed ? updated : prev;
+        });
+    }, [total]);
 
     // Internal margin calculations
-    const totalBaseCost = items.reduce((acc, item) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.baseCost) || 0)), 0);
+    // Base cost from leaf items only (sections would double-count)
+    const totalBaseCost = items.reduce((acc, item) => {
+        const rate = (item.budgetRate !== null && item.budgetRate !== undefined && item.budgetRate !== "")
+            ? parseFloat(item.budgetRate)
+            : (parseFloat(item.baseCost) || 0);
+        const qty = item.budgetQuantity ?? (parseFloat(item.quantity) || 0);
+        if (item.parentId) return acc + (qty * rate);
+        if (!items.some((i: any) => i.parentId === item.id)) return acc + (qty * rate);
+        return acc;
+    }, 0);
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
-    async function handleSave() {
-        setIsSaving(true);
-        const mappedItems = items.map((item, index) => ({
-            ...item,
-            order: index,
-            total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-        }));
-        const mappedSchedules = paymentSchedules.map((schedule, index) => ({
-            ...schedule,
-            order: index
-        }));
+    async function handleSave({ silent = false, skipRefresh = false } = {}) {
+        captureHistory(new Date().toLocaleString());
 
-        await saveEstimate(initialEstimate.id, context.id, context.type, {
-            title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
-            processingFeeMarkup, hideProcessingFee,
-            expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
-            memo: memo || null,
-            termsAndConditions: termsAndConditions || null,
-            signatureUrl: signatureUrl || null,
-        }, mappedItems);
-        setIsSaving(false);
-        toast.success("Estimate saved successfully");
-        router.refresh();
+        // Check if there are actual changes before saving
+        const currentSnapshot = getEstimateSnapshot();
+        const currentSnapshotStr = JSON.stringify(currentSnapshot);
+        if (currentSnapshotStr === lastSavedStateRef.current) {
+            if (!silent) {
+                toast.success("Estimate saved successfully");
+            }
+            return;
+        }
+
+        if (!silent) setIsSaving(true);
+        try {
+            // Recompute section header totals from children before saving
+            const childTotals = new Map<string, number>();
+            for (const item of items) {
+                if (item.parentId) {
+                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                }
+            }
+            const mappedItems = items.map((item, index) => {
+                const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+                const computedTotal = isSection
+                    ? (childTotals.get(item.id) || 0)
+                    : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
+            });
+            const mappedSchedules = paymentSchedules.map((schedule, index) => ({
+                ...schedule,
+                order: index
+            }));
+
+            await saveEstimate(initialEstimate.id, context.id, context.type, {
+                title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
+                processingFeeMarkup, hideProcessingFee,
+                expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
+                memo: memo || null,
+                termsAndConditions: termsAndConditions || null,
+                overviewEnabled,
+                overviewTitle: overviewTitle || null,
+                overviewBody: overviewBody || null,
+                notesEnabled,
+                notesTitle: notesTitle || null,
+                notesBody: notesBody || null,
+                notesPlacement,
+                signatureUrl: signatureUrl || null,
+                targetMarginPercent: parseFloat(targetMargin) || 25,
+                taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            }, mappedItems);
+
+            // Update the last saved state ref to the new state
+            lastSavedStateRef.current = currentSnapshotStr;
+
+            if (!silent) {
+                toast.success("Estimate saved successfully");
+            }
+            if (!skipRefresh) {
+                router.refresh();
+            }
+        } catch (e: any) {
+            console.error("[EstimateEditor] Failed to save estimate:", e);
+            if (!silent) {
+                toast.error(e?.message || "Failed to save estimate. Please try again.");
+            }
+            throw e;
+        } finally {
+            if (!silent) setIsSaving(false);
+        }
     }
 
     async function handleCreateInvoice() {
@@ -453,7 +851,11 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         if (!confirm("Are you sure you want to delete this estimate? This action cannot be undone.")) return;
         setIsDeleting(true);
         try {
-            await deleteEstimate(initialEstimate.id);
+            const result = await deleteEstimate(initialEstimate.id);
+            if (!result.success) {
+                toast.error(result.error || "Failed to delete estimate");
+                return;
+            }
             toast.success("Estimate deleted");
             if (context.type === "project") {
                 router.push(`/projects/${context.id}/estimates`);
@@ -503,8 +905,31 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         return Math.random().toString(36).substr(2, 9);
     }
 
-    function addItem(parentId: string | null = null) {
-        setItems([...items, {
+    function captureHistory(label: string) {
+        setHistory(prev => [{ ts: Date.now(), label, snapshot: JSON.parse(JSON.stringify(items)) }, ...prev.slice(0, 49)]);
+    }
+
+    function revertToHistory(entry: { ts: number; label: string; snapshot: any[] }) {
+        setItems(entry.snapshot);
+        setExpandedHistoryTs(null);
+        toast.success(`Reverted to ${entry.label}`);
+    }
+
+    function diffSnapshots(prev: any[], curr: any[]) {
+        const prevMap = new Map(prev.map(i => [i.id, i]));
+        const currMap = new Map(curr.map(i => [i.id, i]));
+        const added   = curr.filter(i => !prevMap.has(i.id) && i.name?.trim());
+        const removed = prev.filter(i => !currMap.has(i.id) && i.name?.trim());
+        const changed = curr.filter(i => {
+            const p = prevMap.get(i.id);
+            if (!p || !i.name?.trim()) return false;
+            return p.name !== i.name || String(p.quantity) !== String(i.quantity) || String(p.unitCost) !== String(i.unitCost);
+        });
+        return { added, removed, changed };
+    }
+
+    function makeBlankItem(parentId: string | null) {
+        return {
             id: generateId(),
             name: "",
             description: "",
@@ -516,8 +941,53 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             total: 0,
             parentId,
             costCodeId: null,
-            costTypeId: null
-        }]);
+            costTypeId: null,
+        };
+    }
+
+    function addItem(parentId: string | null = null) {
+        if (parentId) {
+            // Insert after the last existing child of this parent
+            const lastChildIdx = items.reduce((last, it, idx) => it.parentId === parentId ? idx : last, -1);
+            const insertAt = lastChildIdx >= 0 ? lastChildIdx + 1 : (items.findIndex(i => i.id === parentId) + 1);
+            const newItems = [...items];
+            newItems.splice(insertAt, 0, makeBlankItem(parentId));
+            setItems(newItems);
+        } else {
+            setItems([...items, makeBlankItem(null)]);
+        }
+    }
+
+    /** "Add Sub-item": carry parent description into new sub-item, clear parent description */
+    function addSubItem(parentIndex: number) {
+        const parent = items[parentIndex];
+        const desc = parent.description || "";
+        const newItems = [...items];
+        newItems[parentIndex] = { ...parent, description: "" };
+        const lastChildIdx = newItems.reduce((last, it, idx) => it.parentId === parent.id ? idx : last, parentIndex);
+        const newSub = { ...makeBlankItem(parent.id), description: desc };
+        newItems.splice(lastChildIdx + 1, 0, newSub);
+        setItems(newItems);
+    }
+
+    /** Insert a blank item right after `afterIndex` with the given parentId */
+    function addItemAfter(afterIndex: number, parentId: string | null) {
+        const newItems = [...items];
+        newItems.splice(afterIndex + 1, 0, makeBlankItem(parentId));
+        setItems(newItems);
+    }
+
+    /** Insert a new category (+ one blank sub-item) right after `afterIndex` */
+    function addCategoryAfter(afterIndex: number) {
+        const catId = generateId();
+        const newCat = {
+            id: catId, name: "", description: "", type: "Section",
+            quantity: 1, baseCost: 0, markupPercent: 25, unitCost: 0, total: 0,
+            parentId: null, costCodeId: null, costTypeId: null, isSection: true,
+        };
+        const newItems = [...items];
+        newItems.splice(afterIndex + 1, 0, newCat, makeBlankItem(catId));
+        setItems(newItems);
     }
 
     async function handleAiGenerate() {
@@ -532,7 +1002,6 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     description: aiPrompt,
                     location: context.location || 'Vancouver, WA',
                     costCodes,
-                    costTypes,
                 }),
             });
 
@@ -543,39 +1012,10 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             }
 
             const data = await res.json();
-            if (data.items && data.items.length > 0) {
-                const newItems = [...items, ...data.items];
-                const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
-                    ? [...paymentSchedules, ...data.paymentMilestones]
-                    : paymentSchedules;
-                setItems(newItems);
-                if (data.paymentMilestones && data.paymentMilestones.length > 0) {
-                    setPaymentSchedules(newSchedules);
-                }
-                toast.success(`AI generated ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
-                setShowAiModal(false);
-                setAiPrompt("");
-
-                // Auto-save with the newly merged items
-                const mappedItems = newItems.map((item, index) => ({
-                    ...item,
-                    order: index,
-                    total: (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)
-                }));
-                const mappedSchedules = newSchedules.map((schedule, index) => ({
-                    ...schedule,
-                    order: index
-                }));
-                const newSubtotal = newItems.reduce((acc, item) => acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
-                const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
-                await saveEstimate(initialEstimate.id, context.id, context.type, {
-                    title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules
-                }, mappedItems);
-                toast.success("Estimate auto-saved");
-                router.refresh();
-            } else {
-                toast.error('AI returned no items');
-            }
+            await applyGeneratedEstimate(data, {
+                verb: "AI generated",
+                onMerged: () => { setShowAiModal(false); setAiPrompt(""); },
+            });
         } catch (err: any) {
             console.error('AI Generate error:', err);
             toast.error(err?.message || 'Failed to generate estimate — check console');
@@ -584,9 +1024,172 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         }
     }
 
+    /**
+     * Shared merge + auto-save path for a generated OR imported estimate payload
+     * ({ items, paymentMilestones, count, totalEstimate }). Appends to existing items,
+     * recomputes section-header totals, persists, and syncs the saved-state ref so blur
+     * saves are skipped. Used by both AI generate and ChatGPT import.
+     */
+    async function applyGeneratedEstimate(
+        data: { items?: any[]; paymentMilestones?: any[]; count?: number; totalEstimate?: number },
+        { verb = "Added", onMerged }: { verb?: string; onMerged?: () => void } = {},
+    ) {
+        if (!data.items || data.items.length === 0) {
+            toast.error('No line items found to add');
+            return;
+        }
+        const newItems = [...items, ...data.items];
+        const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
+            ? [...paymentSchedules, ...data.paymentMilestones]
+            : paymentSchedules;
+
+        // Update UI immediately — don't wait for save
+        setItems(newItems);
+        if (data.paymentMilestones && data.paymentMilestones.length > 0) {
+            setPaymentSchedules(newSchedules);
+        }
+        onMerged?.();
+        toast.success(`${verb} ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
+
+        // Auto-save in background — set isSaving to block concurrent blur-triggered save
+        setIsSaving(true);
+        try {
+            // Recompute section header totals from children before saving
+            const childTotals = new Map<string, number>();
+            for (const item of newItems) {
+                if (item.parentId) {
+                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+                }
+            }
+            const mappedItems = newItems.map((item: any, index: number) => {
+                const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
+                const ct = isSect ? (childTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
+            });
+            const mappedSchedules = newSchedules.map((schedule, index) => ({
+                ...schedule,
+                order: index
+            }));
+            // Subtotal from leaf items only (sections would double-count)
+            const newSubtotal = newItems.reduce((acc: number, item: any) => {
+                if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+                return acc;
+            }, 0);
+            const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
+            await saveEstimate(initialEstimate.id, context.id, context.type, {
+                title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            }, mappedItems);
+            toast.success("Estimate auto-saved");
+
+            // Update lastSavedStateRef so subsequent blur saves are skipped
+            const savedSnapshot = {
+                title: title || "",
+                code: code || "",
+                status: status || "Draft",
+                processingFeeMarkup: Number(processingFeeMarkup) || 0,
+                hideProcessingFee: !!hideProcessingFee,
+                expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
+                memo: memo || null,
+                termsAndConditions: termsAndConditions || null,
+                overviewEnabled,
+                overviewTitle: overviewTitle || null,
+                overviewBody: overviewBody || null,
+                notesEnabled,
+                notesTitle: notesTitle || null,
+                notesBody: notesBody || null,
+                notesPlacement,
+                signatureUrl: signatureUrl || null,
+                targetMarginPercent: parseFloat(targetMargin) || 25,
+                taxExempt: !!taxExempt,
+                taxRateName: taxExempt ? null : (activeTax?.name || null),
+                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+                items: mappedItems.map((item: any, index: number) => ({
+                    id: item.id || null,
+                    parentId: item.parentId || null,
+                    name: item.name || "",
+                    description: item.description || "",
+                    type: item.type || "Material",
+                    quantity: String(item.quantity || "0"),
+                    unitCost: String(item.unitCost || "0"),
+                    costCodeId: item.costCodeId || null,
+                    costTypeId: item.costTypeId || null,
+                    vendorId: item.vendorId || null,
+                    approvalStatus: item.approvalStatus || null,
+                    order: index,
+                    total: item.total,
+                })),
+                paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
+                    id: schedule.id || null,
+                    name: schedule.name || "",
+                    amount: String(schedule.amount || "0"),
+                    dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
+                    status: schedule.status || "Pending",
+                    paymentMethod: schedule.paymentMethod || null,
+                    paymentReference: schedule.paymentReference || null,
+                    percentage: String(schedule.percentage || "0"),
+                    type: schedule.type || null,
+                    order: index
+                })),
+            };
+            lastSavedStateRef.current = JSON.stringify(savedSnapshot);
+
+            router.refresh();
+        } catch (saveErr) {
+            console.error("Auto-save after estimate merge failed:", saveErr);
+            toast.error("Items added — but auto-save failed. Click Save to persist.");
+        } finally {
+            setIsSaving(false);
+        }
+    }
+
+    async function handleImportEstimate() {
+        const raw = importJson.trim();
+        if (!raw) {
+            toast.error("Paste the JSON from ChatGPT first");
+            return;
+        }
+        let parsed: any;
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            toast.error("That doesn't look like valid JSON. Paste ChatGPT's full output — it should start with { and end with }.");
+            return;
+        }
+        setIsImporting(true);
+        try {
+            const res = await fetch('/api/ai-estimate/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    phases: parsed.phases,
+                    paymentMilestones: parsed.paymentMilestones,
+                    costCodes,
+                }),
+            });
+            if (!res.ok) {
+                const d = await res.json().catch(() => ({}));
+                toast.error(d.error || 'Import failed — check the JSON format');
+                return;
+            }
+            const data = await res.json();
+            await applyGeneratedEstimate(data, {
+                verb: "Imported",
+                onMerged: () => { setShowImportModal(false); setImportJson(""); },
+            });
+        } catch (err: any) {
+            console.error('Import estimate error:', err);
+            toast.error(err?.message || 'Failed to import estimate');
+        } finally {
+            setIsImporting(false);
+        }
+    }
+
     function updateItem(index: number, field: string, value: any) {
         const newItems = [...items];
-        newItems[index][field] = value;
+        newItems[index] = { ...newItems[index], [field]: value };
         setItems(newItems);
     }
 
@@ -594,6 +1197,305 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
         const itemToRemove = items[index];
         // Also remove children if it's a parent
         setItems(items.filter((item, i) => i !== index && item.parentId !== itemToRemove.id));
+    }
+
+    async function handleLinkPO(itemId: string) {
+        if (context.type !== "project") return;
+        setPOLinkItemId(itemId);
+        setLoadingPOs(true);
+        try {
+            const pos = await getProjectPurchaseOrdersForLinking(context.id);
+            setProjectPOs(pos);
+        } catch { toast.error("Failed to load purchase orders"); }
+        finally { setLoadingPOs(false); }
+    }
+
+    async function handleSelectPO(itemId: string, po: any) {
+        try {
+            await linkPOToEstimateItem(itemId, po.id);
+            const idx = items.findIndex((i: any) => i.id === itemId);
+            if (idx >= 0) updateItem(idx, "purchaseOrderId", po.id);
+            if (idx >= 0) updateItem(idx, "purchaseOrder", po);
+            toast.success(`Linked ${po.code}`);
+        } catch (err: any) { toast.error(err.message); }
+        finally { setPOLinkItemId(null); }
+    }
+
+    async function handleUnlinkPO(itemId: string) {
+        try {
+            await unlinkPOFromEstimateItem(itemId);
+            const idx = items.findIndex((i: any) => i.id === itemId);
+            if (idx >= 0) { updateItem(idx, "purchaseOrderId", null); updateItem(idx, "purchaseOrder", null); }
+            toast.success("PO unlinked");
+        } catch (err: any) { toast.error(err.message); }
+    }
+
+    function handlePOCreated(itemId: string, po: any) {
+        const idx = items.findIndex((i: any) => i.id === itemId);
+        if (idx >= 0) { updateItem(idx, "purchaseOrderId", po.id); updateItem(idx, "purchaseOrder", po); }
+    }
+
+    async function handleAiFillAll({ overwriteExisting: overwrite }: { overwriteExisting: boolean }) {
+        // Only leaf items (no children) are eligible — section headers are skipped.
+        const leafItems = items.filter(item => {
+            if (!item.parentId && items.some((i: any) => i.parentId === item.id)) return false;
+            return true;
+        });
+
+        // Lock partition. PO-locked items are ALWAYS skipped regardless of overwrite flag —
+        // a cut purchase order is a real dollar commitment, not a suggestion.
+        const isPoLocked = (it: any) => it.purchaseOrderId != null;
+        const hasBudget = (it: any) => {
+            const n = parseFloat(it.budgetRate);
+            return Number.isFinite(n) && n > 0;
+        };
+
+        const poLocked = leafItems.filter(isPoLocked);
+        const eligible = leafItems.filter(it => !isPoLocked(it));
+        const toSend = overwrite ? eligible : eligible.filter(it => !hasBudget(it));
+        const lockedForThisRun = eligible.filter(it => !toSend.includes(it)).concat(poLocked);
+
+        if (toSend.length === 0) {
+            toast.info("No items to fill — all budgets are set. Enable Overwrite to regenerate.");
+            return;
+        }
+
+        // Aggregate locked contributions so AI can distribute remaining margin correctly.
+        let lockedSell = 0;
+        let lockedBudget = 0;
+        for (const it of lockedForThisRun) {
+            const qty = parseFloat(it.quantity) || 0;
+            const price = parseFloat(it.unitCost) || 0;
+            const rate = parseFloat(it.budgetRate);
+            lockedSell += qty * price;
+            // PO-locked item with no recorded budget: treat its committed cost as sell (0% margin)
+            // so the AI distributes the rest against a conservative baseline.
+            lockedBudget += Number.isFinite(rate) && rate > 0 ? qty * rate : qty * price;
+        }
+
+        const tgt = Math.max(0, Math.min(70, parseFloat(targetMargin) || 25));
+
+        setIsAiFilling(true);
+        try {
+            const res = await fetch("/api/ai-estimate/budget-fill", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: toSend.map(i => {
+                        const qty = parseFloat(i.quantity) || 1;
+                        const price = parseFloat(i.unitCost) || 0;
+                        return {
+                            id: i.id,
+                            name: i.name || "",
+                            description: i.description || "",
+                            type: i.type || "Material",
+                            quantity: qty,
+                            unitCost: price,
+                            lineTotal: qty * price,
+                        };
+                    }),
+                    lockedContributions: { totalSellAmount: lockedSell, totalBudgetAmount: lockedBudget },
+                    targetMarginPercent: tgt,
+                    projectContext: `${context.name} (${context.type})`,
+                    location: context.location || "Vancouver, WA",
+                }),
+            });
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.error || "AI budget fill failed");
+            }
+            const { suggestions, notes } = await res.json();
+
+            // Client-side enforcement guard: only apply suggestions for items we actually sent.
+            // Drops stray/hallucinated IDs and any attempt by AI to touch a locked item.
+            const sendableIds = new Set(toSend.map(i => i.id));
+            const validSuggestions = (suggestions || []).filter((s: any) => sendableIds.has(s.id));
+
+            // First pass: apply raw AI budgetRates, mirror sell quantity, derive margin.
+            // Track newly-filled item IDs so we can rescale them in the second pass.
+            const newlyFilledIds = new Set<string>(validSuggestions.map((s: any) => s.id));
+            let filled = 0;
+
+            setItems(prev => {
+                const next = prev.map(item => ({ ...item }));
+
+                for (const s of validSuggestions) {
+                    const idx = next.findIndex((i: any) => i.id === s.id);
+                    if (idx < 0) continue;
+                    const rate = Math.max(0, parseFloat(s.budgetRate) || 0);
+                    const sellQty = parseFloat(next[idx].quantity) || 0;
+                    const sellPrice = parseFloat(next[idx].unitCost) || 0;
+                    next[idx] = {
+                        ...next[idx],
+                        budgetRate: rate > 0 ? String(rate) : null,
+                        baseCost: rate > 0 ? String(rate) : null,
+                        budgetUnit: s.budgetUnit || next[idx].budgetUnit,
+                        budgetQuantity: sellQty,
+                        markupPercent: derivedMarginPct(rate, sellPrice),
+                        // DO NOT touch: unitCost, quantity, total, purchaseOrderId
+                    };
+                    filled++;
+                }
+
+                // Second pass: post-AI rescale to force target margin.
+                // LLMs don't reliably hit weighted targets — scale newly-filled budgetRates
+                // proportionally so (lockedBudget + newAiBudget) / grandSell hits target.
+                const grandSell = lockedSell + next.reduce((sum, it) => {
+                    if (!newlyFilledIds.has(it.id)) return sum;
+                    const q = parseFloat(it.quantity) || 0;
+                    const p = parseFloat(it.unitCost) || 0;
+                    return sum + q * p;
+                }, 0);
+                const targetBudgetTotal = grandSell * (1 - tgt / 100);
+                const neededFromAi = Math.max(0, targetBudgetTotal - lockedBudget);
+                const actualAiBudget = next.reduce((sum, it) => {
+                    if (!newlyFilledIds.has(it.id)) return sum;
+                    const q = parseFloat(it.quantity) || 0;
+                    const r = parseFloat(it.budgetRate);
+                    return sum + (Number.isFinite(r) ? q * r : 0);
+                }, 0);
+
+                let scale = actualAiBudget > 0 ? neededFromAi / actualAiBudget : 1;
+                let clamped = false;
+                if (scale < 0.3) { scale = 0.3; clamped = true; }
+                if (scale > 3.0) { scale = 3.0; clamped = true; }
+
+                if (Math.abs(scale - 1) > 0.005 && scale > 0) {
+                    for (let idx = 0; idx < next.length; idx++) {
+                        if (!newlyFilledIds.has(next[idx].id)) continue;
+                        const r = parseFloat(next[idx].budgetRate);
+                        if (!Number.isFinite(r) || r <= 0) continue;
+                        const sellPrice = parseFloat(next[idx].unitCost) || 0;
+                        // Don't let rescale push budget above sell (would invert margin).
+                        let newRate = r * scale;
+                        if (sellPrice > 0 && newRate >= sellPrice) newRate = sellPrice * 0.99;
+                        if (newRate < 0) newRate = 0;
+                        next[idx] = {
+                            ...next[idx],
+                            budgetRate: newRate > 0 ? String(newRate) : null,
+                            baseCost: newRate > 0 ? String(newRate) : null,
+                            markupPercent: derivedMarginPct(newRate, sellPrice),
+                        };
+                    }
+                    if (clamped) {
+                        // Schedule warning after state commit
+                        setTimeout(() => toast.warning("Margin target approximated — AI estimate was far off"), 0);
+                    }
+                }
+
+                // Compute actual weighted margin for the toast (client-computed, not AI-reported).
+                let totalSell = 0;
+                let totalBudget = 0;
+                for (const it of next) {
+                    const q = parseFloat(it.quantity) || 0;
+                    const p = parseFloat(it.unitCost) || 0;
+                    const r = parseFloat(it.budgetRate);
+                    // Only count leaf items (same filter as above) in the margin total.
+                    const isLeaf = !(!it.parentId && next.some((c: any) => c.parentId === it.id));
+                    if (!isLeaf) continue;
+                    totalSell += q * p;
+                    if (Number.isFinite(r) && r > 0) totalBudget += q * r;
+                }
+                const actualMargin = totalSell > 0 ? ((totalSell - totalBudget) / totalSell) * 100 : 0;
+
+                // Schedule toast after state commit
+                setTimeout(() => {
+                    const base = `AI filled ${filled} budget${filled !== 1 ? "s" : ""} — margin ${actualMargin.toFixed(1)}% (target ${tgt}%)`;
+                    toast.success(notes ? `${base}\n${notes}` : base);
+                }, 0);
+
+                return next;
+            });
+        } catch (err: any) {
+            toast.error(err.message || "AI budget fill failed");
+        } finally {
+            setIsAiFilling(false);
+        }
+    }
+
+    function handleClearBudgets() {
+        if (!window.confirm("Clear all budget values? Items with purchase orders will be preserved.")) return;
+        const resetMargin = Math.max(0, Math.min(70, parseFloat(targetMargin) || 25));
+        setItems(prev => prev.map(it => {
+            if (it.purchaseOrderId != null) return it;                            // PO-locked, never touch
+            if (!it.parentId && prev.some((c: any) => c.parentId === it.id)) return it; // category header
+            return {
+                ...it,
+                budgetRate: null,
+                baseCost: null,
+                budgetQuantity: null,
+                budgetUnit: null,
+                markupPercent: resetMargin,
+                // unitCost/quantity/total untouched
+            };
+        }));
+        toast.success("Budgets cleared — PO-committed items kept");
+    }
+
+    async function handleAiAssignPhases() {
+        const eligibleItems = items.filter(item => {
+            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
+            return !isSection;
+        });
+
+        if (eligibleItems.length === 0) {
+            toast.info("No items found to assign phases.");
+            return;
+        }
+
+        setIsAiAssigningPhases(true);
+        try {
+            const payloadItems = eligibleItems.map(item => ({
+                id: item.id,
+                name: item.name,
+                description: item.description || ""
+            }));
+
+            const payloadCostCodes = costCodes.map(cc => ({
+                id: cc.id,
+                code: cc.code,
+                name: cc.name
+            }));
+
+            const res = await fetch("/api/ai-estimate/assign-phases", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: payloadItems,
+                    costCodes: payloadCostCodes
+                })
+            });
+
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.error || "Failed to auto-assign phases");
+            }
+
+            const { assignments } = await res.json();
+            if (!assignments || !Array.isArray(assignments)) {
+                throw new Error("Invalid response from server");
+            }
+
+            let assignedCount = 0;
+            setItems(prev => {
+                const next = [...prev];
+                for (const ass of assignments) {
+                    const idx = next.findIndex(item => item.id === ass.id);
+                    if (idx >= 0 && ass.costCodeId !== undefined) {
+                        next[idx] = { ...next[idx], costCodeId: ass.costCodeId };
+                        assignedCount++;
+                    }
+                }
+                return next;
+            });
+
+            toast.success(`Successfully matched and assigned phases to ${assignedCount} items.`);
+        } catch (err: any) {
+            console.error("Auto-assign phases error:", err);
+            toast.error(err.message || "Failed to auto-assign phases");
+        } finally {
+            setIsAiAssigningPhases(false);
+        }
     }
 
     function addPaymentSchedule() {
@@ -609,16 +1511,44 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
     function updatePaymentSchedule(index: number, field: string, value: any) {
         const newSchedules = [...paymentSchedules];
         if (field === "percentage") {
-            const pct = parseFloat(value) || 0;
-            newSchedules[index].percentage = value;
-            newSchedules[index].amount = String(rm(total * (pct / 100)));
+            newSchedules[index] = { ...newSchedules[index], percentage: value };
+            const recalced = recalcMilestoneAmounts(newSchedules, total);
+            setPaymentSchedules(recalced);
+            return;
+        } else if (field === "amount") {
+            newSchedules[index] = {
+                ...newSchedules[index],
+                amount: value,
+                percentage: ""
+            };
         } else {
-            newSchedules[index][field] = value;
+            newSchedules[index] = {
+                ...newSchedules[index],
+                [field]: value
+            };
         }
         setPaymentSchedules(newSchedules);
     }
 
+    function handleAmountBlur() {
+        setPaymentSchedules(prev => {
+            const recalced = recalcMilestoneAmounts(prev, total);
+            const changed = recalced.some((s, i) => s.amount !== prev[i].amount);
+            return changed ? recalced : prev;
+        });
+    }
+
     function removePaymentSchedule(index: number) {
+        // Invoice-side milestones are snapshots — deleting the estimate copy does
+        // NOT remove it from an already-generated invoice.
+        if (linkedInvoice) {
+            const ok = window.confirm(
+                `This estimate has already been invoiced (${linkedInvoice.code}). ` +
+                `Deleting this milestone will NOT remove it from the invoice — ` +
+                `the invoice must be adjusted separately. Delete anyway?`
+            );
+            if (!ok) return;
+        }
         const newSchedules = [...paymentSchedules];
         newSchedules.splice(index, 1);
         setPaymentSchedules(newSchedules);
@@ -626,24 +1556,58 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
     function onDragEnd(result: any) {
         if (!result.destination) return;
-        const newItems = Array.from(items);
-        const [reorderedItem] = newItems.splice(result.source.index, 1);
-        newItems.splice(result.destination.index, 0, reorderedItem);
-        setItems(newItems);
+        const srcIdx = result.source.index;
+        const dstIdx = result.destination.index;
+        if (srcIdx === dstIdx) return;
+
+        const dragged = items[srcIdx];
+        const draggedIsCategory = !dragged.parentId && sectionIds.has(dragged.id);
+
+        if (draggedIsCategory) {
+            // Move the category header and all its children as a block
+            const children = items.filter(i => i.parentId === dragged.id);
+            const block = [dragged, ...children];
+            const withoutBlock = items.filter(i => i.id !== dragged.id && i.parentId !== dragged.id);
+            const adjustedDst = Math.max(0, Math.min(dstIdx - (srcIdx < dstIdx ? block.length - 1 : 0), withoutBlock.length));
+            withoutBlock.splice(adjustedDst, 0, ...block);
+            setItems(withoutBlock);
+        } else {
+            const newItems = Array.from(items);
+            newItems.splice(srcIdx, 1);
+            newItems.splice(dstIdx, 0, dragged);
+
+            // Recompute parentId for the dragged item based on its new neighbours
+            const itemBefore = dstIdx > 0 ? newItems[dstIdx - 1] : null;
+            let newParentId: string | null = dragged.parentId;
+            if (!itemBefore) {
+                newParentId = null;
+            } else if (!itemBefore.parentId && newItems.some(i => i !== newItems[dstIdx] && i.parentId === itemBefore.id)) {
+                // Dropped right after a category header → become its child
+                newParentId = itemBefore.id;
+            } else if (itemBefore.parentId) {
+                // Dropped after a sub-item → join that category
+                newParentId = itemBefore.parentId;
+            } else {
+                newParentId = null;
+            }
+            newItems[dstIdx] = { ...newItems[dstIdx], parentId: newParentId };
+            setItems(newItems);
+        }
     }
 
     return (
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showSendModal && !showMoreMenu) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving) {
                     handleSave();
                 }
             }}
         >
             {/* Top Navigation / Action Bar */}
-            <div className="bg-white border-b border-hui-border px-6 py-4 flex items-center justify-between shadow-sm z-10 sticky top-0">
-                <div className="flex items-center gap-4">
+            {/* z-30: must beat the sidebar's sticky tab bar (z-10, later in DOM) so the ⋮ dropdown isn't painted under it */}
+            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-30 sticky top-0">
+                <div className="flex items-center gap-3">
                     <button onClick={() => {
                         if (context.type === "project") {
                             router.push(`/projects/${context.id}/estimates`);
@@ -672,6 +1636,16 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             <option key={s} value={s}>{s}</option>
                         ))}
                     </select>
+                    {showTaxCertWarning && (
+                        <button
+                            onClick={() => router.push(taxCertFixHref)}
+                            title="This estimate is tax-exempt but the client has no valid exemption certificate on file. WA DOR requires one for every exempt sale. Click to open the client record."
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold border transition ${taxCertStatus === "expired" ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
+                        >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                            {taxCertStatus === "expired" ? "Tax-exempt cert expired" : "No tax-exempt cert on file"}
+                        </button>
+                    )}
                 </div>
 
                 {/* Tabs Middle */}
@@ -699,7 +1673,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                         >Client</button>
                         <button
                             onClick={() => setViewMode("internal")}
-                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-amber-50 text-amber-800 shadow-sm border border-amber-200" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-indigo-50 text-indigo-800 shadow-sm border border-indigo-200" : "text-slate-500 hover:text-slate-700"}`}
                         >Internal</button>
                     </div>
 
@@ -708,7 +1682,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                     {/* More dropdown for secondary actions */}
                     <div className="relative">
                         <button
-                            onClick={() => setShowMoreMenu(!showMoreMenu)}
+                            onClick={() => setShowMoreMenu(v => !v)}
                             className="hui-btn hui-btn-secondary px-2.5"
                             title="More actions"
                         >
@@ -718,6 +1692,46 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                             <>
                                 <div className="fixed inset-0 z-40" onClick={() => setShowMoreMenu(false)} />
                                 <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
+                                    {/* AI Tools section */}
+                                    <div className="px-4 py-1 text-[10px] font-semibold text-hui-textMuted uppercase tracking-wider">AI Tools</div>
+                                    <button
+                                        onClick={() => { setShowAiModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700"
+                                    >
+                                        <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                                        AI Generate
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowImportModal(true); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700"
+                                    >
+                                        <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
+                                        Import from ChatGPT
+                                    </button>
+                                    <button
+                                        onClick={() => { handleAiAssignPhases(); setShowMoreMenu(false); }}
+                                        disabled={isAiAssigningPhases}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-purple-50 flex items-center gap-2.5 text-purple-700 disabled:opacity-50"
+                                    >
+                                        <svg className={`w-4 h-4 text-purple-500 ${isAiAssigningPhases ? "animate-pulse" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        {isAiAssigningPhases ? "Assigning..." : "Auto-assign Phases"}
+                                    </button>
+                                    <button
+                                        onClick={() => { handleHistoricalPricing(); setShowMoreMenu(false); }}
+                                        disabled={isLoadingHistorical}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-teal-50 flex items-center gap-2.5 text-teal-700 disabled:opacity-50"
+                                    >
+                                        <svg className="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                                        {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
+                                    </button>
+                                    <button
+                                        onClick={() => { setShowSidebar(v => !v); setShowMoreMenu(false); }}
+                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
+                                    >
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
+                                        {showSidebar ? "Hide Sidebar" : "Show Sidebar"}
+                                    </button>
+                                    <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={() => { window.open(`/portal/estimates/${initialEstimate.id}`, '_blank'); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
@@ -725,24 +1739,13 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                         <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
                                         Customer Portal
                                     </button>
-                                    <a
-                                        href={`/api/pdf/estimates/${initialEstimate.id}?inline=true`}
-                                        target="_blank"
-                                        onClick={() => setShowMoreMenu(false)}
+                                    <button
+                                        onClick={() => { window.open(`/portal/estimates/${initialEstimate.id}`, '_blank'); setShowMoreMenu(false); }}
                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
                                     >
                                         <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
-                                        Preview PDF
-                                    </a>
-                                    <a
-                                        href={`/api/pdf/estimates/${initialEstimate.id}`}
-                                        target="_blank"
-                                        onClick={() => setShowMoreMenu(false)}
-                                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
-                                    >
-                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                        Download PDF
-                                    </a>
+                                        Preview / Download PDF
+                                    </button>
                                     <div className="border-t border-hui-border my-1" />
                                     <button
                                         onClick={() => { handleDuplicate(); setShowMoreMenu(false); }}
@@ -839,40 +1842,31 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                     {/* Primary Actions */}
                     <button
-                        onClick={handleHistoricalPricing}
-                        disabled={isLoadingHistorical}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-teal-50 to-cyan-50 border-teal-200 text-teal-700 hover:from-teal-100 hover:to-cyan-100 flex items-center gap-2 disabled:opacity-50"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                        {isLoadingHistorical ? "Analyzing..." : "Historical Pricing"}
-                    </button>
-                    <button
-                        onClick={() => setShowAiModal(true)}
-                        className="hui-btn hui-btn-secondary bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200 text-purple-700 hover:from-purple-100 hover:to-indigo-100 flex items-center gap-2"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
-                        AI Generate
-                    </button>
-                    <button
-                        onClick={() => setShowSendModal(true)}
+                        onClick={() => {
+                            const unpaidSchedules = paymentSchedules.filter(s => s.status !== "Paid");
+                            if (unpaidSchedules.length > 0) {
+                                const paidSum = paymentSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+                                const milestoneSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+                                const remaining = rm(total - paidSum);
+                                const unpaidSum = rm(milestoneSum - paidSum);
+                                if (Math.abs(unpaidSum - remaining) > 0.01) {
+                                    toast.error(`Payment milestones total $${milestoneSum.toFixed(2)} but estimate total is $${total.toFixed(2)}. Please adjust milestones.`);
+                                    return;
+                                }
+                            }
+                            setShowSendModal(true);
+                        }}
                         className="hui-btn hui-btn-green flex items-center gap-2"
                     >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
-                        Send
+                        {initialEstimate.sentAt ? "Resend" : "Send"}
                     </button>
                     <button
-                        onClick={handleSave}
+                        onClick={() => handleSave()}
                         disabled={isSaving}
                         className="hui-btn hui-btn-primary disabled:opacity-50"
                     >
                         {isSaving ? "Saving..." : "Save"}
-                    </button>
-                    <button
-                        onClick={() => setShowSidebar(!showSidebar)}
-                        className={`hui-btn hui-btn-secondary px-2.5 ${showSidebar ? 'bg-slate-100' : ''}`}
-                        title="Toggle sidebar"
-                    >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
                     </button>
                 </div>
             </div>
@@ -918,7 +1912,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                 <p className="text-sm font-medium text-slate-800">{a.name}</p>
                                                 <p className="text-xs text-slate-400">{a.items.length} item{a.items.length !== 1 ? 's' : ''}</p>
                                             </div>
-                                            <button onClick={(e) => handleDeleteAssembly(a.id, e)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition p-1" title="Delete assembly">
+                                            <button onClick={(e) => handleDeleteAssembly(a.id, e)} className="text-slate-300 hover:text-red-500 transition p-1" title="Delete assembly">
                                                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                                             </button>
                                         </div>
@@ -933,7 +1927,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             {/* Assembly Name Modal */}
             {showAssemblyNameModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" onClick={() => setShowAssemblyNameModal(false)}>
-                    <div className="bg-white rounded-xl shadow-2xl p-6 w-96" onClick={e => e.stopPropagation()}>
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm mx-4" onClick={e => e.stopPropagation()}>
                         <h3 className="text-lg font-bold text-slate-800 mb-1">Save Assembly</h3>
                         <p className="text-sm text-slate-500 mb-4">Name this bundle so you can reuse it across estimates (e.g., &quot;Standard Bathroom Demo&quot;).</p>
                         <input
@@ -955,14 +1949,73 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                 </div>
             )}
 
-            <div className="flex-1 flex overflow-hidden">
-            <div className="flex-1 p-8 flex justify-center pb-24 overflow-y-auto">
+            <div className="flex-1 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
+            <div className="flex-1 p-4 lg:p-8 flex justify-center pb-24 overflow-visible lg:overflow-y-auto">
                 {activeTab === "builder" && (
                     <div className="w-full max-w-5xl">
                         {/* Premium Document Wrapper */}
                         <div className="bg-white rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200 overflow-hidden relative">
                             {/* Subtle Gradient Accent Top Line */}
-                            <div className="h-1.5 w-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500"></div>
+                            <div className="h-1.5 w-full bg-slate-800"></div>
+
+                            {/* Internal-only: Budget fill control cluster */}
+                            {viewMode === "internal" && (
+                                <div className="px-10 py-4 bg-indigo-50/40 border-b border-indigo-100 flex flex-wrap items-center gap-4">
+                                    <div className="flex items-center gap-2">
+                                        <label htmlFor="targetMargin" className="text-xs font-semibold uppercase tracking-wider text-indigo-700">Target margin</label>
+                                        <div className="relative">
+                                            <input
+                                                id="targetMargin"
+                                                type="number"
+                                                min={0}
+                                                max={70}
+                                                step={1}
+                                                value={targetMargin}
+                                                onChange={e => setTargetMargin(e.target.value)}
+                                                className="w-20 px-2 py-1.5 pr-6 text-sm font-semibold text-slate-800 bg-white border border-indigo-200 rounded focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                                            />
+                                            <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-slate-500 pointer-events-none">%</span>
+                                        </div>
+                                    </div>
+                                    <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none" title="PO-committed items are always protected regardless of this setting.">
+                                        <input
+                                            type="checkbox"
+                                            checked={overwriteExisting}
+                                            onChange={e => setOverwriteExisting(e.target.checked)}
+                                            className="w-4 h-4 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-300"
+                                        />
+                                        Overwrite existing budgets
+                                    </label>
+                                    <div className="flex-1" />
+                                    <button
+                                        onClick={() => handleAiFillAll({ overwriteExisting })}
+                                        disabled={isAiFilling}
+                                        className="hui-btn hui-btn-primary text-sm flex items-center gap-2 disabled:opacity-50"
+                                        title="AI distributes budgets across items so overall margin lands on the target."
+                                    >
+                                        <svg className={`w-4 h-4 ${isAiFilling ? "animate-pulse" : ""}`} viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61z" /></svg>
+                                        {isAiFilling ? "Filling…" : "AI fill budgets"}
+                                    </button>
+                                    <button
+                                        onClick={handleAiAssignPhases}
+                                        disabled={isAiAssigningPhases || isAiFilling}
+                                        className="hui-btn hui-btn-secondary text-sm flex items-center gap-2 disabled:opacity-50"
+                                        title="Auto-assign phases using AI."
+                                    >
+                                        <svg className={`w-4 h-4 text-purple-500 ${isAiAssigningPhases ? "animate-pulse" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        {isAiAssigningPhases ? "Assigning..." : "Auto-assign Phases"}
+                                    </button>
+                                    <button
+                                        onClick={handleClearBudgets}
+                                        disabled={isAiFilling}
+                                        className="hui-btn hui-btn-secondary text-sm text-red-600 hover:text-red-700 disabled:opacity-50"
+                                        title="Clear all budget values (PO-committed items are preserved)."
+                                    >
+                                        Clear budgets
+                                    </button>
+                                </div>
+                            )}
+
                             {/* Document Header */}
                             <div className="p-10 pb-12 space-y-10 border-b border-slate-100">
                                 <input
@@ -1002,25 +2055,43 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                             {/* Items Grid with DnD */}
                             <div className="bg-white">
-                                <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
-                                <div className="w-8"></div>
-                                <div className="w-8 pt-0.5">
-                                    <input 
-                                        type="checkbox" 
+                                {sectionIds.size > 0 && (
+                                    <div className="flex justify-end px-8 pt-3 pb-1">
+                                        <button
+                                            onClick={() => {
+                                                if (collapsedSections.size === sectionIds.size) {
+                                                    setCollapsedSections(new Set());
+                                                } else {
+                                                    setCollapsedSections(new Set(sectionIds));
+                                                }
+                                            }}
+                                            className="text-xs text-slate-400 hover:text-slate-600 font-medium flex items-center gap-1 transition"
+                                        >
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                {collapsedSections.size === sectionIds.size
+                                                    ? <path d="M7 10l5 5 5-5" />
+                                                    : <path d="M7 14l5-5 5 5" />
+                                                }
+                                            </svg>
+                                            {collapsedSections.size === sectionIds.size ? "Expand All" : "Collapse All"}
+                                        </button>
+                                    </div>
+                                )}
+                                <div className="flex items-center gap-1 text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-4 py-3 uppercase tracking-wider">
+                                <div className="w-6"></div>
+                                <div className="w-6 pt-0.5">
+                                    <input
+                                        type="checkbox"
                                         checked={items.length > 0 && selectedItemIds.length === items.length}
                                         onChange={(e) => setSelectedItemIds(e.target.checked ? items.map(i => i.id) : [])}
                                         className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
                                     />
                                 </div>
-                                <div className="flex-1">Item Description</div>
-                                <div className="w-32">Phase</div>
-                                <div className="w-32">Type</div>
-                                <div className="w-24 text-right">Qty</div>
-                                {viewMode === "internal" && <div className="w-28 text-right text-amber-500">Base Cost</div>}
-                                {viewMode === "internal" && <div className="w-20 text-right text-amber-500">Markup %</div>}
-                                <div className="w-32 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
-                                <div className="w-32 text-right">Total</div>
-                                <div className="w-28 text-right">Approval</div>
+                                <div className="flex-1">Item</div>
+                                <div className="w-20 text-right">Qty</div>
+                                <div className="w-28 text-right">{viewMode === "internal" ? "Sell Price" : "Unit Cost"}</div>
+                                <div className="w-28 text-right">Total</div>
+                                <div className="w-24 text-right">Approval</div>
                             </div>
 
                             <DragDropContext onDragEnd={onDragEnd}>
@@ -1028,39 +2099,146 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     {(provided) => (
                                         <div {...provided.droppableProps} ref={provided.innerRef} className="divide-y divide-slate-100">
                                             {items.map((item, index) => {
-                                                const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
                                                 const isSubItem = !!item.parentId;
+                                                const isSection = !item.parentId && sectionIds.has(item.id);
+                                                // Hide children of collapsed sections
+                                                if (isSubItem && collapsedSections.has(item.parentId)) return null;
+                                                const sectionTotal = isSection ? (sectionTotals.get(item.id) || 0) : 0;
+                                                const itemTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
+                                                const isCollapsed = isSection && collapsedSections.has(item.id);
+
+                                                // ── Section header row ──────────────────────────────────────
+                                                if (isSection) {
+                                                    return (
+                                                        <Draggable key={item.id} draggableId={item.id} index={index}>
+                                                            {(provided, snapshot) => (
+                                                                <div ref={provided.innerRef} {...provided.draggableProps}
+                                                                    className={`flex items-center px-4 py-2.5 bg-slate-100 border-l-4 border-hui-primary group transition ${snapshot.isDragging ? "shadow-lg z-50" : ""}`}
+                                                                >
+                                                                    <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-400 hover:text-slate-600 cursor-grab">
+                                                                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
+                                                                    </div>
+                                                                    <button onClick={() => setCollapsedSections(prev => { const n = new Set(prev); n.has(item.id) ? n.delete(item.id) : n.add(item.id); return n; })}
+                                                                        className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-200 transition mr-1 text-slate-500 flex-shrink-0"
+                                                                    >
+                                                                        <svg className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "-rotate-90" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                                                        </svg>
+                                                                    </button>
+                                                                    <div className="w-6 mr-1">
+                                                                        <input type="checkbox" checked={selectedItemIds.includes(item.id)}
+                                                                            onChange={e => { if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]); else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id)); }}
+                                                                            className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                                                        />
+                                                                    </div>
+                                                                    <div className="flex-1 flex flex-col">
+                                                                        <input type="text" value={item.name} onChange={e => updateItem(index, "name", e.target.value)}
+                                                                            placeholder="Category name"
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
+                                                                        />
+                                                                        <div className="flex items-center gap-3 mt-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium focus-visible:opacity-100">+ Add Sub-item</button>
+                                                                            <button onClick={() => addCategoryAfter(index + items.filter(i => i.parentId === item.id).length)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium focus-visible:opacity-100">+ Add Category Below</button>
+                                                                        </div>
+                                                                    </div>
+                                                                    <div className="flex items-center gap-3 ml-auto">
+                                                                        {isCollapsed && <span className="text-xs text-slate-400">{items.filter((i: any) => i.parentId === item.id).length} items</span>}
+                                                                        <span className="text-sm font-semibold text-slate-700 w-28 text-right">{formatCurrency(sectionTotal)}</span>
+                                                                        <button onClick={() => removeItem(index)} className="w-7 h-7 flex items-center justify-center rounded text-slate-300 hover:text-red-500 hover:bg-red-50 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </Draggable>
+                                                    );
+                                                }
+
+                                                // ── Regular item row ────────────────────────────────────────
                                                 return (
                                                     <Draggable key={item.id} draggableId={item.id} index={index}>
-                                                        {(provided, snapshot) => (
+                                                        {(provided, snapshot) => (<>
                                                             <div
                                                                 ref={provided.innerRef}
                                                                 {...provided.draggableProps}
-                                                                className={`flex items-center px-6 py-3 bg-white group hover:bg-slate-50 transition border-l-2 ${snapshot.isDragging ? "shadow-lg border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "border-transparent ml-8 bg-slate-50/30" : "border-transparent"}`}
+                                                                className={`px-4 py-2 bg-white group hover:bg-slate-50/80 transition ${snapshot.isDragging ? "shadow-lg border-l-2 border-hui-primary z-50 ring-1 ring-hui-primary/20" : isSubItem ? "ml-6 border-l border-slate-200 bg-slate-50/30" : "border-l-2 border-transparent"}`}
                                                             >
-                                                                <div {...provided.dragHandleProps} className="w-8 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab opacity-0 group-hover:opacity-100">
-                                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
-                                                                </div>
-                                                                <div className="w-8">
-                                                                    <input 
-                                                                        type="checkbox" 
-                                                                        checked={selectedItemIds.includes(item.id)}
-                                                                        onChange={(e) => {
-                                                                            if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]);
-                                                                            else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id));
-                                                                        }}
-                                                                        className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
-                                                                    />
-                                                                </div>
-                                                                <div className="flex-1 flex flex-col">
+                                                                {/* ── Tier 1: Name + Numbers ── */}
+                                                                <div className="flex items-center gap-1">
+                                                                    <div {...provided.dragHandleProps} className="w-6 flex items-center justify-center text-slate-300 hover:text-hui-textMuted cursor-grab flex-shrink-0">
+                                                                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm5-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm0 6a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" /></svg>
+                                                                    </div>
+                                                                    <div className="w-6 flex-shrink-0">
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={selectedItemIds.includes(item.id)}
+                                                                            onChange={(e) => {
+                                                                                if (e.target.checked) setSelectedItemIds([...selectedItemIds, item.id]);
+                                                                                else setSelectedItemIds(selectedItemIds.filter(id => id !== item.id));
+                                                                            }}
+                                                                            className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                                                        />
+                                                                    </div>
                                                                     <input
                                                                         type="text"
                                                                         value={item.name}
                                                                         onChange={e => updateItem(index, "name", e.target.value)}
                                                                         placeholder="Item name"
-                                                                        className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
+                                                                        className={`flex-1 min-w-0 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
                                                                     />
-                                                                    <div className="flex items-start gap-1 mt-0.5">
+                                                                    <div className="w-20 px-2 text-right flex-shrink-0">
+                                                                        <input
+                                                                            type="number"
+                                                                            value={item.quantity}
+                                                                            onChange={e => updateItem(index, "quantity", e.target.value)}
+                                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
+                                                                        />
+                                                                    </div>
+                                                                    {(() => { const isLocked = viewMode === "internal" && !!(item.budgetRate ?? item.baseCost); return (
+                                                                    <div className="w-28 px-2 flex items-center justify-end flex-shrink-0">
+                                                                        <span className={`text-sm flex-shrink-0 ${isLocked ? "text-slate-300" : "text-slate-400"}`}>$</span>
+                                                                        <input
+                                                                            type="number"
+                                                                            value={item.unitCost}
+                                                                            onChange={e => updateItem(index, "unitCost", e.target.value)}
+                                                                            readOnly={isLocked}
+                                                                            aria-label="Unit cost"
+                                                                            className={`w-20 focus:outline-none rounded px-1 py-1 text-right transition text-sm font-medium ${isLocked ? "bg-transparent text-slate-400 cursor-default" : "bg-transparent focus:bg-white focus:ring-1 ring-slate-200 hover:bg-slate-50 text-slate-700"}`}
+                                                                        />
+                                                                    </div>
+                                                                    ); })()}
+                                                                    <div className="w-28 px-2 text-right font-semibold text-slate-800 text-sm flex-shrink-0">
+                                                                        {formatCurrency(itemTotal)}
+                                                                    </div>
+                                                                    <div className="w-24 flex items-center justify-end gap-0.5 flex-shrink-0">
+                                                                        {item.approvalStatus === "approved" ? (
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                                Approved
+                                                                            </span>
+                                                                        ) : item.approvalStatus === "rejected" ? (
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                                Rejected
+                                                                            </span>
+                                                                        ) : (
+                                                                            <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
+                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                                                </button>
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
+                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                                                </button>
+                                                                            </span>
+                                                                        )}
+                                                                        <button onClick={() => removeItem(index)} className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1 transition">
+                                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                                {/* ── Tier 2: Description + Metadata (full width) ── */}
+                                                                <div className={`${isSubItem ? 'pl-8' : 'pl-14'} pr-2 mt-0.5`}>
+                                                                    <div className="flex items-start gap-1">
                                                                         <textarea
                                                                             ref={el => autoExpand(el)}
                                                                             value={item.description || ""}
@@ -1069,38 +2247,79 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                                 autoExpand(e.target);
                                                                             }}
                                                                             onInput={e => autoExpand(e.target as HTMLTextAreaElement)}
-                                                                            placeholder="Description — click sparkle to auto-fill with AI"
+                                                                            placeholder="Add description..."
                                                                             rows={1}
-                                                                            className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 -ml-2 transition text-xs text-hui-textMuted resize-none overflow-hidden"
+                                                                            className="flex-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 transition text-xs text-hui-textMuted resize-none overflow-hidden"
                                                                         />
                                                                         {item.name?.trim() && (
                                                                             <button
                                                                                 onClick={() => suggestDescription(index)}
                                                                                 disabled={aiSuggestingDesc === item.id}
                                                                                 title="AI: suggest description"
-                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition opacity-0 group-hover:opacity-100 disabled:opacity-50 disabled:animate-pulse"
+                                                                                className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto"
                                                                             >
                                                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
                                                                             </button>
                                                                         )}
                                                                     </div>
-                                                                    {!isSubItem && (
-                                                                        <div className="flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition">
-                                                                            <button onClick={() => addItem(item.id)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium text-left w-fit">
-                                                                                + Add Sub-item
+                                                                    {/* Phase/Type pills + action buttons — hover only */}
+                                                                    <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                                        <select
+                                                                            value={item.costCodeId || ""}
+                                                                            onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
+                                                                            className="bg-slate-100 hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-hui-textMuted text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition"
+                                                                        >
+                                                                            <option value="">Phase</option>
+                                                                            {costCodes.map(cc => (
+                                                                                <option key={cc.id} value={cc.id}>{cc.code}</option>
+                                                                            ))}
+                                                                        </select>
+                                                                        <select
+                                                                            value={ITEM_TYPE_LABELS.includes(item.type) ? item.type : ""}
+                                                                            onChange={e => {
+                                                                                const label = e.target.value;
+                                                                                if (!label) return;
+                                                                                // One atomic update: set the label and drop any stale CostType link.
+                                                                                setItems(prev => prev.map((it, i) => i === index ? { ...it, type: label, costTypeId: null } : it));
+                                                                            }}
+                                                                            className={`hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition ${
+                                                                                item.type === 'Allowance'
+                                                                                    ? 'bg-amber-100 text-amber-700 font-semibold'
+                                                                                    : 'bg-slate-100 text-hui-textMuted'
+                                                                            }`}
+                                                                        >
+                                                                            <option value="">Type</option>
+                                                                            {ITEM_TYPE_LABELS.map(label => (
+                                                                                <option key={label} value={label}>{label}</option>
+                                                                            ))}
+                                                                        </select>
+                                                                        <span className="w-px h-3 bg-slate-200"></span>
+                                                                        {!isSubItem && (
+                                                                            <button onClick={() => addSubItem(index)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">
+                                                                                + Sub-item
                                                                             </button>
-                                                                            {item.name?.trim() && (
-                                                                                <button
-                                                                                    onClick={() => suggestSubitems(index)}
-                                                                                    disabled={aiSuggestingSubitems === item.id}
-                                                                                    className="text-[10px] text-amber-500 hover:text-amber-700 font-medium flex items-center gap-0.5 disabled:opacity-50 disabled:animate-pulse"
-                                                                                >
-                                                                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
-                                                                                    {aiSuggestingSubitems === item.id ? "Thinking..." : "AI Sub-items"}
-                                                                                </button>
-                                                                            )}
-                                                                        </div>
-                                                                    )}
+                                                                        )}
+                                                                        {isSubItem && (
+                                                                            <button onClick={() => addItemAfter(index, item.parentId)} className="text-[10px] text-hui-primary hover:text-hui-primaryHover font-medium">
+                                                                                + Item Below
+                                                                            </button>
+                                                                        )}
+                                                                        {!isSubItem && (
+                                                                            <button onClick={() => addCategoryAfter(index)} className="text-[10px] text-slate-400 hover:text-slate-600 font-medium">
+                                                                                + Category
+                                                                            </button>
+                                                                        )}
+                                                                        {!isSubItem && item.name?.trim() && (
+                                                                            <button
+                                                                                onClick={() => suggestSubitems(index)}
+                                                                                disabled={aiSuggestingSubitems === item.id}
+                                                                                className="text-[10px] text-amber-500 hover:text-amber-700 font-medium flex items-center gap-0.5 disabled:opacity-50 disabled:animate-pulse"
+                                                                            >
+                                                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
+                                                                                {aiSuggestingSubitems === item.id ? "Thinking..." : "AI Sub-items"}
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
                                                                     {/* AI sub-item suggestions popover */}
                                                                     {showSubitemSuggestions === item.id && aiSubitemSuggestions.length > 0 && (
                                                                         <div className="mt-2 bg-amber-50 border border-amber-200 rounded-lg p-3 shadow-sm">
@@ -1168,119 +2387,20 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                                         </div>
                                                                     )}
                                                                 </div>
-                                                                <div className="w-32 px-2">
-                                                                    <select
-                                                                        value={item.costCodeId || ""}
-                                                                        onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
-                                                                        className="bg-transparent focus:outline-none text-hui-textMuted w-full text-xs truncate"
-                                                                    >
-                                                                        <option value="">No Phase</option>
-                                                                        {costCodes.map(cc => (
-                                                                            <option key={cc.id} value={cc.id}>{cc.code}</option>
-                                                                        ))}
-                                                                    </select>
-                                                                </div>
-                                                                <div className="w-32 px-4">
-                                                                    <select
-                                                                        value={item.costTypeId || ""}
-                                                                        onChange={e => {
-                                                                            updateItem(index, "costTypeId", e.target.value || null);
-                                                                            // Also update legacy type field for backwards compat
-                                                                            const ct = costTypes.find(c => c.id === e.target.value);
-                                                                            if (ct) updateItem(index, "type", ct.name);
-                                                                        }}
-                                                                        className={`bg-transparent focus:outline-none w-full text-sm ${
-                                                                            costTypes.find(c => c.id === item.costTypeId)?.name === 'Allowance'
-                                                                                ? 'text-amber-600 font-semibold'
-                                                                                : 'text-hui-textMuted'
-                                                                        }`}
-                                                                    >
-                                                                        <option value="">Cost Type</option>
-                                                                        {costTypes.map(ct => (
-                                                                            <option key={ct.id} value={ct.id}>{ct.name}</option>
-                                                                        ))}
-                                                                    </select>
-                                                                    </div>
-                                                                     <div className="w-24 px-4 pt-1 text-right">
-                                                                         <input
-                                                                             type="number"
-                                                                             value={item.quantity}
-                                                                             onChange={e => updateItem(index, "quantity", e.target.value)}
-                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
-                                                                         />
-                                                                     </div>
-                                                                     {viewMode === "internal" && (
-                                                                         <div className="w-28 px-2 pt-1 text-right relative">
-                                                                             <span className="absolute left-4 top-1.5 text-amber-400 text-sm">$</span>
-                                                                             <input
-                                                                                 type="number"
-                                                                                 value={item.baseCost ?? 0}
-                                                                                 onChange={e => {
-                                                                                     const bc = parseFloat(e.target.value) || 0;
-                                                                                     const mp = parseFloat(item.markupPercent) || 0;
-                                                                                     updateItem(index, "baseCost", e.target.value);
-                                                                                     updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
-                                                                                 }}
-                                                                                 className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 pl-5 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
-                                                                             />
-                                                                         </div>
-                                                                     )}
-                                                                     {viewMode === "internal" && (
-                                                                         <div className="w-20 px-1 pt-1 text-right relative">
-                                                                             <input
-                                                                                 type="number"
-                                                                                 value={item.markupPercent ?? 25}
-                                                                                 onChange={e => {
-                                                                                     const mp = parseFloat(e.target.value) || 0;
-                                                                                     const bc = parseFloat(item.baseCost) || 0;
-                                                                                     updateItem(index, "markupPercent", e.target.value);
-                                                                                     updateItem(index, "unitCost", (bc * (1 + mp / 100)).toFixed(2));
-                                                                                 }}
-                                                                                 className="w-full bg-amber-50/50 focus:outline-none focus:bg-white focus:ring-1 ring-amber-200 rounded px-2 py-1 text-right hover:bg-amber-50 transition text-sm font-medium text-amber-800"
-                                                                             />
-                                                                             <span className="absolute right-3 top-2 text-amber-400 text-xs">%</span>
-                                                                         </div>
-                                                                     )}
-                                                                     <div className="w-32 px-4 pt-1 text-right relative">
-                                                                         <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
-                                                                         <input
-                                                                             type="number"
-                                                                             value={item.unitCost}
-                                                                             onChange={e => updateItem(index, "unitCost", e.target.value)}
-                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
-                                                                             readOnly={viewMode === "internal"}
-                                                                         />
-                                                                     </div>
-                                                                    <div className="w-32 px-4 pt-2 text-right font-semibold text-slate-800 text-sm">
-                                                                        {formatCurrency(itemTotal)}
-                                                                    </div>
-                                                                    <div className="w-28 pt-1 flex items-center justify-end gap-0.5">
-                                                                        {item.approvalStatus === "approved" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
-                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                                                Approved
-                                                                            </span>
-                                                                        ) : item.approvalStatus === "rejected" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
-                                                                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                                                                                Rejected
-                                                                            </span>
-                                                                        ) : (
-                                                                            <span className="opacity-0 group-hover:opacity-100 transition flex gap-0.5">
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-300 hover:text-green-600 transition" title="Approve">
-                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                                                </button>
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-300 hover:text-red-500 transition" title="Reject">
-                                                                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                                                                                </button>
-                                                                            </span>
-                                                                        )}
-                                                                        <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
-                                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                                        </button>
-                                                                    </div>
                                                             </div>
-                                                        )}
+                                                            {viewMode === "internal" && !isSection && (
+                                                                <BudgetStrip
+                                                                    item={item}
+                                                                    index={index}
+                                                                    updateItem={updateItem}
+                                                                    contextType={context.type}
+                                                                    onLinkPO={handleLinkPO}
+                                                                    onCreatePO={(id) => setPOCreateItemId(id)}
+                                                                    onUnlinkPO={handleUnlinkPO}
+                                                                    onViewPO={(poId) => window.open(`/projects/${context.id}/purchase-orders/${poId}`, "_blank")}
+                                                                />
+                                                            )}
+                                                        </>)}
                                                     </Draggable>
                                                 );
                                             })}
@@ -1290,12 +2410,18 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </Droppable>
                             </DragDropContext>
 
-                            <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={() => addItem(null)}>
-                                <button className="text-sm font-semibold text-indigo-500 group-hover:text-indigo-600 flex items-center gap-2 transition">
-                                    <span className="bg-indigo-50 text-indigo-500 group-hover:bg-indigo-100 rounded p-1">
+                            <div className="p-4 px-8 border-t border-slate-100 bg-white flex items-center gap-4">
+                                <button onClick={() => addItem(null)} className="text-sm font-semibold text-indigo-500 hover:text-indigo-600 flex items-center gap-2 transition group/btn">
+                                    <span className="bg-indigo-50 text-indigo-500 group-hover/btn:bg-indigo-100 rounded p-1">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
                                     </span>
                                     Add New Item
+                                </button>
+                                <button onClick={() => addCategoryAfter(items.length - 1)} className="text-sm font-semibold text-slate-400 hover:text-slate-600 flex items-center gap-2 transition group/btn">
+                                    <span className="bg-slate-50 text-slate-400 group-hover/btn:bg-slate-100 rounded p-1">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                                    </span>
+                                    Add New Category
                                 </button>
                             </div>
                         </div>
@@ -1306,74 +2432,291 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 <div className="flex items-center justify-between bg-slate-50/50 border-b border-slate-100 px-8 py-5">
                                     <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
                                 </div>
+                                {linkedInvoice && (
+                                    <div className="flex items-start gap-2.5 bg-amber-50 border-b border-amber-200 px-8 py-3">
+                                        <svg className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                                        </svg>
+                                        <p className="text-xs text-amber-800">
+                                            <span className="font-semibold">This estimate has been invoiced ({linkedInvoice.code}).</span>{" "}
+                                            Adding, editing, or deleting milestones here does <strong>not</strong> update the invoice — align the invoice&apos;s payment schedule separately.
+                                        </p>
+                                    </div>
+                                )}
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-white border-b border-slate-100 px-8 py-3 uppercase tracking-wider">
                                     <div className="flex-1">Payment Name</div>
                                     <div className="w-32">Percentage</div>
                                     <div className="w-32">Amount</div>
                                     <div className="w-40 text-right">Due Date</div>
+                                    <div className="w-32 text-right">Status</div>
                                     <div className="w-10"></div>
                                 </div>
                                 <div className="divide-y divide-slate-50">
-                                    {paymentSchedules.map((schedule, index) => (
-                                        <div key={schedule.id || index} className="flex items-center px-8 py-4 bg-white group hover:bg-slate-50/50 transition-colors border-l-4 border-transparent">
+                                    {paymentSchedules.map((schedule, index) => {
+                                        const isPaid = schedule.status === "Paid";
+                                        const paidOn = schedule.paidAt || schedule.paymentDate;
+                                        const isSavedSchedule = !!schedule.id && savedScheduleIds.has(schedule.id);
+                                        const methodLabel = formatEstPaymentMethod(schedule.paymentMethod, schedule.referenceNumber);
+                                        return (
+                                        <div key={schedule.id || index} className={`flex items-center px-8 py-4 transition-colors border-l-4 ${isPaid ? 'bg-green-50/60 border-green-400' : 'bg-white hover:bg-slate-50/50 border-transparent group'}`}>
                                             <div className="flex-1">
                                                 <input
                                                     type="text"
                                                     value={schedule.name}
                                                     onChange={e => updatePaymentSchedule(index, "name", e.target.value)}
                                                     placeholder="e.g. Initial Deposit"
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800"
+                                                    disabled={isPaid}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800 disabled:cursor-default"
                                                 />
+                                                {isPaid && methodLabel && (
+                                                    <div className="text-[11px] text-slate-400 mt-0.5 ml-0">{methodLabel}</div>
+                                                )}
                                             </div>
                                             <div className="w-32 px-4 relative">
                                                 <input
                                                     type="number"
-                                                    value={schedule.percentage}
+                                                    value={schedule.percentage || (total > 0 && schedule.amount ? String(rm(((parseFloat(schedule.amount) || 0) / total) * 100)) : "")}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium text-slate-600"
+                                                    disabled={isPaid}
+                                                    className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium disabled:cursor-default ${!schedule.percentage && schedule.amount ? 'text-slate-300 italic' : 'text-slate-600'}`}
                                                 />
                                                 <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
                                             </div>
                                             <div className="w-32 px-4 relative">
-                                                <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
-                                                <input
-                                                    type="number"
-                                                    value={schedule.amount}
-                                                    onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
-                                                />
+                                                {isPaid ? (
+                                                    <span className="block px-3 py-1.5 text-sm font-medium text-slate-800">{formatCurrency(Number(schedule.amount) || 0)}</span>
+                                                ) : (
+                                                    <>
+                                                        <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
+                                                        <input
+                                                            type="number"
+                                                            value={schedule.amount}
+                                                            onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
+                                                            onBlur={handleAmountBlur}
+                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
+                                                        />
+                                                    </>
+                                                )}
                                             </div>
                                             <div className="w-40 px-4 text-right">
                                                 <input
                                                     type="date"
                                                     value={schedule.dueDate ? new Date(schedule.dueDate).toISOString().split('T')[0] : ''}
-                                                    onChange={e => updatePaymentSchedule(index, "dueDate", new Date(e.target.value).toISOString())}
-                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500"
+                                                    onChange={e => updatePaymentSchedule(index, "dueDate", e.target.value ? new Date(e.target.value).toISOString() : null)}
+                                                    disabled={isPaid}
+                                                    className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500 disabled:cursor-default"
                                                 />
                                             </div>
+                                            <div className="w-32 px-4 text-right">
+                                                {isPaid ? (
+                                                    <div className="flex flex-col items-end gap-0.5">
+                                                        <span className="inline-flex items-center gap-1 text-[11px] font-bold uppercase text-green-700 bg-green-100 px-2 py-0.5 rounded-full">
+                                                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                                                            Paid
+                                                        </span>
+                                                        {paidOn && (
+                                                            <span className="text-[10px] text-slate-400">{new Date(paidOn).toLocaleDateString()}</span>
+                                                        )}
+                                                        <button
+                                                            onClick={async () => {
+                                                                if (!schedule.id) return;
+                                                                setIsSendingEstReceipt(schedule.id);
+                                                                try {
+                                                                    const result = await sendEstimatePaymentReceipt(schedule.id);
+                                                                    if (result.success) {
+                                                                        toast.success("Receipt sent");
+                                                                        router.refresh();
+                                                                    } else {
+                                                                        toast.error(result.error || "Failed to send receipt");
+                                                                    }
+                                                                } catch (e: any) {
+                                                                    toast.error(e?.message || "Failed to send receipt");
+                                                                } finally {
+                                                                    setIsSendingEstReceipt(null);
+                                                                }
+                                                            }}
+                                                            disabled={isSendingEstReceipt === schedule.id}
+                                                            title={schedule.receiptSentAt ? `Last sent ${new Date(schedule.receiptSentAt).toLocaleString()}` : undefined}
+                                                            className="mt-1 text-[10px] text-indigo-600 hover:text-indigo-700 underline underline-offset-2 disabled:opacity-50"
+                                                        >
+                                                            {isSendingEstReceipt === schedule.id
+                                                                ? "Sending..."
+                                                                : schedule.receiptSentAt ? "Resend Receipt" : "Send Receipt"}
+                                                        </button>
+                                                        <button
+                                                            onClick={() => setUndoPaymentTarget(schedule)}
+                                                            className="text-[10px] text-slate-400 hover:text-red-600 underline underline-offset-2"
+                                                        >
+                                                            Undo
+                                                        </button>
+                                                    </div>
+                                                ) : isSavedSchedule ? (
+                                                    <button
+                                                        onClick={() => setRecordingEstPayment({ id: schedule.id, name: schedule.name || "Milestone", amount: Number(schedule.amount) || 0 })}
+                                                        className="hui-btn hui-btn-primary py-1.5 px-3 text-xs flex items-center gap-1.5"
+                                                    >
+                                                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                        </svg>
+                                                        Record Payment
+                                                    </button>
+                                                ) : (
+                                                    <span className="text-[11px] font-medium text-slate-400 uppercase tracking-wide">Pending</span>
+                                                )}
+                                            </div>
                                             <div className="w-10 pt-0.5 flex justify-end">
-                                                <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 group-hover:opacity-100">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                                </button>
+                                                {!isPaid && (
+                                                    <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
+                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                                    </button>
+                                                )}
                                             </div>
                                         </div>
-                                    ))}
+                                        );
+                                    })}
                                 </div>
+                                {/* Schedule total validation */}
+                                {(() => {
+                                    const scheduleSum = rm(paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0));
+                                    const diff = rm(total - scheduleSum);
+                                    const balanced = Math.abs(diff) < 0.01;
+                                    return (
+                                        <div className={`flex items-center justify-between px-8 py-3 border-t ${balanced ? 'bg-green-50/50 border-green-100' : 'bg-amber-50/50 border-amber-200'}`}>
+                                            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Schedule Total</span>
+                                            <div className="flex items-center gap-2.5">
+                                                <span className={`text-sm font-bold ${balanced ? 'text-green-700' : 'text-amber-700'}`}>
+                                                    {formatCurrency(scheduleSum)}
+                                                </span>
+                                                <span className="text-xs text-slate-400">of</span>
+                                                <span className="text-sm font-medium text-slate-600">{formatCurrency(total)}</span>
+                                                {balanced ? (
+                                                    <svg className="w-4 h-4 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                                                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                                    </svg>
+                                                ) : (
+                                                    <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${diff > 0 ? 'text-amber-700 bg-amber-100' : 'text-red-700 bg-red-100'}`}>
+                                                        {diff > 0 ? `${formatCurrency(diff)} under` : `${formatCurrency(Math.abs(diff))} over`}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </div>
+                                    );
+                                })()}
                             </div>
                         )}
 
                         {/* Footer Totals */}
-                            <div className="bg-slate-50 p-10 flex justify-end border-t border-slate-200">
-                                <div className="w-80 space-y-4 text-sm">
+                            <div className="bg-slate-50 p-10 flex justify-between items-start border-t border-slate-200 gap-8">
+                                <div className="flex-1 max-w-lg">
+                                    {/* Stripe Fee Pass-Through Cost Savings Banner */}
+                                    {viewMode === "internal" && (
+                                        <div className="border rounded-xl p-4 transition-all duration-200 shadow-sm bg-white border-slate-200">
+                                            <div className="flex items-start gap-3">
+                                                <div className={`p-2 rounded-lg flex-shrink-0 ${settings?.passProcessingFee ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50/75 text-amber-600'}`}>
+                                                    {settings?.passProcessingFee ? (
+                                                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                                                        </svg>
+                                                    ) : (
+                                                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                        </svg>
+                                                    )}
+                                                </div>
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="flex items-center gap-2">
+                                                        <h5 className="font-bold text-slate-800 text-xs tracking-tight">
+                                                            {settings?.passProcessingFee ? "Stripe Fee Pass-Through Active" : "Stripe Fees Absorbed by Contractor"}
+                                                        </h5>
+                                                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${settings?.passProcessingFee ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+                                                            {settings?.passProcessingFee ? "Saving Money" : "Cost Overhead"}
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                                                        {settings?.passProcessingFee ? (
+                                                            <>
+                                                                Client covers the Stripe card transaction processing fee ({settings?.cardProcessingRate || 2.9}% + ${Number(settings?.cardProcessingFlat || 0.30).toFixed(2)}) at checkout. 
+                                                                This preserves your margins, saving you approximately <span className="font-bold text-emerald-600">{formatCurrency(subtotal * (Number(settings?.cardProcessingRate || 2.9) / 100) + Number(settings?.cardProcessingFlat || 0.30))}</span> on this document.
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                You currently absorb the online transaction processing fee ({settings?.cardProcessingRate || 2.9}% + ${Number(settings?.cardProcessingFlat || 0.30).toFixed(2)}). 
+                                                                If the client pays online, it will cost you roughly <span className="font-bold text-amber-600">{formatCurrency(subtotal * (Number(settings?.cardProcessingRate || 2.9) / 100) + Number(settings?.cardProcessingFlat || 0.30))}</span>. 
+                                                                To pass card fees to the client and save this cost, toggle fee pass-through in <a href="/settings/payment-methods" className="text-indigo-600 hover:text-indigo-800 underline font-medium transition">Settings</a>.
+                                                            </>
+                                                        )}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="w-80 space-y-4 text-sm flex-shrink-0">
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>Subtotal</span>
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
                                     </div>
-                                    <div className="flex justify-between text-slate-500 font-medium">
-                                        <span>{taxName}</span>
-                                        <span className="text-slate-800">{formatCurrency(tax)}</span>
-                                    </div>
+                                    {!taxExempt && (
+                                        <div className="flex justify-between text-slate-500 font-medium">
+                                            <span>{taxName}</span>
+                                            <span className="text-slate-800">{formatCurrency(tax)}</span>
+                                        </div>
+                                    )}
+                                    {viewMode === "internal" && salesTaxes.length > 0 && (
+                                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                                            <select
+                                                value={taxExempt ? "__exempt__" : (selectedTaxName || "")}
+                                                onChange={(e) => {
+                                                    if (e.target.value === "__exempt__") {
+                                                        setTaxExempt(true);
+                                                        setSelectedTaxName(null);
+                                                    } else {
+                                                        setTaxExempt(false);
+                                                        setSelectedTaxName(e.target.value);
+                                                    }
+                                                }}
+                                                className="hui-input text-xs py-1 pl-2 pr-6 rounded"
+                                            >
+                                                {taxOptions.map(t => (
+                                                    <option key={t.name} value={t.name}>
+                                                        {t.name} ({Number(parseFloat(String(t.rate)).toFixed(4))}%){("orphaned" in t && t.orphaned) ? " — not in settings" : ""}
+                                                    </option>
+                                                ))}
+                                                <option value="__exempt__">Tax Exempt</option>
+                                            </select>
+                                        </div>
+                                    )}
+                                    {viewMode === "internal" && salesTaxes.length === 0 && (
+                                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                                            <input
+                                                type="checkbox"
+                                                id="taxExempt"
+                                                checked={taxExempt}
+                                                onChange={(e) => setTaxExempt(e.target.checked)}
+                                                className="accent-hui-primary"
+                                            />
+                                            <label htmlFor="taxExempt" className="cursor-pointer select-none">
+                                                Tax exempt (subcontractor / resale)
+                                            </label>
+                                        </div>
+                                    )}
+                                    {viewMode === "internal" && showTaxCertWarning && (
+                                        <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
+                                            <div className="flex items-start gap-2">
+                                                <svg className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
+                                                <div className="text-xs">
+                                                    <p className="font-bold text-amber-800">
+                                                        {taxCertStatus === "expired"
+                                                            ? `Exemption certificate expired${context.clientTaxExemptCertExpiresAt ? ` ${formatCertExpiry(context.clientTaxExemptCertExpiresAt)}` : ""}`
+                                                            : "No exemption certificate on file"}
+                                                    </p>
+                                                    <p className="text-amber-700 mt-0.5">WA DOR requires a reseller permit or exemption certificate on file for every tax-exempt sale. Signing is not blocked.</p>
+                                                    <a href={taxCertFixHref} className="inline-block mt-1 font-semibold text-amber-800 underline hover:text-amber-900">Add it on the client record →</a>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
                                     {/* Processing Fee Markup — hidden from client view by default */}
                                     {(viewMode === "internal" || !hideProcessingFee) && (
                                         <div className="flex justify-between items-center text-slate-500 font-medium">
@@ -1420,27 +2763,27 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
                             {/* Internal Margin Summary */}
                             {viewMode === "internal" && (
-                                <div className="bg-amber-50/60 border-t border-amber-200 px-10 py-4 flex items-center justify-between">
+                                <div className="bg-indigo-50/60 border-t border-indigo-200 px-10 py-4 flex items-center justify-between">
                                     <div className="flex items-center gap-2">
-                                        <svg className="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-                                        <span className="text-xs font-semibold text-amber-800 uppercase tracking-wider">Internal Margin Summary</span>
+                                        <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                                        <span className="text-xs font-semibold text-indigo-800 uppercase tracking-wider">Internal Margin Summary</span>
                                     </div>
                                     <div className="flex items-center gap-6 text-sm">
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Base Cost</div>
-                                            <div className="font-bold text-amber-900">{formatCurrency(totalBaseCost)}</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Internal Budget</div>
+                                            <div className="font-bold text-indigo-900">{formatCurrency(totalBaseCost)}</div>
                                         </div>
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Markup</div>
-                                            <div className="font-bold text-amber-900">{formatCurrency(totalMarkup)}</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Profit</div>
+                                            <div className="font-bold text-indigo-900">{formatCurrency(totalMarkup)}</div>
                                         </div>
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Margin</div>
-                                            <div className="font-bold text-amber-900">{profitMargin.toFixed(1)}%</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Margin</div>
+                                            <div className="font-bold text-indigo-900">{profitMargin.toFixed(1)}%</div>
                                         </div>
                                         <div className="text-center">
-                                            <div className="text-[10px] text-amber-600 font-semibold uppercase">Sell Price</div>
-                                            <div className="font-bold text-amber-900">{formatCurrency(subtotal)}</div>
+                                            <div className="text-[10px] text-indigo-600 font-semibold uppercase">Sell Total</div>
+                                            <div className="font-bold text-indigo-900">{formatCurrency(subtotal)}</div>
                                         </div>
                                     </div>
                                 </div>
@@ -1456,6 +2799,113 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 <button onClick={addPaymentSchedule} className="hui-btn hui-btn-secondary text-indigo-700 border-indigo-200 hover:bg-indigo-100 bg-white transition shadow-sm text-xs py-1.5 px-3">
                                     + Add milestone
                                 </button>
+                            </div>
+                        </div>
+
+                        {/* Project Overview / Vision Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowOverview(!showOverview)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Project Overview</span>
+                                        {overviewEnabled && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">On</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showOverview ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showOverview && (
+                                    <div className="px-6 pb-5 border-t border-slate-100 space-y-3">
+                                        <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                                            <input type="checkbox" checked={overviewEnabled} onChange={e => setOverviewEnabled(e.target.checked)} className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                                            <span className="text-sm text-slate-600">Include a Project Overview page (shown after the header/client info, before pricing, with a page break so the line items begin on the next page).</span>
+                                        </label>
+                                        <div>
+                                            <label className="text-xs font-medium text-slate-500 mb-1 block">Page title</label>
+                                            <input value={overviewTitle} onChange={e => setOverviewTitle(e.target.value)} placeholder="Project Overview" className="hui-input w-full text-sm" />
+                                        </div>
+                                        {overviewTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm"
+                                                value=""
+                                                onChange={e => { const t = overviewTemplates.find(t => t.id === e.target.value); if (t) setOverviewBody(t.body); }}
+                                            >
+                                                <option value="" disabled>Load a saved overview template...</option>
+                                                {overviewTemplates.map(t => <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>)}
+                                            </select>
+                                        )}
+                                        <RichTextEditor
+                                            value={overviewBody}
+                                            onChange={setOverviewBody}
+                                            placeholder="Describe the overall project vision, the major areas of work, and how the scopes fit together. No pricing here."
+                                        />
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => handleSaveDocTemplate("overview", overviewBody)} disabled={isSavingOverviewTpl} className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                                                {isSavingOverviewTpl ? "Saving…" : "Save as template"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Estimate Notes & Assumptions Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowNotes(!showNotes)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Notes &amp; Assumptions</span>
+                                        {notesEnabled && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">On</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showNotes ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showNotes && (
+                                    <div className="px-6 pb-5 border-t border-slate-100 space-y-3">
+                                        <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                                            <input type="checkbox" checked={notesEnabled} onChange={e => setNotesEnabled(e.target.checked)} className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                                            <span className="text-sm text-slate-600">Include a Notes &amp; Assumptions section for exclusions, allowances, and estimating assumptions.</span>
+                                        </label>
+                                        <div className="grid grid-cols-2 gap-3">
+                                            <div>
+                                                <label className="text-xs font-medium text-slate-500 mb-1 block">Section title</label>
+                                                <input value={notesTitle} onChange={e => setNotesTitle(e.target.value)} placeholder="Estimate Notes & Assumptions" className="hui-input w-full text-sm" />
+                                            </div>
+                                            <div>
+                                                <label className="text-xs font-medium text-slate-500 mb-1 block">Placement</label>
+                                                <select value={notesPlacement} onChange={e => setNotesPlacement(e.target.value === "before" ? "before" : "after")} className="hui-input w-full text-sm">
+                                                    <option value="before">Before the line items</option>
+                                                    <option value="after">After the line items</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        {notesTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm"
+                                                value=""
+                                                onChange={e => { const t = notesTemplates.find(t => t.id === e.target.value); if (t) setNotesBody(t.body); }}
+                                            >
+                                                <option value="" disabled>Load a saved notes template...</option>
+                                                {notesTemplates.map(t => <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>)}
+                                            </select>
+                                        )}
+                                        <RichTextEditor
+                                            value={notesBody}
+                                            onChange={setNotesBody}
+                                            placeholder="Exclusions, allowances, and assumptions behind this estimate..."
+                                        />
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => handleSaveDocTemplate("notes", notesBody)} disabled={isSavingNotesTpl} className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                                                {isSavingNotesTpl ? "Saving…" : "Save as template"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
 
@@ -1484,7 +2934,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                                     <span className="truncate">{f.name}</span>
                                                     <span className="text-xs text-slate-400 flex-shrink-0">{formatFileSize(f.size)}</span>
                                                 </a>
-                                                <button onClick={() => handleDeleteFile(f.id)} className="text-slate-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition ml-2" title="Delete">
+                                                <button onClick={() => handleDeleteFile(f.id)} className="text-slate-400 hover:text-red-500 transition ml-2" title="Delete">
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg>
                                                 </button>
                                             </div>
@@ -1516,10 +2966,25 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 {showTerms && (
                                     <div className="px-6 pb-5 border-t border-slate-100">
                                         <p className="text-xs text-slate-500 mt-3 mb-2">These terms will be included on the estimate sent to the client.</p>
+                                        {termsTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm mb-2"
+                                                value=""
+                                                onChange={e => {
+                                                    const t = termsTemplates.find(t => t.id === e.target.value);
+                                                    if (t) setTermsAndConditions(t.body);
+                                                }}
+                                            >
+                                                <option value="" disabled>Load a template...</option>
+                                                {termsTemplates.map(t => (
+                                                    <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>
+                                                ))}
+                                            </select>
+                                        )}
                                         <textarea
                                             value={termsAndConditions}
                                             onChange={e => setTermsAndConditions(e.target.value)}
-                                            placeholder="Enter your terms and conditions here. For example: Payment is due within 30 days of invoice. A 50% deposit is required before work begins..."
+                                            placeholder="Enter your terms and conditions here, or select a template above..."
                                             className="hui-input w-full h-32 resize-y text-sm"
                                         />
                                     </div>
@@ -1591,78 +3056,95 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
 
             {/* Right Sidebar */}
             {showSidebar && (
-                <div className="w-80 border-l border-slate-200 bg-white flex flex-col overflow-y-auto shrink-0">
+                <div className="w-full lg:w-96 border-t lg:border-t-0 lg:border-l border-slate-200 bg-white flex flex-col overflow-visible lg:overflow-y-auto overflow-x-hidden lg:shrink-0">
                     {/* Sidebar Tabs */}
                     <div className="flex border-b border-slate-200 sticky top-0 bg-white z-10">
                         <button
                             onClick={() => setSidebarTab("overview")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "overview" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "overview" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Overview</button>
                         <button
                             onClick={() => setSidebarTab("activity")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "activity" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "activity" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Activity</button>
                         <button
                             onClick={() => setSidebarTab("comments")}
-                            className={`flex-1 px-4 py-3 text-sm font-medium transition ${sidebarTab === "comments" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "comments" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
                         >Comments</button>
+                        <button
+                            onClick={() => setSidebarTab("history")}
+                            className={`flex-1 px-3 py-2.5 text-sm font-medium transition ${sidebarTab === "history" ? "text-indigo-600 border-b-2 border-indigo-600" : "text-slate-500 hover:text-slate-700"}`}
+                        >History</button>
                     </div>
 
                     {sidebarTab === "overview" && (
-                        <div className="p-5 space-y-5">
-                            {/* Status */}
+                        <div className="p-4 space-y-3">
+                            {/* Financials */}
                             <div>
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block">Status</label>
-                                <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold ${
-                                    status === "Draft" ? "bg-slate-100 text-slate-600" :
-                                    status === "Sent" ? "bg-amber-50 text-amber-700" :
-                                    status === "Viewed" ? "bg-blue-50 text-blue-700" :
-                                    status === "Approved" ? "bg-green-50 text-green-700" :
-                                    status === "Invoiced" ? "bg-teal-50 text-teal-700" :
-                                    status === "Paid" ? "bg-emerald-50 text-emerald-700" :
-                                    "bg-slate-100 text-slate-500"
-                                }`}>{status}</span>
-                            </div>
-
-                            {/* Amounts */}
-                            <div className="space-y-3">
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Financials</label>
-                                <div className="grid grid-cols-2 gap-3">
-                                    <div className="bg-slate-50 rounded-lg p-3">
-                                        <p className="text-[10px] text-slate-500 font-medium uppercase">Subtotal</p>
-                                        <p className="text-sm font-bold text-slate-800">{formatCurrency(subtotal)}</p>
-                                    </div>
-                                    <div className="bg-indigo-50 rounded-lg p-3">
-                                        <p className="text-[10px] text-indigo-500 font-medium uppercase">Total</p>
-                                        <p className="text-sm font-bold text-indigo-700">{formatCurrency(total)}</p>
-                                    </div>
+                                <div className="flex items-center justify-between mb-1.5">
+                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Financials</label>
+                                    {viewMode === "internal" && (() => {
+                                        const leafItems = items.filter(item => {
+                                            if (!item.parentId && items.some((i: any) => i.parentId === item.id)) return false;
+                                            return true;
+                                        });
+                                        const budgeted = leafItems.filter(i => internalBudget({ budgetQuantity: i.budgetQuantity, quantity: parseFloat(i.quantity) || 0, budgetRate: i.budgetRate, baseCost: i.baseCost }) != null).length;
+                                        const totalLeaf = leafItems.length;
+                                        const allBudgeted = budgeted === totalLeaf;
+                                        return (
+                                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${allBudgeted ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+                                                {budgeted}/{totalLeaf} budgeted
+                                            </span>
+                                        );
+                                    })()}
+                                    {viewMode !== "internal" && (
+                                        <span className="text-[11px] text-slate-400">
+                                            {items.length} items{paymentSchedules.length > 0 && ` · ${paymentSchedules.length} milestones`}
+                                        </span>
+                                    )}
                                 </div>
-                                {viewMode === "internal" && (
-                                    <div className="bg-amber-50 rounded-lg p-3">
-                                        <p className="text-[10px] text-amber-600 font-medium uppercase">Profit Margin</p>
-                                        <p className="text-sm font-bold text-amber-800">{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</p>
+                                <div className="bg-slate-50 rounded-lg p-2.5 divide-y divide-slate-200">
+                                    {viewMode === "internal" && (
+                                        <div className="flex justify-between items-baseline pb-2">
+                                            <span className="text-[10px] text-indigo-500 font-medium uppercase">Internal Budget</span>
+                                            <span className="text-sm font-semibold text-indigo-700">{formatCurrency(totalBaseCost)}</span>
+                                        </div>
+                                    )}
+                                    <div className="flex justify-between items-baseline py-2">
+                                        <span className="text-[10px] text-slate-500 font-medium uppercase">{viewMode === "internal" ? "Sell Total" : "Subtotal"}</span>
+                                        <span className="text-sm font-semibold text-slate-700">{formatCurrency(subtotal)}</span>
                                     </div>
-                                )}
+                                    <div className="flex justify-between items-baseline py-2">
+                                        <span className="text-[10px] text-indigo-500 font-medium uppercase">Total</span>
+                                        <span className="text-sm font-bold text-indigo-700">{formatCurrency(total)}</span>
+                                    </div>
+                                    {viewMode === "internal" && (
+                                        <div className="flex justify-between items-baseline pt-2">
+                                            <span className={`text-[10px] font-medium uppercase ${profitMargin >= 20 ? "text-emerald-600" : profitMargin >= 10 ? "text-amber-600" : "text-red-600"}`}>Margin</span>
+                                            <span className={`text-sm font-bold ${profitMargin >= 20 ? "text-emerald-700" : profitMargin >= 10 ? "text-amber-700" : "text-red-700"}`}>{profitMargin.toFixed(1)}% ({formatCurrency(totalMarkup)})</span>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
 
                             {/* Key Dates */}
-                            <div className="space-y-2">
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Key Dates</label>
-                                <div className="space-y-2 text-sm">
+                            <div>
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 block">Key Dates</label>
+                                <div className="space-y-1 text-xs">
                                     <div className="flex justify-between">
                                         <span className="text-slate-500">Created</span>
-                                        <span className="text-slate-800 font-medium">{new Date(initialEstimate.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                        <span className="text-slate-700 font-medium">{new Date(initialEstimate.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                     </div>
                                     {initialEstimate.sentAt && (
                                         <div className="flex justify-between">
                                             <span className="text-slate-500">Sent</span>
-                                            <span className="text-slate-800 font-medium">{new Date(initialEstimate.sentAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                            <span className="text-slate-700 font-medium">{new Date(initialEstimate.sentAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                         </div>
                                     )}
                                     {initialEstimate.viewedAt && (
                                         <div className="flex justify-between">
                                             <span className="text-slate-500">Viewed</span>
-                                            <span className="text-slate-800 font-medium">{new Date(initialEstimate.viewedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                            <span className="text-slate-700 font-medium">{new Date(initialEstimate.viewedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                         </div>
                                     )}
                                     {initialEstimate.approvedAt && (
@@ -1674,99 +3156,78 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     {expirationDate && (
                                         <div className="flex justify-between">
                                             <span className="text-slate-500">Expires</span>
-                                            <span className={`font-medium ${new Date(expirationDate) < new Date() ? 'text-red-600' : 'text-slate-800'}`}>{new Date(expirationDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                                            <span className={`font-medium ${new Date(expirationDate) < new Date() ? 'text-red-600' : 'text-slate-700'}`}>{new Date(expirationDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                                         </div>
                                     )}
                                 </div>
                             </div>
 
                             {/* Client Info */}
-                            <div className="space-y-2">
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Client</label>
-                                <div className="bg-slate-50 rounded-lg p-3 space-y-1">
-                                    <p className="text-sm font-semibold text-slate-800">{context.clientName}</p>
-                                    {context.clientEmail && <p className="text-xs text-slate-500">{context.clientEmail}</p>}
-                                    {context.location && <p className="text-xs text-slate-500">{context.location}</p>}
+                            <div>
+                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 block">Client</label>
+                                <div className="bg-slate-50 rounded-lg px-2.5 py-2 space-y-0.5">
+                                    <p className="text-xs font-semibold text-slate-800 truncate">{context.clientName}</p>
+                                    {context.clientEmail && <p className="text-[11px] text-slate-500 truncate">{context.clientEmail}</p>}
+                                    {context.location && <p className="text-[11px] text-slate-500 truncate">{context.location}</p>}
                                 </div>
                             </div>
 
                             {/* Signature */}
                             {initialEstimate.signatureUrl && (
-                                <div className="space-y-2">
-                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Signature</label>
-                                    <div className="bg-green-50 rounded-lg p-3 border border-green-200">
-                                        <div className="flex items-center gap-2 mb-2">
-                                            <svg className="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                            <span className="text-xs font-semibold text-green-700">Signed by {initialEstimate.approvedBy || 'Client'}</span>
-                                        </div>
-                                        <img src={initialEstimate.signatureUrl} alt="Signature" className="max-h-16 rounded" />
+                                <div>
+                                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 block">Signature</label>
+                                    <div className="bg-green-50 rounded-lg px-2.5 py-2 border border-green-200 flex items-center gap-2.5">
+                                        <svg className="w-3.5 h-3.5 text-green-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                        <span className="text-[11px] font-semibold text-green-700 truncate flex-1 min-w-0">Signed by {initialEstimate.approvedBy || 'Client'}</span>
+                                        <img src={initialEstimate.signatureUrl} alt="Signature" className="max-h-10 max-w-[120px] object-contain rounded shrink-0" />
                                     </div>
                                 </div>
                             )}
-
-                            {/* Items Summary */}
-                            <div>
-                                <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2 block">Items</label>
-                                <div className="text-sm text-slate-600">
-                                    <span className="font-semibold text-slate-800">{items.length}</span> line items
-                                    {paymentSchedules.length > 0 && (
-                                        <> &middot; <span className="font-semibold text-slate-800">{paymentSchedules.length}</span> payment milestones</>
-                                    )}
-                                </div>
-                            </div>
                         </div>
                     )}
 
-                    {sidebarTab === "activity" && (
-                        <div className="p-5">
-                            <div className="space-y-4">
-                                {/* Activity Timeline */}
+                    {sidebarTab === "activity" && (() => {
+                        // Append-only feed from the server (every send/resend, view, signature,
+                        // invoice lifecycle, settled payments). Falls back to the legacy
+                        // single-timestamp rendering only if the prop is missing.
+                        const events: ActivityEvent[] = activityEvents ?? [
+                            { id: "created", ts: initialEstimate.createdAt, kind: "created", title: "Estimate created" },
+                            ...(initialEstimate.sentAt ? [{ id: "sent", ts: initialEstimate.sentAt, kind: "sent" as const, title: "Sent to client" }] : []),
+                            ...(initialEstimate.viewedAt ? [{ id: "viewed", ts: initialEstimate.viewedAt, kind: "viewed" as const, title: "Viewed by client" }] : []),
+                            ...(initialEstimate.approvedAt ? [{ id: "signed", ts: initialEstimate.approvedAt, kind: "signed" as const, title: `Approved${initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ""}` }] : []),
+                        ];
+                        const iconFor = (kind: ActivityEvent["kind"]) => {
+                            switch (kind) {
+                                case "created": return { bg: "bg-slate-200", fg: "text-slate-500", path: "M12 6v6m0 0v6m0-6h6m-6 0H6" };
+                                case "sent": return { bg: "bg-amber-100", fg: "text-amber-600", path: "M12 19l9 2-9-18-9 18 9-2zm0 0v-8" };
+                                case "viewed": return { bg: "bg-blue-100", fg: "text-blue-600", path: "M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7zM15 12a3 3 0 11-6 0 3 3 0 016 0z" };
+                                case "signed": return { bg: "bg-green-100", fg: "text-green-600", path: "M5 13l4 4L19 7" };
+                                case "invoice": return { bg: "bg-indigo-100", fg: "text-indigo-600", path: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" };
+                                case "payment": return { bg: "bg-emerald-100", fg: "text-emerald-600", path: "M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" };
+                                default: return { bg: "bg-slate-100", fg: "text-slate-500", path: "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" };
+                            }
+                        };
+                        return (
+                            <div className="p-5">
                                 <div className="relative">
-                                    <div className="absolute left-[11px] top-6 bottom-0 w-0.5 bg-slate-200"></div>
+                                    <div className="absolute left-[11px] top-6 bottom-3 w-0.5 bg-slate-200"></div>
                                     <div className="space-y-4">
-                                        <div className="flex items-start gap-3 relative">
-                                            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center shrink-0 z-10">
-                                                <svg className="w-3 h-3 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
-                                            </div>
-                                            <div>
-                                                <p className="text-sm font-medium text-slate-800">Estimate created</p>
-                                                <p className="text-xs text-slate-500">{new Date(initialEstimate.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                            </div>
-                                        </div>
-                                        {initialEstimate.sentAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-amber-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                                        {events.map(ev => {
+                                            const icon = iconFor(ev.kind);
+                                            return (
+                                                <div key={ev.id} className="flex items-start gap-3 relative">
+                                                    <div className={`w-6 h-6 rounded-full ${icon.bg} flex items-center justify-center shrink-0 z-10`}>
+                                                        <svg className={`w-3 h-3 ${icon.fg}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={icon.path} /></svg>
+                                                    </div>
+                                                    <div className="min-w-0">
+                                                        <p className="text-sm font-medium text-slate-800">{ev.title}</p>
+                                                        {ev.detail && <p className="text-xs text-slate-500 truncate" title={ev.detail}>{ev.detail}</p>}
+                                                        <p className="text-xs text-slate-400">{new Date(ev.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                    </div>
                                                 </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Sent to client</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.sentAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {initialEstimate.viewedAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-blue-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
-                                                </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Viewed by client</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.viewedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {initialEstimate.approvedAt && (
-                                            <div className="flex items-start gap-3 relative">
-                                                <div className="w-6 h-6 rounded-full bg-green-100 flex items-center justify-center shrink-0 z-10">
-                                                    <svg className="w-3 h-3 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                </div>
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-800">Approved{initialEstimate.approvedBy ? ` by ${initialEstimate.approvedBy}` : ''}</p>
-                                                    <p className="text-xs text-slate-500">{new Date(initialEstimate.approvedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {!initialEstimate.sentAt && !initialEstimate.viewedAt && !initialEstimate.approvedAt && (
+                                            );
+                                        })}
+                                        {events.length <= 1 && (
                                             <div className="mt-4 text-center py-6">
                                                 <svg className="w-10 h-10 text-slate-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                                                 <p className="text-sm text-slate-500">No activity yet</p>
@@ -1776,8 +3237,8 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     </div>
                                 </div>
                             </div>
-                        </div>
-                    )}
+                        );
+                    })()}
 
                     {sidebarTab === "comments" && (
                         <div className="flex-1 flex flex-col min-h-0">
@@ -1788,6 +3249,86 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 currentUserName={undefined}
                                 showClientTab={true}
                             />
+                        </div>
+                    )}
+
+                    {sidebarTab === "history" && (
+                        <div className="p-4 space-y-2 flex-1 overflow-y-auto">
+                            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3">Saved Snapshots</p>
+                            {history.length === 0 ? (
+                                <div className="text-center py-10">
+                                    <svg className="w-8 h-8 text-slate-200 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                    <p className="text-xs text-slate-400">No history yet. Save the estimate to create a snapshot.</p>
+                                </div>
+                            ) : (
+                                history.map((entry) => {
+                                    const isOpen = expandedHistoryTs === entry.ts;
+                                    const diff = diffSnapshots(entry.snapshot, items);
+                                    const hasChanges = diff.added.length + diff.removed.length + diff.changed.length > 0;
+                                    return (
+                                        <div key={entry.ts} className={`border rounded-lg overflow-hidden transition ${isOpen ? "border-indigo-300 shadow-sm" : "border-slate-100"}`}>
+                                            <button
+                                                onClick={() => setExpandedHistoryTs(isOpen ? null : entry.ts)}
+                                                className="w-full flex items-start justify-between gap-2 px-3 py-2.5 text-left hover:bg-slate-50 transition"
+                                            >
+                                                <div>
+                                                    <p className="text-xs font-semibold text-slate-700">{entry.label}</p>
+                                                    <p className="text-[10px] text-slate-400 mt-0.5 flex gap-2">
+                                                        <span>{entry.snapshot.length} items</span>
+                                                        {hasChanges && (
+                                                            <span className="flex gap-1.5">
+                                                                {diff.added.length > 0 && <span className="text-green-600">+{diff.added.length}</span>}
+                                                                {diff.removed.length > 0 && <span className="text-red-500">−{diff.removed.length}</span>}
+                                                                {diff.changed.length > 0 && <span className="text-amber-500">~{diff.changed.length}</span>}
+                                                            </span>
+                                                        )}
+                                                        {!hasChanges && <span className="text-slate-300">(current)</span>}
+                                                    </p>
+                                                </div>
+                                                <svg className={`w-3.5 h-3.5 text-slate-400 mt-0.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                            </button>
+                                            {isOpen && (
+                                                <div className="border-t border-slate-100 bg-slate-50 px-3 pb-3 pt-2 space-y-2">
+                                                    {!hasChanges && <p className="text-[10px] text-slate-400 italic">No differences from current state.</p>}
+                                                    {diff.added.length > 0 && (
+                                                        <div>
+                                                            <p className="text-[10px] font-semibold text-green-700 uppercase mb-1">Added (since this snapshot)</p>
+                                                            {diff.added.map((i: any) => <p key={i.id} className="text-[11px] text-green-700 bg-green-50 rounded px-2 py-0.5 mb-0.5">+ {i.name || "(unnamed)"}</p>)}
+                                                        </div>
+                                                    )}
+                                                    {diff.removed.length > 0 && (
+                                                        <div>
+                                                            <p className="text-[10px] font-semibold text-red-600 uppercase mb-1">Removed (since this snapshot)</p>
+                                                            {diff.removed.map((i: any) => <p key={i.id} className="text-[11px] text-red-600 bg-red-50 rounded px-2 py-0.5 mb-0.5">− {i.name || "(unnamed)"}</p>)}
+                                                        </div>
+                                                    )}
+                                                    {diff.changed.length > 0 && (
+                                                        <div>
+                                                            <p className="text-[10px] font-semibold text-amber-700 uppercase mb-1">Modified</p>
+                                                            {diff.changed.map((i: any) => {
+                                                                const prev = entry.snapshot.find((p: any) => p.id === i.id);
+                                                                return (
+                                                                    <div key={i.id} className="text-[11px] text-amber-800 bg-amber-50 rounded px-2 py-1 mb-0.5">
+                                                                        <span className="font-medium">{i.name}</span>
+                                                                        {prev && String(prev.quantity) !== String(i.quantity) && <span className="text-slate-500"> qty {prev.quantity}→{i.quantity}</span>}
+                                                                        {prev && String(prev.unitCost) !== String(i.unitCost) && <span className="text-slate-500"> ${prev.unitCost}→${i.unitCost}</span>}
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                    <button
+                                                        onClick={() => revertToHistory(entry)}
+                                                        className="mt-1 w-full text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded px-3 py-1.5 transition"
+                                                    >
+                                                        Revert to this snapshot
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })
+                            )}
                         </div>
                     )}
                 </div>
@@ -1812,7 +3353,7 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                 </div>
                                 <div>
                                     <h2 className="text-lg font-bold text-hui-textMain">AI Estimate Generator</h2>
-                                    <p className="text-xs text-purple-600">Powered by Gemini • Vancouver, WA pricing</p>
+                                    <p className="text-xs text-purple-600">Powered by Claude • Vancouver, WA pricing</p>
                                 </div>
                             </div>
                             <button onClick={() => setShowAiModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">
@@ -1866,6 +3407,93 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
                                     <>
                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
                                         Generate Estimate
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Import from ChatGPT Modal */}
+            {showImportModal && (
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full overflow-hidden border border-purple-200">
+                        <div className="px-6 py-4 border-b border-purple-100 bg-gradient-to-r from-purple-50 to-indigo-50 flex justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="w-8 h-8 rounded-lg bg-purple-100 flex items-center justify-center">
+                                    <svg className="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" /></svg>
+                                </div>
+                                <div>
+                                    <h2 className="text-lg font-bold text-hui-textMain">Import from ChatGPT</h2>
+                                    <p className="text-xs text-purple-600">Paste JSON • builds phases + line items + milestones</p>
+                                </div>
+                            </div>
+                            <button onClick={() => setShowImportModal(false)} className="text-hui-textMuted hover:text-hui-textMain transition">
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-6 space-y-4">
+                            <div className="bg-slate-50 rounded-lg p-3 text-xs text-slate-600 space-y-1.5">
+                                <div className="font-semibold text-slate-700">How to use:</div>
+                                <div>1. Click <strong>Copy ChatGPT prompt</strong> below and paste it into ChatGPT, then describe your project.</div>
+                                <div>2. Copy ChatGPT&apos;s JSON reply and paste it into the box below.</div>
+                                <div>3. Click <strong>Import</strong> — phases become collapsible groups with line items beneath them.</div>
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        try {
+                                            await navigator.clipboard.writeText(CHATGPT_ESTIMATE_PROMPT);
+                                            toast.success("Prompt copied — paste it into ChatGPT");
+                                        } catch {
+                                            toast.error("Couldn't copy — select the prompt manually");
+                                        }
+                                    }}
+                                    className="mt-1 inline-flex items-center gap-1.5 text-purple-700 hover:text-purple-900 font-medium"
+                                >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                    Copy ChatGPT prompt
+                                </button>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-hui-textMain mb-2">Paste ChatGPT&apos;s JSON</label>
+                                <textarea
+                                    value={importJson}
+                                    onChange={e => setImportJson(e.target.value)}
+                                    placeholder={'{\n  "phases": [ { "phaseName": "Demolition", "items": [ { "name": "...", "costType": "Labor", "quantity": 1, "unit": "job", "unitCost": 1800 } ] } ],\n  "paymentMilestones": [ { "name": "Deposit", "percentage": 25 } ]\n}'}
+                                    className="hui-input w-full h-40 resize-none font-mono text-xs"
+                                    disabled={isImporting}
+                                />
+                            </div>
+                            {items.length > 0 && (
+                                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
+                                    <strong>Note:</strong> Imported items will be appended to your existing {items.length} item(s).
+                                </div>
+                            )}
+                        </div>
+                        <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50">
+                            <button
+                                type="button"
+                                onClick={() => setShowImportModal(false)}
+                                disabled={isImporting}
+                                className="hui-btn hui-btn-secondary"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleImportEstimate}
+                                disabled={isImporting || !importJson.trim()}
+                                className="hui-btn bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 disabled:opacity-50 flex items-center gap-2"
+                            >
+                                {isImporting ? (
+                                    <>
+                                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Importing...
+                                    </>
+                                ) : (
+                                    <>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19l3 3m0 0l3-3m-3 3V10M5 8a4 4 0 014-4h6a4 4 0 014 4" /></svg>
+                                        Import
                                     </>
                                 )}
                             </button>
@@ -1960,10 +3588,122 @@ export default function EstimateEditor({ context, initialEstimate, defaultTax }:
             {showPaymentModal && (
                 <LogPaymentModal
                     estimateId={initialEstimate.id}
-                    balanceDue={Number(initialEstimate.balanceDue) || 0}
+                    balanceDue={dynamicBalanceDue}
                     onClose={() => setShowPaymentModal(false)}
-                    onSaved={() => router.refresh()}
+                    onSaved={(result) => {
+                        setPaymentSchedules(prev => [...prev, result.schedule]);
+                        setStatus(result.newStatus);
+                        router.refresh();
+                    }}
                 />
+            )}
+
+            {recordingEstPayment && (
+                <RecordPaymentModal
+                    milestoneName={recordingEstPayment.name}
+                    amount={recordingEstPayment.amount}
+                    onClose={() => setRecordingEstPayment(null)}
+                    onSubmit={async (input) => {
+                        await handleSave({ silent: true, skipRefresh: true });
+                        const result = await recordEstimatePayment(recordingEstPayment.id, initialEstimate.id, {
+                            ...input,
+                            amount: recordingEstPayment.amount,
+                        });
+                        if (result.success) {
+                            setPaymentSchedules(prev => prev.map(s =>
+                                s.id === recordingEstPayment.id
+                                    ? { ...s, status: "Paid", amount: String(recordingEstPayment.amount), paymentMethod: input.method, referenceNumber: input.referenceNumber || null, paymentDate: input.paymentDate, paidAt: new Date().toISOString(), notes: input.notes || null }
+                                    : s
+                            ));
+                            router.refresh();
+                        }
+                        return { success: result.success, error: (result as any).error };
+                    }}
+                />
+            )}
+
+            {undoPaymentTarget && (() => {
+                const paidSchedules = paymentSchedules.filter(s => s.status === "Paid");
+                const paidSum = paidSchedules.reduce((sum: number, s: any) => sum + (parseFloat(s.amount) || 0), 0);
+                const currentBalance = Math.max(0, total - paidSum);
+                return (
+                    <UndoPaymentModal
+                        milestoneName={undoPaymentTarget.name || "Payment"}
+                        amount={Number(undoPaymentTarget.amount) || 0}
+                        paymentMethod={undoPaymentTarget.paymentMethod || null}
+                        referenceNumber={undoPaymentTarget.referenceNumber || null}
+                        paidAt={undoPaymentTarget.paidAt || null}
+                        paymentDate={undoPaymentTarget.paymentDate || null}
+                        hasStripeIntent={!!undoPaymentTarget.stripePaymentIntentId}
+                        hasQbPayment={undoPaymentTarget.paymentMethod === "quickbooks"}
+                        currentBalance={currentBalance}
+                        estimateTotal={total}
+                        currentStatus={status}
+                        otherPaidCount={paidSchedules.filter((s: any) => s.id !== undoPaymentTarget.id).length}
+                        statusBeforePayment={initialEstimate.statusBeforePayment || null}
+                        onClose={() => setUndoPaymentTarget(null)}
+                        onConfirm={async () => {
+                            try {
+                                const res = await unrecordEstimatePayment(undoPaymentTarget.id, initialEstimate.id);
+                                if (!res?.success) { toast.error("Nothing to unrecord"); return; }
+                                setPaymentSchedules(prev => prev.map(s =>
+                                    s.id === undoPaymentTarget.id
+                                        ? { ...s, status: "Pending", paymentMethod: null, referenceNumber: null, paymentDate: null, paidAt: null, notes: null }
+                                        : s
+                                ));
+                                toast("Payment unrecorded");
+                                setUndoPaymentTarget(null);
+                                router.refresh();
+                            } catch (e: any) {
+                                toast.error(e?.message || "Failed to unrecord payment");
+                            }
+                        }}
+                    />
+                );
+            })()}
+
+            {poCreateItemId && context.type === "project" && (
+                <POQuickCreateModal
+                    estimateItemId={poCreateItemId}
+                    suggestedAmount={(() => {
+                        const itm = items.find((i: any) => i.id === poCreateItemId);
+                        if (!itm) return null;
+                        const b = internalBudget({ budgetQuantity: itm.budgetQuantity, quantity: parseFloat(itm.quantity) || 0, budgetRate: itm.budgetRate, baseCost: itm.baseCost });
+                        return b;
+                    })()}
+                    projectId={context.id}
+                    onClose={() => setPOCreateItemId(null)}
+                    onCreated={(po) => handlePOCreated(poCreateItemId, po)}
+                />
+            )}
+
+            {poLinkItemId && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+                    <div className="bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-sm overflow-hidden">
+                        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                            <h3 className="font-bold text-slate-800">Link Purchase Order</h3>
+                            <button onClick={() => setPOLinkItemId(null)} className="text-slate-400 hover:text-slate-600">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="p-4 max-h-60 overflow-y-auto divide-y divide-slate-50">
+                            {loadingPOs ? (
+                                <div className="text-sm text-slate-400 text-center py-4">Loading...</div>
+                            ) : projectPOs.length === 0 ? (
+                                <div className="text-sm text-slate-400 text-center py-4">No purchase orders found</div>
+                            ) : projectPOs.map(po => (
+                                <button
+                                    key={po.id}
+                                    onClick={() => handleSelectPO(poLinkItemId, po)}
+                                    className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 transition flex justify-between items-center"
+                                >
+                                    <span className="font-medium">{po.code} — {po.vendor?.name}</span>
+                                    <span className="text-slate-500">{formatCurrency(Number(po.totalAmount))}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     );

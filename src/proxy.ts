@@ -9,13 +9,21 @@ export default async function middleware(req: any, event: any) {
         return NextResponse.next();
     }
 
+    // API requests carrying `Authorization: Bearer <jwt>` are mobile clients. Their
+    // route handlers verify the JWT via authenticateMobileOrSession themselves; redirecting
+    // them to /login (a browser flow) would 307-redirect every mobile API call.
+    const authHeader = req.headers?.get?.("authorization");
+    if (typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")) {
+        return NextResponse.next();
+    }
+
     // Existing authentication logic for other environments
     const authMiddleware = withAuth({
         pages: {
             signIn: "/login",
         },
     });
-    
+
     return authMiddleware(req as any, event);
 }
 
@@ -25,16 +33,22 @@ export const config = {
          * Match all request paths except for the ones starting with:
          * - api/auth (NextAuth endpoints)
          * - api/cron (System automated cron tasks)
+         * - api/twilio (Twilio webhooks — validated by Twilio signature, not session)
          * - api/webhook (Stripe webhooks)
          * - api/payments (Client portal payment sessions)
          * - api/portal (Public backend handlers for documents)
+         * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
+         * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
+         * - api/version (Deployment-id probe for the stale-tab refresh banner)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
          * - sub-portal (Subcontractor portal, magic-link auth)
+         * - share (Public token-gated room design viewer)
          * - _next/static (Static files)
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
+         * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/auth|api/cron|api/webhook|api/payments|api/portal|api/pdf/estimates|api/pdf/invoices|api/sub-portal|login|portal|sub-portal|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg).*)",
+        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

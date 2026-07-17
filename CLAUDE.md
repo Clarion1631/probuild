@@ -28,7 +28,15 @@
 ## Stack
 - Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
 - Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
-- Vercel auto-deploys on push to `main`
+- Auto-deploy is **disabled**. Deploy manually via `vercel --prod`
+
+## Room Studio (3D room designer)
+- Lives in `src/components/studio/` + `src/lib/studio/` (react-three-fiber). The legacy `room-designer` modules are gone — don't recreate them.
+- Document model: `RoomDesign.layoutJson` holds a v2 `DesignDoc` (`lib/studio/doc.ts`); placed items mirror into `RoomAsset` rows. v1 layouts upgrade on load.
+- Catalog/finishes/templates are code-seeded (`lib/studio/catalog.ts`, `materials.ts`, `templates.ts`) — no GLTF downloads, all meshes procedural (`components/studio/canvas/builders-*.tsx`).
+- Perf contract: nothing writes to the zustand store per-frame; drags mutate three.js objects and commit on pointerup. No postprocessing. Keep it that way.
+- LiDAR intake: `POST /api/rooms/scan-import` (RoomPlan JSON or simplified corners). Mobile capture screen: gtr-probuild-mobile `apps/mobile/app/room-scan.tsx`.
+- Client sharing: `/share/room/[token]` (public route in AppLayout) + portal Designs tab lists share-enabled rooms.
 
 ## Product Vision
 See **VISION.md** — AI-first remodeling platform. Every feature should ask: "What can AI do here so the human doesn't have to?"
@@ -45,9 +53,10 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 1. Pick next session from ProbuildTodo.md
 2. Make changes
 3. npm run build          # must pass 0 errors
-4. git push origin main   # triggers Vercel deploy
-5. Click through affected pages on prod to verify
-6. Mark items done in ProbuildTodo.md
+4. git push origin main
+5. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
+6. Click through affected pages on prod to verify
+7. Mark items done in ProbuildTodo.md
 ```
 
 **Error diagnosis (Sentry)**
@@ -60,6 +69,24 @@ sentry-cli issues list --org golden-touch-remodeling --project <project> --outpu
 stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
 stripe trigger payment_intent.succeeded
 ```
+
+## Deploying to Vercel (CLI only — auto-deploy is OFF)
+```powershell
+# Production deploy (from the main repo dir, not a worktree):
+vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
+```
+- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
+- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
+- `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
+- Only deploy when changes are verified locally via `npm run build`
+- Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
+
+## E2E testing — never against the live DB
+See **docs/TESTING.md**. E2E creates leads/estimates/invoices, so:
+- CI runs e2e in a throwaway Postgres container (`.github/workflows/ci.yml`)
+- `e2e/data.setup.ts` refuses to run when DATABASE_URL looks like Supabase (override: `ALLOW_PROD_E2E=1`)
+- Specs that create data must tear it down in `afterAll` (see `qa-lead-estimate-invoice.spec.ts`)
+- History: QA runs against prod once filled /leads with "Master Bath Renovation - Henderson" junk (cleaned 2026-06-11)
 
 ## Dev server — clean start
 ```bash
@@ -76,7 +103,7 @@ sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
 2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
-3. Regenerate: `"C:\Program Files\Git\bin\bash.exe" -c "cd '/c/Users/jat00/.gemini/antigravity/workspaces/gtr-probuild-site' && ./node_modules/.bin/prisma generate"`
+3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site'; node_modules\.bin\prisma generate"`
 4. Update `prisma/schema.prisma` to match the SQL changes
 
 ## Critical database config
@@ -97,10 +124,21 @@ python compare.py --local --page "Page Name"   # single page local test
 - Known prod project ID: `cmn7tlgiv0001phwqjzwk75or`
 - Do NOT try psql, prisma direct connect, or supabase CLI to query prod — use the API
 
+## Messaging component
+`src/components/ClientMessaging.tsx` is the single canonical messaging component used by both lead pages (`/leads/[id]`) and project pages (`/projects/[id]/messages`). It accepts a swappable `headerContent` slot for per-context headers. `LeadMessaging.tsx` was deleted in commit `363b70c`.
+
 ## Common pitfalls
 - **config.py is gitignored** — never commit it, it contains secrets
 - **GoldenTouch Pro URL** is `https://probuild-amber.vercel.app` — that's the live Vercel deployment
 - **WSL env vars** — `setx` vars (VERCEL_TOKEN, STRIPE_API_KEY, etc.) are Windows-only, NOT available in WSL
+
+## UI: hover-reveal buttons must support no-hover devices
+ProBuild is used across different browsers, OS configs, and pointer types (some users may be on Chromebooks or devices where CSS `:hover` doesn't fire reliably). **Any button hidden via `opacity-0 group-hover:opacity-100` MUST also include `[@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto`** so it stays visible on devices without reliable hover. This was discovered when Richard's browser silently hid all Add Sub-item / Add Category / delete buttons on the estimate editor.
+
+Pattern to use:
+```
+className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto transition"
+```
 
 ## Feature Decision Rule
 Before building anything, answer: **"What remodeling problem does this solve, for which role, and can AI automate it?"**
@@ -113,11 +151,12 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
-- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client with `./node_modules/.bin/prisma generate` from git bash
+- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library
 - **Existing routes** — api, company, estimates, invoices, leads, login, manager, portal, projects, reports, settings, sub-portal, time-clock — don't duplicate
+- **Money-path changes** (payments, signing, payment mirrors, notifications) — estimate/invoice milestones are mirrored pairs linked by `PaymentSchedule.sourceScheduleId`; settling or unsettling either side must update both. ALL paid-milestone side effects (team email, client receipt, activity log) flow through `notifyMilestonePaid()` in `lib/payment-notifications.ts` — never add a second writer for a lifecycle event (two duplicate loggers shipped that way before the June 2026 audit caught them). After touching these paths: run codex-peer-review on the diff and keep `e2e/money-pipeline.spec.ts` green (PR CI runs it — it guards the sign→convert→invoice chain, mirror links, undo restore, and exactly-once activity writers).
 
 ## Efficiency rules (token management)
 - **Full context, minimum tokens** — read the 4 reference docs (CLAUDE.md, VISION.md, DESIGN_SYSTEM.md, ProbuildTodo.md) for context, then build. Don't explore the codebase unless you're editing a file you haven't seen.

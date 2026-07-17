@@ -5,6 +5,27 @@ import { useRouter } from "next/navigation";
 import { ChevronLeft, Save } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
+import TeamMemberProjectAccess from "./TeamMemberProjectAccess";
+
+interface UserPermission {
+    manageTeamMembers: boolean;
+    manageSubs: boolean;
+    manageVendors: boolean;
+    companySettings: boolean;
+    costCodesCategories: boolean;
+    schedules: boolean;
+    estimates: boolean;
+    invoices: boolean;
+    contracts: boolean;
+    roomDesigner: boolean;
+    changeOrders: boolean;
+    financialReports: boolean;
+    timeClock: boolean;
+    dailyLogs: boolean;
+    files: boolean;
+    takeoffs: boolean;
+    autoGrantNewProjects: boolean;
+}
 
 interface User {
     id: string;
@@ -14,7 +35,29 @@ interface User {
     hourlyRate: number;
     burdenRate: number;
     hasPin: boolean;
+    permissions: UserPermission | null;
+    projectAccess?: { projectId: string; project?: { id: string } | null }[];
 }
+
+const DEFAULT_PERMISSIONS: UserPermission = {
+    manageTeamMembers: false,
+    manageSubs: false,
+    manageVendors: false,
+    companySettings: false,
+    costCodesCategories: true,
+    schedules: true,
+    estimates: false,
+    invoices: false,
+    contracts: false,
+    roomDesigner: true,
+    changeOrders: false,
+    financialReports: false,
+    timeClock: true,
+    dailyLogs: true,
+    files: true,
+    takeoffs: false,
+    autoGrantNewProjects: true,
+};
 
 export default function TeamMemberEditPage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = use(params);
@@ -22,6 +65,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [allProjects, setAllProjects] = useState<any[]>([]);
 
     // Form state
     const [firstName, setFirstName] = useState("");
@@ -30,6 +74,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     const [hourlyRate, setHourlyRate] = useState(0);
     const [burdenRate, setBurdenRate] = useState(0);
     const [pinCode, setPinCode] = useState("");
+    const [permissions, setPermissions] = useState<UserPermission>(DEFAULT_PERMISSIONS);
 
     useEffect(() => {
         fetchUser();
@@ -38,23 +83,27 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     const fetchUser = async () => {
         setLoading(true);
         try {
-            const res = await fetch('/api/users'); // We can filter client side or add a specific GET /api/users/[id] later if needed. For now, find from list.
+            const res = await fetch(`/api/users/${id}`);
             if (res.ok) {
-                const users: User[] = await res.json();
-                const found = users.find(u => u.id === id);
+                const { user: found, allProjects: projects } = await res.json();
+                setAllProjects(projects || []);
                 if (found) {
                     setUser(found);
                     const names = (found.name || "").split(" ");
                     setFirstName(names[0] || "");
                     setLastName(names.slice(1).join(" ") || "");
                     setRole(found.role);
-                    setHourlyRate(found.hourlyRate);
-                    setBurdenRate(found.burdenRate);
-                    // PIN is hashed server-side; don't pre-populate — leave blank so admin can set a new PIN
+                    setHourlyRate(found.hourlyRate ?? 0);
+                    setBurdenRate(found.burdenRate ?? 0);
+                    if (found.permissions) {
+                        setPermissions({ ...DEFAULT_PERMISSIONS, ...found.permissions });
+                    }
                 } else {
                     toast.error("User not found");
                     router.push("/company/team-members");
                 }
+            } else {
+                toast.error("Failed to load user");
             }
         } catch (error) {
             console.error(error);
@@ -62,6 +111,10 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
         } finally {
             setLoading(false);
         }
+    };
+
+    const togglePermission = (key: keyof UserPermission) => {
+        setPermissions(prev => ({ ...prev, [key]: !prev[key] }));
     };
 
     const handleSave = async () => {
@@ -72,11 +125,9 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    name: fullName,
-                    role,
-                    hourlyRate,
-                    burdenRate,
-                    pinCode
+                    userInfo: { name: fullName, role, hourlyRate, burdenRate },
+                    permissions,
+                    pinCode,
                 })
             });
 
@@ -92,6 +143,26 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
             toast.error("An error occurred while saving");
         } finally {
             setSaving(false);
+        }
+    };
+
+    const handleDisable = async () => {
+        if (!confirm(`Disable ${user?.email}? They will lose access until re-enabled.`)) return;
+        try {
+            const res = await fetch(`/api/users/${id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ userInfo: { status: "DISABLED" } })
+            });
+            if (res.ok) {
+                toast.success("Team member disabled");
+                router.push("/company/team-members");
+            } else {
+                const data = await res.json();
+                toast.error(data.error || "Failed to disable member");
+            }
+        } catch {
+            toast.error("An error occurred");
         }
     };
 
@@ -121,19 +192,27 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     if (loading) return <div className="p-8">Loading...</div>;
     if (!user) return null;
 
-    // Permissions logic mapping based on role
-    const getPermissions = (currentRole: string) => {
-        const isAdmin = currentRole === 'ADMIN';
-        const isManager = currentRole === 'MANAGER';
-        const isFinance = currentRole === 'FINANCE';
-        return {
-            adminOnly: isAdmin,
-            managerUp: isAdmin || isManager,
-            financeUp: isAdmin || isFinance || isManager, // simplified for UI demo
-        };
-    };
+    const adminPerms: { key: keyof UserPermission; label: string }[] = [
+        { key: "manageTeamMembers", label: "Manage Team Members" },
+        { key: "manageSubs", label: "Manage Subcontractors" },
+        { key: "manageVendors", label: "Manage Vendors" },
+        { key: "companySettings", label: "Company Settings" },
+        { key: "costCodesCategories", label: "Cost Codes & Categories" },
+        { key: "financialReports", label: "Financial Reports" },
+    ];
 
-    const perms = getPermissions(role);
+    const projectPerms: { key: keyof UserPermission; label: string }[] = [
+        { key: "schedules", label: "Schedules" },
+        { key: "estimates", label: "Estimates" },
+        { key: "invoices", label: "Invoices" },
+        { key: "contracts", label: "Contracts" },
+        { key: "roomDesigner", label: "Room Designer" },
+        { key: "changeOrders", label: "Change Orders" },
+        { key: "timeClock", label: "Time Clock" },
+        { key: "dailyLogs", label: "Daily Logs" },
+        { key: "files", label: "Files" },
+        { key: "takeoffs", label: "Takeoffs" },
+    ];
 
     return (
         <div className="flex flex-col h-full overflow-y-auto bg-hui-background">
@@ -193,41 +272,58 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                             <option value="ADMIN">Admin</option>
                             <option value="MANAGER">Manager</option>
                             <option value="FINANCE">Finance</option>
-                            <option value="EMPLOYEE">Field Crew</option>
+                            <option value="FIELD_CREW">Field Crew</option>
                         </select>
                     </div>
                 </div>
 
-                {/* Permissions Display (Read-Only Matrix based on Role) */}
-                <div className="hui-card p-6 bg-slate-50 border-hui-border">
-                    <h3 className="text-sm font-semibold text-hui-textMain mb-4 uppercase tracking-wider">Administrative Permissions (Auto-assigned)</h3>
-                    <div className="grid grid-cols-2 gap-y-4 gap-x-8 text-sm text-hui-textMuted">
-                        <label className="flex items-center gap-3">
-                            <input type="checkbox" checked={perms.adminOnly} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
-                            Accounting Integrations
-                        </label>
-                        <label className="flex items-center gap-3">
-                            <input type="checkbox" checked={perms.adminOnly} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
-                            Business Document Setup
-                        </label>
-                        <label className="flex items-center gap-3">
-                            <input type="checkbox" checked={perms.managerUp} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
-                            Manage Team Members
-                        </label>
-                        <label className="flex items-center gap-3">
-                            <input type="checkbox" checked={perms.managerUp} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
-                            Manage Subcontractors
-                        </label>
-                        <label className="flex items-center gap-3">
-                            <input type="checkbox" checked={perms.financeUp} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
-                            Financial Reports
-                        </label>
-                        <label className="flex items-center gap-3">
-                            <input type="checkbox" checked={perms.financeUp} readOnly className="rounded text-blue-600 pointer-events-none opacity-80" />
-                            Time, Expenses, and Rates
-                        </label>
+                {/* Administrative Permissions */}
+                <div className="hui-card p-6">
+                    <h3 className="text-sm font-semibold text-hui-textMain mb-4 uppercase tracking-wider">Administrative Permissions</h3>
+                    <div className="grid grid-cols-2 gap-y-4 gap-x-8 text-sm text-hui-textMain">
+                        {adminPerms.map(({ key, label }) => (
+                            <label key={key} className="flex items-center gap-3 cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    checked={permissions[key]}
+                                    onChange={() => togglePermission(key)}
+                                    className="rounded text-blue-600 cursor-pointer"
+                                />
+                                {label}
+                            </label>
+                        ))}
                     </div>
                 </div>
+
+                {/* Project-Level Permissions */}
+                <div className="hui-card p-6">
+                    <h3 className="text-sm font-semibold text-hui-textMain mb-4 uppercase tracking-wider">Project Access</h3>
+                    <div className="grid grid-cols-2 gap-y-4 gap-x-8 text-sm text-hui-textMain">
+                        {projectPerms.map(({ key, label }) => (
+                            <label key={key} className="flex items-center gap-3 cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    checked={permissions[key]}
+                                    onChange={() => togglePermission(key)}
+                                    className="rounded text-blue-600 cursor-pointer"
+                                />
+                                {label}
+                            </label>
+                        ))}
+                    </div>
+                </div>
+
+                {/* Project Assignments */}
+                <TeamMemberProjectAccess
+                    userId={id}
+                    userRole={role}
+                    initialProjectIds={[...new Set([
+                        ...(user?.projectAccess?.map((pa: { project?: { id: string } | null; projectId?: string }) => pa.project?.id || pa.projectId).filter((id): id is string => !!id) || []),
+                        ...((user as any)?.assignedProjects?.map((p: { id: string }) => p.id) || []),
+                    ])]}
+                    allProjects={allProjects}
+                    autoGrantNewProjects={permissions.autoGrantNewProjects}
+                />
 
                 {/* Rates & App Access */}
                 <div className="grid grid-cols-2 gap-8">
@@ -279,6 +375,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                     <div className="flex gap-4">
                         <button
                             type="button"
+                            onClick={handleDisable}
                             className="hui-btn hui-btn-secondary"
                         >
                             Disable Team Member

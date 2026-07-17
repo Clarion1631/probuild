@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, type Dispatch, type SetStateAction } from "react";
 import { addTaskCommentAsSub, updateTaskStatusAsSub } from "@/lib/actions";
 
 type Dependency = { id: string; predecessorId: string; dependentId: string };
@@ -40,14 +40,26 @@ function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
 function getMonday(d: Date) { const day = d.getDay(); const diff = d.getDate() - day + (day === 0 ? -6 : 1); return new Date(d.setDate(diff)); }
 function isWeekend(d: Date) { const day = d.getDay(); return day === 0 || day === 6; }
 
+type PortalViewMode = "calendar" | "gantt";
+
 export default function PortalGanttChart({
     initialTasks,
+    tasks: controlledTasks,
+    setTasks: controlledSetTasks,
     subcontractorId,
+    viewMode,
+    onViewModeChange,
 }: {
-    initialTasks: Task[];
+    initialTasks?: Task[];
+    tasks?: Task[];
+    setTasks?: Dispatch<SetStateAction<Task[]>>;
     subcontractorId: string | null;
+    viewMode?: PortalViewMode;
+    onViewModeChange?: (m: PortalViewMode) => void;
 }) {
-    const [tasks, setTasks] = useState<Task[]>(initialTasks);
+    const [internalTasks, setInternalTasks] = useState<Task[]>(initialTasks || controlledTasks || []);
+    const tasks = controlledTasks ?? internalTasks;
+    const setTasks = controlledSetTasks ?? setInternalTasks;
     const [zoom, setZoom] = useState<ZoomLevel>("week");
     const [selectedTask, setSelectedTask] = useState<Task | null>(null);
     const [commentText, setCommentText] = useState("");
@@ -64,6 +76,9 @@ export default function PortalGanttChart({
     const colWidth = zoom === "day" ? 40 : zoom === "week" ? 20 : 8;
     const timelineWidth = totalDays * colWidth;
     const ROW_HEIGHT = 44;
+    const BASE_HEADER_HEIGHT = 36;
+    const DAY_SUB_ROW_HEIGHT = 16;
+    const headerHeight = zoom === "week" ? BASE_HEADER_HEIGHT + DAY_SUB_ROW_HEIGHT : BASE_HEADER_HEIGHT;
 
     function getHeaders() {
         const headers: { label: string; span: number; key: string }[] = [];
@@ -117,7 +132,7 @@ export default function PortalGanttChart({
         try {
             await updateTaskStatusAsSub(taskId, subcontractorId, status);
             setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status } : t));
-            if (selectedTask?.id === taskId) setSelectedTask(prev => prev ? { ...prev, status } : prev);
+            setSelectedTask(prev => prev && prev.id === taskId ? { ...prev, status } : prev);
         } catch (e) {
             console.error(e);
         } finally {
@@ -127,20 +142,23 @@ export default function PortalGanttChart({
 
     async function handleAddComment() {
         if (!subcontractorId || !selectedTask || !commentText.trim()) return;
+        const targetTaskId = selectedTask.id;
         setSubmittingComment(true);
         try {
-            await addTaskCommentAsSub(selectedTask.id, subcontractorId, commentText.trim());
+            const created = await addTaskCommentAsSub(targetTaskId, subcontractorId, commentText.trim());
             const newComment: Comment = {
-                id: Math.random().toString(),
-                text: commentText.trim(),
-                createdAt: new Date().toISOString(),
+                id: created.id,
+                text: created.text,
+                createdAt: created.createdAt instanceof Date ? created.createdAt.toISOString() : new Date(created.createdAt as string).toISOString(),
                 authorName: "You",
             };
-            setTasks(prev => prev.map(t => t.id === selectedTask.id
+            setTasks(prev => prev.map(t => t.id === targetTaskId
                 ? { ...t, comments: [...(t.comments || []), newComment] }
                 : t
             ));
-            setSelectedTask(prev => prev ? { ...prev, comments: [...(prev.comments || []), newComment] } : prev);
+            setSelectedTask(prev => prev && prev.id === targetTaskId
+                ? { ...prev, comments: [...(prev.comments || []), newComment] }
+                : prev);
             setCommentText("");
         } catch (e) {
             console.error(e);
@@ -158,6 +176,23 @@ export default function PortalGanttChart({
 
     if (tasks.length === 0) {
         return (
+            <div className="flex flex-col h-full bg-white">
+                {onViewModeChange && (
+                    <div className="flex items-center justify-end px-6 py-3 border-b border-slate-200 shrink-0">
+                        <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                            <button
+                                onClick={() => onViewModeChange("calendar")}
+                                aria-pressed={viewMode === "calendar"}
+                                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            >Calendar</button>
+                            <button
+                                onClick={() => onViewModeChange("gantt")}
+                                aria-pressed={viewMode === "gantt"}
+                                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            >Gantt</button>
+                        </div>
+                    </div>
+                )}
             <div className="flex-1 flex flex-col items-center justify-center bg-slate-50 gap-4 py-20 px-6 text-center">
                 <div className="w-16 h-16 bg-slate-200 rounded-full flex items-center justify-center">
                     <svg className="w-8 h-8 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
@@ -170,6 +205,7 @@ export default function PortalGanttChart({
                             : "The project timeline has not been published yet. Please check back later."}
                     </p>
                 </div>
+            </div>
             </div>
         );
     }
@@ -191,18 +227,39 @@ export default function PortalGanttChart({
                         <span className="text-xs font-semibold text-slate-500">{progressPct}% Complete</span>
                     </div>
                 </div>
-                <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg">
-                    {(["day", "week", "month"] as ZoomLevel[]).map(z => (
-                        <button key={z} onClick={() => setZoom(z)} className={`px-3 py-1 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>{z}</button>
-                    ))}
+                <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg">
+                        {(["day", "week", "month"] as ZoomLevel[]).map(z => (
+                            <button
+                                key={z}
+                                onClick={() => setZoom(z)}
+                                aria-pressed={zoom === z}
+                                className={`px-3 py-1 text-xs font-medium rounded-md transition capitalize ${zoom === z ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            >{z}</button>
+                        ))}
+                    </div>
+                    <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 200); }} className="px-3 py-1 text-xs font-medium bg-white border border-slate-200 rounded-md hover:bg-slate-50">Today</button>
+                    {onViewModeChange && (
+                        <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                            <button
+                                onClick={() => onViewModeChange("calendar")}
+                                aria-pressed={viewMode === "calendar"}
+                                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            >Calendar</button>
+                            <button
+                                onClick={() => onViewModeChange("gantt")}
+                                aria-pressed={viewMode === "gantt"}
+                                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            >Gantt</button>
+                        </div>
+                    )}
                 </div>
-                <button onClick={() => { if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, todayOffset - 200); }} className="px-3 py-1 text-xs font-medium bg-white border border-slate-200 rounded-md hover:bg-slate-50">Today</button>
             </div>
 
             <div className="flex flex-1 overflow-hidden">
                 {/* Task List */}
                 <div className="w-72 shrink-0 bg-white border-r border-slate-200 flex flex-col z-10 shadow-[2px_0_8px_rgba(0,0,0,0.03)]">
-                    <div className="flex items-center px-4 h-[36px] bg-slate-50 border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                    <div className="flex items-center px-4 bg-slate-50 border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-wider" style={{ height: headerHeight }}>
                         <div className="flex-1">Task Name</div>
                         <div className="w-24 text-center">Status</div>
                     </div>
@@ -257,30 +314,52 @@ export default function PortalGanttChart({
                 {/* Timeline */}
                 <div ref={scrollRef} className="flex-1 overflow-auto bg-slate-50/50 relative">
                     <div style={{ width: timelineWidth, minHeight: "100%" }} className="relative bg-white">
-                        <div className="sticky top-0 z-20 flex bg-slate-50 border-b border-slate-200 h-[36px]">
-                            {headers.map(h => (
-                                <div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>
-                                    {h.label}
+                        <div className="sticky top-0 z-20 bg-slate-50 border-b border-slate-200" style={{ height: headerHeight }}>
+                            <div className="flex" style={{ height: BASE_HEADER_HEIGHT }}>
+                                {headers.map(h => (
+                                    <div key={h.key} className="text-[10px] font-semibold text-slate-500 border-r border-slate-200/60 flex items-center justify-center shrink-0 uppercase tracking-wider" style={{ width: h.span * colWidth }}>
+                                        {h.label}
+                                    </div>
+                                ))}
+                            </div>
+                            {zoom === "week" && (
+                                <div className="flex border-t border-slate-200/40" style={{ height: DAY_SUB_ROW_HEIGHT }}>
+                                    {headers.flatMap(h => {
+                                        const dateStr = h.key.slice(2);
+                                        const [y, m, d] = dateStr.split("-").map(Number);
+                                        const monday = new Date(y, m - 1, d);
+                                        return Array.from({ length: 7 }, (_, i) => {
+                                            const day = addDays(monday, i);
+                                            const dayNum = day.getDate();
+                                            const isWknd = day.getDay() === 0 || day.getDay() === 6;
+                                            const isToday = day.getFullYear() === today.getFullYear() && day.getMonth() === today.getMonth() && day.getDate() === today.getDate();
+                                            return (
+                                                <div key={`ds-${h.key}-${i}`} className={`flex items-center justify-center shrink-0 text-[9px] ${isWknd ? "text-slate-300" : isToday ? "text-red-500 font-bold" : "text-slate-400"}`} style={{ width: colWidth }}>
+                                                    {dayNum}
+                                                </div>
+                                            );
+                                        });
+                                    })}
                                 </div>
-                            ))}
+                            )}
                         </div>
 
                         {weekendCols.map((wc, i) => (
-                            <div key={`wk-${i}`} className="absolute top-[36px] bottom-0 bg-slate-100/50 pointer-events-none z-[1]" style={{ left: wc.left, width: wc.width }} />
+                            <div key={`wk-${i}`} className="absolute bottom-0 bg-slate-100/50 pointer-events-none z-[1]" style={{ top: headerHeight, left: wc.left, width: wc.width }} />
                         ))}
 
                         <div className="absolute top-0 bottom-0 w-px z-[5] pointer-events-none" style={{ left: todayOffset, background: "repeating-linear-gradient(to bottom, #ef4444 0, #ef4444 4px, transparent 4px, transparent 8px)" }}>
                             <div className="absolute top-10 -translate-x-1/2 bg-red-500 text-white text-[8px] font-bold px-1.5 py-0.5 rounded-md shadow">TODAY</div>
                         </div>
 
-                        <svg className="absolute top-0 left-0 pointer-events-none z-[4]" style={{ width: timelineWidth, height: 36 + tasks.length * ROW_HEIGHT }}>
+                        <svg className="absolute top-0 left-0 pointer-events-none z-[4]" style={{ width: timelineWidth, height: headerHeight + tasks.length * ROW_HEIGHT }}>
                             <defs><marker id="arrowhead" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto"><polygon points="0 0, 6 2, 0 4" fill="#cbd5e1" /></marker></defs>
                             {arrows.map((arrow, i) => {
                                 const ft = tasks.find(t => t.id === arrow.fromId), tt = tasks.find(t => t.id === arrow.toId);
                                 if (!ft || !tt) return null;
                                 const fb = getBarStyle(ft), tb = getBarStyle(tt);
-                                const x1 = fb.left + fb.width, y1 = 36 + tasks.indexOf(ft) * ROW_HEIGHT + ROW_HEIGHT / 2;
-                                const x2 = tb.left, y2 = 36 + tasks.indexOf(tt) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                                const x1 = fb.left + fb.width, y1 = headerHeight + tasks.indexOf(ft) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                                const x2 = tb.left, y2 = headerHeight + tasks.indexOf(tt) * ROW_HEIGHT + ROW_HEIGHT / 2;
                                 const mx = x2 - 5 > x1 + 5 ? (x1 + x2) / 2 : x1 + 10;
                                 return <path key={`a-${i}`} d={`M ${x1} ${y1} L ${mx} ${y1} L ${mx} ${y2} L ${x2} ${y2}`} fill="none" stroke="#cbd5e1" strokeWidth="1.5" markerEnd="url(#arrowhead)" />;
                             })}
@@ -288,7 +367,7 @@ export default function PortalGanttChart({
 
                         {tasks.map((task, idx) => {
                             const bar = getBarStyle(task);
-                            const topY = 36 + idx * ROW_HEIGHT;
+                            const topY = headerHeight + idx * ROW_HEIGHT;
                             if (task.type === "milestone") {
                                 const cx = bar.left + 8;
                                 return (
@@ -318,7 +397,7 @@ export default function PortalGanttChart({
                         {headers.map((h, i) => {
                             let x = 0;
                             for (let j = 0; j < i; j++) x += headers[j].span * colWidth;
-                            return <div key={`g-${h.key}`} className="absolute top-[36px] bottom-0 border-r border-slate-200/40 pointer-events-none" style={{ left: x }} />;
+                            return <div key={`g-${h.key}`} className="absolute bottom-0 border-r border-slate-200/40 pointer-events-none" style={{ top: headerHeight, left: x }} />;
                         })}
                     </div>
                 </div>

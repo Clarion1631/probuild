@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { getPortalVisibility, getScheduleTasks, getScheduleTasksForSub } from "@/lib/actions";
-import PortalGanttChart from "./PortalGanttChart";
+import PortalScheduleView from "./PortalScheduleView";
 import Link from "next/link";
 import { getSubPortalSession } from "@/lib/sub-portal-auth";
 
@@ -72,7 +72,8 @@ export default async function PortalSchedulePage(props: { params: Promise<{ id: 
             </div>
 
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col min-h-[600px] max-h-[75vh] overflow-hidden">
-                <PortalGanttChart
+                <PortalScheduleView
+                    projectId={id}
                     initialTasks={tasks}
                     subcontractorId={subcontractorId}
                 />

@@ -68,11 +68,11 @@ export async function GET(req: NextRequest) {
     }
 
     if (mode === "archived") {
-      // List ALL conversations (active + archived), ordered by most recent
+      // List archived conversations
       const conversations = await prisma.chatConversation.findMany({
-        where: { userId },
+        where: { userId, archivedAt: { not: null } },
         orderBy: { updatedAt: "desc" },
-        take: 30,
+        take: 20,
         include: {
           _count: { select: { messages: true } },
         },
@@ -84,7 +84,6 @@ export async function GET(req: NextRequest) {
           title: c.title,
           updatedAt: c.updatedAt,
           archivedAt: c.archivedAt,
-          archived: !!c.archivedAt,
           messageCount: c._count.messages,
         })),
       });

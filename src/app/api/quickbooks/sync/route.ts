@@ -1,23 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getQBSettings, saveQBSettings } from "@/lib/integration-store";
-import { syncEstimateToQB, syncInvoiceToQB, refreshQBToken } from "@/lib/quickbooks";
+import { syncEstimateToQB, syncInvoiceToQB, ensureQBCustomer, ensureQBServiceItem, type QBTokens } from "@/lib/quickbooks";
+import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { prisma } from "@/lib/prisma";
+import { toNum } from "@/lib/prisma-helpers";
 
-async function getTokens() {
+async function resolveCustomerAndItem(
+    tokens: QBTokens,
+    client: { id: string; name: string; email: string | null; qbCustomerId: string | null }
+) {
+    const customerId = await ensureQBCustomer(tokens, client);
+    if (customerId !== client.qbCustomerId) {
+        await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+    }
     const qb = await getQBSettings();
-    if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
-        throw new Error("QuickBooks not connected");
+    let itemId = qb.serviceItemId;
+    if (!itemId) {
+        itemId = await ensureQBServiceItem(tokens);
+        await saveQBSettings({ serviceItemId: itemId });
     }
-
-    // Try refresh if token might be stale (QB tokens last 1 hour)
-    try {
-        const fresh = await refreshQBToken(qb.refreshToken);
-        await saveQBSettings({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
-        return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
-    } catch {
-        // Use existing token
-        return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
-    }
+    return { customerId, itemId };
 }
 
 export async function POST(req: NextRequest) {
@@ -33,7 +35,7 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "QuickBooks not connected", notConnected: true }, { status: 400 });
         }
 
-        const tokens = await getTokens();
+        const tokens = await getFreshQBTokens();
 
         if (type === "estimate") {
             const estimate = await prisma.estimate.findUnique({
@@ -50,19 +52,24 @@ export async function POST(req: NextRequest) {
             const client = estimate.project?.client;
             if (!client) return NextResponse.json({ error: "No client attached to estimate" }, { status: 400 });
 
+            const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
+                id: client.id, name: client.name, email: client.email ?? null, qbCustomerId: client.qbCustomerId ?? null,
+            });
+
             const result = await syncEstimateToQB(tokens, {
                 id: estimate.id,
                 code: estimate.code,
                 title: estimate.title,
-                totalAmount: estimate.totalAmount,
+                totalAmount: toNum(estimate.totalAmount),
                 items: estimate.items.map(i => ({
                     name: i.name,
                     quantity: i.quantity,
-                    unitCost: i.unitCost,
-                    total: i.total,
+                    unitCost: toNum(i.unitCost),
+                    total: toNum(i.total),
                     type: i.type,
                 })),
-                client: { name: client.name, email: client.email ?? null },
+                customerId,
+                itemId,
                 project: estimate.project ? { name: estimate.project.name } : null,
             }, qb.glMappings || {});
 
@@ -79,13 +86,19 @@ export async function POST(req: NextRequest) {
             });
             if (!invoice) return NextResponse.json({ error: "Invoice not found" }, { status: 404 });
 
-            const result = await syncInvoiceToQB(tokens, {
-                code: invoice.code,
-                totalAmount: invoice.totalAmount,
-                balanceDue: invoice.balanceDue,
-                client: { name: invoice.client.name, email: invoice.client.email ?? null },
-                project: invoice.project ? { name: invoice.project.name } : null,
-            });
+                const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
+                    id: invoice.client.id, name: invoice.client.name,
+                    email: invoice.client.email ?? null, qbCustomerId: invoice.client.qbCustomerId ?? null,
+                });
+
+                const result = await syncInvoiceToQB(tokens, {
+                    code: invoice.code,
+                    totalAmount: toNum(invoice.totalAmount),
+                    balanceDue: toNum(invoice.balanceDue),
+                    customerId,
+                    itemId,
+                    project: invoice.project ? { name: invoice.project.name } : null,
+                });
 
             return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
         }

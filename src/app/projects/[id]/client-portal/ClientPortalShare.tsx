@@ -27,8 +27,9 @@ export default function ClientPortalShare({ projectId, portalUrl, clientEmail, l
         }
         startTransition(async () => {
             try {
-                await emailPortalLinkToClient(projectId);
-                toast.success(`Portal link sent to ${clientEmail}`);
+                const res = await emailPortalLinkToClient(projectId);
+                if (res?.success) toast.success(`Portal link sent to ${clientEmail}`);
+                else toast.error(res?.error || "Failed to send email");
             } catch (e: any) {
                 toast.error(e.message || "Failed to send email");
             }
@@ -40,7 +41,7 @@ export default function ClientPortalShare({ projectId, portalUrl, clientEmail, l
             <h2 className="text-base font-semibold text-hui-textMain">Share Portal</h2>
 
             <div>
-                <label className="text-xs font-medium text-hui-textMuted mb-1 block">Portal Link</label>
+                <label className="text-xs font-medium text-hui-textMuted mb-1 block">One-click portal link</label>
                 <div className="flex gap-2">
                     <input
                         readOnly
@@ -51,6 +52,7 @@ export default function ClientPortalShare({ projectId, portalUrl, clientEmail, l
                         {copied ? "Copied!" : "Copy"}
                     </button>
                 </div>
+                <p className="text-[11px] text-hui-textMuted mt-1">No password needed — opens straight into their portal. Safe to text or email.</p>
             </div>
 
             <div>

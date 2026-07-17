@@ -57,7 +57,7 @@ export async function POST(
             });
         }
 
-        const appUrl = process.env.NEXTAUTH_URL || 'https://probuild-amber.vercel.app';
+        const appUrl = process.env.NEXTAUTH_URL || 'http://localhost:3000';
         const loginUrl = `${appUrl}/login`;
 
         // Try to send email
@@ -65,9 +65,13 @@ export async function POST(
             try {
                 // Ensure the 'from' email is verified in Resend for the user's domain.
                 // If not, we just catch the error and continue.
+                const inviteCc = client.additionalEmail && client.additionalEmail !== emailToInvite
+                    ? [client.additionalEmail]
+                    : undefined;
                 const { error } = await resend.emails.send({
                     from: 'ProBuild <notifications@goldentouchremodeling.com>',
                     to: emailToInvite,
+                    cc: inviteCc,
                     subject: 'Invitation to Customer Portal',
                     html: `
                     <!DOCTYPE html>

@@ -26,8 +26,12 @@ export async function assertCleanNavigation(
   label?: string
 ) {
   const tag = label || urlPath;
+  // `load` (window.onload) is the right primitive here: it confirms initial
+  // resources finished without waiting for ALL network to go quiet, which
+  // `networkidle` requires and which modern pages with background polling
+  // (Supabase Realtime, periodic fetches, etc.) often never reach within 30s.
   const res = await page.goto(urlPath, {
-    waitUntil: "networkidle",
+    waitUntil: "load",
     timeout: 30_000,
   });
 

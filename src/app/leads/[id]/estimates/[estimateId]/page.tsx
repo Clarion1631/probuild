@@ -1,4 +1,4 @@
-import { getEstimate, getLead, getCompanySettings } from "@/lib/actions";
+import { getEstimate, getLead, getCompanySettings, getEstimateActivity } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import EstimateEditor from "@/app/projects/[id]/estimates/[estimateId]/EstimateEditor";
 
@@ -6,10 +6,11 @@ export const dynamic = "force-dynamic";
 
 export default async function LeadEstimatePage({ params }: { params: Promise<{ id: string, estimateId: string }> }) {
     const resolvedParams = await params;
-    const [lead, estimate, settings] = await Promise.all([
+    const [lead, estimate, settings, activityEvents] = await Promise.all([
         getLead(resolvedParams.id),
         getEstimate(resolvedParams.estimateId),
         getCompanySettings(),
+        getEstimateActivity(resolvedParams.estimateId),
     ]);
 
     if (!lead || !estimate) {
@@ -18,15 +19,14 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
 
     const serializedEstimate = JSON.parse(JSON.stringify(estimate));
 
-    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
+    let salesTaxes: { id?: string; name: string; rate: number; isDefault: boolean }[] = [];
     try {
         salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
     } catch { /* ignore parse errors */ }
-    const defaultTax = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
 
     return (
-        <div className="flex h-full -m-6 h-[calc(100vh-64px)] overflow-hidden">
-            <div className="flex-1 overflow-auto bg-slate-50">
+        <div className="flex-1 flex h-full overflow-hidden">
+            <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
                 <EstimateEditor
                     context={{
                         type: "lead",
@@ -34,10 +34,14 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
                         name: lead.name,
                         clientName: lead.client.name,
                         clientEmail: lead.client.email || undefined,
-                        location: lead.location || undefined
+                        location: lead.location || undefined,
+                        clientTaxExemptCertUrl: (lead.client as any)?.taxExemptCertUrl || null,
+                        clientTaxExemptCertExpiresAt: (lead.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null
                     }}
                     initialEstimate={serializedEstimate}
-                    defaultTax={defaultTax}
+                    salesTaxes={salesTaxes}
+                    settings={settings}
+                    activityEvents={activityEvents}
                 />
             </div>
         </div>

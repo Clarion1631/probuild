@@ -67,7 +67,7 @@ async function main() {
         }
     });
 
-    await prisma.project.create({
+    const project2 = await prisma.project.create({
         data: {
             name: 'Adkins Kitchen',
             clientId: client3.id,
@@ -99,6 +99,43 @@ async function main() {
             status: 'Invoiced',
             totalAmount: 12500,
             balanceDue: 0
+        }
+    });
+
+    // Create Approved Estimate with Payment Schedules for Adkins Kitchen
+    await prisma.estimate.create({
+        data: {
+            title: 'Adkins Kitchen Renovation',
+            projectId: project2.id,
+            code: 'EST-103',
+            status: 'Approved',
+            totalAmount: 10000,
+            balanceDue: 10000,
+            paymentSchedules: {
+                create: [
+                    {
+                        name: 'DEPOSIT - UPON SIGNED CONTRACT',
+                        percentage: 60,
+                        amount: 6000,
+                        order: 0,
+                        status: 'Pending',
+                    },
+                    {
+                        name: 'ROUGH-IN COMPLETE',
+                        percentage: 30,
+                        amount: 3000,
+                        order: 1,
+                        status: 'Pending',
+                    },
+                    {
+                        name: 'FINAL COMPLETION',
+                        percentage: 10,
+                        amount: 1000,
+                        order: 2,
+                        status: 'Pending',
+                    }
+                ]
+            }
         }
     });
 

@@ -22,5 +22,11 @@ export default async function BidPackageEditPage({ params }: Props) {
 
     if (!pkg) return redirect(`/projects/${id}/bid-packages`);
 
-    return <BidPackageEditor pkg={pkg} projectId={id} subcontractors={subs} />;
+    const mappedPkg = {
+        ...pkg,
+        totalBudget: pkg.totalBudget !== null ? Number(pkg.totalBudget) : null,
+        scopes: pkg.scopes.map(s => ({ ...s, budgetAmount: s.budgetAmount !== null ? Number(s.budgetAmount) : null })),
+        invitations: pkg.invitations.map(inv => ({ ...inv, bidAmount: inv.bidAmount !== null ? Number(inv.bidAmount) : null })),
+    };
+    return <BidPackageEditor pkg={mappedPkg} projectId={id} subcontractors={subs} />;
 }

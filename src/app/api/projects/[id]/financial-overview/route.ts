@@ -36,8 +36,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     let validInvoiceStatuses = ["Issued", "Paid", "Overdue", "Partially Paid", "Sent"];
     if (includeUnissued) validInvoiceStatuses.push("Draft");
 
-    let validEstimateStatuses = ["Sent", "Approved", "Invoiced", "Partially Paid"];
-    if (includeUnissued) validEstimateStatuses.push("Draft", "Viewed");
+    // Include Sent/Viewed for the pendingApproval display bucket; Paid for completeness
+    let validEstimateStatuses = ["Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid"];
+    if (includeUnissued) validEstimateStatuses.push("Draft");
 
     let validRetainerStatuses = ["Sent", "Paid", "Partially Paid"];
     if (includeUnissued) validRetainerStatuses.push("Draft");
@@ -90,9 +91,10 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     }
 
     // Estimates (Forecasted without invoices)
-    // Avoid double counting if estimate is already invoiced, we can roughly exclude status "Invoiced" and "Partially Paid"
+    // Only count Approved estimates — Sent/Viewed are not accepted, Invoiced/Partially Paid/Paid
+    // are already tracked via invoice payment schedules above.
     for (const est of estimates) {
-        if (est.status !== "Invoiced" && est.status !== "Partially Paid") {
+        if (est.status === "Approved") {
             forecastedIncomingFromEstimates += Number(est.totalAmount);
         }
     }
@@ -170,7 +172,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // 5. TIMELINE (Cash Flow Tracker)
     // ------------------------------------
     // Build cash flow timeline from actual invoice payments bucketed by month
-    const allPayments = await prisma.payment.findMany({
+    const allPayments = await prisma.paymentSchedule.findMany({
         where: { invoice: { projectId } },
         select: { amount: true, paidAt: true, createdAt: true }
     });

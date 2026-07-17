@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { normalizeE164 } from "@/lib/phone";
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
@@ -47,8 +48,10 @@ export async function POST(req: Request) {
                 email: data.email,
                 companyName: data.companyName,
                 primaryPhone: data.primaryPhone,
+                primaryPhoneE164: normalizeE164(data.primaryPhone),
                 additionalEmail: data.additionalEmail,
                 additionalPhone: data.additionalPhone,
+                additionalPhoneE164: normalizeE164(data.additionalPhone),
                 addressLine1: data.addressLine1,
                 addressLine2: data.addressLine2,
                 city: data.city,

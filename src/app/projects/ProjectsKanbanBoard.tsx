@@ -50,7 +50,7 @@ export default function ProjectsKanbanBoard({ projects: initialProjects, statuse
         <DragDropContext onDragEnd={onDragEnd}>
             <div className="flex gap-6 pb-8 overflow-x-auto min-h-[500px] items-start">
                 {statuses.map(status => {
-                    const colProjects = projects.filter((p: any) => (p.status || "Open") === status.value);
+                    const colProjects = projects.filter((p: any) => (p.status || "In Progress") === status.value);
                     
                     return (
                         <div key={status.value} className="w-[320px] flex-shrink-0 flex flex-col bg-slate-50 border border-slate-200 rounded-xl overflow-hidden p-3">

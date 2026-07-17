@@ -195,7 +195,7 @@ export default function BudgetClient({ project, data }: { project: { id: string;
     const [forecastLoading, setForecastLoading] = useState(false);
     const [forecastResult, setForecastResult] = useState<string | null>(null);
     function updateIncludeStatuses(updater: (prev: typeof includeStatuses) => typeof includeStatuses) {
-        setIncludeStatuses(prev => {
+        setIncludeStatuses((prev: typeof includeStatuses) => {
             const next = updater(prev);
             try { localStorage.setItem(`budget-statuses-${project.id}`, JSON.stringify(next)); } catch {}
             return next;
@@ -217,7 +217,7 @@ export default function BudgetClient({ project, data }: { project: { id: string;
         // Filter estimates by status
         const activeStatuses = [
             ...(includeStatuses.estimateSent ? ["Sent"] : []),
-            ...(includeStatuses.estimateApproved ? ["Approved", "Invoiced", "Partially Paid"] : []),
+            ...(includeStatuses.estimateApproved ? ["Approved", "Invoiced", "Partially Paid", "Paid"] : []),
         ];
         const activeCOStatuses = [
             ...(includeStatuses.coApproved ? ["Approved"] : []),

@@ -6,6 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -28,7 +29,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveChangeOrder(initialData.id, signature.trim(), "Client IP", userAgent, signatureDataUrl);
+            await approveChangeOrder(initialData.id, signature.trim(), userAgent, signatureDataUrl);
             toast.success("Change Order Approved!");
             window.location.reload();
         } catch (e: any) {
@@ -46,9 +47,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const companyAddress = companySettings?.address || "";
 
     const items = initialData.items || [];
-    const subtotal = items.reduce((acc: number, item: any) => acc + (Number(item.quantity || 0) * Number(item.unitCost || 0)), 0);
-    const tax = subtotal * 0.088;
-    const total = subtotal + tax;
+    // Same integer-cents math as the editor, updateChangeOrder's item sync, and
+    // billChangeOrderCore. Tax follows the estimate's treatment (tax-exempt
+    // customers pay none) — the amount shown here is what the customer signs
+    // AND what billing charges, to the cent.
+    const subtotal = coItemsSubtotal(items);
+    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    const total = Math.round((subtotal + tax) * 100) / 100;
+    const taxLabel = coTaxLabel(initialData.estimate);
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -161,6 +167,30 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     )}
 
+                    {/* Company Countersignature */}
+                    {initialData.companySignedBy && (
+                        <div className="mx-10 mt-4 p-5 bg-slate-50 border border-slate-200 rounded-lg">
+                            <div className="flex items-start gap-3">
+                                <div className="w-8 h-8 bg-amber-100 rounded-full flex items-center justify-center shrink-0">
+                                    <svg className="h-4 w-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
+                                </div>
+                                <div>
+                                    <h3 className="text-sm font-semibold text-slate-800">Countersigned by {companyName}</h3>
+                                    <p className="text-sm text-slate-700 mt-0.5">Signed by: <strong>{initialData.companySignedBy}</strong></p>
+                                    {initialData.companySignedAt && (
+                                        <p className="text-xs text-slate-500 mt-0.5">{new Date(initialData.companySignedAt).toLocaleString()}</p>
+                                    )}
+                                </div>
+                            </div>
+                            {initialData.companySignatureUrl && (
+                                <div className="mt-4 pt-4 border-t border-slate-200 flex flex-col items-start">
+                                    <span className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Electronic Signature</span>
+                                    <img src={initialData.companySignatureUrl} alt="Company signature" className="h-16 object-contain mix-blend-multiply" />
+                                </div>
+                            )}
+                        </div>
+                    )}
+
                     {/* Line Items Table */}
                     <div className="px-10 py-8">
                         <table className="w-full text-sm">
@@ -174,7 +204,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {items.map((item: any) => {
-                                    const itemTotal = Number(item.quantity || 0) * Number(item.unitCost || 0);
+                                    const itemTotal = coLineCents(Number(item.quantity || 0), Number(item.unitCost || 0)) / 100;
                                     return (
                                         <tr key={item.id}>
                                             <td className="py-3">
@@ -200,7 +230,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <span>{formatCurrency(subtotal)}</span>
                                 </div>
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
-                                    <span>Tax (8.8%)</span>
+                                    <span>{taxLabel}</span>
                                     <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-amber-600">

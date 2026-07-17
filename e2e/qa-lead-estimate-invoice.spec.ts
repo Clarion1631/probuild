@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { PrismaClient } from "@prisma/client";
 import {
   assertCleanNavigation,
   assertNoCrashUI,
@@ -8,6 +9,12 @@ import {
   parseCurrency,
   capture,
 } from "./helpers/fail-loud";
+
+// Test-data signature — the teardown below deletes by these exact values, so
+// keep the form fills and the cleanup in sync by always using the constants.
+const TEST_LEAD_NAME = "Master Bath Renovation - Henderson";
+const TEST_CLIENT_NAME = "Mike Henderson";
+const TEST_CLIENT_EMAIL = "mike.henderson@gmail.com";
 
 // Shared state across serial tests
 let createdLeadId: string;
@@ -37,32 +44,34 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
     await page.goto("/leads", { waitUntil: "networkidle" });
     await capture(page, testInfo, 1, 2, "before-add-lead");
 
-    // Click Add Lead
-    const addBtn = page.locator('button:has-text("Add Lead")');
+    // Click Add Lead — .first(): an empty leads list renders a second
+    // "Add Lead" button in the empty state alongside the header one.
+    const addBtn = page.locator('button:has-text("Add Lead")').first();
     await expect(addBtn, "Add Lead button not found").toBeVisible();
     await addBtn.click();
     await page.waitForTimeout(1000);
     await capture(page, testInfo, 1, 2, "add-lead-modal");
 
     // Fill form
-    await page.locator('input[name="name"]').fill("Master Bath Renovation - Henderson");
+    await page.locator('input[name="name"]').fill(TEST_LEAD_NAME);
 
     // Client name — combobox: type and pick or create
     const clientInput = page.locator('input[name="clientName"]');
     if (await clientInput.isVisible()) {
-      await clientInput.fill("Mike Henderson");
+      await clientInput.fill(TEST_CLIENT_NAME);
       // Wait for dropdown and click first option or just leave the typed value
       await page.waitForTimeout(500);
-      const option = page.locator('[role="option"]:has-text("Mike Henderson")');
+      const option = page.locator(`[role="option"]:has-text("${TEST_CLIENT_NAME}")`);
       if (await option.isVisible({ timeout: 2000 }).catch(() => false)) {
         await option.click();
       }
     }
 
     // Fill remaining fields
-    await page.locator('input[name="clientEmail"]').fill("mike.henderson@gmail.com");
+    await page.locator('input[name="clientEmail"]').fill(TEST_CLIENT_EMAIL);
     await page.locator('input[name="clientPhone"]').fill("360-412-8837");
-    await page.locator('input[name="location"]').fill("14502 NE 28th St, Vancouver, WA 98684");
+    // Job site address is optional and uses a Google Maps autocomplete + structured
+    // city/state/zip fields without name attributes; leave it empty for this test.
 
     const sourceSelect = page.locator('select[name="source"]');
     if (await sourceSelect.isVisible()) {
@@ -81,10 +90,9 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
 
     await capture(page, testInfo, 1, 2, "form-filled");
 
-    // Submit
-    const submitBtn = page.locator(
-      'button:has-text("Create Lead"), button:has-text("Add Lead"):not([disabled])'
-    ).last();
+    // Submit — the modal's submit button is the only type=submit "Create Lead";
+    // a text-based .last() can grab the empty-state "Add Lead" behind the modal.
+    const submitBtn = page.locator('button[type="submit"]:has-text("Create Lead")');
     await submitBtn.click();
 
     // Wait for redirect to lead detail
@@ -374,6 +382,72 @@ test.describe.serial("Workflows 1-3: Lead → Estimate → Invoice", () => {
         `[${testInfo.title}] ${consoleErrors.length} console error(s):`,
         consoleErrors
       );
+    }
+  });
+
+  // ===========================================================================
+  // TEARDOWN — delete everything this suite created, plus any leads matching
+  // the exact test signature leaked by earlier aborted runs. Without this, QA
+  // runs accumulate junk in whatever DB they target (see docs/TESTING.md).
+  // ===========================================================================
+  test.afterAll(async () => {
+    const prisma = new PrismaClient();
+    try {
+      const strays = await prisma.lead.findMany({
+        where: {
+          name: TEST_LEAD_NAME,
+          stage: "New",
+          project: { is: null },
+          client: { email: TEST_CLIENT_EMAIL },
+        },
+        select: { id: true },
+      });
+      const leadIds = new Set<string>(strays.map((s) => s.id));
+      if (createdLeadId) leadIds.add(createdLeadId);
+
+      for (const leadId of leadIds) {
+        const estimates = await prisma.estimate.findMany({
+          where: { leadId },
+          select: { id: true },
+        });
+        const estimateIds = estimates.map((e) => e.id);
+        if (estimateIds.length > 0) {
+          await prisma.estimateItem.deleteMany({ where: { estimateId: { in: estimateIds } } });
+          await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: estimateIds } } });
+          await prisma.estimate.deleteMany({ where: { id: { in: estimateIds } } });
+        }
+        await prisma.clientMessage.deleteMany({ where: { leadId } });
+        await prisma.leadTask.deleteMany({ where: { leadId } });
+        await prisma.leadNote.deleteMany({ where: { leadId } });
+        await prisma.leadMeeting.deleteMany({ where: { leadId } });
+        await prisma.scheduleTask.deleteMany({ where: { leadId } });
+        await prisma.takeoff.deleteMany({ where: { leadId } });
+        await prisma.roomDesign.deleteMany({ where: { leadId } });
+        await prisma.contract.deleteMany({ where: { leadId } });
+        await prisma.projectFile.deleteMany({ where: { leadId } });
+        await prisma.fileFolder.deleteMany({ where: { leadId } });
+        await prisma.lead.delete({ where: { id: leadId } });
+      }
+
+      // Drop the auto-created test client once nothing references it.
+      const client = await prisma.client.findFirst({
+        where: { email: TEST_CLIENT_EMAIL },
+        include: {
+          _count: { select: { leads: true, projects: true, invoices: true, retainers: true } },
+        },
+      });
+      if (
+        client &&
+        client._count.leads + client._count.projects + client._count.invoices + client._count.retainers === 0
+      ) {
+        await prisma.clientMessage.deleteMany({ where: { clientId: client.id } });
+        await prisma.client.delete({ where: { id: client.id } });
+      }
+      console.log(`[teardown] removed ${leadIds.size} test lead(s)`);
+    } catch (e) {
+      console.warn("[teardown] cleanup failed (non-fatal):", (e as Error).message);
+    } finally {
+      await prisma.$disconnect();
     }
   });
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useState, useRef, useTransition } from "react";
 import { toggleSchedulePublished, emailPortalLinkToClient } from "@/lib/actions";
 import { toast } from "sonner";
 
@@ -14,6 +14,8 @@ export default function SchedulePublishButton({
     const [published, setPublished] = useState(initialPublished);
     const [showMenu, setShowMenu] = useState(false);
     const [isPending, startTransition] = useTransition();
+    const btnRef = useRef<HTMLButtonElement>(null);
+    const [menuPos, setMenuPos] = useState({ top: 0, right: 0 });
 
     function handleToggle() {
         const next = !published;
@@ -33,10 +35,19 @@ export default function SchedulePublishButton({
         });
     }
 
+    function handleToggleMenu() {
+        if (!showMenu && btnRef.current) {
+            const rect = btnRef.current.getBoundingClientRect();
+            setMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+        }
+        setShowMenu(!showMenu);
+    }
+
     return (
         <div className="relative">
             <button
-                onClick={() => setShowMenu(!showMenu)}
+                ref={btnRef}
+                onClick={handleToggleMenu}
                 disabled={isPending}
                 className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md border transition ${
                     published
@@ -63,7 +74,7 @@ export default function SchedulePublishButton({
             {showMenu && (
                 <>
                     <div className="fixed inset-0 z-40" onClick={() => setShowMenu(false)} />
-                    <div className="absolute right-0 top-full mt-1 w-56 bg-white border border-slate-200 rounded-lg shadow-xl z-50 py-1">
+                    <div className="fixed w-56 bg-white border border-slate-200 rounded-lg shadow-xl z-50 py-1" style={{ top: menuPos.top, right: menuPos.right }}>
                         <button
                             onClick={handleToggle}
                             disabled={isPending}

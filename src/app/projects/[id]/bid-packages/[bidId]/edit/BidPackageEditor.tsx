@@ -98,7 +98,7 @@ export default function BidPackageEditor({ pkg: initialPkg, projectId, subcontra
             try {
                 await updateBidPackage(pkg.id, projectId, {
                     title: detailTitle,
-                    description: detailDesc || null,
+                    description: detailDesc || undefined,
                     dueDate: detailDue ? new Date(detailDue) : null,
                     status: detailStatus,
                 });

@@ -1,4 +1,6 @@
 import { test, expect } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   assertNoCrashUI,
   setupConsoleErrorCollector,
@@ -6,6 +8,15 @@ import {
 } from "./helpers/fail-loud";
 
 let consoleErrors: string[] = [];
+
+function anthropicStatus(): "ok" | "invalid" | "unknown" {
+  try {
+    const v = readFileSync(resolve(__dirname, ".anthropic-status"), "utf8").trim();
+    return v === "ok" || v === "invalid" ? v : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 
 test.describe("Workflow 10: Help Chat Widget", () => {
   test.beforeEach(async ({ page }) => {
@@ -35,6 +46,11 @@ test.describe("Workflow 10: Help Chat Widget", () => {
   test("W10.2: Open chat, send message, get AI response", async ({
     page,
   }, testInfo) => {
+    const s = anthropicStatus();
+    test.skip(
+      s === "invalid",
+      "ANTHROPIC_API_KEY is invalid — rotate the GitHub Actions + Vercel secret."
+    );
     await page.goto("/projects", { waitUntil: "networkidle" });
     await page.waitForTimeout(2000);
 

@@ -27,8 +27,14 @@ model User {
   projectAccess    ProjectAccess[]
   leadTasks        LeadTask[]
   managedLeads     Lead[]           @relation("LeadManager")
+  managedProjects  Project[]        @relation("ProjectManager")
   dailyLogs        DailyLog[]
   documentComments DocumentComment[]
+  teamMessages     TeamMessage[]
+  fieldUpdatesSeenAt DateTime?
+  clippedImports   ClippedImport[]
+  officeTasks        OfficeTask[]      @relation("OfficeTaskAssignee")
+  createdOfficeTasks OfficeTask[]      @relation("OfficeTaskCreator")
 }
 
 model Client {
@@ -41,6 +47,11 @@ model Client {
   additionalEmail String?
   additionalPhone String?
 
+  // Normalized E.164 (e.g. "+13609542757") for indexed phone lookups (Twilio inbound).
+  // Populated by createClient/updateClient via normalizeE164().
+  primaryPhoneE164    String?
+  additionalPhoneE164 String?
+
   addressLine1 String?
   addressLine2 String?
   city         String?
@@ -50,10 +61,23 @@ model Client {
 
   internalNotes String?
 
-  projects Project[]
-  leads    Lead[]
-  invoices Invoice[]
-  retainers Retainer[]
+  // QuickBooks Online customer id (set on first invoice push; avoids name-match drift)
+  qbCustomerId String?
+
+  // WA DOR: a reseller permit / exemption certificate must be on file for every
+  // tax-exempt sale (Estimate.taxExempt). File lives in Supabase storage.
+  taxExemptCertUrl       String?
+  taxExemptCertExpiresAt DateTime?
+  taxExemptCertNote      String?
+
+  projects       Project[]
+  leads          Lead[]
+  invoices       Invoice[]
+  retainers      Retainer[]
+  clientMessages ClientMessage[]
+
+  @@index([primaryPhoneE164])
+  @@index([additionalPhoneE164])
 }
 
 model Lead {
@@ -62,7 +86,7 @@ model Lead {
   name              String
   clientId          String
   client            Client    @relation(fields: [clientId], references: [id])
-  stage             String    @default("New") // New, Followed Up, Connected, Estimate Sent, Won, Closed
+  stage             String    @default("New") // New, Followed Up, Connected, Estimate Sent, Won, Closed Lost
   source            String? // My website, Houzz, Manually created lead
   projectType       String?
   location          String?
@@ -82,9 +106,13 @@ model Lead {
   snoozedUntil DateTime?
   isArchived   Boolean   @default(false)
 
+  // Google Drive folder for this lead's photos/videos (mobile intake).
+  driveFolderId  String?
+  driveFolderUrl String?
+
   // Relations
   estimates      Estimate[]
-  floorPlans     FloorPlan[]
+  roomDesigns    RoomDesign[]
   contracts      Contract[]
   files          ProjectFile[]
   folders        FileFolder[]
@@ -126,6 +154,39 @@ model LeadTask {
   updatedAt  DateTime  @updatedAt
 }
 
+model OfficeTask {
+  id          String    @id @default(cuid())
+  title       String
+  notes       String?
+  status      String    @default("To Do") // LEGACY — kept in sync with column.name on create/move for prod rollback safety until v2 deploys; reads should use columnId
+  columnId    String?
+  column      OfficeBoardColumn? @relation(fields: [columnId], references: [id], onDelete: SetNull)
+  position    Int       @default(0) // sort order within its column
+  archivedAt  DateTime?
+  dueDate     DateTime?
+  assigneeId  String?
+  assignee    User?     @relation("OfficeTaskAssignee", fields: [assigneeId], references: [id])
+  aiPrompt    String?   // suggested prompt the user can copy into Claude
+  automationGap String? // what capability gap forced this to be handed off to a human
+  createdById String?
+  createdBy   User?     @relation("OfficeTaskCreator", fields: [createdById], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, position])
+  @@index([assigneeId])
+  @@index([columnId])
+}
+
+model OfficeBoardColumn {
+  id           String       @id @default(cuid())
+  name         String
+  position     Int
+  isDoneColumn Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  tasks        OfficeTask[]
+}
+
 model LeadMeeting {
   id          String   @id @default(cuid())
   leadId      String
@@ -150,21 +211,26 @@ model Project {
   clientId            String
   client              Client                       @relation(fields: [clientId], references: [id])
   leadId              String?                      @unique
-  lead                Lead?                        @relation(fields: [leadId], references: [id])
+  lead                Lead?                        @relation(fields: [leadId], references: [id], onDelete: Restrict)
   viewedAt            DateTime                     @default(now())
   createdAt           DateTime                     @default(now())
   location            String?
-  status              String                       @default("In Progress") // In Progress, Closed, Paid Ready to Start
+  // Geofencing for mobile time-clock (added for gtr-probuild-mobile integration)
+  locationLat            Float?
+  locationLng            Float?
+  geofenceRadiusMeters   Int?     @default(100)
+  status              String                       @default("In Progress") // In Progress, Substantial Completion, Closed Complete, Closed Lost (see lib/project-status.ts)
   type                String? // Kitchen Remodeling, Patio, Water Damage
   code                String?
   tags                String?
   color               String?                      @default("#3b82f6") // Added color field
   managerId           String?
+  manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]
   invoices            Invoice[]
   budgets             Budget[]
   timeEntries         TimeEntry[]
-  floorPlans          FloorPlan[]
+  roomDesigns         RoomDesign[]
   contracts           Contract[]
   crew                User[]                       @relation("CrewAssignments")
   scheduleTasks       ScheduleTask[]
@@ -183,6 +249,8 @@ model Project {
   moodBoards          MoodBoard[]
   retainers           Retainer[]
   bidPackages         BidPackage[]
+  teamMessages        TeamMessage[]
+  activityLogs        ActivityLog[]
 
   @@index([viewedAt])
   @@index([clientId])
@@ -190,17 +258,76 @@ model Project {
   @@index([createdAt])
 }
 
-model FloorPlan {
-  id        String   @id @default(cuid())
-  name      String
-  projectId String?
-  project   Project? @relation(fields: [projectId], references: [id])
-  leadId    String?
-  lead      Lead?    @relation(fields: [leadId], references: [id])
-  modelUrl  String? // URL to raw GLTF/GLB model from iPhone scan
-  data      String? // JSON stringified layout data for 2D/3D walls & furniture
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model RoomDesign {
+  id           String      @id @default(cuid())
+  name         String
+  roomType     String // kitchen | bathroom | laundry | bedroom | other
+  projectId    String?
+  project      Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId       String?
+  lead         Lead?       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  layoutJson   Json // walls, dimensions, camera, surfaces
+  shareToken   String?     @unique
+  shareEnabled Boolean     @default(false)
+  thumbnail    String?
+  // USDZ export of the LiDAR scan - powers "View in AR" (Apple Quick Look).
+  scanUsdzUrl  String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  assets       RoomAsset[]
+  renders      RoomRender[]
+
+  // XOR check: exactly one of projectId or leadId must be non-null.
+  // Enforced at the DB via CHECK constraint "RoomDesign_owner_xor" (not expressible in Prisma).
+  @@index([projectId, updatedAt])
+  @@index([leadId, updatedAt])
+}
+
+// AI photorealistic render of a room snapshot (Gemini image-out), stored in
+// Supabase storage. Shown in the studio gallery + the client share page.
+model RoomRender {
+  id           String     @id @default(cuid())
+  roomDesignId String
+  roomDesign   RoomDesign @relation(fields: [roomDesignId], references: [id], onDelete: Cascade)
+  url          String
+  style        String?
+  createdAt    DateTime   @default(now())
+
+  @@index([roomDesignId, createdAt])
+}
+
+// Raw text clipped from a vendor/product web page via the browser extension.
+// Reviewed on Settings > Design Catalog, then extracted into the library.
+model ClippedImport {
+  id          String   @id @default(cuid())
+  sourceUrl   String?
+  title       String?
+  text        String
+  status      String   @default("pending") // pending | imported | dismissed
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([status, createdAt])
+}
+
+model RoomAsset {
+  id           String     @id @default(cuid())
+  roomDesignId String
+  roomDesign   RoomDesign @relation(fields: [roomDesignId], references: [id], onDelete: Cascade)
+  assetType    String // cabinet | appliance | fixture | window | door
+  assetId      String // references asset-registry.ts id
+  positionX    Float
+  positionY    Float
+  positionZ    Float
+  rotationY    Float      @default(0)
+  scaleX       Float      @default(1)
+  scaleY       Float      @default(1)
+  scaleZ       Float      @default(1)
+  metadata     Json?
+  createdAt    DateTime   @default(now())
+
+  @@index([roomDesignId])
 }
 
 model Estimate {
@@ -225,12 +352,19 @@ model Estimate {
   paymentSchedules EstimatePaymentSchedule[]
   budget           Budget?
   takeoff          Takeoff?
+  invoices         Invoice[] // invoices generated from this estimate (auto-created on signing)
 
   // Processing fee & expiration
   processingFeeMarkup Decimal?
   hideProcessingFee   Boolean   @default(true)
   expirationDate      DateTime?
   archivedAt          DateTime?
+  taxExempt           Boolean   @default(false)
+  taxRateName         String?
+  taxRatePercent      Decimal?
+
+  // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
+  targetMarginPercent Float     @default(25)
 
   // Phase 7: Contracts & Approvals
   approvedBy        String?
@@ -242,7 +376,8 @@ model Estimate {
   contract          Contract? @relation(fields: [contractId], references: [id])
 
   // Memo / notes
-  memo String?
+  memo                String?
+  statusBeforePayment String?
 
   // Phase 8: Tracking
   viewedAt DateTime?
@@ -250,6 +385,16 @@ model Estimate {
   // Phase 9: Terms & Sending
   termsAndConditions String? // Snapshot of T&C HTML at time of sending
   sentAt             DateTime? // When the estimate was emailed to the client
+
+  // Project Overview / Vision cover section (client-facing, no pricing) + Notes & Assumptions
+  overviewEnabled Boolean @default(false)
+  overviewTitle   String? // UI default "Project Overview"
+  overviewBody    String? // sanitized rich-text HTML
+  notesEnabled    Boolean @default(false)
+  notesTitle      String? // UI default "Estimate Notes & Assumptions"
+  notesBody       String? // sanitized rich-text HTML
+  notesPlacement  String  @default("after") // "before" | "after" line items
+
   changeOrders       ChangeOrder[]
   files              EstimateFile[]
 
@@ -283,9 +428,14 @@ model EstimatePaymentSchedule {
   status                String    @default("Pending")
   stripeSessionId       String?
   stripePaymentIntentId String?
-  paymentMethod         String?
+  paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"
+  referenceNumber       String? // check # / confirmation #
+  notes                 String? // free-form memo
+  receiptSentAt         DateTime? // last time admin sent the receipt email
   paidAt                DateTime?
   paymentDate           DateTime?
+
+  @@index([estimateId])
 }
 
 model EstimateItem {
@@ -311,11 +461,17 @@ model EstimateItem {
   costType      CostType?      @relation(fields: [costTypeId], references: [id])
   approvalStatus String?        // pending, approved, rejected
   approvalNote   String?
+  purchaseOrderId  String?
+  purchaseOrder    PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  budgetQuantity   Float?
+  budgetUnit       String?
+  budgetRate       Decimal?
   timeEntries    TimeEntry[]
-  scheduleTasks  ScheduleTask[]
+  scheduleTask   ScheduleTask?
   createdAt      DateTime       @default(now())
 
   @@index([estimateId])
+  @@index([purchaseOrderId])
 }
 
 model Expense {
@@ -351,8 +507,14 @@ model Invoice {
   project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
   clientId    String
   client      Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  // Estimate this invoice was generated from (signed-estimate → invoice link; idempotency for auto-invoicing)
+  estimateId  String?
+  estimate    Estimate? @relation(fields: [estimateId], references: [id], onDelete: SetNull)
   status      String    @default("Draft") // Draft, Issued, Paid, Overdue
   totalAmount Decimal     @default(0)
+  subtotal    Decimal     @default(0)  // pre-tax
+  taxRate     Decimal     @default(0)  // percent, e.g. 8.8
+  taxAmount   Decimal     @default(0)  // dollars
   balanceDue  Decimal     @default(0)
   notes       String?
   issueDate   DateTime?
@@ -364,6 +526,7 @@ model Invoice {
 
   @@index([projectId])
   @@index([createdAt])
+  @@index([estimateId])
 }
 
 model PaymentSchedule {
@@ -377,9 +540,29 @@ model PaymentSchedule {
   paymentDate           DateTime?
   stripeSessionId       String?
   stripePaymentIntentId String?
-  paymentMethod         String?
+  paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"; "quickbooks" via QB Payments
+  referenceNumber       String? // check # / confirmation #
+  notes                 String? // free-form memo
+  receiptSentAt         DateTime? // last time admin sent the receipt email
   paidAt                DateTime?
   createdAt             DateTime  @default(now())
+
+  // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
+  qbInvoiceId   String?
+  qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
+  qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
+  qbSyncedAt    DateTime?
+  qbInvoiceSentAt DateTime? // last time the QBO invoice email was sent to the client
+  qbSyncError   String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
+
+  // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
+  // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
+  sourceScheduleId String?
+
+  @@index([invoiceId])
+  @@index([stripePaymentIntentId])
+  @@index([qbInvoiceId])
+  @@index([sourceScheduleId])
 }
 
 model Budget {
@@ -460,8 +643,26 @@ model TimeEntry {
   editedByManagerId String?
   editedAt          DateTime?
 
+  // Mobile edit audit (gtr-probuild-mobile)
+  isEdited          Boolean   @default(false)
+  originalStartTime DateTime?
+  originalEndTime   DateTime?
+  editNotes         String?
+
+  // Geofence telemetry (gtr-probuild-mobile)
+  offsiteMs         Int       @default(0)
+  isOffsite         Boolean   @default(false)
+  lastLocationCheck DateTime?
+
+  // Invoice linkage — set when pulled into a cost-plus invoice
+  invoicedAt DateTime?
+
   @@index([projectId])
   @@index([userId])
+  @@index([costCodeId])
+  @@index([costTypeId])
+  @@index([estimateItemId])
+  @@index([scheduleTaskId])
 }
 
 model Contract {
@@ -470,7 +671,7 @@ model Contract {
   projectId String?
   project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
   leadId    String?
-  lead      Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  lead      Lead?    @relation(fields: [leadId], references: [id], onDelete: SetNull)
 
   title  String
   body   String // HTML string of the legal agreement (with merge fields resolved)
@@ -483,11 +684,28 @@ model Contract {
   approvedAt        DateTime?
   approvalIp        String?
   approvalUserAgent String?
-  signatureUrl      String? // PNG data URL of drawn signature
+  signatureUrl      String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
+
+  // Contractor signing fields
+  contractorSignedBy       String?
+  contractorSignedAt       DateTime?
+  contractorSignatureUrl   String? // Supabase Storage URL of the contractor's drawn signature (legacy rows may hold an inline data-URL)
+
+  // Company countersignature (executed AFTER the customer signs — see countersignContractAsCompany)
+  requiresCountersign Boolean   @default(false) // when true, contract isn't Finalized until the company countersigns
+  companySignedBy     String?
+  companySignedAt     DateTime?
+  companySignatureUrl String? // Supabase Storage URL of the company signature (NOT an inline data-URL)
+  signedPdfPath       String? // Supabase Storage path of the client-signed intermediate PDF (held until countersign)
+  originalPdfPath     String? // Supabase Storage path of the uploaded original PDF contract
 
   // Sending
   sentAt   DateTime?
   viewedAt DateTime?
+
+  // Portal access token — stable magic-link for client to view/sign the contract without a login.
+  // Generated on first send, preserved on resend so old email links keep working.
+  accessToken String? @unique
 
   // Recurring (e.g. lien release every 30 days)
   recurringDays  Int? // null = one-time, 30 = every 30 days
@@ -496,6 +714,9 @@ model Contract {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model ContractSigningRecord {
@@ -505,7 +726,7 @@ model ContractSigningRecord {
 
   signedBy     String // Full legal name
   signedAt     DateTime @default(now())
-  signatureUrl String? // PNG data URL of drawn signature
+  signatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
   ipAddress    String?
   userAgent    String?
 
@@ -515,6 +736,8 @@ model ContractSigningRecord {
   notes String? // Optional notes (e.g. payment amount)
 
   createdAt DateTime @default(now())
+
+  @@index([contractId])
 }
 
 model CompanySettings {
@@ -527,6 +750,9 @@ model CompanySettings {
   logoUrl             String?
   licenseNumber       String?
   notificationEmail   String? // Where to send View/Sign alerts
+  // Google Drive (work account) - lead media folders. Set via Settings > Integrations.
+  googleDriveRefreshToken String?
+  googleDriveEmail        String?
   projectStatuses     String? // JSON string array of custom statues [{label, value, color, dot}, ...]
   subcontractorTrades String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
   stripeEnabled       Boolean @default(false)
@@ -540,6 +766,10 @@ model CompanySettings {
   cardProcessingRate Decimal   @default(2.9)
   cardProcessingFlat Decimal   @default(0.30)
 
+  // Company overhead per month (rent, insurance, owner salary, vehicles, software…)
+  // Used by /reports/profitability to answer "are we profitable including overhead".
+  monthlyOverhead Decimal @default(0)
+
   // Calendar settings
   workDays      String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
   workdayStart  String? // e.g. "07:00"
@@ -547,6 +777,20 @@ model CompanySettings {
 
   // Sales taxes
   salesTaxes String? // JSON array: [{name, rate, isDefault}]
+
+  // Letterhead
+  letterheadMode         String?  @default("built_in") // 'built_in' | 'custom_image'
+  letterheadImageUrl     String?
+  letterheadLogoPosition String?  @default("left") // 'left' | 'center' | 'right'
+  letterheadFields       String?  @default("[\"name\",\"address\",\"phone\",\"email\",\"license\"]")
+  letterheadAccentColor  String?  @default("#4F46E5")
+  letterheadDivider      Boolean  @default(true)
+
+  // Notification event toggles
+  notificationToggles String? // JSON: {newLead, estimateViewed, estimateSigned, contractSigned, invoiceViewed, paymentReceived, messageReceived}
+
+  // Contract signing
+  requireContractCountersign Boolean @default(false) // default for a new contract's requiresCountersign
 
   updatedAt DateTime @updatedAt
 }
@@ -580,7 +824,7 @@ model ScheduleTask {
   order          Int            @default(0)
   status         String         @default("Not Started")
   type           String         @default("task") // "task" | "milestone"
-  estimateItemId String?
+  estimateItemId String?        @unique
   estimateItem   EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
@@ -597,6 +841,9 @@ model ScheduleTask {
   punchItems     TaskPunchItem[]
   assignments    TaskAssignment[]
   subAssignments SubTaskAssignment[]
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model TaskDependency {
@@ -619,6 +866,17 @@ model TaskComment {
   subcontractorName String?      // display name for sub-portal comments
   text              String
   createdAt         DateTime     @default(now())
+  photos            TaskCommentPhoto[]
+}
+
+model TaskCommentPhoto {
+  id        String      @id @default(cuid())
+  commentId String
+  comment   TaskComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  url       String
+  createdAt DateTime    @default(now())
+
+  @@index([commentId])
 }
 
 model TaskPunchItem {
@@ -693,18 +951,23 @@ model SubTaskAssignment {
 }
 
 model FileFolder {
-  id        String        @id @default(cuid())
-  name      String
-  projectId String?
-  project   Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  leadId    String?
-  lead      Lead?         @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  parentId  String?
-  parent    FileFolder?   @relation("FolderHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
-  children  FileFolder[]  @relation("FolderHierarchy")
-  files     ProjectFile[]
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
+  id         String        @id @default(cuid())
+  name       String
+  visibility String        @default("team") // "team" | "shared" | "financial"
+  projectId  String?
+  project    Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId     String?
+  lead       Lead?         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  parentId   String?
+  parent     FileFolder?   @relation("FolderHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children   FileFolder[]  @relation("FolderHierarchy")
+  files      ProjectFile[]
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
+  @@index([parentId])
 }
 
 model ProjectFile {
@@ -713,6 +976,7 @@ model ProjectFile {
   url          String
   size         Int         @default(0)
   mimeType     String      @default("application/octet-stream")
+  visibility   String?     // null = inherit from folder. Explicit: "team" | "shared" | "financial"
   projectId    String?
   project      Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   leadId       String?
@@ -722,6 +986,11 @@ model ProjectFile {
   uploadedById String?
   uploadedBy   User?       @relation(fields: [uploadedById], references: [id])
   createdAt    DateTime    @default(now())
+
+  @@index([projectId])
+  @@index([leadId])
+  @@index([folderId])
+  @@index([projectId, visibility])
 }
 
 model UserPermission {
@@ -741,7 +1010,7 @@ model UserPermission {
   estimates        Boolean @default(false)
   invoices         Boolean @default(false)
   contracts        Boolean @default(false)
-  floorPlans       Boolean @default(true)
+  roomDesigner     Boolean @default(true)
   changeOrders     Boolean @default(false)
   financialReports Boolean @default(false)
   timeClock        Boolean @default(true)
@@ -792,6 +1061,9 @@ model Takeoff {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([leadId])
 }
 
 model TakeoffFile {
@@ -803,11 +1075,14 @@ model TakeoffFile {
   mimeType  String   @default("application/octet-stream")
   size      Int      @default(0)
   createdAt DateTime @default(now())
+
+  @@index([takeoffId])
 }
 
 model EstimateTemplate {
   id        String                 @id @default(cuid())
   name      String
+  source    String                 @default("custom") // "standard" (seeded GTR library) | "custom" (saved in-app)
   items     EstimateTemplateItem[]
   createdAt DateTime               @default(now())
   updatedAt DateTime               @updatedAt
@@ -878,7 +1153,10 @@ model Message {
 
 model ClientMessage {
   id           String    @id @default(cuid())
-  // Belongs to either a Lead OR a Project (one must be set)
+  // Client-level FK for unified conversation view (all messages for one client)
+  clientId     String?
+  client       Client?   @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  // Entity context: which lead/project the message was sent from/threaded to
   leadId       String?
   lead         Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
   projectId    String?
@@ -898,6 +1176,11 @@ model ClientMessage {
   createdAt    DateTime  @default(now())
   readAt       DateTime? // Set when the recipient (team or client) reads the message
 
+  // Twilio MessageSid for inbound idempotency + outbound observability.
+  // Partial-unique index in DB: WHERE "twilioMessageSid" IS NOT NULL.
+  twilioMessageSid String? @unique
+
+  @@index([clientId])
   @@index([leadId])
   @@index([projectId])
   @@index([createdAt])
@@ -933,10 +1216,17 @@ model ChangeOrder {
   termsAndConditions String?
   memos              String?
 
-  clientSignatureUrl  String?
-  companySignatureUrl String?
+  // Customer approval (set by approveChangeOrder — portal/magic-link signer)
+  clientSignatureUrl  String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
   approvedBy          String?
   approvedAt          DateTime?
+
+  // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
+  // Separate fields so countersigning never overwrites the customer's approval/audit trail.
+  companySignatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
+  companySignedBy     String?
+  companySignedAt     DateTime?
+
   sentAt              DateTime?
   viewedAt            DateTime?
 
@@ -945,6 +1235,8 @@ model ChangeOrder {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
 }
 
 model ChangeOrderItem {
@@ -1052,9 +1344,13 @@ model PurchaseOrder {
   files    PurchaseOrderFile[]
   expenses Expense[]
   messages PurchaseOrderMessage[]
+  estimateItems EstimateItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([vendorId])
 }
 
 model PurchaseOrderMessage {
@@ -1103,6 +1399,8 @@ model PurchaseOrderItem {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([purchaseOrderId])
 }
 
 model SelectionBoard {
@@ -1114,6 +1412,8 @@ model SelectionBoard {
   categories SelectionCategory[]
   createdAt  DateTime            @default(now())
   updatedAt  DateTime            @updatedAt
+
+  @@index([projectId])
 }
 
 model SelectionCategory {
@@ -1148,6 +1448,8 @@ model MoodBoard {
   items     MoodBoardItem[]
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
+
+  @@index([projectId])
 }
 
 model MoodBoardItem {
@@ -1180,6 +1482,8 @@ model DailyLog {
   photos             DailyLogPhoto[]
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
+
+  @@index([projectId])
 }
 
 model DailyLogPhoto {
@@ -1208,6 +1512,9 @@ model Retainer {
   sentAt      DateTime?
   viewedAt    DateTime?
   createdAt   DateTime @default(now())
+
+  @@index([projectId])
+  @@index([clientId])
 }
 
 
@@ -1238,6 +1545,8 @@ model BidPackage {
   updatedAt   DateTime     @updatedAt
   scopes      BidScope[]
   invitations BidInvitation[]
+
+  @@index([projectId])
 }
 
 model BidScope {
@@ -1306,4 +1615,122 @@ model ChatMessage {
   conversation   ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([conversationId])
+}
+
+model TeamMessage {
+  id         String   @id @default(cuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  authorId   String?
+  author     User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  authorName String
+  body       String
+  createdAt  DateTime @default(now())
+
+  @@index([projectId, createdAt])
+}
+
+model ActivityLog {
+  id         String   @id @default(cuid())
+  projectId  String?
+  project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId     String?  // lead-stage events (estimate sent/viewed before conversion); no FK — log survives lead deletion
+  actorType  String   // "CLIENT", "TEAM", "SUBCONTRACTOR", "SYSTEM"
+  actorName  String
+  action     String   // "viewed_estimate", "signed_contract", "paid_invoice", "sent_message", "viewed_portal"
+  entityType String?  // "estimate", "invoice", "contract", "change_order", "message"
+  entityId   String?
+  entityName String?  // e.g. "Estimate #E-001"
+  metadata   String?  // JSON for extra data
+  createdAt  DateTime @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([entityType, entityId])
+  @@index([leadId, createdAt])
+}
+
+model Integration {
+  id        String   @id
+  settings  String
+  updatedAt DateTime @updatedAt
+}
+
+model StripeEvent {
+  id          String    @id
+  type        String
+  payload     String
+  status      String    @default("PENDING")
+  error       String?
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([status])
+}
+
+// ── Room Studio product library ──────────────────────────────────────────────
+// Org-wide custom finishes (real paint/cabinet/floor lines) and placeable
+// products (real SKUs mapped onto procedural builder meshes).
+
+model CatalogFinish {
+  id        String   @id @default(cuid())
+  kind      String // cabinet | paint | floor | counter | tile
+  name      String
+  hex       String
+  vendor    String?
+  sku       String?
+  priceNote String?
+  notes     String?
+  sourceUrl String?
+  createdAt DateTime @default(now())
+
+  @@index([kind])
+}
+
+model CatalogProduct {
+  id          String   @id @default(cuid())
+  name        String
+  vendor      String?
+  sku         String?
+  category    String // studio category key
+  mesh        String // procedural builder key
+  widthIn     Float
+  depthIn     Float
+  heightIn    Float
+  mount       String   @default("floor")
+  elevationIn Float?
+  price       Decimal?
+  finishes    Json?
+  sourceUrl   String?
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  @@index([category])
+}
+
+// Durable outbox for milestone-paid notifications. A row is enqueued INSIDE the
+// same transaction that settles a milestone, so it commits atomically with the
+// payment; a drainer (inline fast-path + cron backstop) then delivers the team
+// alert / client receipt / activity log exactly once. This closes the gap where a
+// crash between commit and the old inline notify would drop the notification.
+// No FK: scheduleId points at a PaymentSchedule (scheduleType "invoice") or an
+// EstimatePaymentSchedule ("estimate"). Not unique — an undo + re-pay is a new
+// event that must notify again.
+model PaymentNotification {
+  id                  String    @id @default(cuid())
+  scheduleId          String
+  scheduleType        String // "invoice" | "estimate"
+  kind                String    @default("milestone_paid")
+  status              String    @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
+  attempts            Int       @default(0)
+  lastError           String?
+  // Fencing token: set on each claim, required by the completion update. A worker whose
+  // lease expired (row re-claimed by another drainer) writes a stale token, so its late
+  // completion no-ops instead of overwriting the new owner's result. Prevents double-finish.
+  claimToken          String?
+  processingStartedAt DateTime?
+  createdAt           DateTime  @default(now())
+  processedAt         DateTime?
+
+  @@index([status])
+  @@index([scheduleId])
 }

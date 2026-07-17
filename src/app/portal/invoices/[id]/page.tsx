@@ -1,10 +1,121 @@
 import { getInvoiceForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import PortalInvoiceClient from "./PortalInvoiceClient";
 import Link from "next/link";
+import { prisma } from "@/lib/prisma";
+import { stripe } from "@/lib/stripe";
+import { toNum } from "@/lib/prisma-helpers";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-outbox";
 
-export default async function PortalInvoicePage({ params }: { params: Promise<{ id: string }> }) {
+// Fallback settlement for when the client lands back on the portal invoice page with a
+// Stripe session_id before the webhook has processed it. Mirrors the webhook's invoice
+// branch exactly: parent locked first, CLAIMED update (status not Paid, scoped to this
+// invoice), recompute after the lock, and — only when THIS call won the claim — the same
+// receipt/team-alert writer the webhook uses. The claim gate makes settlement + notification
+// AT MOST ONCE across the two Stripe paths (whichever loses the claim stays silent), so no
+// second lifecycle writer is introduced and no sibling payment's balance update is lost.
+// (Guaranteed *delivery* — surviving a crash between commit and email — needs the durable
+// outbox tracked as the deferred robustness item; the claim only prevents double sends.)
+async function verifyStripeSession(sessionId: string, invoiceId: string): Promise<void> {
+    try {
+        const existing = await prisma.paymentSchedule.findFirst({
+            where: { stripeSessionId: sessionId, status: "Paid" },
+        });
+        if (existing) return;
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        if (session.payment_status !== "paid") return;
+
+        const metadata = session.metadata;
+        if (!metadata?.paymentScheduleId || !metadata?.invoiceId) return;
+
+        // Ownership check: ensure this Stripe session belongs to the invoice being viewed
+        if (metadata.invoiceId !== invoiceId) return;
+
+        const scheduleId = metadata.paymentScheduleId;
+
+        let paymentMethod = "card";
+        if (session.payment_intent) {
+            try {
+                const pi = await stripe.paymentIntents.retrieve(session.payment_intent as string);
+                const pmType = pi.payment_method_types?.[0];
+                if (pmType === "us_bank_account") paymentMethod = "ach";
+                else if (pmType) paymentMethod = pmType;
+            } catch {}
+        }
+
+        const result = await withTxRetry(() => prisma.$transaction(async (t) => {
+            await lockMoneyParents(t, { invoiceId });
+            const claim = await t.paymentSchedule.updateMany({
+                where: { id: scheduleId, invoiceId, status: { not: "Paid" } },
+                data: {
+                    status: "Paid",
+                    stripeSessionId: sessionId,
+                    stripePaymentIntentId: session.payment_intent as string | null,
+                    paymentMethod,
+                    paymentDate: new Date(),
+                    paidAt: new Date(),
+                },
+            });
+            const won = claim.count > 0;
+            const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
+            if (!invoice) return { won: false };
+            const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
+            const totalPaid = allSchedules
+                .filter(s => s.status === "Paid")
+                .reduce((sum, s) => sum + toNum(s.amount), 0);
+            const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+            const newStatus = newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status;
+            await t.invoice.update({
+                where: { id: invoice.id },
+                data: { balanceDue: newBalance, status: newStatus },
+            });
+            // Durable notification enqueued in-tx; delivered by the drainer below (single
+            // canonical writer, exactly-once with the webhook via the outbox + settle claim).
+            if (won) {
+                await enqueueMilestonePaid(t, { scheduleId, scheduleType: "invoice" });
+            }
+            return { won };
+        }));
+
+        if (result.won) {
+            await drainPaymentNotifications({ scheduleId }).catch(() => {});
+        }
+    } catch (e) {
+        console.error("verifyStripeSession error:", e);
+    }
+}
+
+export default async function PortalInvoicePage({
+    params,
+    searchParams,
+}: {
+    params: Promise<{ id: string }>;
+    searchParams: Promise<{ payment?: string; session_id?: string }>;
+}) {
     const resolvedParams = await params;
+    const resolvedSearch = await searchParams;
+
+    // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
+    const isNumeric = (str: string) => /^\d+$/.test(str);
+    if (isNumeric(resolvedParams.id)) {
+        const inv = await prisma.invoice.findFirst({
+            where: { number: parseInt(resolvedParams.id, 10) },
+            select: { id: true }
+        });
+        if (inv) {
+            const queryParams = resolvedSearch.session_id ? `?session_id=${resolvedSearch.session_id}` : '';
+            redirect(`/portal/invoices/${inv.id}${queryParams}`);
+        } else {
+            return notFound();
+        }
+    }
+
+    if (resolvedSearch.session_id) {
+        await verifyStripeSession(resolvedSearch.session_id, resolvedParams.id);
+    }
+
     const invoice = await getInvoiceForPortal(resolvedParams.id);
     const settings = await getCompanySettings();
 
@@ -31,5 +142,11 @@ export default async function PortalInvoicePage({ params }: { params: Promise<{ 
         }
     }
 
-    return <PortalInvoiceClient initialInvoice={invoice} companySettings={settings} />;
+    return (
+        <PortalInvoiceClient
+            initialInvoice={invoice}
+            companySettings={settings}
+            paymentSuccess={resolvedSearch.payment === "success"}
+        />
+    );
 }

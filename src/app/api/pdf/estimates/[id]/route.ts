@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { generateEstimatePdf } from "@/lib/pdf";
 
+/**
+ * Redirects to the portal estimate page where the client can use the
+ * "Download PDF" button — which produces a portal-quality html-to-image PDF.
+ *
+ * Kept as a route for backward compatibility (e.g. any links that point here).
+ * The portal page handles both browser users and the capture-mode iframe.
+ */
 export async function GET(
     req: NextRequest,
     context: { params: Promise<{ id: string }> }
@@ -11,21 +17,6 @@ export async function GET(
         return NextResponse.json({ error: "Missing ID" }, { status: 400 });
     }
 
-    try {
-        const pdfBuffer = await generateEstimatePdf(id);
-        const inline = req.nextUrl.searchParams.get("inline") === "true";
-
-        return new NextResponse(pdfBuffer as any, {
-            status: 200,
-            headers: {
-                "Content-Type": "application/pdf",
-                "Content-Disposition": inline
-                    ? `inline; filename="Estimate_${id}.pdf"`
-                    : `attachment; filename="Estimate_${id}.pdf"`,
-            },
-        });
-    } catch (error) {
-        console.error("Estimate PDF Generation Error:", error);
-        return NextResponse.json({ error: "Failed to generate PDF" }, { status: 500 });
-    }
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || `${req.nextUrl.protocol}//${req.nextUrl.host}`;
+    return NextResponse.redirect(`${baseUrl}/portal/estimates/${id}`, { status: 302 });
 }

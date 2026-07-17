@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useState, useTransition, useEffect } from "react";
 import SubcontractorInviteForm from "./SubcontractorInviteForm";
-import { toggleSubcontractorProjectAccess, resendSubcontractorInvite } from "@/lib/subcontractor-actions";
+import { toggleSubcontractorProjectAccess, resendSubcontractorInvite, getProjectSubcontractors } from "@/lib/subcontractor-actions";
 import Link from "next/link";
 
 type SubcontractorItem = {
@@ -15,18 +15,34 @@ type SubcontractorItem = {
 
 export default function SubcontractorAssignmentModal({
     projectId,
-    initialSubcontractors,
     onClose,
 }: {
     projectId: string;
-    initialSubcontractors: SubcontractorItem[];
     onClose: () => void;
 }) {
-    const [subs, setSubs] = useState<SubcontractorItem[]>(initialSubcontractors);
+    const [subs, setSubs] = useState<SubcontractorItem[]>([]);
+    const [loading, setLoading] = useState(true);
     const [searchQuery, setSearchQuery] = useState("");
     const [showInviteForm, setShowInviteForm] = useState(false);
     const [isPending, startTransition] = useTransition();
     const [resendingId, setResendingId] = useState<string | null>(null);
+
+    useEffect(() => {
+        let active = true;
+        async function fetchSubs() {
+            setLoading(true);
+            try {
+                const res = await getProjectSubcontractors(projectId);
+                if (active) setSubs(res as SubcontractorItem[]);
+            } catch (e) {
+                console.error("Failed to load subcontractors:", e);
+            } finally {
+                if (active) setLoading(false);
+            }
+        }
+        fetchSubs();
+        return () => { active = false; };
+    }, [projectId]);
 
     if (showInviteForm) {
         return (
@@ -102,7 +118,15 @@ export default function SubcontractorAssignmentModal({
 
                 {/* List */}
                 <div className="overflow-y-auto flex-1 p-2">
-                    {filtered.length === 0 ? (
+                    {loading ? (
+                        <div className="py-20 flex flex-col items-center justify-center gap-3">
+                            <svg className="animate-spin h-8 w-8 text-slate-800" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            <p className="text-xs font-semibold text-slate-500">Loading subcontractors...</p>
+                        </div>
+                    ) : filtered.length === 0 ? (
                         <div className="p-8 text-center text-muted-foreground">No subcontractors found.</div>
                     ) : (
                         <div className="divide-y divide-slate-50">

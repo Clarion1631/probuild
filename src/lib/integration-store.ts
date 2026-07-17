@@ -1,11 +1,10 @@
 /**
- * Integration settings storage via Supabase Storage.
- * Stores OAuth tokens and settings for QB, Gusto, etc. as a private JSON file.
- * Single-tenant: one file per workspace.
+ * Integration settings storage via an encrypted PostgreSQL table.
+ * Stores OAuth tokens and settings for QB, Gusto, etc. securely.
+ * Utilizes a Prisma transaction and AES-256-GCM encryption.
  */
-import { getSupabase, STORAGE_BUCKET } from "./supabase";
-
-const SETTINGS_PATH = "system/integration-settings.json";
+import { prisma } from "./prisma";
+import { encryptObject, decryptObject } from "./crypto";
 
 export interface QBSettings {
     connected: boolean;
@@ -13,7 +12,8 @@ export interface QBSettings {
     refreshToken?: string;
     realmId?: string;
     connectedAt?: string;
-    glMappings?: Record<string, string>; // costCodeId → QB GL account name
+    glMappings?: Record<string, string>; // costCodeId -> QB GL account name
+    serviceItemId?: string; // QBO "Construction Services" item used on pushed invoice lines
 }
 
 export interface GustoSettings {
@@ -22,7 +22,7 @@ export interface GustoSettings {
     refreshToken?: string;
     companyId?: string;
     connectedAt?: string;
-    employeeMappings?: Record<string, string>; // userId → gusto_employee_uuid
+    employeeMappings?: Record<string, string>; // userId -> gusto_employee_uuid
 }
 
 export interface IntegrationSettings {
@@ -30,24 +30,33 @@ export interface IntegrationSettings {
     gusto?: GustoSettings;
 }
 
+// Single row ID for storing all system integrations safely
+const INTEGRATION_ROW_ID = "system_settings";
+
 async function readSettings(): Promise<IntegrationSettings> {
-    const sb = getSupabase();
-    if (!sb) return {};
     try {
-        const { data, error } = await sb.storage.from(STORAGE_BUCKET).download(SETTINGS_PATH);
-        if (error || !data) return {};
-        const text = await data.text();
-        return JSON.parse(text) as IntegrationSettings;
-    } catch {
+        const row = await prisma.integration.findUnique({
+            where: { id: INTEGRATION_ROW_ID }
+        });
+        if (!row || !row.settings) return {};
+        return decryptObject(row.settings) as IntegrationSettings;
+    } catch (err) {
+        console.error("Error reading integration settings:", err);
         return {};
     }
 }
 
 async function writeSettings(settings: IntegrationSettings): Promise<void> {
-    const sb = getSupabase();
-    if (!sb) return;
-    const blob = new Blob([JSON.stringify(settings, null, 2)], { type: "application/json" });
-    await sb.storage.from(STORAGE_BUCKET).upload(SETTINGS_PATH, blob, { upsert: true });
+    const encrypted = encryptObject(settings);
+    try {
+        await prisma.integration.upsert({
+            where: { id: INTEGRATION_ROW_ID },
+            create: { id: INTEGRATION_ROW_ID, settings: encrypted },
+            update: { settings: encrypted }
+        });
+    } catch (err) {
+        console.error("Error writing integration settings:", err);
+    }
 }
 
 export async function getIntegrationSettings(): Promise<IntegrationSettings> {
@@ -59,10 +68,37 @@ export async function getQBSettings(): Promise<QBSettings> {
     return settings.quickbooks || { connected: false };
 }
 
+// Decrypt the stored blob, but never let an undecryptable row (e.g. written
+// under a rotated INTEGRATION key) brick all future saves — start fresh instead.
+// This exact failure blocked the first QuickBooks OAuth connect (Jun 2026).
+function decryptOrReset(ciphertext: string): IntegrationSettings {
+    try {
+        return decryptObject(ciphertext) as IntegrationSettings;
+    } catch (err) {
+        console.error("[integration-store] Existing settings undecryptable — resetting:", err);
+        return {};
+    }
+}
+
 export async function saveQBSettings(qb: Partial<QBSettings>): Promise<void> {
-    const settings = await readSettings();
-    settings.quickbooks = { ...(settings.quickbooks || { connected: false }), ...qb };
-    await writeSettings(settings);
+    // Safe transaction to prevent race conditions during concurrent token updates
+    await prisma.$transaction(async (tx) => {
+        const row = await tx.integration.findUnique({
+            where: { id: INTEGRATION_ROW_ID }
+        });
+        const settings: IntegrationSettings = row && row.settings
+            ? decryptOrReset(row.settings)
+            : {};
+
+        settings.quickbooks = { ...(settings.quickbooks || { connected: false }), ...qb };
+        const encrypted = encryptObject(settings);
+
+        await tx.integration.upsert({
+            where: { id: INTEGRATION_ROW_ID },
+            create: { id: INTEGRATION_ROW_ID, settings: encrypted },
+            update: { settings: encrypted }
+        });
+    });
 }
 
 export async function getGustoSettings(): Promise<GustoSettings> {
@@ -71,7 +107,22 @@ export async function getGustoSettings(): Promise<GustoSettings> {
 }
 
 export async function saveGustoSettings(gusto: Partial<GustoSettings>): Promise<void> {
-    const settings = await readSettings();
-    settings.gusto = { ...(settings.gusto || { connected: false }), ...gusto };
-    await writeSettings(settings);
+    // Safe transaction to prevent race conditions during concurrent token updates
+    await prisma.$transaction(async (tx) => {
+        const row = await tx.integration.findUnique({
+            where: { id: INTEGRATION_ROW_ID }
+        });
+        const settings: IntegrationSettings = row && row.settings
+            ? decryptOrReset(row.settings)
+            : {};
+
+        settings.gusto = { ...(settings.gusto || { connected: false }), ...gusto };
+        const encrypted = encryptObject(settings);
+        
+        await tx.integration.upsert({
+            where: { id: INTEGRATION_ROW_ID },
+            create: { id: INTEGRATION_ROW_ID, settings: encrypted },
+            update: { settings: encrypted }
+        });
+    });
 }

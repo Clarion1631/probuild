@@ -7,10 +7,11 @@ import { toast } from "sonner";
 interface MeetingPopoverProps {
     leadId: string;
     clientName: string;
-    variant?: "default" | "grid";
+    variant?: "default" | "grid" | "list";
+    onClose?: () => void;
 }
 
-export default function MeetingPopover({ leadId, clientName, variant = "default" }: MeetingPopoverProps) {
+export default function MeetingPopover({ leadId, clientName, variant = "default", onClose }: MeetingPopoverProps) {
     const [showPopover, setShowPopover] = useState(false);
     const [showScheduleModal, setShowScheduleModal] = useState(false);
     const popoverRef = useRef<HTMLDivElement>(null);
@@ -33,24 +34,27 @@ export default function MeetingPopover({ leadId, clientName, variant = "default"
             toast.info("Booking link: " + bookingLink);
         });
         setShowPopover(false);
+        onClose?.();
     };
 
     return (
         <div className="relative" ref={popoverRef}>
             <button
                 onClick={() => setShowPopover(!showPopover)}
-                className={`w-full flex flex-col items-center justify-center gap-1.5 transition-all text-slate-600 hover:text-slate-800 group ${
-                    variant === "grid" 
-                        ? "p-2 h-16 rounded border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
-                        : "p-2.5 rounded-lg border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
+                className={`w-full transition-all text-slate-600 hover:text-slate-800 group ${
+                    variant === "grid"
+                        ? "flex flex-col items-center justify-center gap-1.5 p-2 h-16 rounded border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
+                        : variant === "list"
+                        ? "flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-slate-50"
+                        : "flex flex-col items-center justify-center gap-1.5 p-2.5 rounded-lg border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
                 }`}
             >
                 <span className="text-slate-400 group-hover:text-slate-600 transition shrink-0">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <svg width={variant === "list" ? 15 : 18} height={variant === "list" ? 15 : 18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                         <rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>
                     </svg>
                 </span>
-                <span className="text-[10px] font-medium leading-tight text-center">Meeting</span>
+                <span className={variant === "list" ? "text-sm" : "text-[10px] font-medium leading-tight text-center"}>Meeting</span>
             </button>
 
             {/* Popover dropdown */}
@@ -72,7 +76,7 @@ export default function MeetingPopover({ leadId, clientName, variant = "default"
                         </div>
                     </button>
                     <button
-                        onClick={() => { setShowPopover(false); setShowScheduleModal(true); }}
+                        onClick={() => { setShowPopover(false); setShowScheduleModal(true); onClose?.(); }}
                         className="w-full text-left px-4 py-3.5 hover:bg-slate-50 transition flex items-start gap-3"
                     >
                         <span className="text-slate-500 mt-0.5">
