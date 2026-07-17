@@ -1,5 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
+import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
+import { sendChangeOrderToClientCore } from "../src/lib/billing-core";
 
 /**
  * Money-pipeline regression net — born from the June 2026 lifecycle audit.
@@ -445,5 +447,391 @@ test.describe.serial("Money pipeline: concurrent payments never lose a balance u
     expect(notes, "one outbox row per concurrent settle").toHaveLength(2);
     expect(notes.every((n) => n.scheduleType === "invoice")).toBe(true);
     expect(notes.every((n) => n.status === "PROCESSED"), "both delivered by the inline drain").toBe(true);
+  });
+});
+
+const COI = {
+  client: "co-invariant-e2e-client",
+  project: "co-invariant-e2e-project",
+  estimate: "co-invariant-e2e-estimate",
+  rawDraft: "co-invariant-raw-draft",
+  draftApproval: "co-invariant-draft-approval",
+  emptySent: "co-invariant-empty-sent",
+  zeroSent: "co-invariant-zero-sent",
+  validSent: "co-invariant-valid-sent",
+  approved: "co-invariant-approved",
+  race: "co-invariant-race",
+  duplicate: "co-invariant-duplicate",
+  duplicateItem: "co-invariant-duplicate-item",
+  stale: "co-invariant-stale",
+  staleItem: "co-invariant-stale-item",
+  driftSend: "co-invariant-drift-send",
+  driftSendItem: "co-invariant-drift-send-item",
+  driftApproval: "co-invariant-drift-approval",
+  driftApprovalItem: "co-invariant-drift-approval-item",
+  approvedDelete: "co-invariant-approved-delete",
+  unsigned: "co-invariant-unsigned",
+  companySigned: "co-invariant-company-signed",
+  companySignedItem: "co-invariant-company-signed-item",
+  noOpSent: "co-invariant-no-op-sent",
+  noOpSentItem: "co-invariant-no-op-sent-item",
+  legacySignedDraft: "co-invariant-legacy-signed-draft",
+};
+const coInvariantPrisma = new PrismaClient();
+
+async function rejectionMessage(operation: Promise<unknown>): Promise<string> {
+  try {
+    await operation;
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+test.describe.serial("Money pipeline: change-order lifecycle invariants", () => {
+  test.beforeAll(async () => {
+    await coInvariantPrisma.client.upsert({
+      where: { id: COI.client },
+      update: {},
+      create: { id: COI.client, name: "CO Invariant Client", initials: "CI" },
+    });
+    await coInvariantPrisma.project.upsert({
+      where: { id: COI.project },
+      update: {},
+      create: { id: COI.project, name: "CO Invariant Project", clientId: COI.client, status: "In Progress" },
+    });
+    await coInvariantPrisma.estimate.upsert({
+      where: { id: COI.estimate },
+      update: {},
+      create: {
+        id: COI.estimate,
+        title: "CO Invariant Estimate",
+        code: "EST-CO-INVARIANT",
+        projectId: COI.project,
+        status: "Approved",
+        taxExempt: true,
+        totalAmount: 1000,
+        balanceDue: 1000,
+      },
+    });
+
+    const ids = [
+      COI.rawDraft, COI.draftApproval, COI.emptySent, COI.zeroSent, COI.validSent,
+      COI.approved, COI.race, COI.duplicate, COI.stale, COI.driftSend,
+      COI.driftApproval, COI.approvedDelete, COI.unsigned, COI.companySigned,
+      COI.noOpSent, COI.legacySignedDraft,
+    ];
+    await coInvariantPrisma.changeOrder.deleteMany({ where: { id: { in: ids } } });
+
+    async function createChangeOrder(id: string, status: string, totalAmount: number, withItem: boolean, itemId?: string) {
+      await coInvariantPrisma.changeOrder.create({
+        data: {
+          id,
+          code: `CO-${id}`,
+          title: `Title ${id}`,
+          description: `Description ${id}`,
+          projectId: COI.project,
+          estimateId: COI.estimate,
+          status,
+          totalAmount,
+          balanceDue: totalAmount,
+          ...(status === "Sent" ? { sentAt: new Date("2026-07-17T12:00:00.000Z") } : {}),
+          ...(withItem
+            ? {
+                items: {
+                  create: {
+                    ...(itemId ? { id: itemId } : {}),
+                    name: "Invariant item",
+                    quantity: 1,
+                    unitCost: totalAmount,
+                    total: totalAmount,
+                    order: 0,
+                  },
+                },
+              }
+            : {}),
+        },
+      });
+    }
+
+    await createChangeOrder(COI.rawDraft, "Draft", 100, true);
+    await createChangeOrder(COI.draftApproval, "Draft", 100, true);
+    await createChangeOrder(COI.emptySent, "Sent", 100, false);
+    await createChangeOrder(COI.zeroSent, "Sent", 0, true);
+    await createChangeOrder(COI.validSent, "Sent", 100, true);
+    await createChangeOrder(COI.approved, "Approved", 100, true);
+    await createChangeOrder(COI.race, "Sent", 100, true);
+    await createChangeOrder(COI.duplicate, "Draft", 100, true, COI.duplicateItem);
+    await createChangeOrder(COI.stale, "Sent", 100, true, COI.staleItem);
+    await createChangeOrder(COI.driftSend, "Sent", 110, true, COI.driftSendItem);
+    await createChangeOrder(COI.driftApproval, "Sent", 110, true, COI.driftApprovalItem);
+    await createChangeOrder(COI.approvedDelete, "Approved", 100, true);
+    await createChangeOrder(COI.unsigned, "Sent", 100, true);
+    await createChangeOrder(COI.companySigned, "Sent", 100, true, COI.companySignedItem);
+    await createChangeOrder(COI.noOpSent, "Sent", 100, true, COI.noOpSentItem);
+    await createChangeOrder(COI.legacySignedDraft, "Draft", 100, true);
+    await coInvariantPrisma.changeOrderItem.updateMany({
+      where: { id: { in: [COI.driftSendItem, COI.driftApprovalItem] } },
+      data: { unitCost: 100, total: 100 },
+    });
+    await coInvariantPrisma.changeOrder.update({
+      where: { id: COI.companySigned },
+      data: { companySignedBy: "Company Signer", companySignedAt: new Date(), companySignatureUrl: "data:image/png;base64,AA==" },
+    });
+    await coInvariantPrisma.changeOrder.update({
+      where: { id: COI.legacySignedDraft },
+      data: { companySignedBy: "Legacy Company Signer", companySignedAt: new Date(), companySignatureUrl: "data:image/png;base64,AA==" },
+    });
+  });
+
+  test.afterAll(async () => {
+    try {
+      await coInvariantPrisma.changeOrder.deleteMany({ where: { projectId: COI.project } });
+      await coInvariantPrisma.estimate.deleteMany({ where: { id: COI.estimate } });
+      await coInvariantPrisma.project.deleteMany({ where: { id: COI.project } });
+      await coInvariantPrisma.client.deleteMany({ where: { id: COI.client } });
+    } finally {
+      await coInvariantPrisma.$disconnect();
+    }
+  });
+
+  test("CO1: generic updates cannot perform Draft -> Sent", async () => {
+    const message = await rejectionMessage(updateChangeOrderCore(COI.rawDraft, { status: "Sent" }));
+    expect(message).toContain("Send for Approval");
+    const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.rawDraft } });
+    expect(co.status).toBe("Draft");
+    expect(co.sentAt).toBeNull();
+  });
+
+  test("CO2: approval requires the Sent state", async () => {
+    const message = await rejectionMessage(approveChangeOrderCore(COI.draftApproval, {
+      signatureName: "Invariant Signer",
+      clientSignatureUrl: "data:image/png;base64,AA==",
+      approvedAt: new Date(),
+    }));
+    expect(message).toContain("must be Sent");
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.draftApproval } })).status).toBe("Draft");
+  });
+
+  test("CO3: approval requires at least one item", async () => {
+    const message = await rejectionMessage(approveChangeOrderCore(COI.emptySent, {
+      signatureName: "Invariant Signer",
+      clientSignatureUrl: "data:image/png;base64,AA==",
+      approvedAt: new Date(),
+    }));
+    expect(message).toContain("priced item");
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.emptySent } })).status).toBe("Sent");
+  });
+
+  test("CO4: approval requires a positive subtotal", async () => {
+    const message = await rejectionMessage(approveChangeOrderCore(COI.zeroSent, {
+      signatureName: "Invariant Signer",
+      clientSignatureUrl: "data:image/png;base64,AA==",
+      approvedAt: new Date(),
+    }));
+    expect(message).toContain("positive subtotal");
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.zeroSent } })).status).toBe("Sent");
+  });
+
+  test("CO5: a valid Sent change order approves exactly once", async () => {
+    const attempts = await Promise.allSettled([
+      approveChangeOrderCore(COI.validSent, {
+        signatureName: "First Signer",
+        clientSignatureUrl: "data:image/png;base64,AA==",
+        approvedAt: new Date(),
+      }),
+      approveChangeOrderCore(COI.validSent, {
+        signatureName: "Second Signer",
+        clientSignatureUrl: "data:image/png;base64,AQ==",
+        approvedAt: new Date(),
+      }),
+    ]);
+    expect(attempts.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(attempts.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const winner = attempts.find((result) => result.status === "fulfilled");
+    expect(winner?.status === "fulfilled" ? winner.value?.transitioned : false).toBe(true);
+
+    const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.validSent } });
+    expect(co.status).toBe("Approved");
+    expect(["First Signer", "Second Signer"]).toContain(co.approvedBy);
+  });
+
+  test("CO6: Approved scope metadata is immutable", async () => {
+    const original = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.approved },
+      include: { items: true },
+    });
+    const titleMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, { title: "Mutated signed title" }));
+    expect(titleMessage).toContain("signed scope is locked");
+    const descriptionMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, { description: "Mutated signed description" }));
+    expect(descriptionMessage).toContain("signed scope is locked");
+    const itemsMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, {
+      items: [{ id: original.items[0].id, name: "Mutated item", quantity: 2, unitCost: 100, order: 0 }],
+    }));
+    expect(itemsMessage).toContain("signed scope is locked");
+
+    const after = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.approved },
+      include: { items: true },
+    });
+    expect(after.title).toBe(original.title);
+    expect(after.description).toBe(original.description);
+    expect(after.items).toEqual(original.items);
+  });
+
+  test("CO7: approval validation serializes with a concurrent item repricing", async () => {
+    let releaseWriter!: () => void;
+    const writerMayCommit = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    let writerLocked!: () => void;
+    const writerHasLock = new Promise<void>((resolve) => { writerLocked = resolve; });
+
+    const writer = coInvariantPrisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "ChangeOrder" WHERE "id" = ${COI.race} FOR UPDATE`;
+      await tx.changeOrderItem.deleteMany({ where: { changeOrderId: COI.race } });
+      await tx.changeOrder.update({ where: { id: COI.race }, data: { totalAmount: 0, balanceDue: 0 } });
+      writerLocked();
+      await writerMayCommit;
+    }, { timeout: 15_000 });
+
+    await writerHasLock;
+    const approval = approveChangeOrderCore(COI.race, {
+      signatureName: "Racing Signer",
+      clientSignatureUrl: "data:image/png;base64,AA==",
+      approvedAt: new Date(),
+    });
+    try {
+      await expect.poll(async () => {
+        const rows = await coInvariantPrisma.$queryRaw<Array<{ count: number }>>`
+          SELECT COUNT(*)::int AS "count"
+          FROM pg_stat_activity
+          WHERE wait_event_type = 'Lock'
+            AND state = 'active'
+            AND query LIKE '%FROM "ChangeOrder"%FOR UPDATE%'`;
+        return rows[0]?.count ?? 0;
+      }, { timeout: 5_000, intervals: [25, 50, 100] }).toBeGreaterThan(0);
+    } finally {
+      releaseWriter();
+    }
+    await writer;
+
+    const message = await rejectionMessage(approval);
+    expect(message).toMatch(/priced item|positive subtotal/);
+    const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.race },
+      include: { items: true },
+    });
+    expect(co.status).toBe("Sent");
+    expect(co.items).toHaveLength(0);
+    expect(Number(co.totalAmount)).toBe(0);
+  });
+
+  test("CO8: duplicate item IDs cannot inflate the stored subtotal", async () => {
+    const message = await rejectionMessage(updateChangeOrderCore(COI.duplicate, {
+      items: [
+        { id: COI.duplicateItem, name: "Invariant item", quantity: 1, unitCost: 100, order: 0 },
+        { id: COI.duplicateItem, name: "Invariant item", quantity: 1, unitCost: 100, order: 1 },
+      ],
+    }));
+    expect(message).toContain("Duplicate change-order item ID");
+
+    const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.duplicate },
+      include: { items: true },
+    });
+    expect(co.items).toHaveLength(1);
+    expect(Number(co.items[0].total)).toBe(100);
+    expect(Number(co.totalAmount)).toBe(100);
+    expect(Number(co.balanceDue)).toBe(100);
+  });
+
+  test("CO9: editing Sent scope demotes it to Draft and invalidates a stale approval", async () => {
+    const updated = await updateChangeOrderCore(COI.stale, {
+      title: "Repriced after client render",
+      items: [{ id: COI.staleItem, name: "Invariant item", quantity: 1, unitCost: 200, order: 0 }],
+    });
+    expect(updated.status).toBe("Draft");
+    expect(updated.sentAt).toBeNull();
+    expect(Number(updated.totalAmount)).toBe(200);
+
+    const message = await rejectionMessage(approveChangeOrderCore(COI.stale, {
+      signatureName: "Stale-page Signer",
+      clientSignatureUrl: "data:image/png;base64,AA==",
+      approvedAt: new Date(),
+    }));
+    expect(message).toContain("must be Sent");
+  });
+
+  test("CO10: guarded send rejects stored subtotal drift from rendered items", async () => {
+    const result = await sendChangeOrderToClientCore(COI.driftSend);
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toContain("out of sync");
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.driftSend } })).status).toBe("Sent");
+  });
+
+  test("CO11: approval rejects stored subtotal drift from rendered items", async () => {
+    const message = await rejectionMessage(approveChangeOrderCore(COI.driftApproval, {
+      signatureName: "Drift Signer",
+      clientSignatureUrl: "data:image/png;base64,AA==",
+      approvedAt: new Date(),
+    }));
+    expect(message).toContain("out of sync");
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.driftApproval } })).status).toBe("Sent");
+  });
+
+  test("CO12: signed change orders cannot be deleted", async () => {
+    const message = await rejectionMessage(deleteChangeOrderCore(COI.approvedDelete));
+    expect(message).toContain("Only unsigned Draft change orders can be deleted");
+    expect(await coInvariantPrisma.changeOrder.findUnique({ where: { id: COI.approvedDelete } })).not.toBeNull();
+  });
+
+  test("CO13: approval requires a persisted client signature", async () => {
+    const message = await rejectionMessage(approveChangeOrderCore(COI.unsigned, {
+      signatureName: "Unsigned Signer",
+      clientSignatureUrl: null,
+      approvedAt: new Date(),
+    }));
+    expect(message).toContain("signature is required");
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.unsigned } })).status).toBe("Sent");
+  });
+
+  test("CO14: company-countersigned scope is immutable before client approval", async () => {
+    const message = await rejectionMessage(updateChangeOrderCore(COI.companySigned, {
+      items: [{ id: COI.companySignedItem, name: "Mutated after company signature", quantity: 1, unitCost: 200, order: 0 }],
+    }));
+    expect(message).toContain("signed scope is locked");
+    const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.companySigned } });
+    expect(co.status).toBe("Sent");
+    expect(Number(co.totalAmount)).toBe(100);
+  });
+
+  test("CO15: a no-op save preserves Sent status and its delivery timestamp", async () => {
+    const before = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.noOpSent },
+      include: { items: true },
+    });
+    const updated = await updateChangeOrderCore(COI.noOpSent, {
+      title: before.title,
+      description: before.description,
+      items: before.items.map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description,
+        type: item.type,
+        quantity: item.quantity,
+        unitCost: Number(item.unitCost),
+        order: item.order,
+        costCodeId: item.costCodeId,
+        costTypeId: item.costTypeId,
+      })),
+    });
+
+    expect(updated.status).toBe("Sent");
+    expect(updated.sentAt?.toISOString()).toBe(before.sentAt?.toISOString());
+  });
+
+  test("CO16: a legacy company-signed Draft cannot be deleted", async () => {
+    const message = await rejectionMessage(deleteChangeOrderCore(COI.legacySignedDraft));
+    expect(message).toContain("Only unsigned Draft change orders can be deleted");
+    expect(await coInvariantPrisma.changeOrder.findUnique({ where: { id: COI.legacySignedDraft } })).not.toBeNull();
   });
 });

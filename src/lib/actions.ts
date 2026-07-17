@@ -15,7 +15,8 @@ import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
-import { coLineCents } from "./co-tax";
+import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
@@ -7473,16 +7474,21 @@ export async function getChangeOrderForPortal(id: string) {
 
     // IDOR-4 fix: portal clients are gated by their session's clientId
     let clientFilter = {};
+    let lifecycleFilter = {};
     if (!isStaff) {
         const sessionClientId = await resolveSessionClientId();
         if (!sessionClientId) return null;
         clientFilter = { project: { clientId: sessionClientId } };
+        // Draft includes never-sent and invalidated-after-edit versions. A
+        // leaked/stale portal URL must not expose either to the client.
+        lifecycleFilter = { status: { in: ["Sent", "Approved", "Declined"] } };
     }
 
     return await prisma.changeOrder.findFirst({
         where: {
             id,
             ...clientFilter,
+            ...lifecycleFilter,
         },
         include: {
             project: { include: { client: true } },
@@ -7493,7 +7499,7 @@ export async function getChangeOrderForPortal(id: string) {
     });
 }
 
-export async function updateChangeOrder(id: string, data: any) {
+export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput) {
     "use server";
     // Money-path: this is a remotely invokable server action — gate it like
     // sendChangeOrderToClient and whitelist fields so callers can't write
@@ -7501,90 +7507,11 @@ export async function updateChangeOrder(id: string, data: any) {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "changeOrders")) throw new Error("Forbidden");
+    const target = await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!target) throw new Error("Change order not found");
+    if (!canAccessProject(user, target.projectId)) throw new Error("Forbidden");
 
-    const items: any[] | undefined = Array.isArray(data.items) ? data.items : undefined;
-
-    const co = await prisma.$transaction(async (tx) => {
-        // Row lock (same style as billChangeOrderCore): a concurrent approval or
-        // billing run serializes on this row, so we can't read a stale status and
-        // re-price a CO that gets approved mid-save — approve/bill writers block
-        // until this transaction commits, and vice versa.
-        const locked = await tx.$queryRaw<Array<{ status: string; totalAmount: unknown }>>`
-            SELECT "status", "totalAmount" FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
-        const current = locked[0];
-        if (!current) throw new Error("Change order not found");
-
-        const scalarData: Record<string, unknown> = {};
-        if (data.title !== undefined) scalarData.title = data.title;
-        if (data.description !== undefined) scalarData.description = data.description;
-        if (data.status !== undefined && data.status !== current.status) {
-            // The editor only moves Draft <-> Sent. Approved/Declined are owned by
-            // the signature/decline flows (approveChangeOrder drives billing) — a
-            // raw status write in either direction would bypass them.
-            if (!["Draft", "Sent"].includes(data.status) || !["Draft", "Sent"].includes(current.status)) {
-                throw new Error(`Status can only move between Draft and Sent here — "${current.status}" is owned by the signature flow.`);
-            }
-            scalarData.status = data.status;
-        }
-
-        if (items) {
-            // Integer-cents line math (mirrors createChangeOrderDraft) so float dust
-            // can't mis-round a line. totalAmount is the PRE-TAX subtotal — billing
-            // (billChangeOrderCore) adds the estimate's tax on top when invoicing —
-            // and is recomputed here from the items, never trusted from the client.
-            let totalCents = 0;
-            const rows = items.map((item: any, idx: number) => {
-                const quantity = parseFloat(item.quantity) || 0;
-                const unitCost = parseFloat(item.unitCost) || 0;
-                const unitCents = Math.round(unitCost * 100);
-                const lineCents = coLineCents(quantity, unitCost);
-                totalCents += lineCents;
-                return {
-                    id: item.id || undefined,
-                    name: item.name || "",
-                    description: item.description || null,
-                    ...(item.type ? { type: item.type } : {}),
-                    quantity,
-                    unitCost: unitCents / 100,
-                    total: lineCents / 100,
-                    order: item.order ?? idx,
-                    costCodeId: item.costCodeId || null,
-                    costTypeId: item.costTypeId || null,
-                };
-            });
-
-            // An Approved CO's items are what the customer signed and what billing
-            // put on the invoice — any item write here (amounts, quantities, cost
-            // codes) would desync the signed document from the billed milestone.
-            // Title/description edits stay allowed via the scalar path.
-            if (current.status === "Approved") {
-                throw new Error("This change order is approved and billed — its items are locked. Create a new change order for additional work.");
-            }
-
-            // Differential item sync (same pattern as saveEstimate): delete rows the
-            // editor removed, update surviving rows, create new ones.
-            const existing = await tx.changeOrderItem.findMany({ where: { changeOrderId: id }, select: { id: true } });
-            const existingIds = new Set(existing.map(i => i.id));
-            const incomingIds = new Set(rows.map(r => r.id).filter(Boolean));
-            const toDelete = existing.filter(i => !incomingIds.has(i.id)).map(i => i.id);
-            if (toDelete.length > 0) {
-                await tx.changeOrderItem.deleteMany({ where: { id: { in: toDelete }, changeOrderId: id } });
-            }
-            for (const row of rows) {
-                const { id: itemId, ...itemData } = row;
-                if (itemId && existingIds.has(itemId)) {
-                    await tx.changeOrderItem.update({ where: { id: itemId }, data: itemData });
-                } else {
-                    await tx.changeOrderItem.create({ data: { ...itemData, ...(itemId ? { id: itemId } : {}), changeOrderId: id } });
-                }
-            }
-
-            scalarData.totalAmount = totalCents / 100;
-            scalarData.balanceDue = totalCents / 100;
-        }
-
-        return tx.changeOrder.update({ where: { id }, data: scalarData });
-    }, { timeout: 15_000 });
+    const co = await updateChangeOrderCore(id, data);
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
@@ -7593,9 +7520,15 @@ export async function updateChangeOrder(id: string, data: any) {
 
 export async function deleteChangeOrder(id: string) {
     "use server";
-    const co = await prisma.changeOrder.findUnique({ where: { id } });
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "changeOrders")) throw new Error("Forbidden");
+    const target = await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!target) return;
+    if (!canAccessProject(user, target.projectId)) throw new Error("Forbidden");
+
+    const co = await deleteChangeOrderCore(id);
     if (!co) return;
-    await prisma.changeOrder.delete({ where: { id } });
     revalidatePath(`/projects/${co.projectId}/change-orders`);
 }
 
@@ -7626,32 +7559,28 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         if (!owned) return null;
     }
 
+    const normalizedSignatureName = signatureName.trim();
+    if (!normalizedSignatureName) throw new Error("Your full legal name is required");
+    if (!signatureDataUrl) throw new Error("A drawn signature is required");
+
     // Move the signature image into Storage (avoids the PgBouncer pooler message-size
     // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
     const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
 
-    // Atomic transition: only the FIRST approval flips the status (a concurrent
-    // or repeated signing matches zero rows), which also preserves the original
-    // signer's audit trail instead of overwriting it.
+    // The core takes the same CO row lock as editing/sending/billing and enforces
+    // Sent + item existence + positive subtotal in that transaction before the
+    // one-time Approved write.
     const approvedAt = new Date();
-    const transition = await prisma.changeOrder.updateMany({
-        where: { id, status: { not: "Approved" } },
-        data: {
-            status: "Approved",
-            approvedBy: signatureName,
-            approvedAt,
-            clientSignatureUrl,
-        },
-    });
-    const co = await prisma.changeOrder.findUnique({ where: { id } });
-    if (!co) return null;
+    const approval = await approveChangeOrderCore(id, { signatureName: normalizedSignatureName, clientSignatureUrl, approvedAt });
+    if (!approval) return null;
+    const { co, transitioned } = approval;
 
     // Exactly-once post-approval automation: bill the CO onto the invoice and send
     // the payment link (the signature on the exact amount is the approval), with a
     // team notification either way. Scheduled AFTER the response so the customer's
     // signing screen never waits on QuickBooks; falls back to inline best-effort
     // outside a request context.
-    if (transition.count === 1) {
+    if (transitioned) {
         const runAutomation = async () => {
             try {
                 const { handleChangeOrderApproved } = await import("./billing-core");
@@ -7695,8 +7624,11 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
     }
 
     // Verify the change order exists (clear 404-style error) and grab projectId for revalidation.
-    const existing = await prisma.changeOrder.findUnique({ where: { id }, select: { id: true, projectId: true } });
+    const existing = await prisma.changeOrder.findUnique({ where: { id }, select: { id: true, projectId: true, status: true } });
     if (!existing) throw new Error("Change order not found");
+    if (existing.status !== "Sent" && existing.status !== "Approved") {
+        throw new Error("Change order must be Sent before it can be countersigned");
+    }
 
     // Move the signature image into Storage (avoids the PgBouncer pooler message-size
     // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
@@ -7705,7 +7637,7 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
     // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
     // so two concurrent requests can't both succeed (eliminates TOCTOU race).
     const result = await prisma.changeOrder.updateMany({
-        where: { id, companySignedAt: null },
+        where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
         data: {
             companySignedBy: signerName.trim(),
             companySignedAt: new Date(),
@@ -7727,6 +7659,9 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
     const user = await getCurrentUserWithPermissions();
     if (!user) return { success: false, error: "Unauthorized" };
     if (!hasPermission(user, "changeOrders")) return { success: false, error: "Forbidden" };
+    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+    if (!target) return { success: false, error: "Change order not found" };
+    if (!canAccessProject(user, target.projectId)) return { success: false, error: "Forbidden" };
     const { sendChangeOrderToClientCore } = await import("./billing-core");
     return sendChangeOrderToClientCore(changeOrderId);
 }
