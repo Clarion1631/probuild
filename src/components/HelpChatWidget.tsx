@@ -250,10 +250,10 @@ export default function HelpChatWidget({ userRole }: { userId?: string; userRole
                 <button onClick={() => { setTab("history"); setHistoryMode("archived"); }} className={`px-2 py-1 rounded ${tab === "history" ? "bg-white/30 font-medium" : ""}`}>History</button>
                 {effectiveIsAdmin && <button onClick={() => setTab("requests")} className={`px-2 py-1 rounded ${tab === "requests" ? "bg-white/30 font-medium" : ""}`}>Requests</button>}
               </div>
-              <button onClick={() => { setMessages([]); setConversationId(null); }} className="text-white/80 hover:text-white ml-1" title="New conversation">
+              <button onClick={() => { setMessages([]); setConversationId(null); }} className="text-white/80 hover:text-white ml-1" title="New conversation" aria-label="New conversation">
                 <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
               </button>
-              <button onClick={() => setOpen(false)} className="text-white/80 hover:text-white">
+              <button onClick={() => setOpen(false)} className="text-white/80 hover:text-white" aria-label="Close help chat">
                 <svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
               </button>
             </div>

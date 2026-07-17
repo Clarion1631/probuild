@@ -475,7 +475,7 @@ export default function ClientMessaging({
                                     return (
                                         <span key={email} className="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full flex items-center gap-1 border border-slate-200 shadow-sm">
                                             {tm ? tm.name : email}
-                                            <button type="button" onClick={(e) => { e.stopPropagation(); setCcEmails(prev => prev.filter(m => m !== email)); }} className="hover:text-red-500 ml-0.5">×</button>
+                                            <button type="button" aria-label="Remove email" onClick={(e) => { e.stopPropagation(); setCcEmails(prev => prev.filter(m => m !== email)); }} className="hover:text-red-500 ml-0.5">×</button>
                                         </span>
                                     );
                                 })}
