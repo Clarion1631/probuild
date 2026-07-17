@@ -11,6 +11,8 @@
  * QuickBooks, and the bank in sync, and keeps the sales-tax report truthful.
  */
 import { prisma } from "./prisma";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
 import {
@@ -176,7 +178,13 @@ async function markMilestonePaidFromQB(
     invoiceId: string,
     payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null }
 ): Promise<boolean> {
-    return prisma.$transaction(async (t) => {
+    return withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This settle mirrors onto the
+        // estimate copy, so read the estimate link (non-locking) and lock Estimate before Invoice,
+        // matching recordPayment/recordEstimatePayment so overlapping settles never invert order.
+        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+
         // INVARIANT: do NOT pin qbInvoiceId in this claim. A real QBO settlement must
         // win over a concurrent breakQBInvoiceLink (which nulls qbInvoiceId): pinning it
         // would drop a genuinely-received payment (the row would be excluded from the next
@@ -260,8 +268,10 @@ async function markMilestonePaidFromQB(
                 }
             }
         }
+        // Durable notification, enqueued in-tx (delivered by the drainer after commit).
+        await enqueueMilestonePaid(t, { scheduleId: paymentScheduleId, scheduleType: "invoice" });
         return true;
-    });
+    }));
 }
 
 /**
@@ -294,7 +304,18 @@ export async function reconcileMilestoneToQbo(
     if (newAmount <= 0) {
         return { ok: false, error: "QuickBooks shows a $0 total — the invoice may be voided or deleted. Re-push it before sending." };
     }
-    return prisma.$transaction(async (t) => {
+    return withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This reconcile moves the invoice
+        // amount and mirrors onto the estimate copy, so read the schedule's invoice + estimate
+        // links (non-locking) and lock Estimate before Invoice before touching either balance.
+        const linkRow = await t.paymentSchedule.findUnique({
+            where: { id: paymentScheduleId },
+            select: { invoiceId: true, invoice: { select: { estimateId: true } } },
+        });
+        if (linkRow) {
+            await lockMoneyParents(t, { estimateId: linkRow.invoice?.estimateId, invoiceId: linkRow.invoiceId });
+        }
+
         const schedule = await t.paymentSchedule.findUnique({ where: { id: paymentScheduleId } });
         if (!schedule) return { ok: false, error: "Milestone not found" };
         // Fast reject for an already-settled milestone — money already moved.
@@ -386,7 +407,7 @@ export async function reconcileMilestoneToQbo(
             }
         }
         return { ok: true, oldAmount, newAmount, invoiceId: schedule.invoiceId, estimateTouched };
-    });
+    }));
 }
 
 export interface QBPaymentSyncResult {
@@ -491,8 +512,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                 });
                 if (recorded) {
                     result.settled++;
-                    const { notifyMilestonePaid } = await import("./payment-notifications");
-                    await notifyMilestonePaid(schedule.id);
+                    await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => {});
                 }
             } else if (probe.balance < probe.total) {
                 result.partiallyPaid++;

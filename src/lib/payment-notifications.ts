@@ -95,7 +95,12 @@ function receiptBodyHtml(opts: {
  * Fetches fresh state by id (call AFTER the settle transaction commits, so
  * balanceDue is already recalculated). Never throws.
  */
-export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ success: boolean; id?: string } | void> {
+// Returns { ok } for the outbox drainer: ok=true when there was nothing to deliver or every
+// attempted send + the activity write succeeded (mark PROCESSED); ok=false when any of them
+// failed (retry). `dedupeKey` (the outbox row id) makes the activity-log dedupe per-settlement-
+// EVENT so an undo + re-pay of the same schedule still logs a second payment_received; direct
+// callers that omit it fall back to the scheduleId.
+export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { dedupeKey?: string }): Promise<{ ok: boolean }> {
     try {
         const s = await prisma.paymentSchedule.findUnique({
             where: { id: paymentScheduleId },
@@ -111,10 +116,13 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
                 },
             },
         });
-        if (!s?.invoice) return;
+        // Nothing to deliver (row gone / never became Paid) — don't retry forever.
+        if (!s?.invoice) return { ok: true };
         // Hard guard: side effects only for milestones that are actually Paid
         // (protects the maintenance test action and any future mis-call).
-        if (s.status !== "Paid") return;
+        if (s.status !== "Paid") return { ok: true };
+        let ok = true;
+        const dedupeKey = opts?.dedupeKey ?? s.id;
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyName = settings?.companyName || "Golden Touch Remodeling";
         const amount = formatCurrency(s.amount);
@@ -126,24 +134,39 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
             : "https://probuild.goldentouchremodeling.com/invoices";
 
         // 1. Activity feed (independent of notification toggles — the audit trail
-        //    must survive notifications being switched off)
-        await prisma.activityLog.create({
-            data: {
-                projectId: s.invoice.project?.id ?? null,
-                actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
-                actorName: s.paymentMethod === "quickbooks" ? "QuickBooks" : "Team",
-                action: "payment_received",
+        //    must survive notifications being switched off). Deduped by scheduleId so a
+        //    drainer retry (outbox crash-recovery) can't write a second payment_received.
+        const alreadyLogged = await prisma.activityLog.findFirst({
+            where: {
                 entityType: "invoice",
                 entityId: s.invoice.id,
-                entityName: `Invoice ${s.invoice.code}`,
-                metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined }),
+                action: "payment_received",
+                metadata: { contains: `"dedupeKey":"${dedupeKey}"` },
             },
-        }).catch(() => {});
+            select: { id: true },
+        });
+        if (!alreadyLogged) {
+            const logged = await prisma.activityLog.create({
+                data: {
+                    projectId: s.invoice.project?.id ?? null,
+                    actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
+                    actorName: s.paymentMethod === "quickbooks" ? "QuickBooks" : "Team",
+                    action: "payment_received",
+                    entityType: "invoice",
+                    entityId: s.invoice.id,
+                    entityName: `Invoice ${s.invoice.code}`,
+                    metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id, dedupeKey }),
+                },
+            }).then(() => true).catch(() => false);
+            // Bail out BEFORE the emails if the activity write failed: retrying the whole
+            // delivery would otherwise re-send the (un-guarded) team alert every attempt. On
+            // the retry the activity write is re-attempted first, then the emails go once.
+            if (!logged) return { ok: false };
+        }
 
         // 2. Team alert
-        let adminSend: { success: boolean; id?: string } | undefined;
         if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
-            adminSend = await sendNotification(
+            const adminSend = await sendNotification(
                 settings.notificationEmail,
                 `💰 Payment received — ${amount} · ${s.invoice.code}`,
                 `<div style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 0 auto; padding: 20px;">
@@ -162,12 +185,15 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
                     </div>
                 </div>`
             );
+            if (adminSend && !adminSend.success) ok = false;
         }
 
-        // 3. Client receipt (once per milestone — receiptSentAt is the guard)
+        // 3. Client receipt (once per milestone — receiptSentAt is the guard).
+        //    Stamp receiptSentAt ONLY when the send actually succeeded, so a failed
+        //    send stays retryable by the outbox drainer instead of being marked sent.
         if (s.invoice.client?.email && !s.receiptSentAt) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/invoices/${s.invoice.id}`;
-            await sendNotification(
+            const receiptSend = await sendNotification(
                 s.invoice.client.email,
                 `Payment Receipt — Invoice #${s.invoice.code}`,
                 receiptBodyHtml({
@@ -185,14 +211,136 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
                 undefined,
                 { fromName: companyName, replyTo: settings?.email ?? undefined }
             );
-            await prisma.paymentSchedule.update({
-                where: { id: s.id },
-                data: { receiptSentAt: new Date() },
-            }).catch(() => {});
+            if (receiptSend?.success) {
+                await prisma.paymentSchedule.update({
+                    where: { id: s.id },
+                    data: { receiptSentAt: new Date() },
+                }).catch(() => {});
+            } else {
+                ok = false;
+            }
         }
-        return adminSend;
+        return { ok };
     } catch (e) {
         console.error("[notifyMilestonePaid] failed:", e);
+        return { ok: false };
+    }
+}
+
+/**
+ * Canonical single-writer notification for a newly-paid ESTIMATE milestone (a deposit
+ * taken before an invoice exists). Mirror of notifyMilestonePaid: writes the activity
+ * feed (deduped by scheduleId), a team alert, and a client receipt (guarded by
+ * receiptSentAt, stamped only on a successful send) — all idempotent so the outbox
+ * drainer can safely retry. Never throws.
+ */
+export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { dedupeKey?: string }): Promise<{ ok: boolean }> {
+    try {
+        const s = await prisma.estimatePaymentSchedule.findUnique({
+            where: { id: scheduleId },
+            select: {
+                id: true, name: true, amount: true, status: true, paymentMethod: true, referenceNumber: true, receiptSentAt: true,
+                estimate: {
+                    select: {
+                        id: true, code: true, title: true, projectId: true, leadId: true, balanceDue: true,
+                        project: { select: { client: { select: { name: true, email: true } } } },
+                        lead: { select: { name: true, client: { select: { name: true, email: true } } } },
+                    },
+                },
+            },
+        });
+        if (!s?.estimate) return { ok: true };
+        if (s.status !== "Paid") return { ok: true };
+
+        const est = s.estimate;
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        const companyName = settings?.companyName || "Golden Touch Remodeling";
+        const newBalance = Number(est.balanceDue.toString());
+        const code = est.code || est.title || est.id;
+        const methodLabel = formatMethod(s.paymentMethod, s.referenceNumber);
+        let ok = true;
+        const dedupeKey = opts?.dedupeKey ?? s.id;
+
+        // 1. Activity feed (deduped by dedupeKey so a drainer retry can't double-log, while an
+        //    undo + re-pay — new outbox row, same scheduleId — still logs a fresh event)
+        const alreadyLogged = await prisma.activityLog.findFirst({
+            where: {
+                entityType: "estimate",
+                entityId: est.id,
+                action: "payment_received",
+                metadata: { contains: `"dedupeKey":"${dedupeKey}"` },
+            },
+            select: { id: true },
+        });
+        if (!alreadyLogged) {
+            const logged = await prisma.activityLog.create({
+                data: {
+                    projectId: est.projectId ?? null,
+                    leadId: est.leadId ?? null,
+                    actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
+                    actorName: s.paymentMethod === "quickbooks" ? "QuickBooks" : "Team",
+                    action: "payment_received",
+                    entityType: "estimate",
+                    entityId: est.id,
+                    entityName: `Estimate ${code}`,
+                    metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id, dedupeKey }),
+                },
+            }).then(() => true).catch(() => false);
+            // Bail out BEFORE the emails if the activity write failed (see notifyMilestonePaid).
+            if (!logged) return { ok: false };
+        }
+
+        // 2. Team alert
+        if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
+            const adminSend = await sendNotification(
+                settings.notificationEmail,
+                `Estimate Payment Received: ${s.name} — ${code}`,
+                `<div style="font-family: sans-serif; padding: 20px;">
+                    <h2>Estimate Payment Received! 🎉</h2>
+                    <p>A payment of <strong>${formatCurrency(s.amount)}</strong> was processed via ${methodLabel} for Estimate #${code}.</p>
+                    <p>Milestone: ${s.name}</p>
+                    <p>Remaining Estimate Balance: ${formatCurrency(newBalance)}</p>
+                </div>`
+            );
+            if (adminSend && !adminSend.success) ok = false;
+        }
+
+        // 3. Client receipt (once per milestone — receiptSentAt guard, stamped only on success)
+        const clientEmail = est.project?.client?.email || est.lead?.client?.email || null;
+        const clientName = est.project?.client?.name || est.lead?.client?.name || est.lead?.name || "";
+        if (clientEmail && !s.receiptSentAt) {
+            const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/estimates/${est.id}`;
+            const receiptSend = await sendNotification(
+                clientEmail,
+                `Payment Receipt — Estimate #${code}`,
+                receiptBodyHtml({
+                    invoiceLike: { code, kind: "estimate" },
+                    clientName,
+                    schedule: { name: s.name, amount: s.amount },
+                    method: s.paymentMethod,
+                    referenceNumber: s.referenceNumber,
+                    newBalance,
+                    portalUrl,
+                    companyName,
+                    phone: settings?.phone,
+                    email: settings?.email,
+                }),
+                undefined,
+                { fromName: companyName, replyTo: settings?.email ?? undefined }
+            );
+            if (receiptSend?.success) {
+                await prisma.estimatePaymentSchedule.update({
+                    where: { id: s.id },
+                    data: { receiptSentAt: new Date() },
+                }).catch(() => {});
+            } else {
+                ok = false;
+            }
+        }
+        return { ok };
+    } catch (e) {
+        console.error("[notifyEstimateMilestonePaid] failed:", e);
+        return { ok: false };
     }
 }
 

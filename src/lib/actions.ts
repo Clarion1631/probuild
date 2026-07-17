@@ -13,6 +13,8 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { coLineCents } from "./co-tax";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -2750,39 +2752,6 @@ export async function emailInvoiceCopyToMe(
     return { success: true, sentTo: user.email };
 }
 
-// Money-path transactions (saveEstimate, recordEstimatePayment, recordInvoicePayment) all lock
-// the Estimate/Invoice row before their child schedule rows so concurrent calls order locks
-// consistently. Postgres can still abort one side of a residual inversion with a deadlock (40P01)
-// or a serialization failure (40001); Prisma surfaces write conflicts as P2034. In every one of
-// those cases the transaction rolled back cleanly, so re-running the whole thing against fresh
-// state is safe. This retry turns an otherwise-unrecoverable deadlock into a transparent retry.
-function isRetryableTxError(e: any): boolean {
-    // P2034: Prisma's documented write-conflict / deadlock transaction error.
-    // P2028: interactive-transaction timeout — a payment can hit this while waiting on the
-    //   Estimate row lock a large saveEstimate holds; the tx rolled back, so re-running is safe.
-    if (e?.code === "P2034" || e?.code === "P2028") return true;
-    // A deadlock on the `SELECT ... FOR UPDATE` itself comes back as a P2010 raw-query error
-    // carrying the underlying Postgres code (40P01 deadlock / 40001 serialization) in meta.code.
-    const pg = e?.meta?.code;
-    if (pg === "40P01" || pg === "40001") return true;
-    return /deadlock detected|could not serialize|40P01|40001/i.test(String(e?.message ?? ""));
-}
-
-async function withTxRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
-    let lastErr: any;
-    for (let i = 0; i < attempts; i++) {
-        try {
-            return await fn();
-        } catch (e: any) {
-            lastErr = e;
-            if (!isRetryableTxError(e) || i === attempts - 1) throw e;
-            // Backoff with jitter so two contenders don't immediately re-collide in lockstep.
-            await new Promise((r) => setTimeout(r, 25 * (i + 1) + Math.floor(Math.random() * 25)));
-        }
-    }
-    throw lastErr;
-}
-
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
@@ -2791,13 +2760,13 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // schema-drift fallback below the closure for why the retry has to happen at this level.
     const runSave = (safeOnly: boolean) => prisma.$transaction(async (tx) => {
         // Lock the Estimate row FIRST — before reading paid milestones — for two reasons:
-        //  (1) Consistent lock order (Estimate → schedules), shared with recordEstimatePayment,
-        //      so the two flows can't deadlock on inverse lock ordering.
+        //  (1) Canonical lock order (Estimate → Invoice → schedules), shared with the payment
+        //      flows, so no two money-path transactions can deadlock on inverse lock ordering.
         //  (2) Serializes the balance computation on the Estimate row. A concurrent payment
         //      either committed before we took this lock (so the paidSum read below reflects it)
         //      or is blocked until we commit (so it recomputes against our new totalAmount).
         //      Either way, no committed payment's balanceDue effect is silently overwritten.
-        await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
+        await lockMoneyParents(tx, { estimateId });
 
         // Preserve payment credits: subtract already-paid milestones from totalAmount.
         // Read AFTER the lock above so paidSum reflects committed-and-locked state, not a stale
@@ -3083,46 +3052,56 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
 
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
-    if (!estimate) throw new Error("Estimate not found");
+    // One transaction, estimate locked FIRST (canonical Estimate → Invoice order; this flow
+    // touches only the estimate). Without the lock two concurrent logs each read the same
+    // balanceDue and each write balanceDue − amount, losing one decrement. The lock serializes
+    // them so the second reads the already-decremented balance. withTxRetry recovers a deadlock.
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { estimateId });
+        const estimate = await tx.estimate.findUnique({ where: { id: estimateId } });
+        if (!estimate) throw new Error("Estimate not found");
 
-    const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
-    const scheduleCount = await prisma.estimatePaymentSchedule.count({ where: { estimateId } });
+        const refNum = data.referenceNumber || `PM-${String(estimate.number).padStart(5, "0")}`;
+        const scheduleCount = await tx.estimatePaymentSchedule.count({ where: { estimateId } });
 
-    const createdSchedule = await prisma.estimatePaymentSchedule.create({
-        data: {
-            estimateId,
-            name: `Payment — ${data.paymentMethod} (${refNum})`,
-            amount: data.amount,
-            dueDate: new Date(data.date),
-            order: scheduleCount,
-            status: "Paid",
-            paidAt: new Date(),
-            paymentDate: new Date(data.date),
-            paymentMethod: data.paymentMethod.toLowerCase(),
-            referenceNumber: refNum,
-        },
-    });
+        const createdSchedule = await tx.estimatePaymentSchedule.create({
+            data: {
+                estimateId,
+                name: `Payment — ${data.paymentMethod} (${refNum})`,
+                amount: data.amount,
+                dueDate: new Date(data.date),
+                order: scheduleCount,
+                status: "Paid",
+                paidAt: new Date(),
+                paymentDate: new Date(data.date),
+                paymentMethod: data.paymentMethod.toLowerCase(),
+                referenceNumber: refNum,
+            },
+        });
 
-    // Update balance — round to 2 decimal places to avoid floating-point drift
-    const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
-    const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
-    const isFirstPayment = !estimate.statusBeforePayment;
-    const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
+        // Update balance — round to 2 decimal places to avoid floating-point drift.
+        // Read from the locked estimate row above, so no concurrent decrement is lost.
+        const newBalance = Math.max(0, Math.round((Number(estimate.balanceDue) - data.amount) * 100) / 100);
+        const newStatus = newBalance === 0 ? "Paid" : "Partially Paid";
+        const isFirstPayment = !estimate.statusBeforePayment;
+        const statusBeforePayment = isFirstPayment ? estimate.status : estimate.statusBeforePayment;
 
-    await prisma.estimate.update({
-        where: { id: estimateId },
-        data: {
-            balanceDue: newBalance,
-            status: newStatus,
-            statusBeforePayment,
-        },
-    });
+        await tx.estimate.update({
+            where: { id: estimateId },
+            data: {
+                balanceDue: newBalance,
+                status: newStatus,
+                statusBeforePayment,
+            },
+        });
 
-    if (estimate.projectId) {
-        revalidatePath(`/projects/${estimate.projectId}/estimates/${estimateId}`);
+        return { createdSchedule, newStatus, newBalance, projectId: estimate.projectId };
+    }));
+
+    if (result.projectId) {
+        revalidatePath(`/projects/${result.projectId}/estimates/${estimateId}`);
     }
-    return { success: true, schedule: createdSchedule, newStatus, newBalance };
+    return { success: true, schedule: result.createdSchedule, newStatus: result.newStatus, newBalance: result.newBalance };
 }
 
 export async function archiveEstimate(estimateId: string) {
@@ -3464,11 +3443,18 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    // Wrapped in withTxRetry so a residual deadlock with saveEstimate/recordEstimatePayment
-    // (which lock the Estimate row before its estimate-side schedule copies, while this flow
-    // reaches the Estimate row last via the mirror) is detected by Postgres and transparently
-    // retried rather than surfacing as an unrecoverable error. See withTxRetry above.
     const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Two concurrent payments on
+        // DIFFERENT milestones of the SAME invoice each claim their own schedule row (no mutual
+        // block), so without a parent lock they both read a stale sibling set and overwrite each
+        // other's Invoice.balanceDue — one payment's balance effect is silently lost, and no
+        // deadlock fires to trigger a retry. Locking the parent(s) first serializes the recompute:
+        // the second call blocks until the first commits, then recomputes against fresh state.
+        // Read the estimate link (non-locking) so we can lock Estimate BEFORE Invoice, matching
+        // recordEstimatePayment's mirror order so the two flows never invert and deadlock.
+        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+
         const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3550,14 +3536,17 @@ export async function recordPayment(
             }
         }
 
+        // Durable notification: enqueue INSIDE the tx so it commits atomically with the
+        // settle — a crash before delivery can't drop the team alert / receipt / activity log.
+        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice" });
         return { success: true as const, projectId: invoice.projectId };
     }));
 
     if (!tx.success) return tx;
 
-    // Team alert + client receipt + activity entry (single canonical path).
-    const { notifyMilestonePaid } = await import("./payment-notifications");
-    await notifyMilestonePaid(paymentId);
+    // Inline fast-path delivery of the just-enqueued notification (single canonical writer,
+    // via the outbox). Best-effort — the cron backstop redelivers anything left pending.
+    await drainPaymentNotifications({ scheduleId: paymentId }).catch(() => {});
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -3739,11 +3728,19 @@ export async function recordEstimatePayment(
     }
 
     const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
-        // Lock the Estimate row FIRST so this flow orders locks the same way saveEstimate does
-        // (Estimate → schedules). Without it, saveEstimate (Estimate then schedules) and this
-        // flow (schedule then Estimate) invert their lock order and can deadlock. A missing row
-        // is fine — the existence check further down still returns "Estimate not found".
-        await t.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
+        // Canonical lock order: Estimate → Invoice → schedules. Lock the estimate first,
+        // then its (oldest) linked invoice if one exists, BEFORE any reads/writes below.
+        // This flow mirrors onto the invoice copy, so it must take the invoice lock in the
+        // same order recordPayment/the Stripe+QB settles do, or overlapping settles from both
+        // sides would deadlock on every collision (retry recovers, but the lock order avoids it).
+        await lockMoneyParents(t, { estimateId });
+        const lockInv = await t.invoice.findFirst({
+            where: { estimateId },
+            // id tiebreaker so the lock target == the mutation target below even on a createdAt tie.
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+            select: { id: true },
+        });
+        if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
 
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
@@ -3756,11 +3753,12 @@ export async function recordEstimatePayment(
         // several link back (manual re-invoicing); name+amount fallback only
         // fires when it matches exactly one candidate.
         let mirroredCopyId: string | null = null;
-        const linkedInvoice = await t.invoice.findFirst({
-            where: { estimateId },
-            orderBy: { createdAt: "asc" },
-            include: { payments: true },
-        });
+        // Fetch the SAME invoice we locked above by id — not a fresh findFirst — so the mirror
+        // mutates exactly the locked row even if a concurrent insert/delete/re-timestamp shifts
+        // which invoice is "oldest" between the two reads (READ COMMITTED).
+        const linkedInvoice = lockInv
+            ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+            : null;
         if (linkedInvoice) {
             const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId);
             const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
@@ -3833,54 +3831,28 @@ export async function recordEstimatePayment(
             },
         });
 
+        // Durable notification, enqueued in-tx. When the payment settled the mirrored INVOICE
+        // copy, notify the invoice side (matches the pre-outbox behavior); otherwise it's a
+        // pre-invoice estimate deposit, so notify the estimate side.
+        const notifyScheduleId = mirroredCopyId ?? paymentId;
+        await enqueueMilestonePaid(t, {
+            scheduleId: notifyScheduleId,
+            scheduleType: mirroredCopyId ? "invoice" : "estimate",
+        });
+
         return {
             success: true as const, projectId: estimate.projectId, leadId: estimate.leadId,
-            mirroredCopyId, paymentName: payment.name, newBalance,
+            mirroredCopyId, notifyScheduleId, paymentName: payment.name, newBalance,
             paymentAmount: input.amount != null ? input.amount : toNum(payment.amount),
         };
     }));
 
     if (!tx.success) return tx;
 
-    if (tx.mirroredCopyId) {
-        // Invoice copy settled — the canonical milestone-paid path covers team
-        // alert, client receipt, and the activity feed.
-        const { notifyMilestonePaid } = await import("./payment-notifications");
-        await notifyMilestonePaid(tx.mirroredCopyId);
-    } else {
-        // No invoice yet (pre-signing deposit): estimate-flavored emails + log.
-        const estimateFull = await prisma.estimate.findUnique({
-            where: { id: estimateId },
-            select: {
-                id: true, code: true, title: true, projectId: true, leadId: true,
-                project: { select: { client: { select: { name: true, email: true } } } },
-                lead: { select: { name: true, client: { select: { name: true, email: true } } } },
-            },
-        });
-        if (estimateFull) {
-            const { sendEstimatePaymentReceivedEmails } = await import("./payment-notifications");
-            await sendEstimatePaymentReceivedEmails({
-                estimate: { id: estimateFull.id, code: estimateFull.code || estimateFull.title || estimateId, project: estimateFull.project, lead: estimateFull.lead },
-                schedule: { id: paymentId, name: tx.paymentName, amount: tx.paymentAmount, referenceNumber },
-                method,
-                newBalance: tx.newBalance,
-                referenceNumber,
-            }).catch(() => {});
-            await logActivity({
-                projectId: estimateFull.projectId,
-                leadId: estimateFull.leadId,
-                actorType: "TEAM",
-                actorName: user.name || "Team",
-                action: "payment_received",
-                entityType: "estimate",
-                entityId: estimateId,
-                entityName: `Estimate ${estimateFull.code || estimateFull.title || ""}`.trim(),
-                // scheduleId lets the activity feed recognize this exact payment if
-                // the milestone is later copied onto an invoice (dedupe by identity).
-                metadata: { milestone: tx.paymentName, amount: tx.paymentAmount, scheduleId: paymentId, method, referenceNumber: referenceNumber || undefined },
-            });
-        }
-    }
+    // Inline fast-path delivery via the outbox's single canonical writer (notifyMilestonePaid
+    // for an invoice copy, notifyEstimateMilestonePaid for an estimate deposit — the latter
+    // now writes the payment_received activity entry the inline path used to log here).
+    await drainPaymentNotifications({ scheduleId: tx.notifyScheduleId }).catch(() => {});
 
     if (tx.projectId) {
         revalidatePath(`/projects/${tx.projectId}/estimates`);
@@ -3945,7 +3917,19 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This flow releases both the
+        // estimate milestone and its mirrored invoice copy, so lock the estimate first, then its
+        // (oldest) linked invoice, before recomputing either balance.
+        await lockMoneyParents(tx, { estimateId });
+        const lockInv = await tx.invoice.findFirst({
+            where: { estimateId },
+            // id tiebreaker so the lock target == the mutation target below even on a createdAt tie.
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+            select: { id: true },
+        });
+        if (lockInv) await lockMoneyParents(tx, { invoiceId: lockInv.id });
+
         const payment = await tx.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
         if (payment.status !== "Paid") return null;
@@ -3988,7 +3972,10 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         // Unwind the mirrored invoice copy too — a payment recorded on either
         // side settles both, so unrecording must release both. Oldest linked
         // invoice; name+amount fallback only when it matches exactly one row.
-        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, orderBy: { createdAt: "asc" }, include: { payments: true } });
+        // Fetch the SAME invoice we locked above by id (see recordEstimatePayment for rationale).
+        const linkedInvoice = lockInv
+            ? await tx.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+            : null;
         if (linkedInvoice) {
             const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid");
             const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
@@ -4017,7 +4004,7 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         }
 
         return { projectId: estimate.projectId, leadId: estimate.leadId };
-    });
+    }));
 
     if (!result) return { success: false };
 
@@ -4104,26 +4091,53 @@ export async function splitInvoiceMilestones(
         return { name, amount, dueDate: m.dueDate || null };
     });
 
-    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    if (!invoice) throw new Error("Invoice not found");
-
     const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
 
-    // Recalculate balanceDue: paid amount stays the same, only pending changes
-    const paidAmount = Math.round(
-        (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
-    ) / 100;
-    const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-    const newStatus =
-        newBalance <= 0 ? "Paid"
-        : invoice.status === "Draft" ? "Draft"
-        : invoice.status === "Overdue" ? "Overdue"
-        : "Issued";
+    // Interactive tx, invoice locked FIRST (canonical Estimate → Invoice order; this flow touches
+    // only the invoice). The paid portion is re-read from the LOCKED invoice, so a concurrent
+    // settle on a surviving Paid milestone can't leave paidAmount stale and get its balance
+    // overwritten. Arithmetic is otherwise unchanged from the original array-form transaction.
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) throw new Error("Invoice not found");
 
-    // Array-form transaction — atomic with pgbouncer, no interactive session needed
-    await prisma.$transaction([
-        prisma.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } }),
-        prisma.paymentSchedule.createMany({
+        // Refuse to re-split while a payment is in flight on a non-Paid milestone. The delete
+        // below drops every non-Paid schedule; if one has an open Stripe checkout or a sent
+        // QuickBooks invoice, a settlement landing afterward would find no row to claim and the
+        // customer would be charged with nothing to reconcile against. Checked under the invoice
+        // lock so a checkout/QB-send starting concurrently can't slip in after this guard.
+        const inFlight = await tx.paymentSchedule.findFirst({
+            where: {
+                invoiceId,
+                status: { not: "Paid" },
+                OR: [
+                    { stripeSessionId: { not: null } },
+                    { stripePaymentIntentId: { not: null } },
+                    { qbInvoiceId: { not: null } },
+                ],
+            },
+            select: { name: true },
+        });
+        if (inFlight) {
+            throw new Error(
+                `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
+            );
+        }
+
+        // Recalculate balanceDue: paid amount stays the same, only pending changes
+        const paidAmount = Math.round(
+            (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
+        ) / 100;
+        const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
+        const newStatus =
+            newBalance <= 0 ? "Paid"
+            : invoice.status === "Draft" ? "Draft"
+            : invoice.status === "Overdue" ? "Overdue"
+            : "Issued";
+
+        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
+        await tx.paymentSchedule.createMany({
             data: validated.map((m) => ({
                 invoiceId,
                 name: m.name,
@@ -4131,15 +4145,16 @@ export async function splitInvoiceMilestones(
                 status: "Pending",
                 dueDate: m.dueDate ? new Date(m.dueDate) : null,
             })),
-        }),
-        prisma.invoice.update({
+        });
+        await tx.invoice.update({
             where: { id: invoiceId },
             data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
-        }),
-    ]);
+        });
+        return invoice.projectId;
+    }));
 
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    revalidatePath(`/projects/${projectId}/invoices`);
+    revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
 
     return { success: true };
@@ -4148,9 +4163,18 @@ export async function splitInvoiceMilestones(
 export async function unrecordPayment(paymentId: string, invoiceId: string) {
     await assertInvoicePermission();
 
-    const projectId = await prisma.$transaction(async (tx) => {
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. This flow releases the invoice
+        // milestone and its mirrored estimate copy, so read the estimate link (non-locking), then
+        // lock Estimate before Invoice, before recomputing either balance.
+        const invLink = await tx.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(tx, { estimateId: invLink?.estimateId, invoiceId });
+
         const payment = await tx.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) throw new Error("Payment not found");
+        // Guard BEFORE mutating: a mismatched invoiceId would leave the payment's real
+        // parent stale and recompute the wrong (locked) invoice. Mirrors recordPayment.
+        if (payment.invoiceId !== invoiceId) throw new Error("Payment/invoice mismatch");
         if (payment.status !== "Paid") return null;
 
         await tx.paymentSchedule.update({
@@ -4232,7 +4256,7 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
         }
 
         return invoice.projectId;
-    });
+    }));
 
     if (!projectId) return { success: false };
 
