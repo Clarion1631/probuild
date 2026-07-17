@@ -2198,26 +2198,9 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     // DISPLAY adds the default rate on top while the stored total excludes it —
     // the client would see more than they get billed. Snapshot the default rate
     // and gross the totals (and pending milestones) up to match what was shown,
-    // exactly once, before any invoice is created from it.
-    const taxCheck = await prisma.estimate.findUnique({
-        where: { id: estimateId },
-        select: { taxRatePercent: true, taxExempt: true, totalAmount: true, balanceDue: true },
-    });
-    if (taxCheck && !taxCheck.taxExempt && taxCheck.taxRatePercent == null) {
-        const defaultRate = await getDefaultSalesTaxRate();
-        if (defaultRate > 0) {
-            const factor = 1 + defaultRate / 100;
-            await prisma.estimate.update({
-                where: { id: estimateId },
-                data: {
-                    taxRatePercent: defaultRate,
-                    totalAmount: Math.round(toNum(taxCheck.totalAmount) * factor * 100) / 100,
-                    balanceDue: Math.round(toNum(taxCheck.balanceDue) * factor * 100) / 100,
-                },
-            });
-            await prisma.$executeRaw`UPDATE "EstimatePaymentSchedule" SET amount = ROUND(amount * ${factor}::numeric, 2) WHERE "estimateId" = ${estimateId} AND status = 'Pending'`;
-        }
-    }
+    // exactly once, before any invoice is created from it. (createInvoiceFromEstimate
+    // also runs this, so direct invoicing paths get the same treatment.)
+    await ensureEstimateTaxSnapshot(estimateId);
 
     // 2) One invoice per signed estimate (idempotent on re-approval).
     let invoice = await prisma.invoice.findFirst({
@@ -3160,7 +3143,93 @@ async function getDefaultSalesTaxRate(): Promise<number> {
     }
 }
 
+// Snapshot the default tax rate onto a rate-less estimate and gross its totals up,
+// exactly once, so every billing path (approval AND direct invoicing) bills what the
+// portal displayed. Without this, createInvoiceFromEstimate treats the stored
+// tax-EXCLUSIVE total as tax-inclusive and extracts tax out of it, under-billing by
+// the tax amount. No-ops when the estimate is tax-exempt, already has a rate, no
+// default rate is configured, or no Pending milestone remains to carry the gross-up
+// (a fully-paid estimate keeps its pre-tax book so milestones keep summing to the total).
+async function ensureEstimateTaxSnapshot(estimateId: string): Promise<void> {
+    const probe = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { taxRatePercent: true, taxExempt: true },
+    });
+    if (!probe || probe.taxExempt || probe.taxRatePercent != null) return;
+    const defaultRate = await getDefaultSalesTaxRate();
+    if (defaultRate <= 0) return;
+    const factor = 1 + defaultRate / 100;
+
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate first, so a concurrent payment/settle can't read
+        // totals mid-gross-up. Re-check the rate under the lock — a racing approval may
+        // have snapshotted already, and this must apply exactly once.
+        await lockMoneyParents(tx, { estimateId });
+        const est = await tx.estimate.findUnique({
+            where: { id: estimateId },
+            select: { taxRatePercent: true, taxExempt: true, totalAmount: true },
+        });
+        if (!est || est.taxExempt || est.taxRatePercent != null) return;
+
+        const schedules = await tx.estimatePaymentSchedule.findMany({
+            where: { estimateId },
+            orderBy: { order: "asc" },
+            select: { id: true, amount: true, status: true },
+        });
+        const pending = schedules.filter(s => s.status === "Pending");
+        // Only Pending rows can absorb the gross-up — Paid ones are settled history.
+        // If milestones exist but none are Pending, leave the estimate on its pre-tax
+        // book rather than inflate the total past the sum of its milestones.
+        if (schedules.length > 0 && pending.length === 0) return;
+
+        const oldTotal = toNum(est.totalAmount);
+        const newTotal = Math.round(oldTotal * factor * 100) / 100;
+        const paidSum = schedules.filter(s => s.status === "Paid")
+            .reduce((sum, s) => sum + toNum(s.amount), 0);
+
+        if (pending.length > 0) {
+            // Distribute so all milestones sum EXACTLY to newTotal: pending rows scale
+            // proportionally onto (newTotal - untouched rows), rounded per row, and the
+            // LAST pending row absorbs the rounding residual — no more cent drift between
+            // the grossed total and the milestone sum.
+            const nonPendingSum = schedules.filter(s => s.status !== "Pending")
+                .reduce((sum, s) => sum + toNum(s.amount), 0);
+            const pendingTarget = Math.round((newTotal - nonPendingSum) * 100) / 100;
+            const oldPendingSum = pending.reduce((sum, s) => sum + toNum(s.amount), 0);
+            if (pendingTarget <= 0 || oldPendingSum <= 0) return;
+            let allocated = 0;
+            for (let i = 0; i < pending.length; i++) {
+                const isLast = i === pending.length - 1;
+                const amt = isLast
+                    ? Math.round((pendingTarget - allocated) * 100) / 100
+                    : Math.round(toNum(pending[i].amount) * (pendingTarget / oldPendingSum) * 100) / 100;
+                allocated = Math.round((allocated + amt) * 100) / 100;
+                await tx.estimatePaymentSchedule.update({
+                    where: { id: pending[i].id },
+                    data: { amount: amt },
+                });
+            }
+        }
+
+        await tx.estimate.update({
+            where: { id: estimateId },
+            data: {
+                taxRatePercent: defaultRate,
+                totalAmount: newTotal,
+                // Balance excludes what's already been paid — scaling the old balance by
+                // the factor would wrongly gross the already-paid portion too.
+                balanceDue: Math.max(0, Math.round((newTotal - paidSum) * 100) / 100),
+            },
+        });
+    }));
+}
+
 export async function createInvoiceFromEstimate(estimateId: string) {
+    // Bill what the client was shown: a rate-less estimate stores a tax-EXCLUSIVE
+    // total, and deriveInvoiceTaxFields below extracts tax OUT of the total it is
+    // given — so gross the estimate up first or the invoice under-bills by the tax.
+    await ensureEstimateTaxSnapshot(estimateId);
+
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
 
