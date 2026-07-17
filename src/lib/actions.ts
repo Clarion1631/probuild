@@ -2747,6 +2747,39 @@ export async function emailInvoiceCopyToMe(
     return { success: true, sentTo: user.email };
 }
 
+// Money-path transactions (saveEstimate, recordEstimatePayment, recordInvoicePayment) all lock
+// the Estimate/Invoice row before their child schedule rows so concurrent calls order locks
+// consistently. Postgres can still abort one side of a residual inversion with a deadlock (40P01)
+// or a serialization failure (40001); Prisma surfaces write conflicts as P2034. In every one of
+// those cases the transaction rolled back cleanly, so re-running the whole thing against fresh
+// state is safe. This retry turns an otherwise-unrecoverable deadlock into a transparent retry.
+function isRetryableTxError(e: any): boolean {
+    // P2034: Prisma's documented write-conflict / deadlock transaction error.
+    // P2028: interactive-transaction timeout — a payment can hit this while waiting on the
+    //   Estimate row lock a large saveEstimate holds; the tx rolled back, so re-running is safe.
+    if (e?.code === "P2034" || e?.code === "P2028") return true;
+    // A deadlock on the `SELECT ... FOR UPDATE` itself comes back as a P2010 raw-query error
+    // carrying the underlying Postgres code (40P01 deadlock / 40001 serialization) in meta.code.
+    const pg = e?.meta?.code;
+    if (pg === "40P01" || pg === "40001") return true;
+    return /deadlock detected|could not serialize|40P01|40001/i.test(String(e?.message ?? ""));
+}
+
+async function withTxRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+    let lastErr: any;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            return await fn();
+        } catch (e: any) {
+            lastErr = e;
+            if (!isRetryableTxError(e) || i === attempts - 1) throw e;
+            // Backoff with jitter so two contenders don't immediately re-collide in lockstep.
+            await new Promise((r) => setTimeout(r, 25 * (i + 1) + Math.floor(Math.random() * 25)));
+        }
+    }
+    throw lastErr;
+}
+
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
@@ -2754,7 +2787,18 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // safeOnly re-runs the whole transaction writing only the always-present columns — see the
     // schema-drift fallback below the closure for why the retry has to happen at this level.
     const runSave = (safeOnly: boolean) => prisma.$transaction(async (tx) => {
-        // Preserve payment credits: subtract already-paid milestones from totalAmount
+        // Lock the Estimate row FIRST — before reading paid milestones — for two reasons:
+        //  (1) Consistent lock order (Estimate → schedules), shared with recordEstimatePayment,
+        //      so the two flows can't deadlock on inverse lock ordering.
+        //  (2) Serializes the balance computation on the Estimate row. A concurrent payment
+        //      either committed before we took this lock (so the paidSum read below reflects it)
+        //      or is blocked until we commit (so it recomputes against our new totalAmount).
+        //      Either way, no committed payment's balanceDue effect is silently overwritten.
+        await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
+
+        // Preserve payment credits: subtract already-paid milestones from totalAmount.
+        // Read AFTER the lock above so paidSum reflects committed-and-locked state, not a stale
+        // snapshot taken before a racing payment committed.
         const paidMilestones = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId, status: "Paid" },
             select: { amount: true },
@@ -3015,10 +3059,10 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // Any other error (e.g. the linked-expense guard, deadlocks) propagates unchanged.
     let result;
     try {
-        result = await runSave(false);
+        result = await withTxRetry(() => runSave(false));
     } catch (e: any) {
         if (e?.code === "P2022") {
-            result = await runSave(true);
+            result = await withTxRetry(() => runSave(true));
         } else {
             throw e;
         }
@@ -3417,7 +3461,11 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await prisma.$transaction(async (t) => {
+    // Wrapped in withTxRetry so a residual deadlock with saveEstimate/recordEstimatePayment
+    // (which lock the Estimate row before its estimate-side schedule copies, while this flow
+    // reaches the Estimate row last via the mirror) is detected by Postgres and transparently
+    // retried rather than surfacing as an unrecoverable error. See withTxRetry above.
+    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
         const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3500,7 +3548,7 @@ export async function recordPayment(
         }
 
         return { success: true as const, projectId: invoice.projectId };
-    });
+    }));
 
     if (!tx.success) return tx;
 
@@ -3687,7 +3735,13 @@ export async function recordEstimatePayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await prisma.$transaction(async (t) => {
+    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
+        // Lock the Estimate row FIRST so this flow orders locks the same way saveEstimate does
+        // (Estimate → schedules). Without it, saveEstimate (Estimate then schedules) and this
+        // flow (schedule then Estimate) invert their lock order and can deadlock. A missing row
+        // is fine — the existence check further down still returns "Estimate not found".
+        await t.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
+
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3781,7 +3835,7 @@ export async function recordEstimatePayment(
             mirroredCopyId, paymentName: payment.name, newBalance,
             paymentAmount: input.amount != null ? input.amount : toNum(payment.amount),
         };
-    });
+    }));
 
     if (!tx.success) return tx;
 
