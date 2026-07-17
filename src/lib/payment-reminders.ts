@@ -29,7 +29,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const UPCOMING_WINDOW_DAYS = 3; // remind for milestones due within N calendar days...
 const MAX_OVERDUE_DAYS = 60; // ...through N calendar days overdue
 const THROTTLE_DAYS = 6; // at most ~1 reminder/week per milestone
-const BATCH_SIZE = 50; // per-run cap, oldest-due-first
+const BATCH_SIZE = 50; // per-run processing cap, oldest-due-first
+const SELECTION_WINDOW_SIZE = 200; // wider DB fetch so the paid-mirror filter (applied
+// before the cap — see below) doesn't starve the processing batch down below 50 real
+// candidates just because some of the first 50 DB rows happened to be paid mirrors.
 
 export type PaymentReminderResult = {
     scanned: number;
@@ -93,6 +96,17 @@ function reminderEmailHtml(opts: {
     </div>`;
 }
 
+/** Reverts a claim back to whatever lastReminderAt held before this run touched it — only
+ * if the row still holds the exact timestamp we claimed with (so a revert can never clobber
+ * a claim made by a different, later run). Used on send failure and on any unexpected throw
+ * after a successful claim. Never throws. */
+async function revertClaim(scheduleId: string, claimedAt: Date, priorLastReminderAt: Date | null): Promise<void> {
+    await prisma.paymentSchedule.updateMany({
+        where: { id: scheduleId, lastReminderAt: claimedAt },
+        data: { lastReminderAt: priorLastReminderAt },
+    }).catch(() => {});
+}
+
 /**
  * Daily sweep: email clients about payment-schedule milestones due soon or
  * recently overdue. Selection rules (see migrations/payment_reminders.sql for the
@@ -109,19 +123,28 @@ function reminderEmailHtml(opts: {
  *     reminder/week.
  * A milestone whose sourceScheduleId points to an already-Paid EstimatePaymentSchedule
  * is skipped defensively — the estimate side can settle without the invoice-side mirror
- * following (known writer gap, tracked separately).
+ * following (known writer gap, tracked separately). That check happens twice: once against
+ * a wider (200-row) candidate window BEFORE it's sliced down to the 50-row processing
+ * batch (so paid mirrors can't crowd out real candidates), and again against a freshly
+ * re-snapshotted paid set folded into each claim's atomic where clause (narrows, but per
+ * the claim comment below, doesn't fully close, the race with a mirror settling mid-run).
  *
  * Idempotent: each candidate is claimed with a conditional updateMany carrying the
  * FULL eligibility predicate before it's sent, so overlapping/retried runs can't
- * double-send (see the claim comment below). Each milestone is handled in its own
- * try/catch so one failure can't abort the run.
+ * double-send (see the claim comment below). All pre-send work that can throw — building
+ * the portal pay link, sending the email — happens after the claim, inside the same
+ * try/catch, so any failure (explicit or thrown) reverts the claim back to its prior
+ * value rather than leaking a throttle with nothing sent. Each milestone is handled in
+ * its own try/catch so one failure can't abort the run.
  *
- * dryRun (opts.dryRun, ?dryRun=1 on the route, or PAYMENT_REMINDERS_DRY_RUN=1) runs the
- * full selection and reports what would happen — no emails, no lastReminderAt writes.
- * Never throws.
+ * dryRun: PAYMENT_REMINDERS_DRY_RUN=1 always forces dry-run, regardless of opts.dryRun —
+ * it's the operational kill switch. Absent that env var, opts.dryRun (?dryRun=1 on the
+ * route) can turn dry-run on but never off. Dry-run runs the full selection and reports
+ * what would happen — no emails, no lastReminderAt writes. Never throws.
  */
 export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise<PaymentReminderResult> {
-    const dryRun = opts?.dryRun ?? process.env.PAYMENT_REMINDERS_DRY_RUN === "1";
+    const envForcesDryRun = process.env.PAYMENT_REMINDERS_DRY_RUN === "1";
+    const dryRun = envForcesDryRun || (opts?.dryRun ?? false);
     const result: PaymentReminderResult = { scanned: 0, sent: 0, skipped: 0, failed: 0, dryRun, errors: [] };
     try {
         const now = new Date();
@@ -134,19 +157,27 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
         // lastReminderAt <= now - 6 days (inclusive: a milestone reminded exactly 6 days
         // ago is eligible again today).
         const throttleCutoff = new Date(now.getTime() - THROTTLE_DAYS * DAY_MS);
+        const throttleOr: Prisma.PaymentScheduleWhereInput[] = [
+            { lastReminderAt: null },
+            { lastReminderAt: { lte: throttleCutoff } },
+        ];
+
+        const invoiceFilter: Prisma.InvoiceWhereInput = {
+            status: { in: CLIENT_VISIBLE_INVOICE_STATUSES },
+            project: { paymentRemindersEnabled: true },
+            client: { email: { not: null } },
+        };
 
         const eligibilityWhere: Prisma.PaymentScheduleWhereInput = {
             status: "Pending",
             dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
-            OR: [{ lastReminderAt: null }, { lastReminderAt: { lte: throttleCutoff } }],
-            invoice: {
-                status: { in: CLIENT_VISIBLE_INVOICE_STATUSES },
-                project: { paymentRemindersEnabled: true },
-                client: { email: { not: null } },
-            },
+            OR: throttleOr,
+            invoice: invoiceFilter,
         };
 
-        const candidates = await prisma.paymentSchedule.findMany({
+        // Wide window (see SELECTION_WINDOW_SIZE) — filtered for paid mirrors, THEN sliced
+        // to the processing cap, so the cap always holds up to 50 real candidates.
+        const wideCandidates = await prisma.paymentSchedule.findMany({
             where: eligibilityWhere,
             select: {
                 id: true,
@@ -155,6 +186,7 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 dueDate: true,
                 qbInvoiceLink: true,
                 sourceScheduleId: true,
+                lastReminderAt: true,
                 invoice: {
                     select: {
                         id: true,
@@ -165,30 +197,61 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 },
             },
             orderBy: [{ dueDate: "asc" }, { id: "asc" }], // deterministic across runs
-            take: BATCH_SIZE,
+            take: SELECTION_WINDOW_SIZE,
         });
 
-        result.scanned = candidates.length;
-        if (candidates.length === 0) return result;
+        if (wideCandidates.length === 0) return result;
 
-        // Mirror safety: batch-check which of this run's sourceScheduleIds already
-        // settled on the estimate side.
-        const sourceIds = candidates.map(c => c.sourceScheduleId).filter((id): id is string => !!id);
-        const paidSourceIds = sourceIds.length
+        // Mirror safety, selection-time snapshot: drop already-Paid-on-the-estimate-side
+        // mirrors BEFORE slicing to the processing cap.
+        const wideSourceIds = wideCandidates.map(c => c.sourceScheduleId).filter((id): id is string => !!id);
+        const paidAtSelection = wideSourceIds.length
             ? new Set(
                   (await prisma.estimatePaymentSchedule.findMany({
-                      where: { id: { in: sourceIds }, status: "Paid" },
+                      where: { id: { in: wideSourceIds }, status: "Paid" },
                       select: { id: true },
                   })).map(s => s.id)
               )
             : new Set<string>();
 
+        const eligible = wideCandidates.filter(c => !(c.sourceScheduleId && paidAtSelection.has(c.sourceScheduleId)));
+        const candidates = eligible.slice(0, BATCH_SIZE);
+
+        result.scanned = candidates.length;
+        if (candidates.length === 0) return result;
+
+        // Mirror safety, re-snapshotted immediately before the claim loop: the
+        // selection-time snapshot above can go stale between that fetch and the claim
+        // below (an estimate deposit can settle mid-run). This narrows, but — being
+        // snapshot-based, since there's no Prisma relation to join sourceScheduleId
+        // against EstimatePaymentSchedule directly — does NOT fully close that window;
+        // a settlement landing between THIS snapshot and an individual claim a few
+        // milliseconds later would still slip through. That residual gap only matters
+        // while the known invoice-mirror writer bugs exist (tracked separately); once
+        // those are fixed, estimate-side settlement can't happen without the invoice
+        // side following in the same transaction, and this whole check becomes moot.
+        const claimSourceIds = candidates.map(c => c.sourceScheduleId).filter((id): id is string => !!id);
+        const paidAtClaim = claimSourceIds.length
+            ? new Set(
+                  (await prisma.estimatePaymentSchedule.findMany({
+                      where: { id: { in: claimSourceIds }, status: "Paid" },
+                      select: { id: true },
+                  })).map(s => s.id)
+              )
+            : new Set<string>();
+        const mirrorOr: Prisma.PaymentScheduleWhereInput[] = [
+            { sourceScheduleId: null },
+            { sourceScheduleId: { notIn: Array.from(paidAtClaim) } },
+        ];
+
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyName = settings?.companyName || "Golden Touch Remodeling";
 
         for (const schedule of candidates) {
+            let claimedAt: Date | null = null;
+            const priorLastReminderAt = schedule.lastReminderAt;
             try {
-                if (schedule.sourceScheduleId && paidSourceIds.has(schedule.sourceScheduleId)) {
+                if (schedule.sourceScheduleId && paidAtClaim.has(schedule.sourceScheduleId)) {
                     result.skipped++;
                     continue;
                 }
@@ -209,37 +272,49 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 }
 
                 // Claim-before-send: an atomic conditional update using the FULL eligibility
-                // predicate (plus this row's id) as the where clause. Only the run that flips
-                // this row from eligible->claimed gets updateMany's count===1 and proceeds to
-                // send; a concurrent/overlapping run (or a retry racing the same minute) sees
-                // count===0 — lastReminderAt no longer satisfies the OR clause once claimed —
-                // and skips instead of double-sending. If the send itself then fails, the
-                // claim is reverted (matched by the exact claimed timestamp) so the next daily
-                // run can retry. The only gap this doesn't close is a crash between the claim
-                // and the send/revert: that suppresses one reminder for that milestone, and
-                // next week's run (throttle window) picks it back up — an acceptable tradeoff
-                // for never double-sending.
-                const claimedAt = new Date();
+                // predicate (status/dueDate window/throttle/invoice-visibility/mirror-safety,
+                // plus this row's id) as the where clause. Only the run that flips this row
+                // from eligible->claimed gets updateMany's count===1 and proceeds to send; a
+                // concurrent/overlapping run (or a retry racing the same minute) sees
+                // count===0 — lastReminderAt no longer satisfies the throttle OR clause once
+                // claimed, or the mirror OR clause now excludes it — and skips instead of
+                // double-sending. If anything from here on fails or throws, the claim is
+                // reverted to its prior value (captured above, may be null) so a future run
+                // can retry. The only gap this doesn't close is a crash between the claim and
+                // the revert/send: that suppresses one reminder for that milestone, and next
+                // week's run (throttle window) picks it back up — an acceptable tradeoff for
+                // never double-sending.
+                claimedAt = new Date();
                 const claim = await prisma.paymentSchedule.updateMany({
-                    where: { ...eligibilityWhere, id: schedule.id },
+                    where: {
+                        id: schedule.id,
+                        status: "Pending",
+                        dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
+                        invoice: invoiceFilter,
+                        AND: [{ OR: throttleOr }, { OR: mirrorOr }],
+                    },
                     data: { lastReminderAt: claimedAt },
                 });
                 if (claim.count !== 1) {
+                    claimedAt = null; // nothing was claimed — no revert needed
                     result.skipped++;
                     continue;
                 }
 
-                // Portal fallback link routes through the same one-click client-login helper
-                // every other outbound portal email uses (buildClientPortalUrl — see
-                // billing-core.ts's change-order emails), so a logged-out client doesn't just
-                // 404 on /portal/invoices/[id].
-                const { buildClientPortalUrl } = await import("./client-portal-auth");
-                const portalUrl = await buildClientPortalUrl(invoice.client?.id, clientEmail, `/portal/invoices/${invoice.id}`);
-                const payUrl = isHttpsUrl(schedule.qbInvoiceLink)
-                    ? schedule.qbInvoiceLink
-                    : isHttpsUrl(portalUrl)
-                      ? portalUrl
-                      : null;
+                // Pay link: prefer the QBO hosted pay page when it's already https, and only
+                // build (and pay the async cost of) the portal fallback link when we actually
+                // need it.
+                let payUrl: string | null = isHttpsUrl(schedule.qbInvoiceLink) ? schedule.qbInvoiceLink : null;
+                if (!payUrl) {
+                    // Routes through the same one-click client-login helper every other
+                    // outbound portal email uses (buildClientPortalUrl — see billing-core.ts's
+                    // change-order emails), so a logged-out client doesn't just 404 on
+                    // /portal/invoices/[id]. This (and anything else below) can throw — it's
+                    // inside the try so a throw here still reverts the claim above.
+                    const { buildClientPortalUrl } = await import("./client-portal-auth");
+                    const portalUrl = await buildClientPortalUrl(invoice.client?.id, clientEmail, `/portal/invoices/${invoice.id}`);
+                    payUrl = isHttpsUrl(portalUrl) ? portalUrl : null;
+                }
 
                 const send = await sendNotification(
                     clientEmail,
@@ -262,12 +337,7 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 if (!send.success) {
                     result.failed++;
                     result.errors.push(`schedule ${schedule.id}: send failed`);
-                    // Revert the claim (only if it's still exactly what we set) so a future
-                    // run can retry instead of silently throttling a reminder that never sent.
-                    await prisma.paymentSchedule.updateMany({
-                        where: { id: schedule.id, lastReminderAt: claimedAt },
-                        data: { lastReminderAt: null },
-                    }).catch(() => {});
+                    await revertClaim(schedule.id, claimedAt, priorLastReminderAt);
                     continue;
                 }
 
@@ -291,6 +361,9 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
             } catch (err: any) {
                 result.failed++;
                 result.errors.push(`schedule ${schedule.id}: ${err?.message || "unexpected error"}`);
+                if (claimedAt) {
+                    await revertClaim(schedule.id, claimedAt, priorLastReminderAt);
+                }
             }
         }
         return result;

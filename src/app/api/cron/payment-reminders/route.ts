@@ -11,8 +11,12 @@ export const maxDuration = 60;
  * milestone is claimed before it's sent, so overlapping/retried runs can't
  * double-send.
  *
- * ?dryRun=1 (or PAYMENT_REMINDERS_DRY_RUN=1) runs the full selection and
- * reports what would happen without sending any email or writing lastReminderAt.
+ * ?dryRun=1 runs the full selection and reports what would happen without sending any
+ * email or writing lastReminderAt. PAYMENT_REMINDERS_DRY_RUN=1 is the operational kill
+ * switch — it FORCES dry-run regardless of this query param (precedence is enforced in
+ * sendPaymentReminders, not here): when that env var is set, ?dryRun=0 cannot turn
+ * sending back on. Absent the env var, this query param can only turn dry-run on, never
+ * off — omitting it defaults to a real (non-dry) run.
  */
 export async function GET(request: Request) {
     // Any deployed environment (production or preview) requires the cron secret,
