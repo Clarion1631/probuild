@@ -26,6 +26,14 @@ type CostCodeSummary = {
 type SortKey = "code" | "budget" | "actual" | "variance" | "pct";
 type SortDir = "asc" | "desc";
 
+function num(value: unknown): number {
+    if (value === null || value === undefined) return 0;
+    const parsed = typeof value === "object" && "toNumber" in (value as Record<string, unknown>)
+        ? (value as { toNumber: () => number }).toNumber()
+        : Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
 const ChartBarIcon = () => (
     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z" />
@@ -81,7 +89,7 @@ export default function JobCostingClient({
         estimates.forEach(est => {
             est.items.forEach((item: any) => {
                 const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
-                const total = (item.quantity * item.unitCost);
+                const total = num(item.quantity) * num(item.unitCost);
                 const itemCategory = (item.costType?.name || item.type || "").toLowerCase();
                 if (itemCategory.includes("labor")) group.budgetLabor += total;
                 else group.budgetMaterial += total;
@@ -89,13 +97,14 @@ export default function JobCostingClient({
         });
         timeEntries.forEach(te => {
             const group = getGroup(te.costCodeId, te.costCode?.name, te.costCode?.code);
-            group.actualLabor += (te.laborCost || 0);
+            group.actualLabor += num(te.laborCost);
         });
         expenses.forEach(ex => {
             const group = getGroup(ex.costCodeId, ex.costCode?.name, ex.costCode?.code);
-            group.actualMaterial += (ex.amount || 0);
+            const amount = num(ex.amount);
+            group.actualMaterial += amount;
             if (ex.purchaseOrderId) {
-                group.committedMaterial -= (ex.amount || 0);
+                group.committedMaterial -= amount;
             }
         });
         purchaseOrders.forEach(po => {
@@ -104,7 +113,7 @@ export default function JobCostingClient({
             if (po.status !== "Draft") {
                 po.items?.forEach((item: any) => {
                     const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
-                    group.committedMaterial += (item.total || 0);
+                    group.committedMaterial += num(item.total);
                 });
             }
         });
