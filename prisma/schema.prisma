@@ -224,6 +224,7 @@ model Project {
   code                String?
   tags                String?
   color               String?                      @default("#3b82f6") // Added color field
+  paymentRemindersEnabled Boolean                  @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
   managerId           String?
   manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]
@@ -544,6 +545,7 @@ model PaymentSchedule {
   referenceNumber       String? // check # / confirmation #
   notes                 String? // free-form memo
   receiptSentAt         DateTime? // last time admin sent the receipt email
+  lastReminderAt        DateTime? // last time the automated payment-reminder cron emailed the client for this milestone
   paidAt                DateTime?
   createdAt             DateTime  @default(now())
 

@@ -7195,6 +7195,21 @@ export async function savePortalVisibility(projectId: string, data: {
     return { success: true };
 }
 
+export async function setPaymentRemindersEnabled(projectId: string, enabled: boolean) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) return { success: false, error: "Unauthorized" };
+    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    if (!canAccessProject(user, projectId)) return { success: false, error: "Forbidden" };
+
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { paymentRemindersEnabled: enabled },
+    });
+    revalidatePath(`/projects/${projectId}/client-portal`);
+    revalidatePath(`/projects/${projectId}/settings`);
+    return { success: true };
+}
+
 // =============================================
 // Portal Dashboard Shared Actions
 // =============================================
