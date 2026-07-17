@@ -41,6 +41,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     };
 
     const isApproved = initialData.status === "Approved";
+    const isSent = initialData.status === "Sent";
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
@@ -242,7 +243,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                     </div>
 
                     {/* Signature / Approval Area */}
-                    {!isApproved && (
+                    {isSent && (
                         <div className="px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">
@@ -307,6 +308,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                         </div>
                                     )}
                                 </div>
+                            </div>
+                        </div>
+                    )}
+                    {!isApproved && !isSent && (
+                        <div className="px-10 pb-10 print:hidden">
+                            <div className="border-t-2 border-slate-200 pt-8 text-center">
+                                <h3 className="text-lg font-bold text-slate-800 mb-2">Change Order Under Revision</h3>
+                                <p className="text-sm text-slate-500">This change order is not currently available for approval. Please use the newest link from your contractor.</p>
                             </div>
                         </div>
                     )}

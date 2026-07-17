@@ -15,7 +15,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { coTaxRate, coTaxLabel } from "./co-tax";
+import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -971,10 +971,20 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
         // An unpriced draft (e.g. an AI-suggested CO the PM hasn't priced yet)
         // must never reach the client for signature at $0 — once approved it
         // bills and locks, and a $0 approved CO can't be repaired.
-        const itemCount = await tx.changeOrderItem.count({ where: { changeOrderId } });
-        const rawSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
-        if (itemCount === 0 || rawSubtotal <= 0) {
+        const items = await tx.changeOrderItem.findMany({
+            where: { changeOrderId },
+            select: { quantity: true, unitCost: true },
+        });
+        const storedSubtotalCents = Math.round(Number(co.totalAmount) * 100);
+        const renderedSubtotalCents = items.reduce(
+            (sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)),
+            0,
+        );
+        if (items.length === 0 || storedSubtotalCents <= 0 || renderedSubtotalCents <= 0) {
             return { kind: "error", error: `Change order ${co.code} has no priced items yet — add pricing before sending it to the client.` };
+        }
+        if (storedSubtotalCents !== renderedSubtotalCents) {
+            return { kind: "error", error: `Change order ${co.code} pricing is out of sync with its items — save it before sending.` };
         }
 
         const project = await tx.project.findUnique({

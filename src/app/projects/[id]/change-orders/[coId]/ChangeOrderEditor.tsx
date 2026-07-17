@@ -23,9 +23,20 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSigning, setIsSigning] = useState(false);
     const [isSending, setIsSending] = useState(false);
 
-    // A signed CO is a contract: its items are locked (the server rejects item
-    // writes on Approved COs; only title/description remain editable).
-    const isApproved = initialData.status === "Approved";
+    // A signed CO is a contract: title, description, and items are the approved
+    // scope and remain immutable after approval. The server enforces the same
+    // rule; these disabled controls make that invariant visible in the editor.
+    const isApproved = status === "Approved";
+    const hasSignatureAudit = !!(
+        initialData.approvedBy
+        || initialData.approvedAt
+        || initialData.clientSignatureUrl
+        || initialData.companySignedBy
+        || initialData.companySignedAt
+        || initialData.companySignatureUrl
+    );
+    const isScopeLocked = isApproved || hasSignatureAudit;
+    const canCountersign = status === "Sent" || status === "Approved";
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
     // so the Revised Amount shown here is exactly what billing will charge.
@@ -57,6 +68,10 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     // a signature request when the save failed (they'd sign the stale amounts).
     async function handleSave(): Promise<boolean> {
         if (isDeleting) return false; // Prevent saving if we are in the middle of deleting
+        if (isScopeLocked) {
+            toast.error("Signed change orders are locked. Create a new change order for additional work.");
+            return false;
+        }
         setIsSaving(true);
         const mappedItems = items.map((item, index) => ({
             id: item.id,
@@ -76,11 +91,12 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             // tax-inclusive total here is what inflated billed amounts before.
             // Status is never sent: sendChangeOrderToClientCore owns Draft -> Sent,
             // and Approved/Declined belong to the signature flows.
-            await updateChangeOrder(initialData.id, {
+            const updated = await updateChangeOrder(initialData.id, {
                 title,
                 description,
-                ...(isApproved ? {} : { items: mappedItems }),
+                items: mappedItems,
             });
+            setStatus(updated.status);
             toast.success("Change Order saved");
             router.refresh();
             return true;
@@ -185,13 +201,15 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                     </a>
                     <button
                         onClick={handleDelete}
-                        disabled={isDeleting}
+                        disabled={isDeleting || status !== "Draft" || hasSignatureAudit}
+                        title={status !== "Draft" || hasSignatureAudit ? "Only unsigned Draft change orders can be deleted" : undefined}
                         className="hui-btn hui-btn-secondary text-red-600 border-red-200 hover:bg-red-50 disabled:opacity-50"
                     >
                         Delete
                     </button>
                     <button
-                        disabled={isSending}
+                        disabled={isSending || isApproved}
+                        title={isApproved ? "Approved change orders cannot be resent" : undefined}
                         onClick={async () => {
                             if (!confirm("Save and send this change order to the client for approval?")) return;
                             setIsSending(true);
@@ -201,7 +219,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 // sign amounts that never persisted. The Sent status
                                 // is owned by sendChangeOrderToClientCore; the local
                                 // badge only updates after a confirmed send.
-                                const saved = await handleSave();
+                                const saved = isScopeLocked ? true : await handleSave();
                                 if (!saved) return;
                                 const result = await sendChangeOrderToClient(initialData.id);
                                 if (result.success) {
@@ -223,7 +241,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                     </button>
                     <button
                         onClick={handleSave}
-                        disabled={isSaving}
+                        disabled={isSaving || isScopeLocked}
+                        title={isScopeLocked ? "Signed change orders are locked" : undefined}
                         className="hui-btn hui-btn-primary bg-amber-600 hover:bg-amber-700 border-amber-600 text-white disabled:opacity-50"
                     >
                         {isSaving ? "Saving..." : "Save"}
@@ -240,6 +259,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <input
                                     type="text"
                                     value={title}
+                                    disabled={isScopeLocked}
                                     onChange={e => setTitle(e.target.value)}
                                     className="text-4xl font-extrabold tracking-tight text-slate-800 w-full focus:outline-none focus:bg-slate-50 hover:bg-slate-50 transition-colors rounded-lg px-3 py-2 -ml-3 placeholder:text-slate-300 bg-transparent"
                                     placeholder="Change Order Title"
@@ -281,7 +301,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     <input
                                                         type="text"
                                                         value={item.name}
-                                                        disabled={isApproved}
+                                                        disabled={isScopeLocked}
                                                         onChange={e => updateItem(index, "name", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm font-medium text-hui-textMain"
                                                     />
@@ -290,7 +310,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     <input
                                                         type="number"
                                                         value={item.quantity}
-                                                        disabled={isApproved}
+                                                        disabled={isScopeLocked}
                                                         onChange={e => updateItem(index, "quantity", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                     />
@@ -300,7 +320,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     <input
                                                         type="number"
                                                         value={item.unitCost}
-                                                        disabled={isApproved}
+                                                        disabled={isScopeLocked}
                                                         onChange={e => updateItem(index, "unitCost", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 pl-6 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                     />
@@ -309,7 +329,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                     {formatCurrency(itemTotal)}
                                                 </div>
                                                 <div className="w-10 pt-1.5 flex justify-end">
-                                                    {!isApproved && (
+                                                    {!isScopeLocked && (
                                                         <button onClick={() => removeItem(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                         </button>
@@ -323,7 +343,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     )}
                                 </div>
 
-                                {!isApproved && (
+                                {!isScopeLocked && (
                                     <div className="p-4 px-8 border-t border-slate-100 bg-white hover:bg-slate-50 transition-colors flex items-center gap-4 cursor-pointer group" onClick={addItem}>
                                         <button className="text-sm font-semibold text-amber-600 group-hover:text-amber-700 flex items-center gap-2 transition">
                                             <span className="bg-amber-50 text-amber-600 group-hover:bg-amber-100 rounded p-1">
@@ -368,8 +388,9 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     className="hui-input w-full h-40 resize-y"
                                     placeholder="Enter details around the need for this change order..."
                                     value={description}
+                                    disabled={isScopeLocked}
                                     onChange={(e) => setDescription(e.target.value)}
-                                    onBlur={handleSave}
+                                    onBlur={isScopeLocked || description === (initialData.description || "") ? undefined : handleSave}
                                 />
                             </div>
                         </div>
@@ -440,7 +461,12 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                 <p className="text-sm text-slate-700 font-medium">Ready to sign?</p>
                                                 <p className="text-xs text-slate-500 mt-1">Sign on behalf of the company.</p>
                                             </div>
-                                            <button onClick={() => setShowSignModal(true)} className="text-amber-600 hover:text-amber-700 font-medium text-sm mt-1">Sign Now →</button>
+                                            <button
+                                                onClick={() => setShowSignModal(true)}
+                                                disabled={!canCountersign}
+                                                title={!canCountersign ? "Send the change order before countersigning" : undefined}
+                                                className="text-amber-600 hover:text-amber-700 font-medium text-sm mt-1 disabled:text-slate-400 disabled:cursor-not-allowed"
+                                            >Sign Now →</button>
                                         </div>
                                     )}
                                 </div>
