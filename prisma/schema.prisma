@@ -1723,6 +1723,10 @@ model PaymentNotification {
   status              String    @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
   attempts            Int       @default(0)
   lastError           String?
+  // Fencing token: set on each claim, required by the completion update. A worker whose
+  // lease expired (row re-claimed by another drainer) writes a stale token, so its late
+  // completion no-ops instead of overwriting the new owner's result. Prevents double-finish.
+  claimToken          String?
   processingStartedAt DateTime?
   createdAt           DateTime  @default(now())
   processedAt         DateTime?

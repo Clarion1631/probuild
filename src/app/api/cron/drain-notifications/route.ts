@@ -12,9 +12,17 @@ export const maxDuration = 60;
  * in one run. Delivery is idempotent, so overlapping with an inline drain is safe.
  */
 export async function GET(request: Request) {
-    const authHeader = request.headers.get("authorization");
-    if (process.env.VERCEL_ENV === "production" && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    // Fail CLOSED for a mail-sending endpoint: require a non-empty CRON_SECRET and an exact
+    // header match on every deployed environment (production AND preview), so a public preview
+    // URL or an empty secret ("Bearer undefined") can't drive the drainer. Only an explicit
+    // local dev run (not on Vercel, NODE_ENV !== production) is allowed through unauthenticated.
+    const isLocalDev = process.env.NODE_ENV !== "production" && !process.env.VERCEL;
+    if (!isLocalDev) {
+        const secret = process.env.CRON_SECRET;
+        const authHeader = request.headers.get("authorization");
+        if (!secret || authHeader !== `Bearer ${secret}`) {
+            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        }
     }
 
     const total = { processed: 0, retried: 0, failed: 0 };

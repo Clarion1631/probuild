@@ -50,11 +50,14 @@ export async function enqueueMilestonePaid(
     });
 }
 
-async function deliver(row: { scheduleId: string; scheduleType: string }): Promise<{ ok: boolean }> {
+async function deliver(row: { id: string; scheduleId: string; scheduleType: string }): Promise<{ ok: boolean }> {
     const { notifyMilestonePaid, notifyEstimateMilestonePaid } = await import("./payment-notifications");
+    // Pass the outbox row id as the dedupe key so the activity-log dedupe is per-settlement-EVENT,
+    // not per-schedule — an undo + re-pay reuses the same scheduleId but gets a new outbox row,
+    // and so correctly logs a second payment_received.
     return row.scheduleType === "estimate"
-        ? notifyEstimateMilestonePaid(row.scheduleId)
-        : notifyMilestonePaid(row.scheduleId);
+        ? notifyEstimateMilestonePaid(row.scheduleId, { dedupeKey: row.id })
+        : notifyMilestonePaid(row.scheduleId, { dedupeKey: row.id });
 }
 
 /**
@@ -93,41 +96,59 @@ export async function drainPaymentNotifications(
         take: limit,
     });
 
+    const { randomUUID } = await import("crypto");
+
     for (const row of candidates) {
         // Atomic claim scoped to the exact state we observed, so two concurrent drainers
-        // (inline + cron) can't both transition this row to PROCESSING.
+        // (inline + cron) can't both transition this row to PROCESSING. The claimToken we set
+        // here fences the completion update below.
+        const claimToken = randomUUID();
         const claim = await prisma.paymentNotification.updateMany({
             where: {
                 id: row.id,
                 status: row.status,
                 ...(row.status === "PROCESSING" ? { processingStartedAt: { lt: staleBefore } } : {}),
             },
-            data: { status: "PROCESSING", processingStartedAt: new Date(), attempts: { increment: 1 } },
+            data: { status: "PROCESSING", processingStartedAt: new Date(), attempts: { increment: 1 }, claimToken },
         });
         if (claim.count === 0) continue; // another drainer already took it
+
+        // Read back the attempts we just set — safe because we now hold the fresh lease (a
+        // re-claim requires a stale processingStartedAt) — so the FAILED cap counts the true
+        // value rather than the possibly-stale findMany snapshot.
+        const claimed = await prisma.paymentNotification.findUnique({
+            where: { id: row.id },
+            select: { attempts: true },
+        });
+        const attempts = claimed?.attempts ?? row.attempts + 1;
 
         let outcome: { ok: boolean } = { ok: false };
         let lastError: string | null = null;
         try {
-            outcome = await deliver(row);
+            outcome = await deliver({ id: row.id, scheduleId: row.scheduleId, scheduleType: row.scheduleType });
         } catch (e: any) {
             lastError = String(e?.message ?? e).slice(0, 500);
         }
 
+        // Completion fenced on claimToken: if our lease expired and another drainer re-claimed
+        // (writing a new token), this update matches 0 rows and no-ops — no overwrite of the new
+        // owner's result, and the new owner's own completion still lands.
         if (outcome.ok) {
-            await prisma.paymentNotification.update({
-                where: { id: row.id },
+            const done = await prisma.paymentNotification.updateMany({
+                where: { id: row.id, claimToken },
                 data: { status: "PROCESSED", processedAt: new Date(), lastError: null },
-            }).catch(() => {});
-            result.processed++;
+            }).catch(() => ({ count: 0 }));
+            if (done.count > 0) result.processed++;
         } else {
-            const dead = row.attempts + 1 >= MAX_ATTEMPTS;
-            await prisma.paymentNotification.update({
-                where: { id: row.id },
+            const dead = attempts >= MAX_ATTEMPTS;
+            const done = await prisma.paymentNotification.updateMany({
+                where: { id: row.id, claimToken },
                 data: { status: dead ? "FAILED" : "PENDING", lastError },
-            }).catch(() => {});
-            if (dead) result.failed++;
-            else result.retried++;
+            }).catch(() => ({ count: 0 }));
+            if (done.count > 0) {
+                if (dead) result.failed++;
+                else result.retried++;
+            }
         }
     }
 

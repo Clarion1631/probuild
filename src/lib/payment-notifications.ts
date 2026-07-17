@@ -96,8 +96,11 @@ function receiptBodyHtml(opts: {
  * balanceDue is already recalculated). Never throws.
  */
 // Returns { ok } for the outbox drainer: ok=true when there was nothing to deliver or every
-// attempted send succeeded (mark PROCESSED); ok=false when an attempted send failed (retry).
-export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ ok: boolean }> {
+// attempted send + the activity write succeeded (mark PROCESSED); ok=false when any of them
+// failed (retry). `dedupeKey` (the outbox row id) makes the activity-log dedupe per-settlement-
+// EVENT so an undo + re-pay of the same schedule still logs a second payment_received; direct
+// callers that omit it fall back to the scheduleId.
+export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { dedupeKey?: string }): Promise<{ ok: boolean }> {
     try {
         const s = await prisma.paymentSchedule.findUnique({
             where: { id: paymentScheduleId },
@@ -119,6 +122,7 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
         // (protects the maintenance test action and any future mis-call).
         if (s.status !== "Paid") return { ok: true };
         let ok = true;
+        const dedupeKey = opts?.dedupeKey ?? s.id;
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         const companyName = settings?.companyName || "Golden Touch Remodeling";
         const amount = formatCurrency(s.amount);
@@ -137,12 +141,12 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
                 entityType: "invoice",
                 entityId: s.invoice.id,
                 action: "payment_received",
-                metadata: { contains: `"scheduleId":"${s.id}"` },
+                metadata: { contains: `"dedupeKey":"${dedupeKey}"` },
             },
             select: { id: true },
         });
         if (!alreadyLogged) {
-            await prisma.activityLog.create({
+            const logged = await prisma.activityLog.create({
                 data: {
                     projectId: s.invoice.project?.id ?? null,
                     actorType: s.paymentMethod === "quickbooks" ? "SYSTEM" : "TEAM",
@@ -151,9 +155,10 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
                     entityType: "invoice",
                     entityId: s.invoice.id,
                     entityName: `Invoice ${s.invoice.code}`,
-                    metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id }),
+                    metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id, dedupeKey }),
                 },
-            }).catch(() => {});
+            }).then(() => true).catch(() => false);
+            if (!logged) ok = false;
         }
 
         // 2. Team alert
@@ -226,7 +231,7 @@ export async function notifyMilestonePaid(paymentScheduleId: string): Promise<{ 
  * receiptSentAt, stamped only on a successful send) — all idempotent so the outbox
  * drainer can safely retry. Never throws.
  */
-export async function notifyEstimateMilestonePaid(scheduleId: string): Promise<{ ok: boolean }> {
+export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { dedupeKey?: string }): Promise<{ ok: boolean }> {
     try {
         const s = await prisma.estimatePaymentSchedule.findUnique({
             where: { id: scheduleId },
@@ -251,19 +256,21 @@ export async function notifyEstimateMilestonePaid(scheduleId: string): Promise<{
         const code = est.code || est.title || est.id;
         const methodLabel = formatMethod(s.paymentMethod, s.referenceNumber);
         let ok = true;
+        const dedupeKey = opts?.dedupeKey ?? s.id;
 
-        // 1. Activity feed (deduped by scheduleId so a drainer retry can't double-log)
+        // 1. Activity feed (deduped by dedupeKey so a drainer retry can't double-log, while an
+        //    undo + re-pay — new outbox row, same scheduleId — still logs a fresh event)
         const alreadyLogged = await prisma.activityLog.findFirst({
             where: {
                 entityType: "estimate",
                 entityId: est.id,
                 action: "payment_received",
-                metadata: { contains: `"scheduleId":"${s.id}"` },
+                metadata: { contains: `"dedupeKey":"${dedupeKey}"` },
             },
             select: { id: true },
         });
         if (!alreadyLogged) {
-            await prisma.activityLog.create({
+            const logged = await prisma.activityLog.create({
                 data: {
                     projectId: est.projectId ?? null,
                     leadId: est.leadId ?? null,
@@ -273,9 +280,10 @@ export async function notifyEstimateMilestonePaid(scheduleId: string): Promise<{
                     entityType: "estimate",
                     entityId: est.id,
                     entityName: `Estimate ${code}`,
-                    metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id }),
+                    metadata: JSON.stringify({ milestone: s.name, amount: Number(s.amount.toString()), method: s.paymentMethod, referenceNumber: s.referenceNumber || undefined, scheduleId: s.id, dedupeKey }),
                 },
-            }).catch(() => {});
+            }).then(() => true).catch(() => false);
+            if (!logged) ok = false;
         }
 
         // 2. Team alert
