@@ -4,7 +4,19 @@ import { useState, useEffect } from "react";
 import CashFlowCard from "./cash-flow-card";
 import IncomingPaymentsCard from "./incoming-payments-card";
 import OutgoingPaymentsCard from "./outgoing-payments-card";
-import CashFlowTrackerChart from "./cash-flow-tracker-chart";
+import dynamic from "next/dynamic";
+
+const CashFlowTrackerChart = dynamic(
+    () => import("./cash-flow-tracker-chart"),
+    {
+        ssr: false,
+        loading: () => (
+            <div className="h-80 w-full animate-pulse bg-slate-50 border border-slate-100 rounded-xl flex items-center justify-center text-slate-400 text-xs">
+                Loading financial tracker chart...
+            </div>
+        ),
+    }
+);
 import FinancialItemsSection from "./financial-items-section";
 
 // Basic switch replacement
