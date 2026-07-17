@@ -4,6 +4,7 @@ import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { coTaxRate, coTaxLabel } from './co-tax';
+import { drawRichHtml, type RichTextCtx } from './pdf-richtext';
 
 /**
  * Embed a signature image from either a legacy inline data-URL or a migrated http(s)
@@ -250,6 +251,8 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     const doc = await PDFDocument.create();
     const helvetica = await doc.embedFont(StandardFonts.Helvetica);
     const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+    const helveticaOblique = await doc.embedFont(StandardFonts.HelveticaOblique);
+    const helveticaBoldOblique = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
 
     const pageWidth = 612; // Letter width in points
     const pageHeight = 792; // Letter height in points
@@ -264,6 +267,23 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             page = doc.addPage([pageWidth, pageHeight]);
             y = pageHeight - margin;
         }
+    }
+
+    // Render a titled rich-text section (Project Overview / Notes & Assumptions) using
+    // the shared HTML-subset renderer, keeping the closure's page/y cursor in sync.
+    const richFonts = { regular: helvetica, bold: helveticaBold, italic: helveticaOblique, boldItalic: helveticaBoldOblique };
+    function drawRichSection(title: string, body: string, titleSize: number) {
+        checkNewPage(140);
+        page.drawText(title, { x: margin, y, size: titleSize, font: helveticaBold, color: colors.textMain });
+        y -= titleSize + 10;
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: richFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawRichHtml(body, ctx);
+        page = res.page;
+        y = res.y;
     }
 
     // --- Letterhead ---
@@ -327,6 +347,21 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
+    // --- Project Overview / Vision (client-facing, no pricing) ---
+    // Rendered after the header/client block, then the estimate details are forced
+    // onto a fresh page so pricing begins on the following page.
+    if (estimate.overviewEnabled && estimate.overviewBody) {
+        drawRichSection(estimate.overviewTitle || 'Project Overview', estimate.overviewBody, 15);
+        page = doc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - margin;
+    }
+
+    // --- Estimate Notes & Assumptions (placed before the line items) ---
+    if (estimate.notesEnabled && estimate.notesBody && estimate.notesPlacement === 'before') {
+        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', estimate.notesBody, 12);
+        y -= 12;
+    }
+
     // --- Table Header ---
     const cols = {
         name: margin,
@@ -363,6 +398,9 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         y -= 14;
     }
 
+    // Guard against a before-placement Notes section leaving no room: keep the table
+    // header with at least the first row instead of stranding it at the page bottom.
+    checkNewPage(120);
     drawTableHeader();
 
     // --- Table Rows ---
@@ -505,6 +543,12 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     page.drawText(totalStr2, {
         x: cols.total - totalWidth2, y: y - 8, size: 14, font: helveticaBold, color: colors.primary,
     });
+
+    // --- Estimate Notes & Assumptions (placed immediately after the line items/totals) ---
+    if (estimate.notesEnabled && estimate.notesBody && estimate.notesPlacement !== 'before') {
+        y -= 30;
+        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', estimate.notesBody, 12);
+    }
 
     // --- Payment Schedule ---
     if (estimate.paymentSchedules.length > 0) {

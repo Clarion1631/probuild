@@ -42,7 +42,8 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
+import RichTextEditor from "@/components/RichTextEditor";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import ExpensesTab from "./ExpensesTab";
@@ -183,6 +184,21 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [showTerms, setShowTerms] = useState(false);
     const [termsTemplates, setTermsTemplates] = useState<{id: string; name: string; body: string; isDefault: boolean}[]>([]);
     const [memo, setMemo] = useState<string>(initialEstimate.memo || "");
+    // Project Overview / Vision (client-facing cover section, no pricing)
+    const [overviewEnabled, setOverviewEnabled] = useState<boolean>(initialEstimate.overviewEnabled ?? false);
+    const [overviewTitle, setOverviewTitle] = useState<string>(initialEstimate.overviewTitle || "");
+    const [overviewBody, setOverviewBody] = useState<string>(initialEstimate.overviewBody || "");
+    const [showOverview, setShowOverview] = useState<boolean>(!!initialEstimate.overviewEnabled);
+    const [overviewTemplates, setOverviewTemplates] = useState<{ id: string; name: string; body: string; isDefault: boolean }[]>([]);
+    // Estimate Notes & Assumptions (client-facing, placed before/after line items)
+    const [notesEnabled, setNotesEnabled] = useState<boolean>(initialEstimate.notesEnabled ?? false);
+    const [notesTitle, setNotesTitle] = useState<string>(initialEstimate.notesTitle || "");
+    const [notesBody, setNotesBody] = useState<string>(initialEstimate.notesBody || "");
+    const [notesPlacement, setNotesPlacement] = useState<"before" | "after">(initialEstimate.notesPlacement === "before" ? "before" : "after");
+    const [showNotes, setShowNotes] = useState<boolean>(!!initialEstimate.notesEnabled);
+    const [notesTemplates, setNotesTemplates] = useState<{ id: string; name: string; body: string; isDefault: boolean }[]>([]);
+    const [isSavingOverviewTpl, setIsSavingOverviewTpl] = useState(false);
+    const [isSavingNotesTpl, setIsSavingNotesTpl] = useState(false);
     const [estimateFiles, setEstimateFiles] = useState<any[]>(initialEstimate.files || []);
     const [isUploadingFile, setIsUploadingFile] = useState(false);
     const [signatureUrl, setSignatureUrl] = useState<string | null>(initialEstimate.signatureUrl || null);
@@ -267,6 +283,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
             memo: memo || null,
             termsAndConditions: termsAndConditions || null,
+            overviewEnabled: !!overviewEnabled,
+            overviewTitle: overviewTitle || null,
+            overviewBody: overviewBody || null,
+            notesEnabled: !!notesEnabled,
+            notesTitle: notesTitle || null,
+            notesBody: notesBody || null,
+            notesPlacement,
             signatureUrl: signatureUrl || null,
             targetMarginPercent: parseFloat(targetMargin) || 25,
             taxExempt: !!taxExempt,
@@ -277,7 +300,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         };
     }, [
         title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
-        memo, termsAndConditions, signatureUrl, targetMargin, taxExempt, selectedTaxName,
+        memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
+        notesEnabled, notesTitle, notesBody, notesPlacement,
+        signatureUrl, targetMargin, taxExempt, selectedTaxName,
         taxOptions, defaultTaxRate, items, paymentSchedules
     ]);
 
@@ -414,6 +439,36 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             }
         }).catch((err) => console.error("[EstimateEditor] Failed to load T&C templates:", err));
     }, []);
+
+    useEffect(() => {
+        getDocumentTemplates("overview").then((data: any[]) => setOverviewTemplates(data))
+            .catch((err) => console.error("[EstimateEditor] Failed to load overview templates:", err));
+        getDocumentTemplates("notes").then((data: any[]) => setNotesTemplates(data))
+            .catch((err) => console.error("[EstimateEditor] Failed to load notes templates:", err));
+    }, []);
+
+    async function handleSaveDocTemplate(type: "overview" | "notes", body: string) {
+        const label = type === "overview" ? "Project Overview" : "Notes & Assumptions";
+        if (!body || !body.trim()) {
+            toast.error(`Add some ${label} content before saving a template.`);
+            return;
+        }
+        const name = window.prompt(`Save this ${label} as a reusable template. Template name:`)?.trim();
+        if (!name) return;
+        const setBusy = type === "overview" ? setIsSavingOverviewTpl : setIsSavingNotesTpl;
+        setBusy(true);
+        try {
+            await createDocumentTemplate({ name, type, body });
+            const refreshed = await getDocumentTemplates(type);
+            if (type === "overview") setOverviewTemplates(refreshed as any);
+            else setNotesTemplates(refreshed as any);
+            toast.success(`Saved "${name}" template.`);
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to save template.");
+        } finally {
+            setBusy(false);
+        }
+    }
 
     async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const file = e.target.files?.[0];
@@ -742,6 +797,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
                 memo: memo || null,
                 termsAndConditions: termsAndConditions || null,
+                overviewEnabled,
+                overviewTitle: overviewTitle || null,
+                overviewBody: overviewBody || null,
+                notesEnabled,
+                notesTitle: notesTitle || null,
+                notesBody: notesBody || null,
+                notesPlacement,
                 signatureUrl: signatureUrl || null,
                 targetMarginPercent: parseFloat(targetMargin) || 25,
                 taxExempt,
@@ -1032,6 +1094,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
                 memo: memo || null,
                 termsAndConditions: termsAndConditions || null,
+                overviewEnabled,
+                overviewTitle: overviewTitle || null,
+                overviewBody: overviewBody || null,
+                notesEnabled,
+                notesTitle: notesTitle || null,
+                notesBody: notesBody || null,
+                notesPlacement,
                 signatureUrl: signatureUrl || null,
                 targetMarginPercent: parseFloat(targetMargin) || 25,
                 taxExempt: !!taxExempt,
@@ -2730,6 +2799,113 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                 <button onClick={addPaymentSchedule} className="hui-btn hui-btn-secondary text-indigo-700 border-indigo-200 hover:bg-indigo-100 bg-white transition shadow-sm text-xs py-1.5 px-3">
                                     + Add milestone
                                 </button>
+                            </div>
+                        </div>
+
+                        {/* Project Overview / Vision Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowOverview(!showOverview)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Project Overview</span>
+                                        {overviewEnabled && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">On</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showOverview ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showOverview && (
+                                    <div className="px-6 pb-5 border-t border-slate-100 space-y-3">
+                                        <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                                            <input type="checkbox" checked={overviewEnabled} onChange={e => setOverviewEnabled(e.target.checked)} className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                                            <span className="text-sm text-slate-600">Include a Project Overview page (shown after the header/client info, before pricing, with a page break so the line items begin on the next page).</span>
+                                        </label>
+                                        <div>
+                                            <label className="text-xs font-medium text-slate-500 mb-1 block">Page title</label>
+                                            <input value={overviewTitle} onChange={e => setOverviewTitle(e.target.value)} placeholder="Project Overview" className="hui-input w-full text-sm" />
+                                        </div>
+                                        {overviewTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm"
+                                                value=""
+                                                onChange={e => { const t = overviewTemplates.find(t => t.id === e.target.value); if (t) setOverviewBody(t.body); }}
+                                            >
+                                                <option value="" disabled>Load a saved overview template...</option>
+                                                {overviewTemplates.map(t => <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>)}
+                                            </select>
+                                        )}
+                                        <RichTextEditor
+                                            value={overviewBody}
+                                            onChange={setOverviewBody}
+                                            placeholder="Describe the overall project vision, the major areas of work, and how the scopes fit together. No pricing here."
+                                        />
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => handleSaveDocTemplate("overview", overviewBody)} disabled={isSavingOverviewTpl} className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                                                {isSavingOverviewTpl ? "Saving…" : "Save as template"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Estimate Notes & Assumptions Section */}
+                        <div className="mt-8 mx-2">
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                                <button
+                                    onClick={() => setShowNotes(!showNotes)}
+                                    className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-50 transition"
+                                >
+                                    <div className="flex items-center gap-2">
+                                        <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                                        <span className="text-sm font-semibold text-slate-800">Notes &amp; Assumptions</span>
+                                        {notesEnabled && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">On</span>}
+                                    </div>
+                                    <svg className={`w-4 h-4 text-slate-400 transition-transform ${showNotes ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                                </button>
+                                {showNotes && (
+                                    <div className="px-6 pb-5 border-t border-slate-100 space-y-3">
+                                        <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                                            <input type="checkbox" checked={notesEnabled} onChange={e => setNotesEnabled(e.target.checked)} className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                                            <span className="text-sm text-slate-600">Include a Notes &amp; Assumptions section for exclusions, allowances, and estimating assumptions.</span>
+                                        </label>
+                                        <div className="grid grid-cols-2 gap-3">
+                                            <div>
+                                                <label className="text-xs font-medium text-slate-500 mb-1 block">Section title</label>
+                                                <input value={notesTitle} onChange={e => setNotesTitle(e.target.value)} placeholder="Estimate Notes & Assumptions" className="hui-input w-full text-sm" />
+                                            </div>
+                                            <div>
+                                                <label className="text-xs font-medium text-slate-500 mb-1 block">Placement</label>
+                                                <select value={notesPlacement} onChange={e => setNotesPlacement(e.target.value === "before" ? "before" : "after")} className="hui-input w-full text-sm">
+                                                    <option value="before">Before the line items</option>
+                                                    <option value="after">After the line items</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        {notesTemplates.length > 0 && (
+                                            <select
+                                                className="hui-input w-full text-sm"
+                                                value=""
+                                                onChange={e => { const t = notesTemplates.find(t => t.id === e.target.value); if (t) setNotesBody(t.body); }}
+                                            >
+                                                <option value="" disabled>Load a saved notes template...</option>
+                                                {notesTemplates.map(t => <option key={t.id} value={t.id}>{t.name}{t.isDefault ? " (Default)" : ""}</option>)}
+                                            </select>
+                                        )}
+                                        <RichTextEditor
+                                            value={notesBody}
+                                            onChange={setNotesBody}
+                                            placeholder="Exclusions, allowances, and assumptions behind this estimate..."
+                                        />
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => handleSaveDocTemplate("notes", notesBody)} disabled={isSavingNotesTpl} className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                                                {isSavingNotesTpl ? "Saving…" : "Save as template"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
 
