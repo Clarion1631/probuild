@@ -748,12 +748,24 @@ const handler = createMcpHandler(
                 }
                 // Closed/won jobs are accepted on purpose — find_job surfaces them and
                 // parking documents on a finished job is a normal filing action.
-                if (projectId) {
-                    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
-                    if (!project) return { ...textResult({ error: `No project with id ${projectId}. Use find_job or list_projects.` }), isError: true };
+                let targetProjectId: string | null = projectId ?? null;
+                let targetLeadId: string | null = leadId ?? null;
+                let movedToProjectNote: string | null = null;
+                if (targetProjectId) {
+                    const project = await prisma.project.findUnique({ where: { id: targetProjectId }, select: { id: true } });
+                    if (!project) return { ...textResult({ error: `No project with id ${targetProjectId}. Use find_job or list_projects.` }), isError: true };
                 } else {
-                    const lead = await prisma.lead.findUnique({ where: { id: leadId! }, select: { id: true } });
-                    if (!lead) return { ...textResult({ error: `No lead with id ${leadId}. Use find_job or list_leads.` }), isError: true };
+                    const lead = await prisma.lead.findUnique({ where: { id: targetLeadId! }, select: { id: true } });
+                    if (!lead) return { ...textResult({ error: `No lead with id ${targetLeadId}. Use find_job or list_leads.` }), isError: true };
+                    // A won lead becomes a project, and the customer portal only reads
+                    // project-owned folders — a "shared" folder filed on the lead would
+                    // be unreachable. Normalize converted leads to their project.
+                    const linkedProject = await prisma.project.findFirst({ where: { leadId: targetLeadId! }, select: { id: true, name: true } });
+                    if (linkedProject) {
+                        movedToProjectNote = `This lead was already converted to project "${linkedProject.name}" — the file was filed on the project.`;
+                        targetProjectId = linkedProject.id;
+                        targetLeadId = null;
+                    }
                 }
 
                 const b64 = contentBase64.replace(/\s+/g, "");
@@ -777,7 +789,7 @@ const handler = createMcpHandler(
                 let folderId: string | null = null;
                 const folderName = folder?.trim();
                 if (folderName) {
-                    const scope = { projectId: projectId ?? null, leadId: leadId ?? null, parentId: null };
+                    const scope = { projectId: targetProjectId, leadId: targetLeadId, parentId: null };
                     const existing = await prisma.fileFolder.findFirst({
                         where: { ...scope, name: { equals: folderName, mode: "insensitive" } },
                         select: { id: true, name: true, visibility: true },
@@ -800,16 +812,16 @@ const handler = createMcpHandler(
                     buffer,
                     fileName,
                     mimeType: mimeTypeForFileName(fileName),
-                    projectId: projectId ?? null,
-                    leadId: leadId ?? null,
+                    projectId: targetProjectId,
+                    leadId: targetLeadId,
                     folderId,
                     visibility: fileVisibility,
                 });
                 if (!saved.ok) return { ...textResult({ error: saved.error }), isError: true };
 
-                const filesUrl = projectId
-                    ? `https://probuild.goldentouchremodeling.com/projects/${projectId}/files`
-                    : `https://probuild.goldentouchremodeling.com/leads/${leadId}/files`;
+                const filesUrl = targetProjectId
+                    ? `https://probuild.goldentouchremodeling.com/projects/${targetProjectId}/files`
+                    : `https://probuild.goldentouchremodeling.com/leads/${targetLeadId}/files`;
                 return textResult({
                     fileId: saved.file.id,
                     name: saved.file.name,
@@ -817,6 +829,7 @@ const handler = createMcpHandler(
                     folder: folderName ?? null,
                     visibility: fileVisibility,
                     url: filesUrl,
+                    ...(movedToProjectNote ? { movedToProject: movedToProjectNote } : {}),
                     note: fileVisibility === "shared"
                         ? "This file IS visible to the customer (in the client portal, once the job has a project with the portal's Files section enabled)."
                         : "Internal file — the customer cannot see it.",
