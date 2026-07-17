@@ -13,6 +13,7 @@ export type Category =
   | "lighting"
   | "doors-windows"
   | "furniture"
+  | "outdoor"
   | "decor";
 
 export type MountType = "floor" | "wall" | "ceiling" | "counter";
@@ -165,6 +166,35 @@ export const FURNITURE: CatalogItem[] = [
   def({ id: "rug-area", name: "Area Rug", category: "furniture", mesh: "rug", w: IN(96), d: IN(120), h: IN(0.5), mount: "floor", resizable: { min: IN(48), max: IN(144), step: IN(12), axis: "wd" }, finishes: { fabric: "fab-cream-boucle" }, tags: ["rug", "carpet"] }),
 ];
 
+// -------------------------------- Outdoor --------------------------------
+// Structures, patio furniture, and landscaping for outdoor spaces (yards,
+// patios, porches, decks). All floor-mounted; structures are freestanding.
+
+export const OUTDOOR: CatalogItem[] = [
+  // structures
+  def({ id: "deck-platform", name: "Deck Platform", category: "outdoor", mesh: "deck-platform", w: IN(144), d: IN(96), h: IN(6), mount: "floor", resizable: { min: IN(48), max: IN(288), step: IN(12), axis: "wd" }, finishes: { wood: "wood-cedar" }, tags: ["deck", "platform", "outdoor", "patio", "wood"] }),
+  def({ id: "pergola", name: "Pergola", category: "outdoor", mesh: "pergola", w: IN(120), d: IN(120), h: IN(96), mount: "floor", resizable: { min: IN(72), max: IN(192), step: IN(12), axis: "wd" }, finishes: { wood: "wood-cedar" }, tags: ["pergola", "shade", "outdoor", "structure", "trellis"] }),
+  def({ id: "gable-porch", name: "Gabled Porch", category: "outdoor", mesh: "gable-porch", w: IN(144), d: IN(96), h: IN(120), mount: "floor", resizable: { min: IN(96), max: IN(240), step: IN(12) }, finishes: { post: "paint-pure-white", roof: "paint-graphite" }, tags: ["porch", "gable", "roof", "covered", "outdoor", "portico"] }),
+  def({ id: "garden-arbor", name: "Garden Archway", category: "outdoor", mesh: "garden-arbor", w: IN(48), d: IN(24), h: IN(90), mount: "floor", finishes: { wood: "paint-pure-white" }, tags: ["arbor", "arch", "archway", "garden", "gate", "trellis", "outdoor"] }),
+  def({ id: "fence-panel", name: "Privacy Fence", category: "outdoor", mesh: "fence-panel", w: IN(96), d: IN(3.5), h: IN(72), mount: "floor", resizable: { min: IN(24), max: IN(288), step: IN(2) }, finishes: { wood: "wood-cedar" }, tags: ["fence", "privacy", "boundary", "outdoor", "screen"] }),
+  def({ id: "planter-box", name: "Planter Box", category: "outdoor", mesh: "planter-box", w: IN(48), d: IN(18), h: IN(18), mount: "floor", resizable: { min: IN(24), max: IN(96), step: IN(6) }, finishes: { wood: "wood-cedar" }, tags: ["planter", "raised bed", "garden", "outdoor", "flowers"] }),
+  // patio furniture
+  def({ id: "patio-table", name: "Patio Dining Table", category: "outdoor", mesh: "patio-table", w: IN(60), d: IN(38), h: IN(29), mount: "floor", resizable: { min: IN(30), max: IN(84), step: IN(6) }, finishes: { wood: "wood-teak", metal: "metal-matte-black" }, tags: ["patio", "table", "dining", "outdoor"] }),
+  def({ id: "patio-chair", name: "Patio Chair", category: "outdoor", mesh: "patio-chair", w: IN(22), d: IN(24), h: IN(34), mount: "floor", finishes: { metal: "metal-matte-black", fabric: "fab-charcoal" }, tags: ["patio", "chair", "outdoor", "dining"] }),
+  def({ id: "adirondack", name: "Adirondack Chair", category: "outdoor", mesh: "adirondack", w: IN(30), d: IN(34), h: IN(36), mount: "floor", finishes: { wood: "wood-white" }, tags: ["adirondack", "chair", "lounge", "outdoor", "fire pit"] }),
+  def({ id: "chaise-lounge", name: "Chaise Lounge", category: "outdoor", mesh: "chaise-lounge", w: IN(26), d: IN(78), h: IN(38), mount: "floor", finishes: { fabric: "fab-oat", frame: "wood-teak" }, tags: ["chaise", "lounge", "pool", "sun", "outdoor"] }),
+  def({ id: "outdoor-sofa", name: "Outdoor Sofa", category: "outdoor", mesh: "outdoor-sofa", w: IN(78), d: IN(34), h: IN(28), mount: "floor", finishes: { fabric: "fab-cloud", frame: "wood-teak" }, tags: ["outdoor", "sofa", "patio", "sectional", "lounge"] }),
+  def({ id: "fire-pit", name: "Fire Pit", category: "outdoor", mesh: "fire-pit", w: IN(36), d: IN(36), h: IN(16), mount: "floor", emitsLight: true, tags: ["fire", "pit", "firepit", "outdoor", "patio"] }),
+  def({ id: "grill-bbq", name: "BBQ Grill", category: "outdoor", mesh: "grill", w: IN(52), d: IN(24), h: IN(46), mount: "floor", finishes: { metal: "metal-stainless" }, tags: ["grill", "bbq", "barbecue", "outdoor", "kitchen"] }),
+  def({ id: "market-umbrella", name: "Market Umbrella", category: "outdoor", mesh: "umbrella", w: IN(90), d: IN(90), h: IN(96), mount: "floor", finishes: { fabric: "fab-rust", metal: "metal-matte-black" }, tags: ["umbrella", "shade", "patio", "outdoor"] }),
+  // landscaping
+  def({ id: "tree-shade", name: "Shade Tree", category: "outdoor", mesh: "tree-shade", w: IN(96), d: IN(96), h: IN(168), mount: "floor", tags: ["tree", "maple", "oak", "landscape", "outdoor"] }),
+  def({ id: "tree-evergreen", name: "Evergreen Tree", category: "outdoor", mesh: "tree-evergreen", w: IN(60), d: IN(60), h: IN(144), mount: "floor", tags: ["tree", "pine", "evergreen", "landscape", "outdoor"] }),
+  def({ id: "shrub-boxwood", name: "Boxwood Shrub", category: "outdoor", mesh: "shrub", w: IN(30), d: IN(30), h: IN(28), mount: "floor", tags: ["shrub", "bush", "boxwood", "landscape", "outdoor"] }),
+  def({ id: "hedge-row", name: "Hedge Row", category: "outdoor", mesh: "hedge", w: IN(72), d: IN(18), h: IN(42), mount: "floor", resizable: { min: IN(24), max: IN(240), step: IN(6) }, tags: ["hedge", "privacy", "landscape", "outdoor", "boxwood"] }),
+  def({ id: "flower-bed", name: "Flower Bed", category: "outdoor", mesh: "flower-bed", w: IN(72), d: IN(30), h: IN(10), mount: "floor", resizable: { min: IN(24), max: IN(192), step: IN(6), axis: "wd" }, tags: ["flowers", "bed", "garden", "landscape", "mulch", "outdoor"] }),
+];
+
 // --------------------------------- Decor ---------------------------------
 
 export const DECOR: CatalogItem[] = [
@@ -176,7 +206,7 @@ export const DECOR: CatalogItem[] = [
 ];
 
 export const CATALOG: CatalogItem[] = [
-  ...CABINETS, ...APPLIANCES, ...FIXTURES, ...LIGHTING, ...DOORS_WINDOWS, ...FURNITURE, ...DECOR,
+  ...CABINETS, ...APPLIANCES, ...FIXTURES, ...LIGHTING, ...DOORS_WINDOWS, ...FURNITURE, ...OUTDOOR, ...DECOR,
 ];
 
 const CATALOG_MAP = new Map(CATALOG.map((c) => [c.id, c]));
@@ -205,11 +235,12 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   lighting: "Lighting",
   "doors-windows": "Doors & Windows",
   furniture: "Furniture",
+  outdoor: "Outdoor",
   decor: "Decor",
 };
 
 export const CATEGORY_ORDER: Category[] = [
-  "cabinets", "appliances", "fixtures", "lighting", "doors-windows", "furniture", "decor",
+  "cabinets", "appliances", "fixtures", "lighting", "doors-windows", "furniture", "outdoor", "decor",
 ];
 
 /** Every procedural builder key (kept in sync with canvas/builders.tsx, which
@@ -228,6 +259,9 @@ export const MESH_KEYS: string[] = [
   "door", "door-double", "door-sliding", "doorway", "window", "window-double", "window-picture",
   "sofa", "sectional", "armchair", "coffee-table", "side-table", "tv-console", "dining-table",
   "dining-chair", "stool", "bookshelf", "bed", "dresser", "nightstand", "desk", "rug",
+  "deck-platform", "pergola", "gable-porch", "garden-arbor", "fence-panel", "planter-box",
+  "patio-table", "patio-chair", "adirondack", "chaise-lounge", "outdoor-sofa", "fire-pit",
+  "grill", "umbrella", "tree-shade", "tree-evergreen", "shrub", "hedge", "flower-bed",
   "plant", "plant-small", "mirror", "art", "vase",
 ];
 

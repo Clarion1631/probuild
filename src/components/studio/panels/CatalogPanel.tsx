@@ -5,7 +5,7 @@
 import { useMemo, useState } from "react";
 import {
   Search, RefrigeratorIcon, Lamp, DoorOpen, Sofa, Flower2, Grid2x2, Paintbrush,
-  Layers, ShowerHead, X,
+  Layers, ShowerHead, TreePine, X,
 } from "lucide-react";
 import {
   CATALOG, CATEGORY_LABELS, CATEGORY_ORDER, getLibraryProducts,
@@ -29,6 +29,7 @@ const CATEGORY_ICONS: Record<Category, React.ReactNode> = {
   lighting: <Lamp className="h-4 w-4" />,
   "doors-windows": <DoorOpen className="h-4 w-4" />,
   furniture: <Sofa className="h-4 w-4" />,
+  outdoor: <TreePine className="h-4 w-4" />,
   decor: <Flower2 className="h-4 w-4" />,
 };
 
@@ -82,7 +83,7 @@ export function CatalogPanel() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search cabinets, fridge, sofa..."
+                placeholder="Search cabinets, sofa, pergola..."
                 className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-8 pr-7 text-xs outline-none focus:border-blue-400 focus:bg-white"
               />
               {query && (

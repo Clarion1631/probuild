@@ -49,7 +49,7 @@ export default async function BookkeeperReceiptsPage() {
                     <div className="text-sm text-amber-800">
                         <strong>Receipt forwarding address:</strong> Forward emailed receipts to{" "}
                         <code className="bg-amber-100 px-1 py-0.5 rounded font-mono text-xs">receipts@probuild.goldentouchremodeling.com</code>{" "}
-                        (configure email routing in your DNS/email provider to post to <code>/api/receipts/parse</code>).
+                        — they land in the Drive receipts archive, where the receipt automation processes them.
                     </div>
                 </div>
             </div>

@@ -30,27 +30,37 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
         setUploadError("");
         setShowModal(true); // Open modal immediately to show parsing
 
+        // Intentionally no projectId: the parse route auto-creates an expense when
+        // given one, but here the user reviews and saves via POST /api/expenses.
         const formData = new FormData();
-        formData.append("receipt", file);
+        formData.append("file", file);
 
         try {
-            const res = await fetch("/api/expenses/parse", {
+            const res = await fetch("/api/receipts/parse", {
                 method: "POST",
                 body: formData,
             });
 
-            if (!res.ok) throw new Error("Failed to parse receipt");
+            if (!res.ok) {
+                const err = await res.json().catch(() => null);
+                throw new Error(err?.error || "Failed to parse receipt");
+            }
 
             const data = await res.json();
 
             // Populate form with AI data
-            if (data.parsedData) {
-                setAmount(data.parsedData.amount?.toString() || "");
-                setVendor(data.parsedData.vendor || "");
-                setDate(data.parsedData.date || "");
-                setDescription(data.parsedData.description || "");
-            }
+            setAmount(data.amount?.toString() || "");
+            setVendor(data.vendor || "");
+            setDate(data.date || "");
+            const parsed = data.parsed || {};
+            const itemSummary = Array.isArray(parsed.items)
+                ? parsed.items.map((i: any) => i?.description).filter(Boolean).slice(0, 3).join(", ")
+                : "";
+            setDescription(itemSummary || parsed.notes || "");
             setReceiptUrl(data.receiptUrl || "");
+            if (data.storageError) {
+                toast.warning("Receipt parsed, but the image could not be stored — it won't be attached to the expense.");
+            }
 
         } catch (error: any) {
             setUploadError(error.message);

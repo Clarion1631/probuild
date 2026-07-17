@@ -27,6 +27,7 @@ const ROOM_TYPE_OPTIONS: Array<{ value: RoomType; label: string }> = [
   { value: "bathroom", label: "Bathroom" },
   { value: "laundry", label: "Laundry" },
   { value: "bedroom", label: "Bedroom" },
+  { value: "outdoor", label: "Outdoor / Patio" },
   { value: "other", label: "Living / Other" },
 ];
 
@@ -68,7 +69,7 @@ export function RoomList({ ownerKind, ownerId }: RoomListProps) {
         <div>
           <h1 className="text-xl font-bold text-slate-800">Room Designer</h1>
           <p className="mt-0.5 text-sm text-slate-500">
-            Lay out kitchens, baths, and living spaces in 3D - then share them with your client.
+            Lay out kitchens, baths, living spaces, and outdoor areas in 3D - then share them with your client.
           </p>
         </div>
         <button
@@ -130,8 +131,9 @@ export function RoomList({ ownerKind, ownerId }: RoomListProps) {
                     e.stopPropagation();
                     remove(room);
                   }}
-                  className="rounded-lg p-2 text-slate-300 opacity-0 transition group-hover:opacity-100 hover:bg-red-50 hover:text-red-500"
+                  className="rounded-lg p-2 text-slate-300 opacity-0 transition group-hover:opacity-100 hover:bg-red-50 hover:text-red-500 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:outline-none [@media(hover:none)]:opacity-100"
                   title="Delete room"
+                  aria-label={"Delete " + room.name}
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
@@ -199,7 +201,12 @@ function CreateRoomModal({
       <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-bold text-slate-800">New Room</h2>
-          <button onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100">
+          <button
+            onClick={onClose}
+            className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:outline-none"
+            title="Close"
+            aria-label="Close modal"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>

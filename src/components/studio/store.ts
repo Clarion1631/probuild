@@ -10,6 +10,7 @@ import { create } from "zustand";
 import type { DesignDoc, PlacedItem } from "@/lib/studio/doc";
 import { emptyDoc, newItemId } from "@/lib/studio/doc";
 import { getItemDef, type CatalogItem } from "@/lib/studio/catalog";
+import { deckTopYAt, isDeckPlatform, restackFloorItems } from "@/lib/studio/stacking";
 
 export type ViewMode = "plan" | "orbit" | "walk";
 export type SaveState = "saved" | "unsaved" | "saving" | "error";
@@ -138,20 +139,29 @@ export const useStudio = create<StudioState>((set, get) => ({
       rotation: pos.rotation ?? 0,
     };
     const s = get();
-    s.commitDoc({ ...s.doc, items: [...s.doc.items, item] });
+    let items = [...s.doc.items, item];
+    // A freshly dropped deck lifts any floor items already standing on it.
+    if (isDeckPlatform(def.id)) items = restackFloorItems(items);
+    s.commitDoc({ ...s.doc, items });
     set({ selectedId: id });
     return id;
   },
 
   updateItem: (id, patch) => {
     const s = get();
-    const items = s.doc.items.map((it) => (it.id === id ? { ...it, ...patch } : it));
+    let items = s.doc.items.map((it) => (it.id === id ? { ...it, ...patch } : it));
+    // Moving/rotating/resizing a deck re-derives the elevation of its riders.
+    const target = items.find((it) => it.id === id);
+    if (target && isDeckPlatform(target.defId)) items = restackFloorItems(items);
     s.commitDoc({ ...s.doc, items });
   },
 
   removeItem: (id) => {
     const s = get();
-    s.commitDoc({ ...s.doc, items: s.doc.items.filter((it) => it.id !== id) });
+    const removed = s.doc.items.find((it) => it.id === id);
+    let items = s.doc.items.filter((it) => it.id !== id);
+    if (removed && isDeckPlatform(removed.defId)) items = restackFloorItems(items);
+    s.commitDoc({ ...s.doc, items });
     if (s.selectedId === id) set({ selectedId: null });
   },
 
@@ -168,7 +178,13 @@ export const useStudio = create<StudioState>((set, get) => ({
       x: src.x + Math.cos(src.rotation) * offset,
       z: src.z - Math.sin(src.rotation) * offset,
     };
-    s.commitDoc({ ...s.doc, items: [...s.doc.items, copy] });
+    // The copy lands at a new spot - its deck elevation can differ from the source's.
+    if (def?.mount === "floor" && !isDeckPlatform(copy.defId)) {
+      copy.y = deckTopYAt(s.doc.items, { x: copy.x, z: copy.z });
+    }
+    let items = [...s.doc.items, copy];
+    if (isDeckPlatform(copy.defId)) items = restackFloorItems(items);
+    s.commitDoc({ ...s.doc, items });
     set({ selectedId: nid });
     return nid;
   },

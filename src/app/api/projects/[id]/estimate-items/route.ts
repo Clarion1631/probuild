@@ -12,10 +12,23 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const fail = await assertProjectAccess(auth.user, projectId);
     if (fail) return fail;
 
-    // Top-level items only (parentId null) from all estimates on this project
+    const { searchParams } = new URL(req.url);
+    const estimateId = searchParams.get("estimateId");
+
+    const estimateFilter: any = {
+        projectId,
+        status: { in: ["Approved", "Invoiced", "Partially Paid", "Paid"] },
+        archivedAt: null,
+    };
+
+    if (estimateId) {
+        estimateFilter.id = estimateId;
+    }
+
+    // Top-level items only (parentId null) from active and approved estimates on this project
     const items = await prisma.estimateItem.findMany({
         where: {
-            estimate: { projectId },
+            estimate: estimateFilter,
             parentId: null,
         },
         select: {

@@ -17,12 +17,13 @@ import { useStudio, type ViewMode } from "./store";
 import { captureSnapshot, downloadDataUrl } from "./snapshot";
 
 export function TopBar({
-  roomName, backHref, onShare, onRenders,
+  roomName, backHref, onShare, onRenders, onAiFurnish,
 }: {
   roomName: string;
   backHref: string;
   onShare: () => void;
   onRenders: () => void;
+  onAiFurnish: () => void;
 }) {
   const view = useStudio((s) => s.view);
   const setView = useStudio((s) => s.setView);
@@ -120,6 +121,15 @@ export function TopBar({
       </button>
 
       <button
+        onClick={onAiFurnish}
+        className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+        title="Furnish this room using an AI prompt"
+      >
+        <Sparkles className="h-3.5 w-3.5 text-blue-500" />
+        AI Furnish
+      </button>
+
+      <button
         onClick={() => setPresentMode(true)}
         className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
         title="Clean full-screen view for client meetings"
@@ -201,10 +211,13 @@ function RoomSizeButton() {
 
   // Scale the EXISTING polygon to the new bounding box - keeps custom and
   // angled shapes intact instead of resetting them.
+  // Outdoor "walls" are fences - allow them well below the indoor 7ft floor.
+  const minHeight = doc.room.outdoor ? feet(3) : feet(7);
+
   const applyDims = () => {
     const w = Math.min(feet(60), Math.max(feet(4), parseFtIn(wText) ?? bounds.width));
     const l = Math.min(feet(60), Math.max(feet(4), parseFtIn(lText) ?? bounds.length));
-    const h = Math.min(feet(16), Math.max(feet(7), parseFtIn(hText) ?? doc.room.height));
+    const h = Math.min(feet(16), Math.max(minHeight, parseFtIn(hText) ?? doc.room.height));
     const sx = bounds.width > 0 ? w / bounds.width : 1;
     const sz = bounds.length > 0 ? l / bounds.length : 1;
     const points = doc.room.points.map((p) => ({
@@ -218,15 +231,17 @@ function RoomSizeButton() {
   const resetLayout = (shape: "rect" | "l-shape") => {
     const w = Math.min(feet(60), Math.max(feet(4), parseFtIn(wText) ?? bounds.width));
     const l = Math.min(feet(60), Math.max(feet(4), parseFtIn(lText) ?? bounds.length));
-    const h = Math.min(feet(16), Math.max(feet(7), parseFtIn(hText) ?? doc.room.height));
+    const h = Math.min(feet(16), Math.max(minHeight, parseFtIn(hText) ?? doc.room.height));
     const base = shape === "l-shape"
       ? makeLShapeRoom(w, l, w * 0.45, l * 0.45, h)
       : makeRectRoom(w, l, h);
-    // slope only survives onto rect layouts
-    setRoomShape({ ...base, crown: doc.room.crown, slope: shape === "rect" ? doc.room.slope : undefined });
+    // slope only survives onto rect layouts; outdoor + open boundary always survive
+    setRoomShape({ ...base, crown: doc.room.crown, outdoor: doc.room.outdoor, noWalls: doc.room.noWalls, slope: shape === "rect" ? doc.room.slope : undefined });
   };
 
   const setCrown = (on: boolean) => setRoomShape({ ...doc.room, crown: on || undefined });
+
+  const setFence = (on: boolean) => setRoomShape({ ...doc.room, noWalls: on ? undefined : true });
 
   const setSlopeSide = (idx: number | null) => {
     if (idx === null) {
@@ -293,17 +308,34 @@ function RoomSizeButton() {
             </div>
           </div>
 
-          <div className="mt-3 border-t border-slate-100 pt-2.5">
-            <label className="flex items-center justify-between">
-              <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Crown molding</span>
-              <input
-                type="checkbox"
-                checked={!!doc.room.crown}
-                onChange={(e) => setCrown(e.target.checked)}
-                className="h-4 w-4 accent-blue-600"
-              />
-            </label>
-          </div>
+          {doc.room.outdoor ? (
+            <div className="mt-3 border-t border-slate-100 pt-2.5">
+              <label className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Boundary fence / walls</span>
+                <input
+                  type="checkbox"
+                  checked={!doc.room.noWalls}
+                  onChange={(e) => setFence(e.target.checked)}
+                  className="h-4 w-4 accent-blue-600"
+                />
+              </label>
+              <div className="mt-1 text-[10px] leading-snug text-slate-400">
+                Off = open yard with no fence. The boundary still defines the ground area.
+              </div>
+            </div>
+          ) : (
+            <div className="mt-3 border-t border-slate-100 pt-2.5">
+              <label className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Crown molding</span>
+                <input
+                  type="checkbox"
+                  checked={!!doc.room.crown}
+                  onChange={(e) => setCrown(e.target.checked)}
+                  className="h-4 w-4 accent-blue-600"
+                />
+              </label>
+            </div>
+          )}
 
           <div className="mt-3 border-t border-slate-100 pt-2.5">
             <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">Slanted ceiling</div>
