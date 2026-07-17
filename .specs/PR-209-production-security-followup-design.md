@@ -2,9 +2,9 @@
 
 **Date:** 2026-07-17
 
-**Status:** Approved design; awaiting written-spec review
+**Status:** Approved written specification
 
-**Base:** `origin/main` at `74a69c0b0a616ca30ee6dda9b659a0a84da33241`
+**Base:** `origin/main` at `28c5842e2dca915c66b73fec4c4c8d70146913e9`
 
 **Production merge under review:** `f4ad332928c0100acde331d0e9fd06d1e0546d9b`
 
@@ -58,9 +58,9 @@ The owned API returns a small handle with:
 - `url`: the value passed to the database transaction.
 - `discard()`: an idempotent, attempt-local cleanup operation.
 
-When this invocation creates a Supabase object, `discard()` removes that exact path from the existing signatures bucket and reports a storage removal error to its caller. When the input is an already-persisted application-owned URL or the development fallback remains an inline data URL, `discard()` is a no-op because this invocation created no object.
+When this invocation creates a Supabase object, `discard()` removes that exact path from the existing signatures bucket and reports a storage removal error to its caller. Concurrent calls share one in-flight deletion promise so the handle issues at most one removal request. When the input is an already-persisted application-owned URL or the development fallback remains an inline data URL, `discard()` is a no-op because this invocation created no object.
 
-If upload succeeds but public-URL construction unexpectedly fails, the storage function removes the uploaded path before propagating the error. It must never return a handle that has lost the path needed for compensation.
+The Supabase upload API used by this repository does not expose proven cancellation semantics. If the local upload deadline wins, the storage function therefore waits for the already-started upload to settle; a late success is removed through the Storage API before the timeout error propagates. This trades a potentially longer failed request for the stronger money-path guarantee that a late upload cannot escape ownership. If upload succeeds but public-URL construction returns no URL or throws, the storage function likewise removes the uploaded path before propagating the error. It must never return a handle that has lost the path needed for compensation.
 
 ### Approval coordinator
 
@@ -68,8 +68,9 @@ A focused, server-only coordinator in `src/lib/change-order-approval.ts` will ow
 
 1. Persist the signature and receive its ownership handle.
 2. Call `approveChangeOrderCore` with the handle's URL.
-3. If the core throws for any reason, call `discard()` and then rethrow the original approval error.
-4. If the core commits, return its result without calling `discard()`. Ownership has transferred to the committed change-order row.
+3. If the core returns `null` because the row does not exist, call `discard()` and then return `null`.
+4. If the core throws for any reason, call `discard()` and then rethrow the original approval error.
+5. If the core commits, return its result without calling `discard()`. Ownership has transferred to the committed change-order row.
 
 `approveChangeOrder` in `src/lib/actions.ts` will continue to perform authentication, project ownership, signature-name, and drawn-signature validation before calling the coordinator. Its post-commit automation and cache revalidation remain outside the coordinator. Consequently, a failure after the transaction commits cannot delete the winning signature.
 
@@ -77,7 +78,7 @@ The coordinator accepts narrow dependency overrides for tests. Production uses t
 
 ### Error handling
 
-The transaction/business error remains the primary error returned to the caller. If compensating deletion also fails, the coordinator emits a sanitized server-side event containing a stable operation label, the change-order identifier, and only a normalized error type/code/status. It must not log the raw error object or message, signature data URL, bearer credentials, customer-entered signature name, storage path, or public URL. It then rethrows the original approval error.
+The transaction/business error remains the primary error returned to the caller. If compensating deletion also fails, the coordinator emits a sanitized server-side event containing a stable operation label, the change-order identifier, and only a normalized error type/code/status. It must not log the raw error object or message, signature data URL, bearer credentials, customer-entered signature name, storage path, or public URL. Telemetry invocation is itself guarded: a failing reporter is reduced to sanitized fallback logging and can never replace the primary approval error. The coordinator then rethrows the original approval error.
 
 This choice preserves current client-visible validation behavior while making cleanup failure observable for operations. Storage and PostgreSQL cannot participate in one atomic transaction, so compensating deletion is necessarily best-effort at the infrastructure boundary.
 
@@ -110,6 +111,10 @@ Each concurrent request uploads a unique object. The existing `FOR UPDATE` appro
 4. **Transaction failure:** an injected failure at the approval-core boundary removes the attempt's object and preserves the original error.
 5. **Concurrent losers:** multiple simultaneous approvals produce one fulfilled result; all rejected attempts remove their objects; one object remains; and that object's URL equals the database row's `clientSignatureUrl`.
 6. **Cleanup failure:** a simulated removal failure preserves the original approval error and records only the sanitized cleanup event fields.
+7. **Missing row:** a `null` core result removes the attempt's object before returning `null`.
+8. **Storage deadline:** a deterministic late-success-after-timeout case removes the exact uploaded path before returning the storage error.
+9. **URL construction failure:** both a missing public URL and a thrown URL-construction error remove the uploaded object.
+10. **Telemetry failure:** a throwing cleanup reporter cannot replace the primary approval error.
 
 The existing exactly-once, concurrent-writer, item, state, and subtotal tests remain and must continue to pass.
 
