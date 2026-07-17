@@ -35,41 +35,45 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "Takeoff not found" }, { status: 404 });
         }
 
-        const uploadUrls = [];
-        for (const file of files) {
-            const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-            const storagePath = `takeoffs/${takeoffId}/${uuidv4()}_${safeName}`;
+        try {
+            const uploadUrls = await Promise.all(
+                files.map(async (file: any) => {
+                    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+                    const storagePath = `takeoffs/${takeoffId}/${uuidv4()}_${safeName}`;
 
-            // Create a signed URL for direct upload (valid for 10 minutes)
-            const { data: signedData, error: signedError } = await supabase.storage
-                .from(STORAGE_BUCKET)
-                .createSignedUploadUrl(storagePath);
+                    // Create a signed URL for direct upload (valid for 10 minutes)
+                    const { data: signedData, error: signedError } = await supabase.storage
+                        .from(STORAGE_BUCKET)
+                        .createSignedUploadUrl(storagePath);
 
-            if (signedError) {
-                console.error("Signed URL error:", signedError);
-                return NextResponse.json(
-                    { error: `Failed to create upload URL: ${signedError.message}` },
-                    { status: 500 }
-                );
-            }
+                    if (signedError) {
+                        throw new Error(signedError.message);
+                    }
 
-            // Get the public URL for this path
-            const { data: urlData } = supabase.storage
-                .from(STORAGE_BUCKET)
-                .getPublicUrl(storagePath);
+                    // Get the public URL for this path
+                    const { data: urlData } = supabase.storage
+                        .from(STORAGE_BUCKET)
+                        .getPublicUrl(storagePath);
 
-            uploadUrls.push({
-                fileName: file.name,
-                mimeType: file.type || "application/octet-stream",
-                size: file.size || 0,
-                storagePath,
-                signedUrl: signedData.signedUrl,
-                token: signedData.token,
-                publicUrl: urlData.publicUrl,
-            });
+                    return {
+                        fileName: file.name,
+                        mimeType: file.type || "application/octet-stream",
+                        size: file.size || 0,
+                        storagePath,
+                        signedUrl: signedData.signedUrl,
+                        token: signedData.token,
+                        publicUrl: urlData.publicUrl,
+                    };
+                })
+            );
+            return NextResponse.json({ uploadUrls });
+        } catch (error: any) {
+            console.error("Signed URL error:", error);
+            return NextResponse.json(
+                { error: `Failed to create upload URL: ${error.message}` },
+                { status: 500 }
+            );
         }
-
-        return NextResponse.json({ uploadUrls });
     }
 
     // === DIRECT UPLOAD MODE: For smaller files (<4MB) ===
@@ -100,47 +104,48 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "Takeoff not found" }, { status: 404 });
     }
 
-    const uploadedFiles: any[] = [];
+    try {
+        const uploadedFiles = await Promise.all(
+            files.map(async (file: File) => {
+                const bytes = await file.arrayBuffer();
+                const buffer = Buffer.from(bytes);
+                const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+                const storagePath = `takeoffs/${takeoffId}/${uuidv4()}_${safeName}`;
 
-    for (const file of files) {
-        const bytes = await file.arrayBuffer();
-        const buffer = Buffer.from(bytes);
-        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-        const storagePath = `takeoffs/${takeoffId}/${uuidv4()}_${safeName}`;
+                const { error: uploadError } = await supabase.storage
+                    .from(STORAGE_BUCKET)
+                    .upload(storagePath, buffer, {
+                        contentType: file.type || "application/octet-stream",
+                        upsert: false,
+                    });
 
-        const { error: uploadError } = await supabase.storage
-            .from(STORAGE_BUCKET)
-            .upload(storagePath, buffer, {
-                contentType: file.type || "application/octet-stream",
-                upsert: false,
-            });
+                if (uploadError) {
+                    throw new Error(`Storage upload failed: ${uploadError.message}`);
+                }
 
-        if (uploadError) {
-            console.error("Supabase upload error:", uploadError);
-            return NextResponse.json(
-                { error: `Storage upload failed: ${uploadError.message}` },
-                { status: 500 }
-            );
-        }
+                const { data: urlData } = supabase.storage
+                    .from(STORAGE_BUCKET)
+                    .getPublicUrl(storagePath);
 
-        const { data: urlData } = supabase.storage
-            .from(STORAGE_BUCKET)
-            .getPublicUrl(storagePath);
+                const publicUrl = urlData?.publicUrl || storagePath;
 
-        const publicUrl = urlData?.publicUrl || storagePath;
-
-        const takeoffFile = await prisma.takeoffFile.create({
-            data: {
-                takeoffId,
-                name: file.name,
-                url: publicUrl,
-                mimeType: file.type || "application/octet-stream",
-                size: buffer.length,
-            },
-        });
-
-        uploadedFiles.push(takeoffFile);
+                return prisma.takeoffFile.create({
+                    data: {
+                        takeoffId,
+                        name: file.name,
+                        url: publicUrl,
+                        mimeType: file.type || "application/octet-stream",
+                        size: buffer.length,
+                    },
+                });
+            })
+        );
+        return NextResponse.json({ files: uploadedFiles, count: uploadedFiles.length }, { status: 201 });
+    } catch (error: any) {
+        console.error("Supabase upload error:", error);
+        return NextResponse.json(
+            { error: error.message },
+            { status: 500 }
+        );
     }
-
-    return NextResponse.json({ files: uploadedFiles, count: uploadedFiles.length }, { status: 201 });
 }
