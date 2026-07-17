@@ -7899,15 +7899,22 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
             memos: "",
             terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
             items: {
-                create: selectedItems.map((item: any, idx: number) => ({
-                    description: item.name + (item.description ? ` - ${item.description}` : ""),
-                    quantity: parseFloat(item.quantity) || 1,
-                    unitCost: parseFloat(item.unitCost) || 0,
-                    total: (parseFloat(item.quantity) || 1) * (parseFloat(item.unitCost) || 0),
-                    order: idx,
-                    costCodeId: item.costCodeId,
-                    costTypeId: item.costTypeId
-                }))
+                create: selectedItems.map((item: any, idx: number) => {
+                    // Preserve an explicit zero quantity (optional/alternate estimate
+                    // lines are shown at $0) — only a missing/unparseable quantity
+                    // falls back to 1. `|| 1` would reprice a $0 option into the PO.
+                    const parsedQty = parseFloat(item.quantity);
+                    const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
+                    return {
+                        description: item.name + (item.description ? ` - ${item.description}` : ""),
+                        quantity: qty,
+                        unitCost: parseFloat(item.unitCost) || 0,
+                        total: qty * (parseFloat(item.unitCost) || 0),
+                        order: idx,
+                        costCodeId: item.costCodeId,
+                        costTypeId: item.costTypeId
+                    };
+                })
             }
         }
     });

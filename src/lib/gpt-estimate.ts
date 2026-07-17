@@ -351,6 +351,9 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
         // paymentMilestones is ignored here — milestone math is done by
         // recomputeMilestones below so items and tax share one total path.
         transformed = transformPhasesToItems({ phases }, costCodes, costTypes);
+        if (transformed.totalEstimate === 0) {
+            warnings.push("Estimate total is $0. Verify line-item quantities and unit costs unless a $0 estimate is intentional; milestones on a $0 total are all $0.");
+        }
         idMap = new Map<string, string>();
         for (const item of transformed.items) idMap.set(item.id, randomUUID());
     }
@@ -579,6 +582,9 @@ export async function createEstimateFromPhases(input: CreateEstimateInput): Prom
         costCodes,
         costTypes,
     );
+    if (transformed.totalEstimate === 0) {
+        warnings.push("Estimate total is $0. Verify line-item quantities and unit costs unless a $0 estimate is intentional; milestones on a $0 total are all $0.");
+    }
 
     // The transform emits placeholder ids (imp_<ts>_p0, ...) with parentId references;
     // remap them to fresh ids so they can be persisted with real parent links.
