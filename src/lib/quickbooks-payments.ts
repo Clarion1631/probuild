@@ -12,6 +12,7 @@
  */
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
 import {
@@ -267,6 +268,8 @@ async function markMilestonePaidFromQB(
                 }
             }
         }
+        // Durable notification, enqueued in-tx (delivered by the drainer after commit).
+        await enqueueMilestonePaid(t, { scheduleId: paymentScheduleId, scheduleType: "invoice" });
         return true;
     }));
 }
@@ -509,8 +512,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                 });
                 if (recorded) {
                     result.settled++;
-                    const { notifyMilestonePaid } = await import("./payment-notifications");
-                    await notifyMilestonePaid(schedule.id);
+                    await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => {});
                 }
             } else if (probe.balance < probe.total) {
                 result.partiallyPaid++;

@@ -6,7 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
 import { toNum } from "@/lib/prisma-helpers";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
-import { sendInvoicePaymentReceivedEmails } from "@/lib/payment-notifications";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-outbox";
 
 // Fallback settlement for when the client lands back on the portal invoice page with a
 // Stripe session_id before the webhook has processed it. Mirrors the webhook's invoice
@@ -59,9 +59,9 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
                 },
             });
             const won = claim.count > 0;
+            const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
+            if (!invoice) return { won: false };
             const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
-            const invoice = await t.invoice.findUnique({ where: { id: invoiceId }, include: { client: true } });
-            if (!invoice) return { won: false, invoice: null as null, schedule: null as null, newBalance: 0 };
             const totalPaid = allSchedules
                 .filter(s => s.status === "Paid")
                 .reduce((sum, s) => sum + toNum(s.amount), 0);
@@ -71,23 +71,16 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
                 where: { id: invoice.id },
                 data: { balanceDue: newBalance, status: newStatus },
             });
-            const schedule = allSchedules.find(s => s.id === scheduleId) ?? null;
-            return { won, invoice, schedule, newBalance };
+            // Durable notification enqueued in-tx; delivered by the drainer below (single
+            // canonical writer, exactly-once with the webhook via the outbox + settle claim).
+            if (won) {
+                await enqueueMilestonePaid(t, { scheduleId, scheduleType: "invoice" });
+            }
+            return { won };
         }));
 
-        if (result.won && result.invoice && result.schedule) {
-            await sendInvoicePaymentReceivedEmails({
-                invoice: result.invoice,
-                schedule: {
-                    id: result.schedule.id,
-                    name: result.schedule.name,
-                    amount: toNum(result.schedule.amount),
-                    referenceNumber: result.schedule.referenceNumber,
-                },
-                method: paymentMethod,
-                newBalance: result.newBalance,
-                referenceNumber: result.schedule.referenceNumber,
-            });
+        if (result.won) {
+            await drainPaymentNotifications({ scheduleId }).catch(() => {});
         }
     } catch (e) {
         console.error("verifyStripeSession error:", e);

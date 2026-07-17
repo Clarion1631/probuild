@@ -88,6 +88,10 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
       await prisma.activityLog.deleteMany({
         where: { OR: [{ entityId: { in: entityIds } }, { leadId: IDS.lead }, ...(projectId ? [{ projectId }] : [])] },
       });
+      // Outbox rows have no FK, so drop them by scheduleId before the schedules cascade away.
+      const invScheduleIds = (await prisma.paymentSchedule.findMany({ where: { invoiceId: { in: invoices.map(i => i.id) } }, select: { id: true } })).map(s => s.id);
+      const estScheduleIds = (await prisma.estimatePaymentSchedule.findMany({ where: { estimateId: IDS.estimate }, select: { id: true } })).map(s => s.id);
+      await prisma.paymentNotification.deleteMany({ where: { scheduleId: { in: [...invScheduleIds, ...estScheduleIds] } } });
       await prisma.invoice.deleteMany({ where: { estimateId: IDS.estimate } });
       await prisma.estimate.deleteMany({ where: { id: IDS.estimate } });
       if (projectId) await prisma.project.deleteMany({ where: { id: projectId, name: LEAD_NAME } });
@@ -205,6 +209,14 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
       where: { entityType: "invoice", entityId: invoiceId, action: "payment_received" },
     });
     expect(payEvents).toBe(1);
+
+    // Outbox: the settle enqueued exactly one milestone-paid notification and the inline
+    // drain delivered it (no email leaves CI — no client email / CompanySettings — so the
+    // canonical notifier returns ok and the row is marked PROCESSED, not stuck PENDING).
+    const notes = await prisma.paymentNotification.findMany({ where: { scheduleId: invCopy.id } });
+    expect(notes, "one outbox row per settled milestone").toHaveLength(1);
+    expect(notes[0].scheduleType).toBe("invoice");
+    expect(notes[0].status, "inline drain delivered the notification").toBe("PROCESSED");
   });
 
   test("M4: undo the payment — both sides release, statuses restore", async ({ page }) => {
@@ -348,6 +360,7 @@ test.describe.serial("Money pipeline: concurrent payments never lose a balance u
       await cPrisma.activityLog.deleteMany({
         where: { OR: [{ entityId: { in: [C.estimate, C.invoice] } }, { projectId: C.project }] },
       });
+      await cPrisma.paymentNotification.deleteMany({ where: { scheduleId: { in: [C.invDeposit, C.invFinal, C.estDeposit, C.estFinal] } } });
       await cPrisma.paymentSchedule.deleteMany({ where: { invoiceId: C.invoice } });
       await cPrisma.invoice.deleteMany({ where: { id: C.invoice } });
       await cPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: C.estimate } });
@@ -422,5 +435,15 @@ test.describe.serial("Money pipeline: concurrent payments never lose a balance u
     expect(Number(estimate.balanceDue), "estimate balanceDue mirrors with no lost update").toBe(estExpectedBalance);
     expect(Number(estimate.balanceDue)).toBe(0);
     expect(estimate.status).toBe("Paid");
+
+    // Outbox under concurrency: each settle enqueued its own notification and the inline
+    // drains delivered both — exactly one PROCESSED row per invoice milestone, no dupes.
+    const notes = await cPrisma.paymentNotification.findMany({
+      where: { scheduleId: { in: [C.invDeposit, C.invFinal] } },
+      orderBy: { scheduleId: "asc" },
+    });
+    expect(notes, "one outbox row per concurrent settle").toHaveLength(2);
+    expect(notes.every((n) => n.scheduleType === "invoice")).toBe(true);
+    expect(notes.every((n) => n.status === "PROCESSED"), "both delivered by the inline drain").toBe(true);
   });
 });
