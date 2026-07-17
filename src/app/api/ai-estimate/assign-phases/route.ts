@@ -27,7 +27,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
   }
 
-  const { items, costCodes }: { items: ItemInput[]; costCodes: CostCodeInput[] } = await req.json();
+  let items: ItemInput[];
+  let costCodes: CostCodeInput[];
+  try {
+    ({ items, costCodes } = await req.json());
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+  }
 
   if (!items || !Array.isArray(items) || items.length === 0) {
     return NextResponse.json({ error: "items array is required" }, { status: 400 });
@@ -37,10 +43,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "costCodes array is required" }, { status: 400 });
   }
 
+  if (items.length > 500 || costCodes.length > 200) {
+    return NextResponse.json({ error: "Too many items or cost codes" }, { status: 400 });
+  }
+
   const itemsList = items
     .map((item, i) => {
-      const name = (item.name || "").trim();
-      const desc = (item.description || "").trim();
+      const name = (item.name || "").trim().slice(0, 200);
+      const desc = (item.description || "").trim().slice(0, 500);
       return `${i + 1}. ID: "${item.id}" | Name: "${name}"${desc ? ` | Description: "${desc}"` : ""}`;
     })
     .join("\n");
@@ -116,10 +126,20 @@ Rules:
       }
     }
 
-    const assignments = (parsed.assignments || []).map((a: any) => ({
-      id: String(a.id ?? ""),
-      costCodeId: a.costCodeId ? String(a.costCodeId) : null,
-    }));
+    // Only trust IDs that were actually submitted — the model (or an injected
+    // item description) must not be able to introduce arbitrary ids.
+    const validItemIds = new Set(items.map((i) => i.id));
+    const validCostCodeIds = new Set(costCodes.map((c) => c.id));
+    const assignments = (parsed.assignments || [])
+      .map((a: any) => ({
+        id: String(a.id ?? ""),
+        costCodeId: a.costCodeId ? String(a.costCodeId) : null,
+      }))
+      .filter((a: { id: string }) => validItemIds.has(a.id))
+      .map((a: { id: string; costCodeId: string | null }) => ({
+        id: a.id,
+        costCodeId: a.costCodeId && validCostCodeIds.has(a.costCodeId) ? a.costCodeId : null,
+      }));
 
     return NextResponse.json({ assignments });
   } catch (err) {

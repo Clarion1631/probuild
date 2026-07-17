@@ -17,7 +17,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 
     const estimateFilter: any = {
         projectId,
-        status: { in: ["Approved", "Invoiced", "Partially Paid"] },
+        status: { in: ["Approved", "Invoiced", "Partially Paid", "Paid"] },
         archivedAt: null,
     };
 

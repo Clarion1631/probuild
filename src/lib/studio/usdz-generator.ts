@@ -7,10 +7,13 @@ import { getItemDef } from "@/lib/studio/catalog";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import type { DesignDoc, PlacedItem } from "@/lib/studio/doc";
 
-export async function generateUsdzForRoom(roomId: string): Promise<string | null> {
+export async function generateUsdzForRoom(
+    roomId: string,
+    opts: { mirrorToDrive?: boolean } = {},
+): Promise<string | null> {
     const room = await prisma.roomDesign.findUnique({
         where: { id: roomId },
-        select: { id: true, name: true, projectId: true, leadId: true, layoutJson: true },
+        select: { id: true, name: true, projectId: true, leadId: true, layoutJson: true, scanUsdzUrl: true, updatedAt: true },
     });
     if (!room) return null;
 
@@ -45,7 +48,7 @@ export async function generateUsdzForRoom(roomId: string): Promise<string | null
         metalness: floorFinish.metalness ?? 0.0,
     });
     const floorMesh = new THREE.Mesh(new THREE.ShapeGeometry(floorShape), floorMaterial);
-    floorMesh.rotation.x = -Math.PI / 2; // Lie flat on Y=0
+    floorMesh.rotation.x = Math.PI / 2; // Lie flat on Y=0 — must match the studio's +PI/2 so Z isn't mirrored
     scene.add(floorMesh);
 
     // 2. Walls with Openings Cut out
@@ -234,6 +237,19 @@ export async function generateUsdzForRoom(roomId: string): Promise<string | null
 
     const buffer = Buffer.from(arrayBuffer);
 
+    // Autosaves fire every ~2.5s while editing, and each schedules an export.
+    // If the room changed while this export was building, drop it — the newer
+    // save's export will carry the fresh geometry, and stale exports must not
+    // overwrite it (uploads share one storage path per room).
+    const latest = await prisma.roomDesign.findUnique({
+        where: { id: roomId },
+        select: { updatedAt: true },
+    });
+    if (!latest || latest.updatedAt.getTime() !== room.updatedAt.getTime()) {
+        console.log(`USDZ export for ${roomId} superseded by a newer save — skipping upload`);
+        return null;
+    }
+
     // 5. Upload to Supabase Storage
     const supabase = getSupabase();
     if (!supabase) {
@@ -259,14 +275,19 @@ export async function generateUsdzForRoom(roomId: string): Promise<string | null
     const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
     const url = urlData.publicUrl;
 
-    // Update RoomDesign
-    await prisma.roomDesign.update({
-        where: { id: roomId },
-        data: { scanUsdzUrl: url },
-    });
+    // Update RoomDesign — skip when unchanged (the URL is deterministic per
+    // room) so repeated exports don't churn updatedAt.
+    if (room.scanUsdzUrl !== url) {
+        await prisma.roomDesign.update({
+            where: { id: roomId },
+            data: { scanUsdzUrl: url },
+        });
+    }
 
-    // 6. Mirror to Google Drive if lead room
-    if (room.leadId) {
+    // 6. Mirror to Google Drive if lead room — only on explicit generation
+    // (AI furnish etc.), never from the autosave path: mirroring creates a
+    // new Drive file per call.
+    if (opts.mirrorToDrive && room.leadId) {
         try {
             const { mirrorUrlToLeadFolder } = await import("@/lib/lead-drive");
             await mirrorUrlToLeadFolder({

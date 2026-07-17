@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
 
 // Manager wrapper around `Project`. The mobile app uses these to list / create / edit
 // jobs; the response shape matches `ManagerJob` in the mobile `lib/api-types.ts`.
@@ -20,7 +21,7 @@ export async function GET(req: Request) {
     }
 
     const projects = await prisma.project.findMany({
-        where: { status: "In Progress" },
+        where: { status: { in: OPEN_PROJECT_STATUSES } },
         orderBy: { name: "asc" },
         select: {
             id: true,

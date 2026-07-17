@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicText } from "@/lib/anthropic";
-import { CABINETS, APPLIANCES, FIXTURES, LIGHTING, FURNITURE } from "@/lib/studio/catalog";
+import { CABINETS, APPLIANCES, FIXTURES, LIGHTING, FURNITURE, getItemDef } from "@/lib/studio/catalog";
 import type { DesignDoc, PlacedItem, ApiRoomAsset } from "@/lib/studio/doc";
 import { newItemId, toApiPayload } from "@/lib/studio/doc";
 import { generateUsdzForRoom } from "@/lib/studio/usdz-generator";
@@ -23,7 +23,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     const room = await prisma.roomDesign.findUnique({
         where: { id },
-        select: { id: true, name: true, projectId: true, leadId: true, layoutJson: true },
+        select: { id: true, name: true, projectId: true, leadId: true, layoutJson: true, updatedAt: true },
     });
     if (!room) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
@@ -57,10 +57,11 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         return NextResponse.json({ error: "Invalid room layout JSON" }, { status: 500 });
     }
 
-    // Keep structural items (doors, windows, cased openings)
+    // Keep structural items: doors/windows, anything that cuts a wall (niches),
+    // and full-height partitions. Decided by catalog metadata, not id substrings.
     const structuralItems = doc.items.filter((it) => {
-        const category = it.defId.includes("door") || it.defId.includes("window") || it.defId.includes("doorway");
-        return category;
+        const def = getItemDef(it.defId);
+        return !!def && (def.category === "doors-windows" || def.cutsWall || def.fullHeight);
     });
 
     // Catalog items info to pass to Claude
@@ -148,17 +149,46 @@ Return JSON in this exact shape:
             }
         }
 
-        const newItems: PlacedItem[] = (parsed.items || []).map((it: any) => ({
-            id: newItemId(),
-            defId: String(it.defId),
-            x: Number(it.x ?? 0),
-            z: Number(it.z ?? 0),
-            y: it.y !== undefined ? Number(it.y) : undefined,
-            rotation: Number(it.rotation ?? 0),
-            w: it.w !== undefined ? Number(it.w) : undefined,
-            d: it.d !== undefined ? Number(it.d) : undefined,
-            h: it.h !== undefined ? Number(it.h) : undefined,
-        }));
+        // Validate model output before it touches the database: only known
+        // catalog ids, bounded count, finite numbers, positions inside the
+        // room's bounding box, sane dimension overrides.
+        const allowedIds = new Set(catalogSubset.map((c) => c.id));
+        const xs = doc.room.points.map((p) => p.x);
+        const zs = doc.room.points.map((p) => p.z);
+        const bounds = {
+            minX: Math.min(...xs), maxX: Math.max(...xs),
+            minZ: Math.min(...zs), maxZ: Math.max(...zs),
+        };
+        const MAX_ITEMS = 80;
+        const MAX_DIM = 15; // meters
+        const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+        const dimOk = (v: unknown) => v === undefined || (finite(v) && (v as number) > 0.01 && (v as number) <= MAX_DIM);
+
+        const newItems: PlacedItem[] = (Array.isArray(parsed.items) ? parsed.items : [])
+            .slice(0, MAX_ITEMS)
+            .map((it: any) => ({
+                id: newItemId(),
+                defId: String(it.defId),
+                x: Number(it.x ?? 0),
+                z: Number(it.z ?? 0),
+                y: it.y !== undefined ? Number(it.y) : undefined,
+                rotation: Number(it.rotation ?? 0),
+                w: it.w !== undefined ? Number(it.w) : undefined,
+                d: it.d !== undefined ? Number(it.d) : undefined,
+                h: it.h !== undefined ? Number(it.h) : undefined,
+            }))
+            .filter((it: PlacedItem) =>
+                allowedIds.has(it.defId) &&
+                finite(it.x) && finite(it.z) && finite(it.rotation) &&
+                (it.y === undefined || (finite(it.y) && it.y >= 0 && it.y <= (doc.room.height ?? 4))) &&
+                it.x >= bounds.minX - 0.1 && it.x <= bounds.maxX + 0.1 &&
+                it.z >= bounds.minZ - 0.1 && it.z <= bounds.maxZ + 0.1 &&
+                dimOk(it.w) && dimOk(it.d) && dimOk(it.h)
+            );
+
+        if (newItems.length === 0) {
+            return NextResponse.json({ error: "AI response contained no valid placements — try rephrasing the prompt" }, { status: 422 });
+        }
 
         // Merge structural items and AI items
         const mergedItems = [...structuralItems, ...newItems];
@@ -169,13 +199,20 @@ Return JSON in this exact shape:
 
         const { assets } = toApiPayload(updatedDoc);
 
-        // Save in transaction
+        // Save in transaction. The layout was read before the (slow) Claude
+        // call — compare-and-swap on updatedAt so a concurrent autosave or
+        // another editor's save isn't silently overwritten.
         console.log("Saving generated layout to database...");
+        let conflicted = false;
         await prisma.$transaction(async (tx) => {
-            await tx.roomDesign.update({
-                where: { id },
+            const claimed = await tx.roomDesign.updateMany({
+                where: { id, updatedAt: room.updatedAt },
                 data: { layoutJson: updatedDoc as any },
             });
+            if (claimed.count === 0) {
+                conflicted = true;
+                return;
+            }
             await tx.roomAsset.deleteMany({ where: { roomDesignId: id } });
             if (assets.length > 0) {
                 await tx.roomAsset.createMany({
@@ -196,9 +233,13 @@ Return JSON in this exact shape:
             }
         });
 
+        if (conflicted) {
+            return NextResponse.json({ error: "Room was modified while generating — reload and try again" }, { status: 409 });
+        }
+
         // Trigger USDZ regeneration
         console.log("Triggering USDZ export...");
-        const scanUsdzUrl = await generateUsdzForRoom(id);
+        const scanUsdzUrl = await generateUsdzForRoom(id, { mirrorToDrive: true });
 
         const updatedRoom = await prisma.roomDesign.findUnique({
             where: { id },
