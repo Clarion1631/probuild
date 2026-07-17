@@ -396,6 +396,7 @@ export default function FileBrowser({
             <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                     <button
+                        aria-label="More options"
                         className={`p-1.5 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition ${HOVER_REVEAL}`}
                         onClick={e => e.stopPropagation()}
                     >
@@ -462,6 +463,7 @@ export default function FileBrowser({
             <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                     <button
+                        aria-label="More options"
                         className={`p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition ${HOVER_REVEAL}`}
                         onClick={e => e.stopPropagation()}
                     >
@@ -573,10 +575,10 @@ export default function FileBrowser({
                 </div>
                 <div className="flex items-center gap-2">
                     <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                        <button onClick={() => setViewMode("grid")} className={`p-1.5 rounded-md transition ${viewMode === "grid" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
+                        <button onClick={() => setViewMode("grid")} aria-label="Grid view" className={`p-1.5 rounded-md transition ${viewMode === "grid" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
                         </button>
-                        <button onClick={() => setViewMode("list")} className={`p-1.5 rounded-md transition ${viewMode === "list" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
+                        <button onClick={() => setViewMode("list")} aria-label="List view" className={`p-1.5 rounded-md transition ${viewMode === "list" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
                         </button>
                     </div>
@@ -806,7 +808,7 @@ export default function FileBrowser({
                     <div className="bg-white rounded-2xl shadow-2xl w-96 max-h-[60vh] flex flex-col" onClick={e => e.stopPropagation()}>
                         <div className="p-5 border-b border-slate-200 flex items-center justify-between">
                             <h3 className="font-bold text-hui-textMain">Move to Folder</h3>
-                            <button onClick={() => setMoveFileId(null)} className="text-slate-400 hover:text-slate-600 transition">
+                            <button onClick={() => setMoveFileId(null)} aria-label="Close move file modal" className="text-slate-400 hover:text-slate-600 transition">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
                             </button>
                         </div>
@@ -852,7 +854,7 @@ export default function FileBrowser({
                         <img src={previewFile.url} alt={previewFile.name} className="max-w-full max-h-[80vh] rounded-xl shadow-2xl" />
                         <div className="absolute -top-10 right-0 flex items-center gap-3">
                             <p className="text-white text-sm font-medium">{previewFile.name}</p>
-                            <button onClick={() => setPreviewFile(null)} className="text-white/70 hover:text-white transition">
+                            <button onClick={() => setPreviewFile(null)} aria-label="Close file preview" className="text-white/70 hover:text-white transition">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
                             </button>
                         </div>

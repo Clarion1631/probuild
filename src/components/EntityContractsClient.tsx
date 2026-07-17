@@ -10,9 +10,21 @@ import {
 } from "@/lib/actions";
 import { toast } from "sonner";
 import DOMPurify from "dompurify";
-import { ContractWysiwygEditor } from "@/components/ContractWysiwygEditor";
+import dynamic from "next/dynamic";
 import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 import DocumentSignModal from "@/components/DocumentSignModal";
+
+const ContractWysiwygEditor = dynamic(
+    () => import("@/components/ContractWysiwygEditor").then((m) => m.ContractWysiwygEditor),
+    {
+        ssr: false,
+        loading: () => (
+            <div className="h-96 w-full animate-pulse rounded-lg bg-slate-100 flex items-center justify-center text-slate-400 text-sm">
+                Loading editor tools...
+            </div>
+        ),
+    }
+);
 
 interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
@@ -773,7 +785,7 @@ export default function EntityContractsClient({
                                     <span className="text-xl">✨</span>
                                     <h2 className="font-bold text-hui-textMain text-lg">AI Drafted Contract</h2>
                                 </div>
-                                <button onClick={() => setShowDraftPanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
+                                <button aria-label="Close" onClick={() => setShowDraftPanel(false)} className="text-hui-textMuted hover:text-hui-textMain">
                                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                 </button>
                             </div>
@@ -909,7 +921,7 @@ export default function EntityContractsClient({
                     <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[80vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
                         <div className="px-6 pt-6 pb-4 border-b border-slate-200 flex items-center justify-between">
                             <h2 className="text-xl font-bold text-slate-800">Choose Template</h2>
-                            <button onClick={() => setShowTemplateModal(false)} className="text-slate-400 hover:text-slate-600 transition text-xl leading-none">×</button>
+                            <button aria-label="Close" onClick={() => setShowTemplateModal(false)} className="text-slate-400 hover:text-slate-600 transition text-xl leading-none">×</button>
                         </div>
                         <div className="px-6 py-4 flex items-center justify-between gap-4 border-b border-slate-100">
                             <div>
@@ -990,7 +1002,7 @@ export default function EntityContractsClient({
                     <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6 max-h-[80vh] overflow-hidden flex flex-col">
                         <div className="flex items-center justify-between mb-4">
                             <h3 className="text-lg font-bold text-hui-textMain">Signing History</h3>
-                            <button onClick={() => setHistoryModal(null)} className="text-slate-400 hover:text-slate-600 text-xl">&times;</button>
+                            <button aria-label="Close" onClick={() => setHistoryModal(null)} className="text-slate-400 hover:text-slate-600 text-xl">&times;</button>
                         </div>
                         <div className="flex-1 overflow-y-auto">
                             {loadingHistory ? (
