@@ -1706,3 +1706,27 @@ model CatalogProduct {
 
   @@index([category])
 }
+
+// Durable outbox for milestone-paid notifications. A row is enqueued INSIDE the
+// same transaction that settles a milestone, so it commits atomically with the
+// payment; a drainer (inline fast-path + cron backstop) then delivers the team
+// alert / client receipt / activity log exactly once. This closes the gap where a
+// crash between commit and the old inline notify would drop the notification.
+// No FK: scheduleId points at a PaymentSchedule (scheduleType "invoice") or an
+// EstimatePaymentSchedule ("estimate"). Not unique — an undo + re-pay is a new
+// event that must notify again.
+model PaymentNotification {
+  id                  String    @id @default(cuid())
+  scheduleId          String
+  scheduleType        String // "invoice" | "estimate"
+  kind                String    @default("milestone_paid")
+  status              String    @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
+  attempts            Int       @default(0)
+  lastError           String?
+  processingStartedAt DateTime?
+  createdAt           DateTime  @default(now())
+  processedAt         DateTime?
+
+  @@index([status])
+  @@index([scheduleId])
+}

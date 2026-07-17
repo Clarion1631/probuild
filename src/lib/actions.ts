@@ -14,6 +14,7 @@ import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { coLineCents } from "./co-tax";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -3532,14 +3533,17 @@ export async function recordPayment(
             }
         }
 
+        // Durable notification: enqueue INSIDE the tx so it commits atomically with the
+        // settle — a crash before delivery can't drop the team alert / receipt / activity log.
+        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice" });
         return { success: true as const, projectId: invoice.projectId };
     }));
 
     if (!tx.success) return tx;
 
-    // Team alert + client receipt + activity entry (single canonical path).
-    const { notifyMilestonePaid } = await import("./payment-notifications");
-    await notifyMilestonePaid(paymentId);
+    // Inline fast-path delivery of the just-enqueued notification (single canonical writer,
+    // via the outbox). Best-effort — the cron backstop redelivers anything left pending.
+    await drainPaymentNotifications({ scheduleId: paymentId }).catch(() => {});
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -3824,54 +3828,28 @@ export async function recordEstimatePayment(
             },
         });
 
+        // Durable notification, enqueued in-tx. When the payment settled the mirrored INVOICE
+        // copy, notify the invoice side (matches the pre-outbox behavior); otherwise it's a
+        // pre-invoice estimate deposit, so notify the estimate side.
+        const notifyScheduleId = mirroredCopyId ?? paymentId;
+        await enqueueMilestonePaid(t, {
+            scheduleId: notifyScheduleId,
+            scheduleType: mirroredCopyId ? "invoice" : "estimate",
+        });
+
         return {
             success: true as const, projectId: estimate.projectId, leadId: estimate.leadId,
-            mirroredCopyId, paymentName: payment.name, newBalance,
+            mirroredCopyId, notifyScheduleId, paymentName: payment.name, newBalance,
             paymentAmount: input.amount != null ? input.amount : toNum(payment.amount),
         };
     }));
 
     if (!tx.success) return tx;
 
-    if (tx.mirroredCopyId) {
-        // Invoice copy settled — the canonical milestone-paid path covers team
-        // alert, client receipt, and the activity feed.
-        const { notifyMilestonePaid } = await import("./payment-notifications");
-        await notifyMilestonePaid(tx.mirroredCopyId);
-    } else {
-        // No invoice yet (pre-signing deposit): estimate-flavored emails + log.
-        const estimateFull = await prisma.estimate.findUnique({
-            where: { id: estimateId },
-            select: {
-                id: true, code: true, title: true, projectId: true, leadId: true,
-                project: { select: { client: { select: { name: true, email: true } } } },
-                lead: { select: { name: true, client: { select: { name: true, email: true } } } },
-            },
-        });
-        if (estimateFull) {
-            const { sendEstimatePaymentReceivedEmails } = await import("./payment-notifications");
-            await sendEstimatePaymentReceivedEmails({
-                estimate: { id: estimateFull.id, code: estimateFull.code || estimateFull.title || estimateId, project: estimateFull.project, lead: estimateFull.lead },
-                schedule: { id: paymentId, name: tx.paymentName, amount: tx.paymentAmount, referenceNumber },
-                method,
-                newBalance: tx.newBalance,
-                referenceNumber,
-            }).catch(() => {});
-            await logActivity({
-                projectId: estimateFull.projectId,
-                leadId: estimateFull.leadId,
-                actorType: "TEAM",
-                actorName: user.name || "Team",
-                action: "payment_received",
-                entityType: "estimate",
-                entityId: estimateId,
-                entityName: `Estimate ${estimateFull.code || estimateFull.title || ""}`.trim(),
-                // scheduleId lets the activity feed recognize this exact payment if
-                // the milestone is later copied onto an invoice (dedupe by identity).
-                metadata: { milestone: tx.paymentName, amount: tx.paymentAmount, scheduleId: paymentId, method, referenceNumber: referenceNumber || undefined },
-            });
-        }
-    }
+    // Inline fast-path delivery via the outbox's single canonical writer (notifyMilestonePaid
+    // for an invoice copy, notifyEstimateMilestonePaid for an estimate deposit — the latter
+    // now writes the payment_received activity entry the inline path used to log here).
+    await drainPaymentNotifications({ scheduleId: tx.notifyScheduleId }).catch(() => {});
 
     if (tx.projectId) {
         revalidatePath(`/projects/${tx.projectId}/estimates`);
@@ -4120,6 +4098,29 @@ export async function splitInvoiceMilestones(
         await lockMoneyParents(tx, { invoiceId });
         const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
         if (!invoice) throw new Error("Invoice not found");
+
+        // Refuse to re-split while a payment is in flight on a non-Paid milestone. The delete
+        // below drops every non-Paid schedule; if one has an open Stripe checkout or a sent
+        // QuickBooks invoice, a settlement landing afterward would find no row to claim and the
+        // customer would be charged with nothing to reconcile against. Checked under the invoice
+        // lock so a checkout/QB-send starting concurrently can't slip in after this guard.
+        const inFlight = await tx.paymentSchedule.findFirst({
+            where: {
+                invoiceId,
+                status: { not: "Paid" },
+                OR: [
+                    { stripeSessionId: { not: null } },
+                    { stripePaymentIntentId: { not: null } },
+                    { qbInvoiceId: { not: null } },
+                ],
+            },
+            select: { name: true },
+        });
+        if (inFlight) {
+            throw new Error(
+                `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
+            );
+        }
 
         // Recalculate balanceDue: paid amount stays the same, only pending changes
         const paidAmount = Math.round(

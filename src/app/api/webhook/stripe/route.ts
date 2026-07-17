@@ -3,13 +3,10 @@ import { after } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
+import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-outbox";
 import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
-import {
-    sendInvoicePaymentReceivedEmails,
-    sendEstimatePaymentReceivedEmails,
-} from "@/lib/payment-notifications";
 
 // Helper function to process a single event by eventId asynchronously
 async function processEvent(eventId: string) {
@@ -97,22 +94,15 @@ async function processEvent(eventId: string) {
                             where: { id: invoiceId },
                             data: { balanceDue: newBalance, status: newStatus },
                         });
+                        // Durable notification enqueued in-tx (delivered by the drainer below).
+                        if (!alreadyPaid) {
+                            await enqueueMilestonePaid(t, { scheduleId, scheduleType: "invoice" });
+                        }
                         const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
                         return { alreadyPaid, invoice, paidSchedule, newBalance };
                     }));
-                    if (tx.invoice && tx.paidSchedule && !tx.alreadyPaid) {
-                        await sendInvoicePaymentReceivedEmails({
-                            invoice: tx.invoice,
-                            schedule: {
-                                id: tx.paidSchedule.id,
-                                name: tx.paidSchedule.name,
-                                amount: toNum(tx.paidSchedule.amount),
-                                referenceNumber: tx.paidSchedule.referenceNumber,
-                            },
-                            method: paymentMethod,
-                            newBalance: tx.newBalance,
-                            referenceNumber: tx.paidSchedule.referenceNumber,
-                        });
+                    if (!tx.alreadyPaid) {
+                        await drainPaymentNotifications({ scheduleId }).catch(() => {});
                     }
                 }
                 // ── Estimate payment branch ─────────────────────────────────
@@ -215,21 +205,15 @@ async function processEvent(eventId: string) {
                                 }
                             }
                         }
+                        // Durable notification enqueued in-tx (estimate-side, matching the
+                        // pre-outbox behavior for a deposit paid before/at signing).
+                        if (!alreadyPaid) {
+                            await enqueueMilestonePaid(t, { scheduleId, scheduleType: "estimate" });
+                        }
                         return { alreadyPaid, updatedSchedule, newBalance };
                     }));
                     if (!tx.alreadyPaid) {
-                        await sendEstimatePaymentReceivedEmails({
-                            estimate: tx.updatedSchedule.estimate,
-                            schedule: {
-                                id: tx.updatedSchedule.id,
-                                name: tx.updatedSchedule.name,
-                                amount: toNum(tx.updatedSchedule.amount),
-                                referenceNumber: tx.updatedSchedule.referenceNumber,
-                            },
-                            method: paymentMethod,
-                            newBalance: tx.newBalance,
-                            referenceNumber: tx.updatedSchedule.referenceNumber,
-                        });
+                        await drainPaymentNotifications({ scheduleId }).catch(() => {});
                     }
                 }
                 else {
