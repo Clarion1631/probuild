@@ -15,6 +15,7 @@ import {
 import { inches } from "@/lib/studio/units";
 import { useStudio } from "../store";
 import { BUILDERS } from "./builders";
+import { deckTopYAt, isDeckPlatform } from "@/lib/studio/stacking";
 import { resolveItem } from "./Items";
 
 const GRID = inches(1);
@@ -118,11 +119,16 @@ function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem
     e.stopPropagation();
     const p = poseRef.current;
     if (!p) return;
+    // Deck auto-stack: floor items dropped on a deck platform start on its
+    // top surface (decks themselves and wall/ceiling mounts are unaffected).
+    const deckY = placing.mount === "floor" && !isDeckPlatform(placing.id)
+      ? deckTopYAt(doc.items, p)
+      : undefined;
     addItem(placing.id, {
       x: p.x,
       z: p.z,
       rotation: p.rotation,
-      y: placing.mount === "wall" && placing.elevation ? placing.elevation : undefined,
+      y: placing.mount === "wall" && placing.elevation ? placing.elevation : deckY,
     });
     // Hold Shift to keep placing more of the same item.
     if (!e.shiftKey) setPlacing(null);
