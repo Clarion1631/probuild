@@ -385,6 +385,16 @@ model Estimate {
   // Phase 9: Terms & Sending
   termsAndConditions String? // Snapshot of T&C HTML at time of sending
   sentAt             DateTime? // When the estimate was emailed to the client
+
+  // Project Overview / Vision cover section (client-facing, no pricing) + Notes & Assumptions
+  overviewEnabled Boolean @default(false)
+  overviewTitle   String? // UI default "Project Overview"
+  overviewBody    String? // sanitized rich-text HTML
+  notesEnabled    Boolean @default(false)
+  notesTitle      String? // UI default "Estimate Notes & Assumptions"
+  notesBody       String? // sanitized rich-text HTML
+  notesPlacement  String  @default("after") // "before" | "after" line items
+
   changeOrders       ChangeOrder[]
   files              EstimateFile[]
 
