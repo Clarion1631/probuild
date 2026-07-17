@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions } from "@/lib/permissions";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { toNum } from "@/lib/prisma-helpers";
+import { settleStripeEstimatePayment } from "@/lib/stripe-estimate-settlement";
 
 export const maxDuration = 60;
 
@@ -224,32 +225,34 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
             details.push({ sessionId: session.id, type: "estimate", id: scheduleId, action: "not_found", ...context });
             return;
         }
-        if (existing.status === "Paid") {
-            details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "skipped", ...context });
+        // Reconciliation runs even when the estimate copy is already Paid: old
+        // writers could leave its linked invoice copy Pending. The shared helper
+        // repairs both parents without emitting historical notifications.
+        const result = await settleStripeEstimatePayment({
+            estimateId,
+            scheduleId: existing.id,
+            settlement: {
+                stripeSessionId: session.id,
+                stripePaymentIntentId: paymentIntentId,
+                paymentMethod,
+                paymentDate,
+                paidAt: paymentDate,
+            },
+            enqueueNotification: false,
+            dryRun,
+        });
+        if (!result.found) {
+            details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "not_found", ...context });
             return;
         }
 
-        if (!dryRun) {
-            await withTxRetry(() => prisma.$transaction(async (t) => {
-                // Lock the estimate FIRST (canonical Estimate → Invoice order; this branch touches
-                // only the estimate) so backfilling one session can't race a live settle on a
-                // sibling milestone and overwrite its balanceDue. Recompute after the lock.
-                await lockMoneyParents(t, { estimateId });
-                // Claimed update (status guard + parent id) — see the invoice branch above.
-                await t.estimatePaymentSchedule.updateMany({
-                    where: { id: existing!.id, estimateId, status: { not: "Paid" } },
-                    data: { status: "Paid", stripeSessionId: session.id, stripePaymentIntentId: paymentIntentId, paymentMethod, paymentDate, paidAt: paymentDate },
-                });
-                const siblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId } });
-                const estimate = await t.estimate.findUnique({ where: { id: estimateId } });
-                if (!estimate) return;
-                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
-                await t.estimate.update({ where: { id: estimateId }, data: { balanceDue: newBalance } });
-            }));
-        }
-
-        details.push({ sessionId: session.id, type: "estimate", id: existing.id, action: "synced", ...context });
+        details.push({
+            sessionId: session.id,
+            type: "estimate",
+            id: existing.id,
+            action: result.changed ? "synced" : "skipped",
+            ...context,
+        });
         return;
     }
 

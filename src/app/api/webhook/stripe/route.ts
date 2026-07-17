@@ -7,6 +7,7 @@ import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-o
 import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
+import { settleStripeEstimatePayment } from "@/lib/stripe-estimate-settlement";
 
 // Helper function to process a single event by eventId asynchronously
 async function processEvent(eventId: string) {
@@ -107,112 +108,25 @@ async function processEvent(eventId: string) {
                 }
                 // ── Estimate payment branch ─────────────────────────────────
                 else if (metadata?.estimatePaymentScheduleId && metadata?.estimateId) {
-                    // Single transaction: claim + sibling-read + parent update. See invoice branch for rationale.
                     const scheduleId = metadata.estimatePaymentScheduleId;
                     const estimateId = metadata.estimateId;
-                    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
-                        // Canonical lock order: Estimate → Invoice → schedules. Lock the estimate,
-                        // then its (oldest) linked invoice, before the claim + recompute + mirror.
-                        await lockMoneyParents(t, { estimateId });
-                        const lockInv = await t.invoice.findFirst({
-                            where: { estimateId },
-                            // id tiebreaker so the lock target == the mutation target below on a createdAt tie.
-                            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-                            select: { id: true },
-                        });
-                        if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
-
-                        const claim = await t.estimatePaymentSchedule.updateMany({
-                            where: { id: scheduleId, status: { not: "Paid" } },
-                            data: {
-                                status: "Paid",
-                                stripePaymentIntentId: session.payment_intent as string | null,
-                                paymentMethod,
-                                paymentDate: new Date(),
-                                paidAt: new Date(),
-                            },
-                        });
-                        const alreadyPaid = claim.count === 0;
-                        const siblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId } });
-                        const updatedSchedule = await t.estimatePaymentSchedule.findUniqueOrThrow({
-                            where: { id: scheduleId },
-                            include: {
-                                estimate: {
-                                    include: {
-                                        project: { include: { client: true } },
-                                        lead: { include: { client: true } },
-                                    },
-                                },
-                            },
-                        });
-                        const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                        const estimateTotal = toNum(updatedSchedule.estimate.totalAmount);
-                        const newBalance = Math.max(0, estimateTotal - totalPaid);
-                        
-                        // If this is the first payment being logged, track statusBeforePayment
-                        const isFirstPayment = !updatedSchedule.estimate.statusBeforePayment;
-                        const newStatus = newBalance <= 0
-                            ? "Paid"
-                            : totalPaid > 0 ? "Partially Paid"
-                            : updatedSchedule.estimate.status;
-
-                        await t.estimate.update({
-                            where: { id: estimateId },
-                            data: {
-                                balanceDue: newBalance,
-                                status: newStatus,
-                                ...(isFirstPayment && { statusBeforePayment: updatedSchedule.estimate.status }),
-                            },
-                        });
-
-                        // Signing auto-creates an invoice whose milestones mirror this
-                        // schedule — settle the matching copy too so the job can't be
-                        // billed twice (estimate-side Stripe + invoice-side QB/manual).
-                        if (!alreadyPaid) {
-                            // Fetch the SAME invoice we locked in the preamble by id — not a fresh
-                            // findFirst — so the mirror mutates exactly the locked row even if the
-                            // "oldest" ordering shifts concurrently between the two reads.
-                            const linkedInvoice = lockInv
-                                ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
-                                : null;
-                            if (linkedInvoice) {
-                                const copy = linkedInvoice.payments.find(p =>
-                                    p.status !== "Paid" &&
-                                    p.name === updatedSchedule.name &&
-                                    toNum(p.amount) === toNum(updatedSchedule.amount)
-                                );
-                                if (copy) {
-                                    await t.paymentSchedule.update({
-                                        where: { id: copy.id },
-                                        data: {
-                                            status: "Paid",
-                                            paymentMethod,
-                                            paymentDate: new Date(),
-                                            paidAt: new Date(),
-                                            stripePaymentIntentId: (session.payment_intent as string | null) ?? null,
-                                        },
-                                    });
-                                    const allCopies = await t.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
-                                    const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                                    const invBalance = Math.max(0, toNum(linkedInvoice.totalAmount) - invPaid);
-                                    await t.invoice.update({
-                                        where: { id: linkedInvoice.id },
-                                        data: {
-                                            balanceDue: invBalance,
-                                            status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
-                                        },
-                                    });
-                                }
-                            }
-                        }
-                        // Durable notification enqueued in-tx (estimate-side, matching the
-                        // pre-outbox behavior for a deposit paid before/at signing).
-                        if (!alreadyPaid) {
-                            await enqueueMilestonePaid(t, { scheduleId, scheduleType: "estimate" });
-                        }
-                        return { alreadyPaid, updatedSchedule, newBalance };
-                    }));
-                    if (!tx.alreadyPaid) {
+                    const paidAt = new Date();
+                    const tx = await settleStripeEstimatePayment({
+                        estimateId,
+                        scheduleId,
+                        settlement: {
+                            stripeSessionId: session.id,
+                            stripePaymentIntentId: (session.payment_intent as string | null) ?? null,
+                            paymentMethod,
+                            paymentDate: paidAt,
+                            paidAt,
+                        },
+                        enqueueNotification: true,
+                    });
+                    if (!tx.found) {
+                        throw new Error(`Estimate milestone ${scheduleId} was not found on estimate ${estimateId}`);
+                    }
+                    if (tx.notificationEnqueued) {
                         await drainPaymentNotifications({ scheduleId }).catch(() => {});
                     }
                 }
