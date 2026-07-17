@@ -93,10 +93,10 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                     </div>
                 </div>
                 <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                    <button onClick={() => setViewMode("grid")} className={`p-1.5 rounded-md transition ${viewMode === "grid" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
+                    <button onClick={() => setViewMode("grid")} aria-label="Grid view" title="Grid view" className={`p-1.5 rounded-md transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${viewMode === "grid" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
                     </button>
-                    <button onClick={() => setViewMode("list")} className={`p-1.5 rounded-md transition ${viewMode === "list" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
+                    <button onClick={() => setViewMode("list")} aria-label="List view" title="List view" className={`p-1.5 rounded-md transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${viewMode === "list" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
                     </button>
                 </div>
@@ -109,7 +109,8 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                         {i > 0 && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"><path d="M9 5l7 7-7 7"/></svg>}
                         <button
                             onClick={() => navigateToFolder(crumb.id, crumb.name)}
-                            className={`text-xs font-medium transition ${i === folderPath.length - 1 ? "text-hui-textMain font-semibold" : "text-blue-600 hover:text-blue-800"}`}
+                            aria-current={i === folderPath.length - 1 ? "page" : undefined}
+                            className={`text-xs font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 ${i === folderPath.length - 1 ? "text-hui-textMain font-semibold" : "text-blue-600 hover:text-blue-800"}`}
                         >
                             {crumb.name}
                         </button>
@@ -136,7 +137,10 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                             <div
                                 key={folder.id}
                                 onClick={() => navigateToFolder(folder.id, folder.name)}
-                                className="group cursor-pointer bg-white rounded-lg border border-slate-200 px-4 py-3 hover:bg-slate-50 hover:border-blue-200 flex items-center gap-3 transition"
+                                role="button"
+                                tabIndex={0}
+                                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigateToFolder(folder.id, folder.name); } }}
+                                className="group cursor-pointer bg-white rounded-lg border border-slate-200 px-4 py-3 hover:bg-slate-50 hover:border-blue-200 flex items-center gap-3 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                             >
                                 <div className="w-9 h-9 bg-gradient-to-br from-blue-50 to-indigo-50 rounded-lg flex items-center justify-center border border-blue-100/50 shrink-0">
                                     <svg width="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="1.5"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
@@ -161,7 +165,7 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                                 <div key={file.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden hover:shadow-md transition">
                                     <div className="h-28 bg-gradient-to-br from-slate-50 to-slate-100 flex items-center justify-center">
                                         {isImage(file.mimeType) ? (
-                                            <img src={file.url} alt={file.name} className="h-full w-full object-cover cursor-pointer" onClick={() => setPreviewFile(file)} />
+                                            <img src={file.url} alt={`Preview of ${file.name}`} className="h-full w-full object-cover cursor-pointer" onClick={() => setPreviewFile(file)} />
                                         ) : (
                                             <span className="text-3xl">{getFileIcon(file.mimeType)}</span>
                                         )}
@@ -182,7 +186,7 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                                 <div key={file.id} className="px-4 py-3 flex items-center gap-3 hover:bg-slate-50/50 transition">
                                     <div className="w-9 h-9 rounded-lg bg-slate-50 flex items-center justify-center shrink-0 border border-slate-100">
                                         {isImage(file.mimeType) ? (
-                                            <img src={file.url} alt="" className="w-9 h-9 rounded-lg object-cover cursor-pointer" onClick={() => setPreviewFile(file)} />
+                                            <img src={file.url} alt={`Preview of ${file.name}`} className="w-9 h-9 rounded-lg object-cover cursor-pointer" onClick={() => setPreviewFile(file)} />
                                         ) : (
                                             <span className="text-base">{getFileIcon(file.mimeType)}</span>
                                         )}
@@ -192,7 +196,7 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                                         <p className="text-[10px] text-slate-400">{formatBytes(file.size)}</p>
                                     </div>
                                     <span className="text-[10px] text-slate-400 shrink-0">{new Date(file.createdAt).toLocaleDateString()}</span>
-                                    <a href={file.url} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-blue-600 transition p-1" title="Download">
+                                    <a href={file.url} target="_blank" rel="noreferrer" className="text-slate-400 hover:text-blue-600 transition p-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500" title={`Download ${file.name}`} aria-label={`Download ${file.name}`}>
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
                                     </a>
                                 </div>
@@ -209,7 +213,7 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                         <img src={previewFile.url} alt={previewFile.name} className="max-w-full max-h-[80vh] rounded-xl shadow-2xl" />
                         <div className="absolute -top-10 right-0 flex items-center gap-3">
                             <p className="text-white text-sm font-medium">{previewFile.name}</p>
-                            <button onClick={() => setPreviewFile(null)} className="text-white/70 hover:text-white transition">
+                            <button onClick={() => setPreviewFile(null)} aria-label="Close preview" title="Close preview" className="text-white/70 hover:text-white transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white rounded p-1">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
                             </button>
                         </div>

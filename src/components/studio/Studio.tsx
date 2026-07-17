@@ -15,6 +15,7 @@ import { Inspector } from "./panels/Inspector";
 import { TopBar } from "./TopBar";
 import { ShareDialog, type ShareState } from "./ShareDialog";
 import { RendersDialog } from "./RendersDialog";
+import { AiFurnishDialog } from "./AiFurnishDialog";
 import { captureThumbnail } from "./snapshot";
 
 const AUTOSAVE_MS = 2_500;
@@ -33,6 +34,7 @@ export function Studio({ roomId, roomName, initialDoc, backHref, initialShare }:
   const presentMode = useStudio((s) => s.presentMode);
   const [shareOpen, setShareOpen] = useState(false);
   const [rendersOpen, setRendersOpen] = useState(false);
+  const [aiFurnishOpen, setAiFurnishOpen] = useState(false);
   const [share, setShare] = useState<ShareState>(initialShare);
 
   // Load once per room.
@@ -51,6 +53,7 @@ export function Studio({ roomId, roomName, initialDoc, backHref, initialShare }:
         backHref={backHref}
         onShare={() => setShareOpen(true)}
         onRenders={() => setRendersOpen(true)}
+        onAiFurnish={() => setAiFurnishOpen(true)}
       />
       <div className="flex min-h-0 flex-1">
         {!presentMode && <CatalogPanel />}
@@ -69,6 +72,7 @@ export function Studio({ roomId, roomName, initialDoc, backHref, initialShare }:
         />
       )}
       {rendersOpen && <RendersDialog roomId={roomId} onClose={() => setRendersOpen(false)} />}
+      {aiFurnishOpen && <AiFurnishDialog roomId={roomId} onClose={() => setAiFurnishOpen(false)} />}
     </div>
   );
 }

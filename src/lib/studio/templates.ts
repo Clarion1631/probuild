@@ -9,7 +9,7 @@ import type { DesignDoc, PlacedItem } from "./doc";
 import { makeRectRoom, makeLShapeRoom, newItemId } from "./doc";
 import { DEFAULT_SURFACES } from "./materials";
 
-export type RoomType = "kitchen" | "bathroom" | "laundry" | "bedroom" | "other";
+export type RoomType = "kitchen" | "bathroom" | "laundry" | "bedroom" | "outdoor" | "other";
 
 export interface RoomTemplate {
   key: string;
@@ -321,6 +321,118 @@ function lShapeGreatRoom(): DesignDoc {
   );
 }
 
+// ------------------------------ Outdoor spaces ------------------------------
+// Outdoor rooms: the polygon is the yard boundary, walls render as the fence
+// or house siding (room.height = fence height), room.outdoor skips ceiling +
+// baseboards. Items seeded on a deck platform carry y = deck height (6").
+
+const DECK_Y = IN(6);
+
+function backyardPatio(): DesignDoc {
+  const W = ft(20);
+  const L = ft(16);
+  return doc(
+    { ...makeRectRoom(W, L, ft(6)), outdoor: true },
+    { floor: "floor-grass", walls: { all: "wood-cedar" } },
+    [
+      // cedar deck under a pergola, northwest
+      { defId: "deck-platform", x: -ft(3.5), z: -ft(3.75), w: IN(144), d: IN(96) },
+      { defId: "pergola", x: -ft(4), z: -ft(3.75), w: IN(120), d: IN(84) },
+      { defId: "outdoor-sofa", x: -ft(5), z: -ft(6.3), y: DECK_Y },
+      { defId: "fire-pit", x: -ft(5), z: -ft(3), y: DECK_Y },
+      { defId: "patio-chair", x: -ft(6.5), z: -ft(1), deg: 180, y: DECK_Y },
+      { defId: "patio-chair", x: -ft(3.5), z: -ft(1), deg: 180, y: DECK_Y },
+      { defId: "grill-bbq", x: ft(0.2), z: -ft(6.6), y: DECK_Y },
+      { defId: "planter-box", x: ft(1), z: -ft(0.9), y: DECK_Y, w: IN(36) },
+      // dining set on the lawn, east
+      { defId: "patio-table", x: ft(5.5), z: -ft(3) },
+      { defId: "market-umbrella", x: ft(5.5), z: -ft(3) },
+      { defId: "patio-chair", x: ft(5.5), z: -ft(5.2) },
+      { defId: "patio-chair", x: ft(5.5), z: -ft(0.8), deg: 180 },
+      { defId: "patio-chair", x: ft(2.8), z: -ft(3), deg: 90 },
+      { defId: "patio-chair", x: ft(8.2), z: -ft(3), deg: -90 },
+      // lounging + landscaping
+      { defId: "adirondack", x: -ft(6), z: ft(5), deg: 150 },
+      { defId: "adirondack", x: -ft(3.5), z: ft(5.5), deg: 170 },
+      { defId: "garden-arbor", x: ft(1), z: ft(6.8) },
+      { defId: "shrub-boxwood", x: -ft(0.8), z: ft(6.7) },
+      { defId: "shrub-boxwood", x: ft(2.8), z: ft(6.7) },
+      { defId: "hedge-row", x: ft(9), z: ft(1.5), deg: 90, w: IN(96) },
+      { defId: "flower-bed", x: ft(6.5), z: -ft(6.8), w: IN(84) },
+      { defId: "flower-bed", x: -ft(9.2), z: ft(3), deg: 90, w: IN(72), d: IN(24) },
+      { defId: "tree-shade", x: ft(8.4), z: ft(6.6) },
+      { defId: "tree-evergreen", x: -ft(8.5), z: ft(6.5) },
+    ],
+  );
+}
+
+function coveredPorch(): DesignDoc {
+  const W = ft(14);
+  const L = ft(10);
+  return doc(
+    { ...makeRectRoom(W, L, ft(10)), outdoor: true },
+    { floor: "floor-deck-cedar", walls: { all: "paint-swiss-coffee" } },
+    [
+      // gabled roof over the whole porch
+      { defId: "gable-porch", x: 0, z: 0, w: IN(160), d: IN(112) },
+      // house wall: door, window, porch sconces (north)
+      { defId: "door-single", x: ft(4.5), z: -L / 2 },
+      { defId: "window-double", x: -ft(3), z: -L / 2 },
+      { defId: "sconce", x: ft(2.6), z: -L / 2 },
+      { defId: "sconce", x: ft(6.3), z: -L / 2 },
+      // lounge zone, west
+      { defId: "outdoor-sofa", x: -ft(5.4), z: -ft(0.5), deg: 90 },
+      { defId: "coffee-table", x: -ft(3.2), z: -ft(0.5), w: IN(36), d: IN(22) },
+      { defId: "patio-chair", x: -ft(1), z: -ft(1.8), deg: -90 },
+      { defId: "patio-chair", x: -ft(1), z: ft(0.8), deg: -90 },
+      // bistro set, east
+      { defId: "patio-table", x: ft(4), z: ft(1), w: IN(36), d: IN(36) },
+      { defId: "patio-chair", x: ft(4), z: -ft(1), deg: 0 },
+      { defId: "patio-chair", x: ft(4), z: ft(3), deg: 180 },
+      // planters at the open south edge
+      { defId: "planter-box", x: -ft(4), z: ft(4.2) },
+      { defId: "planter-box", x: ft(0.8), z: ft(4.2) },
+    ],
+  );
+}
+
+function gardenRetreat(): DesignDoc {
+  const W = ft(18);
+  const L = ft(14);
+  return doc(
+    { ...makeRectRoom(W, L, ft(6)), outdoor: true },
+    { floor: "floor-grass", walls: { all: "wood-weathered" } },
+    [
+      // pergola-covered deck with a bistro table, north
+      { defId: "deck-platform", x: 0, z: -ft(3), w: IN(96), d: IN(96) },
+      { defId: "pergola", x: 0, z: -ft(3), w: IN(96), d: IN(96) },
+      { defId: "patio-table", x: 0, z: -ft(3), w: IN(48), d: IN(30), y: DECK_Y },
+      { defId: "patio-chair", x: 0, z: -ft(4.9), y: DECK_Y },
+      { defId: "patio-chair", x: 0, z: -ft(1.1), deg: 180, y: DECK_Y },
+      { defId: "patio-chair", x: -ft(2.4), z: -ft(3), deg: 90, y: DECK_Y },
+      { defId: "patio-chair", x: ft(2.4), z: -ft(3), deg: -90, y: DECK_Y },
+      // arbor gate + hedges along the south fence
+      { defId: "garden-arbor", x: 0, z: ft(5.9) },
+      { defId: "shrub-boxwood", x: -ft(1.8), z: ft(5.7) },
+      { defId: "shrub-boxwood", x: ft(1.8), z: ft(5.7) },
+      { defId: "hedge-row", x: -ft(5), z: ft(6.6), w: IN(84) },
+      { defId: "hedge-row", x: ft(5), z: ft(6.6), w: IN(84) },
+      // flower borders down both side fences
+      { defId: "flower-bed", x: -ft(7.7), z: -ft(1), deg: 90, w: IN(120) },
+      { defId: "flower-bed", x: ft(7.7), z: -ft(1), deg: 90, w: IN(120) },
+      // sun loungers, east lawn
+      { defId: "chaise-lounge", x: ft(4.8), z: ft(1.8), deg: 10 },
+      { defId: "chaise-lounge", x: ft(7), z: ft(2), deg: 10 },
+      // fire-pit corner, west lawn
+      { defId: "fire-pit", x: -ft(5), z: ft(2.5) },
+      { defId: "adirondack", x: -ft(7), z: ft(0.8), deg: 45 },
+      { defId: "adirondack", x: -ft(7), z: ft(4.3), deg: 135 },
+      { defId: "tree-shade", x: ft(6.5), z: -ft(5) },
+      { defId: "tree-evergreen", x: -ft(7.5), z: -ft(5.5) },
+    ],
+  );
+}
+
 export const ROOM_TEMPLATES: Record<string, RoomTemplate> = {
   "kitchen_galley": { key: "kitchen_galley", label: "Galley Kitchen", roomType: "kitchen", widthFt: 8, lengthFt: 12, description: "Two parallel runs, efficient workflow", build: kitchenGalley },
   "kitchen_l": { key: "kitchen_l", label: "L-Shape Kitchen", roomType: "kitchen", widthFt: 12, lengthFt: 10, description: "L-run with corner cabinet, sink, and stove", build: kitchenLShape },
@@ -333,6 +445,9 @@ export const ROOM_TEMPLATES: Record<string, RoomTemplate> = {
   "living_room": { key: "living_room", label: "Living Room", roomType: "other", widthFt: 16, lengthFt: 14, description: "Sofa, fireplace, media wall", build: livingRoom },
   "bedroom_queen": { key: "bedroom_queen", label: "Bedroom", roomType: "bedroom", widthFt: 13, lengthFt: 12, description: "Queen bed, dresser, reading chair", build: bedroom },
   "laundry": { key: "laundry", label: "Laundry Room", roomType: "laundry", widthFt: 8, lengthFt: 6, description: "Side-by-side machines, sink, storage", build: laundry },
+  "backyard_patio": { key: "backyard_patio", label: "Backyard Patio", roomType: "outdoor", widthFt: 20, lengthFt: 16, description: "Pergola deck, fire pit, dining set, landscaping", build: backyardPatio },
+  "covered_porch": { key: "covered_porch", label: "Covered Porch", roomType: "outdoor", widthFt: 14, lengthFt: 10, description: "Gabled roof, lounge seating, bistro set", build: coveredPorch },
+  "garden_retreat": { key: "garden_retreat", label: "Garden Retreat", roomType: "outdoor", widthFt: 18, lengthFt: 14, description: "Arbor gate, flower borders, loungers, fire pit", build: gardenRetreat },
 };
 
 export type TemplateKey = keyof typeof ROOM_TEMPLATES;

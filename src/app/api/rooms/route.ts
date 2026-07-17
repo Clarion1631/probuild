@@ -5,7 +5,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { emptyDoc, toApiPayload } from "@/lib/studio/doc";
+import { emptyDoc, emptyOutdoorDoc, toApiPayload } from "@/lib/studio/doc";
 import { resolveTemplate, type RoomType } from "@/lib/studio/templates";
 
 export const dynamic = "force-dynamic";
@@ -113,15 +113,17 @@ export async function POST(req: Request) {
     // body roomType so pickers can't land a "master_bath" template into a
     // kitchen slot by accident.
     const template = resolveTemplate(templateKey);
-    const seedDoc = template ? template.build() : emptyDoc();
-    const payload = toApiPayload(seedDoc);
 
-    const validRoomTypes: RoomType[] = ["kitchen", "bathroom", "laundry", "bedroom", "other"];
+    const validRoomTypes: RoomType[] = ["kitchen", "bathroom", "laundry", "bedroom", "outdoor", "other"];
     const rt: RoomType = template
         ? template.roomType
         : roomType && validRoomTypes.includes(roomType)
             ? roomType
             : "kitchen";
+
+    // Blank outdoor rooms start as a fenced grass yard, not an indoor box.
+    const seedDoc = template ? template.build() : rt === "outdoor" ? emptyOutdoorDoc() : emptyDoc();
+    const payload = toApiPayload(seedDoc);
 
     // Nested create + createMany keeps the insert atomic at the driver level
     // without an interactive $transaction callback (incompatible with the

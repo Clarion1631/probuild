@@ -234,6 +234,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                         amount={payment.amount}
                                                         label="Pay Now"
                                                         settings={companySettings}
+                                                        qbPayLink={payment.status === "Pending" && !payment.qbSyncError ? (payment.qbInvoiceLink || null) : null}
                                                     />
                                                 )}
                                                 {isPaidItem && (
