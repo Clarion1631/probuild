@@ -179,11 +179,12 @@ async function processEvent(eventId: string) {
                         // schedule — settle the matching copy too so the job can't be
                         // billed twice (estimate-side Stripe + invoice-side QB/manual).
                         if (!alreadyPaid) {
-                            const linkedInvoice = await t.invoice.findFirst({
-                                where: { estimateId },
-                                orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-                                include: { payments: true },
-                            });
+                            // Fetch the SAME invoice we locked in the preamble by id — not a fresh
+                            // findFirst — so the mirror mutates exactly the locked row even if the
+                            // "oldest" ordering shifts concurrently between the two reads.
+                            const linkedInvoice = lockInv
+                                ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+                                : null;
                             if (linkedInvoice) {
                                 const copy = linkedInvoice.payments.find(p =>
                                     p.status !== "Paid" &&

@@ -3736,11 +3736,12 @@ export async function recordEstimatePayment(
         // several link back (manual re-invoicing); name+amount fallback only
         // fires when it matches exactly one candidate.
         let mirroredCopyId: string | null = null;
-        const linkedInvoice = await t.invoice.findFirst({
-            where: { estimateId },
-            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-            include: { payments: true },
-        });
+        // Fetch the SAME invoice we locked above by id — not a fresh findFirst — so the mirror
+        // mutates exactly the locked row even if a concurrent insert/delete/re-timestamp shifts
+        // which invoice is "oldest" between the two reads (READ COMMITTED).
+        const linkedInvoice = lockInv
+            ? await t.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+            : null;
         if (linkedInvoice) {
             const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId);
             const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
@@ -3980,7 +3981,10 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
         // Unwind the mirrored invoice copy too — a payment recorded on either
         // side settles both, so unrecording must release both. Oldest linked
         // invoice; name+amount fallback only when it matches exactly one row.
-        const linkedInvoice = await tx.invoice.findFirst({ where: { estimateId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], include: { payments: true } });
+        // Fetch the SAME invoice we locked above by id (see recordEstimatePayment for rationale).
+        const linkedInvoice = lockInv
+            ? await tx.invoice.findUnique({ where: { id: lockInv.id }, include: { payments: true } })
+            : null;
         if (linkedInvoice) {
             const linked = linkedInvoice.payments.find(p => p.sourceScheduleId === paymentId && p.status === "Paid");
             const fallbackCandidates = linked ? [] : linkedInvoice.payments.filter(p =>
