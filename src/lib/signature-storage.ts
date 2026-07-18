@@ -8,8 +8,8 @@ const SIGNATURE_DATA_URL_RE = /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/
 // generous abuse guard, not a real-world limit.
 const MAX_SIGNATURE_BYTES = 6 * 1024 * 1024; // 6 MB
 
-// Cap on the storage upload so a hung/degraded Storage backend can't hang the signing
-// request indefinitely. Drawn signatures are tiny — this only bounds pathological hangs.
+// Caller-visible upload deadline. Cleanup still waits for upload settlement so a late
+// success can be removed instead of leaving an orphaned signature object.
 const UPLOAD_TIMEOUT_MS = 10_000;
 
 export type SignatureStorageBucket = {
