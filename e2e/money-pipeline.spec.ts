@@ -2,6 +2,10 @@ import { test, expect } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
 import { sendChangeOrderToClientCore } from "../src/lib/billing-core";
+import {
+  persistOwnedSignature,
+  type SignatureStorageBucket,
+} from "../src/lib/signature-storage";
 
 /**
  * Money-pipeline regression net — born from the June 2026 lifecycle audit.
@@ -37,6 +41,145 @@ const LEAD_NAME = "Money Pipeline Drill - MPTEST";
 const SIGNER = "E2E Money Signer";
 
 const prisma = new PrismaClient();
+
+test.describe("Change-order signature object ownership", () => {
+  const signatureDataUrl = "data:image/png;base64,AA==";
+
+  test("owned signature discard removes the exact uploaded path once across concurrent calls", async () => {
+    const uploaded: string[] = [];
+    const uploadOptions: Array<{ contentType: string; upsert: false }> = [];
+    const removed: string[][] = [];
+    const bucket: SignatureStorageBucket = {
+      async upload(path, _body, options) {
+        uploaded.push(path);
+        uploadOptions.push(options);
+        return { error: null };
+      },
+      getPublicUrl(path) {
+        return {
+          data: {
+            publicUrl: `https://example.supabase.co/storage/v1/object/public/project-files/${path}`,
+          },
+        };
+      },
+      async remove(paths) {
+        removed.push([...paths]);
+        return { error: null };
+      },
+    };
+
+    const owned = await persistOwnedSignature(
+      signatureDataUrl,
+      "change-orders/test/client",
+      {
+        getBucket: () => bucket,
+        now: () => 1_721_218_400_000,
+        randomId: () => "owned-test-id",
+      },
+    );
+
+    expect(uploaded).toEqual([
+      "signatures/change-orders/test/client/1721218400000_owned-test-id.png",
+    ]);
+    expect(uploadOptions).toEqual([{ contentType: "image/png", upsert: false }]);
+    expect(owned.url).toContain(uploaded[0]);
+
+    await Promise.all([owned.discard(), owned.discard(), owned.discard()]);
+
+    expect(removed).toEqual([[uploaded[0]]]);
+  });
+
+  test("missing public URL compensating-deletes the uploaded object", async () => {
+    const uploaded: string[] = [];
+    const removed: string[][] = [];
+    const bucket: SignatureStorageBucket = {
+      async upload(path) {
+        uploaded.push(path);
+        return { error: null };
+      },
+      getPublicUrl() {
+        return { data: {} };
+      },
+      async remove(paths) {
+        removed.push([...paths]);
+        return { error: null };
+      },
+    };
+
+    await expect(
+      persistOwnedSignature(signatureDataUrl, "change-orders/test/client", {
+        getBucket: () => bucket,
+        now: () => 1_721_218_400_000,
+        randomId: () => "url-failure-id",
+      }),
+    ).rejects.toThrow("Couldn't save your signature");
+
+    expect(removed).toEqual([[uploaded[0]]]);
+  });
+
+  test("thrown public URL construction compensating-deletes the uploaded object", async () => {
+    const uploaded: string[] = [];
+    const removed: string[][] = [];
+    const bucket: SignatureStorageBucket = {
+      async upload(path) {
+        uploaded.push(path);
+        return { error: null };
+      },
+      getPublicUrl() {
+        throw new Error("url construction failed");
+      },
+      async remove(paths) {
+        removed.push([...paths]);
+        return { error: null };
+      },
+    };
+
+    await expect(
+      persistOwnedSignature(signatureDataUrl, "change-orders/test/client", {
+        getBucket: () => bucket,
+        now: () => 1_721_218_400_000,
+        randomId: () => "url-throw-id",
+      }),
+    ).rejects.toThrow("Couldn't save your signature");
+
+    expect(removed).toEqual([[uploaded[0]]]);
+  });
+
+  test("late upload success after deadline is removed before the error returns", async () => {
+    let settleUpload!: (result: { error: unknown | null }) => void;
+    const removed: string[][] = [];
+    const bucket: SignatureStorageBucket = {
+      upload() {
+        return new Promise((resolve) => { settleUpload = resolve; });
+      },
+      getPublicUrl() {
+        throw new Error("must not construct a URL for a timed-out upload");
+      },
+      async remove(paths) {
+        removed.push([...paths]);
+        return { error: null };
+      },
+    };
+
+    const persistence = persistOwnedSignature(
+      signatureDataUrl,
+      "change-orders/test/client",
+      {
+        getBucket: () => bucket,
+        now: () => 1_721_218_400_000,
+        randomId: () => "late-success-id",
+        uploadTimeoutMs: 1,
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    settleUpload({ error: null });
+
+    await expect(persistence).rejects.toThrow("Couldn't save your signature");
+    expect(removed).toEqual([[
+      "signatures/change-orders/test/client/1721218400000_late-success-id.png",
+    ]]);
+  });
+});
 
 // Discovered during the run (conversion creates these)
 let projectId: string;
