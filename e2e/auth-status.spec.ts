@@ -70,12 +70,14 @@ test.describe("public deployment probe", () => {
 
       const health = await anonymous.get("/api/health", { maxRedirects: 0 });
       expect(health.status()).toBe(200);
-      expect(health.headers()["cache-control"]).toContain("no-store");
+      expect(health.headers()["cache-control"]).toBe("no-store, max-age=0");
       const body = await health.json();
       expect(Object.keys(body).sort()).toEqual(["status", "ts"]);
       expect(body.status).toBe("ok");
+      expect(typeof body.ts).toBe("string");
       const timestamp = Date.parse(body.ts);
       expect(Number.isNaN(timestamp)).toBe(false);
+      expect(new Date(timestamp).toISOString()).toBe(body.ts);
       expect(Math.abs(Date.now() - timestamp)).toBeLessThan(10_000);
 
       const nested = await anonymous.get("/api/health/private", { maxRedirects: 0 });

@@ -26,8 +26,8 @@ Both proxy matching paths exclude exactly `/api/health`. Nested paths such as `/
 3. Response time is under 50ms (no database or external calls).
 
 ## Non-Goals
-- Deep health checks (database connectivity, third-party service status).
-- Readiness vs. liveness distinction -- a single endpoint is sufficient for now.
+- Dependency-readiness checks (database, storage, or third-party connectivity).
+- Separate readiness and liveness endpoints; this probe covers only web-process deployment/liveness.
 - Rate limiting.
 
 ## Approach
@@ -48,7 +48,7 @@ None
 4. After deploy, hit `https://probuild.goldentouchremodeling.com/api/health` and confirm the same.
 
 ## Rollback Plan
-Delete `src/app/api/health/route.ts` and redeploy. No migrations or state to revert.
+Revert the scoped health-contract commit (or remove the route plus both exact proxy exceptions) and redeploy. No migrations or state require rollback.
 
 ## Open Questions
 None -- this is self-contained.
