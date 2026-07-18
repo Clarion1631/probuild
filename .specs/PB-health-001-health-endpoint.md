@@ -2,10 +2,23 @@
 
 **ID:** PB-health-001
 **Date:** 2026-04-09
-**Status:** draft
+**Status:** implemented; proxy contract corrected 2026-07-17
 
 ## Context
-ProBuild has no health-check endpoint. Vercel deployment checks and external uptime monitors (e.g., BetterUptime, UptimeRobot) need a lightweight, unauthenticated URL to probe. Without one, we rely on loading the full home page to detect outages, which is slow and brittle.
+ProBuild needs a lightweight, unauthenticated deployment probe. The endpoint must be excluded by both production proxy matching paths so deployment checks and external uptime monitors do not rely on loading the full home page.
+
+## Production contract
+
+- Supported probe: `https://probuild.goldentouchremodeling.com/api/health`
+- Authentication: none for the exact `/api/health` path
+- Response: HTTP 200 with `{ "status": "ok", "ts": "<ISO 8601 timestamp>" }`
+- Cache policy: `Cache-Control: no-store, max-age=0`
+- Dependency scope: web-process deployment probe only; no database, storage, or third-party readiness claim
+- `/api/version`: public deployment identity for stale-client detection, not readiness
+
+## Proxy requirement
+
+Both proxy matching paths exclude exactly `/api/health`. Nested paths such as `/api/health/private` remain protected; the exception does not widen another `/api` namespace.
 
 ## Goals
 1. `GET /api/health` returns HTTP 200 with JSON body `{ "status": "ok", "ts": "<ISO 8601 timestamp>" }`.
@@ -15,13 +28,15 @@ ProBuild has no health-check endpoint. Vercel deployment checks and external upt
 ## Non-Goals
 - Deep health checks (database connectivity, third-party service status).
 - Readiness vs. liveness distinction -- a single endpoint is sufficient for now.
-- Rate limiting or caching headers.
+- Rate limiting.
 
 ## Approach
-Create a Next.js App Router route handler at `src/app/api/health/route.ts`. Export a single `GET` function that returns `NextResponse.json({ status: "ok", ts: new Date().toISOString() })`. No middleware, no auth, no database access. Mark the route as `dynamic = "force-dynamic"` so Vercel never caches a stale timestamp.
+Use a Next.js App Router route handler at `src/app/api/health/route.ts`. Export a single `GET` function that returns only `{ status: "ok", ts: new Date().toISOString() }` with `Cache-Control: no-store, max-age=0`. No auth, database access, storage, or third-party calls. Mark the route as `dynamic = "force-dynamic"` and exclude only the exact path from both production proxy matching paths.
 
 ## Files Touched
-- `src/app/api/health/route.ts` (new)
+- `src/app/api/health/route.ts`
+- `src/proxy.ts`
+- `e2e/auth-status.spec.ts`
 
 ## Data Model Changes
 None
@@ -29,7 +44,8 @@ None
 ## Test Plan
 1. Run `curl http://localhost:3000/api/health` and confirm HTTP 200 with the expected JSON shape.
 2. Verify `ts` is a valid ISO 8601 string within a few seconds of the request time.
-3. After deploy, hit `https://probuild.vercel.app/api/health` and confirm the same.
+3. Run the production proxy test locally and confirm the exact health path is public while `/api/health/private` remains protected.
+4. After deploy, hit `https://probuild.goldentouchremodeling.com/api/health` and confirm the same.
 
 ## Rollback Plan
 Delete `src/app/api/health/route.ts` and redeploy. No migrations or state to revert.

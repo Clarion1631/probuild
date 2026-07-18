@@ -20,7 +20,11 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
     /^\/api\/projects\/[^/]+\/(?:cost-codes|buckets|estimate-items|estimates)\/?$/,
 ];
 
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+
+export function isPublicProxyBypass(pathname: string) {
+    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
+}
 
 function hasNextAuthSessionCookie(req: any) {
     const requestCookies = req.cookies?.getAll?.() ?? [];
@@ -32,7 +36,7 @@ function hasNextAuthSessionCookie(req: any) {
     );
 }
 
-export default async function middleware(req: any, event: any) {
+export default async function proxy(req: any, event: any) {
     // Bypass authentication entirely during development for local testing
     if (process.env.NODE_ENV === 'development') {
         // Allow all requests to pass through without authentication in development
@@ -54,7 +58,7 @@ export default async function middleware(req: any, event: any) {
         }
     }
 
-    if (isServerAction && typeof pathname === "string" && PUBLIC_PROXY_BYPASS_PATTERN.test(pathname)) {
+    if (typeof pathname === "string" && isPublicProxyBypass(pathname)) {
         return NextResponse.next();
     }
 
@@ -104,6 +108,7 @@ export const config = {
          * - api/portal (Public backend handlers for documents)
          * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
          * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
+         * - api/health (Exact public deployment/readiness probe)
          * - api/version (Deployment-id probe for the stale-tab refresh banner)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
@@ -114,6 +119,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };
