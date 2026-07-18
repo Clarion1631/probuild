@@ -6,6 +6,11 @@ import {
   persistOwnedSignature,
   type SignatureStorageBucket,
 } from "../src/lib/signature-storage";
+import {
+  approveChangeOrderWithSignature,
+  type ChangeOrderApprovalDependencies,
+  type ChangeOrderSignatureCleanupEvent,
+} from "../src/lib/change-order-approval";
 
 /**
  * Money-pipeline regression net — born from the June 2026 lifecycle audit.
@@ -602,6 +607,7 @@ const COI = {
   emptySent: "co-invariant-empty-sent",
   zeroSent: "co-invariant-zero-sent",
   validSent: "co-invariant-valid-sent",
+  replaySent: "co-invariant-replay-sent",
   approved: "co-invariant-approved",
   race: "co-invariant-race",
   duplicate: "co-invariant-duplicate",
@@ -631,6 +637,34 @@ async function rejectionMessage(operation: Promise<unknown>): Promise<string> {
   }
 }
 
+function createTrackedSignatureStore() {
+  const objects = new Set<string>();
+  let sequence = 0;
+  const persistSignature: ChangeOrderApprovalDependencies["persistSignature"] = async (
+    _value,
+    keyPrefix,
+  ) => {
+    const url = `https://signature.test/${keyPrefix}/${++sequence}.png`;
+    objects.add(url);
+    let discarded = false;
+    return {
+      url,
+      async discard() {
+        if (discarded) return;
+        objects.delete(url);
+        discarded = true;
+      },
+    };
+  };
+  return { objects, persistSignature };
+}
+
+const approvalInput = (signatureName: string) => ({
+  signatureName,
+  signatureDataUrl: "data:image/png;base64,AA==",
+  approvedAt: new Date(),
+});
+
 test.describe.serial("Money pipeline: change-order lifecycle invariants", () => {
   test.beforeAll(async () => {
     await coInvariantPrisma.client.upsert({
@@ -659,7 +693,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     });
 
     const ids = [
-      COI.rawDraft, COI.draftApproval, COI.emptySent, COI.zeroSent, COI.validSent,
+      COI.rawDraft, COI.draftApproval, COI.emptySent, COI.zeroSent, COI.validSent, COI.replaySent,
       COI.approved, COI.race, COI.duplicate, COI.stale, COI.driftSend,
       COI.driftApproval, COI.approvedDelete, COI.unsigned, COI.companySigned,
       COI.noOpSent, COI.legacySignedDraft,
@@ -702,6 +736,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     await createChangeOrder(COI.emptySent, "Sent", 100, false);
     await createChangeOrder(COI.zeroSent, "Sent", 0, true);
     await createChangeOrder(COI.validSent, "Sent", 100, true);
+    await createChangeOrder(COI.replaySent, "Sent", 100, true);
     await createChangeOrder(COI.approved, "Approved", 100, true);
     await createChangeOrder(COI.race, "Sent", 100, true);
     await createChangeOrder(COI.duplicate, "Draft", 100, true, COI.duplicateItem);
@@ -746,13 +781,15 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     expect(co.sentAt).toBeNull();
   });
 
-  test("CO2: approval requires the Sent state", async () => {
-    const message = await rejectionMessage(approveChangeOrderCore(COI.draftApproval, {
-      signatureName: "Invariant Signer",
-      clientSignatureUrl: "data:image/png;base64,AA==",
-      approvedAt: new Date(),
-    }));
+  test("CO2: invalid status removes the unused signature object", async () => {
+    const approvalSignatures = createTrackedSignatureStore();
+    const message = await rejectionMessage(approveChangeOrderWithSignature(
+      COI.draftApproval,
+      approvalInput("Invariant Signer"),
+      { persistSignature: approvalSignatures.persistSignature },
+    ));
     expect(message).toContain("must be Sent");
+    expect(approvalSignatures.objects).toEqual(new Set());
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.draftApproval } })).status).toBe("Draft");
   });
 
@@ -766,37 +803,163 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.emptySent } })).status).toBe("Sent");
   });
 
-  test("CO4: approval requires a positive subtotal", async () => {
-    const message = await rejectionMessage(approveChangeOrderCore(COI.zeroSent, {
-      signatureName: "Invariant Signer",
-      clientSignatureUrl: "data:image/png;base64,AA==",
-      approvedAt: new Date(),
-    }));
+  test("CO4: invalid subtotal removes the unused signature object", async () => {
+    const approvalSignatures = createTrackedSignatureStore();
+    const message = await rejectionMessage(approveChangeOrderWithSignature(
+      COI.zeroSent,
+      approvalInput("Zero Signer"),
+      { persistSignature: approvalSignatures.persistSignature },
+    ));
     expect(message).toContain("positive subtotal");
+    expect(approvalSignatures.objects).toEqual(new Set());
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.zeroSent } })).status).toBe("Sent");
   });
 
-  test("CO5: a valid Sent change order approves exactly once", async () => {
+  test("CO5: concurrent losing approvals remove every unused signature object", async () => {
+    const approvalSignatures = createTrackedSignatureStore();
     const attempts = await Promise.allSettled([
-      approveChangeOrderCore(COI.validSent, {
-        signatureName: "First Signer",
-        clientSignatureUrl: "data:image/png;base64,AA==",
-        approvedAt: new Date(),
-      }),
-      approveChangeOrderCore(COI.validSent, {
-        signatureName: "Second Signer",
-        clientSignatureUrl: "data:image/png;base64,AQ==",
-        approvedAt: new Date(),
-      }),
+      approveChangeOrderWithSignature(
+        COI.validSent,
+        approvalInput("First Signer"),
+        { persistSignature: approvalSignatures.persistSignature },
+      ),
+      approveChangeOrderWithSignature(
+        COI.validSent,
+        approvalInput("Second Signer"),
+        { persistSignature: approvalSignatures.persistSignature },
+      ),
     ]);
+
     expect(attempts.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(attempts.filter((result) => result.status === "rejected")).toHaveLength(1);
-    const winner = attempts.find((result) => result.status === "fulfilled");
-    expect(winner?.status === "fulfilled" ? winner.value?.transitioned : false).toBe(true);
 
     const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.validSent } });
     expect(co.status).toBe("Approved");
-    expect(["First Signer", "Second Signer"]).toContain(co.approvedBy);
+    expect(co.clientSignatureUrl).toBeTruthy();
+    expect(approvalSignatures.objects).toEqual(new Set([co.clientSignatureUrl!]));
+  });
+
+  test("CO5A: replay removes only the replay upload", async () => {
+    const approvalSignatures = createTrackedSignatureStore();
+    const first = await approveChangeOrderWithSignature(
+      COI.replaySent,
+      approvalInput("Original Signer"),
+      { persistSignature: approvalSignatures.persistSignature },
+    );
+    expect(first?.transitioned).toBe(true);
+    const committed = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.replaySent },
+    });
+    expect(approvalSignatures.objects).toEqual(new Set([committed.clientSignatureUrl!]));
+
+    const message = await rejectionMessage(approveChangeOrderWithSignature(
+      COI.replaySent,
+      approvalInput("Replay Signer"),
+      { persistSignature: approvalSignatures.persistSignature },
+    ));
+
+    expect(message).toContain("must be Sent");
+    expect(approvalSignatures.objects).toEqual(new Set([committed.clientSignatureUrl!]));
+    expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({
+      where: { id: COI.replaySent },
+    })).clientSignatureUrl).toBe(committed.clientSignatureUrl);
+  });
+
+  test("CO5B: transaction failure removes the attempt and preserves the original error", async () => {
+    const approvalSignatures = createTrackedSignatureStore();
+    const transactionError = new Error("injected transaction failure");
+    let caught: unknown;
+    try {
+      await approveChangeOrderWithSignature(
+        COI.rawDraft,
+        approvalInput("Failed Transaction Signer"),
+        {
+          persistSignature: approvalSignatures.persistSignature,
+          approveCore: async () => { throw transactionError; },
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(transactionError);
+    expect(approvalSignatures.objects).toEqual(new Set());
+  });
+
+  test("CO5C: missing change order removes the attempt before returning null", async () => {
+    const approvalSignatures = createTrackedSignatureStore();
+    const result = await approveChangeOrderWithSignature(
+      "co-invariant-missing",
+      approvalInput("Missing Signer"),
+      { persistSignature: approvalSignatures.persistSignature },
+    );
+    expect(result).toBeNull();
+    expect(approvalSignatures.objects).toEqual(new Set());
+  });
+
+  test("CO5D: cleanup failure telemetry is sanitized and the primary error wins", async () => {
+    const primaryError = new Error("primary approval failure");
+    const events: ChangeOrderSignatureCleanupEvent[] = [];
+    let caught: unknown;
+    try {
+      await approveChangeOrderWithSignature(
+        COI.rawDraft,
+        approvalInput("Sensitive Customer Name"),
+        {
+          persistSignature: async () => ({
+            url: "https://signature.test/private-object.png",
+            discard: async () => {
+              throw Object.assign(new Error("private-object.png"), {
+                code: "storage_delete_failed",
+                status: 503,
+              });
+            },
+          }),
+          approveCore: async () => { throw primaryError; },
+          reportCleanupFailure: (event) => events.push(event),
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(primaryError);
+    expect(events).toEqual([{
+      operation: "discard-rejected-change-order-signature",
+      changeOrderId: COI.rawDraft,
+      errorType: "Error",
+      errorCode: "storage_delete_failed",
+      status: 503,
+    }]);
+    expect(JSON.stringify(events)).not.toContain("private-object");
+    expect(JSON.stringify(events)).not.toContain("Sensitive Customer Name");
+  });
+
+  test("CO5E: throwing cleanup reporter cannot replace the primary error", async () => {
+    const primaryError = new Error("primary approval failure");
+    let reporterCalls = 0;
+    let caught: unknown;
+    try {
+      await approveChangeOrderWithSignature(
+        COI.rawDraft,
+        approvalInput("Reporter Failure Signer"),
+        {
+          persistSignature: async () => ({
+            url: "https://signature.test/private-object.png",
+            discard: async () => { throw new Error("cleanup failed"); },
+          }),
+          approveCore: async () => { throw primaryError; },
+          reportCleanupFailure: () => {
+            reporterCalls += 1;
+            throw new Error("telemetry backend failed");
+          },
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(primaryError);
+    expect(reporterCalls).toBe(1);
   });
 
   test("CO6: Approved scope metadata is immutable", async () => {
