@@ -108,7 +108,7 @@ export const config = {
          * - api/portal (Public backend handlers for documents)
          * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
          * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
-         * - api/health (Exact public deployment/readiness probe)
+         * - api/health (Exact public web-process deployment/liveness probe)
          * - api/version (Deployment-id probe for the stale-tab refresh banner)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
