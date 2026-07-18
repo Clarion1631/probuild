@@ -15,7 +15,8 @@ import { persistSignature } from "./signature-storage";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
-import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import { approveChangeOrderWithSignature } from "./change-order-approval";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -7705,15 +7706,12 @@ export async function approveChangeOrder(id: string, signatureName: string, user
     if (!normalizedSignatureName) throw new Error("Your full legal name is required");
     if (!signatureDataUrl) throw new Error("A drawn signature is required");
 
-    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
-    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
-    const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
-
-    // The core takes the same CO row lock as editing/sending/billing and enforces
-    // Sent + item existence + positive subtotal in that transaction before the
-    // one-time Approved write.
     const approvedAt = new Date();
-    const approval = await approveChangeOrderCore(id, { signatureName: normalizedSignatureName, clientSignatureUrl, approvedAt });
+    const approval = await approveChangeOrderWithSignature(id, {
+        signatureName: normalizedSignatureName,
+        signatureDataUrl,
+        approvedAt,
+    });
     if (!approval) return null;
     const { co, transitioned } = approval;
 

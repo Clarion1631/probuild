@@ -1,5 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
 import { sendChangeOrderToClientCore } from "../src/lib/billing-core";
 import {
@@ -1139,5 +1141,17 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     const message = await rejectionMessage(deleteChangeOrderCore(COI.legacySignedDraft));
     expect(message).toContain("Only unsigned Draft change orders can be deleted");
     expect(await coInvariantPrisma.changeOrder.findUnique({ where: { id: COI.legacySignedDraft } })).not.toBeNull();
+  });
+
+  test("CO17: the server action delegates signature ownership to the coordinator", () => {
+    const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
+    const start = source.indexOf("export async function approveChangeOrder(");
+    const end = source.indexOf("\nexport async function ", start + 1);
+    const actionSource = source.slice(start, end === -1 ? undefined : end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(actionSource).toContain("await approveChangeOrderWithSignature(");
+    expect(actionSource).not.toContain("await persistSignature(");
+    expect(actionSource).not.toContain("await approveChangeOrderCore(");
   });
 });
