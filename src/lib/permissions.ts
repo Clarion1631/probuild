@@ -20,8 +20,12 @@ export async function getCurrentUserWithPermissions() {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) return null;
 
+    return getUserWithPermissionsByEmail(session.user.email);
+}
+
+export async function getUserWithPermissionsByEmail(email: string) {
     const user = await prisma.user.findUnique({
-        where: { email: session.user.email },
+        where: { email: email.toLowerCase() },
         include: {
             permissions: true,
             projectAccess: { select: { projectId: true } },
@@ -29,7 +33,7 @@ export async function getCurrentUserWithPermissions() {
         },
     });
 
-    return user;
+    return user?.status === "DISABLED" ? null : user;
 }
 
 // Check if user has a specific permission
