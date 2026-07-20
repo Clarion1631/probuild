@@ -6,7 +6,7 @@
 ## Key paths & service IDs
 | Thing | Value |
 |---|---|
-| This project (Windows) | `C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site` |
+| This project (Windows) | `C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site` |
 | GitHub | https://github.com/Clarion1631/probuild |
 | Production | https://probuild.goldentouchremodeling.com |
 | Vercel preview | https://probuild-amber.vercel.app |
@@ -54,9 +54,10 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 2. Make changes
 3. npm run build          # must pass 0 errors
 4. git push origin main
-5. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
-6. Click through affected pages on prod to verify
-7. Mark items done in ProbuildTodo.md
+5. Schema changed? Run the branch's scripts/apply-*.mjs against prod FIRST (see "Deploying to Vercel")
+6. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
+7. Click through affected pages on prod to verify
+8. Mark items done in ProbuildTodo.md
 ```
 
 **Error diagnosis (Sentry)**
@@ -73,8 +74,13 @@ stripe trigger payment_intent.succeeded
 ## Deploying to Vercel (CLI only — auto-deploy is OFF)
 ```powershell
 # Production deploy (from the main repo dir, not a worktree):
-vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site"
+vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site"
 ```
+**Pre-deploy checklist (in order):**
+1. `npm run build` passes locally with 0 errors
+2. **Schema changed?** If the branch edits `prisma/schema.prisma` and ships a `scripts/apply-*.mjs`, run it against prod BEFORE deploying (`node scripts/apply-<name>.mjs`). These scripts are additive + idempotent (`IF NOT EXISTS`, guarded FKs) and safe while the old build is live — but the new build's Prisma client selects the new columns immediately, so any page querying them throws P2022 "column does not exist" until the script runs. (2026-07-20: the company-schedule deploy went out before `apply-company-schedule-schema.mjs` ran; project pages hit the route error boundary until it was applied.)
+3. Deploy with the command above, then click through the affected pages on prod
+
 - Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
 - `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
 - `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
@@ -103,7 +109,7 @@ sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
 2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
-3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\.gemini\antigravity\workspaces\gtr-probuild-site'; node_modules\.bin\prisma generate"`
+3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site'; node_modules\.bin\prisma generate"`
 4. Update `prisma/schema.prisma` to match the SQL changes
 
 ## Critical database config
