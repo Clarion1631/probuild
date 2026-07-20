@@ -4,7 +4,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
-import { getCompanyPipeline, getStartCalendar, setProjectStartDate, parseStartDateInput } from "@/lib/schedule-core";
+import { getCompanyPipeline, getStartCalendar, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, getCrewConflicts } from "@/lib/schedule-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 
@@ -866,10 +866,16 @@ const handler = createMcpHandler(
                 // getStartCalendar's `to` is exclusive, so from + N days lists
                 // exactly N calendar days (today through today+N-1).
                 const to = new Date(from.getTime() + horizonDays * 86_400_000);
-                const [pipeline, calendar] = await Promise.all([
+                const [pipeline, calendar, crewConflicts] = await Promise.all([
                     getCompanyPipeline(),
                     getStartCalendar(from, to, { includeFinancials: false }),
+                    getCrewConflicts(from, to),
                 ]);
+                // Crew per project (ids + names) — joined onto the start list too.
+                const crewOf = new Map<string, { id: string; name: string }[]>();
+                for (const p of [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress, ...pipeline.substantialCompletion]) {
+                    crewOf.set(p.id, p.crew);
+                }
                 return textResult({
                     pipeline: {
                         estimating: pipeline.estimating.length,
@@ -879,17 +885,21 @@ const handler = createMcpHandler(
                         substantialCompletion: pipeline.substantialCompletion.length,
                     },
                     waitingToStart: pipeline.waitingToStart.map(p => ({
-                        projectId: p.id, name: p.name, client: p.client, contractValue: p.contractValue,
+                        projectId: p.id, name: p.name, client: p.client, contractValue: p.contractValue, crew: p.crew,
                     })),
                     upcomingStarts: {
                         windowDays: horizonDays,
                         projects: calendar.projectStarts.map(p => ({
                             projectId: p.id, name: p.name, client: p.client, status: p.status, startDate: p.startDate.slice(0, 10),
+                            crew: crewOf.get(p.id) ?? [],
                         })),
                         leads: calendar.leadStarts.map(l => ({
                             leadId: l.id, name: l.name, client: l.client, stage: l.stage, expectedStartDate: l.expectedStartDate.slice(0, 10),
                         })),
                     },
+                    // Double-booked crew from project windows (startDate →
+                    // endDate ?? latest task end ?? startDate+1d, half-open).
+                    crewConflicts,
                 });
             },
         );
@@ -925,9 +935,66 @@ const handler = createMcpHandler(
                 }
             },
         );
+
+        server.registerTool(
+            "generate_project_schedule",
+            {
+                title: "Generate a project's schedule from its estimate",
+                description:
+                    "Builds the job's schedule from an estimate: phase parent tasks with children (or flat tasks for phase-less " +
+                    "estimates) apportioned across the project window by labor-dollar share, plus milestone tasks — and links the " +
+                    "payment milestones to them. Preconditions: the estimate must be Approved, Invoiced, Partially Paid, or Paid, " +
+                    "owned by a PROJECT (not a lead), and the project must have a start date first (set_project_start_date). " +
+                    "mode 'merge' (default) skips items already task-linked; 'regenerate' deletes untouched generated tasks and rebuilds. " +
+                    "Idempotent — safe to re-run.",
+                inputSchema: {
+                    estimateId: z.string().max(50).describe("Estimate id (from find_job or list_project_billing) — must be Approved+ and on a project with a start date"),
+                    mode: z.enum(["merge", "regenerate"]).optional().describe("'merge' (default) fills gaps; 'regenerate' rebuilds untouched generated tasks"),
+                },
+            },
+            async ({ estimateId, mode }) => {
+                try {
+                    const result = await generateScheduleFromEstimate({
+                        estimateId,
+                        mode: mode ?? "merge",
+                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
+                    });
+                    return textResult(result);
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to generate schedule" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "assign_project_crew",
+            {
+                title: "Assign crew to a project (idempotent replace)",
+                description:
+                    "Replaces the project's crew with exactly the given user ids (connect/disconnect diff — re-running with the " +
+                    "same list is a no-op). Every id must be an ACTIVATED team member. Crew drives the company-calendar chips and " +
+                    "the crewConflicts block in get_company_schedule (double-bookings across overlapping project windows).",
+                inputSchema: {
+                    projectId: z.string().max(50).describe("Project id from get_company_schedule or list_projects"),
+                    userIds: z.array(z.string().max(50)).max(50).describe("ACTIVATED user ids to assign — the FULL crew (not a delta); empty array clears the crew"),
+                },
+            },
+            async ({ projectId, userIds }) => {
+                try {
+                    const result = await setProjectCrew({
+                        projectId,
+                        userIds,
+                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
+                    });
+                    return textResult(result);
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to assign crew" }), isError: true };
+                }
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.7.0" },
+        serverInfo: { name: "probuild", version: "1.8.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -950,9 +1017,13 @@ const handler = createMcpHandler(
             "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
             "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
             "SCHEDULING: get_company_schedule answers 'what jobs are waiting to start?' and lists upcoming project starts (plus lead expected starts) " +
-            "for the next N days. set_project_start_date moves a project's company start date — for a project still Waiting to Start it also shifts " +
+            "for the next N days, with each project's crew and a crewConflicts block (double-bookings across overlapping project windows). " +
+            "set_project_start_date moves a project's company start date — for a project still Waiting to Start it also shifts " +
             "the job's tasks and linked milestones by the same delta (pass shiftJobTasks false to move only the marker); milestone groups already pushed " +
             "to QuickBooks are never shifted and come back in skippedQbMilestones for manual fixing. " +
+            "generate_project_schedule builds a project's schedule from its estimate (the estimate must be Approved/Invoiced/Partially Paid/Paid and " +
+            "the project needs a start date first — set one with set_project_start_date); default 'merge' mode is idempotent, 'regenerate' rebuilds untouched generated tasks. " +
+            "assign_project_crew replaces a project's crew with the given ACTIVATED user ids (full list, not a delta). " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },
     { basePath: "/api/mcp", maxDuration: 60 },
