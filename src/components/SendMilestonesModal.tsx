@@ -74,6 +74,13 @@ export default function SendMilestonesModal({
                         ? `Sent ${result.sent} invoice(s) to ${email} (${reconciledCount} reconciled to QuickBooks)`
                         : `Successfully sent ${result.sent} invoice(s) to ${email}`
                 );
+                // Delivered-but-not-recorded must be loud: the milestone will still
+                // show "Send" because the stamp failed, and a blind resend would
+                // email the client twice.
+                const recordingIssues = result.results.filter(r => (r.status === "sent" || r.status === "reconciled") && r.error);
+                if (recordingIssues.length > 0) {
+                    toast.warning(`The email went out, but recording it failed — verify in QuickBooks before resending (${recordingIssues[0].error})`);
+                }
                 if (result.failed > 0 || result.skipped > 0) {
                     toast.warning(`Failed: ${result.failed}, Skipped: ${result.skipped}`);
                 }
@@ -103,7 +110,7 @@ export default function SendMilestonesModal({
                         <p className="text-xs text-hui-textMuted mt-0.5">
                             {phase === "review"
                                 ? "Review the differences below before sending."
-                                : "The client will receive official QuickBooks Online invoice emails to review and pay."}
+                                : "The client will receive one email from your company listing only these milestones, with a link to view and pay online."}
                         </p>
                     </div>
                     <button onClick={onClose} className="text-hui-textMuted hover:text-hui-textMain transition">
@@ -149,9 +156,9 @@ export default function SendMilestonesModal({
                         <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 space-y-2">
                             <h3 className="text-sm font-semibold text-emerald-800">What happens when you send:</h3>
                             <ul className="text-xs text-emerald-700 space-y-1.5 list-disc pl-4">
-                                <li>Each milestone will be synced to QuickBooks if not already pushed.</li>
-                                <li>Client receives official QuickBooks Online invoice emails (with {"Review & Pay"} links).</li>
-                                <li>QuickBooks invoice status will be marked as emailed.</li>
+                                <li>Each milestone is synced to QuickBooks and its amount verified before anything goes out.</li>
+                                <li>Client receives one email requesting only the milestone(s) above — never the full invoice balance.</li>
+                                <li>The email opens their client portal focused on these payments, with a Pay Now button.</li>
                                 <li>Parent invoice status will change to {"Issued"} if currently a Draft.</li>
                             </ul>
                         </div>

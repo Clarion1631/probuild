@@ -30,7 +30,7 @@ class PaymentSectionErrorBoundary extends React.Component<{ children: React.Reac
     }
 }
 
-export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean }) {
+export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess, focusMilestoneParam }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean, focusMilestoneParam?: string | null }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
 
     useEffect(() => {
@@ -78,6 +78,18 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
     const companyLicense = companySettings?.licenseNumber || "";
     const isPaid = initialInvoice.status === "Paid";
     const totalPaid = Number(initialInvoice.totalAmount || 0) - Number(initialInvoice.balanceDue || 0);
+
+    // Milestone focus mode: the payment-request email links here with
+    // ?milestone=<ids> so the client sees a clear "amount due now" for exactly
+    // the requested payment(s), with the full-invoice figures demoted to a
+    // secondary reference line. Paid/unknown ids fall out; if nothing valid
+    // remains the page renders as the normal full invoice.
+    const focusIds = (focusMilestoneParam || "").split(",").map(s => s.trim()).filter(Boolean);
+    const focusedPayments = focusIds.length > 0
+        ? (initialInvoice.payments || []).filter((p: any) => focusIds.includes(p.id) && p.status !== "Paid")
+        : [];
+    const hasFocus = focusedPayments.length > 0;
+    const focusTotal = focusedPayments.reduce((sum: number, p: any) => sum + Number(p.amount), 0);
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -155,7 +167,36 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         </div>
                     </div>
 
-                    {/* Amount Summary */}
+                    {/* Focused payment request — the amount the client is being asked to pay right now */}
+                    {hasFocus && (
+                        <div className="px-10 py-8 bg-emerald-50 border-b border-emerald-200">
+                            <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wider mb-1">Payment Requested</p>
+                            <p className="text-sm text-emerald-900 mb-3">{focusedPayments.map((p: any) => p.name).join(" · ")}</p>
+                            <div className="flex items-center justify-between flex-wrap gap-4">
+                                <p className="text-3xl font-bold text-emerald-700">{formatCurrency(focusTotal)}</p>
+                                {focusedPayments.length === 1 && (
+                                    <PortalPayButton
+                                        invoiceId={initialInvoice.id}
+                                        paymentScheduleId={focusedPayments[0].id}
+                                        amount={Number(focusedPayments[0].amount)}
+                                        label="Pay Now"
+                                        settings={companySettings}
+                                        qbPayLink={focusedPayments[0].status === "Pending" && !focusedPayments[0].qbSyncError ? (focusedPayments[0].qbInvoiceLink || null) : null}
+                                    />
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Amount Summary — full-width when there's no focus; a compact
+                        reference line when a specific payment is being requested */}
+                    {hasFocus ? (
+                        <div className="px-10 py-4 bg-slate-50 border-b border-slate-200">
+                            <p className="text-xs text-slate-500 text-center">
+                                Full invoice {initialInvoice.code}: total {formatCurrency(initialInvoice.totalAmount)} · paid to date {formatCurrency(totalPaid)} · remaining balance {formatCurrency(initialInvoice.balanceDue)}
+                            </p>
+                        </div>
+                    ) : (
                     <div className="px-10 py-8 bg-slate-50 border-b border-slate-200">
                         <div className="flex justify-between items-center">
                             <div>
@@ -174,6 +215,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                             </div>
                         </div>
                     </div>
+                    )}
 
                     {/* Notes */}
                     {initialInvoice.notes && (
@@ -192,6 +234,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                 {initialInvoice.payments.map((payment: any) => {
                                     const isPaidItem = payment.status === "Paid";
                                     const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && !isPaidItem;
+                                    const isFocused = !isPaidItem && focusIds.includes(payment.id);
 
                                     return (
                                         <div
@@ -199,16 +242,21 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                             className={`flex items-center justify-between px-5 py-4 rounded-lg border ${
                                                 isPaidItem
                                                     ? 'bg-green-50 border-green-200'
+                                                    : isFocused
+                                                    ? 'bg-white border-emerald-300 ring-2 ring-emerald-200'
                                                     : isPastDue
                                                     ? 'bg-red-50 border-red-200'
                                                     : 'bg-white border-slate-200'
-                                            }`}
+                                            }${hasFocus && !isFocused && !isPaidItem ? ' opacity-60' : ''}`}
                                         >
                                             <div className="flex-1">
                                                 <div className="flex items-center gap-2">
                                                     <span className="font-medium text-slate-800">{payment.name}</span>
                                                     {isPaidItem && (
                                                         <span className="text-[10px] font-bold uppercase text-green-700 bg-green-100 px-1.5 py-0.5 rounded">Paid</span>
+                                                    )}
+                                                    {isFocused && (
+                                                        <span className="text-[10px] font-bold uppercase text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">Requested</span>
                                                     )}
                                                     {isPastDue && (
                                                         <span className="text-[10px] font-bold uppercase text-red-700 bg-red-100 px-1.5 py-0.5 rounded">Overdue</span>
