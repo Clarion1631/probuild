@@ -83,19 +83,17 @@ export const authOptions: NextAuthOptions = {
                     where: { email: (token.email as string).toLowerCase() },
                     select: { id: true, role: true, status: true },
                 });
-                if (dbUser?.status === "DISABLED") {
-                    // Keep the email so a later refresh can observe reactivation,
-                    // but strip all authorization claims immediately.
+                if (!dbUser || dbUser.status === "DISABLED") {
+                    // Keep the email so a later refresh can observe reactivation
+                    // or a recreated account, but strip authorization claims now.
                     delete token.role;
                     delete staffToken.userId;
                     staffToken.accountDisabled = true;
                     return token;
                 }
-                if (dbUser) {
-                    delete staffToken.accountDisabled;
-                    token.role = dbUser.role;
-                    staffToken.userId = dbUser.id;
-                }
+                delete staffToken.accountDisabled;
+                token.role = dbUser.role;
+                staffToken.userId = dbUser.id;
             }
             return token;
         },

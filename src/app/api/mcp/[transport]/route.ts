@@ -609,7 +609,15 @@ const handler = createMcpHandler(
                     });
                 }
                 const { sendEstimateToClient } = await import("@/lib/actions");
-                const result = await sendEstimateToClient(estimateId, undefined, overrideEmail, undefined, customMessage);
+                const result = await sendEstimateToClient(
+                    estimateId,
+                    undefined,
+                    overrideEmail,
+                    undefined,
+                    customMessage,
+                    undefined,
+                    process.env.MCP_SECRET,
+                );
                 if (!result.success) return { ...textResult({ error: result.error }), isError: true };
                 return textResult({ ...result, note: "The customer reviews and signs via the portal link; signing auto-creates the invoice in ProBuild." });
             },

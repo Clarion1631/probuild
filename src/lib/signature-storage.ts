@@ -8,9 +8,47 @@ const SIGNATURE_DATA_URL_RE = /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/
 // generous abuse guard, not a real-world limit.
 const MAX_SIGNATURE_BYTES = 6 * 1024 * 1024; // 6 MB
 
-// Cap on the storage upload so a hung/degraded Storage backend can't hang the signing
-// request indefinitely. Drawn signatures are tiny — this only bounds pathological hangs.
+// Caller-visible upload deadline. Cleanup still waits for upload settlement so a late
+// success can be removed instead of leaving an orphaned signature object.
 const UPLOAD_TIMEOUT_MS = 10_000;
+
+export type SignatureStorageBucket = {
+    upload(
+        path: string,
+        body: Buffer,
+        options: { contentType: string; upsert: false },
+    ): Promise<{ error: unknown | null }>;
+    getPublicUrl(path: string): { data: { publicUrl?: string | null } };
+    remove(paths: string[]): Promise<{ error: unknown | null }>;
+};
+
+export type SignaturePersistenceDependencies = {
+    getBucket: () => SignatureStorageBucket | null;
+    now: () => number;
+    randomId: () => string;
+    uploadTimeoutMs: number;
+};
+
+export type OwnedSignature = {
+    url: string | null;
+    discard: () => Promise<void>;
+};
+
+const noDiscard = async () => {};
+
+function defaultSignatureBucket(): SignatureStorageBucket | null {
+    const supabase = getSupabase();
+    return supabase
+        ? supabase.storage.from(STORAGE_BUCKET) as unknown as SignatureStorageBucket
+        : null;
+}
+
+function cleanupErrorType(error: unknown): string {
+    if (error instanceof Error && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name)) {
+        return error.name;
+    }
+    return typeof error;
+}
 
 /**
  * SSRF guard. True only for a public/sign object URL in OUR Supabase project + bucket,
@@ -41,36 +79,27 @@ export function isOwnSignatureStorageUrl(url: string): boolean {
 }
 
 /**
- * Persist a drawn-signature image and return a value that is safe to store in the DB.
+ * Persist a drawn-signature image and return an owned Storage object that can be
+ * compensated if a subsequent database transaction fails.
  *
- * Behaviour:
- *  - null / empty             → null (nothing to store)
- *  - an http(s) URL           → returned unchanged ONLY if it is one of OUR Storage URLs
- *                               (idempotent re-runs / backfill output); any other http(s)
- *                               value is rejected as "Invalid signature format" so an
- *                               untrusted caller cannot store an arbitrary URL (SSRF/audit)
- *  - a PNG/JPEG/WEBP data-URL  → uploaded to Supabase Storage; the public URL is returned
- *  - anything else            → throws "Invalid signature format"
- *
- * Storage-not-configured behaviour: getSupabase() is null only when SUPABASE_URL /
- * SUPABASE_SERVICE_KEY are absent. On the Supabase transaction pooler (the prod/preview
- * signal `pgbouncer=true` in DATABASE_URL) that is a misconfiguration — we FAIL LOUDLY
- * rather than silently store a large data-URL and reintroduce the pooler message-size
- * error. Off the pooler (plain Postgres in e2e/CI/local, no such limit) we keep the
- * data-URL so signing still works without Storage.
+ * Storage-not-configured behaviour preserves the compatibility wrapper's prior
+ * behaviour: fail on the Supabase pooler, otherwise return the data URL unchanged.
  *
  * @param value     captured signature (data-URL) or an existing URL
  * @param keyPrefix storage sub-path, e.g. `contracts/<id>/contractor`
  */
-export async function persistSignature(
+export async function persistOwnedSignature(
     value: string | null | undefined,
     keyPrefix: string,
-): Promise<string | null> {
-    if (!value) return null;
+    dependencies: Partial<SignaturePersistenceDependencies> = {},
+): Promise<OwnedSignature> {
+    if (!value) return { url: null, discard: noDiscard };
 
     // Already migrated / remote — only OUR storage URLs may pass through unchanged.
     if (/^https?:\/\//i.test(value)) {
-        if (isOwnSignatureStorageUrl(value)) return value;
+        if (isOwnSignatureStorageUrl(value)) {
+            return { url: value, discard: noDiscard };
+        }
         throw new Error("Invalid signature format");
     }
 
@@ -82,8 +111,9 @@ export async function persistSignature(
     if (buffer.length === 0) throw new Error("Invalid signature format");
     if (buffer.length > MAX_SIGNATURE_BYTES) throw new Error("Signature image too large");
 
-    const supabase = getSupabase();
-    if (!supabase) {
+    const getBucket = dependencies.getBucket ?? defaultSignatureBucket;
+    const bucket = getBucket();
+    if (!bucket) {
         const onPooler = (process.env.DATABASE_URL || "").includes("pgbouncer=true");
         if (onPooler) {
             // Pooler configured but Storage isn't — storing the data-URL here is exactly
@@ -91,36 +121,91 @@ export async function persistSignature(
             throw new Error("Signature storage is not configured");
         }
         // Plain Postgres (no pooler size limit) — keep prior behaviour, store the data-URL.
-        return value;
+        return { url: value, discard: noDiscard };
     }
 
+    const now = dependencies.now ?? Date.now;
+    const randomId = dependencies.randomId ?? randomUUID;
     const ext = mime === "jpeg" ? "jpg" : mime;
     const safePrefix = keyPrefix.replace(/[^a-zA-Z0-9/_-]/g, "_");
-    const storagePath = `signatures/${safePrefix}/${Date.now()}_${randomUUID()}.${ext}`;
+    const storagePath = `signatures/${safePrefix}/${now()}_${randomId()}.${ext}`;
 
-    const uploadPromise = supabase.storage.from(STORAGE_BUCKET).upload(storagePath, buffer, {
+    const uploadPromise = bucket.upload(storagePath, buffer, {
         contentType: `image/${mime}`,
         upsert: false,
     });
+    const uploadTimeoutMs = dependencies.uploadTimeoutMs ?? UPLOAD_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let res: Awaited<typeof uploadPromise>;
+    let deadlineWon = false;
+    let uploadResult: Awaited<typeof uploadPromise>;
     try {
-        const timeout = new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error("Signature upload timed out")), UPLOAD_TIMEOUT_MS);
+        const timeout = new Promise<"deadline">((resolve) => {
+            timer = setTimeout(() => resolve("deadline"), uploadTimeoutMs);
         });
-        res = await Promise.race([uploadPromise, timeout]);
+        const first = await Promise.race([uploadPromise, timeout]);
+        if (first === "deadline") {
+            deadlineWon = true;
+            // Supabase upload has no proven cancellation signal. Observe settlement so
+            // a late success can be removed before this attempt returns an error.
+            uploadResult = await uploadPromise;
+        } else {
+            uploadResult = first;
+        }
     } catch {
         throw new Error("Couldn't save your signature — please try again.");
     } finally {
         if (timer) clearTimeout(timer);
     }
 
-    if (res.error) throw new Error("Couldn't save your signature — please try again.");
-
-    const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-    if (!data?.publicUrl) {
-        // Don't persist a bare object path — it's neither renderable nor re-migratable.
+    if (uploadResult.error) {
         throw new Error("Couldn't save your signature — please try again.");
     }
-    return data.publicUrl;
+
+    let discardPromise: Promise<void> | undefined;
+    const discard = () => {
+        discardPromise ??= (async () => {
+            const removal = await bucket.remove([storagePath]);
+            if (removal.error) throw removal.error;
+        })();
+        return discardPromise;
+    };
+
+    if (deadlineWon) {
+        try {
+            await discard();
+        } catch (error) {
+            console.error("[signature-storage] cleanup failed", {
+                operation: "discard-late-signature-upload",
+                errorType: cleanupErrorType(error),
+            });
+        }
+        throw new Error("Couldn't save your signature — please try again.");
+    }
+
+    let publicUrl: string | null | undefined;
+    try {
+        publicUrl = bucket.getPublicUrl(storagePath).data?.publicUrl;
+    } catch {
+        publicUrl = null;
+    }
+    if (!publicUrl) {
+        try {
+            await discard();
+        } catch (error) {
+            console.error("[signature-storage] cleanup failed", {
+                operation: "discard-unaddressable-signature",
+                errorType: cleanupErrorType(error),
+            });
+        }
+        throw new Error("Couldn't save your signature — please try again.");
+    }
+
+    return { url: publicUrl, discard };
+}
+
+export async function persistSignature(
+    value: string | null | undefined,
+    keyPrefix: string,
+): Promise<string | null> {
+    return (await persistOwnedSignature(value, keyPrefix)).url;
 }

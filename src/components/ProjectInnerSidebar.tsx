@@ -63,7 +63,7 @@ export default function ProjectInnerSidebar({ projectId, projectName, clientName
                 { label: "Room Designer", href: `/projects/${projectId}/room-designer`, permission: "roomDesigner" },
                 { label: "Mood Boards", href: `/projects/${projectId}/mood-boards` },
                 { label: "Selection Boards", href: `/projects/${projectId}/selections` },
-                { label: "Bids", href: `/projects/${projectId}/bid-packages` },
+                { label: "Bids", href: `/projects/${projectId}/bid-packages`, permission: "financialReports" },
             ],
         },
         {

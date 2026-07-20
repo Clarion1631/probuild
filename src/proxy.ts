@@ -1,4 +1,5 @@
 import { withAuth } from "next-auth/middleware";
+import { getToken } from "next-auth/jwt";
 import { NextResponse } from "next/server";
 import { isStaffAccountEnabled } from "@/lib/staff-status";
 
@@ -19,7 +20,23 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
     /^\/api\/projects\/[^/]+\/(?:cost-codes|buckets|estimate-items|estimates)\/?$/,
 ];
 
-export default async function middleware(req: any, event: any) {
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+
+export function isPublicProxyBypass(pathname: string) {
+    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
+}
+
+function hasNextAuthSessionCookie(req: any) {
+    const requestCookies = req.cookies?.getAll?.() ?? [];
+    return requestCookies.some(({ name }: { name: string }) =>
+        name === "next-auth.session-token"
+        || name.startsWith("next-auth.session-token.")
+        || name === "__Secure-next-auth.session-token"
+        || name.startsWith("__Secure-next-auth.session-token.")
+    );
+}
+
+export default async function proxy(req: any, event: any) {
     // Bypass authentication entirely during development for local testing
     if (process.env.NODE_ENV === 'development') {
         // Allow all requests to pass through without authentication in development
@@ -27,11 +44,28 @@ export default async function middleware(req: any, event: any) {
         return NextResponse.next();
     }
 
+    const pathname = req.nextUrl?.pathname;
+    const isServerAction = typeof req.headers?.get?.("next-action") === "string";
+
+    // Public portal routes must remain reachable without a staff session, but a
+    // stale staff cookie must never use those routes to bypass the production
+    // auth matcher and replay a Server Action. Anonymous portal actions still
+    // authorize through their own client/token checks inside the action.
+    if (isServerAction && hasNextAuthSessionCookie(req)) {
+        const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+        if (!token?.email || (token as any).accountDisabled === true || !await isStaffAccountEnabled(token.email)) {
+            return new NextResponse("Forbidden", { status: 403 });
+        }
+    }
+
+    if (typeof pathname === "string" && isPublicProxyBypass(pathname)) {
+        return NextResponse.next();
+    }
+
     // Approved shared API routes verify mobile JWTs in their own handlers. Do not
     // extend this to arbitrary Bearer requests: many web routes rely on Proxy as
     // their authentication boundary.
     const authHeader = req.headers?.get?.("authorization");
-    const pathname = req.nextUrl?.pathname;
     const handlerVerifiesBearer = typeof pathname === "string"
         && MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
     if (
@@ -60,6 +94,10 @@ export default async function middleware(req: any, event: any) {
 
 export const config = {
     matcher: [
+        {
+            source: "/:path*",
+            has: [{ type: "header", key: "next-action" }],
+        },
         /*
          * Match all request paths except for the ones starting with:
          * - api/auth (NextAuth endpoints)
@@ -70,6 +108,7 @@ export const config = {
          * - api/portal (Public backend handlers for documents)
          * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
          * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
+         * - api/health (Exact public web-process deployment/liveness probe)
          * - api/version (Deployment-id probe for the stale-tab refresh banner)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
@@ -80,6 +119,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

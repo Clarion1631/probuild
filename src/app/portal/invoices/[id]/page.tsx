@@ -1,4 +1,4 @@
-import { getInvoiceForPortal, getCompanySettings, getPortalVisibility } from "@/lib/actions";
+import { getInvoiceForPortal, getPublicCompanySettings, getPortalVisibility } from "@/lib/actions";
 import { notFound, redirect } from "next/navigation";
 import PortalInvoiceClient from "./PortalInvoiceClient";
 import Link from "next/link";
@@ -117,7 +117,7 @@ export default async function PortalInvoicePage({
     }
 
     const invoice = await getInvoiceForPortal(resolvedParams.id);
-    const settings = await getCompanySettings();
+    const settings = await getPublicCompanySettings();
 
     if (!invoice) {
         return notFound();

@@ -12,10 +12,11 @@ import { formatCurrency } from "./utils";
 import { createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
-import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
-import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import { approveChangeOrderWithSignature } from "./change-order-approval";
 import { setProjectStartDate, parseStartDateInput } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
@@ -140,6 +141,7 @@ function isAllowedCapturedPdfUrl(url: string): boolean {
  * where <expiry> is a Unix timestamp (seconds) and <sig> is HMAC-SHA256.
  */
 export async function generatePdfUploadToken(estimateId: string): Promise<string> {
+    await assertEstimateStaffOrPortalAccess(estimateId);
     const secret = process.env.NEXTAUTH_SECRET;
     if (!secret) {
         throw new Error("NEXTAUTH_SECRET is not configured");
@@ -151,6 +153,7 @@ export async function generatePdfUploadToken(estimateId: string): Promise<string
 }
 
 export async function getLeads() {
+    await assertActiveStaff();
     const leads = await prisma.lead.findMany({
         orderBy: { createdAt: "desc" },
         include: {
@@ -303,7 +306,7 @@ export async function createLead(data: { name: string; clientName: string; clien
     revalidatePath("/leads");
 
     try {
-        const settings = await getCompanySettings();
+        const settings = await getCachedCompanySettings();
         if (settings.notificationEmail && isNotificationEnabled(settings, "newLead")) {
             await sendNotification(
                 settings.notificationEmail,
@@ -339,6 +342,7 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
 }
 
 export async function deleteLead(id: string) {
+    await assertActiveStaff();
     // Prevent deletion of leads that have a linked project — checking the FK directly is
     // authoritative. Previously this only checked stage === "Won", but any stage can be
     // linked to a project, and with unlink removed there is no recovery path from a
@@ -983,6 +987,7 @@ export async function deleteLeadMeeting(meetingId: string) {
 }
 
 export async function getProjects() {
+    await assertActiveStaff();
     const projects = await prisma.project.findMany({
         orderBy: { viewedAt: "desc" },
         include: {
@@ -996,6 +1001,7 @@ export async function getProjects() {
     }))));
 }
 export const getProject = cache(async function getProject(id: string) {
+    await assertActiveStaff();
     const include = {
         client: true,
         estimates: {
@@ -1198,6 +1204,7 @@ export async function createProject(data: {
 }
 
 export async function createDraftEstimate(projectId: string) {
+    await assertEstimatePermission();
     // WA is destination-based: default the rate from the job-site address,
     // falling back to the company default (null fields) when unresolvable.
     const taxDefault = await defaultTaxForNewEstimate({ projectId });
@@ -1223,6 +1230,7 @@ export async function createDraftEstimate(projectId: string) {
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
+    await assertEstimatePermission();
     const taxDefault = await defaultTaxForNewEstimate({ leadId });
     const estimate = await prisma.estimate.create({
         data: {
@@ -1415,6 +1423,7 @@ export async function listRoomsForLead(leadId: string) {
 }
 
 export const getEstimate = cache(async function getEstimate(id: string) {
+    await assertEstimatePermission();
     try {
         // Full query — works when all schema columns exist in DB
         return await prisma.estimate.findUnique({
@@ -1705,6 +1714,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
  *  Race-safe: catches P2002 on concurrent creates and re-reads the winner. */
 export async function ensureEstimatePayInFullSchedule(estimateId: string): Promise<string> {
     "use server";
+    await assertEstimateStaffOrPortalAccess(estimateId);
     // Derive amount from canonical server data — never accept it from the client
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
@@ -1747,6 +1757,7 @@ export async function ensureEstimatePayInFullSchedule(estimateId: string): Promi
 }
 
 export const getAllEstimates = cache(async function getAllEstimates() {
+    await assertEstimatePermission();
     return await prisma.estimate.findMany({
         orderBy: { createdAt: "desc" },
         select: {
@@ -1958,7 +1969,7 @@ export async function markEstimateViewed(estimateId: string) {
 
         const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || "A client";
         const projectName = estimate.project?.name || estimate.lead?.name || "";
-        const settings = await getCompanySettings();
+        const settings = await getCachedCompanySettings();
         if (settings.notificationEmail && isNotificationEnabled(settings, "estimateViewed")) {
             await sendNotification(
                 settings.notificationEmail,
@@ -2008,6 +2019,7 @@ export type EstimateActivityEvent = {
  * so payment history is always complete without any extra logging.
  */
 export async function getEstimateActivity(estimateId: string): Promise<EstimateActivityEvent[]> {
+    await assertEstimatePermission();
     const [estimate, logs, invoice] = await Promise.all([
         prisma.estimate.findUnique({
             where: { id: estimateId },
@@ -2132,7 +2144,7 @@ export async function markContractViewed(contractId: string, accessToken?: strin
 
         const clientName = contract.project?.client?.name || contract.lead?.client?.name || "A client";
         const projectName = contract.project?.name || contract.lead?.name || "";
-        const settings = await getCompanySettings();
+        const settings = await getCachedCompanySettings();
         if (settings.notificationEmail) {
             await sendNotification(
                 settings.notificationEmail,
@@ -2231,7 +2243,7 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         select: { id: true, code: true },
     });
     if (!invoice) {
-        const created = await createInvoiceFromEstimate(estimateId);
+        const created = await createInvoiceFromEstimateInternal(estimateId);
         invoice = await prisma.invoice.update({
             where: { id: created.id },
             data: { status: "Issued", issueDate: new Date() },
@@ -2358,7 +2370,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         entityName: `Estimate ${estimate?.code || estimateId}`,
     });
 
-    const settings = await getCompanySettings();
+    const settings = await getCachedCompanySettings();
     const companyName = settings.companyName || "Golden Touch Remodeling";
     const estimateCode = estimate?.code || estimateId;
     const projectName = estimate?.project?.name || estimate?.lead?.name || "your project";
@@ -2546,6 +2558,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 }
 
 export async function deleteInvoice(invoiceId: string) {
+    await assertInvoicePermission();
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         include: { payments: true },
@@ -2565,6 +2578,7 @@ export async function deleteInvoice(invoiceId: string) {
 }
 
 export async function updateInvoiceNotes(invoiceId: string, notes: string) {
+    await assertInvoicePermission();
     const invoice = await prisma.invoice.update({
         where: { id: invoiceId },
         data: { notes },
@@ -2656,6 +2670,22 @@ export async function getInvoiceForPortal(id: string) {
 }
 
 export async function markInvoiceViewed(invoiceId: string) {
+    const sessionClientId = await assertInvoicePortalAccess();
+    if (!sessionClientId) return;
+
+    const claim = await prisma.invoice.updateMany({
+        where: {
+            id: invoiceId,
+            viewedAt: null,
+            OR: [
+                { clientId: sessionClientId },
+                { project: { clientId: sessionClientId } },
+            ],
+        },
+        data: { viewedAt: new Date() },
+    });
+    if (claim.count === 0) return;
+
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         select: {
@@ -2664,15 +2694,11 @@ export async function markInvoiceViewed(invoiceId: string) {
             client: { select: { name: true } },
         },
     });
-    if (invoice && !invoice.viewedAt) {
-        await prisma.invoice.update({
-            where: { id: invoiceId },
-            data: { viewedAt: new Date() },
-        });
+    if (invoice) {
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
         try {
-            const settings = await getCompanySettings();
+            const settings = await getCachedCompanySettings();
             if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
                 const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
                 const editorUrl = invoice.projectId ? `${appUrl}/projects/${invoice.projectId}/invoices/${invoiceId}` : `${appUrl}/invoices`;
@@ -2758,6 +2784,7 @@ export async function emailInvoiceCopyToMe(
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
+    await assertEstimatePermission();
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
@@ -3057,6 +3084,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
 
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
+    await assertEstimatePermission();
     // One transaction, estimate locked FIRST (canonical Estimate → Invoice order; this flow
     // touches only the estimate). Without the lock two concurrent logs each read the same
     // balanceDue and each write balanceDue − amount, losing one decrement. The lock serializes
@@ -3111,6 +3139,7 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
 
 export async function archiveEstimate(estimateId: string) {
     "use server";
+    await assertEstimatePermission();
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: safeEstimateSelect,
@@ -3167,117 +3196,13 @@ async function getDefaultSalesTaxRate(): Promise<number> {
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
-    if (!estimate) throw new Error("Estimate not found");
+    await assertInvoicePermission();
+    return createInvoiceFromEstimateInternal(estimateId);
+}
 
-    const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
-    if (!project) throw new Error("Project not found");
-
-    const total = toNum(estimate.totalAmount || 0);
-    const rate = estimate.taxRatePercent != null
-        ? Number(estimate.taxRatePercent)
-        : await getDefaultSalesTaxRate();
-    const tax = deriveInvoiceTaxFields(total, rate, !!estimate.taxExempt);
-
-    const invoice = await prisma.invoice.create({
-        data: {
-            code: "INV-TEMP",
-            projectId: estimate.projectId!,
-            clientId: project.clientId,
-            estimateId: estimate.id,
-            status: "Draft",
-            totalAmount: total,
-            balanceDue: total,
-            subtotal: tax.subtotal,
-            taxRate: tax.taxRate,
-            taxAmount: tax.taxAmount,
-        },
-    });
-
-    // Use DB-assigned autoincrement for collision-free code
-    const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
-    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
-
-    // Clone the estimate's milestones into invoice-side PaymentSchedules. The
-    // source read + clone inserts run in ONE transaction that first takes the
-    // same Project row lock setProjectStartDate uses: a start-date move can
-    // then never slip between our read of the source dueDates and the clone
-    // inserts (which would leave the new clones on pre-shift dates while their
-    // EPS rows and the project's tasks moved -- a partially shifted mirror
-    // group). Lock order is parent-before-child (Project before its Estimate/
-    // Invoice children), matching the canonical money-lock direction in
-    // tx-retry.ts; withTxRetry covers residual serialization failures.
-    const paidAmount = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        // Serialize against start-date moves BEFORE reading the source rows.
-        // Lead-owned estimates (no projectId) need no lock -- start-date
-        // moves only target projects.
-        if (estimate.projectId) {
-            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
-        }
-
-        const schedules = await tx.estimatePaymentSchedule.findMany({
-            where: { estimateId },
-            orderBy: { order: "asc" },
-        });
-
-        let paidAmount = 0;
-        if (schedules.length > 0) {
-            for (const schedule of schedules) {
-                const isPaid = schedule.status === "Paid";
-                if (isPaid) {
-                    paidAmount += toNum(schedule.amount);
-                }
-                await tx.paymentSchedule.create({
-                    data: {
-                        invoiceId: invoice.id,
-                        sourceScheduleId: schedule.id,
-                        // Keep the schedule-task link on the invoice-side clone so
-                        // start-date moves can shift both milestone mirrors together.
-                        scheduleTaskId: schedule.scheduleTaskId || null,
-                        name: schedule.name,
-                        amount: schedule.amount,
-                        status: schedule.status,
-                        dueDate: schedule.dueDate || null,
-                        paymentDate: schedule.paymentDate || null,
-                        paidAt: schedule.paidAt || null,
-                        stripeSessionId: schedule.stripeSessionId || null,
-                        stripePaymentIntentId: schedule.stripePaymentIntentId || null,
-                        paymentMethod: schedule.paymentMethod || null,
-                        referenceNumber: schedule.referenceNumber || null,
-                        notes: schedule.notes || null,
-                    },
-                });
-            }
-        } else {
-            await tx.paymentSchedule.create({
-                data: {
-                    invoiceId: invoice.id,
-                    name: "Initial Payment",
-                    amount: estimate.totalAmount || 0,
-                    status: "Pending",
-                },
-            });
-        }
-        return paidAmount;
-    }));
-
-    const newBalanceDue = Math.max(0, total - paidAmount);
-    let invoiceStatus = "Draft";
-    if (paidAmount > 0) {
-        invoiceStatus = newBalanceDue <= 0 ? "Paid" : "Partially Paid";
-    }
-
-    await prisma.invoice.update({
-        where: { id: invoice.id },
-        data: {
-            code: invoiceCode,
-            balanceDue: newBalanceDue,
-            status: invoiceStatus,
-        }
-    });
-
-    revalidatePath(`/projects/${estimate.projectId}/invoices`);
-    return { id: invoice.id, projectId: estimate.projectId };
+async function createInvoiceFromEstimateInternal(estimateId: string) {
+    const { createInvoiceFromEstimateCore } = await import("./billing-core");
+    return createInvoiceFromEstimateCore(estimateId);
 }
 
 export async function createOneOffInvoice(
@@ -3334,7 +3259,7 @@ export async function createOneOffInvoice(
 }
 
 export async function createInvoiceFromTimeEntries(projectId: string, timeEntryIds: string[]) {
-    "use server";
+    await assertInvoicePermission();
     if (!timeEntryIds.length) throw new Error("No time entries selected");
 
     const project = await prisma.project.findUnique({ where: { id: projectId } });
@@ -3398,6 +3323,7 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
 }
 
 export async function getInvoice(id: string) {
+    await assertInvoicePermission();
     const invoice = await prisma.invoice.findUnique({
         where: { id },
         include: {
@@ -4052,11 +3978,100 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
     return { success: true };
 }
 
-async function assertInvoicePermission() {
+async function assertActiveStaff(): Promise<any> {
     const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "invoices")) throw new Error("Forbidden");
+    if (user) return user;
+
+    if (await canUseDevAuthFallback()) {
+        const devSession = await getSessionOrDev();
+        if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
+    }
+    throw new Error("Unauthorized");
+}
+
+async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings") {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, permission)) throw new Error("Forbidden");
     return user;
+}
+
+async function assertEstimatePermission() {
+    return assertStaffPermission("estimates");
+}
+
+async function assertInvoicePermission() {
+    return assertStaffPermission("invoices");
+}
+
+async function assertChangeOrderPermission() {
+    return assertStaffPermission("changeOrders");
+}
+
+async function assertFinancialPermission() {
+    return assertStaffPermission("financialReports");
+}
+
+function assertFinancialProjectScope(user: any, projectId: string) {
+    if (["ADMIN", "MANAGER", "FINANCE"].includes(user.role)) return;
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+}
+
+async function assertFinancialProjectAccess(projectId: string) {
+    const user = await assertFinancialPermission();
+    assertFinancialProjectScope(user, projectId);
+    return user;
+}
+
+async function assertCompanySettingsPermission() {
+    return assertStaffPermission("companySettings");
+}
+
+async function assertEstimateStaffOrPortalAccess(estimateId: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (user) {
+        if (!hasPermission(user, "estimates") && !hasPermission(user, "invoices")) {
+            throw new Error("Forbidden");
+        }
+        return;
+    }
+    if (await canUseDevAuthFallback()) {
+        await assertActiveStaff();
+        return;
+    }
+
+    const clientId = await resolveSessionClientId();
+    if (!clientId) throw new Error("Unauthorized");
+    const owned = await prisma.estimate.findFirst({
+        where: {
+            id: estimateId,
+            OR: [
+                { project: { is: { clientId } } },
+                { lead: { is: { clientId } } },
+            ],
+        },
+        select: { id: true },
+    });
+    if (!owned) throw new Error("Unauthorized");
+}
+
+async function assertInvoicePortalAccess(): Promise<string | null> {
+    // Staff previews must never register as client views.
+    if (await getCurrentUserWithPermissions()) return null;
+    if (await canUseDevAuthFallback()) {
+        await assertActiveStaff();
+        return null;
+    }
+    return resolveSessionClientId();
+}
+
+async function assertEstimateSendPermission(mcpSecret?: string) {
+    const configuredSecret = process.env.MCP_SECRET;
+    if (mcpSecret && configuredSecret) {
+        const supplied = Buffer.from(mcpSecret);
+        const configured = Buffer.from(configuredSecret);
+        if (supplied.length === configured.length && timingSafeEqual(supplied, configured)) return;
+    }
+    await assertEstimatePermission();
 }
 
 export async function addInvoiceMilestone(
@@ -4300,6 +4315,7 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
 }
 
 export async function getProjectInvoices(projectId: string) {
+    await assertInvoicePermission();
     return await prisma.invoice.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
@@ -4308,6 +4324,7 @@ export async function getProjectInvoices(projectId: string) {
 }
 
 export async function getAllInvoices() {
+    await assertInvoicePermission();
     return await prisma.invoice.findMany({
         orderBy: { createdAt: "desc" },
         include: {
@@ -4318,6 +4335,7 @@ export async function getAllInvoices() {
 }
 
 export async function issueInvoice(invoiceId: string) {
+    await assertInvoicePermission();
     const invoice = await prisma.invoice.update({
         where: { id: invoiceId },
         data: {
@@ -4356,9 +4374,77 @@ async function generateBudgetForEstimate(estimateId: string, projectId: string) 
 }
 
 
-export const getCompanySettings = unstable_cache(
+const staffCompanySettingsSelect = {
+    id: true,
+    companyName: true,
+    address: true,
+    phone: true,
+    email: true,
+    website: true,
+    logoUrl: true,
+    licenseNumber: true,
+    notificationEmail: true,
+    googleDriveEmail: true,
+    projectStatuses: true,
+    subcontractorTrades: true,
+    stripeEnabled: true,
+    enableCard: true,
+    enableBankTransfer: true,
+    enableAffirm: true,
+    enableKlarna: true,
+    passProcessingFee: true,
+    cardProcessingRate: true,
+    cardProcessingFlat: true,
+    monthlyOverhead: true,
+    workDays: true,
+    workdayStart: true,
+    workdayEnd: true,
+    salesTaxes: true,
+    letterheadMode: true,
+    letterheadImageUrl: true,
+    letterheadLogoPosition: true,
+    letterheadFields: true,
+    letterheadAccentColor: true,
+    letterheadDivider: true,
+    notificationToggles: true,
+    requireContractCountersign: true,
+    updatedAt: true,
+} as const;
+
+const publicCompanySettingsSelect = {
+    id: true,
+    companyName: true,
+    address: true,
+    phone: true,
+    email: true,
+    website: true,
+    logoUrl: true,
+    licenseNumber: true,
+    stripeEnabled: true,
+    enableCard: true,
+    enableBankTransfer: true,
+    enableAffirm: true,
+    enableKlarna: true,
+    passProcessingFee: true,
+    cardProcessingRate: true,
+    cardProcessingFlat: true,
+    salesTaxes: true,
+    letterheadMode: true,
+    letterheadImageUrl: true,
+    letterheadLogoPosition: true,
+    letterheadFields: true,
+    letterheadAccentColor: true,
+    letterheadDivider: true,
+    requireContractCountersign: true,
+    updatedAt: true,
+} as const;
+
+const getCachedCompanySettings = unstable_cache(
     async () => {
-        let settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+        let settings = await prisma.companySettings.findUnique({
+            where: { id: "singleton" },
+            select: staffCompanySettingsSelect,
+        });
 
         if (!settings) {
             settings = await prisma.companySettings.create({
@@ -4366,6 +4452,7 @@ export const getCompanySettings = unstable_cache(
                     id: "singleton",
                     companyName: "My Construction Co.",
                 },
+                select: staffCompanySettingsSelect,
             });
         }
 
@@ -4375,7 +4462,29 @@ export const getCompanySettings = unstable_cache(
     { revalidate: 300, tags: ["company-settings"] }
 );
 
+const getCachedPublicCompanySettings = unstable_cache(
+    async () => {
+        const settings = await prisma.companySettings.findUnique({
+            where: { id: "singleton" },
+            select: publicCompanySettingsSelect,
+        });
+        return settings ? JSON.parse(JSON.stringify(settings)) : null;
+    },
+    ["public-company-settings"],
+    { revalidate: 300, tags: ["company-settings"] },
+);
+
+export async function getCompanySettings() {
+    await assertActiveStaff();
+    return getCachedCompanySettings();
+}
+
+export async function getPublicCompanySettings() {
+    return getCachedPublicCompanySettings();
+}
+
 export async function saveCompanySettings(data: any) {
+    await assertCompanySettingsPermission();
     await prisma.companySettings.update({
         where: { id: "singleton" },
         data: {
@@ -4420,6 +4529,7 @@ export async function saveCompanySettings(data: any) {
 }
 
 export async function deleteEstimate(estimateId: string): Promise<{ success: boolean; error?: string }> {
+    await assertEstimatePermission();
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { projectId: true, leadId: true, status: true },
@@ -4477,6 +4587,7 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
 // =============================================
 
 export async function duplicateEstimate(estimateId: string, targetProjectId?: string, newTitle?: string) {
+    await assertEstimatePermission();
     const original = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -4618,6 +4729,7 @@ export async function duplicateEstimates(
 // =============================================
 
 export async function saveEstimateAsTemplate(estimateId: string, templateName: string) {
+    await assertEstimatePermission();
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: { items: { orderBy: { order: "asc" } } },
@@ -4663,6 +4775,7 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
 }
 
 export async function getEstimateTemplates() {
+    await assertEstimatePermission();
     return await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
@@ -4670,6 +4783,7 @@ export async function getEstimateTemplates() {
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
+    await assertEstimatePermission();
     const template = await prisma.estimateTemplate.findUnique({
         where: { id: templateId },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
@@ -4732,6 +4846,7 @@ export async function createEstimateFromTemplate(projectId: string, templateId: 
 // =============================================
 
 export async function saveItemsAsAssembly(name: string, items: { name: string; description?: string; type: string; quantity: number; baseCost: number; markupPercent: number; unitCost: number; order: number; parentId?: string | null; costCodeId?: string | null; costTypeId?: string | null; isSection?: boolean }[]) {
+    await assertEstimatePermission();
     const itemRows = items.map((item, idx) => ({
         name: item.name,
         description: item.description || "",
@@ -4772,6 +4887,7 @@ export async function saveItemsAsAssembly(name: string, items: { name: string; d
 }
 
 export async function deleteAssembly(templateId: string) {
+    await assertEstimatePermission();
     await prisma.estimateTemplate.delete({ where: { id: templateId } });
     return { success: true };
 }
@@ -4832,7 +4948,8 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string, capturedPdfUrl?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string, capturedPdfUrl?: string, mcpSecret?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+    await assertEstimateSendPermission(mcpSecret);
     try {
     // --- Server-side CC validation ---
     const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -6005,7 +6122,7 @@ export async function approveContract(contractId: string, signatureName: string,
         });
     });
 
-    const settings = await getCompanySettings();
+    const settings = await getCachedCompanySettings();
     if (settings.notificationEmail && isNotificationEnabled(settings, "contractSigned")) {
         const isRecurring = contract.recurringDays && contract.recurringDays > 0;
         await sendNotification(
@@ -6292,6 +6409,7 @@ export async function getDashboardTasks(projectId: string) {
 }
 
 export async function getEstimateItemsForProject(projectId: string) {
+    await assertEstimatePermission();
     const items = await prisma.estimateItem.findMany({
         where: { estimate: { projectId }, type: { not: "Section" } },
         orderBy: { order: "asc" },
@@ -6495,6 +6613,7 @@ export async function unlinkTasks(predecessorId: string, dependentId: string) {
 }
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {
+    await assertEstimatePermission();
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -7009,6 +7128,7 @@ export async function getActiveSubcontractors() {
 // ========== PROJECT BOARD ACTIONS ==========
 
 export async function updateProjectStatus(projectId: string, status: string) {
+    await assertActiveStaff();
     await prisma.project.update({
         where: { id: projectId },
         data: { status }
@@ -7059,6 +7179,7 @@ export async function updateProjectTags(projectId: string, tags: string) {
 }
 
 export async function updateProjectName(projectId: string, name: string) {
+    await assertActiveStaff();
     await prisma.project.update({
         where: { id: projectId },
         data: { name }
@@ -7091,6 +7212,7 @@ export async function updateProjectLocation(projectId: string, location: string)
 }
 
 export async function deleteProjects(projectIds: string[]) {
+    await assertActiveStaff();
     await prisma.project.deleteMany({
         where: { id: { in: projectIds } }
     });
@@ -7099,6 +7221,7 @@ export async function deleteProjects(projectIds: string[]) {
 }
 
 export async function updateCompanyProjectStatuses(statuses: string) {
+    await assertCompanySettingsPermission();
     await prisma.companySettings.update({
         where: { id: "singleton" },
         data: { projectStatuses: statuses }
@@ -7339,6 +7462,7 @@ export async function getCompanySubcontractorTrades() {
 }
 
 export async function saveCompanySubcontractorTrades(trades: string[]) {
+    await assertCompanySettingsPermission();
     await prisma.companySettings.update({
         where: { id: "singleton" },
         data: { subcontractorTrades: JSON.stringify(trades) },
@@ -7378,7 +7502,7 @@ export async function saveSubcontractorExplicitProjects(subId: string, projectId
 // =============================================
 
 export async function createChangeOrder(projectId: string, estimateId: string, itemIds?: string[]) {
-    "use server";
+    await assertChangeOrderPermission();
 
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
@@ -7491,7 +7615,7 @@ export async function createSuggestedChangeOrder(
 }
 
 export async function getChangeOrders(projectId: string) {
-    "use server";
+    await assertChangeOrderPermission();
     return await prisma.changeOrder.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
@@ -7500,7 +7624,7 @@ export async function getChangeOrders(projectId: string) {
 }
 
 export async function getChangeOrder(id: string) {
-    "use server";
+    await assertChangeOrderPermission();
     return await prisma.changeOrder.findUnique({
         where: { id },
         include: {
@@ -7565,10 +7689,7 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
 }
 
 export async function deleteChangeOrder(id: string) {
-    "use server";
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "changeOrders")) throw new Error("Forbidden");
+    const user = await assertChangeOrderPermission();
     const target = await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } });
     if (!target) return;
     if (!canAccessProject(user, target.projectId)) throw new Error("Forbidden");
@@ -7609,15 +7730,12 @@ export async function approveChangeOrder(id: string, signatureName: string, user
     if (!normalizedSignatureName) throw new Error("Your full legal name is required");
     if (!signatureDataUrl) throw new Error("A drawn signature is required");
 
-    // Move the signature image into Storage (avoids the PgBouncer pooler message-size
-    // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
-    const clientSignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/client`);
-
-    // The core takes the same CO row lock as editing/sending/billing and enforces
-    // Sent + item existence + positive subtotal in that transaction before the
-    // one-time Approved write.
     const approvedAt = new Date();
-    const approval = await approveChangeOrderCore(id, { signatureName: normalizedSignatureName, clientSignatureUrl, approvedAt });
+    const approval = await approveChangeOrderWithSignature(id, {
+        signatureName: normalizedSignatureName,
+        signatureDataUrl,
+        approvedAt,
+    });
     if (!approval) return null;
     const { co, transitioned } = approval;
 
@@ -7999,7 +8117,7 @@ export async function deleteVendorTag(id: string) {
 // Purchase Orders
 // ==========================================
 export async function getPurchaseOrders(projectId: string) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
     return prisma.purchaseOrder.findMany({
         where: { projectId },
         include: { vendor: true, items: true },
@@ -8008,27 +8126,41 @@ export async function getPurchaseOrders(projectId: string) {
 }
 
 export async function getPurchaseOrder(id: string) {
-    "use server";
-    return prisma.purchaseOrder.findUnique({
+    const user = await assertFinancialPermission();
+    const purchaseOrder = await prisma.purchaseOrder.findUnique({
         where: { id },
         include: { vendor: true, items: { include: { costCode: true } }, files: true, expenses: { include: { costCode: true } } }
     });
+    if (purchaseOrder) assertFinancialProjectScope(user, purchaseOrder.projectId);
+    return purchaseOrder;
 }
 
 export async function createPurchaseOrder(projectId: string, data: any) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
     const count = await prisma.purchaseOrder.count({ where: { projectId } });
     const code = `PO-${(count + 1).toString().padStart(3, "0")}`;
-    
-    const { items, ...poData } = data;
+    const items = data.items;
     
     const po = await prisma.purchaseOrder.create({
         data: {
-            ...poData,
             projectId,
             code,
+            vendorId: data.vendorId,
+            status: data.status,
+            totalAmount: data.totalAmount,
+            notes: data.notes,
+            memos: data.memos,
+            terms: data.terms,
             items: {
-                create: items || []
+                create: (items || []).map((item: any) => ({
+                    description: item.description,
+                    quantity: item.quantity,
+                    unitCost: item.unitCost,
+                    total: item.total,
+                    order: item.order,
+                    costCodeId: item.costCodeId,
+                    costTypeId: item.costTypeId,
+                })),
             }
         }
     });
@@ -8037,7 +8169,7 @@ export async function createPurchaseOrder(projectId: string, data: any) {
 }
 
 export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
     
     // Validate inputs
     if (!itemIds || itemIds.length === 0) throw new Error("No items selected");
@@ -8049,6 +8181,7 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     });
 
     if (!estimate) throw new Error("Estimate not found");
+    if (estimate.projectId !== projectId) throw new Error("Estimate does not belong to this project");
 
     const selectedItems = estimate.items.filter((item: any) => itemIds.includes(item.id));
     if (selectedItems.length === 0) throw new Error("No valid items found");
@@ -8096,11 +8229,19 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
 }
 
 export async function updatePurchaseOrder(id: string, data: any) {
-    "use server";
-    const { items, vendorId, ...poData } = data;
-    
-    let updateData: any = { ...poData };
-    if (vendorId) updateData.vendorId = vendorId;
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
+    const items = data.items;
+    const updateData = {
+        ...(data.vendorId ? { vendorId: data.vendorId } : {}),
+        status: data.status,
+        totalAmount: data.totalAmount,
+        notes: data.notes,
+        memos: data.memos,
+        terms: data.terms,
+    };
 
     const po = await prisma.purchaseOrder.update({
         where: { id },
@@ -8134,15 +8275,19 @@ export async function updatePurchaseOrder(id: string, data: any) {
 }
 
 export async function deletePurchaseOrder(id: string) {
-    "use server";
+    const user = await assertFinancialPermission();
     const po = await prisma.purchaseOrder.findUnique({ where: { id } });
     if (!po) return;
+    assertFinancialProjectScope(user, po.projectId);
     await prisma.purchaseOrder.delete({ where: { id } });
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
 }
 
 export async function updatePurchaseOrderStatus(id: string, status: string) {
-    "use server";
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const po = await prisma.purchaseOrder.update({
         where: { id },
         data: { status }
@@ -8153,7 +8298,10 @@ export async function updatePurchaseOrderStatus(id: string, status: string) {
 }
 
 export async function approvePurchaseOrder(id: string, signatureName: string) {
-    "use server";
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const approvedAt = new Date();
     const po = await prisma.purchaseOrder.update({
         where: { id },
@@ -8170,7 +8318,10 @@ export async function approvePurchaseOrder(id: string, signatureName: string) {
 }
 
 export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
-    "use server";
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId }, select: { projectId: true } });
+    if (!existing) throw new Error("Purchase order not found");
+    assertFinancialProjectScope(user, existing.projectId);
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
 
@@ -8214,9 +8365,10 @@ export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData:
 }
 
 export async function deletePurchaseOrderFile(fileId: string) {
-    "use server";
+    const user = await assertFinancialPermission();
     const file = await prisma.purchaseOrderFile.findUnique({ where: { id: fileId }, include: { purchaseOrder: true } });
     if (!file) return;
+    assertFinancialProjectScope(user, file.purchaseOrder.projectId);
 
     await prisma.purchaseOrderFile.delete({ where: { id: fileId } });
     revalidatePath(`/projects/${file.purchaseOrder.projectId}/purchase-orders/${file.purchaseOrderId}`);
@@ -8228,9 +8380,10 @@ export async function uploadPurchaseOrderFileFromBuffer(
     projectId: string,
     formData: FormData
 ) {
-    "use server";
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    const user = await assertFinancialPermission();
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId }, select: { projectId: true } });
+    if (!existing || existing.projectId !== projectId) return;
+    assertFinancialProjectScope(user, existing.projectId);
 
     const file = formData.get("file") as File;
     if (!file) return;
@@ -8271,7 +8424,7 @@ export async function uploadPurchaseOrderFileFromBuffer(
 }
 
 export async function uploadEstimateFile(estimateId: string, formData: FormData) {
-    "use server";
+    await assertEstimatePermission();
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
 
@@ -8318,7 +8471,7 @@ export async function uploadEstimateFile(estimateId: string, formData: FormData)
 }
 
 export async function deleteEstimateFile(fileId: string) {
-    "use server";
+    await assertEstimatePermission();
     const file = await prisma.estimateFile.findUnique({ where: { id: fileId }, include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true, projectId: true, leadId: true } } } });
     if (!file) return;
 
@@ -8329,7 +8482,7 @@ export async function deleteEstimateFile(fileId: string) {
 }
 
 export async function getEstimateFiles(estimateId: string) {
-    "use server";
+    await assertEstimatePermission();
     return prisma.estimateFile.findMany({
         where: { estimateId },
         orderBy: { createdAt: "desc" },
@@ -8338,7 +8491,7 @@ export async function getEstimateFiles(estimateId: string) {
 
 
 export async function sendPurchaseOrder(id: string, toEmail: string, message: string) {
-    "use server";
+    const user = await assertFinancialPermission();
     const { sendNotification } = await import("./email");
     const { generatePurchaseOrderPdf } = await import("./pdf");
 
@@ -8347,6 +8500,7 @@ export async function sendPurchaseOrder(id: string, toEmail: string, message: st
         include: { project: true, vendor: true }
     });
     if (!po) throw new Error("PO not found");
+    assertFinancialProjectScope(user, po.projectId);
 
     const pdfBuffer = await generatePurchaseOrderPdf(id);
 
@@ -8529,7 +8683,7 @@ export async function sendSelectionBoardToClient(boardId: string) {
     // Email the client
     const clientEmail = board.project.client?.email;
     if (clientEmail) {
-        const settings = await getCompanySettings();
+        const settings = await getCachedCompanySettings();
         const { buildClientPortalUrl } = await import("./client-portal-auth");
         const portalUrl = await buildClientPortalUrl(board.project.client?.id, clientEmail, `/portal/projects/${board.projectId}/selections`);
         const selectionCc = buildCc(clientEmail, (board.project.client as any)?.additionalEmail);
@@ -8581,7 +8735,7 @@ export async function submitClientSelections(boardId: string, selections: Record
     });
 
     // Notify PM
-    const settings = await getCompanySettings();
+    const settings = await getCachedCompanySettings();
     if (settings.notificationEmail) {
         const selectedSummary = board.categories.map(cat => {
             const selectedOpt = cat.options.find(o => selections[cat.id] === o.id);
@@ -8937,6 +9091,7 @@ export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
 // ─── Bid Packages ─────────────────────────────────────────────────────────
 
 export async function getProjectBidPackages(projectId: string) {
+    await assertFinancialProjectAccess(projectId);
     return prisma.bidPackage.findMany({
         where: { projectId },
         include: { scopes: { orderBy: { order: "asc" } }, invitations: true },
@@ -8945,6 +9100,7 @@ export async function getProjectBidPackages(projectId: string) {
 }
 
 export async function getBidPackage(id: string) {
+    const user = await assertFinancialPermission();
     const pkg = await prisma.bidPackage.findUnique({
         where: { id },
         include: {
@@ -8955,6 +9111,7 @@ export async function getBidPackage(id: string) {
     });
 
     if (!pkg) return null;
+    assertFinancialProjectScope(user, pkg.projectId);
 
     return {
         ...pkg,
@@ -8976,9 +9133,15 @@ export async function createBidPackage(projectId: string, data: {
     dueDate?: Date | null;
     totalBudget?: number | null;
 }) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
     const pkg = await prisma.bidPackage.create({
-        data: { projectId, ...data },
+        data: {
+            projectId,
+            title: data.title,
+            description: data.description,
+            dueDate: data.dueDate,
+            totalBudget: data.totalBudget,
+        },
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     return pkg;
@@ -8991,15 +9154,28 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     status?: string;
     totalBudget?: number | null;
 }) {
-    "use server";
-    const pkg = await prisma.bidPackage.update({ where: { id }, data });
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidPackage.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing || existing.projectId !== projectId) throw new Error("Bid package not found");
+    const pkg = await prisma.bidPackage.update({
+        where: { id },
+        data: {
+            title: data.title,
+            description: data.description,
+            dueDate: data.dueDate,
+            status: data.status,
+            totalBudget: data.totalBudget,
+        },
+    });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
     return pkg;
 }
 
 export async function deleteBidPackage(id: string, projectId: string) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidPackage.findUnique({ where: { id }, select: { projectId: true } });
+    if (!existing || existing.projectId !== projectId) throw new Error("Bid package not found");
     await prisma.bidPackage.delete({ where: { id } });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     return { success: true };
@@ -9010,16 +9186,30 @@ export async function addBidScope(packageId: string, projectId: string, data: {
     description?: string;
     budgetAmount?: number | null;
 }) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
+    const pkg = await prisma.bidPackage.findUnique({ where: { id: packageId }, select: { projectId: true } });
+    if (!pkg || pkg.projectId !== projectId) throw new Error("Bid package not found");
     const scope = await prisma.bidScope.create({
-        data: { packageId, ...data },
+        data: {
+            packageId,
+            name: data.name,
+            description: data.description,
+            budgetAmount: data.budgetAmount,
+        },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return scope;
 }
 
 export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidScope.findUnique({
+        where: { id: scopeId },
+        select: { packageId: true, package: { select: { projectId: true } } },
+    });
+    if (!existing || existing.packageId !== packageId || existing.package.projectId !== projectId) {
+        throw new Error("Bid scope not found");
+    }
     await prisma.bidScope.delete({ where: { id: scopeId } });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return { success: true };
@@ -9029,7 +9219,9 @@ export async function inviteSubToBid(packageId: string, projectId: string, data:
     email: string;
     subcontractorId?: string;
 }) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
+    const pkg = await prisma.bidPackage.findUnique({ where: { id: packageId }, select: { projectId: true } });
+    if (!pkg || pkg.projectId !== projectId) throw new Error("Bid package not found");
     const inv = await prisma.bidInvitation.create({
         data: { packageId, email: data.email, subcontractorId: data.subcontractorId || null, sentAt: new Date() },
     });
@@ -9042,17 +9234,36 @@ export async function recordBidResponse(invitationId: string, packageId: string,
     bidAmount?: number | null;
     notes?: string;
 }) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
+    const existing = await prisma.bidInvitation.findUnique({
+        where: { id: invitationId },
+        select: { packageId: true, package: { select: { projectId: true } } },
+    });
+    if (!existing || existing.packageId !== packageId || existing.package.projectId !== projectId) {
+        throw new Error("Bid invitation not found");
+    }
     const inv = await prisma.bidInvitation.update({
         where: { id: invitationId },
-        data: { ...data, respondedAt: new Date() },
+        data: {
+            status: data.status,
+            bidAmount: data.bidAmount,
+            notes: data.notes,
+            respondedAt: new Date(),
+        },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
     return inv;
 }
 
 export async function awardBid(packageId: string, invitationId: string, projectId: string) {
-    "use server";
+    await assertFinancialProjectAccess(projectId);
+    const invitation = await prisma.bidInvitation.findUnique({
+        where: { id: invitationId },
+        select: { packageId: true, package: { select: { projectId: true } } },
+    });
+    if (!invitation || invitation.packageId !== packageId || invitation.package.projectId !== projectId) {
+        throw new Error("Bid invitation not found");
+    }
     await prisma.$transaction([
         prisma.bidInvitation.update({ where: { id: invitationId }, data: { status: "Awarded" } }),
         prisma.bidPackage.update({ where: { id: packageId }, data: { status: "Awarded" } }),
@@ -9068,6 +9279,7 @@ export async function createRetainer(projectId: string, data: {
     notes?: string;
     dueDate?: string;
 }) {
+    await assertInvoicePermission();
     const project = await prisma.project.findUnique({
         where: { id: projectId },
         select: { clientId: true },
@@ -9102,6 +9314,7 @@ export async function updateRetainer(id: string, data: {
     dueDate?: string | null;
     status?: string;
 }) {
+    await assertInvoicePermission();
     const existing = await prisma.retainer.findUnique({ where: { id }, select: { projectId: true, amountPaid: true } });
     if (!existing) throw new Error("Retainer not found");
 
@@ -9124,6 +9337,7 @@ export async function updateRetainer(id: string, data: {
 }
 
 export async function deleteRetainer(id: string) {
+    await assertInvoicePermission();
     const retainer = await prisma.retainer.findUnique({ where: { id }, select: { projectId: true } });
     if (!retainer) return { success: false };
 
@@ -9292,6 +9506,7 @@ export async function deleteDocumentComment(commentId: string) {
 // ========== PER-ITEM APPROVAL ==========
 
 export async function updateItemApproval(itemId: string, status: "approved" | "rejected" | null, note?: string) {
+    await assertEstimatePermission();
     try {
         return await prisma.estimateItem.update({
             where: { id: itemId },
@@ -9304,6 +9519,7 @@ export async function updateItemApproval(itemId: string, status: "approved" | "r
 }
 
 export async function bulkUpdateItemApproval(itemIds: string[], status: "approved" | "rejected" | null) {
+    await assertEstimatePermission();
     try {
         await prisma.estimateItem.updateMany({
             where: { id: { in: itemIds } },
@@ -9317,9 +9533,7 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
 }
 
 export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrderId: string) {
-    "use server";
-    const session = await getServerSession(authOptions);
-    if (!session) throw new Error("Unauthorized");
+    const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
@@ -9327,6 +9541,7 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     });
     if (!item) throw new Error("Estimate item not found");
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
+    assertFinancialProjectScope(user, item.estimate.projectId);
 
     const po = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId } });
     if (!po) throw new Error("Purchase order not found");
@@ -9341,14 +9556,15 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
 }
 
 export async function unlinkPOFromEstimateItem(estimateItemId: string) {
-    "use server";
-    const session = await getServerSession(authOptions);
-    if (!session) throw new Error("Unauthorized");
+    const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
         include: { estimate: { select: { projectId: true } } },
     });
+    if (!item) throw new Error("Estimate item not found");
+    if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
+    assertFinancialProjectScope(user, item.estimate.projectId);
     await prisma.estimateItem.update({
         where: { id: estimateItemId },
         data: { purchaseOrderId: null },
@@ -9359,9 +9575,7 @@ export async function unlinkPOFromEstimateItem(estimateItemId: string) {
 }
 
 export async function quickCreatePOAndLink(estimateItemId: string, data: { vendorId: string; amount: number; notes?: string }) {
-    "use server";
-    const session = await getServerSession(authOptions);
-    if (!session) throw new Error("Unauthorized");
+    const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
         where: { id: estimateItemId },
@@ -9371,6 +9585,7 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
 
     const projectId = item.estimate.projectId;
+    assertFinancialProjectScope(user, projectId);
 
     // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count
     let po: any;
@@ -9407,9 +9622,7 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
 }
 
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
-    "use server";
-    const session = await getServerSession(authOptions);
-    if (!session) throw new Error("Unauthorized");
+    await assertFinancialProjectAccess(projectId);
 
     return prisma.purchaseOrder.findMany({
         where: { projectId },
@@ -9419,9 +9632,7 @@ export async function getProjectPurchaseOrdersForLinking(projectId: string) {
 }
 
 export async function createEstimateFromRoomDesign(roomId: string) {
-    "use server";
-    const session = await getServerSession(authOptions);
-    if (!session) throw new Error("Unauthorized");
+    await assertEstimatePermission();
 
     const room = await prisma.roomDesign.findUnique({
         where: { id: roomId },
@@ -9624,6 +9835,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
 }
 
 export async function addVoiceEstimateItem(projectId: string, name: string, quantity: number, unitCost: number) {
+    await assertEstimatePermission();
     const estimate = await prisma.estimate.findFirst({
         where: { projectId },
         orderBy: { createdAt: "desc" }
@@ -9690,8 +9902,7 @@ async function assertOfficeTaskAccess() {
     }
 
     // Otherwise, re-resolve the caller from the DB as defense in depth. The
-    // shared JWT callback already suppresses sessions for DISABLED users, but
-    // still leaves existing claims untouched when the User row is deleted.
+    // shared JWT callback already suppresses missing and DISABLED staff users.
     const user = sessionUserId
         ? await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true, role: true, status: true } })
         : sessionEmail

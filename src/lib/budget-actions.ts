@@ -2,8 +2,18 @@
 
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
+import { canAccessProject, canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
+
+async function assertFinancialProjectAccess(projectId: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user && await canUseDevAuthFallback()) return;
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "financialReports")) throw new Error("Forbidden");
+    if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
+}
 
 export async function getBudgetData(projectId: string) {
+    await assertFinancialProjectAccess(projectId);
     const estimates = await prisma.estimate.findMany({
         where: { projectId },
         select: {
