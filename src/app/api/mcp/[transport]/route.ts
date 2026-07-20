@@ -338,9 +338,11 @@ const handler = createMcpHandler(
         server.registerTool(
             "send_milestone_invoice",
             {
-                title: "Send payment milestone(s) to the customer via QuickBooks",
+                title: "Send payment milestone(s) to the customer",
                 description:
-                    "Emails the customer a QuickBooks invoice with a payment link for each selected milestone. TWO-STEP: call without confirmToken to get a preview " +
+                    "Emails the customer a payment request listing ONLY the selected milestones (name + amount, never the whole invoice balance), with a portal link " +
+                    "that opens their invoice focused on exactly those payments and a Pay Now button. QuickBooks is still the money rail: each milestone is pushed/verified " +
+                    "against QBO before anything is emailed. TWO-STEP: call without confirmToken to get a preview " +
                     "(what will be sent, to whom, amounts) plus a confirmToken; show the preview to the user, then call again with the confirmToken only after they approve. " +
                     "The token is bound to the exact milestones/recipient/amounts and expires in ~5 minutes. " +
                     "If QuickBooks amounts have drifted, the result returns needsReview + driftReview — show the user the amounts and, if they approve reconciling, " +

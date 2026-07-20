@@ -567,8 +567,142 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Milestone send via QuickBooks. Moved verbatim from actions.ts; the actor's
-// display name is a parameter instead of coming from the session.
+// Milestone-scoped payment request email. The client is asked for EXACTLY the
+// listed milestones — the whole-invoice total/balance never appears in the
+// email — and the portal link opens the invoice focused on just those payments
+// (/portal/invoices/<id>?milestone=<ids>), where views are first-class events.
+//
+// Composition (buildMilestoneRequestEmail) is a pure exported function so the
+// e2e regression net can pin the milestone-only totals, HTML escaping, and
+// header sanitization without a mail provider.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Header-injection guard for values that end up in the Subject/From headers.
+function sanitizeHeaderValue(s: string): string {
+    return s.replace(/[\r\n]+/g, " ").trim();
+}
+
+export function buildMilestoneRequestEmail(input: {
+    companyName: string;
+    clientName: string | null | undefined;
+    projectName: string | null | undefined;
+    invoiceCode: string;
+    milestones: Array<{ name: string; amount: number }>;
+    portalUrl: string;
+}): { subject: string; html: string } {
+    const company = escapeHtml(input.companyName);
+    const total = input.milestones.reduce((sum, m) => sum + m.amount, 0);
+    const single = input.milestones.length === 1;
+    const projectName = input.projectName || "project";
+    const milestoneRows = input.milestones.map(m => `
+                    <tr>
+                        <td style="padding: 10px 0; color: #333; border-bottom: 1px solid #f0f0f0;">${escapeHtml(m.name)}</td>
+                        <td style="padding: 10px 0; color: #111; font-weight: 600; text-align: right; border-bottom: 1px solid #f0f0f0;">${formatCurrency(m.amount)}</td>
+                    </tr>`).join("");
+
+    const subject = sanitizeHeaderValue(
+        `${input.companyName} — payment request: ${formatCurrency(total)} due${single ? ` for ${input.milestones[0].name}` : ""}`
+    );
+
+    const html = `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${company}</h1>
+            </div>
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Payment Requested</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${escapeHtml(input.clientName || 'there')},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    ${company} is requesting ${single ? "a progress payment" : "payment"} for your ${escapeHtml(projectName)}:
+                </p>
+                <table style="width: 100%; border-collapse: collapse; margin: 8px 0 0;">
+                    ${milestoneRows}
+                </table>
+                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin-top: 24px;">
+                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due Now</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(total)}</div>
+                </div>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${escapeHtml(input.portalUrl)}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        View &amp; Pay ${formatCurrency(total)}
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
+                    Reference: Invoice ${escapeHtml(input.invoiceCode)}. Only the payment${single ? "" : "s"} above ${single ? "is" : "are"} due now — your full invoice is available at the same link for reference.
+                </p>
+                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 8px;">
+                    Or copy this link: ${escapeHtml(input.portalUrl)}
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                Sent via ProBuild • ${company}
+            </p>
+        </body>
+        </html>`;
+
+    return { subject, html };
+}
+
+async function sendMilestoneRequestEmail(
+    invoice: {
+        id: string;
+        code: string;
+        clientId: string | null;
+        client: { name: string | null; email: string | null; additionalEmail: string | null } | null;
+        project: { name: string; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
+    },
+    milestones: Array<{ id: string; name: string; amount: number }>,
+    recipient: string,
+    companyName: string,
+): Promise<void> {
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+    const clientId = invoice.clientId || invoice.project?.clientId;
+    const nextPath = `/portal/invoices/${invoice.id}?milestone=${milestones.map(m => m.id).join(",")}`;
+    let portalUrl: string;
+    if (clientId) {
+        const { signClientPortalToken } = await import("./client-portal-auth");
+        const token = await signClientPortalToken(clientId, recipient.toLowerCase());
+        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(nextPath)}`;
+    } else {
+        portalUrl = `${appUrl}${nextPath}`;
+    }
+
+    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const { subject, html } = buildMilestoneRequestEmail({
+        companyName,
+        clientName: invoice.client?.name,
+        projectName: invoice.project?.name,
+        invoiceCode: invoice.code,
+        milestones,
+        portalUrl,
+    });
+
+    const result = await sendNotification(
+        recipient,
+        subject,
+        html,
+        undefined,
+        {
+            fromName: sanitizeHeaderValue(companyName),
+            replyTo: settings?.email || undefined,
+            cc: buildCc(recipient, invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null),
+            copyToInternal: true,
+        }
+    );
+    // sendNotification reports provider/network failure as { success: false }
+    // rather than throwing — escalate it so no milestone is stamped "sent"
+    // when no email actually left.
+    if (!result.success) {
+        throw new Error("Email provider failed to send the payment request");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone send: QBO stays the money rail (push + Drift Guard per milestone),
+// but the client-facing email is ProBuild's milestone-scoped request above.
+// Moved from actions.ts; the actor's display name is a parameter instead of
+// coming from the session.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendMilestoneInvoicesCore(
@@ -610,7 +744,7 @@ export async function sendMilestoneInvoicesCore(
         }
 
         const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
-        const { sendQBInvoice, getQBInvoiceStatus } = await import("./quickbooks");
+        const { getQBInvoiceStatus, getQBInvoicePaymentLink } = await import("./quickbooks");
 
         let tokens;
         try {
@@ -635,6 +769,11 @@ export async function sendMilestoneInvoicesCore(
         let reconciledEstimate = false;
         const results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }> = [];
         const driftReview: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }> = [];
+        // Milestones that cleared every guard, queued for the single request email
+        // that goes out after the loop (one email per batch, not one per milestone).
+        // effectiveAmount is the verified QuickBooks total — after a reconcile this
+        // is the NEW amount, so the email never quotes the stale pre-reconcile one.
+        const sendable: Array<{ schedule: (typeof selectedPayments)[number]; wasReconciled: boolean; effectiveAmount: number }> = [];
 
         for (const schedule of selectedPayments) {
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
@@ -742,48 +881,116 @@ export async function sendMilestoneInvoicesCore(
                     && approvedTotal != null
                     && Math.abs(approvedTotal - qbTotal) <= 0.005;
 
-                // Send QBO invoice
-                const sendRes = await sendQBInvoice(tokens, qbInvoiceId, recipient);
-                if (!sendRes.ok) {
-                    failedCount++;
-                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: sendRes.error || "QuickBooks send failed" });
-                    continue;
-                }
-
-                // Success -> update sent status
-                await prisma.paymentSchedule.update({
-                    where: { id: schedule.id },
-                    data: { qbInvoiceSentAt: new Date() },
-                });
-
-                sentCount++;
-                results.push({ id: schedule.id, name: schedule.name, status: wasReconciled ? "reconciled" : "sent", sentTo: recipient });
-
-                // Log activity per sent milestone
-                if (invoice.projectId) {
-                    await logActivityLazy({
-                        projectId: invoice.projectId,
-                        actorType: "TEAM",
-                        actorName: companyName,
-                        action: "sent_invoice",
-                        entityType: "invoice",
-                        entityId: invoiceId,
-                        entityName: `Invoice ${invoice.code}`,
-                        metadata: { milestone: schedule.name, sentTo: recipient },
-                    });
-                }
+                // Amount verified. Queue for the ProBuild-branded request email sent
+                // after the loop, instead of Intuit's own invoice email — the client
+                // is asked for exactly these milestone amounts (never the whole
+                // invoice balance) and the view is tracked on the ProBuild portal.
+                sendable.push({ schedule, wasReconciled, effectiveAmount: qbTotal });
             } catch (err: any) {
                 failedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
             }
         }
 
-        // If >= 1 successfully sent and invoice is Draft, flip to Issued
+        // One client email per send batch, listing only the milestones that passed
+        // the guards, with a portal link focused on them. If the email itself fails,
+        // every queued milestone is marked failed (nothing was communicated), and
+        // nothing is stamped as sent.
+        if (sendable.length > 0) {
+            const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+
+            // Refresh each milestone's live QBO pay link so the portal Pay Now
+            // never hands the client a stale link (best-effort — the portal
+            // still works when a link can't be fetched).
+            for (const { schedule } of sendable) {
+                if (!schedule.qbInvoiceId) continue;
+                try {
+                    const liveLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId);
+                    if (liveLink && liveLink !== schedule.qbInvoiceLink) {
+                        await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: liveLink } });
+                    }
+                } catch { /* link refresh is best-effort */ }
+            }
+
+            let emailFailed = false;
+            try {
+                await sendMilestoneRequestEmail(
+                    invoice,
+                    sendable.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
+                    recipient,
+                    companyName,
+                );
+            } catch (emailErr: any) {
+                emailFailed = true;
+                for (const { schedule } of sendable) {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: emailErr?.message || "Failed to send request email" });
+                }
+            }
+
+            // The email left — from here on a failure is a BOOKKEEPING failure and
+            // must never be reported as a send failure (that would invite a
+            // duplicate resend to the client). Stamp the batch atomically; if the
+            // stamp fails, milestones still report "sent" with the recording error
+            // attached so staff know to verify, not resend.
+            if (!emailFailed) {
+                const stampedAt = new Date();
+                let stampError: string | null = null;
+                try {
+                    await prisma.$transaction(
+                        sendable.map(({ schedule }) =>
+                            prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceSentAt: stampedAt } })
+                        )
+                    );
+                } catch (e: any) {
+                    stampError = e?.message || "unknown error";
+                    console.error("[sendMilestoneInvoices] email delivered but recording the send failed:", e);
+                }
+                for (const { schedule, wasReconciled } of sendable) {
+                    sentCount++;
+                    results.push({
+                        id: schedule.id,
+                        name: schedule.name,
+                        status: wasReconciled ? "reconciled" : "sent",
+                        sentTo: recipient,
+                        ...(stampError ? { error: `Email delivered, but recording the send failed (${stampError}) — verify in QuickBooks before resending` } : {}),
+                    });
+
+                    // Log activity per sent milestone (best-effort — never flips a
+                    // delivered send to "failed")
+                    if (invoice.projectId) {
+                        try {
+                            await logActivityLazy({
+                                projectId: invoice.projectId,
+                                actorType: "TEAM",
+                                actorName: companyName,
+                                action: "sent_invoice",
+                                entityType: "invoice",
+                                entityId: invoiceId,
+                                entityName: `Invoice ${invoice.code}`,
+                                metadata: { milestone: schedule.name, sentTo: recipient },
+                            });
+                        } catch (e) {
+                            console.error("[sendMilestoneInvoices] activity log failed for", schedule.name, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If >= 1 successfully sent and invoice is Draft, flip to Issued.
+        // Post-delivery bookkeeping: a failure here must NOT fall into the
+        // global catch and report success:false for an email the client
+        // already received — log it and let the sent results stand.
         if (sentCount > 0 && invoice.status === "Draft") {
-            await prisma.invoice.update({
-                where: { id: invoiceId },
-                data: { status: "Issued", issueDate: new Date() },
-            });
+            try {
+                await prisma.invoice.update({
+                    where: { id: invoiceId },
+                    data: { status: "Issued", issueDate: new Date() },
+                });
+            } catch (e) {
+                console.error("[sendMilestoneInvoices] email delivered but Draft→Issued flip failed:", e);
+            }
         }
 
         if (invoice.projectId) {

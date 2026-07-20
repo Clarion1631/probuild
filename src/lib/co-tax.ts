@@ -43,3 +43,13 @@ export function coTaxLabel(estimate: EstimateTaxInfo): string {
         ? `${estimate.taxRateName} (${pctDisplay}%)`
         : `Estimated Tax (${pctDisplay}%)`;
 }
+
+// The amount the customer signs (and billing invoices): the PRE-TAX subtotal
+// plus tax at the estimate's rate. Same cents-rounding steps billing-core's
+// billChangeOrderCore uses, so a projected amount matches the later billed
+// amount bit-for-bit. Used by the CO→schedule zero-row milestone projection.
+export function coSignedAmount(totalAmount: number, estimate: EstimateTaxInfo): number {
+    const subtotal = Math.round(totalAmount * 100) / 100;
+    const taxAmount = Math.round(subtotal * coTaxRate(estimate) * 100) / 100;
+    return Math.round((subtotal + taxAmount) * 100) / 100;
+}
