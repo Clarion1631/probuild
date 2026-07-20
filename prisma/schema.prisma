@@ -219,7 +219,11 @@ model Project {
   locationLat            Float?
   locationLng            Float?
   geofenceRadiusMeters   Int?     @default(100)
-  status              String                       @default("In Progress") // In Progress, Substantial Completion, Closed Complete, Closed Lost (see lib/project-status.ts)
+  status              String                       @default("In Progress") // Waiting to Start, In Progress, Substantial Completion, Closed Complete, Closed Lost (see lib/project-status.ts)
+  // Company-level schedule markers (company dashboard): startDate = planned
+  // project start shown on the start calendar; endDate reserved for Phase 2.
+  startDate           DateTime?
+  endDate             DateTime?
   type                String? // Kitchen Remodeling, Patio, Water Damage
   code                String?
   tags                String?
@@ -257,6 +261,7 @@ model Project {
   @@index([clientId])
   @@index([status])
   @@index([createdAt])
+  @@index([startDate])
 }
 
 model RoomDesign {
@@ -436,7 +441,13 @@ model EstimatePaymentSchedule {
   paidAt                DateTime?
   paymentDate           DateTime?
 
+  // Optional link to the schedule task this milestone follows (company
+  // dashboard start-date moves shift the dueDate with the task).
+  scheduleTaskId        String?
+  scheduleTask          ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
+
   @@index([estimateId])
+  @@index([scheduleTaskId])
 }
 
 model EstimateItem {
@@ -561,10 +572,16 @@ model PaymentSchedule {
   // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
   sourceScheduleId String?
 
+  // Optional link to the schedule task this milestone follows (copied from the
+  // EstimatePaymentSchedule at invoicing; shifted with the task on start moves).
+  scheduleTaskId String?
+  scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
+
   @@index([invoiceId])
   @@index([stripePaymentIntentId])
   @@index([qbInvoiceId])
   @@index([sourceScheduleId])
+  @@index([scheduleTaskId])
 }
 
 model Budget {
@@ -843,6 +860,10 @@ model ScheduleTask {
   punchItems     TaskPunchItem[]
   assignments    TaskAssignment[]
   subAssignments SubTaskAssignment[]
+
+  // Payment milestones anchored to this task (company dashboard start moves).
+  estimatePaymentSchedules EstimatePaymentSchedule[]
+  paymentSchedules         PaymentSchedule[]
 
   @@index([projectId])
   @@index([leadId])

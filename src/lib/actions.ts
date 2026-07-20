@@ -16,6 +16,7 @@ import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import { setProjectStartDate, parseStartDateInput } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -1057,7 +1058,8 @@ export async function convertLeadToProject(leadId: string) {
                 clientId: lead.clientId,
                 location: geo?.formattedAddress ?? lead.location,
                 ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
-                status: "In Progress",
+                status: "Waiting to Start",
+                startDate: lead.expectedStartDate ?? null,
                 type: lead.projectType || "Unknown",
                 managerId: lead.managerId || null,
                 tags: lead.tags || null,
@@ -1183,8 +1185,10 @@ export async function createProject(data: {
 
     const { id: projectId } = await convertLeadToProject(lead.id);
 
-    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
-    if (data.status && data.status !== "In Progress") {
+    // Apply project-specific fields the conversion doesn't carry (it defaults status to "Waiting to Start").
+    // A provided status always applies — including "In Progress" for callers
+    // that explicitly want the job to skip the waiting stage.
+    if (data.status) {
         await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
     }
 
@@ -3194,46 +3198,68 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
     await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
 
-    const schedules = await prisma.estimatePaymentSchedule.findMany({
-        where: { estimateId },
-        orderBy: { order: "asc" },
-    });
+    // Clone the estimate's milestones into invoice-side PaymentSchedules. The
+    // source read + clone inserts run in ONE transaction that first takes the
+    // same Project row lock setProjectStartDate uses: a start-date move can
+    // then never slip between our read of the source dueDates and the clone
+    // inserts (which would leave the new clones on pre-shift dates while their
+    // EPS rows and the project's tasks moved -- a partially shifted mirror
+    // group). Lock order is parent-before-child (Project before its Estimate/
+    // Invoice children), matching the canonical money-lock direction in
+    // tx-retry.ts; withTxRetry covers residual serialization failures.
+    const paidAmount = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Serialize against start-date moves BEFORE reading the source rows.
+        // Lead-owned estimates (no projectId) need no lock -- start-date
+        // moves only target projects.
+        if (estimate.projectId) {
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
+        }
 
-    let paidAmount = 0;
-    if (schedules.length > 0) {
-        for (const schedule of schedules) {
-            const isPaid = schedule.status === "Paid";
-            if (isPaid) {
-                paidAmount += toNum(schedule.amount);
+        const schedules = await tx.estimatePaymentSchedule.findMany({
+            where: { estimateId },
+            orderBy: { order: "asc" },
+        });
+
+        let paidAmount = 0;
+        if (schedules.length > 0) {
+            for (const schedule of schedules) {
+                const isPaid = schedule.status === "Paid";
+                if (isPaid) {
+                    paidAmount += toNum(schedule.amount);
+                }
+                await tx.paymentSchedule.create({
+                    data: {
+                        invoiceId: invoice.id,
+                        sourceScheduleId: schedule.id,
+                        // Keep the schedule-task link on the invoice-side clone so
+                        // start-date moves can shift both milestone mirrors together.
+                        scheduleTaskId: schedule.scheduleTaskId || null,
+                        name: schedule.name,
+                        amount: schedule.amount,
+                        status: schedule.status,
+                        dueDate: schedule.dueDate || null,
+                        paymentDate: schedule.paymentDate || null,
+                        paidAt: schedule.paidAt || null,
+                        stripeSessionId: schedule.stripeSessionId || null,
+                        stripePaymentIntentId: schedule.stripePaymentIntentId || null,
+                        paymentMethod: schedule.paymentMethod || null,
+                        referenceNumber: schedule.referenceNumber || null,
+                        notes: schedule.notes || null,
+                    },
+                });
             }
-            await prisma.paymentSchedule.create({
+        } else {
+            await tx.paymentSchedule.create({
                 data: {
                     invoiceId: invoice.id,
-                    sourceScheduleId: schedule.id,
-                    name: schedule.name,
-                    amount: schedule.amount,
-                    status: schedule.status,
-                    dueDate: schedule.dueDate || null,
-                    paymentDate: schedule.paymentDate || null,
-                    paidAt: schedule.paidAt || null,
-                    stripeSessionId: schedule.stripeSessionId || null,
-                    stripePaymentIntentId: schedule.stripePaymentIntentId || null,
-                    paymentMethod: schedule.paymentMethod || null,
-                    referenceNumber: schedule.referenceNumber || null,
-                    notes: schedule.notes || null,
+                    name: "Initial Payment",
+                    amount: estimate.totalAmount || 0,
+                    status: "Pending",
                 },
             });
         }
-    } else {
-        await prisma.paymentSchedule.create({
-            data: {
-                invoiceId: invoice.id,
-                name: "Initial Payment",
-                amount: estimate.totalAmount || 0,
-                status: "Pending",
-            },
-        });
-    }
+        return paidAmount;
+    }));
 
     const newBalanceDue = Math.max(0, total - paidAmount);
     let invoiceStatus = "Draft";
@@ -6990,6 +7016,26 @@ export async function updateProjectStatus(projectId: string, status: string) {
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
     return { success: true };
+}
+
+// Move a project's company-level start date from the dashboard's waiting-to-start
+// table. Thin wrapper over schedule-core (which owns the shift rules + ActivityLog);
+// ADMIN/MANAGER only, same inline role check as the other project actions.
+export async function updateProjectStartDateAction(projectId: string, startDateISO: string | null, shiftJobTasks: boolean) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setProjectStartDate({
+        projectId,
+        startDate: startDateISO ? parseStartDateInput(startDateISO) : null,
+        shiftJobTasks,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
 }
 
 export async function updateProjectColor(projectId: string, color: string) {

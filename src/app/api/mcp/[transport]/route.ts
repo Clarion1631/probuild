@@ -4,6 +4,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
+import { getCompanyPipeline, getStartCalendar, setProjectStartDate, parseStartDateInput } from "@/lib/schedule-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 
@@ -836,9 +837,89 @@ const handler = createMcpHandler(
                 });
             },
         );
+
+        server.registerTool(
+            "get_company_schedule",
+            {
+                title: "Company pipeline and upcoming project starts",
+                annotations: { readOnlyHint: true },
+                description:
+                    "The company-wide book of work: pipeline counts (estimating / waiting to start / scheduled / in progress), " +
+                    "the waiting-to-start list, and project + lead starts coming up in the next N days (default 90). " +
+                    "Answers 'what jobs are waiting to start?' and 'show project starts for August'. Read surface stays lean — no milestone amounts.",
+                inputSchema: {
+                    days: z.number().int().min(1).max(365).optional().describe("How many days ahead to list upcoming starts (default 90)"),
+                },
+            },
+            async ({ days }) => {
+                const horizonDays = days ?? 90;
+                const now = new Date();
+                const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+                // getStartCalendar's `to` is exclusive, so from + N days lists
+                // exactly N calendar days (today through today+N-1).
+                const to = new Date(from.getTime() + horizonDays * 86_400_000);
+                const [pipeline, calendar] = await Promise.all([
+                    getCompanyPipeline(),
+                    getStartCalendar(from, to, { includeFinancials: false }),
+                ]);
+                return textResult({
+                    pipeline: {
+                        estimating: pipeline.estimating.length,
+                        waitingToStart: pipeline.waitingToStart.length,
+                        scheduled: pipeline.scheduled.length,
+                        inProgress: pipeline.inProgress.length,
+                        substantialCompletion: pipeline.substantialCompletion.length,
+                    },
+                    waitingToStart: pipeline.waitingToStart.map(p => ({
+                        projectId: p.id, name: p.name, client: p.client, contractValue: p.contractValue,
+                    })),
+                    upcomingStarts: {
+                        windowDays: horizonDays,
+                        projects: calendar.projectStarts.map(p => ({
+                            projectId: p.id, name: p.name, client: p.client, status: p.status, startDate: p.startDate.slice(0, 10),
+                        })),
+                        leads: calendar.leadStarts.map(l => ({
+                            leadId: l.id, name: l.name, client: l.client, stage: l.stage, expectedStartDate: l.expectedStartDate.slice(0, 10),
+                        })),
+                    },
+                });
+            },
+        );
+
+        server.registerTool(
+            "set_project_start_date",
+            {
+                title: "Move (or clear) a project's company start date",
+                description:
+                    "Sets the project start marker shown on the company dashboard. For a project still 'Waiting to Start' that already " +
+                    "had a start date, the whole job plan moves with it: every schedule task shifts by the same delta and linked payment " +
+                    "milestones shift on both mirrors (estimate + invoice side) — EXCEPT any milestone group already pushed to QuickBooks, " +
+                    "which is skipped entirely and reported in skippedQbMilestones for manual/QB-side fixing. In-progress projects only move " +
+                    "the marker (tasks never shift). Closed projects are refused. Pass startDate null to clear the marker (tasks untouched). " +
+                    "Internal and reversible — no customer email, no preview token needed.",
+                inputSchema: {
+                    projectId: z.string().max(50).describe("Project id from get_company_schedule or list_projects"),
+                    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD (no time component)").nullable().describe("New start date as YYYY-MM-DD; null clears the start marker"),
+                    shiftJobTasks: z.boolean().optional().describe("Shift the job's tasks and linked milestones by the same delta (default true)"),
+                },
+            },
+            async ({ projectId, startDate, shiftJobTasks }) => {
+                try {
+                    const result = await setProjectStartDate({
+                        projectId,
+                        startDate: startDate === null ? null : parseStartDateInput(startDate),
+                        shiftJobTasks: shiftJobTasks ?? true,
+                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
+                    });
+                    return textResult(result);
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to set project start date" }), isError: true };
+                }
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.6.0" },
+        serverInfo: { name: "probuild", version: "1.7.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -860,6 +941,10 @@ const handler = createMcpHandler(
             "once Approved, bill_change_order puts it on the invoice → send_milestone_invoice emails the payment link. " +
             "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
             "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
+            "SCHEDULING: get_company_schedule answers 'what jobs are waiting to start?' and lists upcoming project starts (plus lead expected starts) " +
+            "for the next N days. set_project_start_date moves a project's company start date — for a project still Waiting to Start it also shifts " +
+            "the job's tasks and linked milestones by the same delta (pass shiftJobTasks false to move only the marker); milestone groups already pushed " +
+            "to QuickBooks are never shifted and come back in skippedQbMilestones for manual fixing. " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },
     { basePath: "/api/mcp", maxDuration: 60 },
