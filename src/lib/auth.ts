@@ -1,7 +1,13 @@
 import { NextAuthOptions, getServerSession } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import CredentialsProvider from "next-auth/providers/credentials";
+import type { JWT } from "next-auth/jwt";
 import { prisma } from "@/lib/prisma";
+
+type StaffJWT = JWT & {
+    userId?: string;
+    accountDisabled?: boolean;
+};
 
 const providers: NextAuthOptions["providers"] = [
     GoogleProvider({
@@ -26,7 +32,7 @@ if (process.env.PLAYWRIGHT_TEST_SECRET) {
                 const user = await prisma.user.findUnique({
                     where: { email: email.toLowerCase() },
                 });
-                if (!user) return null;
+                if (!user || user.status === "DISABLED") return null;
                 return { id: user.id, name: user.name, email: user.email };
             },
         })
@@ -68,26 +74,38 @@ export const authOptions: NextAuthOptions = {
             return true;
         },
         async jwt({ token, user, trigger }) {
-            // Always read the latest role + DB id from DB.
+            const staffToken = token as StaffJWT;
+            // Always read the latest role, status, and DB id from DB.
             // token.sub on Google sign-ins is the OAuth subject, NOT the local
             // User.id, so anything storing token.sub as a User foreign key fails.
             if (token.email) {
                 const dbUser = await prisma.user.findUnique({
                     where: { email: (token.email as string).toLowerCase() },
-                    select: { id: true, role: true },
+                    select: { id: true, role: true, status: true },
                 });
+                if (dbUser?.status === "DISABLED") {
+                    // Keep the email so a later refresh can observe reactivation,
+                    // but strip all authorization claims immediately.
+                    delete token.role;
+                    delete staffToken.userId;
+                    staffToken.accountDisabled = true;
+                    return token;
+                }
                 if (dbUser) {
+                    delete staffToken.accountDisabled;
                     token.role = dbUser.role;
-                    (token as any).userId = dbUser.id;
+                    staffToken.userId = dbUser.id;
                 }
             }
             return token;
         },
         async session({ session, token }) {
+            const staffToken = token as StaffJWT;
+            if (staffToken.accountDisabled) return {} as typeof session;
             if (session?.user) {
                 // Only expose the local DB User.id. token.sub is the OAuth subject
                 // (Google sub for Google sign-ins) and is NOT a valid User.id.
-                (session.user as any).id = (token as any).userId ?? null;
+                (session.user as any).id = staffToken.userId ?? null;
                 (session.user as any).role = token.role;
             }
             return session;

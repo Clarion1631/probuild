@@ -9154,17 +9154,6 @@ function assertValidVisibility(visibility: string): asserts visibility is "team"
     }
 }
 
-// A staff session whose User row has flipped to DISABLED must not be trusted
-// here. getCurrentUserWithPermissions() doesn't filter on status (NextAuth's
-// jwt() callback only re-checks `role` on token refresh, not `status` — see
-// signIn() in lib/auth.ts, which only rejects DISABLED at initial login), so
-// an existing session survives a disable until the token expires. That's a
-// pre-existing gap in the shared helper across the whole app, not something
-// safe to fix here — see the PR body for the follow-up. Scoped locally:
-function activeStaffUser<T extends { status: string }>(user: T | null): T | null {
-    return user && user.status !== "DISABLED" ? user : null;
-}
-
 // Resolves the Client that owns a given document, for portal ownership
 // checks. Returns null for document types with no portal-ownership shape
 // (change-order, purchase-order, contract) or when the document isn't found.
@@ -9208,7 +9197,7 @@ export async function getDocumentComments(documentType: string, documentId: stri
     // nothing back — otherwise a caller who merely knows a documentId (e.g.
     // from a portal URL) could read another client's, or TEAM-visibility,
     // comments.
-    const staffUser = activeStaffUser(await getCurrentUserWithPermissions());
+    const staffUser = await getCurrentUserWithPermissions();
     if (staffUser) {
         const comments = await prisma.documentComment.findMany({
             where: { documentType, documentId },
@@ -9256,7 +9245,7 @@ export async function addDocumentComment(
     let authorId: string | null = null;
     let authorName: string | null = null;
 
-    const staffUser = activeStaffUser(await getCurrentUserWithPermissions());
+    const staffUser = await getCurrentUserWithPermissions();
     if (staffUser) {
         authorId = staffUser.id;
         authorName = staffUser.name || staffUser.email;
@@ -9288,7 +9277,7 @@ export async function deleteDocumentComment(commentId: string) {
     // Non-staff (portal) callers never satisfy either check today — there's
     // no portal mount for this component yet, so portal-authored comments
     // are deliberately admin-only to delete for now (see getDocumentComments).
-    const staffUser = activeStaffUser(await getCurrentUserWithPermissions());
+    const staffUser = await getCurrentUserWithPermissions();
     const comment = await prisma.documentComment.findUnique({ where: { id: commentId }, select: { authorId: true } });
     if (!comment) return { success: true };
 
@@ -9700,11 +9689,9 @@ async function assertOfficeTaskAccess() {
         return { id: null as string | null, role: sessionRole as string };
     }
 
-    // Otherwise, re-resolve the caller from the DB instead of trusting the
-    // session's role/id: auth.ts's jwt() callback leaves token.role/userId
-    // untouched when the DB lookup finds no user (deleted user, live token),
-    // and never encodes `status` into the token at all — so a disabled user's
-    // token would still read role: ADMIN until it expires.
+    // Otherwise, re-resolve the caller from the DB as defense in depth. The
+    // shared JWT callback already suppresses sessions for DISABLED users, but
+    // still leaves existing claims untouched when the User row is deleted.
     const user = sessionUserId
         ? await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true, role: true, status: true } })
         : sessionEmail

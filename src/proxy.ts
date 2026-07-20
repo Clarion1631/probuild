@@ -1,5 +1,23 @@
 import { withAuth } from "next-auth/middleware";
 import { NextResponse } from "next/server";
+import { isStaffAccountEnabled } from "@/lib/staff-status";
+
+// These shared web/mobile API handlers always call authenticateMobileOrSession,
+// so they can safely receive bearer requests without a browser session. Keep
+// this allowlist exact: a generic Bearer shortcut would bypass proxy auth for
+// pages and Server Actions that rely on this boundary.
+const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
+    /^\/api\/calendar\/sync\/?$/,
+    /^\/api\/manager\/dashboard\/?$/,
+    /^\/api\/manager\/(?:jobs|employees)(?:\/[^/]+)?\/?$/,
+    /^\/api\/time-entries(?:\/[^/]+)?\/?$/,
+    /^\/api\/files\/(?:signed-upload|register)\/?$/,
+    /^\/api\/(?:expenses|receipts\/parse)\/?$/,
+    /^\/api\/rooms\/scan-import\/?$/,
+    /^\/api\/rooms\/[^/]+\/(?:usdz|ai-furnish)\/?$/,
+    /^\/api\/projects\/?$/,
+    /^\/api\/projects\/[^/]+\/(?:cost-codes|buckets|estimate-items|estimates)\/?$/,
+];
 
 export default async function middleware(req: any, event: any) {
     // Bypass authentication entirely during development for local testing
@@ -9,11 +27,18 @@ export default async function middleware(req: any, event: any) {
         return NextResponse.next();
     }
 
-    // API requests carrying `Authorization: Bearer <jwt>` are mobile clients. Their
-    // route handlers verify the JWT via authenticateMobileOrSession themselves; redirecting
-    // them to /login (a browser flow) would 307-redirect every mobile API call.
+    // Approved shared API routes verify mobile JWTs in their own handlers. Do not
+    // extend this to arbitrary Bearer requests: many web routes rely on Proxy as
+    // their authentication boundary.
     const authHeader = req.headers?.get?.("authorization");
-    if (typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")) {
+    const pathname = req.nextUrl?.pathname;
+    const handlerVerifiesBearer = typeof pathname === "string"
+        && MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
+    if (
+        handlerVerifiesBearer
+        && typeof authHeader === "string"
+        && authHeader.toLowerCase().startsWith("bearer ")
+    ) {
         return NextResponse.next();
     }
 
@@ -21,6 +46,12 @@ export default async function middleware(req: any, event: any) {
     const authMiddleware = withAuth({
         pages: {
             signIn: "/login",
+        },
+        callbacks: {
+            async authorized({ token }) {
+                if (!token?.email || token.accountDisabled === true) return false;
+                return isStaffAccountEnabled(token.email);
+            },
         },
     });
 
