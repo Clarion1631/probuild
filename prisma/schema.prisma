@@ -852,6 +852,10 @@ model ScheduleTask {
   // milestones) so regenerate can identify them without touching manual tasks.
   generatedFromEstimateId String?
   generatedFromEstimate   Estimate? @relation(fields: [generatedFromEstimateId], references: [id], onDelete: SetNull)
+  // CO-task provenance: set on tasks created by applyChangeOrderToSchedule
+  // (CO parent, children, milestones).
+  generatedFromChangeOrderId String?
+  generatedFromChangeOrder   ChangeOrder? @relation(fields: [generatedFromChangeOrderId], references: [id], onDelete: SetNull)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
@@ -871,10 +875,12 @@ model ScheduleTask {
   // Payment milestones anchored to this task (company dashboard start moves).
   estimatePaymentSchedules EstimatePaymentSchedule[]
   paymentSchedules         PaymentSchedule[]
+  changeOrderPaymentSchedules ChangeOrderPaymentSchedule[]
 
   @@index([projectId])
   @@index([leadId])
   @@index([generatedFromEstimateId])
+  @@index([generatedFromChangeOrderId])
 }
 
 model TaskDependency {
@@ -1263,6 +1269,8 @@ model ChangeOrder {
 
   items            ChangeOrderItem[]
   paymentSchedules ChangeOrderPaymentSchedule[]
+  // Schedule tasks generated from this CO (provenance / idempotency).
+  generatedScheduleTasks ScheduleTask[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1299,6 +1307,12 @@ model ChangeOrderPaymentSchedule {
   dueDate       DateTime?
   order         Int         @default(0)
   createdAt     DateTime    @default(now())
+
+  // Optional milestone anchor created by applyChangeOrderToSchedule.
+  scheduleTaskId String?
+  scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
+
+  @@index([scheduleTaskId])
 }
 
 model VendorTag {

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
-import { getCompanyPipeline, getStartCalendar, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, getCrewConflicts } from "@/lib/schedule-core";
+import { applyChangeOrderToSchedule, getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, getCrewConflicts } from "@/lib/schedule-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 
@@ -871,6 +871,8 @@ const handler = createMcpHandler(
                     getStartCalendar(from, to, { includeFinancials: false }),
                     getCrewConflicts(from, to),
                 ]);
+                const openProjects = [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress];
+                const unappliedChangeOrders = await getUnappliedChangeOrders(openProjects.map(project => project.id));
                 // Crew per project (ids + names) — joined onto the start list too.
                 const crewOf = new Map<string, { id: string; name: string }[]>();
                 for (const p of [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress, ...pipeline.substantialCompletion]) {
@@ -886,19 +888,29 @@ const handler = createMcpHandler(
                     },
                     waitingToStart: pipeline.waitingToStart.map(p => ({
                         projectId: p.id, name: p.name, client: p.client, contractValue: p.contractValue, crew: p.crew,
+                        unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
+                    })),
+                    projects: openProjects.map(p => ({
+                        projectId: p.id,
+                        name: p.name,
+                        status: p.status,
+                        startDate: p.startDate?.slice(0, 10) ?? null,
+                        crew: p.crew,
+                        unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
                     })),
                     upcomingStarts: {
                         windowDays: horizonDays,
                         projects: calendar.projectStarts.map(p => ({
                             projectId: p.id, name: p.name, client: p.client, status: p.status, startDate: p.startDate.slice(0, 10),
                             crew: crewOf.get(p.id) ?? [],
+                            unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
                         })),
                         leads: calendar.leadStarts.map(l => ({
                             leadId: l.id, name: l.name, client: l.client, stage: l.stage, expectedStartDate: l.expectedStartDate.slice(0, 10),
                         })),
                     },
-                    // Double-booked crew from project windows (startDate →
-                    // endDate ?? latest task end ?? startDate+1d, half-open).
+                    // Conflict v2: assigned task windows plus per-(user,project)
+                    // effective-work-window fallback, deduped per project pair.
                     crewConflicts,
                 });
             },
@@ -992,9 +1004,36 @@ const handler = createMcpHandler(
                 }
             },
         );
+
+        server.registerTool(
+            "apply_change_order_to_schedule",
+            {
+                title: "Apply an approved change order to the project schedule",
+                description:
+                    "Adds an Approved change order's positive-scope tasks and payment milestones to its project's schedule. " +
+                    "Deductions are reported for manual trimming and never remove existing tasks automatically. " +
+                    "Default merge mode is idempotent; regenerate rebuilds only untouched CO-generated task subtrees.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).describe("Approved change-order id"),
+                    mode: z.enum(["merge", "regenerate"]).optional().describe("'merge' (default) applies once; 'regenerate' rebuilds only untouched generated work"),
+                },
+            },
+            async ({ changeOrderId, mode }) => {
+                try {
+                    const result = await applyChangeOrderToSchedule({
+                        changeOrderId,
+                        mode: mode ?? "merge",
+                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
+                    });
+                    return textResult(result);
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to apply change order to schedule" }), isError: true };
+                }
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.8.0" },
+        serverInfo: { name: "probuild", version: "1.9.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -1023,6 +1062,7 @@ const handler = createMcpHandler(
             "to QuickBooks are never shifted and come back in skippedQbMilestones for manual fixing. " +
             "generate_project_schedule builds a project's schedule from its estimate (the estimate must be Approved/Invoiced/Partially Paid/Paid and " +
             "the project needs a start date first — set one with set_project_start_date); default 'merge' mode is idempotent, 'regenerate' rebuilds untouched generated tasks. " +
+            "change orders adjust the schedule — approve in ProBuild (auto) or call apply_change_order_to_schedule; deductions never auto-remove tasks. " +
             "assign_project_crew replaces a project's crew with the given ACTIVATED user ids (full list, not a delta). " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },

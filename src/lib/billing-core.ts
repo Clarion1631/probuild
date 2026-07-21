@@ -981,7 +981,10 @@ export async function billChangeOrderCore(changeOrderId: string) {
 // a silent stall. Never throws: the customer's approval must stand regardless.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function handleChangeOrderApproved(changeOrderId: string, opts?: { notify?: boolean }): Promise<{ billed: boolean; sent: boolean; issues: string[] }> {
+export async function handleChangeOrderApproved(
+    changeOrderId: string,
+    opts?: { notify?: boolean; freshlyApproved?: boolean },
+): Promise<{ billed: boolean; sent: boolean; issues: string[] }> {
     const summary = { billed: false, sent: false, issues: [] as string[] };
     let coLabel = changeOrderId;
     let amountLabel = "";
@@ -1025,6 +1028,26 @@ export async function handleChangeOrderApproved(changeOrderId: string, opts?: { 
         }
     } catch (err: any) {
         summary.issues.push(err?.message || "Unexpected error during auto-billing");
+    }
+
+    // Only the request that actually transitioned the CO to Approved invokes
+    // the schedule hook. It is post-billing and best-effort so money-path state
+    // can never be unwound by scheduling.
+    if (opts?.freshlyApproved) {
+        let PreconditionError: (new (...args: any[]) => Error) | null = null;
+        try {
+            const { applyChangeOrderToSchedule, CoSchedulePreconditionError } = await import("./schedule-core");
+            PreconditionError = CoSchedulePreconditionError;
+            await applyChangeOrderToSchedule({
+                changeOrderId,
+                mode: "merge",
+                actor: { type: "SYSTEM", name: "system" },
+            });
+        } catch (error: any) {
+            if (!PreconditionError || !(error instanceof PreconditionError)) {
+                summary.issues.push(`Schedule update failed (billing unaffected): ${error?.message ?? error}`);
+            }
+        }
     }
 
     // Team notification (System Notification Email in Settings → Company).
