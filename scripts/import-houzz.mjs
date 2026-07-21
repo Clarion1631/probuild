@@ -698,7 +698,7 @@ async function importInvoice(row, docNum, docName, projectId, projectKey) {
       const houzzStatus = (row.STATUS || '').trim();
       if (houzzStatus === 'Sent') status = 'Issued';
       else if (houzzStatus === 'Paid') status = 'Paid';
-      else if (houzzStatus === 'Overdue') status = 'Overdue';
+      else if (houzzStatus === 'Overdue') status = 'Issued'; // overdue is derived from due dates at read time
       else if (houzzStatus === 'PartiallyPaid') status = 'Issued';
 
       const totalAmount = parseMoney(row.TOTAL_PAYMENT);

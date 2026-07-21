@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { type SearchParamMap, getParam, getAllParams } from "./report-utils";
+import { displayInvoiceStatus } from "./invoice-lifecycle";
 
 export type OpenInvoicesFilters = {
     clientId: string | null;
@@ -26,17 +27,26 @@ export function stringifyOpenInvoicesFilters(f: Partial<OpenInvoicesFilters>): s
 }
 
 export async function queryOpenInvoicesData(filters: OpenInvoicesFilters) {
-    const activeStatuses = filters.statuses.length ? filters.statuses : ALL_STATUSES;
-    return prisma.invoice.findMany({
+    const requestedStatuses = filters.statuses.length ? filters.statuses : ALL_STATUSES;
+    const persistedStatuses = requestedStatuses.filter(status => status !== "Overdue");
+    if (requestedStatuses.includes("Overdue")) persistedStatuses.push("Issued", "Partially Paid");
+    const invoices = await prisma.invoice.findMany({
         where: {
-            status: { in: activeStatuses },
+            status: { in: [...new Set(persistedStatuses)] },
             ...(filters.clientId ? { clientId: filters.clientId } : {}),
             ...(filters.projectId ? { projectId: filters.projectId } : {}),
         },
         include: {
             project: { select: { id: true, name: true } },
             client: { select: { id: true, name: true } },
+            payments: { select: { dueDate: true } },
         },
         orderBy: { issueDate: "asc" },
     });
+    return invoices
+        .map(invoice => ({
+            ...invoice,
+            status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+        }))
+        .filter(invoice => requestedStatuses.includes(invoice.status));
 }

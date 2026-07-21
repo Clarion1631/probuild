@@ -5,6 +5,36 @@ import { sendNotification, type NotificationOptions, type NotificationResult } f
 
 type DbClient = Prisma.TransactionClient | PrismaClient;
 
+export type CanonicalInvoiceStatus = "Draft" | "Issued" | "Partially Paid" | "Paid" | "Canceled";
+
+export function deriveInvoiceStatus(input: {
+    currentStatus?: string | null;
+    balanceDue: number;
+    issueDate?: Date | null;
+    sentAt?: Date | null;
+    paymentStatuses?: string[];
+}): CanonicalInvoiceStatus {
+    if (input.currentStatus === "Canceled") return "Canceled";
+    const active = (input.paymentStatuses || []).filter((status) => status !== "Canceled");
+    const anyPaid = active.some((status) => status === "Paid");
+    if (input.balanceDue <= 0 || (active.length > 0 && active.every((status) => status === "Paid"))) return "Paid";
+    if (anyPaid) return "Partially Paid";
+    if (input.issueDate || input.sentAt) return "Issued";
+    return "Draft";
+}
+
+export function displayInvoiceStatus(input: {
+    status: string;
+    dueDates?: Array<Date | null>;
+    now?: Date;
+}) {
+    if (!["Issued", "Partially Paid"].includes(input.status)) return input.status;
+    const now = input.now ?? new Date();
+    return (input.dueDates || []).some((dueDate) => dueDate && dueDate.getTime() + 86_400_000 < now.getTime())
+        ? "Overdue"
+        : input.status;
+}
+
 export type InvoiceSendMilestone = {
     id: string;
     name: string;
@@ -261,12 +291,21 @@ export async function executeInvoiceSendAttempt(
         });
         const invoice = await tx.invoice.findUniqueOrThrow({
             where: { id: input.invoiceId },
-            select: { projectId: true, code: true, status: true, issueDate: true, sentAt: true },
+            select: {
+                projectId: true, code: true, status: true, issueDate: true, sentAt: true, balanceDue: true,
+                payments: { select: { status: true } },
+            },
         });
         await tx.invoice.update({
             where: { id: input.invoiceId },
             data: {
-                status: invoice.status === "Draft" ? "Issued" : invoice.status,
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: Number(invoice.balanceDue),
+                    issueDate: invoice.issueDate ?? sentAt,
+                    sentAt: invoice.sentAt ?? sentAt,
+                    paymentStatuses: invoice.payments.map(payment => payment.status),
+                }),
                 issueDate: invoice.issueDate ?? sentAt,
                 sentAt: invoice.sentAt ?? sentAt,
                 emailStatus: "sent",

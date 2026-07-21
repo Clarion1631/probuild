@@ -30,6 +30,7 @@ import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
+import { deriveInvoiceStatus, displayInvoiceStatus } from "./invoice-lifecycle";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -2244,9 +2245,23 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     });
     if (!invoice) {
         const created = await createInvoiceFromEstimateInternal(estimateId);
+        const createdInvoice = await prisma.invoice.findUniqueOrThrow({
+            where: { id: created.id },
+            include: { payments: { select: { status: true } } },
+        });
+        const issuedAt = new Date();
         invoice = await prisma.invoice.update({
             where: { id: created.id },
-            data: { status: "Issued", issueDate: new Date() },
+            data: {
+                status: deriveInvoiceStatus({
+                    currentStatus: createdInvoice.status,
+                    balanceDue: Number(createdInvoice.balanceDue),
+                    issueDate: issuedAt,
+                    sentAt: createdInvoice.sentAt,
+                    paymentStatuses: createdInvoice.payments.map(payment => payment.status),
+                }),
+                issueDate: issuedAt,
+            },
             select: { id: true, code: true },
         });
     }
@@ -2639,6 +2654,7 @@ export async function getInvoiceForPortal(id: string) {
             if (!invoice) return null;
             return {
                 ...invoice,
+                status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
                 projectName: invoice.project?.name || null,
                 clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
                 clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
@@ -2661,6 +2677,7 @@ export async function getInvoiceForPortal(id: string) {
         if (!invoice) return null;
         return {
             ...invoice,
+            status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
             projectName: invoice.project?.name || null,
             clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
             clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
@@ -3308,10 +3325,20 @@ export async function getInvoice(id: string) {
             client: true,
             payments: {
                 orderBy: { createdAt: "asc" },
+                include: {
+                    sendAttemptMilestones: {
+                        orderBy: { sendAttempt: { createdAt: "desc" } },
+                        take: 1,
+                        select: { sendAttempt: { select: { status: true, sentAt: true, deliveredAt: true, lastError: true } } },
+                    },
+                },
             },
         },
     });
-    return invoice;
+    return invoice ? {
+        ...invoice,
+        status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+    } : null;
 }
 
 /** Parse a payment-date input into a Date.
@@ -3410,10 +3437,13 @@ export async function recordPayment(
             .filter((s) => s.status === "Paid")
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : totalPaid > 0 ? "Partially Paid"
-            : invoice.status;
+        const newStatus = deriveInvoiceStatus({
+            currentStatus: invoice.status,
+            balanceDue: newBalance,
+            issueDate: invoice.issueDate,
+            sentAt: invoice.sentAt,
+            paymentStatuses: allSchedules.map(schedule => schedule.status),
+        });
 
         await t.invoice.update({
             where: { id: invoiceId },
@@ -3715,7 +3745,13 @@ export async function recordEstimatePayment(
                     where: { id: linkedInvoice.id },
                     data: {
                         balanceDue: invBalance,
-                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                        status: deriveInvoiceStatus({
+                            currentStatus: linkedInvoice.status,
+                            balanceDue: invBalance,
+                            issueDate: linkedInvoice.issueDate,
+                            sentAt: linkedInvoice.sentAt,
+                            paymentStatuses: allCopies.map(schedule => schedule.status),
+                        }),
                     },
                 });
                 mirroredCopyId = copy.id;
@@ -3925,7 +3961,13 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
                     where: { id: linkedInvoice.id },
                     data: {
                         balanceDue: invBalance,
-                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : "Issued",
+                        status: deriveInvoiceStatus({
+                            currentStatus: linkedInvoice.status,
+                            balanceDue: invBalance,
+                            issueDate: linkedInvoice.issueDate,
+                            sentAt: linkedInvoice.sentAt,
+                            paymentStatuses: allCopies.map(schedule => schedule.status),
+                        }),
                     },
                 });
             }
@@ -4060,7 +4102,7 @@ export async function addInvoiceMilestone(
     if (!name) throw new Error("Milestone name is required");
     if (!Number.isFinite(amount) || amount <= 0) throw new Error("Milestone amount must be greater than zero");
 
-    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { payments: { select: { status: true } } } });
     if (!invoice) throw new Error("Invoice not found");
 
     await prisma.paymentSchedule.create({
@@ -4073,7 +4115,14 @@ export async function addInvoiceMilestone(
         },
     });
 
-    const nextStatus = invoice.status === "Paid" ? "Partially Paid" : invoice.status;
+    const nextBalance = Number(invoice.balanceDue) + amount;
+    const nextStatus = deriveInvoiceStatus({
+        currentStatus: invoice.status,
+        balanceDue: nextBalance,
+        issueDate: invoice.issueDate,
+        sentAt: invoice.sentAt,
+        paymentStatuses: [...invoice.payments.map(payment => payment.status), "Pending"],
+    });
     await prisma.invoice.update({
         where: { id: invoiceId },
         data: {
@@ -4147,11 +4196,17 @@ export async function splitInvoiceMilestones(
             (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
         ) / 100;
         const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : invoice.status === "Draft" ? "Draft"
-            : invoice.status === "Overdue" ? "Overdue"
-            : "Issued";
+        const retainedPaid = await tx.paymentSchedule.findMany({
+            where: { invoiceId, status: "Paid" },
+            select: { status: true },
+        });
+        const newStatus = deriveInvoiceStatus({
+            currentStatus: invoice.status,
+            balanceDue: newBalance,
+            issueDate: invoice.issueDate,
+            sentAt: invoice.sentAt,
+            paymentStatuses: [...retainedPaid.map(payment => payment.status), ...validated.map(() => "Pending")],
+        });
 
         await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
         await tx.paymentSchedule.createMany({
@@ -4215,16 +4270,13 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
         
-        let newStatus = invoice.status;
-        if (newBalance <= 0) {
-            newStatus = "Paid";
-        } else if (totalPaid > 0) {
-            newStatus = "Partially Paid";
-        } else if (invoice.status === "Overdue") {
-            newStatus = "Overdue";
-        } else {
-            newStatus = "Issued"; // default state for issued invoices with no payments
-        }
+        const newStatus = deriveInvoiceStatus({
+            currentStatus: invoice.status,
+            balanceDue: newBalance,
+            issueDate: invoice.issueDate,
+            sentAt: invoice.sentAt,
+            paymentStatuses: allSchedules.map(schedule => schedule.status),
+        });
 
         await tx.invoice.update({
             where: { id: invoiceId },
@@ -4291,31 +4343,51 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
 
 export async function getProjectInvoices(projectId: string) {
     await assertInvoicePermission();
-    return await prisma.invoice.findMany({
+    const invoices = await prisma.invoice.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
-        include: { client: true },
+        include: { client: true, payments: { select: { dueDate: true } } },
     });
+    return invoices.map(invoice => ({
+        ...invoice,
+        status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+    }));
 }
 
 export async function getAllInvoices() {
     await assertInvoicePermission();
-    return await prisma.invoice.findMany({
+    const invoices = await prisma.invoice.findMany({
         orderBy: { createdAt: "desc" },
         include: {
             project: { select: { id: true, name: true } },
             client: { select: { id: true, name: true } },
+            payments: { select: { dueDate: true } },
         },
     });
+    return invoices.map(invoice => ({
+        ...invoice,
+        status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+    }));
 }
 
 export async function issueInvoice(invoiceId: string) {
     await assertInvoicePermission();
+    const current = await prisma.invoice.findUniqueOrThrow({
+        where: { id: invoiceId },
+        include: { payments: { select: { status: true } } },
+    });
+    const issuedAt = new Date();
     const invoice = await prisma.invoice.update({
         where: { id: invoiceId },
         data: {
-            status: "Issued",
-            issueDate: new Date(),
+            status: deriveInvoiceStatus({
+                currentStatus: current.status,
+                balanceDue: Number(current.balanceDue),
+                issueDate: issuedAt,
+                sentAt: current.sentAt,
+                paymentStatuses: current.payments.map(payment => payment.status),
+            }),
+            issueDate: issuedAt,
         },
     });
     revalidatePath(`/projects/${invoice.projectId}/invoices`);
@@ -4383,6 +4455,7 @@ const staffCompanySettingsSelect = {
     letterheadDivider: true,
     notificationToggles: true,
     requireContractCountersign: true,
+    qbAlsoSendIntuitEmail: true,
     updatedAt: true,
 } as const;
 
@@ -4479,6 +4552,7 @@ export async function saveCompanySettings(data: any) {
             enableAffirm: data.enableAffirm,
             enableKlarna: data.enableKlarna,
             passProcessingFee: data.passProcessingFee,
+            qbAlsoSendIntuitEmail: data.qbAlsoSendIntuitEmail,
             cardProcessingRate: data.cardProcessingRate !== undefined ? parseFloat(data.cardProcessingRate) : undefined,
             cardProcessingFlat: data.cardProcessingFlat !== undefined ? parseFloat(data.cardProcessingFlat) : undefined,
             workDays: data.workDays,

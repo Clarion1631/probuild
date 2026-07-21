@@ -23,7 +23,7 @@ function isHttpsUrl(url: string | null | undefined): url is string {
 
 // Invoice statuses a client can actually see in the portal (mirrors the filter in
 // src/app/portal/page.tsx) — Draft/Paid/Canceled invoices never get a reminder.
-const CLIENT_VISIBLE_INVOICE_STATUSES = ["Issued", "Overdue", "Partially Paid"];
+const CLIENT_VISIBLE_INVOICE_STATUSES = ["Issued", "Partially Paid"];
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UPCOMING_WINDOW_DAYS = 3; // remind for milestones due within N calendar days...

@@ -667,6 +667,10 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                     const sentLabel = payment.qbInvoiceSentAt
                                         ? `Sent · ${new Date(payment.qbInvoiceSentAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
                                         : null;
+                                    const delivery = payment.sendAttemptMilestones?.[0]?.sendAttempt;
+                                    const viewLabel = payment.firstViewedAt
+                                        ? `Viewed ${new Date(payment.firstViewedAt).toLocaleString()}${payment.lastViewedAt && payment.lastViewedAt !== payment.firstViewedAt ? ` · last ${new Date(payment.lastViewedAt).toLocaleString()}` : ''}`
+                                        : null;
                                     return (
                                         <tr key={payment.id} className={`hover:bg-slate-50 transition ${isPastDue ? 'bg-red-50/30' : ''}`}>
                                             <td className="px-4 py-4 w-10 text-center">
@@ -698,6 +702,13 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                         {sentLabel}
                                                     </div>
                                                 )}
+                                                {delivery && (
+                                                    <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">
+                                                        Delivery: {delivery.lastError === 'interrupted' ? 'interrupted' : delivery.status}
+                                                        {delivery.deliveredAt ? ` · ${new Date(delivery.deliveredAt).toLocaleString()}` : ''}
+                                                    </div>
+                                                )}
+                                                {viewLabel && <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{viewLabel}</div>}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
                                                 {payment.dueDate ? (

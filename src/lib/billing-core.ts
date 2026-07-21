@@ -17,7 +17,7 @@ import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
-import { executeInvoiceSendAttempt } from "./invoice-lifecycle";
+import { deriveInvoiceStatus, displayInvoiceStatus, executeInvoiceSendAttempt } from "./invoice-lifecycle";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -77,12 +77,18 @@ export async function getProjectBilling(projectId: string) {
                 orderBy: { createdAt: "desc" },
                 select: {
                     id: true, code: true, status: true, totalAmount: true, balanceDue: true,
-                    issueDate: true, sentAt: true,
+                    issueDate: true, sentAt: true, viewedAt: true, lastViewedAt: true, viewCount: true,
                     payments: {
                         orderBy: { createdAt: "asc" },
                         select: {
                             id: true, name: true, amount: true, status: true, dueDate: true, paidAt: true,
+                            paymentMethod: true, referenceNumber: true, firstViewedAt: true, lastViewedAt: true,
                             qbInvoiceId: true, qbInvoiceLink: true, qbInvoiceSentAt: true, qbSyncError: true,
+                            sendAttemptMilestones: {
+                                orderBy: { sendAttempt: { createdAt: "desc" } },
+                                take: 1,
+                                select: { sendAttempt: { select: { id: true, status: true, sentAt: true, deliveredAt: true, lastError: true } } },
+                            },
                         },
                     },
                 },
@@ -106,14 +112,18 @@ export async function getProjectBilling(projectId: string) {
             total: Number(co.totalAmount), approvedAt: co.approvedAt, sentAt: co.sentAt,
         })),
         invoices: project.invoices.map(inv => ({
-            id: inv.id, code: inv.code, status: inv.status,
+            id: inv.id, code: inv.code, status: displayInvoiceStatus({ status: inv.status, dueDates: inv.payments.map(p => p.dueDate) }),
             total: Number(inv.totalAmount), balanceDue: Number(inv.balanceDue),
-            sentAt: inv.sentAt, issueDate: inv.issueDate,
+            sentAt: inv.sentAt, issueDate: inv.issueDate, viewedAt: inv.viewedAt,
+            lastViewedAt: inv.lastViewedAt, viewCount: inv.viewCount,
             milestones: inv.payments.map(p => ({
                 id: p.id, name: p.name, amount: Number(p.amount), status: p.status,
-                dueDate: p.dueDate, paidAt: p.paidAt,
+                dueDate: p.dueDate, paidAt: p.paidAt, paymentMethod: p.paymentMethod,
+                referenceNumber: p.referenceNumber, firstViewedAt: p.firstViewedAt,
+                lastViewedAt: p.lastViewedAt,
                 inQuickBooks: !!p.qbInvoiceId,
                 lastEmailedAt: p.qbInvoiceSentAt,
+                delivery: p.sendAttemptMilestones[0]?.sendAttempt ?? null,
                 paymentLinkStale: !!p.qbSyncError || (!!p.qbInvoiceId && !p.qbInvoiceLink),
                 qbSyncError: p.qbSyncError,
             })),
@@ -127,21 +137,36 @@ export async function getProjectBilling(projectId: string) {
 
 export async function listReceivables() {
     const now = Date.now();
-    const invoices = await prisma.invoice.findMany({
+    const [invoices, recentlyPaidRows] = await Promise.all([prisma.invoice.findMany({
         where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft"] } },
         orderBy: { issueDate: "asc" },
         select: {
             id: true, code: true, status: true, totalAmount: true, balanceDue: true,
-            issueDate: true, sentAt: true, createdAt: true,
+            issueDate: true, sentAt: true, createdAt: true, viewedAt: true, lastViewedAt: true, viewCount: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true, email: true } },
             payments: {
                 where: { status: "Pending" },
                 orderBy: { createdAt: "asc" },
-                select: { id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true },
+                select: {
+                    id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true,
+                    firstViewedAt: true, lastViewedAt: true,
+                    sendAttemptMilestones: {
+                        orderBy: { sendAttempt: { createdAt: "desc" } },
+                        take: 1,
+                        select: { sendAttempt: { select: { id: true, status: true, sentAt: true, deliveredAt: true, lastError: true, createdAt: true } } },
+                    },
+                },
             },
         },
-    });
+    }), prisma.paymentSchedule.findMany({
+        where: { status: "Paid", paidAt: { gte: new Date(now - 30 * 86_400_000) } },
+        orderBy: { paidAt: "desc" },
+        select: {
+            id: true, name: true, amount: true, paidAt: true, paymentMethod: true, referenceNumber: true,
+            invoice: { select: { id: true, code: true, project: { select: { id: true, name: true } }, client: { select: { name: true } } } },
+        },
+    })]);
 
     const rows = invoices.map(inv => {
         const anchor = inv.issueDate ?? inv.sentAt ?? inv.createdAt;
@@ -152,7 +177,7 @@ export async function listReceivables() {
         return {
             invoiceId: inv.id,
             code: inv.code,
-            status: inv.status,
+            status: displayInvoiceStatus({ status: inv.status, dueDates: inv.payments.map(p => p.dueDate), now: new Date(now) }),
             project: inv.project?.name ?? null,
             projectId: inv.project?.id ?? null,
             client: inv.client?.name ?? null,
@@ -160,10 +185,29 @@ export async function listReceivables() {
             total: Number(inv.totalAmount),
             ageDays,
             overdue: pastDue || ageDays > 30,
-            unpaidMilestones: inv.payments.map(p => ({
-                id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
-                lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
-            })),
+            viewedAt: inv.viewedAt,
+            lastViewedAt: inv.lastViewedAt,
+            viewCount: inv.viewCount,
+            unpaidMilestones: inv.payments.map(p => {
+                const attempt = p.sendAttemptMilestones[0]?.sendAttempt ?? null;
+                const sentAt = attempt?.sentAt ?? p.qbInvoiceSentAt;
+                const daysSinceSent = sentAt ? Math.floor((now - sentAt.getTime()) / 86_400_000) : null;
+                let lifecycleBucket = "Not sent";
+                if (attempt?.lastError === "interrupted") lifecycleBucket = "Send interrupted";
+                else if (attempt && ["bounced", "complained", "failed"].includes(attempt.status)) lifecycleBucket = "Sent not delivered";
+                else if (p.firstViewedAt) lifecycleBucket = "Viewed not paid";
+                else if (attempt?.status === "delivered") lifecycleBucket = "Delivered not viewed";
+                else if (sentAt && now - sentAt.getTime() >= 86_400_000) lifecycleBucket = "Delivery unknown";
+                else if (sentAt) lifecycleBucket = "Awaiting delivery";
+                return {
+                    id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
+                    sentAt, deliveredAt: attempt?.deliveredAt ?? null,
+                    firstViewedAt: p.firstViewedAt, lastViewedAt: p.lastViewedAt,
+                    invoiceViewCount: inv.viewCount, daysSinceSent, lifecycleBucket,
+                    sendAttemptStatus: attempt?.status ?? null,
+                    lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
+                };
+            }),
         };
     });
 
@@ -172,6 +216,19 @@ export async function listReceivables() {
         overdueOutstanding: Math.round(rows.filter(r => r.overdue).reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
         invoiceCount: rows.length,
         invoices: rows,
+        recentlyPaid: recentlyPaidRows.map(row => ({
+            id: row.id,
+            invoiceId: row.invoice.id,
+            code: row.invoice.code,
+            projectId: row.invoice.project?.id ?? null,
+            project: row.invoice.project?.name ?? null,
+            client: row.invoice.client?.name ?? null,
+            milestone: row.name,
+            amount: Number(row.amount),
+            paidAt: row.paidAt,
+            paymentMethod: row.paymentMethod,
+            referenceNumber: row.referenceNumber,
+        })),
     };
 }
 
@@ -331,9 +388,11 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
     }));
 
     const newBalanceDue = Math.max(0, total - paidAmount);
-    const invoiceStatus = paidAmount > 0
-        ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
-        : "Draft";
+    const invoiceStatus = deriveInvoiceStatus({
+        currentStatus: invoice.status,
+        balanceDue: newBalanceDue,
+        paymentStatuses: paidAmount > 0 ? ["Paid", ...(newBalanceDue > 0 ? ["Pending"] : [])] : ["Pending"],
+    });
 
     await prisma.invoice.update({
         where: { id: invoice.id },
@@ -424,6 +483,7 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
         include: {
             project: { include: { client: true } },
             client: true,
+            payments: { select: { status: true } },
         },
     });
     if (!invoice) throw new Error("Invoice not found");
@@ -432,9 +492,20 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
     if (!recipientEmail) throw new Error("No email address provided");
 
     if (invoice.status === "Draft") {
+        const sentAt = new Date();
         await prisma.invoice.update({
             where: { id: invoiceId },
-            data: { status: "Issued", issueDate: new Date(), sentAt: new Date() },
+            data: {
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: Number(invoice.balanceDue),
+                    issueDate: sentAt,
+                    sentAt,
+                    paymentStatuses: invoice.payments.map(payment => payment.status),
+                }),
+                issueDate: sentAt,
+                sentAt,
+            },
         });
     } else {
         await prisma.invoice.update({
@@ -971,7 +1042,16 @@ export async function sendMilestoneInvoicesCore(
             try {
                 await prisma.invoice.update({
                     where: { id: invoiceId },
-                    data: { status: "Issued", issueDate: new Date() },
+                    data: {
+                        status: deriveInvoiceStatus({
+                            currentStatus: invoice.status,
+                            balanceDue: Number(invoice.balanceDue),
+                            issueDate: new Date(),
+                            sentAt: invoice.sentAt,
+                            paymentStatuses: invoice.payments.map(payment => payment.status),
+                        }),
+                        issueDate: new Date(),
+                    },
                 });
             } catch (e) {
                 console.error("[sendMilestoneInvoices] email delivered but Draft→Issued flip failed:", e);
@@ -1093,7 +1173,13 @@ export async function billChangeOrderCore(changeOrderId: string) {
         // findFirst above — a concurrent settle could otherwise leave it "Paid" with a positive
         // balanceDue after this bump. Reading it under the lock closes that window.
         await lockMoneyParents(tx, { invoiceId: invoice.id });
-        const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+        const lockedInvoice = await tx.invoice.findUnique({
+            where: { id: invoice.id },
+            select: {
+                status: true, balanceDue: true, issueDate: true, sentAt: true,
+                payments: { select: { status: true } },
+            },
+        });
         const curStatus = lockedInvoice?.status ?? invoice.status;
 
         const created = await tx.paymentSchedule.create({
@@ -1101,7 +1187,13 @@ export async function billChangeOrderCore(changeOrderId: string) {
         });
         // Same totals math as addInvoiceMilestone: bump invoice totals; a fully
         // Paid invoice becomes Partially Paid when new work lands on it.
-        const nextStatus = curStatus === "Paid" ? "Partially Paid" : curStatus;
+        const nextStatus = deriveInvoiceStatus({
+            currentStatus: curStatus,
+            balanceDue: Number(lockedInvoice?.balanceDue ?? 0) + amount,
+            issueDate: lockedInvoice?.issueDate,
+            sentAt: lockedInvoice?.sentAt,
+            paymentStatuses: [...(lockedInvoice?.payments.map(payment => payment.status) ?? []), "Pending"],
+        });
         await tx.invoice.update({
             where: { id: invoice.id },
             data: {

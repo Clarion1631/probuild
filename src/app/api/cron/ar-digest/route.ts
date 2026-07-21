@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { sendArDigest } from "@/lib/billing-core";
+import { sendInvoiceLifecycleDigest } from "@/lib/invoice-alignment";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -17,7 +18,7 @@ export async function GET(request: Request) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const result = await sendArDigest();
+    const [result, lifecycle] = await Promise.all([sendArDigest(), sendInvoiceLifecycleDigest()]);
     console.log("[cron/ar-digest]", JSON.stringify({ sent: result.sent, invoices: result.invoiceCount, outstanding: result.totalOutstanding }));
-    return NextResponse.json(result);
+    return NextResponse.json({ ...result, lifecycle });
 }

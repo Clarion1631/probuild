@@ -94,7 +94,9 @@ export async function sendNotification(
             console.error("Resend API returned error:", data.error);
             return { success: false };
         }
-        return { success: true, id: data.data?.id, acceptedAt: new Date() };
+        // Resend does not return an authoritative acceptance timestamp here.
+        // The durable send core therefore uses the attempt's createdAt fallback.
+        return { success: true, id: data.data?.id };
     } catch (error) {
         console.error("Failed to send Resend email:", error);
         return { success: false };

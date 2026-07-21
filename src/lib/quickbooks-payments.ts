@@ -15,6 +15,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
+import { deriveInvoiceStatus } from "./invoice-lifecycle";
 import {
     type QBTokens,
     refreshQBToken,
@@ -215,7 +216,13 @@ export async function markMilestonePaidFromQB(
             where: { id: invoiceId },
             data: {
                 balanceDue: newBalance,
-                status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: newBalance,
+                    issueDate: invoice.issueDate,
+                    sentAt: invoice.sentAt,
+                    paymentStatuses: allSchedules.map(schedule => schedule.status),
+                }),
             },
         });
 
@@ -357,7 +364,13 @@ export async function reconcileMilestoneToQbo(
                 subtotal: tax.subtotal,
                 taxAmount: tax.taxAmount,
                 balanceDue: newBalance,
-                status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: newBalance,
+                    issueDate: invoice.issueDate,
+                    sentAt: invoice.sentAt,
+                    paymentStatuses: allSchedules.map(schedule => schedule.status),
+                }),
             },
         });
 
