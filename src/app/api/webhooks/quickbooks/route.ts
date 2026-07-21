@@ -6,7 +6,7 @@ import { getQBSettings } from "@/lib/integration-store";
 export const dynamic = "force-dynamic";
 export const maxDuration = 10;
 
-function validSignature(rawBody: string, supplied: string, verifierToken: string) {
+export function validSignature(rawBody: string, supplied: string, verifierToken: string) {
     const expected = Buffer.from(createHmac("sha256", verifierToken).update(rawBody).digest("base64"));
     const actual = Buffer.from(supplied);
     return expected.length === actual.length && timingSafeEqual(expected, actual);

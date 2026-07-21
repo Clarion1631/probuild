@@ -6,10 +6,11 @@ import { formatCurrency } from "./utils";
 import { drainPaymentNotifications } from "./payment-outbox";
 import { getQBPayment, probeQBInvoice } from "./quickbooks";
 import { getFreshQBTokens, markMilestonePaidFromQB } from "./quickbooks-payments";
+import { listReceivables } from "./billing-core";
 
 type FindingEvidence = { kind: string; detail: Record<string, unknown> };
 
-async function recordFinding(paymentScheduleId: string, qbInvoiceId: string, runId: string, evidence: FindingEvidence) {
+export async function recordAlignmentFinding(paymentScheduleId: string, qbInvoiceId: string, runId: string, evidence: FindingEvidence) {
     const key = { paymentScheduleId_qbInvoiceId_kind: { paymentScheduleId, qbInvoiceId, kind: evidence.kind } };
     const existing = await prisma.alignmentFinding.findUnique({ where: key });
     if (!existing) {
@@ -30,7 +31,7 @@ async function recordFinding(paymentScheduleId: string, qbInvoiceId: string, run
     });
 }
 
-async function resolveMissingEvidence(
+export async function resolveAlignmentFindingsWithEvidence(
     paymentScheduleId: string,
     qbInvoiceId: string,
     runId: string,
@@ -48,16 +49,21 @@ async function resolveMissingEvidence(
     });
 }
 
-export async function runInvoiceAlignmentAudit() {
+export async function runInvoiceAlignmentAudit(deps: {
+    getTokens?: typeof getFreshQBTokens;
+    probeInvoice?: typeof probeQBInvoice;
+    getPayment?: typeof getQBPayment;
+    markPaid?: typeof markMilestonePaidFromQB;
+    drainNotifications?: typeof drainPaymentNotifications;
+} = {}) {
     const runId = randomUUID();
     const summary = { runId, checked: 0, findings: 0, healed: 0, transientErrors: 0 };
     const [tokens, settings, schedules] = await Promise.all([
-        getFreshQBTokens(),
+        (deps.getTokens ?? getFreshQBTokens)(),
         prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { qbAlsoSendIntuitEmail: true } }),
         prisma.paymentSchedule.findMany({
             where: { status: { notIn: ["Paid", "Canceled"] }, qbInvoiceId: { not: null } },
             orderBy: { createdAt: "asc" },
-            take: 250,
             select: {
                 id: true, invoiceId: true, qbInvoiceId: true, name: true, amount: true,
                 sendAttemptMilestones: {
@@ -72,7 +78,7 @@ export async function runInvoiceAlignmentAudit() {
     for (const schedule of schedules) {
         const qbInvoiceId = schedule.qbInvoiceId!;
         summary.checked++;
-        const probe = await probeQBInvoice(tokens, qbInvoiceId);
+        const probe = await (deps.probeInvoice ?? probeQBInvoice)(tokens, qbInvoiceId);
         if (probe.state === "error") {
             summary.transientErrors++;
             continue; // no evidence means no finding transition
@@ -82,22 +88,23 @@ export async function runInvoiceAlignmentAudit() {
         if (probe.state === "voided" || probe.state === "notFound") {
             evidence.push({ kind: "qbo_invoice_missing", detail: { state: probe.state, milestone: schedule.name } });
         } else {
-            if (Math.abs(probe.total - Number(schedule.amount)) > 0.005) {
+            const amountMatches = Math.abs(probe.total - Number(schedule.amount)) <= 0.005;
+            if (!amountMatches) {
                 evidence.push({ kind: "amount_mismatch", detail: { probuildAmount: Number(schedule.amount), qboTotal: probe.total } });
             }
 
-            if (probe.total > 0 && probe.balance <= 0) {
+            if (amountMatches && probe.total > 0 && probe.balance <= 0) {
                 const paymentId = probe.paymentTxnIds[0] || null;
-                const payment = paymentId ? await getQBPayment(tokens, paymentId) : null;
+                const payment = paymentId ? await (deps.getPayment ?? getQBPayment)(tokens, paymentId) : null;
                 const paidAt = payment?.txnDate ? new Date(`${payment.txnDate}T12:00:00`) : new Date();
-                const healed = await markMilestonePaidFromQB(schedule.id, schedule.invoiceId, {
+                const healed = await (deps.markPaid ?? markMilestonePaidFromQB)(schedule.id, schedule.invoiceId, {
                     paidAt,
                     referenceNumber: payment?.referenceNumber || null,
                     qbPaymentId: paymentId,
                 });
                 if (healed) {
                     summary.healed++;
-                    await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => undefined);
+                    await (deps.drainNotifications ?? drainPaymentNotifications)({ scheduleId: schedule.id }).catch(() => undefined);
                 }
             } else if (Math.abs(probe.balance - Number(schedule.amount)) > 0.005) {
                 evidence.push({ kind: "balance_mismatch", detail: { probuildOpenAmount: Number(schedule.amount), qboBalance: probe.balance } });
@@ -112,14 +119,14 @@ export async function runInvoiceAlignmentAudit() {
 
         const observedKinds = new Set(evidence.map(item => item.kind));
         for (const item of evidence) {
-            await recordFinding(schedule.id, qbInvoiceId, runId, item);
+            await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, item);
             summary.findings++;
         }
         // Only a successful, current QBO read is evidence that an older
         // discrepancy is absent. A missing/voided/transient response never
         // auto-resolves unrelated historical findings.
         if (probe.state === "ok") {
-            await resolveMissingEvidence(schedule.id, qbInvoiceId, runId, observedKinds);
+            await resolveAlignmentFindingsWithEvidence(schedule.id, qbInvoiceId, runId, observedKinds);
         }
     }
     return summary;
@@ -127,7 +134,7 @@ export async function runInvoiceAlignmentAudit() {
 
 export async function sendInvoiceLifecycleDigest() {
     const unmatchedBefore = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const [findings, deadEmail, deadQbo, unmatchedEmail, settings] = await Promise.all([
+    const [findings, deadEmail, deadQbo, unmatchedEmail, settings, receivables] = await Promise.all([
         prisma.alignmentFinding.findMany({
             where: { resolvedAt: null },
             orderBy: { lastSeenAt: "desc" },
@@ -140,11 +147,22 @@ export async function sendInvoiceLifecycleDigest() {
             where: { processedAt: null, attempts: 0, createdAt: { lt: unmatchedBefore } },
         }),
         prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, email: true, companyName: true } }),
+        listReceivables(),
     ]);
+    const bucketCounts = receivables.invoices
+        .flatMap(invoice => invoice.unpaidMilestones)
+        .reduce<Record<string, number>>((counts, milestone) => {
+            counts[milestone.lifecycleBucket] = (counts[milestone.lifecycleBucket] ?? 0) + 1;
+            return counts;
+        }, {});
+    const bucketSummary = Object.entries(bucketCounts)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([bucket, count]) => `${bucket}: ${count}`)
+        .join(" · ") || "No open milestones";
     const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
-    if (!to) return { sent: false, reason: "no notification email configured", findings: findings.length, deadEmail, deadQbo, unmatchedEmail };
-    if (!findings.length && !deadEmail && !deadQbo && !unmatchedEmail) {
-        return { sent: false, reason: "nothing to report", findings: 0, deadEmail, deadQbo, unmatchedEmail };
+    if (!to) return { sent: false, reason: "no notification email configured", findings: findings.length, deadEmail, deadQbo, unmatchedEmail, bucketCounts };
+    if (!findings.length && !deadEmail && !deadQbo && !unmatchedEmail && Object.keys(bucketCounts).length === 0) {
+        return { sent: false, reason: "nothing to report", findings: 0, deadEmail, deadQbo, unmatchedEmail, bucketCounts };
     }
 
     const rows = findings.map(finding => `<tr>
@@ -159,10 +177,11 @@ export async function sendInvoiceLifecycleDigest() {
         `<div style="font-family:-apple-system,sans-serif;max-width:680px;margin:auto;padding:24px">
             <h2>Invoice alignment</h2>
             <p><strong>${findings.length}</strong> unresolved · <strong>${deadEmail + deadQbo}</strong> dead letters · <strong>${unmatchedEmail}</strong> unmatched email events older than 24h</p>
+            <p><strong>Lifecycle radar:</strong> ${bucketSummary}</p>
             <table style="border-collapse:collapse;width:100%;font-size:13px"><tr><th>Invoice</th><th>Milestone</th><th>Finding</th><th>Amount</th></tr>${rows}</table>
         </div>`,
         undefined,
         { fromName: settings?.companyName || "ProBuild" },
     );
-    return { sent: sent.success, findings: findings.length, deadEmail, deadQbo, unmatchedEmail };
+    return { sent: sent.success, findings: findings.length, deadEmail, deadQbo, unmatchedEmail, bucketCounts };
 }

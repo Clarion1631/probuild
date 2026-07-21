@@ -1,37 +1,75 @@
 import { randomUUID } from "crypto";
+import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { applyEmailEventTx, sweepStrandedSendAttempts } from "./invoice-lifecycle";
 import { drainPaymentNotifications } from "./payment-outbox";
 import { getQBPayment, probeQBInvoice } from "./quickbooks";
 import { getFreshQBTokens, markMilestonePaidFromQB } from "./quickbooks-payments";
+import { recordAlignmentFinding } from "./invoice-alignment";
+import type { QBTokens } from "./quickbooks";
 
 const LEASE_MS = 5 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 
 type DrainCounts = { processed: number; retried: number; dead: number; unmatched: number };
 
-async function drainEmailEvents(limit: number): Promise<DrainCounts> {
+async function logEmailDeadLetter(eventId: string, resendEmailId: string, claimToken: string, lastError: string) {
+    return prisma.$transaction(async (tx) => {
+        const done = await tx.emailEvent.updateMany({
+            where: { id: eventId, claimToken },
+            data: { claimedAt: null, claimToken: null, lastError: `dead:${lastError}`, processedAt: null },
+        });
+        if (!done.count) return false;
+        const attempt = await tx.sendAttempt.findUnique({
+            where: { resendEmailId },
+            select: { invoiceId: true, invoice: { select: { projectId: true, code: true } } },
+        });
+        await tx.activityLog.create({
+            data: {
+                projectId: attempt?.invoice.projectId ?? null,
+                actorType: "SYSTEM",
+                actorName: "Invoice lifecycle worker",
+                action: "invoice_email_dead_letter",
+                entityType: "invoice",
+                entityId: attempt?.invoiceId ?? null,
+                entityName: attempt ? `Invoice ${attempt.invoice.code}` : null,
+                metadata: JSON.stringify({ eventId, resendEmailId, attempts: MAX_ATTEMPTS, error: lastError }),
+            },
+        });
+        return true;
+    });
+}
+
+export async function drainEmailEvents(limit: number): Promise<DrainCounts> {
     const result = { processed: 0, retried: 0, dead: 0, unmatched: 0 };
     const staleBefore = new Date(Date.now() - LEASE_MS);
+    const unmatchedRows = await prisma.$queryRaw<Array<{ count: number }>>(Prisma.sql`
+        SELECT COUNT(*)::int AS "count"
+        FROM "EmailEvent" e
+        LEFT JOIN "SendAttempt" s ON s."resendEmailId" = e."resendEmailId"
+        WHERE e."processedAt" IS NULL AND e."attempts" = 0 AND s."id" IS NULL
+    `);
+    result.unmatched = unmatchedRows[0]?.count ?? 0;
+    // Join before limiting so a burst of pre-finalization events cannot keep
+    // matched events behind it from ever reaching the worker.
+    const candidateIds = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT e."id"
+        FROM "EmailEvent" e
+        INNER JOIN "SendAttempt" s ON s."resendEmailId" = e."resendEmailId"
+        WHERE e."processedAt" IS NULL
+          AND e."attempts" < ${MAX_ATTEMPTS}
+          AND (e."claimedAt" IS NULL OR e."claimedAt" < ${staleBefore})
+        ORDER BY e."createdAt" ASC
+        LIMIT ${limit}
+    `);
     const candidates = await prisma.emailEvent.findMany({
-        where: {
-            processedAt: null,
-            attempts: { lt: MAX_ATTEMPTS },
-            OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }],
-        },
+        where: { id: { in: candidateIds.map(row => row.id) } },
         orderBy: { createdAt: "asc" },
-        take: limit,
     });
 
     for (const row of candidates) {
         // Provider events can win the race with send finalization. Keep them
         // pending, unclaimed, and at zero attempts until that attempt appears.
-        const matched = await prisma.sendAttempt.findUnique({ where: { resendEmailId: row.resendEmailId }, select: { id: true } });
-        if (!matched) {
-            result.unmatched++;
-            continue;
-        }
-
         const claimToken = randomUUID();
         const claim = await prisma.emailEvent.updateMany({
             where: {
@@ -45,73 +83,124 @@ async function drainEmailEvents(limit: number): Promise<DrainCounts> {
         if (claim.count === 0) continue;
         const attemptNumber = row.attempts + 1;
         try {
-            await prisma.$transaction(async (tx) => {
+            const processed = await prisma.$transaction(async (tx) => {
                 const owned = await tx.emailEvent.findFirst({
                     where: { id: row.id, claimToken },
                     select: { id: true, resendEmailId: true, type: true, occurredAt: true },
                 });
-                if (!owned) return;
-                await applyEmailEventTx(tx, owned);
+                if (!owned) return false;
+                return applyEmailEventTx(tx, { ...owned, claimToken });
             });
-            result.processed++;
+            if (processed) result.processed++;
         } catch (error) {
             const lastError = String(error instanceof Error ? error.message : error).slice(0, 500);
             const dead = attemptNumber === MAX_ATTEMPTS;
-            await prisma.emailEvent.updateMany({
-                where: { id: row.id, claimToken },
-                data: {
-                    claimedAt: null,
-                    claimToken: null,
-                    lastError: dead ? `dead:${lastError}` : lastError,
-                    processedAt: dead ? new Date() : null,
-                },
-            });
-            if (dead) result.dead++;
-            else result.retried++;
+            if (dead) {
+                if (await logEmailDeadLetter(row.id, row.resendEmailId, claimToken, lastError)) result.dead++;
+            } else {
+                const retry = await prisma.emailEvent.updateMany({
+                    where: { id: row.id, claimToken },
+                    data: { claimedAt: null, claimToken: null, lastError, processedAt: null },
+                });
+                if (retry.count) result.retried++;
+            }
         }
     }
     return result;
 }
 
-async function settleQboInvoice(qbInvoiceId: string, paymentIdHint?: string) {
-    const tokens = await getFreshQBTokens();
+async function settleQboInvoice(tokens: QBTokens, qbInvoiceId: string, runId: string, paymentIdHint?: string) {
     const schedules = await prisma.paymentSchedule.findMany({
-        where: { qbInvoiceId, status: { not: "Paid" } },
-        select: { id: true, invoiceId: true },
+        where: { qbInvoiceId },
+        select: { id: true, invoiceId: true, amount: true, status: true },
     });
     if (schedules.length === 0) return;
+    if (schedules.length !== 1) {
+        for (const schedule of schedules) {
+            await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
+                kind: "duplicate_qbo_mapping",
+                detail: { mappingCount: schedules.length },
+            });
+        }
+        return;
+    }
+    if (["Paid", "Canceled"].includes(schedules[0].status)) return;
     const probe = await probeQBInvoice(tokens, qbInvoiceId);
     if (probe.state !== "ok" || probe.total <= 0 || probe.balance > 0) return;
+    const schedule = schedules[0];
+    if (Math.abs(Number(schedule.amount) - probe.total) > 0.005) {
+        await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
+            kind: "amount_mismatch",
+            detail: { probuildAmount: Number(schedule.amount), qboTotal: probe.total },
+        });
+        return;
+    }
 
     const paymentId = paymentIdHint || probe.paymentTxnIds[0] || null;
     const payment = paymentId ? await getQBPayment(tokens, paymentId) : null;
     const paidAt = payment?.txnDate ? new Date(`${payment.txnDate}T12:00:00`) : new Date();
-    for (const schedule of schedules) {
-        const recorded = await markMilestonePaidFromQB(schedule.id, schedule.invoiceId, {
-            paidAt,
-            referenceNumber: payment?.referenceNumber || null,
-            qbPaymentId: paymentId,
-        });
-        if (recorded) await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => undefined);
-    }
+    const recorded = await markMilestonePaidFromQB(schedule.id, schedule.invoiceId, {
+        paidAt,
+        referenceNumber: payment?.referenceNumber || null,
+        qbPaymentId: paymentId,
+    });
+    if (recorded) await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => undefined);
 }
 
-async function processQboEvent(entity: string, entityQboId: string) {
-    if (entity.toLowerCase() === "invoice") {
-        await settleQboInvoice(entityQboId);
+async function processQboEvent(row: { id: string; realmId: string; entity: string; entityQboId: string }) {
+    const tokens = await getFreshQBTokens();
+    if (tokens.realmId !== row.realmId) throw new Error("realm-mismatch-quarantined");
+    const runId = `qbo-event:${row.id}`;
+    if (row.entity.toLowerCase() === "invoice") {
+        await settleQboInvoice(tokens, row.entityQboId, runId);
         return;
     }
-    if (entity.toLowerCase() === "payment") {
-        const tokens = await getFreshQBTokens();
-        const payment = await getQBPayment(tokens, entityQboId);
+    if (row.entity.toLowerCase() === "payment") {
+        const payment = await getQBPayment(tokens, row.entityQboId);
         if (!payment) throw new Error("QBO payment was not readable");
         for (const qbInvoiceId of payment.linkedInvoiceIds) {
-            await settleQboInvoice(qbInvoiceId, entityQboId);
+            await settleQboInvoice(tokens, qbInvoiceId, runId, row.entityQboId);
         }
     }
 }
 
-async function drainQboEvents(limit: number): Promise<DrainCounts> {
+async function logQboDeadLetter(
+    row: { id: string; entity: string; entityQboId: string },
+    claimToken: string,
+    lastError: string,
+) {
+    return prisma.$transaction(async (tx) => {
+        const done = await tx.inboundQboEvent.updateMany({
+            where: { id: row.id, claimToken },
+            data: { claimedAt: null, claimToken: null, lastError: `dead:${lastError}`, processedAt: null },
+        });
+        if (!done.count) return false;
+        const schedule = row.entity.toLowerCase() === "invoice"
+            ? await tx.paymentSchedule.findFirst({
+                where: { qbInvoiceId: row.entityQboId },
+                select: { invoiceId: true, invoice: { select: { projectId: true, code: true } } },
+            })
+            : null;
+        await tx.activityLog.create({
+            data: {
+                projectId: schedule?.invoice.projectId ?? null,
+                actorType: "SYSTEM",
+                actorName: "Invoice lifecycle worker",
+                action: "qbo_event_dead_letter",
+                entityType: schedule ? "invoice" : "qbo_event",
+                entityId: schedule?.invoiceId ?? row.id,
+                entityName: schedule ? `Invoice ${schedule.invoice.code}` : `${row.entity} ${row.entityQboId}`,
+                metadata: JSON.stringify({ eventId: row.id, entity: row.entity, entityQboId: row.entityQboId, attempts: MAX_ATTEMPTS, error: lastError }),
+            },
+        });
+        return true;
+    });
+}
+
+export async function drainQboEvents(
+    limit: number,
+    deps: { processEvent?: typeof processQboEvent } = {},
+): Promise<DrainCounts> {
     const result = { processed: 0, retried: 0, dead: 0, unmatched: 0 };
     const staleBefore = new Date(Date.now() - LEASE_MS);
     const candidates = await prisma.inboundQboEvent.findMany({
@@ -137,7 +226,7 @@ async function drainQboEvents(limit: number): Promise<DrainCounts> {
         if (claim.count === 0) continue;
         const attemptNumber = row.attempts + 1;
         try {
-            await processQboEvent(row.entity, row.entityQboId);
+            await (deps.processEvent ?? processQboEvent)(row);
             const done = await prisma.inboundQboEvent.updateMany({
                 where: { id: row.id, claimToken },
                 data: { processedAt: new Date(), claimedAt: null, claimToken: null, lastError: null },
@@ -146,18 +235,14 @@ async function drainQboEvents(limit: number): Promise<DrainCounts> {
         } catch (error) {
             const lastError = String(error instanceof Error ? error.message : error).slice(0, 500);
             const dead = attemptNumber === MAX_ATTEMPTS;
-            const done = await prisma.inboundQboEvent.updateMany({
-                where: { id: row.id, claimToken },
-                data: {
-                    claimedAt: null,
-                    claimToken: null,
-                    lastError: dead ? `dead:${lastError}` : lastError,
-                    processedAt: dead ? new Date() : null,
-                },
-            });
-            if (done.count) {
-                if (dead) result.dead++;
-                else result.retried++;
+            if (dead) {
+                if (await logQboDeadLetter(row, claimToken, lastError)) result.dead++;
+            } else {
+                const done = await prisma.inboundQboEvent.updateMany({
+                    where: { id: row.id, claimToken },
+                    data: { claimedAt: null, claimToken: null, lastError, processedAt: null },
+                });
+                if (done.count) result.retried++;
             }
         }
     }

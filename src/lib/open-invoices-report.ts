@@ -39,14 +39,14 @@ export async function queryOpenInvoicesData(filters: OpenInvoicesFilters) {
         include: {
             project: { select: { id: true, name: true } },
             client: { select: { id: true, name: true } },
-            payments: { select: { dueDate: true } },
+            payments: { select: { dueDate: true, status: true } },
         },
         orderBy: { issueDate: "asc" },
     });
     return invoices
         .map(invoice => ({
             ...invoice,
-            status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+            status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
         }))
         .filter(invoice => requestedStatuses.includes(invoice.status));
 }

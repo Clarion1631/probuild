@@ -102,7 +102,7 @@ export default function SendMilestonesModal({
                     toast.error(`Detail: ${firstBad.error}`);
                 }
             }
-            onClose();
+            if (!result.retrySameRequest) onClose();
         } catch (e: any) {
             toast.error(e.message || "Failed to send invoices");
         } finally {

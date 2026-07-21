@@ -326,6 +326,14 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
 }
 
 /** Read a QBO payment (date / amount / reference) for receipt details. */
+export function extractLinkedInvoiceIds(payment: { Line?: Array<{ LinkedTxn?: Array<{ TxnType?: string; TxnId?: unknown }> }> }) {
+    return Array.from(new Set<string>(
+        (payment.Line || []).flatMap(line => line.LinkedTxn || [])
+            .filter(link => link.TxnType === "Invoice" && link.TxnId)
+            .map(link => String(link.TxnId)),
+    ));
+}
+
 export async function getQBPayment(
     tokens: QBTokens,
     paymentId: string
@@ -339,11 +347,7 @@ export async function getQBPayment(
         txnDate: p.TxnDate || null,
         amount: Number(p.TotalAmt ?? 0),
         referenceNumber: p.PaymentRefNum || null,
-        linkedInvoiceIds: Array.from(new Set<string>(
-            (p.Line || []).flatMap((line: any) => line.LinkedTxn || [])
-                .filter((link: any) => link.TxnType === "Invoice" && link.TxnId)
-                .map((link: any) => String(link.TxnId)),
-        )),
+        linkedInvoiceIds: extractLinkedInvoiceIds(p),
     };
 }
 

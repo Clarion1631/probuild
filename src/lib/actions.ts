@@ -2654,7 +2654,7 @@ export async function getInvoiceForPortal(id: string) {
             if (!invoice) return null;
             return {
                 ...invoice,
-                status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+                status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
                 projectName: invoice.project?.name || null,
                 clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
                 clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
@@ -2677,7 +2677,7 @@ export async function getInvoiceForPortal(id: string) {
         if (!invoice) return null;
         return {
             ...invoice,
-            status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+            status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
             projectName: invoice.project?.name || null,
             clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
             clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
@@ -3337,7 +3337,7 @@ export async function getInvoice(id: string) {
     });
     return invoice ? {
         ...invoice,
-        status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+        status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
     } : null;
 }
 
@@ -4346,11 +4346,11 @@ export async function getProjectInvoices(projectId: string) {
     const invoices = await prisma.invoice.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
-        include: { client: true, payments: { select: { dueDate: true } } },
+        include: { client: true, payments: { select: { dueDate: true, status: true } } },
     });
     return invoices.map(invoice => ({
         ...invoice,
-        status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+        status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
     }));
 }
 
@@ -4361,12 +4361,12 @@ export async function getAllInvoices() {
         include: {
             project: { select: { id: true, name: true } },
             client: { select: { id: true, name: true } },
-            payments: { select: { dueDate: true } },
+            payments: { select: { dueDate: true, status: true } },
         },
     });
     return invoices.map(invoice => ({
         ...invoice,
-        status: displayInvoiceStatus({ status: invoice.status, dueDates: invoice.payments.map(payment => payment.dueDate) }),
+        status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
     }));
 }
 

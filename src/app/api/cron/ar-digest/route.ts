@@ -14,7 +14,10 @@ export async function GET(request: Request) {
     // Any deployed environment (production or preview) requires the cron secret,
     // and fails closed if CRON_SECRET is unset. Only local dev skips the check.
     const authHeader = request.headers.get("authorization");
-    if (process.env.VERCEL_ENV && (!process.env.CRON_SECRET || authHeader !== `Bearer ${process.env.CRON_SECRET}`)) {
+    const secret = process.env.CRON_SECRET;
+    const authed = !!secret && authHeader === `Bearer ${secret}`;
+    const isLocalDev = !process.env.VERCEL && process.env.NODE_ENV !== "production" && !secret;
+    if (!authed && !isLocalDev) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 

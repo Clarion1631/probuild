@@ -1,10 +1,13 @@
 import { test, expect } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import {
+  applyEmailEventTx,
   executeInvoiceSendAttempt,
   markInvoiceViewedCore,
+  replayPendingEmailEventsForAttemptTx,
   sweepStrandedSendAttempts,
 } from "../src/lib/invoice-lifecycle";
+import { drainEmailEvents } from "../src/lib/invoice-event-workers";
 
 /**
  * Invoice lifecycle regression net.
@@ -175,6 +178,19 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
     expect(stranded.status).toBe("sending");
     expect(stranded.sentAt).toBeNull();
 
+    await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_before_finalization",
+        resendEmailId: "life_resume_email",
+        type: "email.delivered",
+        occurredAt: new Date("2026-07-20T18:00:05.000Z"),
+        payload: {},
+      },
+    });
+    const unmatchedDrain = await drainEmailEvents(50);
+    expect(unmatchedDrain.processed).toBe(0);
+    expect((await prisma.emailEvent.findUniqueOrThrow({ where: { svixId: "life_svix_before_finalization" } })).attempts).toBe(0);
+
     const viewedAt = new Date(Math.max(Date.now(), stranded.createdAt.getTime() + 1_000));
     const view = await markInvoiceViewedCore(IDS.resumeInvoice, IDS.client, {
       now: () => viewedAt,
@@ -192,13 +208,15 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
     );
 
     expect(resumed.attemptId).toBe(stranded.id);
-    expect(resumed.status).toBe("sent");
+    expect(resumed.status).toBe("delivered");
     expect(providerCalls).toBe(2);
     expect(providerAcceptances).toBe(1);
 
     const finalized = await prisma.sendAttempt.findUniqueOrThrow({ where: { id: stranded.id } });
     expect(finalized.sentAt?.toISOString()).toBe("2026-07-20T18:00:00.000Z");
     expect(finalized.resendEmailId).toBe("life_resume_email");
+    expect(finalized.status).toBe("delivered");
+    expect((await prisma.emailEvent.findUniqueOrThrow({ where: { svixId: "life_svix_before_finalization" } })).attempts).toBe(1);
     const projected = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: IDS.resumeMilestone } });
     expect(projected.firstViewedAt?.toISOString()).toBe(viewedAt.toISOString());
     expect(projected.lastViewedAt?.toISOString()).toBe(viewedAt.toISOString());
@@ -214,6 +232,97 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
       }),
       { sendEmail: async () => ({ success: true, id: "life_must_not_send" }) },
     )).rejects.toThrow("sendRequestId reused with a different payload");
+  });
+
+  test("duplicate provider ids are deduped and event recency cannot regress the latest send", async () => {
+    const duplicate = {
+      svixId: "life_svix_duplicate",
+      resendEmailId: "life_resume_email",
+      type: "email.delivered",
+      occurredAt: new Date("2026-07-20T18:00:06.000Z"),
+      payload: {},
+    };
+    const inserted = await prisma.emailEvent.createMany({ data: [duplicate, duplicate], skipDuplicates: true });
+    expect(inserted.count).toBe(1);
+
+    const bounced = await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_bounced",
+        resendEmailId: "life_resume_email",
+        type: "email.bounced",
+        occurredAt: new Date("2026-07-20T18:00:10.000Z"),
+        payload: {},
+      },
+    });
+    await prisma.$transaction(tx => applyEmailEventTx(tx, bounced));
+
+    const staleHealthy = await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_stale_healthy",
+        resendEmailId: "life_resume_email",
+        type: "email.delivery_delayed",
+        occurredAt: new Date("2026-07-20T18:00:02.000Z"),
+        payload: {},
+      },
+    });
+    await prisma.$transaction(tx => applyEmailEventTx(tx, staleHealthy));
+    expect((await prisma.sendAttempt.findUniqueOrThrow({ where: { resendEmailId: "life_resume_email" } })).status).toBe("bounced");
+
+    const latest = await executeInvoiceSendAttempt(
+      request({
+        invoiceId: IDS.resumeInvoice,
+        milestoneId: IDS.resumeMilestone,
+        sendRequestId: "invoice-lifecycle-latest-send",
+      }),
+      { sendEmail: async () => ({ success: true, id: "life_latest_email", acceptedAt: new Date("2026-07-20T18:01:00.000Z") }) },
+    );
+    expect(latest.status).toBe("sent");
+
+    const lateOldBounce = await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_late_old_bounce",
+        resendEmailId: "life_resume_email",
+        type: "email.bounced",
+        occurredAt: new Date("2026-07-20T18:02:00.000Z"),
+        payload: {},
+      },
+    });
+    await prisma.$transaction(tx => applyEmailEventTx(tx, lateOldBounce));
+    const invoice = await prisma.invoice.findUniqueOrThrow({ where: { id: IDS.resumeInvoice } });
+    expect(invoice.emailStatus).toBe("sent");
+    expect(invoice.emailBouncedAt).toBeNull();
+  });
+
+  test("concurrent events for one invoice serialize and roll up once per event", async () => {
+    const delivered = await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_concurrent_delivered",
+        resendEmailId: "life_latest_email",
+        type: "email.delivered",
+        occurredAt: new Date("2026-07-20T18:03:00.000Z"),
+        payload: {},
+      },
+    });
+    const bounced = await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_concurrent_bounced",
+        resendEmailId: "life_latest_email",
+        type: "email.bounced",
+        occurredAt: new Date("2026-07-20T18:03:01.000Z"),
+        payload: {},
+      },
+    });
+
+    await Promise.all([
+      prisma.$transaction(tx => applyEmailEventTx(tx, delivered)),
+      prisma.$transaction(tx => applyEmailEventTx(tx, bounced)),
+    ]);
+
+    expect((await prisma.sendAttempt.findUniqueOrThrow({ where: { resendEmailId: "life_latest_email" } })).status).toBe("bounced");
+    expect((await prisma.invoice.findUniqueOrThrow({ where: { id: IDS.resumeInvoice } })).emailStatus).toBe("bounced");
+    expect(await prisma.activityLog.count({
+      where: { entityId: IDS.resumeInvoice, metadata: { contains: "life_latest_email" } },
+    })).toBe(2);
   });
 
   test("repeat views append events and keep firstViewedAt stable", async () => {
@@ -288,5 +397,41 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
     });
     expect(attempt.status).toBe("failed");
     expect(attempt.lastError).toBe("interrupted");
+  });
+
+  test("finalization replay racing the worker applies and logs an event once", async () => {
+    await prisma.sendAttempt.create({
+      data: {
+        invoiceId: IDS.atomicInvoice,
+        recipient: "lifecycle@example.com",
+        sendRequestId: "invoice-lifecycle-replay-race",
+        payloadHash: "replay-race-payload",
+        status: "sent",
+        sentAt: new Date("2026-07-20T19:00:00.000Z"),
+        resendEmailId: "life_replay_race_email",
+        milestones: { create: { paymentScheduleId: IDS.atomicMilestone } },
+      },
+    });
+    await prisma.emailEvent.create({
+      data: {
+        svixId: "life_svix_replay_race",
+        resendEmailId: "life_replay_race_email",
+        type: "email.delivered",
+        occurredAt: new Date("2026-07-20T19:00:01.000Z"),
+        payload: {},
+      },
+    });
+
+    await Promise.all([
+      prisma.$transaction(tx => replayPendingEmailEventsForAttemptTx(tx, "life_replay_race_email")),
+      drainEmailEvents(50),
+    ]);
+
+    const event = await prisma.emailEvent.findUniqueOrThrow({ where: { svixId: "life_svix_replay_race" } });
+    expect(event.processedAt).not.toBeNull();
+    expect(event.attempts).toBe(1);
+    expect(await prisma.activityLog.count({
+      where: { entityId: IDS.atomicInvoice, metadata: { contains: "life_replay_race_email" } },
+    })).toBe(1);
   });
 });

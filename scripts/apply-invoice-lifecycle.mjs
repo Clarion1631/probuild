@@ -196,7 +196,7 @@ const statements = [
          WHERE p."invoiceId" = i."id" AND p."status" NOT IN ('Paid', 'Canceled')
        )
      ) THEN 'Paid'
-     WHEN EXISTS (
+     WHEN (i."balanceDue" > 0 AND i."balanceDue" < i."totalAmount") OR EXISTS (
        SELECT 1 FROM "PaymentSchedule" p
        WHERE p."invoiceId" = i."id" AND p."status" = 'Paid'
      ) THEN 'Partially Paid'
@@ -210,10 +210,12 @@ const statements = [
 ];
 
 try {
-  for (const sql of statements) {
-    await prisma.$executeRawUnsafe(sql);
-    console.log("applied:", sql.split("\n")[0]);
-  }
+  await prisma.$transaction(async (tx) => {
+    for (const sql of statements) {
+      await tx.$executeRawUnsafe(sql);
+      console.log("applied:", sql.split("\n")[0]);
+    }
+  }, { timeout: 120_000 });
   console.log("Invoice lifecycle migration complete.");
 } catch (error) {
   console.error("Migration failed:", error);

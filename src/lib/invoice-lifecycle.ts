@@ -10,6 +10,7 @@ export type CanonicalInvoiceStatus = "Draft" | "Issued" | "Partially Paid" | "Pa
 export function deriveInvoiceStatus(input: {
     currentStatus?: string | null;
     balanceDue: number;
+    totalAmount?: number;
     issueDate?: Date | null;
     sentAt?: Date | null;
     paymentStatuses?: string[];
@@ -18,7 +19,7 @@ export function deriveInvoiceStatus(input: {
     const active = (input.paymentStatuses || []).filter((status) => status !== "Canceled");
     const anyPaid = active.some((status) => status === "Paid");
     if (input.balanceDue <= 0 || (active.length > 0 && active.every((status) => status === "Paid"))) return "Paid";
-    if (anyPaid) return "Partially Paid";
+    if (anyPaid || (input.totalAmount != null && input.balanceDue < input.totalAmount)) return "Partially Paid";
     if (input.issueDate || input.sentAt) return "Issued";
     return "Draft";
 }
@@ -26,11 +27,15 @@ export function deriveInvoiceStatus(input: {
 export function displayInvoiceStatus(input: {
     status: string;
     dueDates?: Array<Date | null>;
+    payments?: Array<{ dueDate: Date | null; status: string }>;
     now?: Date;
 }) {
     if (!["Issued", "Partially Paid"].includes(input.status)) return input.status;
     const now = input.now ?? new Date();
-    return (input.dueDates || []).some((dueDate) => dueDate && dueDate.getTime() + 86_400_000 < now.getTime())
+    const dueDates = input.payments
+        ? input.payments.filter(payment => !["Paid", "Canceled"].includes(payment.status)).map(payment => payment.dueDate)
+        : (input.dueDates || []);
+    return dueDates.some((dueDate) => dueDate && dueDate.getTime() + 86_400_000 < now.getTime())
         ? "Overdue"
         : input.status;
 }
@@ -127,7 +132,7 @@ async function rollUpLatestAttempt(tx: DbClient, invoiceId: string) {
         where: { id: invoiceId },
         data: {
             emailStatus: latest?.status ?? null,
-            emailBouncedAt: latest && ["bounced", "complained"].includes(latest.status)
+            emailBouncedAt: latest && ["bounced", "complained", "failed"].includes(latest.status)
                 ? latest.terminalAt
                 : null,
         },
@@ -137,15 +142,34 @@ async function rollUpLatestAttempt(tx: DbClient, invoiceId: string) {
 /** Apply one verified Resend event. The caller owns the surrounding transaction. */
 export async function applyEmailEventTx(
     tx: Prisma.TransactionClient,
-    event: { id: string; resendEmailId: string; type: string; occurredAt: Date },
+    event: { id: string; resendEmailId: string; type: string; occurredAt: Date; claimToken?: string },
 ) {
-    const attempt = await tx.sendAttempt.findUnique({
-        where: { resendEmailId: event.resendEmailId },
-        select: { id: true, invoiceId: true, status: true, terminalAt: true },
+    const eventRow = await tx.emailEvent.findUnique({
+        where: { id: event.id },
+        select: { processedAt: true, claimToken: true },
     });
-    if (!attempt) return false;
+    if (eventRow?.processedAt) return true;
+    if (!eventRow || (event.claimToken && eventRow.claimToken !== event.claimToken)) return false;
 
-    await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${attempt.invoiceId} FOR UPDATE`;
+    const attemptRef = await tx.sendAttempt.findUnique({
+        where: { resendEmailId: event.resendEmailId },
+        select: { invoiceId: true },
+    });
+    if (!attemptRef) return false;
+
+    await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${attemptRef.invoiceId} FOR UPDATE`;
+    // The invoice lock may have queued behind another worker. Re-prove event
+    // ownership after acquiring it so an expired claimant cannot apply/log late.
+    const ownedEvent = await tx.emailEvent.findUnique({
+        where: { id: event.id },
+        select: { processedAt: true, claimToken: true },
+    });
+    if (ownedEvent?.processedAt) return true;
+    if (!ownedEvent || (event.claimToken && ownedEvent.claimToken !== event.claimToken)) return false;
+    const attempt = await tx.sendAttempt.findUniqueOrThrow({
+        where: { resendEmailId: event.resendEmailId },
+        select: { id: true, invoiceId: true, status: true, sentAt: true, deliveredAt: true, terminalAt: true },
+    });
     const incoming = normalizedEmailEventType(event.type);
     const supported = new Set(["delivered", "bounced", "complained", "delayed", "failed"]);
     if (!supported.has(incoming)) {
@@ -155,9 +179,19 @@ export async function applyEmailEventTx(
 
     const currentIsBad = BAD_EMAIL_STATUSES.has(attempt.status);
     const incomingIsBad = BAD_EMAIL_STATUSES.has(incoming);
+    const latestHealthyEvent = !incomingIsBad ? await tx.emailEvent.findFirst({
+        where: {
+            resendEmailId: event.resendEmailId,
+            processedAt: { not: null },
+            type: { in: ["email.delivered", "email.delivery_delayed"] },
+        },
+        orderBy: { occurredAt: "desc" },
+        select: { occurredAt: true },
+    }) : null;
+    const latestHealthyAt = latestHealthyEvent?.occurredAt ?? attempt.deliveredAt ?? attempt.sentAt;
     const accept = incomingIsBad
         ? !currentIsBad || !attempt.terminalAt || event.occurredAt >= attempt.terminalAt
-        : !currentIsBad;
+        : !currentIsBad && (!latestHealthyAt || event.occurredAt >= latestHealthyAt);
 
     if (accept) {
         await tx.sendAttempt.update({
@@ -188,16 +222,32 @@ export async function applyEmailEventTx(
     return true;
 }
 
-async function replayPendingEmailEventsForAttemptTx(
+export async function replayPendingEmailEventsForAttemptTx(
     tx: Prisma.TransactionClient,
     resendEmailId: string,
 ) {
+    const staleBefore = new Date(Date.now() - 5 * 60 * 1000);
     const events = await tx.emailEvent.findMany({
-        where: { resendEmailId, processedAt: null },
+        where: {
+            resendEmailId,
+            processedAt: null,
+            OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }],
+        },
         orderBy: [{ occurredAt: "asc" }, { createdAt: "asc" }],
         select: { id: true, resendEmailId: true, type: true, occurredAt: true },
     });
-    for (const event of events) await applyEmailEventTx(tx, event);
+    for (const event of events) {
+        const claimToken = randomUUID();
+        const claim = await tx.emailEvent.updateMany({
+            where: {
+                id: event.id,
+                processedAt: null,
+                OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }],
+            },
+            data: { claimedAt: new Date(), claimToken, attempts: { increment: 1 } },
+        });
+        if (claim.count) await applyEmailEventTx(tx, { ...event, claimToken });
+    }
 }
 
 export async function executeInvoiceSendAttempt(
@@ -260,9 +310,13 @@ export async function executeInvoiceSendAttempt(
     );
 
     if (!result.success || !result.id) {
-        await prisma.sendAttempt.update({
-            where: { id: attempt.id },
-            data: { status: "failed", terminalAt: new Date(), lastError: "email provider failed" },
+        await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${attempt.invoiceId} FOR UPDATE`;
+            await tx.sendAttempt.update({
+                where: { id: attempt.id },
+                data: { status: "failed", terminalAt: new Date(), lastError: "email provider failed" },
+            });
+            await rollUpLatestAttempt(tx, attempt.invoiceId);
         });
         return { attemptId: attempt.id, status: "failed", resumed: false };
     }
@@ -308,8 +362,6 @@ export async function executeInvoiceSendAttempt(
                 }),
                 issueDate: invoice.issueDate ?? sentAt,
                 sentAt: invoice.sentAt ?? sentAt,
-                emailStatus: "sent",
-                emailBouncedAt: null,
             },
         });
         for (const milestone of input.milestones) {
@@ -327,6 +379,7 @@ export async function executeInvoiceSendAttempt(
             });
         }
         await replayPendingEmailEventsForAttemptTx(tx, providerEmailId);
+        await rollUpLatestAttempt(tx, input.invoiceId);
         await recomputeMilestoneViewProjection(tx, input.invoiceId);
         return tx.sendAttempt.findUniqueOrThrow({ where: { id: current.id }, select: { status: true } });
     });
@@ -401,14 +454,22 @@ export async function sweepStrandedSendAttempts(input: { now?: Date; limit?: num
         where: { status: "sending", createdAt: { lt: cutoff } },
         orderBy: { createdAt: "asc" },
         take: input.limit ?? 100,
-        select: { id: true },
+        select: { id: true, invoiceId: true },
     });
     if (stranded.length === 0) return 0;
-    const result = await prisma.sendAttempt.updateMany({
-        where: { id: { in: stranded.map((attempt) => attempt.id) }, status: "sending" },
-        data: { status: "failed", terminalAt: now, lastError: "interrupted" },
-    });
-    return result.count;
+    let swept = 0;
+    for (const attempt of stranded) {
+        swept += await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${attempt.invoiceId} FOR UPDATE`;
+            const updated = await tx.sendAttempt.updateMany({
+                where: { id: attempt.id, status: "sending" },
+                data: { status: "failed", terminalAt: now, lastError: "interrupted" },
+            });
+            if (updated.count) await rollUpLatestAttempt(tx, attempt.invoiceId);
+            return updated.count;
+        });
+    }
+    return swept;
 }
 
 export function newSendRequestId(prefix = "send") {

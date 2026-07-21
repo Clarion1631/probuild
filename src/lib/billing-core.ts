@@ -19,6 +19,33 @@ import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { deriveInvoiceStatus, displayInvoiceStatus, executeInvoiceSendAttempt } from "./invoice-lifecycle";
 
+type LifecycleAttempt = {
+    status: string;
+    sentAt: Date | null;
+    deliveredAt: Date | null;
+    lastError: string | null;
+};
+
+export function invoiceLifecycleMetrics(
+    attempt: LifecycleAttempt | null,
+    firstViewedAt: Date | null,
+    lastViewedAt: Date | null,
+    now = Date.now(),
+) {
+    const sentAt = attempt?.sentAt ?? null;
+    const daysSinceSent = sentAt ? Math.floor((now - sentAt.getTime()) / 86_400_000) : null;
+    const daysSinceFirstViewed = firstViewedAt ? Math.floor((now - firstViewedAt.getTime()) / 86_400_000) : null;
+    const daysSinceViewed = lastViewedAt ? Math.floor((now - lastViewedAt.getTime()) / 86_400_000) : null;
+    let lifecycleBucket = "Not sent";
+    if (attempt?.lastError === "interrupted") lifecycleBucket = "Send interrupted";
+    else if (attempt && ["bounced", "complained", "failed"].includes(attempt.status)) lifecycleBucket = "Sent not delivered";
+    else if (firstViewedAt) lifecycleBucket = "Viewed not paid";
+    else if (attempt?.status === "delivered") lifecycleBucket = "Delivered not viewed";
+    else if (sentAt && now - sentAt.getTime() >= 86_400_000) lifecycleBucket = "Delivery unknown";
+    else if (sentAt) lifecycleBucket = "Awaiting delivery";
+    return { sentAt, daysSinceSent, daysSinceFirstViewed, daysSinceViewed, lifecycleBucket };
+}
+
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
 // the transport). actions.ts is "use server", so every export there is a remotely
@@ -112,21 +139,27 @@ export async function getProjectBilling(projectId: string) {
             total: Number(co.totalAmount), approvedAt: co.approvedAt, sentAt: co.sentAt,
         })),
         invoices: project.invoices.map(inv => ({
-            id: inv.id, code: inv.code, status: displayInvoiceStatus({ status: inv.status, dueDates: inv.payments.map(p => p.dueDate) }),
+            id: inv.id, code: inv.code, status: displayInvoiceStatus({ status: inv.status, payments: inv.payments }),
             total: Number(inv.totalAmount), balanceDue: Number(inv.balanceDue),
             sentAt: inv.sentAt, issueDate: inv.issueDate, viewedAt: inv.viewedAt,
             lastViewedAt: inv.lastViewedAt, viewCount: inv.viewCount,
-            milestones: inv.payments.map(p => ({
-                id: p.id, name: p.name, amount: Number(p.amount), status: p.status,
-                dueDate: p.dueDate, paidAt: p.paidAt, paymentMethod: p.paymentMethod,
-                referenceNumber: p.referenceNumber, firstViewedAt: p.firstViewedAt,
-                lastViewedAt: p.lastViewedAt,
-                inQuickBooks: !!p.qbInvoiceId,
-                lastEmailedAt: p.qbInvoiceSentAt,
-                delivery: p.sendAttemptMilestones[0]?.sendAttempt ?? null,
-                paymentLinkStale: !!p.qbSyncError || (!!p.qbInvoiceId && !p.qbInvoiceLink),
-                qbSyncError: p.qbSyncError,
-            })),
+            daysSinceFirstViewed: inv.viewedAt ? Math.floor((Date.now() - inv.viewedAt.getTime()) / 86_400_000) : null,
+            daysSinceViewed: inv.lastViewedAt ? Math.floor((Date.now() - inv.lastViewedAt.getTime()) / 86_400_000) : null,
+            milestones: inv.payments.map(p => {
+                const delivery = p.sendAttemptMilestones[0]?.sendAttempt ?? null;
+                return {
+                    id: p.id, name: p.name, amount: Number(p.amount), status: p.status,
+                    dueDate: p.dueDate, paidAt: p.paidAt, paymentMethod: p.paymentMethod,
+                    referenceNumber: p.referenceNumber, firstViewedAt: p.firstViewedAt,
+                    lastViewedAt: p.lastViewedAt,
+                    inQuickBooks: !!p.qbInvoiceId,
+                    lastEmailedAt: p.qbInvoiceSentAt,
+                    delivery,
+                    ...invoiceLifecycleMetrics(delivery, p.firstViewedAt, p.lastViewedAt),
+                    paymentLinkStale: !!p.qbSyncError || (!!p.qbInvoiceId && !p.qbInvoiceLink),
+                    qbSyncError: p.qbSyncError,
+                };
+            }),
         })),
     };
 }
@@ -138,7 +171,7 @@ export async function getProjectBilling(projectId: string) {
 export async function listReceivables() {
     const now = Date.now();
     const [invoices, recentlyPaidRows] = await Promise.all([prisma.invoice.findMany({
-        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft"] } },
+        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft", "Canceled"] } },
         orderBy: { issueDate: "asc" },
         select: {
             id: true, code: true, status: true, totalAmount: true, balanceDue: true,
@@ -149,7 +182,7 @@ export async function listReceivables() {
                 where: { status: "Pending" },
                 orderBy: { createdAt: "asc" },
                 select: {
-                    id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true,
+                    id: true, name: true, amount: true, status: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true,
                     firstViewedAt: true, lastViewedAt: true,
                     sendAttemptMilestones: {
                         orderBy: { sendAttempt: { createdAt: "desc" } },
@@ -177,7 +210,7 @@ export async function listReceivables() {
         return {
             invoiceId: inv.id,
             code: inv.code,
-            status: displayInvoiceStatus({ status: inv.status, dueDates: inv.payments.map(p => p.dueDate), now: new Date(now) }),
+            status: displayInvoiceStatus({ status: inv.status, payments: inv.payments, now: new Date(now) }),
             project: inv.project?.name ?? null,
             projectId: inv.project?.id ?? null,
             client: inv.client?.name ?? null,
@@ -188,22 +221,16 @@ export async function listReceivables() {
             viewedAt: inv.viewedAt,
             lastViewedAt: inv.lastViewedAt,
             viewCount: inv.viewCount,
+            daysSinceFirstViewed: inv.viewedAt ? Math.floor((now - inv.viewedAt.getTime()) / 86_400_000) : null,
+            daysSinceViewed: inv.lastViewedAt ? Math.floor((now - inv.lastViewedAt.getTime()) / 86_400_000) : null,
             unpaidMilestones: inv.payments.map(p => {
                 const attempt = p.sendAttemptMilestones[0]?.sendAttempt ?? null;
-                const sentAt = attempt?.sentAt ?? p.qbInvoiceSentAt;
-                const daysSinceSent = sentAt ? Math.floor((now - sentAt.getTime()) / 86_400_000) : null;
-                let lifecycleBucket = "Not sent";
-                if (attempt?.lastError === "interrupted") lifecycleBucket = "Send interrupted";
-                else if (attempt && ["bounced", "complained", "failed"].includes(attempt.status)) lifecycleBucket = "Sent not delivered";
-                else if (p.firstViewedAt) lifecycleBucket = "Viewed not paid";
-                else if (attempt?.status === "delivered") lifecycleBucket = "Delivered not viewed";
-                else if (sentAt && now - sentAt.getTime() >= 86_400_000) lifecycleBucket = "Delivery unknown";
-                else if (sentAt) lifecycleBucket = "Awaiting delivery";
+                const metrics = invoiceLifecycleMetrics(attempt, p.firstViewedAt, p.lastViewedAt, now);
                 return {
                     id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
-                    sentAt, deliveredAt: attempt?.deliveredAt ?? null,
+                    deliveredAt: attempt?.deliveredAt ?? null,
                     firstViewedAt: p.firstViewedAt, lastViewedAt: p.lastViewedAt,
-                    invoiceViewCount: inv.viewCount, daysSinceSent, lifecycleBucket,
+                    invoiceViewCount: inv.viewCount, ...metrics,
                     sendAttemptStatus: attempt?.status ?? null,
                     lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
                 };
@@ -1020,7 +1047,7 @@ export async function sendMilestoneInvoicesCore(
                         });
                     }
 
-                    if (settings?.qbAlsoSendIntuitEmail) {
+                    if (settings?.qbAlsoSendIntuitEmail && !attempt.resumed) {
                         const { sendQBInvoice } = await import("./quickbooks");
                         for (const { qbInvoiceId, schedule } of readyToEmail) {
                             try {
