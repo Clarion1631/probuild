@@ -83,7 +83,8 @@ export async function recomputeMilestoneViewProjection(tx: DbClient, invoiceId: 
 const BAD_EMAIL_STATUSES = new Set(["bounced", "complained", "failed"]);
 
 function normalizedEmailEventType(type: string) {
-    return type.toLowerCase().replace(/^email\./, "");
+    const normalized = type.toLowerCase().replace(/^email\./, "");
+    return normalized === "delivery_delayed" ? "delayed" : normalized;
 }
 
 async function rollUpLatestAttempt(tx: DbClient, invoiceId: string) {

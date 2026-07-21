@@ -17,6 +17,10 @@
       "schedule": "*/15 * * * *"
     },
     {
+      "path": "/api/cron/invoice-lifecycle-drain",
+      "schedule": "* * * * *"
+    },
+    {
       "path": "/api/cron/co-billing-sweep",
       "schedule": "30 * * * *"
     },

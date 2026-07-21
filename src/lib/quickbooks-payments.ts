@@ -173,7 +173,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
  * Mark a milestone Paid from a QuickBooks settlement. Mirrors the Stripe
  * webhook's claim-then-recalculate transaction so balances never drift.
  */
-async function markMilestonePaidFromQB(
+export async function markMilestonePaidFromQB(
     paymentScheduleId: string,
     invoiceId: string,
     payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null }

@@ -329,7 +329,7 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
 export async function getQBPayment(
     tokens: QBTokens,
     paymentId: string
-): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null> {
+): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null; linkedInvoiceIds: string[] } | null> {
     const res = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
     if (!res.ok) return null;
     const data = await res.json();
@@ -339,6 +339,11 @@ export async function getQBPayment(
         txnDate: p.TxnDate || null,
         amount: Number(p.TotalAmt ?? 0),
         referenceNumber: p.PaymentRefNum || null,
+        linkedInvoiceIds: Array.from(new Set<string>(
+            (p.Line || []).flatMap((line: any) => line.LinkedTxn || [])
+                .filter((link: any) => link.TxnType === "Invoice" && link.TxnId)
+                .map((link: any) => String(link.TxnId)),
+        )),
     };
 }
 
