@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { Fragment, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import type { CompanyDashboardData, DashboardProjectRow, ProjectCrewMember } from "@/lib/schedule-core";
+import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, ProjectCrewMember } from "@/lib/schedule-core";
 import { PROJECT_STATUSES } from "@/lib/project-status";
-import { generateProjectScheduleAction, updateProjectCrewAction, updateProjectStartDateAction } from "@/lib/actions";
+import { applyChangeOrderToScheduleAction, generateProjectScheduleAction, updateProjectCrewAction, updateProjectStartDateAction, updateTaskCrewAction } from "@/lib/actions";
 import {
     formatCurrency,
     formatDate,
@@ -147,6 +147,80 @@ function GenerateScheduleButton({ projectId }: { projectId: string }) {
     );
 }
 
+function ApplyChangeOrderButton({ changeOrderId, code }: { changeOrderId: string; code: string }) {
+    const router = useRouter();
+    const [isPending, startTransition] = useTransition();
+    return (
+        <button
+            type="button"
+            onClick={() => startTransition(async () => {
+                try {
+                    await applyChangeOrderToScheduleAction(changeOrderId);
+                    toast.success(`${code} applied to the schedule`);
+                    router.refresh();
+                } catch (err: any) {
+                    toast.error(err?.message || "Failed to apply change order");
+                }
+            })}
+            disabled={isPending}
+            className="hui-btn hui-btn-green text-xs px-2 py-1 whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto focus:opacity-100 focus:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto"
+        >
+            {isPending ? `Applying ${code}...` : `Apply CO ${code}`}
+        </button>
+    );
+}
+
+function TaskCrewPicker({ task, teamMembers }: { task: DashboardTaskRow; teamMembers: { id: string; name: string; email: string }[] }) {
+    const router = useRouter();
+    const [open, setOpen] = useState(false);
+    const [isPending, startTransition] = useTransition();
+    const assignedIds = task.assignments.map(a => a.userId);
+    const assignmentKey = [...assignedIds].sort().join(",");
+    const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
+    const selected = override?.key === assignmentKey ? override.ids : assignedIds;
+    const inactive = task.assignments.filter(a => a.status !== "ACTIVATED" || !teamMembers.some(m => m.id === a.userId));
+    const options = [
+        ...teamMembers.map(member => ({ id: member.id, label: member.name || member.email })),
+        ...inactive.filter(a => !teamMembers.some(m => m.id === a.userId)).map(a => ({ id: a.userId, label: `${a.name} (inactive)` })),
+    ];
+
+    function toggle(userId: string) {
+        const next = selected.includes(userId) ? selected.filter(id => id !== userId) : [...selected, userId];
+        setOverride({ key: assignmentKey, ids: next });
+        startTransition(async () => {
+            try {
+                await updateTaskCrewAction(task.id, next);
+                router.refresh();
+            } catch (err: any) {
+                toast.error(err?.message || "Failed to update task crew");
+                setOverride(null);
+            }
+        });
+    }
+
+    return (
+        <div className="relative inline-block">
+            <button type="button" onClick={() => setOpen(value => !value)} disabled={isPending} className="hui-btn hui-btn-secondary text-xs px-2 py-1" aria-expanded={open}>
+                {selected.length === 0 ? "Assign task crew" : task.assignments.filter(a => selected.includes(a.userId)).map(a => initials(a.name)).join(" ") || `${selected.length} assigned`}
+            </button>
+            {open && (
+                <>
+                    <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
+                    <div className="absolute right-0 z-30 mt-1 w-56 bg-white border border-hui-border rounded-lg shadow-lg p-2 max-h-64 overflow-y-auto">
+                        {options.length === 0 && <p className="text-xs text-hui-textMuted px-2 py-1">No active team members.</p>}
+                        {options.map(option => (
+                            <label key={option.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
+                                <input type="checkbox" checked={selected.includes(option.id)} onChange={() => toggle(option.id)} className="accent-hui-primary" />
+                                <span className="text-sm text-hui-textMain">{option.label}</span>
+                            </label>
+                        ))}
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
 // Inline date setter for one waiting-to-start project (P1).
 function StartDateRow({ project }: { project: DashboardProjectRow }) {
     const router = useRouter();
@@ -212,8 +286,10 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
 
     // Overlay layer toggles (ADMIN only): income default on, others off.
     const [showIncome, setShowIncome] = useState(true);
+    const [showProjectedCo, setShowProjectedCo] = useState(true);
     const [showExpenses, setShowExpenses] = useState(false);
     const [showHours, setShowHours] = useState(false);
+    const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
 
     const anchor = parseUTCDate(`${month}-01`);
     const days = getMonthGrid(anchor);
@@ -244,6 +320,11 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
     for (const m of overlays?.income ?? []) {
         const key = m.effectiveDueDate.slice(0, 10);
         incomeByDay.set(key, (incomeByDay.get(key) ?? 0) + m.amount);
+    }
+    const projectedCoByDay = new Map<string, number>();
+    for (const row of overlays?.changeOrders ?? []) {
+        const key = row.effectiveDueDate.slice(0, 10);
+        projectedCoByDay.set(key, (projectedCoByDay.get(key) ?? 0) + row.amount);
     }
     const expensesByDay = new Map<string, number>();
     for (const e of overlays?.expenses ?? []) {
@@ -299,6 +380,12 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                     Expenses
                                 </button>
                                 <button
+                                    onClick={() => setShowProjectedCo(v => !v)}
+                                    className={`text-xs font-semibold px-2 py-1 rounded-full border transition ${showProjectedCo ? "bg-amber-100 text-amber-800 border-amber-300" : "bg-white text-hui-textMuted border-hui-border"}`}
+                                >
+                                    Projected CO
+                                </button>
+                                <button
                                     onClick={() => setShowHours(v => !v)}
                                     className={`text-xs font-semibold px-2 py-1 rounded-full border transition ${showHours ? "bg-blue-100 text-blue-700 border-blue-300" : "bg-white text-hui-textMuted border-hui-border"}`}
                                 >
@@ -324,6 +411,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                         const projectStarts = projectStartsByDay.get(dayKey) ?? [];
                         const leadStarts = leadStartsByDay.get(dayKey) ?? [];
                         const incomeTotal = showIncome ? incomeByDay.get(dayKey) : undefined;
+                        const projectedCoTotal = showProjectedCo ? projectedCoByDay.get(dayKey) : undefined;
                         const expenseTotal = showExpenses ? expensesByDay.get(dayKey) : undefined;
                         const hoursTotal = showHours ? hoursByDay.get(dayKey) : undefined;
                         return (
@@ -368,6 +456,11 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                             {formatCurrency(incomeTotal)} due
                                         </span>
                                     )}
+                                    {projectedCoTotal != null && projectedCoTotal > 0 && (
+                                        <span className="text-[10px] font-medium text-amber-700 px-1.5" title="Approved, unbilled change-order income projected this day">
+                                            {formatCurrency(projectedCoTotal)} projected CO
+                                        </span>
+                                    )}
                                     {expenseTotal != null && expenseTotal > 0 && (
                                         <span className="text-[10px] font-medium text-red-700 px-1.5" title="Expenses this day">
                                             −{formatCurrency(expenseTotal)}
@@ -409,38 +502,89 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                             {crewRows.map(p => {
                                 const canGenerate =
                                     (p.status === "Waiting to Start") && p.hasQualifyingEstimate && p.taskCount === 0;
+                                const expanded = expandedProjects.has(p.id);
                                 return (
-                                    <tr key={p.id} className="hover:bg-slate-50 transition">
-                                        <td className="px-4 py-3">
-                                            <Link href={`/projects/${p.id}`} className="text-sm font-medium text-hui-textMain hover:text-hui-primary">
-                                                {p.name}
-                                            </Link>
-                                            <span className="block text-xs text-hui-textMuted">{p.client ?? "—"}</span>
-                                        </td>
-                                        <td className="px-4 py-3">
-                                            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${statusColor(p.status)}`}>
-                                                {p.status === "Waiting to Start" && p.startDate ? "Scheduled" : p.status}
-                                            </span>
-                                        </td>
-                                        <td className="px-4 py-3">
-                                            {canEdit && teamMembers ? (
-                                                <CrewPicker projectId={p.id} crew={p.crew} teamMembers={teamMembers} />
-                                            ) : (
-                                                <span className="text-xs text-hui-textMuted">
-                                                    {p.crew.length === 0 ? "—" : p.crew.map(c => initials(c.name)).join(" ")}
+                                    <Fragment key={p.id}>
+                                        <tr className="group hover:bg-slate-50 transition">
+                                            <td className="px-4 py-3">
+                                                <div className="flex items-start gap-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setExpandedProjects(current => {
+                                                            const next = new Set(current);
+                                                            next.has(p.id) ? next.delete(p.id) : next.add(p.id);
+                                                            return next;
+                                                        })}
+                                                        disabled={p.taskCount === 0}
+                                                        aria-expanded={expanded}
+                                                        aria-controls={`project-tasks-${p.id}`}
+                                                        className="mt-0.5 w-6 h-6 rounded text-hui-textMuted hover:bg-slate-200 disabled:opacity-30"
+                                                        title={p.taskCount === 0 ? "No tasks" : expanded ? "Collapse tasks" : "Expand tasks"}
+                                                    >
+                                                        {expanded ? "−" : "+"}
+                                                    </button>
+                                                    <div>
+                                                        <Link href={`/projects/${p.id}`} className="text-sm font-medium text-hui-textMain hover:text-hui-primary">
+                                                            {p.name}
+                                                        </Link>
+                                                        <span className="block text-xs text-hui-textMuted">{p.client ?? "—"}</span>
+                                                    </div>
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${statusColor(p.status)}`}>
+                                                    {p.status === "Waiting to Start" && p.startDate ? "Scheduled" : p.status}
                                                 </span>
-                                            )}
-                                        </td>
-                                        <td className="px-4 py-3">
-                                            {canEdit && canGenerate ? (
-                                                <GenerateScheduleButton projectId={p.id} />
-                                            ) : (
-                                                <span className="text-xs text-hui-textMuted">
-                                                    {p.taskCount > 0 ? `${p.taskCount} task${p.taskCount === 1 ? "" : "s"}` : "—"}
-                                                </span>
-                                            )}
-                                        </td>
-                                    </tr>
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                {canEdit && teamMembers ? (
+                                                    <CrewPicker projectId={p.id} crew={p.crew} teamMembers={teamMembers} />
+                                                ) : (
+                                                    <span className="text-xs text-hui-textMuted">
+                                                        {p.crew.length === 0 ? "—" : p.crew.map(c => initials(c.name)).join(" ")}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    {canEdit && canGenerate ? (
+                                                        <GenerateScheduleButton projectId={p.id} />
+                                                    ) : (
+                                                        <span className="text-xs text-hui-textMuted">
+                                                            {p.taskCount > 0 ? `${p.taskCount} task${p.taskCount === 1 ? "" : "s"}` : "—"}
+                                                        </span>
+                                                    )}
+                                                    {canEdit && p.status === "In Progress" && p.unappliedChangeOrders.items.map(co => (
+                                                        <ApplyChangeOrderButton key={co.id} changeOrderId={co.id} code={co.code} />
+                                                    ))}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                        {expanded && (
+                                            <tr id={`project-tasks-${p.id}`}>
+                                                <td colSpan={4} className="bg-slate-50/70 px-8 py-3">
+                                                    <div className="space-y-2">
+                                                        {p.tasks.map(task => (
+                                                            <div key={task.id} className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 rounded-lg border border-hui-border bg-white px-3 py-2">
+                                                                <div className="min-w-0">
+                                                                    <p className="truncate text-sm font-medium text-hui-textMain">{task.name}</p>
+                                                                    <p className="text-xs text-hui-textMuted">
+                                                                        {task.type === "milestone" ? "Milestone" : task.status} · {task.startDate.slice(0, 10)} → {task.endDate.slice(0, 10)}
+                                                                    </p>
+                                                                </div>
+                                                                <div className="text-xs text-hui-textMuted">
+                                                                    {task.assignments.length === 0
+                                                                        ? "No task crew"
+                                                                        : task.assignments.map(a => `${a.name}${a.status === "ACTIVATED" ? "" : " (inactive)"}`).join(", ")}
+                                                                </div>
+                                                                {canEdit && teamMembers && <TaskCrewPicker task={task} teamMembers={teamMembers} />}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </Fragment>
                                 );
                             })}
                         </tbody>
@@ -500,6 +644,11 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                                 {" × "}
                                                 <Link href={`/projects/${pair.projectB.id}`} className="text-hui-primary hover:underline">{pair.projectB.name}</Link>
                                                 {` — ${pair.overlapStart.slice(0, 10)} → ${pair.overlapEnd.slice(0, 10)}`}
+                                                {(pair.taskA || pair.taskB) && (
+                                                    <span className="block pl-3 text-[11px] text-slate-500">
+                                                        {[pair.taskA, pair.taskB].filter(Boolean).map(task => `${task!.name} (${task!.startDate.slice(0, 10)} → ${task!.endDate.slice(0, 10)})`).join(" × ")}
+                                                    </span>
+                                                )}
                                             </li>
                                         ))}
                                     </ul>
@@ -549,7 +698,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                 <div className="hui-card">
                     <div className="px-4 py-3 border-b border-hui-border">
                         <h2 className="text-base font-semibold text-hui-textMain">This month by project</h2>
-                        <p className="text-xs text-hui-textMuted mt-1">Income due, received, expenses, burdened labor, and hours for {monthLabel}.</p>
+                        <p className="text-xs text-hui-textMuted mt-1">Billed income due, projected unbilled CO income, received, expenses, burdened labor, and hours for {monthLabel}.</p>
                     </div>
                     {strip.length === 0 ? (
                         <p className="px-4 py-8 text-sm text-hui-textMuted text-center">No project activity this month.</p>
@@ -560,6 +709,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                     <tr className="border-b border-hui-border bg-slate-50">
                                         <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Project</th>
                                         <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Income due</th>
+                                        <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Projected CO</th>
                                         <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Received</th>
                                         <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Expenses</th>
                                         <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Labor (actual, burdened)</th>
@@ -576,6 +726,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                                 </Link>
                                             </td>
                                             <td className="px-4 py-3 text-sm text-right text-green-700">{formatCurrency(r.incomeDue)}</td>
+                                            <td className="px-4 py-3 text-sm text-right text-amber-700">{formatCurrency(r.coProjected)}</td>
                                             <td className="px-4 py-3 text-sm text-right text-hui-textMain">{formatCurrency(r.received)}</td>
                                             <td className="px-4 py-3 text-sm text-right text-red-700">{formatCurrency(r.expenses)}</td>
                                             <td className="px-4 py-3 text-sm text-right text-hui-textMain">{formatCurrency(r.laborBurdened)}</td>

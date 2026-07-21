@@ -17,7 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
-import { setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
+import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -2553,6 +2553,13 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
         revalidatePath(`/projects/${estimate.projectId}/files`);
     }
+    // Post-commit best effort: approval/invoice/budget work above must stand even
+    // if schedule generation is skipped or fails.
+    try {
+        await autoGenerateScheduleForApprovedEstimate(estimateId);
+    } catch (error) {
+        console.error("[approveEstimate] schedule auto-generation failed (approval unaffected):", error);
+    }
     revalidatePath(`/portal/estimates/${estimateId}`);
     return { success: true };
 }
@@ -4005,6 +4012,19 @@ async function assertInvoicePermission() {
 
 async function assertChangeOrderPermission() {
     return assertStaffPermission("changeOrders");
+}
+
+async function assertScheduleProjectAccess(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules") || !canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+async function assertScheduleTaskAccess(taskId: string) {
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId }, select: { projectId: true } });
+    if (!task?.projectId) throw new Error("Task not found");
+    const user = await assertScheduleProjectAccess(task.projectId);
+    return { user, projectId: task.projectId };
 }
 
 async function assertFinancialPermission() {
@@ -6486,6 +6506,7 @@ export async function createScheduleTask(projectId: string, data: {
     parentId?: string;
     type?: string;
 }) {
+    await assertScheduleProjectAccess(projectId);
     const maxOrder = await prisma.scheduleTask.aggregate({
         where: { projectId },
         _max: { order: true },
@@ -6522,6 +6543,7 @@ export async function updateScheduleTask(taskId: string, data: {
     type?: string;
     estimateItemId?: string | null;
 }) {
+    await assertScheduleTaskAccess(taskId);
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.startDate !== undefined) updateData.startDate = new Date(data.startDate);
@@ -6564,12 +6586,14 @@ export async function updateScheduleTask(taskId: string, data: {
 }
 
 export async function deleteScheduleTask(taskId: string) {
+    await assertScheduleTaskAccess(taskId);
     const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
     revalidatePath(`/projects/${task.projectId}/schedule`);
     return task;
 }
 
 export async function reorderScheduleTasks(projectId: string, orderedIds: string[]) {
+    await assertScheduleProjectAccess(projectId);
     if (new Set(orderedIds).size !== orderedIds.length) {
         throw new Error("Duplicate task IDs in reorder request");
     }
@@ -6596,6 +6620,11 @@ export async function reorderScheduleTasks(projectId: string, orderedIds: string
 }
 
 export async function linkTasks(predecessorId: string, dependentId: string) {
+    const [predecessor, dependent] = await Promise.all([
+        assertScheduleTaskAccess(predecessorId),
+        assertScheduleTaskAccess(dependentId),
+    ]);
+    if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
     const dep = await prisma.taskDependency.create({
         data: { predecessorId, dependentId },
     });
@@ -6605,6 +6634,11 @@ export async function linkTasks(predecessorId: string, dependentId: string) {
 }
 
 export async function unlinkTasks(predecessorId: string, dependentId: string) {
+    const [predecessor, dependent] = await Promise.all([
+        assertScheduleTaskAccess(predecessorId),
+        assertScheduleTaskAccess(dependentId),
+    ]);
+    if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
     await prisma.taskDependency.deleteMany({
         where: { predecessorId, dependentId },
     });
@@ -6830,6 +6864,9 @@ export async function getTaskPunchItems(taskId: string) {
 // ========== TASK ASSIGNMENTS ==========
 
 export async function assignUserToTask(taskId: string, userId: string) {
+    await assertScheduleTaskAccess(taskId);
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
+    if (!user || user.status !== "ACTIVATED") throw new Error("Task crew members must be ACTIVATED users");
     const assignment = await prisma.taskAssignment.create({
         data: { taskId, userId },
         include: { user: { select: { id: true, name: true, email: true } } },
@@ -6840,6 +6877,7 @@ export async function assignUserToTask(taskId: string, userId: string) {
 }
 
 export async function unassignUserFromTask(taskId: string, userId: string) {
+    await assertScheduleTaskAccess(taskId);
     await prisma.taskAssignment.deleteMany({
         where: { taskId, userId },
     });
@@ -6848,6 +6886,7 @@ export async function unassignUserFromTask(taskId: string, userId: string) {
 }
 
 export async function assignSubToTask(taskId: string, subcontractorId: string) {
+    await assertScheduleTaskAccess(taskId);
     const assignment = await prisma.subTaskAssignment.create({
         data: { taskId, subcontractorId },
         include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } },
@@ -6858,6 +6897,7 @@ export async function assignSubToTask(taskId: string, subcontractorId: string) {
 }
 
 export async function unassignSubFromTask(taskId: string, subcontractorId: string) {
+    await assertScheduleTaskAccess(taskId);
     await prisma.subTaskAssignment.deleteMany({
         where: { taskId, subcontractorId },
     });
@@ -7117,6 +7157,7 @@ export async function generateProjectScheduleAction(projectId: string) {
     const result = await generateScheduleFromEstimate({
         estimateId: estimate.id,
         mode: "merge",
+        requireEmptyProject: true,
         actor: { type: "TEAM", name: caller.name || caller.email },
     });
     revalidatePath("/company-dashboard");
@@ -7138,6 +7179,38 @@ export async function updateProjectCrewAction(projectId: string, userIds: string
         actor: { type: "TEAM", name: caller.name || caller.email },
     });
     revalidatePath("/company-dashboard");
+    return result;
+}
+
+export async function applyChangeOrderToScheduleAction(changeOrderId: string, mode: "merge" | "regenerate" = "merge") {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await applyChangeOrderToSchedule({
+        changeOrderId,
+        mode,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${result.projectId}/schedule`);
+    return result;
+}
+
+export async function updateTaskCrewAction(taskId: string, userIds: string[]) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setTaskCrew({
+        taskId,
+        userIds,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${result.projectId}/schedule`);
     return result;
 }
 
@@ -7731,7 +7804,7 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         const runAutomation = async () => {
             try {
                 const { handleChangeOrderApproved } = await import("./billing-core");
-                await handleChangeOrderApproved(id);
+                await handleChangeOrderApproved(id, { freshlyApproved: true });
             } catch (err) {
                 console.error("[approveChangeOrder] post-approval automation failed:", err);
             }
