@@ -747,7 +747,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                                     setShowSendMilestonesModal(true);
                                                                 }}
                                                                 className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
-                                                                title={payment.qbInvoiceSentAt ? "Resend invoice email via QuickBooks" : "Send invoice email via QuickBooks"}
+                                                                title={payment.qbInvoiceSentAt ? "Resend the payment request email for just this milestone" : "Email the client a payment request for just this milestone"}
                                                             >
                                                                 {payment.qbInvoiceSentAt ? "Resend" : "Send"}
                                                             </button>
