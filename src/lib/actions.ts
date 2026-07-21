@@ -31,6 +31,7 @@ import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
 import { deriveInvoiceStatus, displayInvoiceStatus } from "./invoice-lifecycle";
+import { qboRealmMatches } from "./qbo-mapping-integrity";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -3595,7 +3596,7 @@ export async function breakQBInvoiceLink(
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentId },
         select: {
-            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            id: true, status: true, qbInvoiceId: true, qbRealmId: true, qbPaymentId: true,
             invoiceId: true, invoice: { select: { projectId: true } },
         },
     });
@@ -3622,6 +3623,7 @@ export async function breakQBInvoiceLink(
                 status: { not: "Paid" },
                 qbPaymentId: null,
                 qbInvoiceId: schedule.qbInvoiceId,
+                qbRealmId: schedule.qbRealmId,
             },
             data: {
                 qbInvoiceId: null,
@@ -3656,8 +3658,12 @@ export async function breakQBInvoiceLink(
             const { getFreshQBTokens } = await import("./quickbooks-payments");
             const { deleteQBInvoice } = await import("./quickbooks");
             const tokens = await getFreshQBTokens();
-            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
+            if (!qboRealmMatches(schedule.qbRealmId, tokens.realmId)) {
+                warning = "Link cleared in ProBuild, but the QuickBooks invoice was not deleted because its company realm is unbound or no longer active.";
+            } else {
+                const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
             if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
+            }
         } catch {
             warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
         }

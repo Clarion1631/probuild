@@ -4,6 +4,10 @@ export type QboMappingIdentityIssue =
     | { kind: "duplicate_qbo_mapping"; detail: { mappingCount: number } }
     | { kind: "realm_mismatch"; detail: { binding: "unbound" | "different" } };
 
+export function qboRealmMatches(boundRealmId: string | null, activeRealmId: string) {
+    return boundRealmId !== null && boundRealmId === activeRealmId;
+}
+
 /**
  * Fail-closed identity gate shared by every path that can turn a QBO state
  * change into a ProBuild settlement. QBO entity IDs are unique only inside a
@@ -14,7 +18,7 @@ export function validateQboMappingIdentity(input: {
     boundRealmId: string | null;
     activeRealmId: string;
 }): QboMappingIdentityIssue | null {
-    if (input.boundRealmId !== input.activeRealmId) {
+    if (!qboRealmMatches(input.boundRealmId, input.activeRealmId)) {
         return {
             kind: "realm_mismatch",
             detail: { binding: input.boundRealmId ? "different" : "unbound" },

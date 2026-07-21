@@ -1,7 +1,10 @@
 import { expect, test } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
     QBO_AMOUNT_TOLERANCE,
     qboAmountsMatch,
+    qboRealmMatches,
     validateQboMappingIdentity,
 } from "../src/lib/qbo-mapping-integrity";
 
@@ -23,5 +26,15 @@ test.describe("QBO mapping integrity gate", () => {
         expect(QBO_AMOUNT_TOLERANCE).toBe(0.005);
         expect(qboAmountsMatch(100, 100.005)).toBe(true);
         expect(qboAmountsMatch(100, 100.006)).toBe(false);
+    });
+
+    test("destructive QBO writes require an exact non-null realm binding", () => {
+        expect(qboRealmMatches("realm-a", "realm-a")).toBe(true);
+        expect(qboRealmMatches("realm-b", "realm-a")).toBe(false);
+        expect(qboRealmMatches(null, "realm-a")).toBe(false);
+
+        const actions = readFileSync(resolve(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+        expect(actions).toContain("qboRealmMatches(schedule.qbRealmId, tokens.realmId)");
+        expect(actions).toContain("qbRealmId: schedule.qbRealmId");
     });
 });
