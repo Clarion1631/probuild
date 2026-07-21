@@ -104,7 +104,12 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
 
     if (schedule.qbInvoiceId) {
         const identityIssue = validateQboMappingIdentity({
-            mappingCount: await prisma.paymentSchedule.count({ where: { qbInvoiceId: schedule.qbInvoiceId } }),
+            mappingCount: await prisma.paymentSchedule.count({
+                where: {
+                    qbInvoiceId: schedule.qbInvoiceId,
+                    OR: [{ qbRealmId: tokens.realmId }, { qbRealmId: null }],
+                },
+            }),
             boundRealmId: schedule.qbRealmId,
             activeRealmId: tokens.realmId,
         });
@@ -207,6 +212,15 @@ export async function markMilestonePaidFromQB(
             && currentSchedule.qbRealmId === settlement.realmId;
         const linkWasExplicitlyBroken = currentSchedule.qbInvoiceId === null && currentSchedule.qbRealmId === null;
         if (!mappingStillMatches && !linkWasExplicitlyBroken) return false;
+        if (mappingStillMatches) {
+            const unsafeMappingCount = await t.paymentSchedule.count({
+                where: {
+                    qbInvoiceId: settlement.qbInvoiceId,
+                    OR: [{ qbRealmId: settlement.realmId }, { qbRealmId: null }],
+                },
+            });
+            if (unsafeMappingCount !== 1) return false;
+        }
 
         // INVARIANT: do NOT pin qbInvoiceId in this claim. A real QBO settlement must
         // win over a concurrent breakQBInvoiceLink (which nulls qbInvoiceId): pinning it
@@ -486,17 +500,18 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
     const mappingRows = await prisma.paymentSchedule.groupBy({
-        by: ["qbInvoiceId"],
+        by: ["qbRealmId", "qbInvoiceId"],
         where: { qbInvoiceId: { in: pending.map(schedule => schedule.qbInvoiceId!) } },
         _count: { _all: true },
     });
-    const mappingCounts = new Map(mappingRows.map(row => [row.qbInvoiceId!, row._count._all]));
+    const mappingCounts = new Map(mappingRows.map(row => [`${row.qbRealmId ?? "<unbound>"}:${row.qbInvoiceId}`, row._count._all]));
 
     for (const schedule of pending) {
         result.checked++;
         try {
             const identityIssue = validateQboMappingIdentity({
-                mappingCount: mappingCounts.get(schedule.qbInvoiceId!) ?? 0,
+                mappingCount: (mappingCounts.get(`${tokens.realmId}:${schedule.qbInvoiceId}`) ?? 0)
+                    + (mappingCounts.get(`<unbound>:${schedule.qbInvoiceId}`) ?? 0),
                 boundRealmId: schedule.qbRealmId,
                 activeRealmId: tokens.realmId,
             });

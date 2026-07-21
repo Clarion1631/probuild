@@ -142,13 +142,24 @@ async function settleQboInvoice(
         select: { id: true, invoiceId: true, amount: true, status: true, qbRealmId: true },
     });
     if (schedules.length === 0) return;
+    const activeSchedules = schedules.filter(schedule => schedule.qbRealmId === tokens.realmId);
+    const unboundSchedules = schedules.filter(schedule => schedule.qbRealmId === null);
+    for (const schedule of schedules.filter(schedule => schedule.qbRealmId !== tokens.realmId)) {
+        await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
+            kind: "realm_mismatch",
+            detail: { binding: schedule.qbRealmId ? "different" : "unbound" },
+        });
+    }
+    if (activeSchedules.length === 0) return;
     const identityIssue = validateQboMappingIdentity({
-        mappingCount: schedules.length,
-        boundRealmId: schedules.length === 1 ? schedules[0].qbRealmId : null,
+        // Other explicitly bound realms have their own identity namespace.
+        // Unbound rows remain unsafe because they may belong to this realm.
+        mappingCount: activeSchedules.length + unboundSchedules.length,
+        boundRealmId: activeSchedules[0].qbRealmId,
         activeRealmId: tokens.realmId,
     });
     if (identityIssue) {
-        for (const schedule of schedules) {
+        for (const schedule of [...activeSchedules, ...unboundSchedules]) {
             await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
                 kind: identityIssue.kind,
                 detail: identityIssue.detail,
@@ -158,7 +169,7 @@ async function settleQboInvoice(
     }
     const probe = await (deps.probeInvoice ?? probeQBInvoice)(tokens, qbInvoiceId);
     if (probe.state !== "ok" || probe.total <= 0) return;
-    const schedule = schedules[0];
+    const schedule = activeSchedules[0];
     const observedKinds = new Set<string>();
     if (!qboAmountsMatch(Number(schedule.amount), probe.total)) {
         observedKinds.add("amount_mismatch");
@@ -179,7 +190,7 @@ async function settleQboInvoice(
         qbInvoiceId,
         runId,
         observedKinds,
-        new Set(["amount_mismatch", "balance_mismatch", "duplicate_qbo_mapping", "realm_mismatch"]),
+        new Set(["amount_mismatch", "balance_mismatch", "duplicate_qbo_mapping", "realm_mismatch", "qbo_invoice_missing"]),
     );
     if (observedKinds.size || probe.balance > 0 || ["Paid", "Canceled"].includes(schedule.status)) return;
 

@@ -13,6 +13,8 @@ test.describe("QBO mapping integrity gate", () => {
             .toEqual({ kind: "realm_mismatch", detail: { binding: "unbound" } });
         expect(validateQboMappingIdentity({ mappingCount: 1, boundRealmId: "realm-b", activeRealmId: "realm-a" }))
             .toEqual({ kind: "realm_mismatch", detail: { binding: "different" } });
+        expect(validateQboMappingIdentity({ mappingCount: 0, boundRealmId: "realm-b", activeRealmId: "realm-a" }))
+            .toEqual({ kind: "realm_mismatch", detail: { binding: "different" } });
         expect(validateQboMappingIdentity({ mappingCount: 1, boundRealmId: "realm-a", activeRealmId: "realm-a" }))
             .toBeNull();
     });

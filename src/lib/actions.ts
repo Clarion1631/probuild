@@ -3615,21 +3615,34 @@ export async function breakQBInvoiceLink(
     // above and this write, the claim matches 0 rows and we never strip QB fields
     // off a now-paid row. `qbInvoiceId` is pinned to the value we read so a
     // concurrent re-push (new id) can't be clobbered either.
-    const cleared = await prisma.paymentSchedule.updateMany({
-        where: {
-            id: schedule.id,
-            status: { not: "Paid" },
-            qbPaymentId: null,
-            qbInvoiceId: schedule.qbInvoiceId,
-        },
-        data: {
-            qbInvoiceId: null,
-            qbRealmId: null,
-            qbInvoiceLink: null,
-            qbInvoiceSentAt: null,
-            qbSyncedAt: null,
-            qbSyncError: null,
-        },
+    const cleared = await prisma.$transaction(async (tx) => {
+        const claim = await tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                status: { not: "Paid" },
+                qbPaymentId: null,
+                qbInvoiceId: schedule.qbInvoiceId,
+            },
+            data: {
+                qbInvoiceId: null,
+                qbRealmId: null,
+                qbInvoiceLink: null,
+                qbInvoiceSentAt: null,
+                qbSyncedAt: null,
+                qbSyncError: null,
+            },
+        });
+        if (claim.count === 1) {
+            await tx.alignmentFinding.updateMany({
+                where: {
+                    paymentScheduleId: schedule.id,
+                    qbInvoiceId: schedule.qbInvoiceId!,
+                    resolvedAt: null,
+                },
+                data: { resolvedAt: new Date() },
+            });
+        }
+        return claim;
     });
     if (cleared.count !== 1) {
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };

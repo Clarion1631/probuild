@@ -14,14 +14,14 @@ export function validateQboMappingIdentity(input: {
     boundRealmId: string | null;
     activeRealmId: string;
 }): QboMappingIdentityIssue | null {
-    if (input.mappingCount !== 1) {
-        return { kind: "duplicate_qbo_mapping", detail: { mappingCount: input.mappingCount } };
-    }
     if (input.boundRealmId !== input.activeRealmId) {
         return {
             kind: "realm_mismatch",
             detail: { binding: input.boundRealmId ? "different" : "unbound" },
         };
+    }
+    if (input.mappingCount !== 1) {
+        return { kind: "duplicate_qbo_mapping", detail: { mappingCount: input.mappingCount } };
     }
     return null;
 }

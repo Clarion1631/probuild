@@ -89,17 +89,18 @@ export async function runInvoiceAlignmentAudit(deps: {
         }),
     ]);
     const mappingRows = schedules.length ? await prisma.paymentSchedule.groupBy({
-        by: ["qbInvoiceId"],
+        by: ["qbRealmId", "qbInvoiceId"],
         where: { qbInvoiceId: { in: schedules.map(schedule => schedule.qbInvoiceId!) } },
         _count: { _all: true },
     }) : [];
-    const mappingCounts = new Map(mappingRows.map(row => [row.qbInvoiceId!, row._count._all]));
+    const mappingCounts = new Map(mappingRows.map(row => [`${row.qbRealmId ?? "<unbound>"}:${row.qbInvoiceId}`, row._count._all]));
 
     for (const schedule of schedules) {
         const qbInvoiceId = schedule.qbInvoiceId!;
         summary.checked++;
         const identityIssue = validateQboMappingIdentity({
-            mappingCount: mappingCounts.get(qbInvoiceId) ?? 0,
+            mappingCount: (mappingCounts.get(`${tokens.realmId}:${qbInvoiceId}`) ?? 0)
+                + (mappingCounts.get(`<unbound>:${qbInvoiceId}`) ?? 0),
             boundRealmId: schedule.qbRealmId,
             activeRealmId: tokens.realmId,
         });

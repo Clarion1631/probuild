@@ -1,8 +1,12 @@
 // One-time script to create Takeoff tables in Supabase
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.SUPABASE_URL || 'https://ghzdbzdnwjxazvmcefbh.supabase.co';
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdoemRiemRud2p4YXp2bWNlZmJoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjA3NTQyMiwiZXhwIjoyMDg3NjUxNDIyfQ.7TmN0axLB6zwSwO07kCaPlhmcCjY6Vz9vaPadzsGNMM';
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+    throw new Error('SUPABASE_URL and SUPABASE_SERVICE_KEY are required');
+}
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
