@@ -288,7 +288,7 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
       .toBe("Invoiced");
   });
 
-  test("M2: conversion chain — lead Won, project In Progress, linked invoice, sourceScheduleId mirrors", async () => {
+  test("M2: conversion chain — lead Won, project Waiting to Start, linked invoice, sourceScheduleId mirrors", async () => {
     const estimate = await prisma.estimate.findUniqueOrThrow({ where: { id: IDS.estimate } });
     expect(estimate.status, "estimate flips to Invoiced on signing").toBe("Invoiced");
     expect(estimate.approvedBy).toBe(SIGNER);
@@ -299,7 +299,7 @@ test.describe.serial("Money pipeline: sign → convert → invoice → mirror �
     expect(lead.stage, "lead marked Won").toBe("Won");
 
     const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
-    expect(project.status).toBe("In Progress");
+    expect(project.status, "projects are born Waiting to Start since c250526").toBe("Waiting to Start");
     expect(project.clientId).toBe(IDS.client);
 
     const invoice = await prisma.invoice.findFirstOrThrow({ where: { estimateId: IDS.estimate } });

@@ -17,6 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
+import { setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -1063,7 +1064,8 @@ export async function convertLeadToProject(leadId: string) {
                 clientId: lead.clientId,
                 location: geo?.formattedAddress ?? lead.location,
                 ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
-                status: "In Progress",
+                status: "Waiting to Start",
+                startDate: lead.expectedStartDate ?? null,
                 type: lead.projectType || "Unknown",
                 managerId: lead.managerId || null,
                 tags: lead.tags || null,
@@ -1189,8 +1191,10 @@ export async function createProject(data: {
 
     const { id: projectId } = await convertLeadToProject(lead.id);
 
-    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
-    if (data.status && data.status !== "In Progress") {
+    // Apply project-specific fields the conversion doesn't carry (it defaults status to "Waiting to Start").
+    // A provided status always applies — including "In Progress" for callers
+    // that explicitly want the job to skip the waiting stage.
+    if (data.status) {
         await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
     }
 
@@ -6610,78 +6614,18 @@ export async function unlinkTasks(predecessorId: string, dependentId: string) {
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {
     await assertEstimatePermission();
-    const estimate = await prisma.estimate.findUnique({
-        where: { id: estimateId },
-        include: {
-            items: {
-                where: { parentId: null },
-                orderBy: { order: "asc" },
-                include: {
-                    subItems: { orderBy: { order: "asc" } },
-                },
-            },
-        },
+    // Rewired through the schedule-core generator (PB-pipeline-002): one
+    // shared precondition/idempotency path for estimate — schedule.
+    // Merge mode skips already task-linked items. Response shape preserved
+    // for existing callers: the created task rows.
+    const result = await generateScheduleFromEstimate({
+        estimateId,
+        mode: "merge",
+        actor: { type: "TEAM", name: "Team" },
     });
-    if (!estimate || estimate.items.length === 0) return [];
-
-    const maxOrder = await prisma.scheduleTask.aggregate({
-        where: { projectId },
-        _max: { order: true },
-    });
-    let order = (maxOrder._max.order ?? -1) + 1;
-
-    const TYPE_COLORS: Record<string, string> = {
-        Material: "#3b82f6",
-        Labor: "#f59e0b",
-        Subcontractor: "#8b5cf6",
-    };
-
-    const today = new Date();
-    const created = [];
-    let dayOffset = 0;
-
-    for (const item of estimate.items) {
-        // Calculate estimated hours from labor items
-        let estimatedHours: number | null = null;
-        if (item.type === "Labor") {
-            // Top-level is labor — use its quantity as hours
-            estimatedHours = item.quantity || null;
-        } else if (item.subItems && item.subItems.length > 0) {
-            // Parent group — sum labor sub-item quantities as hours
-            const laborHours = item.subItems
-                .filter((si: any) => si.type === "Labor")
-                .reduce((sum: number, si: any) => sum + (si.quantity || 0), 0);
-            if (laborHours > 0) estimatedHours = laborHours;
-        }
-
-        const duration = item.type === "Labor" ? 7 : item.type === "Subcontractor" ? 10 : 5;
-        const startDate = new Date(today.getTime() + dayOffset * 86400000);
-        const endDate = new Date(today.getTime() + (dayOffset + duration) * 86400000);
-        dayOffset += Math.ceil(duration * 0.7);
-
-        const alreadyLinked = await prisma.scheduleTask.findFirst({
-            where: { estimateItemId: item.id }, select: { id: true },
-        });
-        const task = await prisma.scheduleTask.create({
-            data: {
-                projectId,
-                name: item.name,
-                startDate,
-                endDate,
-                color: getDefaultColorForTaskName(item.name) || TYPE_COLORS[item.type] || "#4c9a2a",
-                order: order++,
-                status: "Not Started",
-                estimatedHours,
-                estimateItemId: alreadyLinked ? null : item.id,
-            },
-        });
-        created.push(task);
-    }
-
     revalidatePath(`/projects/${projectId}/schedule`);
-    return created;
+    return result.created;
 }
-
 
 // ========== TASK COMMENTS ==========
 
@@ -7132,6 +7076,69 @@ export async function updateProjectStatus(projectId: string, status: string) {
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
     return { success: true };
+}
+
+// Move a project's company-level start date from the dashboard's waiting-to-start
+// table. Thin wrapper over schedule-core (which owns the shift rules + ActivityLog);
+// ADMIN/MANAGER only, same inline role check as the other project actions.
+export async function updateProjectStartDateAction(projectId: string, startDateISO: string | null, shiftJobTasks: boolean) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setProjectStartDate({
+        projectId,
+        startDate: startDateISO ? parseStartDateInput(startDateISO) : null,
+        shiftJobTasks,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
+}
+
+// Generate a project's schedule from its most recent qualifying estimate
+// (the same deterministic selection contractValue uses). ADMIN/MANAGER only.
+export async function generateProjectScheduleAction(projectId: string) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+
+    const estimate = await prisma.estimate.findFirst({
+        where: { projectId, status: { in: CONTRACT_ESTIMATE_STATUSES } },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+    });
+    if (!estimate) throw new Error("No Approved, Invoiced, Partially Paid, or Paid estimate on this project yet — approve an estimate first.");
+
+    const result = await generateScheduleFromEstimate({
+        estimateId: estimate.id,
+        mode: "merge",
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return result;
+}
+
+// Replace a project's crew from the dashboard picker. ADMIN/MANAGER only;
+// the core validates every id is an ACTIVATED user.
+export async function updateProjectCrewAction(projectId: string, userIds: string[]) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setProjectCrew({
+        projectId,
+        userIds,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    return result;
 }
 
 export async function updateProjectColor(projectId: string, color: string) {

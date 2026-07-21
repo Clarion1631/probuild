@@ -268,43 +268,66 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
     const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
     await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
 
-    const schedules = await prisma.estimatePaymentSchedule.findMany({
-        where: { estimateId },
-        orderBy: { order: "asc" },
-    });
+    // Clone the estimate's milestones into invoice-side PaymentSchedules. The
+    // source read + clone inserts run in ONE transaction that first takes the
+    // same Project row lock setProjectStartDate uses: a start-date move can
+    // then never slip between our read of the source dueDates and the clone
+    // inserts (which would leave the new clones on pre-shift dates while their
+    // EPS rows and the project's tasks moved -- a partially shifted mirror
+    // group). Lock order is parent-before-child (Project before its Estimate/
+    // Invoice children), matching the canonical money-lock direction in
+    // tx-retry.ts; withTxRetry covers residual serialization failures.
+    // (Lock + scheduleTaskId propagation ported from c250526 during the
+    // feat/company-pipeline-dashboard merge.)
+    const paidAmount = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Lead-owned estimates (no projectId) need no lock -- start-date
+        // moves only target projects.
+        if (estimate.projectId) {
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
+        }
 
-    let paidAmount = 0;
-    if (schedules.length > 0) {
-        for (const schedule of schedules) {
-            if (schedule.status === "Paid") paidAmount += toNum(schedule.amount);
-            await prisma.paymentSchedule.create({
+        const schedules = await tx.estimatePaymentSchedule.findMany({
+            where: { estimateId },
+            orderBy: { order: "asc" },
+        });
+
+        let paidAmount = 0;
+        if (schedules.length > 0) {
+            for (const schedule of schedules) {
+                if (schedule.status === "Paid") paidAmount += toNum(schedule.amount);
+                await tx.paymentSchedule.create({
+                    data: {
+                        invoiceId: invoice.id,
+                        sourceScheduleId: schedule.id,
+                        // Keep the schedule-task link on the invoice-side clone so
+                        // start-date moves can shift both milestone mirrors together.
+                        scheduleTaskId: schedule.scheduleTaskId || null,
+                        name: schedule.name,
+                        amount: schedule.amount,
+                        status: schedule.status,
+                        dueDate: schedule.dueDate || null,
+                        paymentDate: schedule.paymentDate || null,
+                        paidAt: schedule.paidAt || null,
+                        stripeSessionId: schedule.stripeSessionId || null,
+                        stripePaymentIntentId: schedule.stripePaymentIntentId || null,
+                        paymentMethod: schedule.paymentMethod || null,
+                        referenceNumber: schedule.referenceNumber || null,
+                        notes: schedule.notes || null,
+                    },
+                });
+            }
+        } else {
+            await tx.paymentSchedule.create({
                 data: {
                     invoiceId: invoice.id,
-                    sourceScheduleId: schedule.id,
-                    name: schedule.name,
-                    amount: schedule.amount,
-                    status: schedule.status,
-                    dueDate: schedule.dueDate || null,
-                    paymentDate: schedule.paymentDate || null,
-                    paidAt: schedule.paidAt || null,
-                    stripeSessionId: schedule.stripeSessionId || null,
-                    stripePaymentIntentId: schedule.stripePaymentIntentId || null,
-                    paymentMethod: schedule.paymentMethod || null,
-                    referenceNumber: schedule.referenceNumber || null,
-                    notes: schedule.notes || null,
+                    name: "Initial Payment",
+                    amount: estimate.totalAmount || 0,
+                    status: "Pending",
                 },
             });
         }
-    } else {
-        await prisma.paymentSchedule.create({
-            data: {
-                invoiceId: invoice.id,
-                name: "Initial Payment",
-                amount: estimate.totalAmount || 0,
-                status: "Pending",
-            },
-        });
-    }
+        return paidAmount;
+    }));
 
     const newBalanceDue = Math.max(0, total - paidAmount);
     const invoiceStatus = paidAmount > 0
