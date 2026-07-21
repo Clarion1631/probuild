@@ -17,6 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
+import { setProjectStartDate, parseStartDateInput } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -1063,7 +1064,8 @@ export async function convertLeadToProject(leadId: string) {
                 clientId: lead.clientId,
                 location: geo?.formattedAddress ?? lead.location,
                 ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
-                status: "In Progress",
+                status: "Waiting to Start",
+                startDate: lead.expectedStartDate ?? null,
                 type: lead.projectType || "Unknown",
                 managerId: lead.managerId || null,
                 tags: lead.tags || null,
@@ -1189,8 +1191,10 @@ export async function createProject(data: {
 
     const { id: projectId } = await convertLeadToProject(lead.id);
 
-    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
-    if (data.status && data.status !== "In Progress") {
+    // Apply project-specific fields the conversion doesn't carry (it defaults status to "Waiting to Start").
+    // A provided status always applies — including "In Progress" for callers
+    // that explicitly want the job to skip the waiting stage.
+    if (data.status) {
         await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
     }
 
@@ -7132,6 +7136,26 @@ export async function updateProjectStatus(projectId: string, status: string) {
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
     return { success: true };
+}
+
+// Move a project's company-level start date from the dashboard's waiting-to-start
+// table. Thin wrapper over schedule-core (which owns the shift rules + ActivityLog);
+// ADMIN/MANAGER only, same inline role check as the other project actions.
+export async function updateProjectStartDateAction(projectId: string, startDateISO: string | null, shiftJobTasks: boolean) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setProjectStartDate({
+        projectId,
+        startDate: startDateISO ? parseStartDateInput(startDateISO) : null,
+        shiftJobTasks,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
 }
 
 export async function updateProjectColor(projectId: string, color: string) {
