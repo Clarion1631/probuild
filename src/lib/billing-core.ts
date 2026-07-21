@@ -794,6 +794,7 @@ export async function sendMilestoneInvoicesCore(
     driftReview?: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }>;
     results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }>;
     error?: string;
+    retrySameRequest?: boolean;
 }> {
     try {
         const invoice = await prisma.invoice.findUnique({
@@ -1091,6 +1092,10 @@ export async function sendMilestoneInvoicesCore(
             skipped: 0,
             results: [],
             error: globalErr?.message || "An unexpected error occurred",
+            // The failure may have happened after provider acceptance but before
+            // finalization. Callers must retain sendRequestId so the next click
+            // resumes the same provider-idempotent attempt.
+            retrySameRequest: true,
         };
     }
 }

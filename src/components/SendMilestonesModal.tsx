@@ -50,7 +50,7 @@ export default function SendMilestonesModal({
             );
             // A returned result is definitive. A thrown transport error retains the
             // key so the next click resumes the same provider-idempotent attempt.
-            sendRequestIdRef.current = null;
+            if (!result.retrySameRequest) sendRequestIdRef.current = null;
 
             // Drift detected → enter (or stay in) the review step. Never close here.
             if (result.needsReview && result.driftReview?.length) {

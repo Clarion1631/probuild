@@ -45,12 +45,6 @@ export async function POST(request: Request) {
         }
     }
 
-    for (const row of rows) {
-        await prisma.inboundQboEvent.upsert({
-            where: { realmId_eventId: { realmId: row.realmId, eventId: row.eventId } },
-            create: row,
-            update: {},
-        });
-    }
+    if (rows.length) await prisma.inboundQboEvent.createMany({ data: rows, skipDuplicates: true });
     return NextResponse.json({ accepted: true, persisted: rows.length });
 }
