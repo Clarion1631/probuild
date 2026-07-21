@@ -58,7 +58,10 @@ test.describe.serial("Invoice lifecycle: alignment findings", () => {
     await resolveAlignmentFindingsWithEvidence(IDS.milestone, "alignment-qbo-1", "run-3", new Set());
     expect((await prisma.alignmentFinding.findUniqueOrThrow({ where: { id: created.id } })).resolvedAt).not.toBeNull();
 
-    await recordAlignmentFinding(IDS.milestone, "alignment-qbo-1", "run-4", { kind: "amount_mismatch", detail: { qbo: 97 } });
+    await Promise.all([
+      recordAlignmentFinding(IDS.milestone, "alignment-qbo-1", "run-4a", { kind: "amount_mismatch", detail: { qbo: 97 } }),
+      recordAlignmentFinding(IDS.milestone, "alignment-qbo-1", "run-4b", { kind: "amount_mismatch", detail: { qbo: 97 } }),
+    ]);
     const reopened = await prisma.alignmentFinding.findUniqueOrThrow({ where: { id: created.id } });
     expect(reopened.resolvedAt).toBeNull();
     expect(reopened.reopenedCount).toBe(1);

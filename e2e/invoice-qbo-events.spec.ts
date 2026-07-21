@@ -2,9 +2,9 @@ import { createHmac } from "node:crypto";
 import { test, expect } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { validSignature } from "../src/app/api/webhooks/quickbooks/route";
-import { drainQboEvents } from "../src/lib/invoice-event-workers";
+import { drainQboEvents, processQboEvent } from "../src/lib/invoice-event-workers";
+import { recordAlignmentFinding } from "../src/lib/invoice-alignment";
 import { extractLinkedInvoiceIds } from "../src/lib/quickbooks";
-import { markMilestonePaidFromQB } from "../src/lib/quickbooks-payments";
 
 const prisma = new PrismaClient();
 const IDS = {
@@ -12,6 +12,8 @@ const IDS = {
   project: "invoice-qbo-events-project",
   invoice: "invoice-qbo-events-invoice",
   milestone: "invoice-qbo-events-milestone",
+  distractorInvoice: "invoice-qbo-events-distractor-invoice",
+  distractorMilestone: "invoice-qbo-events-distractor-milestone",
 };
 
 test.describe.serial("Invoice lifecycle: QBO inbox", () => {
@@ -30,8 +32,23 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
         balanceDue: 100,
       },
     });
+    await prisma.invoice.create({
+      data: {
+        id: IDS.distractorInvoice,
+        code: "INV-QBO-DISTRACTOR",
+        projectId: IDS.project,
+        clientId: IDS.client,
+        status: "Issued",
+        issueDate: new Date("2026-07-01T12:00:00.000Z"),
+        totalAmount: 200,
+        balanceDue: 200,
+      },
+    });
     await prisma.paymentSchedule.create({
       data: { id: IDS.milestone, invoiceId: IDS.invoice, name: "QBO draw", amount: 100, qbInvoiceId: "qbo-invoice-event-1" },
+    });
+    await prisma.paymentSchedule.create({
+      data: { id: IDS.distractorMilestone, invoiceId: IDS.distractorInvoice, name: "Distractor draw", amount: 200, qbInvoiceId: "qbo-invoice-distractor" },
     });
   });
 
@@ -39,8 +56,8 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
     await prisma.activityLog.deleteMany({ where: { action: { in: ["qbo_event_dead_letter", "payment_received"] }, projectId: IDS.project } });
     await prisma.paymentNotification.deleteMany({ where: { scheduleId: IDS.milestone } });
     await prisma.inboundQboEvent.deleteMany({ where: { realmId: { startsWith: "qbo-test-realm" } } });
-    await prisma.paymentSchedule.deleteMany({ where: { id: IDS.milestone } });
-    await prisma.invoice.deleteMany({ where: { id: IDS.invoice } });
+    await prisma.paymentSchedule.deleteMany({ where: { id: { in: [IDS.milestone, IDS.distractorMilestone] } } });
+    await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoice, IDS.distractorInvoice] } } });
     await prisma.project.deleteMany({ where: { id: IDS.project } });
     await prisma.client.deleteMany({ where: { id: IDS.client } });
     await prisma.$disconnect();
@@ -121,16 +138,40 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
     expect(calls).toBe(5);
   });
 
-  test("settlement replay performs one paid transition and enqueues one notification", async () => {
-    const payment = {
-      paidAt: new Date("2026-07-20T12:00:00.000Z"),
-      referenceNumber: "QBO-PAY-1",
-      qbPaymentId: "qbo-payment-1",
+  test("a Payment inbox event settles only its linked milestone and replay is idempotent", async () => {
+    const row = { id: "qbo-payment-inbox-row", realmId: "test-realm", entity: "Payment", entityQboId: "qbo-payment-1" };
+    const deps = {
+      getTokens: async () => ({ accessToken: "test", refreshToken: "test", realmId: "test-realm" }),
+      getPayment: async () => ({
+        txnDate: "2026-07-20",
+        amount: 100,
+        referenceNumber: "QBO-PAY-1",
+        linkedInvoiceIds: ["qbo-invoice-event-1"],
+      }),
+      probeInvoice: async () => ({
+        state: "ok" as const,
+        balance: 0,
+        total: 100,
+        paymentTxnIds: ["qbo-payment-1"],
+        emailStatus: null,
+      }),
+      drainNotifications: async () => ({ processed: 0, retried: 0, failed: 0 }),
     };
-    expect(await markMilestonePaidFromQB(IDS.milestone, IDS.invoice, payment)).toBe(true);
-    expect(await markMilestonePaidFromQB(IDS.milestone, IDS.invoice, payment)).toBe(false);
+    await recordAlignmentFinding(IDS.milestone, "qbo-invoice-event-1", "stale-finding", {
+      kind: "amount_mismatch",
+      detail: { probuildAmount: 100, qboTotal: 90 },
+    });
+    await processQboEvent(row, deps);
+    await processQboEvent(row, deps);
+
     const milestone = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: IDS.milestone } });
+    const distractor = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: IDS.distractorMilestone } });
     expect(milestone.status).toBe("Paid");
+    expect(milestone.qbPaymentId).toBe("qbo-payment-1");
+    expect(distractor.status).toBe("Pending");
     expect(await prisma.paymentNotification.count({ where: { scheduleId: IDS.milestone } })).toBe(1);
+    expect((await prisma.alignmentFinding.findFirstOrThrow({
+      where: { paymentScheduleId: IDS.milestone, kind: "amount_mismatch" },
+    })).resolvedAt).not.toBeNull();
   });
 });

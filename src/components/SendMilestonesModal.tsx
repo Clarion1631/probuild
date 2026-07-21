@@ -124,7 +124,12 @@ export default function SendMilestonesModal({
                                 : "The client will receive one email from your company listing only these milestones, with a link to view and pay online."}
                         </p>
                     </div>
-                    <button onClick={onClose} className="text-hui-textMuted hover:text-hui-textMain transition">
+                    <button
+                        onClick={onClose}
+                        disabled={isSending}
+                        aria-label="Close"
+                        className="text-hui-textMuted hover:text-hui-textMain transition disabled:cursor-not-allowed disabled:opacity-40"
+                    >
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                     </button>
                 </div>

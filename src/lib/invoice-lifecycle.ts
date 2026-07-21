@@ -116,6 +116,7 @@ export async function recomputeMilestoneViewProjection(tx: DbClient, invoiceId: 
 }
 
 const BAD_EMAIL_STATUSES = new Set(["bounced", "complained", "failed"]);
+const MAX_EMAIL_EVENT_FAILURES = 5;
 
 function normalizedEmailEventType(type: string) {
     const normalized = type.toLowerCase().replace(/^email\./, "");
@@ -231,10 +232,11 @@ export async function replayPendingEmailEventsForAttemptTx(
         where: {
             resendEmailId,
             processedAt: null,
+            attempts: { lt: MAX_EMAIL_EVENT_FAILURES },
             OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }],
         },
         orderBy: [{ occurredAt: "asc" }, { createdAt: "asc" }],
-        select: { id: true, resendEmailId: true, type: true, occurredAt: true },
+        select: { id: true, resendEmailId: true, type: true, occurredAt: true, attempts: true },
     });
     for (const event of events) {
         const claimToken = randomUUID();
@@ -244,9 +246,43 @@ export async function replayPendingEmailEventsForAttemptTx(
                 processedAt: null,
                 OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }],
             },
-            data: { claimedAt: new Date(), claimToken, attempts: { increment: 1 } },
+            data: { claimedAt: new Date(), claimToken },
         });
-        if (claim.count) await applyEmailEventTx(tx, { ...event, claimToken });
+        if (!claim.count) continue;
+        try {
+            await applyEmailEventTx(tx, { ...event, claimToken });
+        } catch (error) {
+            const lastError = String(error instanceof Error ? error.message : error).slice(0, 500);
+            const dead = event.attempts + 1 === MAX_EMAIL_EVENT_FAILURES;
+            const failed = await tx.emailEvent.updateMany({
+                where: { id: event.id, claimToken },
+                data: {
+                    attempts: { increment: 1 },
+                    claimedAt: null,
+                    claimToken: null,
+                    lastError: dead ? `dead:${lastError}` : lastError,
+                    processedAt: null,
+                },
+            });
+            if (dead && failed.count) {
+                const attempt = await tx.sendAttempt.findUnique({
+                    where: { resendEmailId },
+                    select: { invoiceId: true, invoice: { select: { projectId: true, code: true } } },
+                });
+                await tx.activityLog.create({
+                    data: {
+                        projectId: attempt?.invoice.projectId ?? null,
+                        actorType: "SYSTEM",
+                        actorName: "Invoice lifecycle worker",
+                        action: "invoice_email_dead_letter",
+                        entityType: "invoice",
+                        entityId: attempt?.invoiceId ?? null,
+                        entityName: attempt ? `Invoice ${attempt.invoice.code}` : null,
+                        metadata: JSON.stringify({ eventId: event.id, resendEmailId, attempts: MAX_EMAIL_EVENT_FAILURES, error: lastError }),
+                    },
+                });
+            }
+        }
     }
 }
 
@@ -310,15 +346,23 @@ export async function executeInvoiceSendAttempt(
     );
 
     if (!result.success || !result.id) {
-        await prisma.$transaction(async (tx) => {
+        const failure = await prisma.$transaction(async (tx) => {
             await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${attempt.invoiceId} FOR UPDATE`;
-            await tx.sendAttempt.update({
-                where: { id: attempt.id },
+            const current = await tx.sendAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
+            if (current.sentAt && current.resendEmailId) {
+                return { status: current.status, resumed: true };
+            }
+            const updated = await tx.sendAttempt.updateMany({
+                where: { id: attempt.id, status: "sending", sentAt: null, resendEmailId: null },
                 data: { status: "failed", terminalAt: new Date(), lastError: "email provider failed" },
             });
-            await rollUpLatestAttempt(tx, attempt.invoiceId);
+            if (updated.count) await rollUpLatestAttempt(tx, attempt.invoiceId);
+            const latest = updated.count
+                ? { status: "failed" }
+                : await tx.sendAttempt.findUniqueOrThrow({ where: { id: attempt.id }, select: { status: true } });
+            return { status: latest.status, resumed: updated.count === 0 };
         });
-        return { attemptId: attempt.id, status: "failed", resumed: false };
+        return { attemptId: attempt.id, ...failure };
     }
 
     const providerEmailId = result.id;
@@ -328,6 +372,9 @@ export async function executeInvoiceSendAttempt(
     const finalized = await prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${input.invoiceId} FOR UPDATE`;
         const current = await tx.sendAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
+        if (current.sentAt && current.resendEmailId) {
+            return { status: current.status, alreadyFinalized: true };
+        }
         const sentAt = current.sentAt ?? acceptedAt;
         await tx.sendAttempt.update({
             where: { id: current.id },
@@ -381,10 +428,15 @@ export async function executeInvoiceSendAttempt(
         await replayPendingEmailEventsForAttemptTx(tx, providerEmailId);
         await rollUpLatestAttempt(tx, input.invoiceId);
         await recomputeMilestoneViewProjection(tx, input.invoiceId);
-        return tx.sendAttempt.findUniqueOrThrow({ where: { id: current.id }, select: { status: true } });
+        const completed = await tx.sendAttempt.findUniqueOrThrow({ where: { id: current.id }, select: { status: true } });
+        return { status: completed.status, alreadyFinalized: false };
     });
 
-    return { attemptId: attempt.id, status: finalized.status, resumed: Boolean(attempt.resendEmailId) };
+    return {
+        attemptId: attempt.id,
+        status: finalized.status,
+        resumed: finalized.alreadyFinalized || Boolean(attempt.resendEmailId),
+    };
 }
 
 export async function markInvoiceViewedCore(

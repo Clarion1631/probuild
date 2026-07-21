@@ -37,7 +37,8 @@ export function invoiceLifecycleMetrics(
     const daysSinceFirstViewed = firstViewedAt ? Math.floor((now - firstViewedAt.getTime()) / 86_400_000) : null;
     const daysSinceViewed = lastViewedAt ? Math.floor((now - lastViewedAt.getTime()) / 86_400_000) : null;
     let lifecycleBucket = "Not sent";
-    if (attempt?.lastError === "interrupted") lifecycleBucket = "Send interrupted";
+    if (!attempt) return { sentAt, daysSinceSent, daysSinceFirstViewed, daysSinceViewed, lifecycleBucket };
+    if (attempt.lastError === "interrupted") lifecycleBucket = "Send interrupted";
     else if (attempt && ["bounced", "complained", "failed"].includes(attempt.status)) lifecycleBucket = "Sent not delivered";
     else if (firstViewedAt) lifecycleBucket = "Viewed not paid";
     else if (attempt?.status === "delivered") lifecycleBucket = "Delivered not viewed";

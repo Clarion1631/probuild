@@ -5,7 +5,7 @@ import { applyEmailEventTx, sweepStrandedSendAttempts } from "./invoice-lifecycl
 import { drainPaymentNotifications } from "./payment-outbox";
 import { getQBPayment, probeQBInvoice } from "./quickbooks";
 import { getFreshQBTokens, markMilestonePaidFromQB } from "./quickbooks-payments";
-import { recordAlignmentFinding } from "./invoice-alignment";
+import { recordAlignmentFinding, resolveAlignmentFindingsWithEvidence } from "./invoice-alignment";
 import type { QBTokens } from "./quickbooks";
 
 const LEASE_MS = 5 * 60 * 1000;
@@ -17,7 +17,13 @@ async function logEmailDeadLetter(eventId: string, resendEmailId: string, claimT
     return prisma.$transaction(async (tx) => {
         const done = await tx.emailEvent.updateMany({
             where: { id: eventId, claimToken },
-            data: { claimedAt: null, claimToken: null, lastError: `dead:${lastError}`, processedAt: null },
+            data: {
+                attempts: { increment: 1 },
+                claimedAt: null,
+                claimToken: null,
+                lastError: `dead:${lastError}`,
+                processedAt: null,
+            },
         });
         if (!done.count) return false;
         const attempt = await tx.sendAttempt.findUnique({
@@ -78,7 +84,7 @@ export async function drainEmailEvents(limit: number): Promise<DrainCounts> {
                 attempts: row.attempts,
                 OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }],
             },
-            data: { claimedAt: new Date(), claimToken, attempts: { increment: 1 } },
+            data: { claimedAt: new Date(), claimToken },
         });
         if (claim.count === 0) continue;
         const attemptNumber = row.attempts + 1;
@@ -100,7 +106,13 @@ export async function drainEmailEvents(limit: number): Promise<DrainCounts> {
             } else {
                 const retry = await prisma.emailEvent.updateMany({
                     where: { id: row.id, claimToken },
-                    data: { claimedAt: null, claimToken: null, lastError, processedAt: null },
+                    data: {
+                        attempts: { increment: 1 },
+                        claimedAt: null,
+                        claimToken: null,
+                        lastError,
+                        processedAt: null,
+                    },
                 });
                 if (retry.count) result.retried++;
             }
@@ -109,7 +121,21 @@ export async function drainEmailEvents(limit: number): Promise<DrainCounts> {
     return result;
 }
 
-async function settleQboInvoice(tokens: QBTokens, qbInvoiceId: string, runId: string, paymentIdHint?: string) {
+type QboProcessingDeps = {
+    getTokens?: typeof getFreshQBTokens;
+    getPayment?: typeof getQBPayment;
+    probeInvoice?: typeof probeQBInvoice;
+    markPaid?: typeof markMilestonePaidFromQB;
+    drainNotifications?: typeof drainPaymentNotifications;
+};
+
+async function settleQboInvoice(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    runId: string,
+    paymentIdHint?: string,
+    deps: QboProcessingDeps = {},
+) {
     const schedules = await prisma.paymentSchedule.findMany({
         where: { qbInvoiceId },
         select: { id: true, invoiceId: true, amount: true, status: true },
@@ -124,42 +150,54 @@ async function settleQboInvoice(tokens: QBTokens, qbInvoiceId: string, runId: st
         }
         return;
     }
-    if (["Paid", "Canceled"].includes(schedules[0].status)) return;
-    const probe = await probeQBInvoice(tokens, qbInvoiceId);
-    if (probe.state !== "ok" || probe.total <= 0 || probe.balance > 0) return;
+    const probe = await (deps.probeInvoice ?? probeQBInvoice)(tokens, qbInvoiceId);
+    if (probe.state !== "ok" || probe.total <= 0) return;
     const schedule = schedules[0];
+    const observedKinds = new Set<string>();
     if (Math.abs(Number(schedule.amount) - probe.total) > 0.005) {
+        observedKinds.add("amount_mismatch");
         await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
             kind: "amount_mismatch",
             detail: { probuildAmount: Number(schedule.amount), qboTotal: probe.total },
         });
-        return;
     }
+    if (probe.balance > 0 && Math.abs(Number(schedule.amount) - probe.balance) > 0.005) {
+        observedKinds.add("balance_mismatch");
+        await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
+            kind: "balance_mismatch",
+            detail: { probuildOpenAmount: Number(schedule.amount), qboBalance: probe.balance },
+        });
+    }
+    await resolveAlignmentFindingsWithEvidence(schedule.id, qbInvoiceId, runId, observedKinds);
+    if (observedKinds.size || probe.balance > 0 || ["Paid", "Canceled"].includes(schedule.status)) return;
 
     const paymentId = paymentIdHint || probe.paymentTxnIds[0] || null;
-    const payment = paymentId ? await getQBPayment(tokens, paymentId) : null;
+    const payment = paymentId ? await (deps.getPayment ?? getQBPayment)(tokens, paymentId) : null;
     const paidAt = payment?.txnDate ? new Date(`${payment.txnDate}T12:00:00`) : new Date();
-    const recorded = await markMilestonePaidFromQB(schedule.id, schedule.invoiceId, {
+    const recorded = await (deps.markPaid ?? markMilestonePaidFromQB)(schedule.id, schedule.invoiceId, {
         paidAt,
         referenceNumber: payment?.referenceNumber || null,
         qbPaymentId: paymentId,
     });
-    if (recorded) await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => undefined);
+    if (recorded) await (deps.drainNotifications ?? drainPaymentNotifications)({ scheduleId: schedule.id }).catch(() => undefined);
 }
 
-async function processQboEvent(row: { id: string; realmId: string; entity: string; entityQboId: string }) {
-    const tokens = await getFreshQBTokens();
+export async function processQboEvent(
+    row: { id: string; realmId: string; entity: string; entityQboId: string },
+    deps: QboProcessingDeps = {},
+) {
+    const tokens = await (deps.getTokens ?? getFreshQBTokens)();
     if (tokens.realmId !== row.realmId) throw new Error("realm-mismatch-quarantined");
     const runId = `qbo-event:${row.id}`;
     if (row.entity.toLowerCase() === "invoice") {
-        await settleQboInvoice(tokens, row.entityQboId, runId);
+        await settleQboInvoice(tokens, row.entityQboId, runId, undefined, deps);
         return;
     }
     if (row.entity.toLowerCase() === "payment") {
-        const payment = await getQBPayment(tokens, row.entityQboId);
+        const payment = await (deps.getPayment ?? getQBPayment)(tokens, row.entityQboId);
         if (!payment) throw new Error("QBO payment was not readable");
         for (const qbInvoiceId of payment.linkedInvoiceIds) {
-            await settleQboInvoice(tokens, qbInvoiceId, runId, row.entityQboId);
+            await settleQboInvoice(tokens, qbInvoiceId, runId, row.entityQboId, deps);
         }
     }
 }

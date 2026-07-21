@@ -12,7 +12,7 @@ export async function GET(request: Request) {
 
     const result = await drainInvoiceLifecycleEvents({ limit: 50 });
     if (result.email.processed || result.qbo.processed || result.strandedSends || result.email.dead || result.qbo.dead) {
-        console.log("[cron/invoice-lifecycle-drain]", JSON.stringify(result));
+        console.log("[cron/qbo-webhook-drain]", JSON.stringify(result));
     }
     return NextResponse.json(result);
 }

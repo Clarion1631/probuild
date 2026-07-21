@@ -12,22 +12,31 @@ type FindingEvidence = { kind: string; detail: Record<string, unknown> };
 
 export async function recordAlignmentFinding(paymentScheduleId: string, qbInvoiceId: string, runId: string, evidence: FindingEvidence) {
     const key = { paymentScheduleId_qbInvoiceId_kind: { paymentScheduleId, qbInvoiceId, kind: evidence.kind } };
-    const existing = await prisma.alignmentFinding.findUnique({ where: key });
-    if (!existing) {
-        await prisma.alignmentFinding.create({
-            data: { paymentScheduleId, qbInvoiceId, kind: evidence.kind, detail: evidence.detail as Prisma.InputJsonValue, lastRunId: runId },
+    const now = new Date();
+    await prisma.$transaction(async (tx) => {
+        // Increment only for a resolved row. Concurrent detectors serialize on
+        // this conditional update; after the first clears resolvedAt, the next
+        // detector no longer counts the same reopen twice.
+        await tx.alignmentFinding.updateMany({
+            where: { paymentScheduleId, qbInvoiceId, kind: evidence.kind, resolvedAt: { not: null } },
+            data: { reopenedCount: { increment: 1 } },
         });
-        return;
-    }
-    await prisma.alignmentFinding.update({
-        where: key,
-        data: {
-            detail: evidence.detail as Prisma.InputJsonValue,
-            lastSeenAt: new Date(),
-            lastRunId: runId,
-            resolvedAt: null,
-            ...(existing.resolvedAt ? { reopenedCount: { increment: 1 } } : {}),
-        },
+        await tx.alignmentFinding.upsert({
+            where: key,
+            create: {
+                paymentScheduleId,
+                qbInvoiceId,
+                kind: evidence.kind,
+                detail: evidence.detail as Prisma.InputJsonValue,
+                lastRunId: runId,
+            },
+            update: {
+                detail: evidence.detail as Prisma.InputJsonValue,
+                lastSeenAt: now,
+                lastRunId: runId,
+                resolvedAt: null,
+            },
+        });
     });
 }
 

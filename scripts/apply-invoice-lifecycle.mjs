@@ -159,8 +159,9 @@ const statements = [
    END $$`,
 
   // W2 legacy-view backfill. The deterministic id + NOT EXISTS predicate make
-  // this safe to re-run. Existing viewedAt is the only historical observation,
-  // so every milestone on that legacy invoice receives the same projection.
+  // this safe to re-run. Existing viewedAt is an invoice-grain observation.
+  // Legacy rows have no SendAttempt membership, so milestone projections remain
+  // null rather than fabricating which milestone the client could see.
   `INSERT INTO "InvoiceViewEvent" ("id", "invoiceId", "viewedAt", "source")
    SELECT 'ive_backfill_' || md5(i."id"), i."id", i."viewedAt", 'legacy_backfill'
    FROM "Invoice" i
@@ -173,12 +174,6 @@ const statements = [
    SET "viewCount" = GREATEST("viewCount", 1),
        "lastViewedAt" = COALESCE("lastViewedAt", "viewedAt")
    WHERE "viewedAt" IS NOT NULL`,
-  `UPDATE "PaymentSchedule" p
-   SET "firstViewedAt" = COALESCE(p."firstViewedAt", i."viewedAt"),
-       "lastViewedAt" = COALESCE(p."lastViewedAt", i."viewedAt")
-   FROM "Invoice" i
-   WHERE p."invoiceId" = i."id" AND i."viewedAt" IS NOT NULL`,
-
   // W6 canonical status backfill. issueDate is the best surviving evidence for
   // legacy milestone sends whose Invoice.sentAt was never stamped.
   `UPDATE "Invoice" SET "sentAt" = "issueDate"

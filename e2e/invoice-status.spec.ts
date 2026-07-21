@@ -27,7 +27,12 @@ test.describe("canonical invoice status", () => {
     });
 
     test("lifecycle radar requires a durable send attempt and exposes day counters", () => {
-        expect(invoiceLifecycleMetrics(null, null, null, new Date("2026-07-20T12:00:00.000Z").getTime()).lifecycleBucket).toBe("Not sent");
+        expect(invoiceLifecycleMetrics(
+            null,
+            new Date("2026-07-18T12:00:00.000Z"),
+            new Date("2026-07-19T12:00:00.000Z"),
+            new Date("2026-07-20T12:00:00.000Z").getTime(),
+        )).toMatchObject({ lifecycleBucket: "Not sent", daysSinceViewed: 1 });
         expect(invoiceLifecycleMetrics(
             { status: "delivered", sentAt: new Date("2026-07-15T12:00:00.000Z"), deliveredAt: new Date("2026-07-15T12:01:00.000Z"), lastError: null },
             new Date("2026-07-18T12:00:00.000Z"),
@@ -41,6 +46,7 @@ test.describe("canonical invoice status", () => {
         expect(migration).toContain("prisma.$transaction");
         expect(migration).toContain('"balanceDue" > 0 AND "balanceDue" < "totalAmount"');
         expect(migration).toContain("ADD COLUMN IF NOT EXISTS");
+        expect(migration).not.toContain('SET "firstViewedAt"');
 
         const importer = readFileSync(resolve(__dirname, "..", "scripts", "import-houzz.mjs"), "utf8");
         expect(importer).toContain('"Partially Paid"');

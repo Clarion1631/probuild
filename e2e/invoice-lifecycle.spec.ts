@@ -136,6 +136,41 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
     })).toBe(0);
   });
 
+  test("a late concurrent provider failure cannot overwrite a finalized success", async () => {
+    let releaseFailure!: () => void;
+    const successCommitted = new Promise<void>(resolve => { releaseFailure = resolve; });
+    const input = request({
+      invoiceId: IDS.failedInvoice,
+      milestoneId: IDS.failedMilestone,
+      sendRequestId: "invoice-lifecycle-concurrent-finalize",
+    });
+    const lateFailure = executeInvoiceSendAttempt(input, {
+      sendEmail: async () => {
+        await successCommitted;
+        return { success: false as const };
+      },
+    });
+
+    const success = await executeInvoiceSendAttempt(input, {
+      sendEmail: async () => ({
+        success: true as const,
+        id: "life_concurrent_finalize_email",
+        acceptedAt: new Date("2026-07-20T17:30:00.000Z"),
+      }),
+    });
+    releaseFailure();
+    const failureResult = await lateFailure;
+
+    expect(success).toMatchObject({ status: "sent", resumed: false });
+    expect(failureResult).toMatchObject({ status: "sent", resumed: true });
+    const attempt = await prisma.sendAttempt.findUniqueOrThrow({ where: { sendRequestId: input.sendRequestId } });
+    expect(attempt.status).toBe("sent");
+    expect(attempt.resendEmailId).toBe("life_concurrent_finalize_email");
+    expect(await prisma.activityLog.count({
+      where: { entityId: IDS.failedInvoice, action: "sent_invoice", metadata: { contains: attempt.id } },
+    })).toBe(1);
+  });
+
   test("provider success, crash, portal view, and resume reuse one attempt and recover the view projection", async () => {
     const acceptedByKey = new Map<string, { id: string; acceptedAt: Date }>();
     let providerCalls = 0;
@@ -216,7 +251,7 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
     expect(finalized.sentAt?.toISOString()).toBe("2026-07-20T18:00:00.000Z");
     expect(finalized.resendEmailId).toBe("life_resume_email");
     expect(finalized.status).toBe("delivered");
-    expect((await prisma.emailEvent.findUniqueOrThrow({ where: { svixId: "life_svix_before_finalization" } })).attempts).toBe(1);
+    expect((await prisma.emailEvent.findUniqueOrThrow({ where: { svixId: "life_svix_before_finalization" } })).attempts).toBe(0);
     const projected = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: IDS.resumeMilestone } });
     expect(projected.firstViewedAt?.toISOString()).toBe(viewedAt.toISOString());
     expect(projected.lastViewedAt?.toISOString()).toBe(viewedAt.toISOString());
@@ -429,7 +464,7 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
 
     const event = await prisma.emailEvent.findUniqueOrThrow({ where: { svixId: "life_svix_replay_race" } });
     expect(event.processedAt).not.toBeNull();
-    expect(event.attempts).toBe(1);
+    expect(event.attempts).toBe(0);
     expect(await prisma.activityLog.count({
       where: { entityId: IDS.atomicInvoice, metadata: { contains: "life_replay_race_email" } },
     })).toBe(1);
