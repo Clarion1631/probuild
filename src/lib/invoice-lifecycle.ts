@@ -290,6 +290,7 @@ export async function executeInvoiceSendAttempt(
     input: InvoiceSendInput,
     deps: {
         sendEmail?: SendEmail;
+        beforeRestartAttempt?: () => Promise<void>;
         afterProviderAccepted?: (result: NotificationResult) => Promise<void>;
     } = {},
 ) {
@@ -331,10 +332,27 @@ export async function executeInvoiceSendAttempt(
     }
 
     if (attempt.status !== "sending") {
-        attempt = await prisma.sendAttempt.update({
-            where: { id: attempt.id },
-            data: { status: "sending", lastError: null, terminalAt: null },
+        const restartAttemptId = attempt.id;
+        const restartInvoiceId = attempt.invoiceId;
+        await deps.beforeRestartAttempt?.();
+        attempt = await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ${restartInvoiceId} FOR UPDATE`;
+            const current = await tx.sendAttempt.findUniqueOrThrow({ where: { id: restartAttemptId } });
+            if (current.sentAt && current.resendEmailId) return current;
+            await tx.sendAttempt.updateMany({
+                where: {
+                    id: current.id,
+                    status: { not: "sending" },
+                    sentAt: null,
+                    resendEmailId: null,
+                },
+                data: { status: "sending", lastError: null, terminalAt: null },
+            });
+            return tx.sendAttempt.findUniqueOrThrow({ where: { id: current.id } });
         });
+        if (attempt.sentAt && attempt.resendEmailId) {
+            return { attemptId: attempt.id, status: attempt.status, resumed: true };
+        }
     }
 
     const result = await (deps.sendEmail ?? sendNotification)(

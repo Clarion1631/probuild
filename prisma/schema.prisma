@@ -572,6 +572,7 @@ model PaymentSchedule {
 
   // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
   qbInvoiceId   String?
+  qbRealmId     String? // QBO company realm that owns qbInvoiceId; required before automated settlement
   qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt    DateTime?
@@ -592,6 +593,7 @@ model PaymentSchedule {
   @@index([invoiceId])
   @@index([stripePaymentIntentId])
   @@index([qbInvoiceId])
+  @@unique([qbRealmId, qbInvoiceId])
   @@index([sourceScheduleId])
   @@index([scheduleTaskId])
 }

@@ -45,10 +45,10 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
       },
     });
     await prisma.paymentSchedule.create({
-      data: { id: IDS.milestone, invoiceId: IDS.invoice, name: "QBO draw", amount: 100, qbInvoiceId: "qbo-invoice-event-1" },
+      data: { id: IDS.milestone, invoiceId: IDS.invoice, name: "QBO draw", amount: 100, qbInvoiceId: "qbo-invoice-event-1", qbRealmId: "test-realm" },
     });
     await prisma.paymentSchedule.create({
-      data: { id: IDS.distractorMilestone, invoiceId: IDS.distractorInvoice, name: "Distractor draw", amount: 200, qbInvoiceId: "qbo-invoice-distractor" },
+      data: { id: IDS.distractorMilestone, invoiceId: IDS.distractorInvoice, name: "Distractor draw", amount: 200, qbInvoiceId: "qbo-invoice-distractor", qbRealmId: "test-realm" },
     });
   });
 
@@ -138,6 +138,37 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
     expect(calls).toBe(5);
   });
 
+  test("a realm-local QBO id cannot settle a mapping owned by another realm", async () => {
+    await prisma.paymentSchedule.update({ where: { id: IDS.milestone }, data: { qbRealmId: "old-realm" } });
+    await processQboEvent(
+      { id: "realm-collision-row", realmId: "test-realm", entity: "Invoice", entityQboId: "qbo-invoice-event-1" },
+      {
+        getTokens: async () => ({ accessToken: "test", refreshToken: "test", realmId: "test-realm" }),
+        probeInvoice: async () => { throw new Error("realm mismatch must be rejected before probing"); },
+      },
+    );
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: IDS.milestone } })).status).toBe("Pending");
+    expect((await prisma.alignmentFinding.findFirstOrThrow({
+      where: { paymentScheduleId: IDS.milestone, kind: "realm_mismatch" },
+    })).resolvedAt).toBeNull();
+    await prisma.paymentSchedule.update({ where: { id: IDS.milestone }, data: { qbRealmId: "test-realm" } });
+  });
+
+  test("settlement revalidates the local amount after the QBO probe", async () => {
+    await processQboEvent(
+      { id: "amount-race-row", realmId: "test-realm", entity: "Invoice", entityQboId: "qbo-invoice-event-1" },
+      {
+        getTokens: async () => ({ accessToken: "test", refreshToken: "test", realmId: "test-realm" }),
+        probeInvoice: async () => {
+          await prisma.paymentSchedule.update({ where: { id: IDS.milestone }, data: { amount: 101 } });
+          return { state: "ok" as const, balance: 0, total: 100, paymentTxnIds: [], emailStatus: null };
+        },
+      },
+    );
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: IDS.milestone } })).status).toBe("Pending");
+    await prisma.paymentSchedule.update({ where: { id: IDS.milestone }, data: { amount: 100 } });
+  });
+
   test("a Payment inbox event settles only its linked milestone and replay is idempotent", async () => {
     const row = { id: "qbo-payment-inbox-row", realmId: "test-realm", entity: "Payment", entityQboId: "qbo-payment-1" };
     const deps = {
@@ -161,6 +192,10 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
       kind: "amount_mismatch",
       detail: { probuildAmount: 100, qboTotal: 90 },
     });
+    await recordAlignmentFinding(IDS.milestone, "qbo-invoice-event-1", "unevaluated-finding", {
+      kind: "email_status_mismatch",
+      detail: { probuild: "delivered", qbo: null },
+    });
     await processQboEvent(row, deps);
     await processQboEvent(row, deps);
 
@@ -172,6 +207,12 @@ test.describe.serial("Invoice lifecycle: QBO inbox", () => {
     expect(await prisma.paymentNotification.count({ where: { scheduleId: IDS.milestone } })).toBe(1);
     expect((await prisma.alignmentFinding.findFirstOrThrow({
       where: { paymentScheduleId: IDS.milestone, kind: "amount_mismatch" },
+    })).resolvedAt).not.toBeNull();
+    expect((await prisma.alignmentFinding.findFirstOrThrow({
+      where: { paymentScheduleId: IDS.milestone, kind: "email_status_mismatch" },
+    })).resolvedAt).toBeNull();
+    expect((await prisma.alignmentFinding.findFirstOrThrow({
+      where: { paymentScheduleId: IDS.milestone, kind: "realm_mismatch" },
     })).resolvedAt).not.toBeNull();
   });
 });

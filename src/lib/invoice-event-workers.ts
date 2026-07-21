@@ -7,6 +7,7 @@ import { getQBPayment, probeQBInvoice } from "./quickbooks";
 import { getFreshQBTokens, markMilestonePaidFromQB } from "./quickbooks-payments";
 import { recordAlignmentFinding, resolveAlignmentFindingsWithEvidence } from "./invoice-alignment";
 import type { QBTokens } from "./quickbooks";
+import { qboAmountsMatch, validateQboMappingIdentity } from "./qbo-mapping-integrity";
 
 const LEASE_MS = 5 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
@@ -138,14 +139,19 @@ async function settleQboInvoice(
 ) {
     const schedules = await prisma.paymentSchedule.findMany({
         where: { qbInvoiceId },
-        select: { id: true, invoiceId: true, amount: true, status: true },
+        select: { id: true, invoiceId: true, amount: true, status: true, qbRealmId: true },
     });
     if (schedules.length === 0) return;
-    if (schedules.length !== 1) {
+    const identityIssue = validateQboMappingIdentity({
+        mappingCount: schedules.length,
+        boundRealmId: schedules.length === 1 ? schedules[0].qbRealmId : null,
+        activeRealmId: tokens.realmId,
+    });
+    if (identityIssue) {
         for (const schedule of schedules) {
             await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
-                kind: "duplicate_qbo_mapping",
-                detail: { mappingCount: schedules.length },
+                kind: identityIssue.kind,
+                detail: identityIssue.detail,
             });
         }
         return;
@@ -154,7 +160,7 @@ async function settleQboInvoice(
     if (probe.state !== "ok" || probe.total <= 0) return;
     const schedule = schedules[0];
     const observedKinds = new Set<string>();
-    if (Math.abs(Number(schedule.amount) - probe.total) > 0.005) {
+    if (!qboAmountsMatch(Number(schedule.amount), probe.total)) {
         observedKinds.add("amount_mismatch");
         await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
             kind: "amount_mismatch",
@@ -168,7 +174,13 @@ async function settleQboInvoice(
             detail: { probuildOpenAmount: Number(schedule.amount), qboBalance: probe.balance },
         });
     }
-    await resolveAlignmentFindingsWithEvidence(schedule.id, qbInvoiceId, runId, observedKinds);
+    await resolveAlignmentFindingsWithEvidence(
+        schedule.id,
+        qbInvoiceId,
+        runId,
+        observedKinds,
+        new Set(["amount_mismatch", "balance_mismatch", "duplicate_qbo_mapping", "realm_mismatch"]),
+    );
     if (observedKinds.size || probe.balance > 0 || ["Paid", "Canceled"].includes(schedule.status)) return;
 
     const paymentId = paymentIdHint || probe.paymentTxnIds[0] || null;
@@ -178,7 +190,7 @@ async function settleQboInvoice(
         paidAt,
         referenceNumber: payment?.referenceNumber || null,
         qbPaymentId: paymentId,
-    });
+    }, { qbInvoiceId, realmId: tokens.realmId, qboTotal: probe.total });
     if (recorded) await (deps.drainNotifications ?? drainPaymentNotifications)({ scheduleId: schedule.id }).catch(() => undefined);
 }
 

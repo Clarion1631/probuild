@@ -33,7 +33,7 @@ test.describe.serial("Invoice lifecycle: alignment findings", () => {
       },
     });
     await prisma.paymentSchedule.create({
-      data: { id: IDS.milestone, invoiceId: IDS.invoice, name: "Alignment draw", amount: 100, qbInvoiceId: "alignment-qbo-1" },
+      data: { id: IDS.milestone, invoiceId: IDS.invoice, name: "Alignment draw", amount: 100, qbInvoiceId: "alignment-qbo-1", qbRealmId: "test-realm" },
     });
   });
 
@@ -79,6 +79,44 @@ test.describe.serial("Invoice lifecycle: alignment findings", () => {
     expect(after.lastRunId).toBe(before.lastRunId);
   });
 
+  test("duplicate QBO invoice mappings are quarantined before audit settlement", async () => {
+    await prisma.invoice.create({
+      data: {
+        id: "invoice-alignment-duplicate",
+        code: "INV-ALIGN-DUP",
+        projectId: IDS.project,
+        clientId: IDS.client,
+        status: "Issued",
+        issueDate: new Date("2026-07-01T12:00:00.000Z"),
+        totalAmount: 100,
+        balanceDue: 100,
+      },
+    });
+    await prisma.paymentSchedule.create({
+      data: {
+        id: "invoice-alignment-duplicate-milestone",
+        invoiceId: "invoice-alignment-duplicate",
+        name: "Duplicate mapping",
+        amount: 100,
+        qbInvoiceId: "alignment-qbo-1",
+        // Simulate a legacy/corrupt unbound duplicate. The new compound unique
+        // index prevents two correctly bound rows from being created.
+        qbRealmId: null,
+      },
+    });
+    let settlementCalls = 0;
+    await runInvoiceAlignmentAudit({
+      getTokens: fakeTokens,
+      probeInvoice: async (_tokens, qbInvoiceId) => qbInvoiceId === "alignment-qbo-1"
+        ? ({ state: "ok" as const, balance: 0, total: 100, paymentTxnIds: [], emailStatus: null })
+        : ({ state: "ok" as const, balance: 100, total: 100, paymentTxnIds: [], emailStatus: null }),
+      markPaid: async () => { settlementCalls += 1; return true; },
+      drainNotifications: async () => ({ processed: 0, retried: 0, failed: 0 }),
+    });
+    expect(settlementCalls).toBe(0);
+    expect(await prisma.alignmentFinding.count({ where: { qbInvoiceId: "alignment-qbo-1", kind: "duplicate_qbo_mapping", resolvedAt: null } })).toBe(2);
+  });
+
   test("the audit checks every nonterminal mapping beyond the former 250-row cap", async () => {
     test.setTimeout(120_000);
     const invoices = Array.from({ length: 251 }, (_, index) => ({
@@ -99,6 +137,7 @@ test.describe.serial("Invoice lifecycle: alignment findings", () => {
         name: "Bulk alignment draw",
         amount: 100,
         qbInvoiceId: `alignment-qbo-bulk-${index}`,
+        qbRealmId: "test-realm",
       })),
     });
 

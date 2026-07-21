@@ -3624,6 +3624,7 @@ export async function breakQBInvoiceLink(
         },
         data: {
             qbInvoiceId: null,
+            qbRealmId: null,
             qbInvoiceLink: null,
             qbInvoiceSentAt: null,
             qbSyncedAt: null,
@@ -6953,7 +6954,7 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
 
-    let items: string[] = JSON.parse(rawText);
+    const items: string[] = JSON.parse(rawText);
     if (!Array.isArray(items)) throw new Error("Invalid AI response");
 
     const maxOrder = await prisma.taskPunchItem.aggregate({

@@ -46,6 +46,8 @@ test.describe("canonical invoice status", () => {
         expect(migration).toContain("prisma.$transaction");
         expect(migration).toContain('"balanceDue" > 0 AND "balanceDue" < "totalAmount"');
         expect(migration).toContain("ADD COLUMN IF NOT EXISTS");
+        expect(migration).toContain("QBO_LEGACY_REALM_ID");
+        expect(migration).toContain('SET "qbRealmId" = ${legacyQboRealmId}');
         expect(migration).not.toContain('SET "firstViewedAt"');
 
         const importer = readFileSync(resolve(__dirname, "..", "scripts", "import-houzz.mjs"), "utf8");

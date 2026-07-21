@@ -136,6 +136,44 @@ test.describe.serial("Invoice lifecycle: send attempts and view projection", () 
     })).toBe(0);
   });
 
+  test("a stale retry cannot overwrite another caller's completed retry", async () => {
+    const input = request({
+      invoiceId: IDS.failedInvoice,
+      milestoneId: IDS.failedMilestone,
+      sendRequestId: "invoice-lifecycle-mailer-failure",
+    });
+    let paused!: () => void;
+    let release!: () => void;
+    const reachedRestart = new Promise<void>(resolve => { paused = resolve; });
+    const holdRestart = new Promise<void>(resolve => { release = resolve; });
+    let providerCalls = 0;
+    const sendEmail = async () => {
+      providerCalls += 1;
+      return { success: true as const, id: "life_retry_race_email", acceptedAt: new Date("2026-07-20T17:15:00.000Z") };
+    };
+
+    const staleRetry = executeInvoiceSendAttempt(input, {
+      sendEmail,
+      beforeRestartAttempt: async () => {
+        paused();
+        await holdRestart;
+      },
+    });
+    await reachedRestart;
+    const winningRetry = await executeInvoiceSendAttempt(input, { sendEmail });
+    release();
+    const staleResult = await staleRetry;
+
+    expect(winningRetry).toMatchObject({ status: "sent", resumed: false });
+    expect(staleResult).toMatchObject({ status: "sent", resumed: true });
+    expect(providerCalls).toBe(1);
+    const attempt = await prisma.sendAttempt.findUniqueOrThrow({ where: { sendRequestId: input.sendRequestId } });
+    expect(attempt.status).toBe("sent");
+    expect(await prisma.activityLog.count({
+      where: { entityId: IDS.failedInvoice, action: "sent_invoice", metadata: { contains: attempt.id } },
+    })).toBe(1);
+  });
+
   test("a late concurrent provider failure cannot overwrite a finalized success", async () => {
     let releaseFailure!: () => void;
     const successCommitted = new Promise<void>(resolve => { releaseFailure = resolve; });

@@ -7,6 +7,7 @@ import { drainPaymentNotifications } from "./payment-outbox";
 import { getQBPayment, probeQBInvoice } from "./quickbooks";
 import { getFreshQBTokens, markMilestonePaidFromQB } from "./quickbooks-payments";
 import { listReceivables } from "./billing-core";
+import { qboAmountsMatch, validateQboMappingIdentity } from "./qbo-mapping-integrity";
 
 type FindingEvidence = { kind: string; detail: Record<string, unknown> };
 
@@ -45,6 +46,7 @@ export async function resolveAlignmentFindingsWithEvidence(
     qbInvoiceId: string,
     runId: string,
     observedKinds: Set<string>,
+    evaluatedKinds?: Set<string>,
 ) {
     await prisma.alignmentFinding.updateMany({
         where: {
@@ -52,7 +54,10 @@ export async function resolveAlignmentFindingsWithEvidence(
             qbInvoiceId,
             resolvedAt: null,
             lastRunId: { not: runId },
-            kind: { notIn: [...observedKinds] },
+            kind: {
+                ...(evaluatedKinds ? { in: [...evaluatedKinds] } : {}),
+                notIn: [...observedKinds],
+            },
         },
         data: { resolvedAt: new Date() },
     });
@@ -74,7 +79,7 @@ export async function runInvoiceAlignmentAudit(deps: {
             where: { status: { notIn: ["Paid", "Canceled"] }, qbInvoiceId: { not: null } },
             orderBy: { createdAt: "asc" },
             select: {
-                id: true, invoiceId: true, qbInvoiceId: true, name: true, amount: true,
+                id: true, invoiceId: true, qbInvoiceId: true, qbRealmId: true, name: true, amount: true,
                 sendAttemptMilestones: {
                     orderBy: { sendAttempt: { createdAt: "desc" } },
                     take: 1,
@@ -83,10 +88,29 @@ export async function runInvoiceAlignmentAudit(deps: {
             },
         }),
     ]);
+    const mappingRows = schedules.length ? await prisma.paymentSchedule.groupBy({
+        by: ["qbInvoiceId"],
+        where: { qbInvoiceId: { in: schedules.map(schedule => schedule.qbInvoiceId!) } },
+        _count: { _all: true },
+    }) : [];
+    const mappingCounts = new Map(mappingRows.map(row => [row.qbInvoiceId!, row._count._all]));
 
     for (const schedule of schedules) {
         const qbInvoiceId = schedule.qbInvoiceId!;
         summary.checked++;
+        const identityIssue = validateQboMappingIdentity({
+            mappingCount: mappingCounts.get(qbInvoiceId) ?? 0,
+            boundRealmId: schedule.qbRealmId,
+            activeRealmId: tokens.realmId,
+        });
+        if (identityIssue) {
+            await recordAlignmentFinding(schedule.id, qbInvoiceId, runId, {
+                kind: identityIssue.kind,
+                detail: identityIssue.detail,
+            });
+            summary.findings++;
+            continue;
+        }
         const probe = await (deps.probeInvoice ?? probeQBInvoice)(tokens, qbInvoiceId);
         if (probe.state === "error") {
             summary.transientErrors++;
@@ -97,7 +121,7 @@ export async function runInvoiceAlignmentAudit(deps: {
         if (probe.state === "voided" || probe.state === "notFound") {
             evidence.push({ kind: "qbo_invoice_missing", detail: { state: probe.state, milestone: schedule.name } });
         } else {
-            const amountMatches = Math.abs(probe.total - Number(schedule.amount)) <= 0.005;
+            const amountMatches = qboAmountsMatch(Number(schedule.amount), probe.total);
             if (!amountMatches) {
                 evidence.push({ kind: "amount_mismatch", detail: { probuildAmount: Number(schedule.amount), qboTotal: probe.total } });
             }
@@ -110,7 +134,7 @@ export async function runInvoiceAlignmentAudit(deps: {
                     paidAt,
                     referenceNumber: payment?.referenceNumber || null,
                     qbPaymentId: paymentId,
-                });
+                }, { qbInvoiceId, realmId: tokens.realmId, qboTotal: probe.total });
                 if (healed) {
                     summary.healed++;
                     await (deps.drainNotifications ?? drainPaymentNotifications)({ scheduleId: schedule.id }).catch(() => undefined);

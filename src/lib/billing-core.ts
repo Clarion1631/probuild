@@ -18,6 +18,7 @@ import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { deriveInvoiceStatus, displayInvoiceStatus, executeInvoiceSendAttempt } from "./invoice-lifecycle";
+import { qboAmountsMatch } from "./qbo-mapping-integrity";
 
 type LifecycleAttempt = {
     status: string;
@@ -842,7 +843,7 @@ export async function sendMilestoneInvoicesCore(
         }
 
         const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
-        const { getQBInvoiceStatus, getQBInvoicePaymentLink } = await import("./quickbooks");
+        const { getQBInvoicePaymentLink } = await import("./quickbooks");
 
         let tokens;
         try {
@@ -888,17 +889,11 @@ export async function sendMilestoneInvoicesCore(
             }
 
             try {
-                let qbInvoiceId = schedule.qbInvoiceId;
-                let qbTotal: number | undefined;
-
-                if (qbInvoiceId) {
-                    const status = await getQBInvoiceStatus(tokens, qbInvoiceId);
-                    qbTotal = status?.total;
-                } else {
-                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
-                    qbInvoiceId = pushRes.qbInvoiceId;
-                    qbTotal = pushRes.qbTotal;
-                }
+                // The push helper is also the canonical identity gate for an
+                // existing mapping (one local row, explicitly bound realm).
+                const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
+                const qbInvoiceId = pushRes.qbInvoiceId;
+                const qbTotal = pushRes.qbTotal;
 
                 if (!qbInvoiceId) {
                     failedCount++;
@@ -925,10 +920,10 @@ export async function sendMilestoneInvoicesCore(
                 // charged. If it has drifted from the ProBuild milestone, do not send
                 // until the user reviews and explicitly approves reconciling ProBuild
                 // to the QBO total (optimistic-locked to the exact qbTotal they saw).
-                if (Math.abs(qbTotal - Number(schedule.amount)) > 0.05) {
+                if (!qboAmountsMatch(Number(schedule.amount), qbTotal)) {
                     const approved = opts?.reconcile?.[schedule.id];
                     // Cent-exact match: only reconcile the precise total the user approved.
-                    const userApprovedThisTotal = approved != null && Math.abs(approved - qbTotal) <= 0.005;
+                    const userApprovedThisTotal = approved != null && qboAmountsMatch(approved, qbTotal);
 
                     if (!userApprovedThisTotal) {
                         // Phase 1 (or a stale confirmation): surface for review, do NOT send.
@@ -975,9 +970,9 @@ export async function sendMilestoneInvoicesCore(
                 }
 
                 const approvedTotal = opts?.reconcile?.[schedule.id];
-                const wasReconciled = Math.abs(qbTotal - Number(schedule.amount)) > 0.05
+                const wasReconciled = !qboAmountsMatch(Number(schedule.amount), qbTotal)
                     && approvedTotal != null
-                    && Math.abs(approvedTotal - qbTotal) <= 0.005;
+                    && qboAmountsMatch(approvedTotal, qbTotal);
 
                 // Amount verified. Queue for the ProBuild-branded request email sent
                 // after the loop, instead of Intuit's own invoice email — the client

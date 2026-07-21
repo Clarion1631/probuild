@@ -3,6 +3,9 @@
 // IMPORTANT: run against production BEFORE deploying the build that selects
 // these columns. Do not run this script from tests or local development.
 //
+// Run: set QBO_LEGACY_REALM_ID to the currently connected pre-deploy QBO
+// company realm when legacy qbInvoiceId rows exist, then run this script.
+// The migration aborts atomically if that binding is missing or duplicated.
 // Run: node scripts/apply-invoice-lifecycle.mjs
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
@@ -18,6 +21,7 @@ function resolveDatabaseUrl() {
 }
 
 const prisma = new PrismaClient({ datasources: { db: { url: resolveDatabaseUrl() } } });
+const legacyQboRealmId = process.env.QBO_LEGACY_REALM_ID?.trim();
 
 const statements = [
   `ALTER TABLE "Invoice"
@@ -27,7 +31,8 @@ const statements = [
      ADD COLUMN IF NOT EXISTS "emailBouncedAt" TIMESTAMP(3)`,
   `ALTER TABLE "PaymentSchedule"
      ADD COLUMN IF NOT EXISTS "firstViewedAt" TIMESTAMP(3),
-     ADD COLUMN IF NOT EXISTS "lastViewedAt" TIMESTAMP(3)`,
+     ADD COLUMN IF NOT EXISTS "lastViewedAt" TIMESTAMP(3),
+     ADD COLUMN IF NOT EXISTS "qbRealmId" TEXT`,
   `ALTER TABLE "CompanySettings"
      ADD COLUMN IF NOT EXISTS "qbAlsoSendIntuitEmail" BOOLEAN NOT NULL DEFAULT false`,
 
@@ -115,6 +120,7 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS "EmailEvent_processedAt_claimedAt_idx" ON "EmailEvent" ("processedAt", "claimedAt")`,
   `CREATE INDEX IF NOT EXISTS "InboundQboEvent_processedAt_claimedAt_idx" ON "InboundQboEvent" ("processedAt", "claimedAt")`,
   `CREATE INDEX IF NOT EXISTS "AlignmentFinding_resolvedAt_lastSeenAt_idx" ON "AlignmentFinding" ("resolvedAt", "lastSeenAt")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "PaymentSchedule_qbRealmId_qbInvoiceId_key" ON "PaymentSchedule" ("qbRealmId", "qbInvoiceId")`,
 
   `DO $$ BEGIN
      ALTER TABLE "InvoiceViewEvent" ADD CONSTRAINT "InvoiceViewEvent_invoiceId_fkey"
@@ -209,6 +215,40 @@ try {
     for (const sql of statements) {
       await tx.$executeRawUnsafe(sql);
       console.log("applied:", sql.split("\n")[0]);
+      if (sql.includes('ADD COLUMN IF NOT EXISTS "qbRealmId"')) {
+        const [{ count }] = await tx.$queryRaw`
+          SELECT COUNT(*)::int AS "count"
+          FROM "PaymentSchedule"
+          WHERE "qbInvoiceId" IS NOT NULL AND "qbRealmId" IS NULL
+        `;
+        if (count > 0 && !legacyQboRealmId) {
+          throw new Error(
+            `${count} legacy QBO mappings need a trusted realm binding. ` +
+            "Set QBO_LEGACY_REALM_ID to the pre-deploy connected company realm and rerun.",
+          );
+        }
+        if (count > 0) {
+          await tx.$executeRaw`
+            UPDATE "PaymentSchedule"
+            SET "qbRealmId" = ${legacyQboRealmId}
+            WHERE "qbInvoiceId" IS NOT NULL AND "qbRealmId" IS NULL
+          `;
+          console.log(`bound ${count} legacy QBO mappings to the explicitly supplied realm`);
+        }
+        const duplicates = await tx.$queryRaw`
+          SELECT "qbRealmId", "qbInvoiceId", COUNT(*)::int AS "count"
+          FROM "PaymentSchedule"
+          WHERE "qbInvoiceId" IS NOT NULL
+          GROUP BY "qbRealmId", "qbInvoiceId"
+          HAVING COUNT(*) > 1
+          LIMIT 20
+        `;
+        if (duplicates.length > 0) {
+          throw new Error(
+            `Duplicate QBO mappings must be repaired before migration: ${JSON.stringify(duplicates)}`,
+          );
+        }
+      }
     }
   }, { timeout: 120_000 });
   console.log("Invoice lifecycle migration complete.");
