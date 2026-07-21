@@ -4,6 +4,17 @@ import { prisma } from './prisma';
 const resendApiKey = process.env.RESEND_API_KEY || 're_dummy_fallback';
 const resend = new Resend(resendApiKey);
 
+export type NotificationOptions = {
+    fromName?: string;
+    replyTo?: string;
+    cc?: string[];
+    bcc?: string[];
+    copyToInternal?: boolean;
+    idempotencyKey?: string;
+};
+
+export type NotificationResult = { success: boolean; id?: string; acceptedAt?: Date };
+
 // Fallback internal-copy address for client-facing documents. Used only when the
 // editable "System Notification Email" setting (Settings → Company) is unset.
 // BCC'd so the client never sees the internal address. Override via env var.
@@ -14,8 +25,8 @@ export async function sendNotification(
     subject: string,
     htmlContent: string,
     attachments?: { filename: string, content: Buffer }[],
-    options?: { fromName?: string; replyTo?: string; cc?: string[]; bcc?: string[]; copyToInternal?: boolean }
-): Promise<{ success: boolean; id?: string }> {
+    options?: NotificationOptions
+): Promise<NotificationResult> {
     // The "to" can be comma-separated (e.g. the System Notification Email setting
     // holding several team addresses) — split into a proper recipient list.
     const toList = toEmail ? toEmail.split(",").map(e => e.trim()).filter(Boolean) : [];
@@ -78,12 +89,12 @@ export async function sendNotification(
             attachments: attachments,
             cc: options?.cc,
             bcc: bccList
-        });
+        }, options?.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : undefined);
         if (data.error) {
             console.error("Resend API returned error:", data.error);
             return { success: false };
         }
-        return { success: true, id: data.data?.id };
+        return { success: true, id: data.data?.id, acceptedAt: new Date() };
     } catch (error) {
         console.error("Failed to send Resend email:", error);
         return { success: false };

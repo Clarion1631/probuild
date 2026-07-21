@@ -17,6 +17,7 @@ import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
+import { executeInvoiceSendAttempt } from "./invoice-lifecycle";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -644,7 +645,7 @@ export function buildMilestoneRequestEmail(input: {
     return { subject, html };
 }
 
-async function sendMilestoneRequestEmail(
+async function composeMilestoneRequestEmail(
     invoice: {
         id: string;
         code: string;
@@ -655,7 +656,11 @@ async function sendMilestoneRequestEmail(
     milestones: Array<{ id: string; name: string; amount: number }>,
     recipient: string,
     companyName: string,
-): Promise<void> {
+): Promise<{
+    subject: string;
+    html: string;
+    emailOptions: { fromName: string; replyTo?: string; cc?: string[]; copyToInternal: true };
+}> {
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
     const clientId = invoice.clientId || invoice.project?.clientId;
     const nextPath = `/portal/invoices/${invoice.id}?milestone=${milestones.map(m => m.id).join(",")}`;
@@ -678,24 +683,16 @@ async function sendMilestoneRequestEmail(
         portalUrl,
     });
 
-    const result = await sendNotification(
-        recipient,
+    return {
         subject,
         html,
-        undefined,
-        {
+        emailOptions: {
             fromName: sanitizeHeaderValue(companyName),
             replyTo: settings?.email || undefined,
             cc: buildCc(recipient, invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null),
             copyToInternal: true,
-        }
-    );
-    // sendNotification reports provider/network failure as { success: false }
-    // rather than throwing — escalate it so no milestone is stamped "sent"
-    // when no email actually left.
-    if (!result.success) {
-        throw new Error("Email provider failed to send the payment request");
-    }
+        },
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,6 +711,7 @@ export async function sendMilestoneInvoicesCore(
     // optimistic-lock token (we only reconcile if the live QBO total still matches).
     opts: { reconcile?: Record<string, number> } | undefined,
     actorName: string,
+    sendRequestId: string,
 ): Promise<{
     success: boolean;
     sent: number;
@@ -773,7 +771,7 @@ export async function sendMilestoneInvoicesCore(
         // that goes out after the loop (one email per batch, not one per milestone).
         // effectiveAmount is the verified QuickBooks total — after a reconcile this
         // is the NEW amount, so the email never quotes the stale pre-reconcile one.
-        const sendable: Array<{ schedule: (typeof selectedPayments)[number]; wasReconciled: boolean; effectiveAmount: number }> = [];
+        const sendable: Array<{ schedule: (typeof selectedPayments)[number]; qbInvoiceId: string; wasReconciled: boolean; effectiveAmount: number }> = [];
 
         for (const schedule of selectedPayments) {
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
@@ -885,7 +883,7 @@ export async function sendMilestoneInvoicesCore(
                 // after the loop, instead of Intuit's own invoice email — the client
                 // is asked for exactly these milestone amounts (never the whole
                 // invoice balance) and the view is tracked on the ProBuild portal.
-                sendable.push({ schedule, wasReconciled, effectiveAmount: qbTotal });
+                sendable.push({ schedule, qbInvoiceId, wasReconciled, effectiveAmount: qbTotal });
             } catch (err: any) {
                 failedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
@@ -898,80 +896,67 @@ export async function sendMilestoneInvoicesCore(
         // nothing is stamped as sent.
         if (sendable.length > 0) {
             const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+            const readyToEmail: typeof sendable = [];
 
-            // Refresh each milestone's live QBO pay link so the portal Pay Now
-            // never hands the client a stale link (best-effort — the portal
-            // still works when a link can't be fetched).
-            for (const { schedule } of sendable) {
-                if (!schedule.qbInvoiceId) continue;
+            // A fresh, non-empty Intuit payment URL is a money-path prerequisite.
+            for (const item of sendable) {
+                const { schedule, qbInvoiceId } = item;
                 try {
-                    const liveLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId);
-                    if (liveLink && liveLink !== schedule.qbInvoiceLink) {
+                    const liveLink = await getQBInvoicePaymentLink(tokens, qbInvoiceId);
+                    if (!liveLink?.trim()) throw new Error("payment-link-unavailable");
+                    if (liveLink !== schedule.qbInvoiceLink) {
                         await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: liveLink } });
                     }
-                } catch { /* link refresh is best-effort */ }
+                    readyToEmail.push(item);
+                } catch {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "payment-link-unavailable" });
+                }
             }
 
-            let emailFailed = false;
-            try {
-                await sendMilestoneRequestEmail(
+            if (readyToEmail.length > 0) {
+                const composed = await composeMilestoneRequestEmail(
                     invoice,
-                    sendable.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
+                    readyToEmail.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
                     recipient,
                     companyName,
                 );
-            } catch (emailErr: any) {
-                emailFailed = true;
-                for (const { schedule } of sendable) {
-                    failedCount++;
-                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: emailErr?.message || "Failed to send request email" });
-                }
-            }
+                const attempt = await executeInvoiceSendAttempt({
+                    invoiceId,
+                    recipient,
+                    sendRequestId,
+                    milestones: readyToEmail.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
+                    actorName: actorName || companyName,
+                    subject: composed.subject,
+                    html: composed.html,
+                    emailOptions: composed.emailOptions,
+                });
 
-            // The email left — from here on a failure is a BOOKKEEPING failure and
-            // must never be reported as a send failure (that would invite a
-            // duplicate resend to the client). Stamp the batch atomically; if the
-            // stamp fails, milestones still report "sent" with the recording error
-            // attached so staff know to verify, not resend.
-            if (!emailFailed) {
-                const stampedAt = new Date();
-                let stampError: string | null = null;
-                try {
-                    await prisma.$transaction(
-                        sendable.map(({ schedule }) =>
-                            prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceSentAt: stampedAt } })
-                        )
-                    );
-                } catch (e: any) {
-                    stampError = e?.message || "unknown error";
-                    console.error("[sendMilestoneInvoices] email delivered but recording the send failed:", e);
-                }
-                for (const { schedule, wasReconciled } of sendable) {
-                    sentCount++;
-                    results.push({
-                        id: schedule.id,
-                        name: schedule.name,
-                        status: wasReconciled ? "reconciled" : "sent",
-                        sentTo: recipient,
-                        ...(stampError ? { error: `Email delivered, but recording the send failed (${stampError}) — verify in QuickBooks before resending` } : {}),
-                    });
+                if (attempt.status === "failed") {
+                    for (const { schedule } of readyToEmail) {
+                        failedCount++;
+                        results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "Email provider failed to send the payment request" });
+                    }
+                } else {
+                    for (const { schedule, wasReconciled } of readyToEmail) {
+                        sentCount++;
+                        results.push({
+                            id: schedule.id,
+                            name: schedule.name,
+                            status: wasReconciled ? "reconciled" : "sent",
+                            sentTo: recipient,
+                        });
+                    }
 
-                    // Log activity per sent milestone (best-effort — never flips a
-                    // delivered send to "failed")
-                    if (invoice.projectId) {
-                        try {
-                            await logActivityLazy({
-                                projectId: invoice.projectId,
-                                actorType: "TEAM",
-                                actorName: companyName,
-                                action: "sent_invoice",
-                                entityType: "invoice",
-                                entityId: invoiceId,
-                                entityName: `Invoice ${invoice.code}`,
-                                metadata: { milestone: schedule.name, sentTo: recipient },
-                            });
-                        } catch (e) {
-                            console.error("[sendMilestoneInvoices] activity log failed for", schedule.name, e);
+                    if (settings?.qbAlsoSendIntuitEmail) {
+                        const { sendQBInvoice } = await import("./quickbooks");
+                        for (const { qbInvoiceId, schedule } of readyToEmail) {
+                            try {
+                                const qbSent = await sendQBInvoice(tokens, qbInvoiceId, recipient);
+                                if (!qbSent.ok) console.error("[sendMilestoneInvoices] optional Intuit email failed", schedule.id, qbSent.error);
+                            } catch (error) {
+                                console.error("[sendMilestoneInvoices] optional Intuit email failed", schedule.id, error);
+                            }
                         }
                     }
                 }
@@ -1223,7 +1208,7 @@ export async function handleChangeOrderApproved(changeOrderId: string, opts?: { 
             summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
         } else {
             summary.billed = true;
-            const send = await sendMilestoneInvoicesCore(bill.invoiceId, [bill.milestoneId], undefined, undefined, "Auto (change-order approval)");
+            const send = await sendMilestoneInvoicesCore(bill.invoiceId, [bill.milestoneId], undefined, undefined, "Auto (change-order approval)", `auto-change-order:${changeOrderId}`);
             const resultIssues = send.results.map(r => r.error).filter((e): e is string => !!e);
             summary.sent = send.results.some(r => !!r.sentTo);
             if (resultIssues.length) summary.issues.push(...resultIssues);

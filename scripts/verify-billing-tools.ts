@@ -131,7 +131,7 @@ async function main() {
     checks.push(["approval hook: bad id doesn't throw", badApprove.billed === false && badApprove.sent === false && badApprove.issues.length > 0]);
 
     // 4. Send cores: error paths only (never send for real)
-    const badSend = await sendMilestoneInvoicesCore("not-a-real-invoice", ["x"], undefined, undefined, "test");
+    const badSend = await sendMilestoneInvoicesCore("not-a-real-invoice", ["x"], undefined, undefined, "test", "verify:not-a-real-invoice");
     checks.push(["milestone send: bad invoice errors cleanly", badSend.success === false && badSend.error === "Invoice not found"]);
     const badResend = await resendInvoiceCore("not-a-real-invoice");
     checks.push(["resend: bad invoice errors cleanly", badResend.success === false]);

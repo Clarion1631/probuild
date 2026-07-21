@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { sendMilestoneInvoices } from "@/lib/actions";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
@@ -24,6 +24,7 @@ export default function SendMilestonesModal({
     const [isSending, setIsSending] = useState(false);
     const [sendToEmail, setSendToEmail] = useState(clientEmail || "");
     const [phase, setPhase] = useState<"compose" | "review">("compose");
+    const sendRequestIdRef = useRef<string | null>(null);
     const [driftRows, setDriftRows] = useState<DriftRow[]>([]);
 
     const totalAmount = selectedPayments.reduce((sum, p) => sum + Number(p.amount), 0);
@@ -39,7 +40,17 @@ export default function SendMilestonesModal({
         const ids = reconcile ? driftRows.map(r => r.id) : selectedPaymentIds;
         setIsSending(true);
         try {
-            const result = await sendMilestoneInvoices(invoiceId, ids, email, reconcile ? { reconcile } : undefined);
+            sendRequestIdRef.current ||= crypto.randomUUID();
+            const result = await sendMilestoneInvoices(
+                invoiceId,
+                ids,
+                email,
+                reconcile ? { reconcile } : undefined,
+                sendRequestIdRef.current,
+            );
+            // A returned result is definitive. A thrown transport error retains the
+            // key so the next click resumes the same provider-idempotent attempt.
+            sendRequestIdRef.current = null;
 
             // Drift detected → enter (or stay in) the review step. Never close here.
             if (result.needsReview && result.driftReview?.length) {

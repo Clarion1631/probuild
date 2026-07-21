@@ -127,7 +127,7 @@ test.describe("sendMilestoneInvoicesCore fail-closed (no QuickBooks connection)"
     });
 
     test("nothing is sent, stamped, or logged when the money rail is down", async () => {
-        const res = await sendMilestoneInvoicesCore(FIX.invoice, [FIX.milestone], "drill@example.com", undefined, "E2E Drill");
+        const res = await sendMilestoneInvoicesCore(FIX.invoice, [FIX.milestone], "drill@example.com", undefined, "E2E Drill", "e2e:milestone-payment-request");
 
         expect(res.success).toBe(false);
         expect(res.sent).toBe(0);

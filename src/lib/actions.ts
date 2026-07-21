@@ -2603,12 +2603,14 @@ export async function sendMilestoneInvoices(
     // Per-milestone reconcile intents the user explicitly confirmed in the review
     // step: scheduleId -> the QBO total they saw and approved.
     opts?: { reconcile?: Record<string, number> },
+    sendRequestId?: string,
 ) {
     // Permission gate stays here (remotely invokable server action); the send
     // logic lives in billing-core.ts, shared with the MCP connector.
     const actor = await assertInvoicePermission();
     const { sendMilestoneInvoicesCore } = await import("./billing-core");
-    return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "");
+    if (!sendRequestId) throw new Error("sendRequestId is required");
+    return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "", sendRequestId);
 }
 
 export async function getInvoiceForPortal(id: string) {
@@ -2673,30 +2675,12 @@ export async function markInvoiceViewed(invoiceId: string) {
     const sessionClientId = await assertInvoicePortalAccess();
     if (!sessionClientId) return;
 
-    const claim = await prisma.invoice.updateMany({
-        where: {
-            id: invoiceId,
-            viewedAt: null,
-            OR: [
-                { clientId: sessionClientId },
-                { project: { clientId: sessionClientId } },
-            ],
-        },
-        data: { viewedAt: new Date() },
-    });
-    if (claim.count === 0) return;
-
-    const invoice = await prisma.invoice.findUnique({
-        where: { id: invoiceId },
-        select: {
-            viewedAt: true, code: true, projectId: true,
-            project: { select: { name: true, client: { select: { name: true } } } },
-            client: { select: { name: true } },
-        },
-    });
-    if (invoice) {
-        const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
-        const projectName = invoice.project?.name || "";
+    const { markInvoiceViewedCore } = await import("./invoice-lifecycle");
+    const view = await markInvoiceViewedCore(invoiceId, sessionClientId);
+    if (view.firstView) {
+        const { invoice } = view;
+        const clientName = invoice.clientName;
+        const projectName = invoice.projectName || "";
         try {
             const settings = await getCachedCompanySettings();
             if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
@@ -2721,7 +2705,7 @@ export async function markInvoiceViewed(invoiceId: string) {
                         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
                             <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${view.viewedAt.toLocaleString()}</p>
                             <div style="text-align: center; margin: 16px 0;">
                                 <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
                                     View Invoice
@@ -2736,15 +2720,6 @@ export async function markInvoiceViewed(invoiceId: string) {
         } catch (e) {
             console.error("[markInvoiceViewed] Notification block failed:", e);
         }
-        await logActivity({
-            projectId: invoice.projectId,
-            actorType: "CLIENT",
-            actorName: clientName,
-            action: "viewed_invoice",
-            entityType: "invoice",
-            entityId: invoiceId,
-            entityName: `Invoice ${invoice.code}`,
-        });
     }
 }
 
