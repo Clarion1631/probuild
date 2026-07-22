@@ -5701,18 +5701,72 @@ export async function createContractFromPdf(
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
-    const existing = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
-    if (existing && ["Signed", "Finalized"].includes(existing.status)) {
-        if (data.title !== undefined || data.body !== undefined) {
-            throw new Error("Cannot edit a contract that has already been signed or finalized");
-        }
-    }
+    const existing = await prisma.contract.findUnique({
+        where: { id },
+        select: { status: true, title: true, body: true, contractorSignedBy: true, contractorSignedAt: true },
+    });
+    if (!existing) throw new Error("Contract not found");
 
     // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
     // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
     const safeData = { ...data };
     if (typeof safeData.body === "string") safeData.body = normalizeContractBody(safeData.body);
-    const contract = await prisma.contract.update({ where: { id }, data: safeData });
+
+    const editsText = safeData.title !== undefined || safeData.body !== undefined;
+    if (!editsText) {
+        const contract = await prisma.contract.update({ where: { id }, data: safeData });
+        revalidatePath(`/`);
+        return contract;
+    }
+
+    // A contractor pre-signature (signContractAsContractor) covers the document text as it
+    // stood when signed — the send/approve gates only check that contractorSignedAt exists,
+    // so an edit after pre-sign would present altered text over the old signature. Text
+    // edits therefore clear the contractor signature fields (forcing a re-sign of the new
+    // text) in the SAME write, and the write is a full compare-and-swap on the snapshot we
+    // diffed against (title/body/signature state): any concurrent edit or signature landing
+    // between our read and this write makes the CAS miss and the save is rejected, instead
+    // of silently reverting someone else's text under a live signature (Codex round-1
+    // blocker: a stale no-op save must not retain a signature made over newer text).
+    const textChanged =
+        (safeData.title !== undefined && safeData.title !== existing.title) ||
+        (safeData.body !== undefined && safeData.body !== (existing.body ?? ""));
+    const clearingSignature = textChanged && !!existing.contractorSignedAt;
+    await prisma.$transaction(async (tx) => {
+        const res = await tx.contract.updateMany({
+            where: {
+                id,
+                status: { notIn: ["Signed", "Finalized"] },
+                title: existing.title,
+                body: existing.body,
+                contractorSignedAt: existing.contractorSignedAt,
+            },
+            data: {
+                ...safeData,
+                ...(textChanged ? { contractorSignedBy: null, contractorSignedAt: null, contractorSignatureUrl: null } : {}),
+            },
+        });
+        if (res.count === 0) {
+            const current = await tx.contract.findUnique({ where: { id }, select: { status: true } });
+            if (current && ["Signed", "Finalized"].includes(current.status)) {
+                throw new Error("Cannot edit a contract that has already been signed or finalized");
+            }
+            throw new Error("Contract changed while you were editing (someone edited or signed it) — reload and try again.");
+        }
+        // The cleared signature's original audit row stays; append an invalidation marker so
+        // the e-sign trail shows the pre-edit signature no longer covers the current text.
+        if (clearingSignature) {
+            await tx.contractSigningRecord.create({
+                data: {
+                    contractId: id,
+                    signedBy: existing.contractorSignedBy || "Contractor",
+                    notes: "Contractor signature invalidated — contract text was edited after signing; re-sign required",
+                },
+            });
+        }
+    });
+    const contract = await prisma.contract.findUnique({ where: { id } });
+    if (!contract) throw new Error("Contract not found");
     revalidatePath(`/`);
     return contract;
 }
@@ -5774,16 +5828,32 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     // the email so the client gets their link, but we do NOT clobber status).
     // Recurring contracts that the cron re-arms legitimately re-enter "Sent"
     // from an earlier "Sent"/"Viewed" cycle — the whitelist includes those.
-    await prisma.contract.updateMany({
+    //
+    // The transition also CAS-binds the body we validated above (and, when the text
+    // carries a contractor block, that the contractor signature still exists) — an
+    // edit landing between the gate check and here now clears the pre-signature, so
+    // without this binding we could email a link to altered, unsigned text that the
+    // upfront gate never saw. A CAS miss on a still-unsigned contract aborts the
+    // send; a miss on an already-Signed/Finalized row keeps the old resend-as-no-op
+    // behavior (email the executed contract's link, never clobber status).
+    const sendTransition = await prisma.contract.updateMany({
         where: {
             id: contractId,
             status: { in: ["Draft", "Sent", "Viewed"] },
+            body: contract.body,
+            ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
         },
         data: {
             status: "Sent",
             sentAt: new Date(),
         }
     });
+    if (sendTransition.count === 0) {
+        const current = await prisma.contract.findUnique({ where: { id: contractId }, select: { status: true } });
+        if (!current || !["Signed", "Finalized"].includes(current.status)) {
+            throw new Error("Contract changed while sending (text edited or signature cleared) — reload and try again.");
+        }
+    }
 
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     const portalUrl = `${appUrl}/portal/contracts/${contractId}?token=${accessToken}`;
@@ -5871,7 +5941,7 @@ export async function getContractSendDefaults(contractId: string): Promise<{ toE
     return { toEmail: client?.email || null, autoCc };
 }
 
-export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
+export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string, expectedTitle: string, expectedBody: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
 
@@ -5899,16 +5969,29 @@ export async function signContractAsContractor(contractId: string, signerName: s
     // the signature write back too — a retry then redoes BOTH (never leaves contractorSignedAt set
     // with no audit row). updateMany only matches rows where contractorSignedAt IS NULL, so two
     // concurrent requests can't both succeed (eliminates TOCTOU race).
+    // The guard also CAS-checks the title and body the signer saw (both are cleared-signature
+    // triggers in updateContract), so a signature can never commit over a document that was
+    // edited after the signer last saw it (Codex blockers: a sign request based on an old
+    // document must not reintroduce a live signature on changed text OR a changed title).
     await prisma.$transaction(async (tx) => {
         const guard = await tx.contract.updateMany({
-            where: { id: contractId, contractorSignedAt: null },
+            where: {
+                id: contractId,
+                contractorSignedAt: null,
+                title: expectedTitle,
+                body: expectedBody,
+            },
             data: {
                 contractorSignedBy: signerName,
                 contractorSignedAt: signedAt,
                 contractorSignatureUrl,
             },
         });
-        if (guard.count === 0) throw new Error("Contract already signed by contractor");
+        if (guard.count === 0) {
+            const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+            if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
+            throw new Error("The contract text changed after you opened it — review the current text and sign again.");
+        }
         // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
         await tx.contractSigningRecord.create({
             data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
@@ -6090,10 +6173,17 @@ export async function approveContract(contractId: string, signatureName: string,
 
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
+            // CAS-bind the body we validated (and, when it carries a contractor block, that
+            // the contractor pre-signature still exists) into the transition — text edits now
+            // clear the pre-signature, so without this a contract could flip to Signed over
+            // text the upfront gate never validated, or without the required contractor
+            // signature at commit time.
             const transition = await tx.contract.updateMany({
                 where: {
                     id: contractId,
                     status: { in: ["Draft", "Sent", "Viewed"] },
+                    body: contract.body,
+                    ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
                 },
                 data: {
                     status: "Signed",
@@ -6106,15 +6196,27 @@ export async function approveContract(contractId: string, signatureName: string,
             });
             if (transition.count === 0) {
                 // Already signed — allow finalize retry without overwriting audit data.
-                // If status is anything other than "Signed", the contract is finalized and immutable.
                 const current = await tx.contract.findUnique({ where: { id: contractId }, select: { status: true } });
                 if (current?.status === "Signed") return;
+                if (current && ["Draft", "Sent", "Viewed"].includes(current.status)) {
+                    // Still signable ⇒ the CAS missed: text was edited (or the contractor
+                    // signature was cleared) between validation and commit.
+                    throw new Error("The contract changed while you were signing — please reload and review the current text.");
+                }
                 throw new Error("Contract is not in a signable state (already finalized)");
             }
         } else {
             const nextDue = new Date(now.getTime() + contract.recurringDays! * 86400000);
-            await tx.contract.update({
-                where: { id: contractId },
+            // Recurring signs tolerate duplicate same-cycle audit rows, but they get the same
+            // content/signature CAS as the one-time branch: both concurrent signers see the
+            // same body so both still match, while an edit (which clears the contractor
+            // pre-signature) between validation and commit makes the CAS miss and rejects.
+            const recurringTransition = await tx.contract.updateMany({
+                where: {
+                    id: contractId,
+                    body: contract.body,
+                    ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
+                },
                 data: {
                     approvedBy: signatureName,
                     approvedAt: now,
@@ -6126,6 +6228,9 @@ export async function approveContract(contractId: string, signatureName: string,
                     nextDueDate: nextDue,
                 }
             });
+            if (recurringTransition.count === 0) {
+                throw new Error("The contract changed while you were signing — please reload and review the current text.");
+            }
         }
 
         // Audit record — inside the same transaction as the state flip, so
