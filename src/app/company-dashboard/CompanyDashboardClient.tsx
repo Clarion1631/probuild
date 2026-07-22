@@ -4,7 +4,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useTransit
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, ProjectCrewMember } from "@/lib/schedule-core";
+import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, PipelineCrewMember } from "@/lib/schedule-core";
 import { PROJECT_STATUSES } from "@/lib/project-status";
 import { applyChangeOrderToScheduleAction, generateProjectScheduleAction, updateProjectCrewAction, updateProjectStartDateAction, updateTaskCrewAction } from "@/lib/actions";
 import { formatCurrency, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
@@ -45,7 +45,7 @@ function CrewPicker({
     teamMembers,
 }: {
     projectId: string;
-    crew: ProjectCrewMember[];
+    crew: PipelineCrewMember[];
     teamMembers: { id: string; name: string; email: string }[];
 }) {
     const router = useRouter();
@@ -72,14 +72,16 @@ function CrewPicker({
         });
     }
 
-    // Option list: the ACTIVATED team list PLUS any currently-assigned member
-    // who is no longer ACTIVATED — rendered as a removable "(inactive)" entry,
-    // checked by default (they ARE assigned); unchecking them before saving
-    // removes them (the core validates the FINAL set).
-    const inactiveAssigned = crew.filter(c => !teamMembers.some(m => m.id === c.id));
+    // Option list: the picker team list PLUS any currently-assigned member who
+    // isn't in it — either because they're no longer ACTIVATED (removable
+    // "(inactive)" entry) or because they're a FINANCE user excluded from the
+    // picker (removable "(finance)" entry). Checked by default (they ARE
+    // assigned); unchecking them before saving removes them (the core
+    // validates only newly-ADDED members against ACTIVATED).
+    const unlistedAssigned = crew.filter(c => !teamMembers.some(m => m.id === c.id));
     const options = [
         ...teamMembers.map(m => ({ id: m.id, label: m.name || m.email })),
-        ...inactiveAssigned.map(c => ({ id: c.id, label: `${c.name} (inactive)` })),
+        ...unlistedAssigned.map(c => ({ id: c.id, label: `${c.name} (${c.role === "FINANCE" ? "finance" : "inactive"})` })),
     ];
     const selectedNames = options.filter(o => selected.includes(o.id));
     return (
@@ -170,10 +172,10 @@ function TaskCrewPicker({ task, teamMembers }: { task: DashboardTaskRow; teamMem
     const assignmentKey = [...assignedIds].sort().join(",");
     const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
     const selected = override?.key === assignmentKey ? override.ids : assignedIds;
-    const inactive = task.assignments.filter(a => a.status !== "ACTIVATED" || !teamMembers.some(m => m.id === a.userId));
+    const unlisted = task.assignments.filter(a => !teamMembers.some(m => m.id === a.userId));
     const options = [
         ...teamMembers.map(member => ({ id: member.id, label: member.name || member.email })),
-        ...inactive.filter(a => !teamMembers.some(m => m.id === a.userId)).map(a => ({ id: a.userId, label: `${a.name} (inactive)` })),
+        ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.role === "FINANCE" ? "finance" : "inactive"})` })),
     ];
 
     function toggle(userId: string) {
@@ -525,7 +527,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                                                 <div className="text-xs text-hui-textMuted">
                                                                     {task.assignments.length === 0
                                                                         ? "No task crew"
-                                                                        : task.assignments.map(a => `${a.name}${a.status === "ACTIVATED" ? "" : " (inactive)"}`).join(", ")}
+                                                                        : task.assignments.map(a => `${a.name}${a.role === "FINANCE" ? " (finance)" : a.status === "ACTIVATED" ? "" : " (inactive)"}`).join(", ")}
                                                                 </div>
                                                                 {canEdit && teamMembers && <TaskCrewPicker task={task} teamMembers={teamMembers} />}
                                                             </div>

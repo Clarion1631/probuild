@@ -434,6 +434,48 @@ export function assignMonthProjectLanes(
     return { visibleWork, visibleMilestoneHosts, hiddenProjectIdsByWeek };
 }
 
+export const MAX_TASK_LANES = 3;
+
+export interface TaskLaneRange {
+    id: string;
+    start: Date;
+    end: Date;
+}
+
+export interface TaskLaneLayout {
+    laneByTaskId: Map<string, number>;
+    hiddenTaskIds: string[];
+    laneCount: number;
+}
+
+/**
+ * Stack a project's own tasks into overlap-free mini-lanes (a project can
+ * carry concurrent phases — e.g. concrete + deck). Same greedy
+ * interval-partition idea as assignProjectLanes, capped at MAX_TASK_LANES;
+ * tasks beyond the cap are reported as hidden for a "+N" affordance. Sorted
+ * by start (tie-broken by id) for a deterministic, stable assignment.
+ */
+export function assignTaskLanes(tasks: TaskLaneRange[]): TaskLaneLayout {
+    const sorted = [...tasks].sort((a, b) => a.start.getTime() - b.start.getTime() || a.id.localeCompare(b.id));
+    const laneEnds: Date[] = [];
+    const laneByTaskId = new Map<string, number>();
+    const hiddenTaskIds: string[] = [];
+
+    for (const task of sorted) {
+        let lane = laneEnds.findIndex(end => end <= task.start);
+        if (lane === -1) lane = laneEnds.length;
+        if (lane >= MAX_TASK_LANES) {
+            hiddenTaskIds.push(task.id);
+            continue;
+        }
+        laneEnds[lane] = task.end;
+        laneByTaskId.set(task.id, lane);
+    }
+
+    const laneCount = laneByTaskId.size === 0 ? 0 : Math.max(...laneByTaskId.values()) + 1;
+    return { laneByTaskId, hiddenTaskIds, laneCount };
+}
+
 export function toTimelineRect(range: DateRange, origin: Date, dayWidth: number): TimelineRect {
     const normalizedOrigin = toUTCDay(origin);
     const start = toUTCDay(range.start);

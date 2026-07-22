@@ -7305,6 +7305,67 @@ export async function updateTaskCrewAction(taskId: string, userIds: string[]) {
     return result;
 }
 
+export interface SaveCompanyScheduleTaskDatesInput {
+    taskId: string;
+    startDate: string; // YYYY-MM-DD
+    endDate: string;   // YYYY-MM-DD
+}
+
+export interface SaveCompanyScheduleTaskDateResult {
+    taskId: string;
+    ok: boolean;
+    startDate?: string;
+    endDate?: string;
+    error?: string;
+}
+
+export interface SaveCompanyScheduleTaskDatesResult {
+    results: SaveCompanyScheduleTaskDateResult[];
+    succeeded: number;
+    failed: number;
+}
+
+// Commit the company schedule board's draft-mode edits in one batch. ADMIN/
+// MANAGER only, same gate as the other dashboard batch actions. Loops the
+// canonical updateScheduleTask per task — deliberately NOT a second mutation
+// core — so every existing lock/validation/ActivityLog path applies
+// unchanged. One task's failure never blocks the rest: each change is applied
+// independently and reported in `results`, so the client can clear succeeded
+// drafts and keep failed ones pending for retry.
+export async function saveCompanyScheduleTaskDatesAction(
+    changes: SaveCompanyScheduleTaskDatesInput[],
+): Promise<SaveCompanyScheduleTaskDatesResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+
+    const results: SaveCompanyScheduleTaskDateResult[] = [];
+    for (const change of changes) {
+        try {
+            const task = await updateScheduleTask(change.taskId, {
+                startDate: change.startDate,
+                endDate: change.endDate,
+            });
+            results.push({
+                taskId: change.taskId,
+                ok: true,
+                startDate: task.startDate.toISOString(),
+                endDate: task.endDate.toISOString(),
+            });
+        } catch (err: any) {
+            results.push({ taskId: change.taskId, ok: false, error: err?.message ?? String(err) });
+        }
+    }
+
+    return {
+        results,
+        succeeded: results.filter(r => r.ok).length,
+        failed: results.filter(r => !r.ok).length,
+    };
+}
+
 export async function updateProjectColor(projectId: string, color: string) {
     await prisma.project.update({
         where: { id: projectId },

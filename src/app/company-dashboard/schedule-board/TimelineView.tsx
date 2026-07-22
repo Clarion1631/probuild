@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 import Link from "next/link";
 import type { CompanyDashboardData, DashboardProjectRow } from "@/lib/schedule-core";
 import {
@@ -15,16 +15,17 @@ import {
     todayUTC,
 } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MilestoneMarker } from "./MilestoneMarker";
-import { ProjectBar, ProjectBarGridStartContext, type ProjectEditCallbacks } from "./ProjectBar";
+import { ProjectBar, ProjectBarGridStartContext, computeTaskLaneLayout, type ProjectEditCallbacks } from "./ProjectBar";
 import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks } from "./TaskBlockSegment";
 import { PROJECT_DRAG_MIME } from "./UnscheduledTray";
-import { clipRange, getEffectiveProjectRange, toTimelineRect, type WeekSegment } from "./useBarLayout";
+import { assignTaskLanes, clipRange, getEffectiveProjectRange, toTimelineRect, type WeekSegment } from "./useBarLayout";
 
 const DAY_WIDTH = 20;
 const TIMELINE_DAYS = 42;
 const LABEL_WIDTH = 240;
 const CANVAS_WIDTH = DAY_WIDTH * TIMELINE_DAYS;
 const FALLBACK_COLORS = ["#2563eb", "#7c3aed", "#0f766e", "#c2410c", "#be123c", "#4338ca", "#047857", "#a21caf"];
+const CREW_MODE_STORAGE_KEY = "gtr-company-schedule-board-crew-mode";
 
 interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     data: CompanyDashboardData;
@@ -34,8 +35,90 @@ interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     showHours: boolean;
     pendingProjectIds: ReadonlySet<string>;
     pendingTaskIds: ReadonlySet<string>;
+    draftProjectIds: ReadonlySet<string>;
+    draftTaskIds: ReadonlySet<string>;
+    isSaving: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     onTrayProjectDrop: (_project: DashboardProjectRow, _targetStart: string) => void;
+}
+
+interface CrewTaskBlock {
+    taskId: string;
+    projectId: string;
+    projectName: string;
+    projectColor: string;
+    name: string;
+    start: Date;
+    end: Date;
+}
+
+interface CrewCoverageBlock {
+    projectId: string;
+    projectName: string;
+    projectColor: string;
+    start: Date;
+    end: Date;
+}
+
+interface CrewTimelineRow {
+    userId: string;
+    name: string;
+    taskBlocks: CrewTaskBlock[];
+    coverageBlocks: CrewCoverageBlock[];
+}
+
+/**
+ * One row per ACTIVATED crew member with task assignments or project-crew
+ * membership in range (item 8). Reuses the already-serialized
+ * DashboardTaskRow.assignments and project.crew — no new money/data fetch.
+ * A project a member is on the crew of but has NO task assignment on renders
+ * as hollow coverage over the project's window (same source data as
+ * getCrewConflicts' P2 project-window fallback, just for display here).
+ */
+function buildCrewTimelineRows(projects: DashboardProjectRow[], colorFor: (project: DashboardProjectRow) => string): CrewTimelineRow[] {
+    const rowsByUser = new Map<string, CrewTimelineRow>();
+    const assignedProjectIdsByUser = new Map<string, Set<string>>();
+    const rowFor = (userId: string, name: string): CrewTimelineRow => {
+        let row = rowsByUser.get(userId);
+        if (!row) {
+            row = { userId, name, taskBlocks: [], coverageBlocks: [] };
+            rowsByUser.set(userId, row);
+        }
+        return row;
+    };
+
+    for (const project of projects) {
+        const projectColor = colorFor(project);
+        for (const task of project.tasks) {
+            for (const assignment of task.assignments) {
+                if (assignment.status !== "ACTIVATED") continue;
+                const start = parseUTCDate(task.startDate.slice(0, 10));
+                const end = task.type === "milestone" ? addDays(start, 1) : parseUTCDate(task.endDate.slice(0, 10));
+                if (end <= start) continue;
+                rowFor(assignment.userId, assignment.name).taskBlocks.push({
+                    taskId: task.id, projectId: project.id, projectName: project.name, projectColor,
+                    name: task.name, start, end,
+                });
+                const assignedSet = assignedProjectIdsByUser.get(assignment.userId) ?? new Set<string>();
+                assignedSet.add(project.id);
+                assignedProjectIdsByUser.set(assignment.userId, assignedSet);
+            }
+        }
+    }
+    for (const project of projects) {
+        const range = getEffectiveProjectRange(project);
+        if (!range) continue;
+        const projectColor = colorFor(project);
+        for (const member of project.crew) {
+            if (member.status !== "ACTIVATED") continue;
+            if (assignedProjectIdsByUser.get(member.id)?.has(project.id)) continue;
+            rowFor(member.id, member.name).coverageBlocks.push({
+                projectId: project.id, projectName: project.name, projectColor,
+                start: range.start, end: range.end,
+            });
+        }
+    }
+    return [...rowsByUser.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function TimelineView({
@@ -46,6 +129,9 @@ export function TimelineView({
     showHours,
     pendingProjectIds,
     pendingTaskIds,
+    draftProjectIds,
+    draftTaskIds,
+    isSaving,
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
     onProjectMoveCommit,
@@ -65,6 +151,26 @@ export function TimelineView({
 }: TimelineViewProps) {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const [dragOverDate, setDragOverDate] = useState<string | null>(null);
+    const [groupByCrew, setGroupByCrew] = useState(false);
+    useEffect(() => {
+        try {
+            const stored = localStorage.getItem(CREW_MODE_STORAGE_KEY);
+            if (stored === "true") setGroupByCrew(true);
+        } catch {
+            // Storage can be unavailable in privacy-restricted browser contexts.
+        }
+    }, []);
+    function toggleGroupByCrew() {
+        setGroupByCrew(value => {
+            const next = !value;
+            try {
+                localStorage.setItem(CREW_MODE_STORAGE_KEY, String(next));
+            } catch {
+                // The selected mode still applies for this session when persistence fails.
+            }
+            return next;
+        });
+    }
     const anchor = parseUTCDate(`${data.month}-01`);
     const days = getMonthGrid(anchor).slice(0, TIMELINE_DAYS);
     const gridStart = days[0];
@@ -77,6 +183,8 @@ export function TimelineView({
         ...data.pipeline.inProgress,
         ...data.pipeline.substantialCompletion,
     ];
+    const colorForProject = (project: DashboardProjectRow) => project.color || FALLBACK_COLORS[projects.indexOf(project) % FALLBACK_COLORS.length];
+    const crewRows = groupByCrew ? buildCrewTimelineRows(projects, colorForProject) : [];
     const adminOverlays = data.isAdmin ? data.overlays : null;
     const visibleIncomeMilestones = adminOverlays && showIncome ? adminOverlays.income : [];
     const visibleChangeOrderMilestones = adminOverlays && showProjectedCo ? adminOverlays.changeOrders : [];
@@ -128,8 +236,16 @@ export function TimelineView({
             <div ref={scrollContainerRef} className="overflow-x-auto" aria-label="Project schedule timeline">
                 <div style={{ width: LABEL_WIDTH + CANVAS_WIDTH }}>
                     <div className="flex border-b border-hui-border bg-white">
-                        <div data-timeline-sticky-label="true" className="sticky left-0 z-50 flex shrink-0 items-end border-r border-hui-border bg-white px-3 pb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500" style={{ width: LABEL_WIDTH }}>
-                            Project
+                        <div data-timeline-sticky-label="true" className="sticky left-0 z-50 flex shrink-0 items-end justify-between gap-2 border-r border-hui-border bg-white px-3 pb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500" style={{ width: LABEL_WIDTH }}>
+                            <span>{groupByCrew ? "Crew" : "Project"}</span>
+                            <button
+                                type="button"
+                                onClick={toggleGroupByCrew}
+                                aria-pressed={groupByCrew}
+                                className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold normal-case tracking-normal transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${groupByCrew ? "border-indigo-300 bg-indigo-100 text-indigo-700" : "border-hui-border bg-white text-hui-textMuted hover:bg-slate-50"}`}
+                            >
+                                By crew
+                            </button>
                         </div>
                         <div className="shrink-0" style={{ width: CANVAS_WIDTH }}>
                             <div className="grid grid-cols-6 border-b border-hui-border">
@@ -192,6 +308,66 @@ export function TimelineView({
                         </div>
                     )}
 
+                    {groupByCrew ? (
+                        crewRows.length === 0 ? (
+                            <div className="px-4 py-8 text-center text-sm text-hui-textMuted">No active crew coverage in this window.</div>
+                        ) : crewRows.map(row => {
+                            const { laneByTaskId, laneCount: rawLaneCount } = assignTaskLanes(row.taskBlocks.map(block => ({ id: block.taskId, start: block.start, end: block.end })));
+                            const laneCount = Math.max(1, rawLaneCount);
+                            const TASK_LANE_TOP = 20;
+                            const TASK_LANE_HEIGHT = 16;
+                            const coverageTop = TASK_LANE_TOP + laneCount * TASK_LANE_HEIGHT + 4;
+                            const rowHeight = Math.max(64, coverageTop + (row.coverageBlocks.length > 0 ? TASK_LANE_HEIGHT + 8 : 8));
+                            return (
+                                <div key={row.userId} className="flex border-b border-hui-border last:border-b-0" style={{ minHeight: rowHeight }}>
+                                    <div data-timeline-sticky-label="true" className="sticky left-0 z-40 flex shrink-0 items-center border-r border-hui-border bg-white px-3 py-2" style={{ width: LABEL_WIDTH }}>
+                                        <span className="truncate text-xs font-semibold text-hui-textMain" title={row.name}>{row.name}</span>
+                                    </div>
+                                    <div className="relative shrink-0" style={{ width: CANVAS_WIDTH, height: rowHeight }}>
+                                        <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS}, ${DAY_WIDTH}px)` }} aria-hidden="true">
+                                            {days.map(day => (
+                                                <div key={formatDate(day)} className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`} />
+                                            ))}
+                                        </div>
+                                        {today >= gridStart && today < gridEnd && (
+                                            <span className="pointer-events-none absolute inset-y-0 z-20 w-px bg-indigo-500" style={{ left: toTimelineRect({ start: today, end: addDays(today, 1) }, gridStart, DAY_WIDTH).left + DAY_WIDTH / 2 }} aria-hidden="true" />
+                                        )}
+                                        {row.taskBlocks.filter(block => laneByTaskId.has(block.taskId)).map(block => {
+                                            const clipped = clipRange({ start: block.start, end: block.end }, visibleRange);
+                                            if (!clipped) return null;
+                                            const rect = toTimelineRect(clipped, gridStart, DAY_WIDTH);
+                                            const lane = laneByTaskId.get(block.taskId)!;
+                                            return (
+                                                <div
+                                                    key={block.taskId}
+                                                    className="absolute z-10 overflow-hidden rounded-sm text-[9px] font-semibold leading-[15px] text-white shadow-sm"
+                                                    style={{ left: rect.left, top: TASK_LANE_TOP + lane * TASK_LANE_HEIGHT, width: Math.max(rect.width, DAY_WIDTH), height: TASK_LANE_HEIGHT - 2, backgroundColor: block.projectColor }}
+                                                    title={`${block.projectName} — ${block.name} — UTC ${formatDate(block.start)} → ${formatDate(block.end)}`}
+                                                >
+                                                    <span className="block truncate px-1">{block.name}</span>
+                                                </div>
+                                            );
+                                        })}
+                                        {row.coverageBlocks.map(block => {
+                                            const clipped = clipRange({ start: block.start, end: block.end }, visibleRange);
+                                            if (!clipped) return null;
+                                            const rect = toTimelineRect(clipped, gridStart, DAY_WIDTH);
+                                            return (
+                                                <div
+                                                    key={`coverage-${block.projectId}`}
+                                                    className="absolute z-10 overflow-hidden rounded-sm border-2 border-dashed text-[9px] font-semibold leading-[13px]"
+                                                    style={{ left: rect.left, top: coverageTop, width: Math.max(rect.width, DAY_WIDTH), height: TASK_LANE_HEIGHT - 2, borderColor: block.projectColor, backgroundColor: `${block.projectColor}22`, color: block.projectColor }}
+                                                    title={`${block.projectName} — on the project crew, no task assignment in range`}
+                                                >
+                                                    <span className="block truncate px-1">{block.projectName}</span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            );
+                        })
+                    ) : (<>
                     {projects.map((project, projectIndex) => {
                         const range = getEffectiveProjectRange(project);
                         const clipped = range ? clipRange(range, visibleRange) : null;
@@ -224,6 +400,9 @@ export function TimelineView({
                                 : [],
                         ))];
                         const crewLabel = project.crew.length > 0 ? project.crew.map(member => member.name).join(", ") : "No project crew";
+                        // Row must fit the bar: wrapper sits at top 8 + py-1 (4),
+                        // so a laneCount-3 bar (60px) needs 12 + 60 + 8 = 80px.
+                        const rowHeight = Math.max(64, 12 + computeTaskLaneLayout(project.tasks).barHeight + 8);
                         const milestoneRows = [
                             ...visibleIncomeMilestones.filter(item => item.projectId === project.id).map(item => ({
                                 key: `income-${item.id}`,
@@ -261,7 +440,7 @@ export function TimelineView({
                                         </span>
                                     )}
                                 </div>
-                                <div data-timeline-schedule-grid="true" className="relative h-16 shrink-0" style={{ width: CANVAS_WIDTH }}>
+                                <div data-timeline-schedule-grid="true" className="relative shrink-0" style={{ width: CANVAS_WIDTH, height: rowHeight }}>
                                     <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS}, ${DAY_WIDTH}px)` }} aria-hidden="true">
                                         {days.map(day => {
                                             const dayKey = formatDate(day);
@@ -291,8 +470,10 @@ export function TimelineView({
                                                 changeOrderMilestones={[]}
                                                 canEdit={data.canEdit}
                                                 canMoveProject={data.canEdit && (project.status === "Waiting to Start" || project.status === "In Progress")}
-                                                isPending={pendingProjectIds.has(project.id)}
+                                                isPending={isSaving || pendingProjectIds.has(project.id)}
+                                                isDraft={draftProjectIds.has(project.id)}
                                                 pendingTaskIds={pendingTaskIds}
+                                                draftTaskIds={draftTaskIds}
                                                 activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                 activeProjectKeyboardId={activeProjectKeyboardId}
                                                 timelineDayWidth={DAY_WIDTH}
@@ -325,7 +506,8 @@ export function TimelineView({
                                                     visibleRange={milestoneRange}
                                                     projectColor={project.color || FALLBACK_COLORS[projectIndex % FALLBACK_COLORS.length]}
                                                     canEdit={data.canEdit}
-                                                    isPending={pendingProjectIds.has(project.id) || pendingTaskIds.has(task.id)}
+                                                    isPending={isSaving || pendingProjectIds.has(project.id) || pendingTaskIds.has(task.id)}
+                                                    isDraft={draftProjectIds.has(project.id) || draftTaskIds.has(task.id)}
                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                     timelineDayWidth={DAY_WIDTH}
                                                     timelineLeftInset={LABEL_WIDTH}
@@ -363,6 +545,7 @@ export function TimelineView({
                         );
                     })}
                     {projects.length === 0 && <div className="px-4 py-8 text-center text-sm text-hui-textMuted">No scheduled projects in this window.</div>}
+                    </>)}
                 </div>
             </div>
         </ProjectBarGridStartContext.Provider>

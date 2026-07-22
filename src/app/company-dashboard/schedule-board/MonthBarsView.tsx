@@ -37,6 +37,12 @@ interface MonthBarsViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     showHours: boolean;
     pendingProjectIds: ReadonlySet<string>;
     pendingTaskIds: ReadonlySet<string>;
+    // Drafted (unsaved) items — still fully interactive, rendered with a
+    // dashed/desaturated treatment. isSaving locks every project/task board-
+    // wide while a Save is committing.
+    draftProjectIds: ReadonlySet<string>;
+    draftTaskIds: ReadonlySet<string>;
+    isSaving: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     onTrayProjectDrop: (_project: DashboardProjectRow, _targetStart: string) => void;
 }
@@ -93,6 +99,9 @@ export function MonthBarsView({
     showHours,
     pendingProjectIds,
     pendingTaskIds,
+    draftProjectIds,
+    draftTaskIds,
+    isSaving,
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
     onProjectMoveCommit,
@@ -233,7 +242,7 @@ export function MonthBarsView({
                         const expanded = expandedWeeks.has(weekIndex);
 
                         return (
-                            <div key={weekIndex} className="relative grid min-h-[246px] grid-cols-7 border-b border-hui-border last:border-b-0">
+                            <div key={weekIndex} className="relative grid min-h-[350px] grid-cols-7 border-b border-hui-border last:border-b-0">
                                 {weekDays.map(day => {
                                     const dayKey = formatDate(day);
                                     const isToday = isSameUTCDay(day, today);
@@ -252,7 +261,7 @@ export function MonthBarsView({
                                             className={`min-w-0 border-r border-hui-border p-1.5 last:border-r-0 ${isCurrentMonth ? (isWeekend(day) ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""} ${dragOverDate === dayKey ? "bg-indigo-50 ring-2 ring-inset ring-indigo-500" : ""}`}
                                         >
                                             <span className={`text-xs font-semibold ${isToday ? "inline-flex h-6 w-6 items-center justify-center rounded-full bg-indigo-600 text-white" : isCurrentMonth ? "text-hui-textMain" : "text-slate-400"}`}>{day.getUTCDate()}</span>
-                                            <div className="space-y-0.5 pt-[164px]">
+                                            <div className="space-y-0.5 pt-[268px]">
                                                 {incomeTotal != null && incomeTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-green-700" title="Income due this day (effective due date)">{formatCurrency(incomeTotal)} due</div>}
                                                 {projectedCoTotal != null && projectedCoTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-amber-700" title="Approved, unbilled change-order income projected this day">{formatCurrency(projectedCoTotal)} projected CO</div>}
                                                 {expenseTotal != null && expenseTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-red-700" title="Expenses this day">−{formatCurrency(expenseTotal)}</div>}
@@ -261,7 +270,7 @@ export function MonthBarsView({
                                         </div>
                                     );
                                 })}
-                                <div className="pointer-events-none absolute inset-x-0 top-8 grid h-[152px] grid-cols-7 grid-rows-[repeat(4,38px)] gap-y-0 px-0.5">
+                                <div className="pointer-events-none absolute inset-x-0 top-8 grid h-[256px] grid-cols-7 grid-rows-[repeat(4,64px)] gap-y-0 px-0.5">
                                     {visibleSegments.map(segment => {
                                         const project = projectById.get(segment.projectId);
                                         if (!project) return null;
@@ -280,8 +289,10 @@ export function MonthBarsView({
                                                     changeOrderMilestones={milestoneMaps?.changeOrders.get(project.id) ?? EMPTY_CHANGE_ORDERS}
                                                     canEdit={data.canEdit}
                                                     canMoveProject={data.canEdit && (project.status === "Waiting to Start" || project.status === "In Progress")}
-                                                    isPending={pendingProjectIds.has(project.id)}
+                                                    isPending={isSaving || pendingProjectIds.has(project.id)}
+                                                    isDraft={draftProjectIds.has(project.id)}
                                                     pendingTaskIds={pendingTaskIds}
+                                                    draftTaskIds={draftTaskIds}
                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                     activeProjectKeyboardId={activeProjectKeyboardId}
                                                     onProjectPointerEditStart={onProjectPointerEditStart}
@@ -334,7 +345,8 @@ export function MonthBarsView({
                                                                     visibleRange={visibleRange}
                                                                     projectColor={project.color || fallbackProjectColor(project.id)}
                                                                     canEdit={data.canEdit}
-                                                                    isPending={pendingProjectIds.has(project.id) || pendingTaskIds.has(task.id)}
+                                                                    isPending={isSaving || pendingProjectIds.has(project.id) || pendingTaskIds.has(task.id)}
+                                                                    isDraft={draftProjectIds.has(project.id) || draftTaskIds.has(task.id)}
                                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                                     onTaskKeyboardStart={onTaskKeyboardStart}
@@ -353,7 +365,7 @@ export function MonthBarsView({
                                     })}
                                 </div>
                                 {hiddenCount > 0 && (
-                                    <div className="absolute right-2 top-[180px] z-40 text-right">
+                                    <div className="absolute right-2 top-[284px] z-40 text-right">
                                         <button
                                             type="button"
                                             onClick={() => setExpandedWeeks(current => {

@@ -1,16 +1,40 @@
 "use client";
 
-import { createContext, useContext, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import Link from "next/link";
 import type {
     DashboardProjectRow,
     OverlayChangeOrderItem,
     OverlayIncomeItem,
 } from "@/lib/schedule-core";
-import { addDays, formatDate } from "@/app/projects/[id]/schedule/schedule-utils";
-import { getEffectiveProjectRange, type WeekSegment } from "./useBarLayout";
+import { addDays, formatDate, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import { assignTaskLanes, getEffectiveProjectRange, type WeekSegment } from "./useBarLayout";
 import { MilestoneMarker } from "./MilestoneMarker";
 import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks } from "./TaskBlockSegment";
+import { FloatingPopover } from "./FloatingPopover";
+
+// Mini-lane sizing for overlapping tasks inside one project bar (item 5): the
+// common single-lane case keeps the original 18px strip untouched; 2-3 lanes
+// pack into slightly shorter rows. Callers (MonthBarsView's fixed-height grid
+// rows) size their row budget for the MAX_TASK_LANES=3 case.
+const TASK_STRIP_SINGLE_LANE_HEIGHT = 18;
+const TASK_LANE_HEIGHT = 14;
+
+// One source of truth for a bar's mini-lane geometry: used by the bar itself
+// AND by row-height calculations in the views (Timeline rows must grow with
+// lane count or a 3-lane bar overflows into the row below).
+export function computeTaskLaneLayout(tasks: { id: string; startDate: string; endDate: string; type: string }[]) {
+    const taskLaneInput = tasks.map(task => {
+        const start = parseUTCDate(task.startDate.slice(0, 10));
+        const end = task.type === "milestone" ? addDays(start, 1) : parseUTCDate(task.endDate.slice(0, 10));
+        return { id: task.id, start, end };
+    });
+    const { laneByTaskId, hiddenTaskIds, laneCount: rawLaneCount } = assignTaskLanes(taskLaneInput);
+    const laneCount = Math.max(1, rawLaneCount);
+    const laneHeight = laneCount <= 1 ? TASK_STRIP_SINGLE_LANE_HEIGHT : TASK_LANE_HEIGHT;
+    const taskStripHeight = laneCount * laneHeight;
+    return { laneByTaskId, hiddenTaskIds, laneCount, laneHeight, taskStripHeight, barHeight: 18 + taskStripHeight };
+}
 
 export interface ProjectEditCallbacks {
     activeProjectKeyboardId: string | null;
@@ -32,7 +56,11 @@ export interface ProjectBarProps extends TaskEditCallbacks {
     canEdit: boolean;
     canMoveProject: boolean;
     isPending: boolean;
+    // Drafted (unsaved project-start move) — dashed ring + desaturated, but
+    // still fully draggable (draft mode never locks a drafted item).
+    isDraft?: boolean;
     pendingTaskIds: ReadonlySet<string>;
+    draftTaskIds: ReadonlySet<string>;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     timelineDayWidth?: number;
     timelineLeftInset?: number;
@@ -74,7 +102,9 @@ export function ProjectBar({
     canEdit,
     canMoveProject,
     isPending,
+    isDraft = false,
     pendingTaskIds,
+    draftTaskIds,
     activeTaskKeyboardEdit,
     timelineDayWidth,
     timelineLeftInset,
@@ -97,7 +127,10 @@ export function ProjectBar({
     const gridStart = useContext(ProjectBarGridStartContext);
     const projectRange = getEffectiveProjectRange(project);
     const projectStart = projectRange ? formatDate(projectRange.start) : "";
-    const actionDetailsRef = useRef<HTMLDetailsElement>(null);
+    const actionTriggerRef = useRef<HTMLButtonElement>(null);
+    const [menuOpen, setMenuOpen] = useState(false);
+    const overflowTriggerRef = useRef<HTMLButtonElement>(null);
+    const [overflowOpen, setOverflowOpen] = useState(false);
     const actionResetKey = `${isPending ? "pending" : "ready"}:${projectStart}`;
     const [targetStartDraft, setTargetStartDraft] = useState(() => ({ resetKey: actionResetKey, value: projectStart }));
     const targetStart = targetStartDraft.resetKey === actionResetKey ? targetStartDraft.value : projectStart;
@@ -105,7 +138,7 @@ export function ProjectBar({
         setTargetStartDraft({ resetKey: actionResetKey, value: projectStart });
     }
     useEffect(() => {
-        if (actionDetailsRef.current) actionDetailsRef.current.open = false;
+        setMenuOpen(false);
     }, [actionResetKey]);
     if (!gridStart || !projectRange) return null;
 
@@ -113,6 +146,13 @@ export function ProjectBar({
     const visibleRange = { start: visibleStart, end: addDays(visibleStart, segment.spanDays) };
     const crewLabel = project.crew.length > 0 ? project.crew.map(member => member.name).join(", ") : "No project crew";
     const projectTitle = `${project.name}${project.client ? ` — ${project.client}` : ""} — ${crewLabel}`;
+
+    // Mini-lane layout for tasks that overlap inside this bar (e.g. concrete
+    // + deck running concurrently) — capped at 3 lanes with a "+N" chip.
+    const { laneByTaskId, hiddenTaskIds, laneCount, laneHeight, taskStripHeight, barHeight } = computeTaskLaneLayout(project.tasks);
+    const hiddenTasks = hiddenTaskIds
+        .map(id => project.tasks.find(task => task.id === id))
+        .filter((task): task is DashboardProjectRow["tasks"][number] => Boolean(task));
     const milestoneMarkers = [
         ...incomeMilestones.map(item => ({
             key: `income-${item.id}`,
@@ -178,17 +218,30 @@ export function ProjectBar({
         onMoveCommit(project, targetStart);
     }
 
+    // A bare click on the bar (not a drag, and not on an interactive
+    // descendant like the name link or the Actions menu itself) toggles the
+    // Actions dropdown instead of doing nothing — the bar itself never
+    // navigates. An active drag calls preventDefault on pointermove once the
+    // threshold is crossed, which suppresses the browser's synthetic click,
+    // so this only fires for genuine clicks.
+    function handleBarClick(event: ReactMouseEvent<HTMLDivElement>) {
+        if (!canMoveProject || isPending) return;
+        if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
+        setMenuOpen(value => !value);
+    }
+
     return (
         <div
-            className={`group/project relative h-9 touch-pan-y select-none overflow-visible rounded-md border border-black/10 text-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 ${canMoveProject && !isPending ? "cursor-move" : ""}`}
-            style={{ backgroundColor: projectColor }}
+            className={`group/project relative touch-pan-y select-none overflow-visible rounded-md border text-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 ${canMoveProject && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
+            style={{ backgroundColor: projectColor, height: barHeight }}
             data-can-edit={canEdit ? "true" : "false"}
             role="group"
-            aria-label={`${project.name} project bar`}
+            aria-label={`${project.name} project bar${isDraft ? " (unsaved change)" : ""}`}
             aria-disabled={!canMoveProject || isPending}
             aria-busy={isPending}
             tabIndex={canMoveProject && !isPending ? 0 : undefined}
             onPointerDown={handlePointerDown}
+            onClick={handleBarClick}
             onKeyDown={handleKeyboard}
         >
             <div className="absolute inset-x-0 top-0 z-10 flex h-[18px] min-w-0 items-center gap-1 px-1 text-[10px] leading-none">
@@ -207,30 +260,67 @@ export function ProjectBar({
                     </span>
                 )}
                 {canMoveProject && (
-                    <details ref={actionDetailsRef} className="relative shrink-0 opacity-0 pointer-events-none transition group-hover/project:opacity-100 group-hover/project:pointer-events-auto group-focus-within/project:opacity-100 group-focus-within/project:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
-                        <summary className="cursor-pointer list-none rounded bg-white/20 px-1 py-0.5 text-[9px] font-bold text-white hover:bg-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white" aria-label={`Project actions for ${project.name}`}>
+                    <>
+                        <button
+                            ref={actionTriggerRef}
+                            type="button"
+                            onClick={event => { event.stopPropagation(); setMenuOpen(value => !value); }}
+                            aria-expanded={menuOpen}
+                            className="shrink-0 cursor-pointer rounded bg-white/20 px-1 py-0.5 text-[9px] font-bold text-white opacity-0 transition hover:bg-white/30 group-hover/project:opacity-100 group-focus-within/project:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                            aria-label={`Project actions for ${project.name}`}
+                        >
                             Actions
-                        </summary>
-                        <form onSubmit={handleDateSubmit} className="absolute right-0 top-full z-[80] mt-1 w-56 space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl">
-                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-date-${project.id}-${segment.weekIndex}`}>Start date</label>
-                            <input
-                                id={`bar-project-date-${project.id}-${segment.weekIndex}`}
-                                type="date"
-                                value={targetStart}
-                                onChange={event => setTargetStartDraft({ resetKey: actionResetKey, value: event.target.value })}
-                                disabled={isPending}
-                                className="hui-input w-full px-2 py-1 text-xs"
-                            />
-                            <button type="submit" disabled={isPending || !targetStart} className="hui-btn hui-btn-primary w-full text-xs disabled:cursor-wait disabled:opacity-60">
-                                Move project
-                            </button>
-                        </form>
-                    </details>
+                        </button>
+                        <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} onClose={() => setMenuOpen(false)}>
+                            <form onSubmit={handleDateSubmit} className="space-y-2">
+                                <Link
+                                    href={`/projects/${project.id}`}
+                                    className="block w-full rounded px-2 py-1.5 text-xs font-semibold text-hui-primary hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                                >
+                                    Open project
+                                </Link>
+                                <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-date-${project.id}-${segment.weekIndex}`}>Start date</label>
+                                <input
+                                    id={`bar-project-date-${project.id}-${segment.weekIndex}`}
+                                    type="date"
+                                    value={targetStart}
+                                    onChange={event => setTargetStartDraft({ resetKey: actionResetKey, value: event.target.value })}
+                                    disabled={isPending}
+                                    className="hui-input w-full px-2 py-1 text-xs"
+                                />
+                                <button type="submit" disabled={isPending || !targetStart} className="hui-btn hui-btn-primary w-full text-xs disabled:cursor-wait disabled:opacity-60">
+                                    Move project
+                                </button>
+                            </form>
+                        </FloatingPopover>
+                    </>
                 )}
                 {segment.continuesAfter && <span aria-hidden="true">›</span>}
             </div>
-            <div className="absolute inset-x-0 bottom-0 h-[18px] overflow-visible rounded-b-md">
-                {project.tasks.map(task => (
+            {hiddenTasks.length > 0 && (
+                <>
+                    <button
+                        ref={overflowTriggerRef}
+                        type="button"
+                        onClick={event => { event.stopPropagation(); setOverflowOpen(value => !value); }}
+                        aria-expanded={overflowOpen}
+                        className="absolute bottom-0 right-0 z-20 rounded-tl bg-black/40 px-1 text-[8px] font-bold text-white hover:bg-black/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                        aria-label={`${hiddenTasks.length} more overlapping task${hiddenTasks.length === 1 ? "" : "s"} on ${project.name}`}
+                    >
+                        +{hiddenTasks.length}
+                    </button>
+                    <FloatingPopover open={overflowOpen} anchorRef={overflowTriggerRef} onClose={() => setOverflowOpen(false)} width={200}>
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Also running</p>
+                        <ul className="space-y-1">
+                            {hiddenTasks.map(task => (
+                                <li key={task.id} className="truncate text-xs text-hui-textMain" title={task.name}>{task.name}</li>
+                            ))}
+                        </ul>
+                    </FloatingPopover>
+                </>
+            )}
+            <div className="absolute inset-x-0 bottom-0 overflow-visible rounded-b-md" style={{ height: taskStripHeight }}>
+                {project.tasks.filter(task => laneByTaskId.has(task.id)).map(task => (
                     <TaskBlockSegment
                         key={task.id}
                         task={task}
@@ -238,7 +328,10 @@ export function ProjectBar({
                         visibleRange={visibleRange}
                         projectColor={projectColor}
                         canEdit={canEdit}
+                        laneTop={laneByTaskId.get(task.id)! * laneHeight}
+                        laneHeight={laneHeight}
                         isPending={isPending || pendingTaskIds.has(task.id)}
+                        isDraft={isDraft || draftTaskIds.has(task.id)}
                         activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                         timelineDayWidth={timelineDayWidth}
                         timelineLeftInset={timelineLeftInset}

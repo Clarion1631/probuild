@@ -4,9 +4,10 @@ import { readFileSync } from "node:fs";
 import { Prisma } from "@prisma/client";
 
 import { prisma } from "../src/lib/prisma";
-import { getCompanyDashboardData, setProjectStartDate, shiftNotStartedTasks } from "../src/lib/schedule-core";
+import { getCompanyDashboardData, setProjectCrew, setProjectStartDate, setTaskCrew, shiftNotStartedTasks } from "../src/lib/schedule-core";
 import { canAccessProject, hasPermission } from "../src/lib/permissions";
 import { withTxRetry } from "../src/lib/tx-retry";
+import { saveCompanyScheduleTaskDatesAction } from "../src/lib/actions";
 
 type Check = [label: string, passed: boolean];
 
@@ -47,6 +48,7 @@ async function main() {
     const projectIds: string[] = [];
     const estimateIds: string[] = [];
     const invoiceIds: string[] = [];
+    const userIds: string[] = [];
     let clientId: string | null = null;
 
     try {
@@ -465,6 +467,134 @@ async function main() {
             && !["ADMIN", "MANAGER"].includes(authorizedFieldCrew.role));
         check("TEAM actor expression stays pinned to the authenticated caller", actionBody.includes('actor: { type: "TEAM", name: caller.name || caller.email }'));
 
+        // ── Owner-feedback round: crew ACTIVATED-added-only validation (fix 1),
+        // FINANCE exclusion + name disambiguation (fix 7), batch task-date save
+        // (fix 2) ──
+        const crewUsers = [
+            await prisma.user.create({ data: { email: `board-active-${tag}@example.invalid`, name: `Board Active ${tag}`, role: "FIELD_CREW", status: "ACTIVATED" } }),
+            await prisma.user.create({ data: { email: `board-pending-${tag}@example.invalid`, name: `Board Pending ${tag}`, role: "FIELD_CREW", status: "PENDING" } }),
+            await prisma.user.create({ data: { email: `board-legacy-${tag}@example.invalid`, name: `Board Legacy ${tag}`, role: "FIELD_CREW", status: "DISABLED" } }),
+            await prisma.user.create({ data: { email: `board-finance-${tag}@example.invalid`, name: `Board Finance ${tag}`, role: "FINANCE", status: "ACTIVATED" } }),
+            await prisma.user.create({ data: { email: `board-dupe-a-${tag}@example.invalid`, name: `Board Dupe ${tag}`, role: "FIELD_CREW", status: "ACTIVATED" } }),
+            await prisma.user.create({ data: { email: `board-dupe-b-${tag}@example.invalid`, name: `Board Dupe ${tag}`, role: "FIELD_CREW", status: "ACTIVATED" } }),
+        ];
+        userIds.push(...crewUsers.map(u => u.id));
+        const [activeUser, pendingUser, legacyUser, financeUser, dupeUserA, dupeUserB] = crewUsers;
+
+        const crewProject = await prisma.project.create({
+            data: {
+                name: `BOARD CREW VERIFY ${tag} DELETE ME`,
+                clientId: client.id,
+                status: "Waiting to Start",
+                startDate: at(20),
+                crew: { connect: [{ id: activeUser.id }, { id: legacyUser.id }] },
+            },
+        });
+        projectIds.push(crewProject.id);
+        const crewTask = await prisma.scheduleTask.create({
+            data: { projectId: crewProject.id, name: `Crew task ${tag}`, startDate: at(21), endDate: at(22), status: "Not Started" },
+        });
+        await prisma.taskAssignment.createMany({
+            data: [
+                { taskId: crewTask.id, userId: activeUser.id, role: "assigned" },
+                { taskId: crewTask.id, userId: legacyUser.id, role: "assigned" },
+            ],
+        });
+
+        const crewKeepResult = await setProjectCrew({ projectId: crewProject.id, userIds: [activeUser.id, legacyUser.id], actor });
+        check("setProjectCrew: keeping an already-assigned inactive member does not throw",
+            crewKeepResult.crew.length === 2 && crewKeepResult.crew.some(c => c.id === legacyUser.id));
+
+        const crewRemoveResult = await setProjectCrew({ projectId: crewProject.id, userIds: [activeUser.id], actor });
+        check("setProjectCrew: removing an inactive member never throws",
+            crewRemoveResult.crew.length === 1 && crewRemoveResult.crew[0].id === activeUser.id);
+
+        let addNonActivatedRejected = false;
+        try {
+            await setProjectCrew({ projectId: crewProject.id, userIds: [activeUser.id, pendingUser.id], actor });
+        } catch (error) {
+            addNonActivatedRejected = /ACTIVATED/i.test(String((error as Error).message));
+        }
+        const crewAfterAddReject = await prisma.project.findUniqueOrThrow({ where: { id: crewProject.id }, select: { crew: { select: { id: true } } } });
+        check("setProjectCrew: adding a NEW non-ACTIVATED user still rejects, existing crew untouched",
+            addNonActivatedRejected && crewAfterAddReject.crew.length === 1 && crewAfterAddReject.crew[0].id === activeUser.id);
+
+        const taskKeepResult = await setTaskCrew({ taskId: crewTask.id, userIds: [activeUser.id, legacyUser.id], actor });
+        check("setTaskCrew: keeping an already-assigned inactive member does not throw",
+            taskKeepResult.assignments.length === 2 && taskKeepResult.assignments.some(a => a.userId === legacyUser.id));
+
+        const taskRemoveResult = await setTaskCrew({ taskId: crewTask.id, userIds: [activeUser.id], actor });
+        check("setTaskCrew: removing an inactive member never throws",
+            taskRemoveResult.assignments.length === 1 && taskRemoveResult.assignments[0].userId === activeUser.id);
+
+        let taskAddNonActivatedRejected = false;
+        try {
+            await setTaskCrew({ taskId: crewTask.id, userIds: [activeUser.id, pendingUser.id], actor });
+        } catch (error) {
+            taskAddNonActivatedRejected = /ACTIVATED/i.test(String((error as Error).message));
+        }
+        const taskAssignmentsAfterReject = await prisma.taskAssignment.findMany({ where: { taskId: crewTask.id } });
+        check("setTaskCrew: adding a NEW non-ACTIVATED user still rejects, existing assignments untouched",
+            taskAddNonActivatedRejected && taskAssignmentsAfterReject.length === 1 && taskAssignmentsAfterReject[0].userId === activeUser.id);
+
+        await prisma.project.update({ where: { id: crewProject.id }, data: { crew: { connect: [{ id: legacyUser.id }, { id: financeUser.id }] } } });
+        const dashboardForCrew = await getCompanyDashboardData({ role: "ADMIN" }, month);
+        check("teamMembers picker excludes FINANCE-role users", !(dashboardForCrew.teamMembers ?? []).some(u => u.id === financeUser.id));
+        const crewProjectRow = [...dashboardForCrew.pipeline.waitingToStart, ...dashboardForCrew.pipeline.scheduled]
+            .find(candidate => candidate.id === crewProject.id);
+        const financeCrewEntry = crewProjectRow?.crew.find(c => c.id === financeUser.id);
+        check("assigned FINANCE user still appears as a removable crew entry with role carried",
+            !!financeCrewEntry && financeCrewEntry.role === "FINANCE");
+        const inactiveCrewEntry = crewProjectRow?.crew.find(c => c.id === legacyUser.id);
+        check("assigned DISABLED user still appears as a removable crew entry", !!inactiveCrewEntry && inactiveCrewEntry.status !== "ACTIVATED");
+
+        const dupeEntries = (dashboardForCrew.teamMembers ?? []).filter(u => u.id === dupeUserA.id || u.id === dupeUserB.id);
+        check("teamMembers disambiguates identical display names with the email",
+            dupeEntries.length === 2 && dupeEntries.every(u => u.name.includes(u.email)) && dupeEntries[0].name !== dupeEntries[1].name);
+        const soloNamedEntry = (dashboardForCrew.teamMembers ?? []).find(u => u.id === activeUser.id);
+        check("teamMembers leaves unique display names unmodified",
+            soloNamedEntry?.name === (activeUser.name ?? activeUser.email) && !soloNamedEntry.name.includes("@"));
+
+        const scheduleCoreCrewStart = scheduleCoreSource.indexOf("export async function setProjectCrew");
+        const scheduleCoreCrewEnd = scheduleCoreSource.indexOf("export interface CrewConflictPair", scheduleCoreCrewStart);
+        const scheduleCoreCrewBody = scheduleCoreSource.slice(scheduleCoreCrewStart, scheduleCoreCrewEnd);
+        check("source validates ACTIVATED only for users being added to project crew",
+            scheduleCoreCrewBody.includes("toConnect.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));
+        const scheduleCoreTaskCrewStart = scheduleCoreSource.indexOf("export async function setTaskCrew");
+        const scheduleCoreTaskCrewBody = scheduleCoreSource.slice(scheduleCoreTaskCrewStart);
+        check("source validates ACTIVATED only for users being added to task crew",
+            scheduleCoreTaskCrewBody.includes("toAdd.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));
+        check("teamMembers query excludes FINANCE role", scheduleCoreSource.includes('role: { not: "FINANCE" }'));
+
+        // Batch task-date save (fix 2) — ADMIN/MANAGER gated, loops the ONE
+        // canonical updateScheduleTask (not a second mutation core), isolates
+        // per-task failures, and reports per-task results.
+        const batchActionStart = actionsSource.indexOf("export async function saveCompanyScheduleTaskDatesAction");
+        const batchActionEnd = actionsSource.indexOf("export async function updateProjectColor", batchActionStart);
+        const batchActionBody = actionsSource.slice(batchActionStart, batchActionEnd);
+        check("saveCompanyScheduleTaskDatesAction exists and is ADMIN/MANAGER gated",
+            batchActionStart >= 0 && batchActionBody.includes('["ADMIN", "MANAGER"].includes(caller.role)'));
+        check("saveCompanyScheduleTaskDatesAction loops the canonical updateScheduleTask exactly once per change (not a second mutation core)",
+            (batchActionBody.match(/updateScheduleTask\(/g) ?? []).length === 1
+            && batchActionBody.includes("for (const change of changes)"));
+        check("saveCompanyScheduleTaskDatesAction isolates per-task failures and reports per-task ok/succeeded/failed results",
+            batchActionBody.includes("try {") && batchActionBody.includes("catch (err")
+            && batchActionBody.includes("ok: true") && batchActionBody.includes("ok: false")
+            && batchActionBody.includes("succeeded:") && batchActionBody.includes("failed:"));
+
+        let batchActionRan = false;
+        let batchActionErr = "";
+        try {
+            const batchResult = await saveCompanyScheduleTaskDatesAction([{ taskId: crewTask.id, startDate: "2040-06-01", endDate: "2040-06-02" }]);
+            batchActionRan = true;
+            check("saveCompanyScheduleTaskDatesAction returns per-task results when it runs in a request scope",
+                Array.isArray(batchResult.results) && typeof batchResult.succeeded === "number" && typeof batchResult.failed === "number");
+        } catch (error) {
+            batchActionErr = String((error as Error)?.message ?? error);
+        }
+        check("saveCompanyScheduleTaskDatesAction is reachable (runs, or hits the expected script auth wall outside a request scope)",
+            batchActionRan || /Unauthorized|Forbidden|outside a request scope|headers/i.test(batchActionErr));
+
         const boardSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/ScheduleBoard.tsx", import.meta.url), "utf8");
         const monthSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/MonthBarsView.tsx", import.meta.url), "utf8");
         const timelineSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TimelineView.tsx", import.meta.url), "utf8");
@@ -494,21 +624,25 @@ async function main() {
             if (projectIds.length > 0) {
                 await prisma.project.deleteMany({ where: { id: { in: projectIds } } });
             }
+            if (userIds.length > 0) {
+                await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+            }
             if (clientId) {
                 await prisma.client.deleteMany({ where: { id: clientId } });
             }
 
-            const [projectsLeft, estimatesLeft, invoicesLeft, clientLeft] = await Promise.all([
+            const [projectsLeft, estimatesLeft, invoicesLeft, usersLeft, clientLeft] = await Promise.all([
                 prisma.project.count({ where: { id: { in: projectIds } } }),
                 prisma.estimate.count({ where: { id: { in: estimateIds } } }),
                 prisma.invoice.count({ where: { id: { in: invoiceIds } } }),
+                prisma.user.count({ where: { id: { in: userIds } } }),
                 clientId ? prisma.client.count({ where: { id: clientId } }) : Promise.resolve(0),
             ]);
-            cleanupPassed = projectsLeft === 0 && estimatesLeft === 0 && invoicesLeft === 0 && clientLeft === 0;
+            cleanupPassed = projectsLeft === 0 && estimatesLeft === 0 && invoicesLeft === 0 && usersLeft === 0 && clientLeft === 0;
         } catch (error) {
             console.error("Fixture cleanup error:", error);
         }
-        check("fixture cleanup removed collected client/project/estimate/invoice IDs", cleanupPassed);
+        check("fixture cleanup removed collected client/project/estimate/invoice/user IDs", cleanupPassed);
     }
 
     let failures = 0;
