@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
     assignMonthProjectLanes,
     assignProjectLanes,
+    assignTaskLanes,
     clipRange,
     getEffectiveProjectRange,
     segmentProjectRange,
@@ -76,6 +77,13 @@ assert.deepEqual(preview.tasks.map(task => [task.startDate, task.endDate]), [
 assert.equal(new Date(preview.tasks[0].endDate).getTime() - new Date(preview.tasks[0].startDate).getTime(), 3 * 86_400_000);
 const unscheduledPreview = previewProjectMove({ ...project, id: "p-unscheduled", startDate: null, tasks: [] }, "2037-03-15");
 assert.equal(unscheduledPreview.startDate, "2037-03-15");
+// In Progress preview moves the start marker ONLY (owner-decided semantics):
+// neither save choice shifts started work, and the "also shift" choice is
+// consented to in the dialog — the preview never promises more than the
+// guaranteed minimum.
+const inProgressPreview = previewProjectMove({ ...project, id: "p-in-progress", status: "In Progress", startDate: "2037-01-03T00:00:00.000Z" }, "2037-03-15");
+assert.equal(inProgressPreview.startDate, "2037-03-15");
+assert.deepEqual(inProgressPreview.tasks, project.tasks, "In Progress preview must not shift tasks");
 
 type TaskEditMode = import("../src/app/company-dashboard/schedule-board/useBarLayout").TaskEditMode;
 const taskEditModes: TaskEditMode[] = ["move", "resize-left", "resize-right"];
@@ -367,4 +375,32 @@ const milestoneOnlyDays = new Map(Array.from({ length: 5 }, (_, index) => [`m${i
 const milestoneOnlyLanes = assignMonthProjectLanes(new Map(), milestoneOnlyDays, laneGridStart, laneGridEnd);
 assert.equal(milestoneOnlyLanes.visibleMilestoneHosts.length, 4);
 assert.deepEqual(milestoneOnlyLanes.hiddenProjectIdsByWeek.get(3), ["m4"]);
+// Item 5: overlapping mini-lanes inside one project bar (concrete + deck run
+// concurrently) — capped at MAX_TASK_LANES, greedy interval-partition.
+const laneDay = (n: number) => new Date(Date.UTC(2038, 0, n));
+const nonOverlapping = assignTaskLanes([
+    { id: "a", start: laneDay(1), end: laneDay(3) },
+    { id: "b", start: laneDay(3), end: laneDay(5) },
+]);
+assert.deepEqual([...nonOverlapping.laneByTaskId.entries()].sort(), [["a", 0], ["b", 0]], "back-to-back tasks share lane 0");
+assert.equal(nonOverlapping.laneCount, 1);
+assert.deepEqual(nonOverlapping.hiddenTaskIds, []);
+
+const twoOverlapping = assignTaskLanes([
+    { id: "concrete", start: laneDay(1), end: laneDay(5) },
+    { id: "deck", start: laneDay(2), end: laneDay(6) },
+]);
+assert.deepEqual([...twoOverlapping.laneByTaskId.entries()].sort(), [["concrete", 0], ["deck", 1]]);
+assert.equal(twoOverlapping.laneCount, 2);
+
+const fourOverlapping = assignTaskLanes([
+    { id: "t1", start: laneDay(1), end: laneDay(10) },
+    { id: "t2", start: laneDay(1), end: laneDay(10) },
+    { id: "t3", start: laneDay(1), end: laneDay(10) },
+    { id: "t4", start: laneDay(1), end: laneDay(10) },
+]);
+assert.equal(fourOverlapping.laneCount, 3, "lane assignment caps at MAX_TASK_LANES");
+assert.equal(fourOverlapping.hiddenTaskIds.length, 1, "the 4th concurrent task is reported hidden for the +N chip");
+assert.deepEqual([...fourOverlapping.laneByTaskId.values()].sort(), [0, 1, 2]);
+
 console.log("schedule-board layout verification: PASS");

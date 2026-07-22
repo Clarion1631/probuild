@@ -48,6 +48,9 @@ export interface PipelineCrewMember {
     // User status (PENDING/ACTIVATED/DISABLED) — the dashboard picker renders
     // assigned non-ACTIVATED members as removable "(inactive)" entries.
     status: string;
+    // User role — the picker renders an assigned FINANCE user (excluded from
+    // the pickable teamMembers list) as a removable "(finance)" entry.
+    role: string;
 }
 
 export interface PipelineProject {
@@ -109,7 +112,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             select: {
                 id: true, name: true, status: true, startDate: true, color: true,
                 client: { select: { name: true } },
-                crew: { select: { id: true, name: true, email: true, status: true } },
+                crew: { select: { id: true, name: true, email: true, status: true, role: true } },
                 estimates: {
                     where: { status: { in: CONTRACT_ESTIMATE_STATUSES } },
                     orderBy: { createdAt: "desc" },
@@ -128,7 +131,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         startDate: p.startDate ? p.startDate.toISOString() : null,
         color: p.color,
         contractValue: p.estimates[0] ? Number(p.estimates[0].totalAmount) : null,
-        crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status })),
+        crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status, role: u.role })),
     });
 
     const waitingToStart: PipelineProject[] = [];
@@ -1377,14 +1380,18 @@ export async function setProjectCrew(input: {
         const byId = new Map(users.map(u => [u.id, u]));
         const missing = wanted.filter(id => !byId.has(id));
         if (missing.length > 0) throw new Error(`Unknown user id(s): ${missing.join(", ")}`);
-        const notActivated = users.filter(u => u.status !== "ACTIVATED");
-        if (notActivated.length > 0) {
-            throw new Error(`Crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
-        }
 
         const current = project.crew.map(u => u.id);
         const toConnect = wanted.filter(id => !current.includes(id));
         const toDisconnect = current.filter(id => !wanted.includes(id));
+
+        // ACTIVATED is required only for users being ADDED — a project already
+        // carrying a legacy inactive/finance crew member (kept or removed) must
+        // never throw; only a NEW non-ACTIVATED addition is rejected.
+        const notActivated = toConnect.map(id => byId.get(id)!).filter(u => u.status !== "ACTIVATED");
+        if (notActivated.length > 0) {
+            throw new Error(`Crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
+        }
         await tx.project.update({
             where: { id: input.projectId },
             data: {
@@ -1840,6 +1847,7 @@ export interface DashboardTaskAssignment {
     userId: string;
     name: string;
     status: string;
+    role: string;
 }
 
 export interface DashboardTaskRow {
@@ -2077,7 +2085,7 @@ export async function getCompanyDashboardData(
                 id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
-                    select: { id: true, userId: true, user: { select: { name: true, email: true, status: true } } },
+                    select: { id: true, userId: true, user: { select: { name: true, email: true, status: true, role: true } } },
                 },
             },
         }),
@@ -2103,6 +2111,7 @@ export async function getCompanyDashboardData(
                 userId: a.userId,
                 name: a.user.name || a.user.email,
                 status: a.user.status,
+                role: a.user.role,
             })),
         });
         tasksByProject.set(task.projectId, rows);
@@ -2116,14 +2125,25 @@ export async function getCompanyDashboardData(
         unappliedChangeOrders: unappliedByProject[p.id] ?? { count: 0, items: [] },
     });
 
-    // Picker list is pre-filtered to ACTIVATED (getTeamMembers stays unchanged
-    // for other callers) and only sent to roles that can edit.
-    const teamMembers = canEdit
-        ? (await prisma.user.findMany({
-            where: { status: "ACTIVATED" },
+    // Picker list is pre-filtered to ACTIVATED, non-FINANCE (getTeamMembers
+    // stays unchanged for other callers) and only sent to roles that can edit
+    // — bookkeeper accounts must never be offered as job crew. Display names
+    // that collide (e.g. two "Justin Adkins" accounts) get their email
+    // appended so the picker stays unambiguous.
+    const teamMembersRaw = canEdit
+        ? await prisma.user.findMany({
+            where: { status: "ACTIVATED", role: { not: "FINANCE" } },
             orderBy: { name: "asc" },
             select: { id: true, name: true, email: true },
-        })).map(u => ({ id: u.id, name: u.name || u.email, email: u.email }))
+        })
+        : [];
+    const teamMembers = canEdit
+        ? (() => {
+            const rows = teamMembersRaw.map(u => ({ id: u.id, name: u.name || u.email, email: u.email }));
+            const nameCounts = new Map<string, number>();
+            for (const r of rows) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1);
+            return rows.map(r => (nameCounts.get(r.name)! > 1 ? { ...r, name: `${r.name} (${r.email})` } : r));
+        })()
         : null;
 
     // Money redaction for schedules-only viewers: null out pipeline dollar
@@ -2738,14 +2758,18 @@ export async function setTaskCrew(input: {
         const byId = new Map(users.map(u => [u.id, u]));
         const missing = wanted.filter(id => !byId.has(id));
         if (missing.length > 0) throw new Error(`Unknown user id(s): ${missing.join(", ")}`);
-        const notActivated = users.filter(u => u.status !== "ACTIVATED");
-        if (notActivated.length > 0) {
-            throw new Error(`Task crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
-        }
 
         const current = task.assignments.map(a => a.userId);
         const toAdd = wanted.filter(id => !current.includes(id));
         const toRemove = current.filter(id => !wanted.includes(id));
+
+        // ACTIVATED is required only for users being ADDED — same added-only
+        // rule as setProjectCrew, so a task already carrying an inactive
+        // assignee never blocks unrelated edits.
+        const notActivated = toAdd.map(id => byId.get(id)!).filter(u => u.status !== "ACTIVATED");
+        if (notActivated.length > 0) {
+            throw new Error(`Task crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
+        }
         if (toRemove.length > 0) {
             await tx.taskAssignment.deleteMany({ where: { taskId: input.taskId, userId: { in: toRemove } } });
         }
