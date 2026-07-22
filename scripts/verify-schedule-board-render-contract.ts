@@ -56,7 +56,7 @@ const saveAllDraftsStart = boardSource.indexOf("async function saveAllDrafts()")
 const saveAllDraftsEnd = boardSource.indexOf("function cancelProjectEditsForProjects", saveAllDraftsStart);
 const saveAllDraftsBody = boardSource.slice(saveAllDraftsStart, saveAllDraftsEnd);
 assert.ok(saveAllDraftsStart >= 0, "saveAllDrafts must exist");
-assert.match(saveAllDraftsBody, /saveCompanyScheduleTaskDatesAction\(changes\.slice\(offset, offset \+ 200\)\)/, "Save batches task changes through the one canonical action, chunked to the server cap");
+assert.match(saveAllDraftsBody, /const chunk = changes\.slice\(offset, offset \+ 200\);\s*\n\s*try \{\s*\n\s*const batchResult = await saveCompanyScheduleTaskDatesAction\(chunk\)/, "Save batches task changes through the one canonical action, chunked to the server cap with per-chunk isolation");
 assert.match(saveAllDraftsBody, /updateProjectStartDateAction\(/);
 assert.match(saveAllDraftsBody, /shiftNotStartedTasksAction\(/);
 assert.equal((saveAllDraftsBody.match(/router\.refresh\(\)/g) ?? []).length, 1, "exactly one router.refresh() after the whole batch settles");
@@ -127,6 +127,10 @@ assert.match(boardSource, /Object\.entries\(current\)\.filter\(\(\[taskId\]\) =>
 assert.match(boardSource, /-previousDelta/, "cancelling a project draft must undo its task-draft rebase");
 assert.match(boardSource, /failedProjectIds\.has\(projectId\)/, "task drafts of failed project shifts must be retained, not batched");
 assert.match(boardSource, /changes\.slice\(offset, offset \+ 200\)/, "client saves chunk to the server's 200 cap");
+assert.match(boardSource, /function clearTaskPreview\(taskId: string\) \{\n[^}]*if \(awaitingTaskRefreshIds\.has\(taskId\)\) return;/, "cancelling a speculative edit must never delete a saved-awaiting override");
+assert.match(boardSource, /const shiftedById = new Map\(shiftedPersistedDates\.map\(row => \[row\.id, row\]\)\)/, "successful shifts must rewrite saved-awaiting overrides to the persisted dates");
+assert.match(boardSource, /catch \(chunkError: any\) \{/, "chunk failures are isolated per chunk");
+assert.match(boardSource, /chunk\.map\(change => \(\{ taskId: change\.taskId, ok: false as const, error: message \}\)\)/, "a rejected chunk synthesizes failures for its own tasks only");
 assert.match(boardSource, /const markerResult = await updateProjectStartDateAction\(projectId, draft\.targetStart, false\);\s*\n\s*const shiftResult = await shiftNotStartedTasksAction\(projectId, draft\.deltaDays\)/, "In Progress shift choice moves the marker AND the not-started work");
 assert.match(popoverSource, /VIEWPORT_MARGIN_PX/);
 assert.match(projectBarSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);

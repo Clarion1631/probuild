@@ -270,6 +270,10 @@ export function ScheduleBoard({
     }
 
     function clearTaskPreview(taskId: string) {
+        // A saved-awaiting task's override IS its committed state pending
+        // refresh — cancelling a speculative edit must restore it, never
+        // delete it (deleting strands the awaiting id and the refresh poll).
+        if (awaitingTaskRefreshIds.has(taskId)) return;
         setTaskDateOverrides(current => {
             if (!(taskId in current)) return current;
             const next = { ...current };
@@ -570,6 +574,10 @@ export function ScheduleBoard({
         const succeededProjectIds: string[] = [];
         const failedProjectIds = new Set<string>();
         const projectExpectations: Record<string, ProjectRefreshExpectation> = {};
+        // Persisted task dates from successful shifts — saved-awaiting tasks
+        // caught in a shift must have their pinned overrides rewritten to the
+        // shifted dates or their awaiting ids can never reconcile.
+        const shiftedPersistedDates: { id: string; startDate: string; endDate: string }[] = [];
 
         for (const [projectId, draft] of projectEntries) {
             const canonicalProject = canonicalProjectById.get(projectId);
@@ -597,6 +605,7 @@ export function ScheduleBoard({
                         // the job follows the drag; started work stays put.
                         const markerResult = await updateProjectStartDateAction(projectId, draft.targetStart, false);
                         const shiftResult = await shiftNotStartedTasksAction(projectId, draft.deltaDays);
+                        shiftedPersistedDates.push(...shiftResult.shiftedTaskDates);
                         projectExpectations[projectId] = {
                             projectStartDate: markerResult.startDate,
                             taskDates: shiftResult.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)),
@@ -604,6 +613,7 @@ export function ScheduleBoard({
                     }
                 } else {
                     const result = await updateProjectStartDateAction(projectId, draft.targetStart, true);
+                    shiftedPersistedDates.push(...result.shiftedTaskDates);
                     projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
                 }
                 succeededProjectIds.push(projectId);
@@ -617,6 +627,21 @@ export function ScheduleBoard({
             const succeeded = new Set(succeededProjectIds);
             setProjectDrafts(current => Object.fromEntries(Object.entries(current).filter(([id]) => !succeeded.has(id))));
             setProjectRefreshExpectations(current => ({ ...current, ...projectExpectations }));
+            // Rewrite saved-awaiting overrides that a shift just moved: their
+            // pinned dates must track the PERSISTED (shifted) dates or their
+            // awaiting ids never match refreshed canonical rows.
+            const shiftedById = new Map(shiftedPersistedDates.map(row => [row.id, row]));
+            setTaskDateOverrides(current => {
+                let changed = false;
+                const next = { ...current };
+                for (const taskId of awaitingTaskRefreshIds) {
+                    const shifted = shiftedById.get(taskId);
+                    if (!shifted || !(taskId in next)) continue;
+                    next[taskId] = { startDate: shifted.startDate.slice(0, 10), endDate: shifted.endDate.slice(0, 10) };
+                    changed = true;
+                }
+                return changed ? next : current;
+            });
         }
 
         let failedTaskNames: string[] = [];
@@ -633,11 +658,20 @@ export function ScheduleBoard({
             const changes = sendableTaskEntries.map(([taskId, dates]) => ({ taskId, startDate: dates.startDate, endDate: dates.endDate }));
             try {
                 // Chunked to the server's 200-change cap so any draft count
-                // saves in one gesture.
+                // saves in one gesture. Failures are isolated PER CHUNK: a
+                // rejected chunk synthesizes failure rows for its own tasks
+                // only — earlier chunks' successes are never discarded or
+                // retried as if unsaved.
                 const allResults = [] as Awaited<ReturnType<typeof saveCompanyScheduleTaskDatesAction>>["results"];
                 for (let offset = 0; offset < changes.length; offset += 200) {
-                    const batchResult = await saveCompanyScheduleTaskDatesAction(changes.slice(offset, offset + 200));
-                    allResults.push(...batchResult.results);
+                    const chunk = changes.slice(offset, offset + 200);
+                    try {
+                        const batchResult = await saveCompanyScheduleTaskDatesAction(chunk);
+                        allResults.push(...batchResult.results);
+                    } catch (chunkError: any) {
+                        const message = chunkError?.message ?? "Save failed";
+                        allResults.push(...chunk.map(change => ({ taskId: change.taskId, ok: false as const, error: message })));
+                    }
                 }
                 const succeededRows = allResults.filter(row => row.ok);
                 failedTaskNames = allResults
