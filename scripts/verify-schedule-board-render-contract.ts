@@ -111,7 +111,12 @@ assert.match(popoverSource, /createPortal\(/);
 assert.match(popoverSource, /document\.body/);
 assert.match(popoverSource, /event\.key !== "Escape"/);
 assert.match(popoverSource, /anchorRef\.current\?\.focus\(\)/);
-assert.match(popoverSource, /flipAbove/);
+// Vertical placement must handle the neither-side-fits case (open on the
+// larger side, capped + scrollable) and the horizontal floor must be applied
+// last so narrow viewports pin to the margin instead of going negative.
+assert.match(popoverSource, /openAbove/);
+assert.match(popoverSource, /maxHeight: effectiveHeight/);
+assert.match(popoverSource, /Math\.max\(Math\.min\(left, viewportWidth - panelWidth - VIEWPORT_MARGIN_PX\), VIEWPORT_MARGIN_PX\)/);
 assert.match(popoverSource, /VIEWPORT_MARGIN_PX/);
 assert.match(projectBarSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);
 assert.match(taskBlockSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);

@@ -203,7 +203,13 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
-    const draftTaskIds = useMemo(() => new Set(Object.keys(taskDateOverrides)), [taskDateOverrides]);
+    // A saved-but-not-yet-refreshed task keeps its override (pinned to the
+    // persisted dates) purely for rendering/reconciliation — it is NOT an
+    // unsaved draft and must not count toward or re-enter a Save.
+    const draftTaskIds = useMemo(
+        () => new Set(Object.keys(taskDateOverrides).filter(taskId => !awaitingTaskRefreshIds.has(taskId))),
+        [taskDateOverrides, awaitingTaskRefreshIds],
+    );
     const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
     const draftCount = draftTaskIds.size + draftProjectIds.size;
 
@@ -421,6 +427,11 @@ export function ScheduleBoard({
             clearTaskPreview(taskId);
             return;
         }
+        // Re-editing a saved-awaiting task turns it back into a live draft.
+        setAwaitingTaskRefreshIds(current => {
+            if (!current.has(taskId)) return current;
+            return new Set([...current].filter(id => id !== taskId));
+        });
         setTaskPreview(taskId, normalizedDates);
     }
 
@@ -437,6 +448,25 @@ export function ScheduleBoard({
             return;
         }
         setProjectPreview(canonicalProject, intent.targetStart);
+        // Rebase this project's existing task drafts by the CHANGE in project
+        // delta (full-shift projects only — the preview shifts their tasks, so
+        // a task drafted at X before a +D project drag must follow to X+D or
+        // Save would write the stale pre-shift date over the shifted schedule).
+        // In Progress previews never move tasks, so their drafts stay absolute.
+        if (canonicalProject.status !== "In Progress") {
+            const previousDelta = projectDrafts[project.id]?.deltaDays ?? 0;
+            const deltaChange = intent.deltaDays - previousDelta;
+            if (deltaChange !== 0) {
+                const projectTaskIds = new Set(canonicalProject.tasks.map(task => task.id));
+                setTaskDateOverrides(current => Object.fromEntries(Object.entries(current).map(([taskId, dates]) => {
+                    if (!projectTaskIds.has(taskId)) return [taskId, dates];
+                    return [taskId, {
+                        startDate: formatDate(addDays(parseUTCDate(dates.startDate), deltaChange)),
+                        endDate: formatDate(addDays(parseUTCDate(dates.endDate), deltaChange)),
+                    }];
+                })));
+            }
+        }
         setProjectDrafts(current => ({
             ...current,
             [project.id]: { originalStart: intent.originalStart, targetStart: intent.targetStart, deltaDays: intent.deltaDays },
@@ -475,9 +505,30 @@ export function ScheduleBoard({
     // router.refresh() fires, after everything settles.
     async function saveAllDrafts() {
         if (isSaving) return;
-        const projectEntries = Object.entries(projectDrafts);
-        const taskEntries = Object.entries(taskDateOverrides);
+        // Drafts on a project the legacy StartDateRow is mutating RIGHT NOW are
+        // retained (not sent) — the board must never serialize over a sibling
+        // writer's in-flight result. They save on the next click.
+        const retainedForExternalLock: string[] = [];
+        const projectEntries = Object.entries(projectDrafts).filter(([projectId]) => {
+            if (!isProjectExternallyPending(projectId)) return true;
+            retainedForExternalLock.push(canonicalProjectById.get(projectId)?.name ?? projectId);
+            return false;
+        });
+        const taskEntries = Object.entries(taskDateOverrides).filter(([taskId]) => {
+            if (awaitingTaskRefreshIds.has(taskId)) return false; // already saved, awaiting refresh
+            const projectId = canonicalTaskProjectById.get(taskId);
+            if (!projectId || !isProjectExternallyPending(projectId)) return true;
+            retainedForExternalLock.push(canonicalTaskById.get(taskId)?.name ?? taskId);
+            return false;
+        });
+        if (retainedForExternalLock.length > 0) {
+            toast.info(`${retainedForExternalLock.length} draft${retainedForExternalLock.length === 1 ? "" : "s"} kept unsaved while another edit finishes: ${retainedForExternalLock.join(", ")}`);
+        }
         if (projectEntries.length === 0 && taskEntries.length === 0) return;
+        // The batch below reconciles these tasks itself (override + awaiting
+        // id); project-shift expectations must not also claim them or the two
+        // mechanisms deadlock the refresh poll on conflicting dates.
+        const batchedTaskIds = new Set(taskEntries.map(([taskId]) => taskId));
 
         setIsSaving(true);
         const lockedProjectIds = new Set<string>([
@@ -513,11 +564,11 @@ export function ScheduleBoard({
                         projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: [] };
                     } else {
                         const result = await shiftNotStartedTasksAction(projectId, draft.deltaDays);
-                        projectExpectations[projectId] = { taskDates: result.shiftedTaskDates };
+                        projectExpectations[projectId] = { taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
                     }
                 } else {
                     const result = await updateProjectStartDateAction(projectId, draft.targetStart, true);
-                    projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: result.shiftedTaskDates };
+                    projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
                 }
                 succeededProjectIds.push(projectId);
             } catch (error) {
@@ -537,15 +588,26 @@ export function ScheduleBoard({
             const changes = taskEntries.map(([taskId, dates]) => ({ taskId, startDate: dates.startDate, endDate: dates.endDate }));
             try {
                 const batchResult = await saveCompanyScheduleTaskDatesAction(changes);
-                const succeededTaskIds = batchResult.results.filter(row => row.ok).map(row => row.taskId);
+                const succeededRows = batchResult.results.filter(row => row.ok);
                 failedTaskNames = batchResult.results
                     .filter(row => !row.ok)
                     .map(row => canonicalTaskById.get(row.taskId)?.name ?? row.taskId);
-                succeededTaskCount = succeededTaskIds.length;
-                if (succeededTaskIds.length > 0) {
-                    const succeeded = new Set(succeededTaskIds);
-                    setTaskDateOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !succeeded.has(id))));
-                    setAwaitingTaskRefreshIds(current => new Set([...current, ...succeededTaskIds]));
+                succeededTaskCount = succeededRows.length;
+                if (succeededRows.length > 0) {
+                    // Keep the override (pinned to the PERSISTED dates) until the
+                    // refresh poll sees matching canonical rows — reconciliation
+                    // requires the override to exist; deleting it here would
+                    // leave awaiting ids stranded and the poll running forever.
+                    const savedById = new Map(succeededRows.map(row => [row.taskId, {
+                        startDate: row.startDate!.slice(0, 10),
+                        endDate: row.endDate!.slice(0, 10),
+                    }]));
+                    setTaskDateOverrides(current => {
+                        const next = { ...current };
+                        for (const [taskId, dates] of savedById) next[taskId] = dates;
+                        return next;
+                    });
+                    setAwaitingTaskRefreshIds(current => new Set([...current, ...savedById.keys()]));
                 }
             } catch (error) {
                 failedTaskNames = taskEntries.map(([taskId]) => canonicalTaskById.get(taskId)?.name ?? taskId);

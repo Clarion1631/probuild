@@ -26,7 +26,7 @@ export interface FloatingPopoverProps {
  */
 export function FloatingPopover({ open, anchorRef, onClose, children, width = 224 }: FloatingPopoverProps) {
     const panelRef = useRef<HTMLDivElement | null>(null);
-    const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+    const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
     useLayoutEffect(() => {
         if (!open) {
@@ -43,14 +43,26 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
             const panelWidth = panelRef.current?.offsetWidth ?? width;
             const panelHeight = panelRef.current?.offsetHeight ?? 0;
 
+            // Clamp order matters: the left-edge floor is applied LAST so a
+            // viewport narrower than the panel pins to the margin instead of
+            // going negative off-screen.
             let left = rect.right - panelWidth;
-            left = Math.min(Math.max(left, VIEWPORT_MARGIN_PX), viewportWidth - panelWidth - VIEWPORT_MARGIN_PX);
+            left = Math.max(Math.min(left, viewportWidth - panelWidth - VIEWPORT_MARGIN_PX), VIEWPORT_MARGIN_PX);
 
-            const spaceBelow = viewportHeight - rect.bottom;
-            const flipAbove = spaceBelow < panelHeight + ANCHOR_GAP_PX && rect.top > panelHeight + ANCHOR_GAP_PX;
-            const top = flipAbove ? rect.top - panelHeight - ANCHOR_GAP_PX : rect.bottom + ANCHOR_GAP_PX;
+            const spaceBelow = viewportHeight - rect.bottom - ANCHOR_GAP_PX - VIEWPORT_MARGIN_PX;
+            const spaceAbove = rect.top - ANCHOR_GAP_PX - VIEWPORT_MARGIN_PX;
+            // Fit below if possible, else above if possible, else whichever
+            // side has more room — capped to that room and scrollable inside.
+            const fitsBelow = spaceBelow >= panelHeight;
+            const fitsAbove = spaceAbove >= panelHeight;
+            const openAbove = !fitsBelow && (fitsAbove || spaceAbove > spaceBelow);
+            const available = Math.max(openAbove ? spaceAbove : spaceBelow, 120);
+            const effectiveHeight = Math.min(panelHeight, available);
+            const top = openAbove
+                ? Math.max(rect.top - effectiveHeight - ANCHOR_GAP_PX, VIEWPORT_MARGIN_PX)
+                : rect.bottom + ANCHOR_GAP_PX;
 
-            setPosition({ top, left });
+            setPosition({ top, left, maxHeight: effectiveHeight });
         }
         place();
         window.addEventListener("resize", place);
@@ -92,6 +104,8 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
                 position: "fixed",
                 top: position?.top ?? -9999,
                 left: position?.left ?? -9999,
+                maxHeight: position?.maxHeight,
+                overflowY: "auto",
                 width,
                 visibility: position ? "visible" : "hidden",
             }}

@@ -7340,9 +7340,13 @@ export async function saveCompanyScheduleTaskDatesAction(
         ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
         : null;
     if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    if (changes.length > 200) throw new Error("Too many schedule changes in one save (max 200) — save in smaller batches");
+    // Deterministic dedupe: the LAST occurrence of a taskId wins and is applied
+    // exactly once (no duplicate activity records or inflated success counts).
+    const deduped = [...new Map(changes.map(change => [change.taskId, change])).values()];
 
     const results: SaveCompanyScheduleTaskDateResult[] = [];
-    for (const change of changes) {
+    for (const change of deduped) {
         try {
             const task = await updateScheduleTask(change.taskId, {
                 startDate: change.startDate,

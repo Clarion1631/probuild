@@ -574,9 +574,11 @@ async function main() {
         const batchActionBody = actionsSource.slice(batchActionStart, batchActionEnd);
         check("saveCompanyScheduleTaskDatesAction exists and is ADMIN/MANAGER gated",
             batchActionStart >= 0 && batchActionBody.includes('["ADMIN", "MANAGER"].includes(caller.role)'));
-        check("saveCompanyScheduleTaskDatesAction loops the canonical updateScheduleTask exactly once per change (not a second mutation core)",
+        check("saveCompanyScheduleTaskDatesAction loops the canonical updateScheduleTask exactly once per deduped change (not a second mutation core)",
             (batchActionBody.match(/updateScheduleTask\(/g) ?? []).length === 1
-            && batchActionBody.includes("for (const change of changes)"));
+            && batchActionBody.includes("for (const change of deduped)")
+            && batchActionBody.includes("changes.length > 200")
+            && batchActionBody.includes("new Map(changes.map(change => [change.taskId, change]))"));
         check("saveCompanyScheduleTaskDatesAction isolates per-task failures and reports per-task ok/succeeded/failed results",
             batchActionBody.includes("try {") && batchActionBody.includes("catch (err")
             && batchActionBody.includes("ok: true") && batchActionBody.includes("ok: false")
