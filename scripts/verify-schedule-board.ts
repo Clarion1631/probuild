@@ -28,6 +28,9 @@ function withoutTaskDates(value: Record<string, unknown>): string {
     const rest = { ...value };
     delete rest.startDate;
     delete rest.endDate;
+    // updatedAt legitimately advances on a shift (raw UPDATE sets NOW() to
+    // preserve @updatedAt semantics) — asserted separately, not as identity.
+    delete rest.updatedAt;
     return snapshot(rest);
 }
 
@@ -289,6 +292,14 @@ async function main() {
         }
         check("fractional delta rejects", fractionalRejected);
 
+        let oversizedRejected = false;
+        try {
+            await shiftNotStartedTasks({ projectId: project.id, deltaDays: 366, actor });
+        } catch (error) {
+            oversizedRejected = /cannot exceed 365/i.test(String((error as Error).message));
+        }
+        check("delta beyond 365 days rejects", oversizedRejected);
+
         const projectBefore = snapshot(await prisma.project.findUniqueOrThrow({ where: { id: project.id } }));
         const notStartedBefore = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: notStarted.id } });
         const milestoneTaskBefore = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: milestoneTask.id } });
@@ -323,6 +334,8 @@ async function main() {
             && milestoneTaskAfter.endDate.getTime() === at(7).getTime()
             && milestoneTaskAfter.endDate.getTime() - milestoneTaskAfter.startDate.getTime() === milestoneTaskBefore.endDate.getTime() - milestoneTaskBefore.startDate.getTime()
             && withoutTaskDates(milestoneTaskAfter as unknown as Record<string, unknown>) === withoutTaskDates(milestoneTaskBefore as unknown as Record<string, unknown>));
+        check("shifted task updatedAt advances", new Date(String(notStartedAfter.updatedAt)).getTime() > new Date(String(notStartedBefore.updatedAt)).getTime()
+            && new Date(String(milestoneTaskAfter.updatedAt)).getTime() > new Date(String(milestoneTaskBefore.updatedAt)).getTime());
         check("In Progress task row remains byte-identical", activeAfter === activeBefore);
         check("Completed task row remains byte-identical", completeAfter === completeBefore);
         check("Project row and startDate remain byte-identical", projectAfter === projectBefore);

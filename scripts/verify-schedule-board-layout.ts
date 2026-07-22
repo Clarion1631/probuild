@@ -24,9 +24,11 @@ assert.deepEqual(getEffectiveProjectRange(project), {
     start: new Date("2037-01-03T00:00:00.000Z"),
     end: new Date("2037-01-06T00:00:00.000Z"),
 });
+// Marker-only moves (In Progress) leave tasks in place: the bar must span
+// BOTH the existing work and the marker day — neither may clip out of view.
 const markerPrecedenceProject = { ...project, id: "p-marker", startDate: "2037-01-10T00:00:00.000Z" };
 assert.deepEqual(getEffectiveProjectRange(markerPrecedenceProject), {
-    start: new Date("2037-01-10T00:00:00.000Z"),
+    start: new Date("2037-01-03T00:00:00.000Z"),
     end: new Date("2037-01-11T00:00:00.000Z"),
 });
 const markerOnlyProject = { ...project, id: "p-marker-only", startDate: "2037-01-10T00:00:00.000Z", taskCount: 0, tasks: [] };

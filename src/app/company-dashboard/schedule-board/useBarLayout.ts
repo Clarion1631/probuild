@@ -79,14 +79,28 @@ export function getEffectiveProjectRange(project: DashboardProjectRow): DateRang
         (earliest, range) => !earliest || range.start < earliest ? range.start : earliest,
         null,
     );
-    const start = project.startDate ? parseSerializedUTCDay(project.startDate) : earliestTaskStart;
+    // A marker-only start move (In Progress) leaves tasks in place, so the
+    // marker can sit AFTER existing work — the bar must still cover those
+    // tasks or they'd clip out of both views. Span from the earliest of
+    // marker/first-task to the latest task end.
+    const markerStart = project.startDate ? parseSerializedUTCDay(project.startDate) : null;
+    const start = markerStart && earliestTaskStart
+        ? (earliestTaskStart < markerStart ? earliestTaskStart : markerStart)
+        : (markerStart ?? earliestTaskStart);
     if (!start) return null;
 
     const latestTaskEnd = taskRanges.reduce<Date | null>(
         (latest, range) => range.end > start && (!latest || range.end > latest) ? range.end : latest,
         null,
     );
-    return { start, end: latestTaskEnd ?? addDays(start, 1) };
+    // The marker day itself must stay visible even when it sits beyond the
+    // last task (end-exclusive, so marker + 1 day).
+    const markerEnd = markerStart ? addDays(markerStart, 1) : null;
+    const end = [latestTaskEnd, markerEnd].reduce<Date | null>(
+        (latest, candidate) => candidate && (!latest || candidate > latest) ? candidate : latest,
+        null,
+    );
+    return { start, end: end ?? addDays(start, 1) };
 }
 
 export function createProjectDropIntent(project: DashboardProjectRow, targetStart: string): ProjectDropIntent | null {

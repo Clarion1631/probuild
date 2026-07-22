@@ -46,6 +46,11 @@ export function parseUTCDate(yyyyMmDd: string): Date {
     const [y, m, d] = yyyyMmDd.split("-").map(Number);
     return new Date(Date.UTC(y, m - 1, d));
 }
+// Deliberately built from LOCAL date components: schedule dates are
+// timezone-less user-entered calendar days stored as UTC midnights, so
+// "today" must be the USER'S current calendar day mapped into that same
+// UTC-day space. Using getUTC* here would highlight tomorrow for any
+// US-evening user (00:00+ UTC). Do not "fix" this to getUTC*.
 export function todayUTC(): Date {
     const now = new Date();
     return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));

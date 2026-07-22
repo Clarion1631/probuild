@@ -621,8 +621,14 @@ export async function shiftNotStartedTasks(
     input: ShiftNotStartedTasksInput,
 ): Promise<ShiftNotStartedTasksResult> {
     const { projectId, deltaDays, actor } = input;
-    if (!Number.isInteger(deltaDays) || deltaDays === 0) {
+    if (!Number.isSafeInteger(deltaDays) || deltaDays === 0) {
         throw new Error("deltaDays must be a nonzero whole integer");
+    }
+    // Hard magnitude cap: a schedule never legitimately moves more than a year
+    // in one gesture, and an unbounded delta from a direct action call could
+    // push dates outside representable ranges.
+    if (Math.abs(deltaDays) > 365) {
+        throw new Error("deltaDays cannot exceed 365 days in a single shift");
     }
 
     return withTxRetry(() => prisma.$transaction(async (tx) => {
@@ -655,7 +661,8 @@ export async function shiftNotStartedTasks(
             await tx.$executeRaw`
                 UPDATE "ScheduleTask"
                 SET "startDate" = ${shiftedStartDate},
-                    "endDate" = ${shiftedEndDate}
+                    "endDate" = ${shiftedEndDate},
+                    "updatedAt" = NOW()
                 WHERE "id" = ${task.id}
             `;
             shiftedTaskDates.push({
@@ -685,11 +692,24 @@ export async function shiftNotStartedTasks(
                 orderBy: { id: "asc" },
                 select: { id: true, name: true },
             });
+            // CO payment rows carry the same task link since PB-pipeline-003 and
+            // have no status column — any explicit dueDate is billing's authority.
+            const coMilestones = await tx.changeOrderPaymentSchedule.findMany({
+                where: {
+                    scheduleTaskId: { in: shiftedTaskIds },
+                    dueDate: { not: null },
+                },
+                orderBy: { id: "asc" },
+                select: { id: true, name: true },
+            });
             for (const milestone of estimateMilestones) {
                 notes.push(`Estimate milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
             }
             for (const milestone of invoiceMilestones) {
                 notes.push(`Invoice milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
+            }
+            for (const milestone of coMilestones) {
+                notes.push(`Change-order milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
             }
         }
 
