@@ -364,7 +364,11 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
         if (expectation.taskDates.length > 0) {
             externalShiftNonceRef.current += 1;
             const event = { nonce: externalShiftNonceRef.current, taskDates: expectation.taskDates };
-            setExternalShiftEvents(current => [...current, event].slice(-20));
+            // No cap: any truncation can silently drop an unseen event while
+            // the board's nonce ref advances past it. Growth is bounded by
+            // actual legacy saves in this page's lifetime (tiny objects) and
+            // reclaimed on unmount.
+            setExternalShiftEvents(current => [...current, event]);
         }
     }, []);
 

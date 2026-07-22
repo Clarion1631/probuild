@@ -131,7 +131,8 @@ assert.match(boardSource, /function clearTaskPreview\(taskId: string\) \{\n[^}]*
 assert.match(boardSource, /rewriteAwaitingOverridesFromShift\(shiftedPersistedDates\)/, "board-owned shifts must rewrite saved-awaiting overrides to the persisted dates");
 assert.match(boardSource, /rewriteAwaitingOverridesFromShift\(unseen\.flatMap\(event => event\.taskDates\)\)/, "external (legacy StartDateRow) shifts must ALSO rewrite saved-awaiting overrides — ALL unseen events, not just the latest");
 assert.match(boardSource, /externalShiftEvents\.filter\(event => event\.nonce > lastExternalShiftNonceRef\.current\)/, "every unseen external-shift nonce is applied exactly once");
-assert.match(companyDashboardSource, /setExternalShiftEvents\(current => \[\.\.\.current, event\]\.slice\(-20\)\)/, "the legacy path publishes shifts via a functional append (batch-safe queue), never a latest-payload slot");
+assert.match(companyDashboardSource, /setExternalShiftEvents\(current => \[\.\.\.current, event\]\)/, "the legacy path publishes shifts via an UNCAPPED functional append — any truncation can silently drop an unseen event");
+assert.doesNotMatch(companyDashboardSource, /setExternalShiftEvents\([^)]*slice\(/, "the external-shift queue must never be truncated");
 assert.match(companyDashboardSource, /externalShiftEvents=\{externalShiftEvents\}/, "the board must receive the external-shift event queue");
 assert.match(boardSource, /catch \(chunkError: any\) \{/, "chunk failures are isolated per chunk");
 assert.match(boardSource, /chunk\.map\(change => \(\{ taskId: change\.taskId, ok: false as const, error: message \}\)\)/, "a rejected chunk synthesizes failures for its own tasks only");
