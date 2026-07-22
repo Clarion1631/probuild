@@ -9,7 +9,7 @@ import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
@@ -5724,7 +5724,7 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[], expectedFingerprint?: string) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5734,6 +5734,20 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     });
 
     if (!contract) throw new Error("Contract not found");
+
+    // MCP confirm-token guard: the caller previewed a specific document to the user and
+    // binds that snapshot's hash here. If the contract changed between their preview and
+    // this read (a concurrent edit), refuse — never email a legal document whose text
+    // differs from what the user approved. Must hash the SAME fields, the same way, as
+    // the send_contract tool in src/app/api/mcp/[transport]/route.ts.
+    if (expectedFingerprint) {
+        const fresh = createHash("sha256")
+            .update(JSON.stringify({ title: contract.title, body: contract.body, status: contract.status, requiresCountersign: contract.requiresCountersign }))
+            .digest("hex").slice(0, 24);
+        if (fresh !== expectedFingerprint) {
+            throw new Error("The contract changed after the preview — run the send preview again and re-confirm.");
+        }
+    }
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
