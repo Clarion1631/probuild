@@ -1,23 +1,21 @@
 "use client";
 
-import { Fragment, useState, useTransition } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, ProjectCrewMember } from "@/lib/schedule-core";
 import { PROJECT_STATUSES } from "@/lib/project-status";
 import { applyChangeOrderToScheduleAction, generateProjectScheduleAction, updateProjectCrewAction, updateProjectStartDateAction, updateTaskCrewAction } from "@/lib/actions";
+import { formatCurrency, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import { ScheduleBoard } from "./schedule-board/ScheduleBoard";
 import {
-    formatCurrency,
-    formatDate,
-    getMonthGrid,
-    isSameUTCDay,
-    isWeekend,
-    parseUTCDate,
-    todayUTC,
-} from "@/app/projects/[id]/schedule/schedule-utils";
+    mergeProjectPendingIds,
+    projectIdSetsEqual,
+    projectRefreshMatches,
+    type ProjectRefreshExpectation,
+} from "./schedule-board/useBarLayout";
 
-const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTH_LABELS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
 function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
@@ -28,12 +26,6 @@ function StatCard({ label, value, sub }: { label: string; value: string; sub?: s
             {sub && <p className="text-xs text-hui-textMuted mt-1">{sub}</p>}
         </div>
     );
-}
-
-function shiftMonth(month: string, delta: number): string {
-    const [y, m] = month.split("-").map(Number);
-    const d = new Date(Date.UTC(y, m - 1 + delta, 1));
-    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
 function initials(name: string): string {
@@ -221,8 +213,26 @@ function TaskCrewPicker({ task, teamMembers }: { task: DashboardTaskRow; teamMem
     );
 }
 
+interface LegacyProjectMutation {
+    expectation: ProjectRefreshExpectation | null;
+}
+
+interface StartDateRowProps {
+    project: DashboardProjectRow;
+    isProjectPending: boolean;
+    beginProjectMutation: (projectId: string) => boolean;
+    awaitProjectRefresh: (projectId: string, expectation: ProjectRefreshExpectation) => void;
+    clearProjectMutation: (projectId: string) => void;
+}
+
 // Inline date setter for one waiting-to-start project (P1).
-function StartDateRow({ project }: { project: DashboardProjectRow }) {
+function StartDateRow({
+    project,
+    isProjectPending,
+    beginProjectMutation,
+    awaitProjectRefresh,
+    clearProjectMutation,
+}: StartDateRowProps) {
     const router = useRouter();
     const [date, setDate] = useState("");
     const [isPending, startTransition] = useTransition();
@@ -232,17 +242,23 @@ function StartDateRow({ project }: { project: DashboardProjectRow }) {
             toast.error("Pick a start date first");
             return;
         }
+        if (!beginProjectMutation(project.id)) return;
         startTransition(async () => {
             try {
                 const result = await updateProjectStartDateAction(project.id, date, true);
+                awaitProjectRefresh(project.id, {
+                    projectStartDate: result.startDate,
+                    taskDates: result.shiftedTaskDates,
+                });
                 toast.success(
                     result.shiftedTasks > 0
                         ? `Start set — ${result.shiftedTasks} job task${result.shiftedTasks === 1 ? "" : "s"} shifted`
                         : "Start date set"
                 );
                 router.refresh();
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to set start date");
+            } catch (error) {
+                clearProjectMutation(project.id);
+                toast.error(error instanceof Error ? error.message : "Failed to set start date");
             }
         });
     }
@@ -265,14 +281,14 @@ function StartDateRow({ project }: { project: DashboardProjectRow }) {
                         value={date}
                         onChange={e => setDate(e.target.value)}
                         className="hui-input text-sm"
-                        disabled={isPending}
+                        disabled={isPending || isProjectPending}
                     />
                     <button
                         onClick={handleSet}
-                        disabled={isPending}
+                        disabled={isPending || isProjectPending}
                         className="hui-btn hui-btn-green text-sm whitespace-nowrap"
                     >
-                        {isPending ? "Setting..." : "Set"}
+                        {isPending ? "Setting..." : isProjectPending ? "Refreshing..." : "Set"}
                     </button>
                 </div>
             </td>
@@ -282,65 +298,103 @@ function StartDateRow({ project }: { project: DashboardProjectRow }) {
 
 export default function CompanyDashboardClient({ data }: { data: CompanyDashboardData }) {
     const router = useRouter();
-    const { month, canEdit, isAdmin, pipeline, calendar, cashflow, teamMembers, crewConflicts, overlays, strip } = data;
+    const { month, canEdit, isAdmin, canSeeFinancials, pipeline, cashflow, teamMembers, crewConflicts, strip } = data;
 
-    // Overlay layer toggles (ADMIN only): income default on, others off.
-    const [showIncome, setShowIncome] = useState(true);
-    const [showProjectedCo, setShowProjectedCo] = useState(true);
-    const [showExpenses, setShowExpenses] = useState(false);
-    const [showHours, setShowHours] = useState(false);
     const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
+    const pageMountedRef = useRef(true);
+    const boardPendingProjectIdsRef = useRef<Set<string>>(new Set());
+    const legacyProjectMutationsRef = useRef<Map<string, LegacyProjectMutation>>(new Map());
+    const [boardPendingProjectIds, setBoardPendingProjectIds] = useState<Set<string>>(() => new Set());
+    const [legacyProjectMutations, setLegacyProjectMutations] = useState<Map<string, LegacyProjectMutation>>(() => new Map());
+    const canonicalProjects = useMemo(() => [
+        ...pipeline.waitingToStart,
+        ...pipeline.scheduled,
+        ...pipeline.inProgress,
+        ...pipeline.substantialCompletion,
+    ], [pipeline]);
+    const canonicalProjectById = useMemo(() => new Map(canonicalProjects.map(project => [project.id, project])), [canonicalProjects]);
+    const legacyPendingProjectIds = useMemo(() => new Set(legacyProjectMutations.keys()), [legacyProjectMutations]);
+    const pagePendingProjectIds = useMemo(
+        () => mergeProjectPendingIds(boardPendingProjectIds, legacyPendingProjectIds),
+        [boardPendingProjectIds, legacyPendingProjectIds],
+    );
+    const legacyRefreshCount = useMemo(
+        () => [...legacyProjectMutations.values()].filter(mutation => mutation.expectation !== null).length,
+        [legacyProjectMutations],
+    );
 
+    const isPageProjectPending = useCallback((projectId: string) => (
+        boardPendingProjectIdsRef.current.has(projectId)
+        || legacyProjectMutationsRef.current.has(projectId)
+    ), []);
+
+    const publishBoardPendingProjectIds = useCallback((projectIds: ReadonlySet<string>) => {
+        const next = new Set(projectIds);
+        if (projectIdSetsEqual(boardPendingProjectIdsRef.current, next)) return;
+        boardPendingProjectIdsRef.current = next;
+        if (pageMountedRef.current) setBoardPendingProjectIds(next);
+    }, []);
+
+    const beginLegacyProjectMutation = useCallback((projectId: string) => {
+        if (!pageMountedRef.current || isPageProjectPending(projectId)) return false;
+        const next = new Map(legacyProjectMutationsRef.current);
+        next.set(projectId, { expectation: null });
+        legacyProjectMutationsRef.current = next;
+        setLegacyProjectMutations(next);
+        return true;
+    }, [isPageProjectPending]);
+
+    const awaitLegacyProjectRefresh = useCallback((projectId: string, expectation: ProjectRefreshExpectation) => {
+        if (!pageMountedRef.current || !legacyProjectMutationsRef.current.has(projectId)) return;
+        const next = new Map(legacyProjectMutationsRef.current);
+        next.set(projectId, { expectation });
+        legacyProjectMutationsRef.current = next;
+        setLegacyProjectMutations(next);
+    }, []);
+
+    const clearLegacyProjectMutation = useCallback((projectId: string) => {
+        if (!legacyProjectMutationsRef.current.has(projectId)) return;
+        const next = new Map(legacyProjectMutationsRef.current);
+        next.delete(projectId);
+        legacyProjectMutationsRef.current = next;
+        if (pageMountedRef.current) setLegacyProjectMutations(next);
+    }, []);
+
+    const reconciledLegacyProjectIds = useMemo(() => [...legacyProjectMutations].flatMap(([projectId, mutation]) => {
+        if (!mutation.expectation) return [];
+        if (!canonicalProjectById.has(projectId)) return [projectId];
+        return projectRefreshMatches(canonicalProjectById.get(projectId), mutation.expectation) ? [projectId] : [];
+    }), [canonicalProjectById, legacyProjectMutations]);
+
+    useEffect(() => {
+        if (reconciledLegacyProjectIds.length === 0) return;
+        const timeoutId = window.setTimeout(() => {
+            for (const projectId of reconciledLegacyProjectIds) clearLegacyProjectMutation(projectId);
+        }, 0);
+        return () => window.clearTimeout(timeoutId);
+    }, [clearLegacyProjectMutation, reconciledLegacyProjectIds]);
+
+    useEffect(() => {
+        if (legacyRefreshCount === 0) return;
+        const intervalId = window.setInterval(() => router.refresh(), 2_000);
+        return () => window.clearInterval(intervalId);
+    }, [legacyRefreshCount, router]);
+
+    useEffect(() => {
+        pageMountedRef.current = true;
+        return () => {
+            pageMountedRef.current = false;
+            boardPendingProjectIdsRef.current = new Set();
+            legacyProjectMutationsRef.current = new Map();
+        };
+    }, []);
     const anchor = parseUTCDate(`${month}-01`);
-    const days = getMonthGrid(anchor);
-    const today = todayUTC();
-    const currentMonth = anchor.getUTCMonth();
     const monthLabel = `${MONTH_LABELS[anchor.getUTCMonth()]} ${anchor.getUTCFullYear()}`;
-
-    // Bucket calendar entries by UTC day key (YYYY-MM-DD) for O(1) cell lookup.
-    const projectStartsByDay = new Map<string, typeof calendar.projectStarts>();
-    for (const p of calendar.projectStarts) {
-        const key = p.startDate.slice(0, 10);
-        projectStartsByDay.set(key, [...(projectStartsByDay.get(key) ?? []), p]);
-    }
-    const leadStartsByDay = new Map<string, typeof calendar.leadStarts>();
-    for (const l of calendar.leadStarts) {
-        const key = l.expectedStartDate.slice(0, 10);
-        leadStartsByDay.set(key, [...(leadStartsByDay.get(key) ?? []), l]);
-    }
-
-    // Crew per project (chips show up to 3 initials + overflow count).
-    const crewByProject = new Map<string, ProjectCrewMember[]>();
-    for (const row of [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress, ...pipeline.substantialCompletion]) {
-        crewByProject.set(row.id, row.crew);
-    }
-
-    // Overlay per-day totals (income uses the shared effectiveDueDate rule).
-    const incomeByDay = new Map<string, number>();
-    for (const m of overlays?.income ?? []) {
-        const key = m.effectiveDueDate.slice(0, 10);
-        incomeByDay.set(key, (incomeByDay.get(key) ?? 0) + m.amount);
-    }
-    const projectedCoByDay = new Map<string, number>();
-    for (const row of overlays?.changeOrders ?? []) {
-        const key = row.effectiveDueDate.slice(0, 10);
-        projectedCoByDay.set(key, (projectedCoByDay.get(key) ?? 0) + row.amount);
-    }
-    const expensesByDay = new Map<string, number>();
-    for (const e of overlays?.expenses ?? []) {
-        const key = e.date.slice(0, 10);
-        expensesByDay.set(key, (expensesByDay.get(key) ?? 0) + e.amount);
-    }
-    const hoursByDay = new Map<string, number>();
-    for (const h of overlays?.hours ?? []) {
-        const key = h.startTime.slice(0, 10);
-        hoursByDay.set(key, (hoursByDay.get(key) ?? 0) + h.durationHours);
-    }
 
     const sumContract = (rows: { contractValue: number | null }[]) => rows.reduce((s, r) => s + (r.contractValue ?? 0), 0);
     const estimatingTotal = pipeline.estimating.reduce((s, l) => s + (l.targetRevenue ?? 0), 0);
 
-    const crewRows = [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress];
+    const crewRows = [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress, ...pipeline.substantialCompletion];
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6">
@@ -354,129 +408,25 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
 
             {/* Funnel */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-                <StatCard label="Estimating" value={String(pipeline.estimating.length)} sub={`${formatCurrency(estimatingTotal)} pipeline`} />
-                <StatCard label="Waiting to Start" value={String(pipeline.waitingToStart.length)} sub={`${formatCurrency(sumContract(pipeline.waitingToStart))} contracted`} />
-                <StatCard label="Scheduled" value={String(pipeline.scheduled.length)} sub={`${formatCurrency(sumContract(pipeline.scheduled))} contracted`} />
-                <StatCard label="In Progress" value={String(pipeline.inProgress.length)} sub={`${formatCurrency(sumContract(pipeline.inProgress))} contracted`} />
+                <StatCard label="Estimating" value={String(pipeline.estimating.length)} sub={canSeeFinancials ? `${formatCurrency(estimatingTotal)} pipeline` : undefined} />
+                <StatCard label="Waiting to Start" value={String(pipeline.waitingToStart.length)} sub={canSeeFinancials ? `${formatCurrency(sumContract(pipeline.waitingToStart))} contracted` : undefined} />
+                <StatCard label="Scheduled" value={String(pipeline.scheduled.length)} sub={canSeeFinancials ? `${formatCurrency(sumContract(pipeline.scheduled))} contracted` : undefined} />
+                <StatCard label="In Progress" value={String(pipeline.inProgress.length)} sub={canSeeFinancials ? `${formatCurrency(sumContract(pipeline.inProgress))} contracted` : undefined} />
             </div>
 
-            {/* Start calendar */}
-            <div className="hui-card mb-6 overflow-hidden">
-                <div className="flex items-center justify-between px-4 py-3 border-b border-hui-border">
-                    <h2 className="text-base font-semibold text-hui-textMain">Project Starts — {monthLabel}</h2>
-                    <div className="flex items-center gap-2">
-                        {isAdmin && overlays && (
-                            <div className="flex items-center gap-1 mr-3">
-                                <button
-                                    onClick={() => setShowIncome(v => !v)}
-                                    className={`text-xs font-semibold px-2 py-1 rounded-full border transition ${showIncome ? "bg-green-100 text-green-700 border-green-300" : "bg-white text-hui-textMuted border-hui-border"}`}
-                                >
-                                    Income
-                                </button>
-                                <button
-                                    onClick={() => setShowExpenses(v => !v)}
-                                    className={`text-xs font-semibold px-2 py-1 rounded-full border transition ${showExpenses ? "bg-red-100 text-red-700 border-red-300" : "bg-white text-hui-textMuted border-hui-border"}`}
-                                >
-                                    Expenses
-                                </button>
-                                <button
-                                    onClick={() => setShowProjectedCo(v => !v)}
-                                    className={`text-xs font-semibold px-2 py-1 rounded-full border transition ${showProjectedCo ? "bg-amber-100 text-amber-800 border-amber-300" : "bg-white text-hui-textMuted border-hui-border"}`}
-                                >
-                                    Projected CO
-                                </button>
-                                <button
-                                    onClick={() => setShowHours(v => !v)}
-                                    className={`text-xs font-semibold px-2 py-1 rounded-full border transition ${showHours ? "bg-blue-100 text-blue-700 border-blue-300" : "bg-white text-hui-textMuted border-hui-border"}`}
-                                >
-                                    Hours
-                                </button>
-                            </div>
-                        )}
-                        <button onClick={() => router.push(`?month=${shiftMonth(month, -1)}`)} className="hui-btn hui-btn-secondary text-sm">← Prev</button>
-                        <button onClick={() => router.push("?")} className="hui-btn hui-btn-secondary text-sm">Today</button>
-                        <button onClick={() => router.push(`?month=${shiftMonth(month, 1)}`)} className="hui-btn hui-btn-secondary text-sm">Next →</button>
-                    </div>
+            <ScheduleBoard
+                data={data}
+                externallyPendingProjectIds={legacyPendingProjectIds}
+                isProjectExternallyPending={isPageProjectPending}
+                onEffectivePendingProjectIdsChange={publishBoardPendingProjectIds}
+            />
+
+            {legacyRefreshCount > 0 && (
+                <div role="status" className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                    Refreshing start-date changes...{" "}
+                    <button type="button" className="font-semibold underline" onClick={() => router.refresh()}>Retry now</button>
                 </div>
-                <div className="grid grid-cols-7 bg-white border-b border-hui-border">
-                    {WEEKDAY_LABELS.map(w => (
-                        <div key={w} className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">{w}</div>
-                    ))}
-                </div>
-                <div className="grid grid-cols-7 grid-rows-6">
-                    {days.map((day, idx) => {
-                        const dayKey = formatDate(day);
-                        const isToday = isSameUTCDay(day, today);
-                        const isCurrentMonth = day.getUTCMonth() === currentMonth;
-                        const projectStarts = projectStartsByDay.get(dayKey) ?? [];
-                        const leadStarts = leadStartsByDay.get(dayKey) ?? [];
-                        const incomeTotal = showIncome ? incomeByDay.get(dayKey) : undefined;
-                        const projectedCoTotal = showProjectedCo ? projectedCoByDay.get(dayKey) : undefined;
-                        const expenseTotal = showExpenses ? expensesByDay.get(dayKey) : undefined;
-                        const hoursTotal = showHours ? hoursByDay.get(dayKey) : undefined;
-                        return (
-                            <div
-                                key={idx}
-                                className={`border-r border-b border-hui-border p-1.5 min-h-[96px] ${isCurrentMonth ? (isWeekend(day) ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""}`}
-                            >
-                                <span className={`text-xs font-semibold ${isToday ? "inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-600 text-white" : isCurrentMonth ? "text-hui-textMain" : "text-slate-400"}`}>
-                                    {day.getUTCDate()}
-                                </span>
-                                <div className="mt-1 flex flex-col gap-0.5">
-                                    {projectStarts.map(p => {
-                                        const crew = crewByProject.get(p.id) ?? [];
-                                        return (
-                                            <Link
-                                                key={p.id}
-                                                href={`/projects/${p.id}`}
-                                                title={`${p.name}${p.client ? ` — ${p.client}` : ""}${crew.length ? ` — crew: ${crew.map(c => c.name).join(", ")}` : ""}`}
-                                                className="block text-[11px] px-1.5 py-0.5 rounded bg-hui-primary text-white hover:opacity-90 transition"
-                                            >
-                                                <span className="block truncate">{p.name}</span>
-                                                {crew.length > 0 && (
-                                                    <span className="block text-[9px] opacity-90">
-                                                        {crew.slice(0, 3).map(c => initials(c.name)).join(" ")}{crew.length > 3 ? ` +${crew.length - 3}` : ""}
-                                                    </span>
-                                                )}
-                                            </Link>
-                                        );
-                                    })}
-                                    {leadStarts.map(l => (
-                                        <Link
-                                            key={l.id}
-                                            href={`/leads/${l.id}`}
-                                            title={`${l.name}${l.client ? ` — ${l.client}` : ""} (lead)`}
-                                            className="block text-[11px] px-1.5 py-0.5 rounded truncate border border-dashed border-hui-primary text-hui-primary hover:bg-green-50 transition"
-                                        >
-                                            {l.name}
-                                        </Link>
-                                    ))}
-                                    {incomeTotal != null && incomeTotal > 0 && (
-                                        <span className="text-[10px] font-medium text-green-700 px-1.5" title="Income due this day (effective due date)">
-                                            {formatCurrency(incomeTotal)} due
-                                        </span>
-                                    )}
-                                    {projectedCoTotal != null && projectedCoTotal > 0 && (
-                                        <span className="text-[10px] font-medium text-amber-700 px-1.5" title="Approved, unbilled change-order income projected this day">
-                                            {formatCurrency(projectedCoTotal)} projected CO
-                                        </span>
-                                    )}
-                                    {expenseTotal != null && expenseTotal > 0 && (
-                                        <span className="text-[10px] font-medium text-red-700 px-1.5" title="Expenses this day">
-                                            −{formatCurrency(expenseTotal)}
-                                        </span>
-                                    )}
-                                    {hoursTotal != null && hoursTotal > 0 && (
-                                        <span className="text-[10px] font-medium text-blue-700 px-1.5" title="Hours logged this day">
-                                            {hoursTotal.toFixed(1)}h
-                                        </span>
-                                    )}
-                                </div>
-                            </div>
-                        );
-                    })}
-                </div>
-            </div>
+            )}
 
             {/* Schedule & crew */}
             <div className="hui-card mb-6">
@@ -616,7 +566,14 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {pipeline.waitingToStart.map(p => (
-                                    <StartDateRow key={p.id} project={p} />
+                                    <StartDateRow
+                                        key={p.id}
+                                        project={p}
+                                        isProjectPending={pagePendingProjectIds.has(p.id)}
+                                        beginProjectMutation={beginLegacyProjectMutation}
+                                        awaitProjectRefresh={awaitLegacyProjectRefresh}
+                                        clearProjectMutation={clearLegacyProjectMutation}
+                                    />
                                 ))}
                             </tbody>
                         </table>

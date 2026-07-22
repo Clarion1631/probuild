@@ -7,11 +7,15 @@ import type { ReactNode } from "react";
 
 type IconProps = { className?: string };
 
-const svg = (children: ReactNode) => ({ className }: IconProps) => (
-  <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-    {children}
-  </svg>
-);
+const svg = (children: ReactNode) => {
+  const NavIcon = ({ className }: IconProps) => (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+      {children}
+    </svg>
+  );
+  NavIcon.displayName = "NavIcon";
+  return NavIcon;
+};
 
 const DashboardIcon = svg(
   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -56,7 +60,7 @@ export type NavItem = {
 };
 
 export const NAV_ITEMS: NavItem[] = [
-  { key: "dashboard", href: "/company-dashboard", label: "Dashboard", Icon: DashboardIcon, show: (can) => can("financialReports") },
+  { key: "dashboard", href: "/company-dashboard", label: "Dashboard", Icon: DashboardIcon, show: (can) => can("financialReports") || can("schedules") },
   // Projects is always visible (the API filters by ProjectAccess).
   { key: "projects", href: "/projects", label: "Projects", Icon: ProjectsIcon, show: () => true },
   { key: "leads", href: "/leads", label: "Leads", Icon: LeadsIcon, show: (can) => can("leadAccess") },

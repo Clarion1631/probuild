@@ -56,6 +56,7 @@ export interface PipelineProject {
     client: string | null;
     status: string;
     startDate: string | null;
+    color: string | null;
     // totalAmount of the project's most recent Approved/Invoiced/Partially
     // Paid/Paid estimate; null when none exists.
     contractValue: number | null;
@@ -106,7 +107,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             where: { status: { in: OPEN_PROJECT_STATUSES } },
             orderBy: { createdAt: "desc" },
             select: {
-                id: true, name: true, status: true, startDate: true,
+                id: true, name: true, status: true, startDate: true, color: true,
                 client: { select: { name: true } },
                 crew: { select: { id: true, name: true, email: true, status: true } },
                 estimates: {
@@ -125,6 +126,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         client: p.client?.name ?? null,
         status: p.status,
         startDate: p.startDate ? p.startDate.toISOString() : null,
+        color: p.color,
         contractValue: p.estimates[0] ? Number(p.estimates[0].totalAmount) : null,
         crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status })),
     });
@@ -274,11 +276,18 @@ export interface SkippedQbMilestone {
     paymentScheduleIds: string[];
 }
 
+export interface PersistedScheduleTaskDate {
+    id: string;
+    startDate: string;
+    endDate: string;
+}
+
 export interface SetProjectStartDateResult {
     projectId: string;
     previousStartDate: string | null;
     startDate: string | null;
     shiftedTasks: number;
+    shiftedTaskDates: PersistedScheduleTaskDate[];
     shiftedMilestones: number;
     skippedQbMilestones: SkippedQbMilestone[];
     notes: string[];
@@ -332,6 +341,7 @@ export async function setProjectStartDate(input: {
         const notes: string[] = [];
         const skippedQbMilestones: SkippedQbMilestone[] = [];
         let shiftedTasks = 0;
+        let shiftedTaskDates: PersistedScheduleTaskDate[] = [];
         let shiftedMilestones = 0;
 
         // Delta shift only applies to a Waiting-to-Start project with both an
@@ -356,13 +366,22 @@ export async function setProjectStartDate(input: {
             const daysParam = String(shiftDays);
 
             // (a) Every job task shifts in ONE update.
-            shiftedTasks = await tx.$executeRaw`
+            const shiftedTaskRows = await tx.$queryRaw<{ id: string; startDate: Date; endDate: Date }[]>`
                 UPDATE "ScheduleTask"
                 SET "startDate" = "startDate" + (${daysParam} || ' days')::interval,
                     "endDate" = "endDate" + (${daysParam} || ' days')::interval,
                     "updatedAt" = NOW()
                 WHERE "projectId" = ${projectId}
+                RETURNING "id", "startDate", "endDate"
             `;
+            shiftedTaskDates = shiftedTaskRows
+                .map(task => ({
+                    id: task.id,
+                    startDate: task.startDate.toISOString(),
+                    endDate: task.endDate.toISOString(),
+                }))
+                .sort((a, b) => a.id.localeCompare(b.id));
+            shiftedTasks = shiftedTaskDates.length;
 
             // (b) Milestone mirror groups anchored to this project's tasks:
             // two bounded reads, then skip/shift computed in memory. The
@@ -540,6 +559,7 @@ export async function setProjectStartDate(input: {
             previousStartDate: previousStartDate ? previousStartDate.toISOString() : null,
             startDate: startDate ? startDate.toISOString() : null,
             shiftedTasks,
+            shiftedTaskDates,
             shiftedMilestones,
             skippedQbMilestones,
             notes,
@@ -575,6 +595,131 @@ export async function setProjectStartDate(input: {
     }
 
     return result;
+}
+
+export interface ShiftNotStartedTasksInput {
+    projectId: string;
+    deltaDays: number;
+    actor: { type: "TEAM" | "SYSTEM"; name: string };
+}
+
+export interface ShiftNotStartedTasksResult {
+    projectId: string;
+    deltaDays: number;
+    shiftedTaskIds: string[];
+    shiftedTaskDates: PersistedScheduleTaskDate[];
+    shiftedTasks: number;
+    notes: string[];
+}
+
+/**
+ * Shift only exact `Not Started` tasks on an active project. Explicitly dated
+ * Pending payment milestones stay fixed and are returned as operator notes;
+ * this path never changes the project marker or any payment/money row.
+ */
+export async function shiftNotStartedTasks(
+    input: ShiftNotStartedTasksInput,
+): Promise<ShiftNotStartedTasksResult> {
+    const { projectId, deltaDays, actor } = input;
+    if (!Number.isInteger(deltaDays) || deltaDays === 0) {
+        throw new Error("deltaDays must be a nonzero whole integer");
+    }
+
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Keep this lock first: all schedule moves serialize on Project before
+        // selecting child tasks, matching setProjectStartDate's lock family.
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const project = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { id: true, name: true, status: true },
+        });
+        if (!project) throw new Error("Project not found");
+        if (project.status !== "In Progress") {
+            throw new Error("Only In Progress projects can shift Not Started tasks");
+        }
+
+        const tasks = await tx.$queryRaw<{ id: string; startDate: Date; endDate: Date }[]>`
+            SELECT "id", "startDate", "endDate"
+            FROM "ScheduleTask"
+            WHERE "projectId" = ${projectId}
+              AND "status" = 'Not Started'
+            ORDER BY "id"
+            FOR UPDATE
+        `;
+        const shiftedTaskIds = tasks.map(task => task.id);
+        const shiftedTaskDates: PersistedScheduleTaskDate[] = [];
+
+        for (const task of tasks) {
+            const shiftedStartDate = addDays(task.startDate, deltaDays);
+            const shiftedEndDate = addDays(task.endDate, deltaDays);
+            await tx.$executeRaw`
+                UPDATE "ScheduleTask"
+                SET "startDate" = ${shiftedStartDate},
+                    "endDate" = ${shiftedEndDate}
+                WHERE "id" = ${task.id}
+            `;
+            shiftedTaskDates.push({
+                id: task.id,
+                startDate: shiftedStartDate.toISOString(),
+                endDate: shiftedEndDate.toISOString(),
+            });
+        }
+
+        const notes: string[] = [];
+        if (shiftedTaskIds.length > 0) {
+            const estimateMilestones = await tx.estimatePaymentSchedule.findMany({
+                where: {
+                    scheduleTaskId: { in: shiftedTaskIds },
+                    status: "Pending",
+                    dueDate: { not: null },
+                },
+                orderBy: { id: "asc" },
+                select: { id: true, name: true },
+            });
+            const invoiceMilestones = await tx.paymentSchedule.findMany({
+                where: {
+                    scheduleTaskId: { in: shiftedTaskIds },
+                    status: "Pending",
+                    dueDate: { not: null },
+                },
+                orderBy: { id: "asc" },
+                select: { id: true, name: true },
+            });
+            for (const milestone of estimateMilestones) {
+                notes.push(`Estimate milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
+            }
+            for (const milestone of invoiceMilestones) {
+                notes.push(`Invoice milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
+            }
+        }
+
+        await tx.activityLog.create({
+            data: {
+                projectId,
+                actorType: actor.type,
+                actorName: actor.name,
+                action: "shift_not_started_tasks",
+                entityType: "project",
+                entityId: projectId,
+                entityName: project.name,
+                metadata: JSON.stringify({
+                    deltaDays,
+                    shiftedTasks: shiftedTaskIds.length,
+                    shiftedTaskIds,
+                    explicitDueDateMilestones: notes.length,
+                }),
+            },
+        });
+
+        return {
+            projectId,
+            deltaDays,
+            shiftedTaskIds,
+            shiftedTaskDates,
+            shiftedTasks: shiftedTaskIds.length,
+            notes,
+        };
+    }));
 }
 
 export interface CashflowBucket {
@@ -1428,6 +1573,7 @@ export interface OverlayIncomeItem {
     invoiceCode: string;
     projectId: string | null;
     projectName: string | null;
+    scheduleTaskId: string | null;
     anchoredToTask: boolean;
     inQuickBooks: boolean;
 }
@@ -1452,6 +1598,7 @@ export interface OverlayHoursItem {
 }
 
 export interface OverlayChangeOrderItem {
+    paymentScheduleId: string;
     changeOrderId: string;
     code: string;
     title: string;
@@ -1518,6 +1665,7 @@ export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<O
                 const effective = row.dueDate ?? (row.scheduleTaskId ? taskStartById.get(row.scheduleTaskId) : undefined) ?? null;
                 if (!effective || effective < from || effective >= to) continue;
                 rows.push({
+                    paymentScheduleId: row.id,
                     changeOrderId: co.id,
                     code: co.code,
                     title: co.title,
@@ -1534,6 +1682,7 @@ export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<O
             const synthDate = co.generatedScheduleTasks[0]?.startDate ?? null;
             if (!synthDate || synthDate < from || synthDate >= to) continue;
             rows.push({
+                paymentScheduleId: `synthetic:${co.id}`,
                 changeOrderId: co.id,
                 code: co.code,
                 title: co.title,
@@ -1608,6 +1757,7 @@ export async function getCalendarOverlays(
                 invoiceCode: m.invoice.code,
                 projectId: m.invoice.project?.id ?? null,
                 projectName: m.invoice.project?.name ?? null,
+                scheduleTaskId: m.scheduleTaskId,
                 anchoredToTask: !!m.scheduleTaskId,
                 inQuickBooks: !!m.qbInvoiceId,
             };
@@ -1677,6 +1827,9 @@ export interface DashboardTaskRow {
     name: string;
     startDate: string;
     endDate: string;
+    color: string | null;
+    parentId: string | null;
+    progress: number;
     status: string;
     type: string;
     assignments: DashboardTaskAssignment[];
@@ -1712,12 +1865,17 @@ export interface CompanyDashboardData {
     role: string;
     canEdit: boolean;
     isAdmin: boolean;
+    // Pipeline money (contractValue, targetRevenue, latestEstimateTotal) is
+    // serialized only for holders of financialReports; schedules-only viewers
+    // (FIELD_CREW/EMPLOYEE read-only board) get nulls — redaction happens at
+    // serialization, matching the overlays/cashflow/strip rule.
+    canSeeFinancials: boolean;
     pipeline: {
         estimating: CompanyPipeline["estimating"];
         waitingToStart: DashboardProjectRow[];
         scheduled: DashboardProjectRow[];
         inProgress: DashboardProjectRow[];
-        substantialCompletion: CompanyPipeline["substantialCompletion"];
+        substantialCompletion: DashboardProjectRow[];
     };
     calendar: StartCalendar;
     cashflow: CashflowOutlook | null;
@@ -1853,12 +2011,16 @@ async function getProjectMonthStrip(from: Date, to: Date, coRows: OverlayChangeO
  * `month` must be a validated "YYYY-MM" string (the page validates).
  */
 export async function getCompanyDashboardData(
-    userLike: { role: string },
+    userLike: { role: string; canSeeFinancials?: boolean },
     month: string,
 ): Promise<CompanyDashboardData> {
     const role = userLike.role;
     const isAdmin = role === "ADMIN";
     const canEdit = role === "ADMIN" || role === "MANAGER";
+    // Explicit flag wins (the page computes hasPermission(user, "financialReports")
+    // so per-user overrides are honored); the role fallback mirrors the default
+    // permission matrix for callers that don't pass it.
+    const canSeeFinancials = userLike.canSeeFinancials ?? !["FIELD_CREW", "EMPLOYEE"].includes(role);
 
     // Same 42-day grid as the calendar; `to` exclusive (getStartCalendar rule).
     const grid = getMonthGrid(parseUTCDate(`${month}-01`));
@@ -1885,13 +2047,14 @@ export async function getCompanyDashboardData(
         ...pipeline.waitingToStart.map(p => p.id),
         ...pipeline.scheduled.map(p => p.id),
         ...pipeline.inProgress.map(p => p.id),
+        ...pipeline.substantialCompletion.map(p => p.id),
     ];
     const [taskRows, qualifying, unappliedByProject] = await Promise.all([
         prisma.scheduleTask.findMany({
             where: { projectId: { in: rowIds } },
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
             select: {
-                id: true, projectId: true, name: true, startDate: true, endDate: true, status: true, type: true,
+                id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
                     select: { id: true, userId: true, user: { select: { name: true, email: true, status: true } } },
@@ -1910,6 +2073,9 @@ export async function getCompanyDashboardData(
             name: task.name,
             startDate: task.startDate.toISOString(),
             endDate: task.endDate.toISOString(),
+            color: task.color,
+            parentId: task.parentId,
+            progress: task.progress,
             status: task.status,
             type: task.type,
             assignments: task.assignments.map(a => ({
@@ -1940,17 +2106,26 @@ export async function getCompanyDashboardData(
         })).map(u => ({ id: u.id, name: u.name || u.email, email: u.email }))
         : null;
 
+    // Money redaction for schedules-only viewers: null out pipeline dollar
+    // fields at serialization (the UI renders "—" for null). Task/crew/date
+    // data stays intact — that's what the read-only board needs.
+    const redactProject = (p: DashboardProjectRow): DashboardProjectRow =>
+        canSeeFinancials ? p : { ...p, contractValue: null };
+    const redactLead = (l: CompanyPipeline["estimating"][number]): CompanyPipeline["estimating"][number] =>
+        canSeeFinancials ? l : { ...l, targetRevenue: null, latestEstimateTotal: null };
+
     return {
         month,
         role,
         canEdit,
         isAdmin,
+        canSeeFinancials,
         pipeline: {
-            estimating: pipeline.estimating,
-            waitingToStart: pipeline.waitingToStart.map(enrich),
-            scheduled: pipeline.scheduled.map(enrich),
-            inProgress: pipeline.inProgress.map(enrich),
-            substantialCompletion: pipeline.substantialCompletion,
+            estimating: pipeline.estimating.map(redactLead),
+            waitingToStart: pipeline.waitingToStart.map(enrich).map(redactProject),
+            scheduled: pipeline.scheduled.map(enrich).map(redactProject),
+            inProgress: pipeline.inProgress.map(enrich).map(redactProject),
+            substantialCompletion: pipeline.substantialCompletion.map(enrich).map(redactProject),
         },
         calendar,
         cashflow,
