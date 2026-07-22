@@ -4,6 +4,7 @@ import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type K
 import type { DashboardTaskRow } from "@/lib/schedule-core";
 import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } from "./useBarLayout";
+import { FloatingPopover } from "./FloatingPopover";
 
 export interface TaskPointerEditStart {
     pointerId: number;
@@ -38,10 +39,17 @@ export interface TaskBlockSegmentProps extends TaskEditCallbacks {
     projectColor: string;
     canEdit: boolean;
     isPending: boolean;
+    // Drafted (unsaved) — dashed ring + desaturated, but still fully
+    // draggable/editable (draft mode never locks a drafted item).
+    isDraft?: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     timelineDayWidth?: number;
     timelineLeftInset?: number;
     timelineScrollContainerRef?: RefObject<HTMLDivElement | null>;
+    // Mini-lane placement within a project bar carrying overlapping tasks.
+    // Omitted (default) fills the parent's full height, as before.
+    laneTop?: number;
+    laneHeight?: number;
 }
 
 function readableText(color: string): string {
@@ -64,10 +72,13 @@ export function TaskBlockSegment({
     projectColor,
     canEdit,
     isPending,
+    isDraft = false,
     activeTaskKeyboardEdit,
     timelineDayWidth,
     timelineLeftInset,
     timelineScrollContainerRef,
+    laneTop,
+    laneHeight,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
     onTaskKeyboardAdjust,
@@ -79,7 +90,8 @@ export function TaskBlockSegment({
     const observerRef = useRef<ResizeObserver | null>(null);
     const fragmentId = useId().replace(/:/g, "");
     const [allocatedWidth, setAllocatedWidth] = useState(0);
-    const actionDetailsRef = useRef<HTMLDetailsElement>(null);
+    const actionTriggerRef = useRef<HTMLButtonElement>(null);
+    const [menuOpen, setMenuOpen] = useState(false);
     const actionResetKey = `${isPending ? "pending" : "ready"}:${task.startDate}:${task.endDate}`;
     const [menuDraft, setMenuDraft] = useState<{ resetKey: string; dates: TaskDateOverride | null }>(() => ({
         resetKey: actionResetKey,
@@ -112,7 +124,7 @@ export function TaskBlockSegment({
 
     useEffect(() => () => observerRef.current?.disconnect(), []);
     useEffect(() => {
-        if (actionDetailsRef.current) actionDetailsRef.current.open = false;
+        setMenuOpen(false);
     }, [actionResetKey]);
 
     if (!clipped || (!isMilestone && taskEnd <= taskStart)) return null;
@@ -187,17 +199,22 @@ export function TaskBlockSegment({
             endDate: isMilestone ? menuStartDate : menuEndDate,
         });
         setMenuDraft({ resetKey: actionResetKey, dates: null });
+        setMenuOpen(false);
     }
+
+    const laneStyle = laneTop != null && laneHeight != null
+        ? { top: laneTop, height: laneHeight }
+        : undefined;
 
     return (
         <div
             ref={setMeasuredElement}
-            className={`group/task absolute inset-y-0 touch-pan-y select-none overflow-visible rounded-sm border border-black/10 text-[9px] font-semibold leading-[16px] shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${canEdit && !isPending ? "cursor-move" : ""}`}
-            style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color, color: readableText(color) }}
+            className={`group/task absolute ${laneStyle ? "" : "inset-y-0"} touch-pan-y select-none overflow-visible rounded-sm border text-[9px] font-semibold leading-[16px] shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${canEdit && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
+            style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color, color: readableText(color), ...laneStyle }}
             title={title}
             role="group"
             tabIndex={0}
-            aria-label={`${title}. ${canEdit ? "Press Space or Enter to move with the keyboard." : "Read only."}`}
+            aria-label={`${title}. ${canEdit ? "Press Space or Enter to move with the keyboard." : "Read only."}${isDraft ? " Unsaved change." : ""}`}
             aria-disabled={!canEdit || isPending}
             aria-busy={isPending}
             data-task-edit-block="true"
@@ -240,49 +257,59 @@ export function TaskBlockSegment({
             )}
 
             {!mutationDisabled && (
-            <details ref={actionDetailsRef} className="absolute right-0 top-0 z-30 opacity-0 pointer-events-none transition group-hover/task:opacity-100 group-hover/task:pointer-events-auto group-focus-within/task:opacity-100 group-focus-within/task:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
-                <summary className="cursor-pointer list-none rounded bg-white/85 px-1 text-[8px] font-bold text-slate-800 shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500" aria-label={`Task actions for ${task.name}`}>
+            <>
+                <button
+                    ref={actionTriggerRef}
+                    type="button"
+                    onClick={event => { event.stopPropagation(); setMenuOpen(value => !value); }}
+                    onPointerDown={event => event.stopPropagation()}
+                    aria-expanded={menuOpen}
+                    className="absolute right-0 top-0 z-30 cursor-pointer rounded bg-white/85 px-1 text-[8px] font-bold text-slate-800 opacity-0 shadow transition group-hover/task:opacity-100 group-focus-within/task:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                    aria-label={`Task actions for ${task.name}`}
+                >
                     ⋯
-                </summary>
-                <form onSubmit={handleDateSubmit} onPointerDown={event => event.stopPropagation()} className="absolute right-0 top-full z-[90] mt-1 w-60 space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl">
-                    <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-start-${task.id}-${fragmentId}`}>Start date</label>
-                    <input
-                        id={`task-start-${task.id}-${fragmentId}`}
-                        type="date"
-                        value={menuStartDate}
-                        max={!isMilestone && menuEndDate ? formatDate(addDays(parseUTCDate(menuEndDate), -1)) : undefined}
-                        onChange={event => {
-                            const nextStartDate = event.target.value;
-                            setMenuDraft({
+                </button>
+                <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} onClose={() => setMenuOpen(false)} width={240}>
+                    <form onSubmit={handleDateSubmit} onPointerDown={event => event.stopPropagation()} className="space-y-2">
+                        <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-start-${task.id}-${fragmentId}`}>Start date</label>
+                        <input
+                            id={`task-start-${task.id}-${fragmentId}`}
+                            type="date"
+                            value={menuStartDate}
+                            max={!isMilestone && menuEndDate ? formatDate(addDays(parseUTCDate(menuEndDate), -1)) : undefined}
+                            onChange={event => {
+                                const nextStartDate = event.target.value;
+                                setMenuDraft({
+                                    resetKey: actionResetKey,
+                                    dates: { startDate: nextStartDate, endDate: isMilestone ? nextStartDate : menuEndDate },
+                                });
+                            }}
+                            disabled={mutationDisabled}
+                            className="hui-input w-full px-2 py-1 text-xs"
+                        />
+                        <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-end-${task.id}-${fragmentId}`}>End date</label>
+                        <input
+                            id={`task-end-${task.id}-${fragmentId}`}
+                            type="date"
+                            value={isMilestone ? menuStartDate : menuEndDate}
+                            min={!isMilestone && menuStartDate ? formatDate(addDays(parseUTCDate(menuStartDate), 1)) : undefined}
+                            onChange={event => setMenuDraft({
                                 resetKey: actionResetKey,
-                                dates: { startDate: nextStartDate, endDate: isMilestone ? nextStartDate : menuEndDate },
-                            });
-                        }}
-                        disabled={mutationDisabled}
-                        className="hui-input w-full px-2 py-1 text-xs"
-                    />
-                    <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-end-${task.id}-${fragmentId}`}>End date</label>
-                    <input
-                        id={`task-end-${task.id}-${fragmentId}`}
-                        type="date"
-                        value={isMilestone ? menuStartDate : menuEndDate}
-                        min={!isMilestone && menuStartDate ? formatDate(addDays(parseUTCDate(menuStartDate), 1)) : undefined}
-                        onChange={event => setMenuDraft({
-                            resetKey: actionResetKey,
-                            dates: { startDate: menuStartDate, endDate: event.target.value },
-                        })}
-                        disabled={mutationDisabled || isMilestone}
-                        className="hui-input w-full px-2 py-1 text-xs"
-                    />
-                    <div className="grid grid-cols-2 gap-2">
-                        <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, -1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Earlier</button>
-                        <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, 1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Later</button>
-                    </div>
-                    <button type="submit" disabled={mutationDisabled || !menuStartDate || (!isMilestone && !menuEndDate)} className="hui-btn hui-btn-primary w-full text-xs disabled:opacity-60">
-                        Save task dates
-                    </button>
-                </form>
-            </details>
+                                dates: { startDate: menuStartDate, endDate: event.target.value },
+                            })}
+                            disabled={mutationDisabled || isMilestone}
+                            className="hui-input w-full px-2 py-1 text-xs"
+                        />
+                        <div className="grid grid-cols-2 gap-2">
+                            <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, -1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Earlier</button>
+                            <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, 1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Later</button>
+                        </div>
+                        <button type="submit" disabled={mutationDisabled || !menuStartDate || (!isMilestone && !menuEndDate)} className="hui-btn hui-btn-primary w-full text-xs disabled:opacity-60">
+                            Save task dates
+                        </button>
+                    </form>
+                </FloatingPopover>
+            </>
             )}
         </div>
     );

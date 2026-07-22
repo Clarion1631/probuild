@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { shiftNotStartedTasksAction, updateCompanyScheduleTaskDatesAction, updateProjectStartDateAction } from "@/lib/actions";
+import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectStartDateAction } from "@/lib/actions";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, OverlayIncomeItem } from "@/lib/schedule-core";
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
@@ -12,15 +13,12 @@ import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog
 import { UnscheduledTray } from "./UnscheduledTray";
 import {
     createProjectDropIntent,
-    getEffectivePendingProjectIds,
     getEffectiveProjectRange,
     getNewlyPendingProjectIds,
     getTimelineAutoscrollStep,
     getTimelinePointerDelta,
     previewProjectMove,
-    previewProjectWithPersistedTaskDates,
     previewProjectIncomeOverlays,
-    previewShiftedTaskIncomeOverlays,
     previewTaskDates,
     previewTaskPointerCandidate,
     projectRefreshMatches,
@@ -52,6 +50,12 @@ interface ScheduleBoardProps {
     externallyPendingProjectIds: ReadonlySet<string>;
     isProjectExternallyPending: (projectId: string) => boolean;
     onEffectivePendingProjectIdsChange: (projectIds: ReadonlySet<string>) => void;
+    // Persisted task shifts from sibling writers (legacy StartDateRow) so the
+    // board can rewrite saved-awaiting overrides caught in an external shift.
+    // An append-only event queue: concurrent legacy shifts resolving in one
+    // React batch each keep their event (a single latest-payload slot would
+    // drop all but the last).
+    externalShiftEvents: { nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] }[];
 }
 
 interface TaskKeyboardEditState {
@@ -106,6 +110,13 @@ interface ActiveProjectPointerEdit {
     cleanup: () => void;
 }
 
+// Draft-mode: a drafted project-start move accumulated locally until Save.
+interface ProjectDraftMove {
+    originalStart: string;
+    targetStart: string;
+    deltaDays: number;
+}
+
 function hitTestScheduleDate(clientX: number, clientY: number): string | null {
     for (const element of document.elementsFromPoint(clientX, clientY)) {
         const cell = element instanceof HTMLElement ? element.closest<HTMLElement>("[data-schedule-date]") : null;
@@ -144,6 +155,7 @@ export function ScheduleBoard({
     externallyPendingProjectIds,
     isProjectExternallyPending,
     onEffectivePendingProjectIdsChange,
+    externalShiftEvents,
 }: ScheduleBoardProps) {
     const router = useRouter();
     const { month, isAdmin, overlays } = data;
@@ -155,9 +167,11 @@ export function ScheduleBoard({
     const [projectPreviewOverrides, setProjectPreviewOverrides] = useState<Record<string, DashboardProjectRow>>({});
     const [projectIncomeOverrides, setProjectIncomeOverrides] = useState<Record<string, OverlayIncomeItem[]>>({});
     const [projectRefreshExpectations, setProjectRefreshExpectations] = useState<Record<string, ProjectRefreshExpectation>>({});
+    // Drafts accumulate here — the SAME map drives the live visual preview AND
+    // the pending-to-save payload; nothing writes to the server until Save.
     const [taskDateOverrides, setTaskDateOverrides] = useState<Record<string, TaskDateOverride>>({});
-    const [pendingProjectIds, setPendingProjectIds] = useState<Set<string>>(() => new Set());
-    const [pendingTaskIds, setPendingTaskIds] = useState<Set<string>>(() => new Set());
+    const [projectDrafts, setProjectDrafts] = useState<Record<string, ProjectDraftMove>>({});
+    const [isSaving, setIsSaving] = useState(false);
     const [awaitingTaskRefreshIds, setAwaitingTaskRefreshIds] = useState<Set<string>>(() => new Set());
     const [taskKeyboardEdit, setTaskKeyboardEdit] = useState<TaskKeyboardEditState | null>(null);
     const taskKeyboardEditRef = useRef<TaskKeyboardEditState | null>(null);
@@ -170,13 +184,11 @@ export function ScheduleBoard({
     const projectKeyboardCleanupRef = useRef<(() => void) | null>(null);
     const projectKeyboardSentinelRef = useRef<HTMLSpanElement>(null);
     const activeProjectPointerRef = useRef<ActiveProjectPointerEdit | null>(null);
-    const effectivePendingTaskIdsRef = useRef<Set<string>>(new Set());
-    const effectivePendingProjectIdsRef = useRef<Set<string>>(new Set());
     const previousExternallyPendingProjectIdsRef = useRef<ReadonlySet<string>>(new Set(externallyPendingProjectIds));
     const [confirmIntent, setConfirmIntent] = useState<ProjectDropIntent | null>(null);
-    const confirmIntentRef = useRef<ProjectDropIntent | null>(null);
-    confirmIntentRef.current = confirmIntent;
-    const [, startTransition] = useTransition();
+    // Bridges the ShiftConfirmDialog (shown at SAVE time, one project at a
+    // time) back into the sequential save loop below.
+    const confirmResolverRef = useRef<((choice: ProjectMoveChoice | "cancel") => void) | null>(null);
     useEffect(() => {
         try {
             const stored = localStorage.getItem(BOARD_VIEW_STORAGE_KEY);
@@ -198,37 +210,31 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
-    const effectivePendingTaskIds = useMemo(
-        () => new Set([...pendingTaskIds, ...awaitingTaskRefreshIds]),
-        [awaitingTaskRefreshIds, pendingTaskIds],
+    // A saved-but-not-yet-refreshed task keeps its override (pinned to the
+    // persisted dates) purely for rendering/reconciliation — it is NOT an
+    // unsaved draft and must not count toward or re-enter a Save.
+    const draftTaskIds = useMemo(
+        () => new Set(Object.keys(taskDateOverrides).filter(taskId => !awaitingTaskRefreshIds.has(taskId))),
+        [taskDateOverrides, awaitingTaskRefreshIds],
     );
-    const effectivePendingProjectIds = useMemo(() => getEffectivePendingProjectIds(
-        [...pendingProjectIds, ...Object.keys(projectRefreshExpectations), ...externallyPendingProjectIds],
-        effectivePendingTaskIds,
-        canonicalTaskProjectById,
-    ), [canonicalTaskProjectById, effectivePendingTaskIds, externallyPendingProjectIds, pendingProjectIds, projectRefreshExpectations]);
-    effectivePendingTaskIdsRef.current = effectivePendingTaskIds;
-    effectivePendingProjectIdsRef.current = effectivePendingProjectIds;
-    const isProjectPending = (projectId: string) => (
-        effectivePendingProjectIdsRef.current.has(projectId) || isProjectExternallyPending(projectId)
-    );
-    const publishEffectivePendingProjectIds = useCallback((next: ReadonlySet<string>) => {
-        effectivePendingProjectIdsRef.current = new Set(next);
-        onEffectivePendingProjectIdsChange(next);
-    }, [onEffectivePendingProjectIdsChange]);
-    useEffect(() => {
-        publishEffectivePendingProjectIds(effectivePendingProjectIds);
-    }, [effectivePendingProjectIds, publishEffectivePendingProjectIds]);
-    useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
-    const isTaskOrProjectPending = (taskId: string) => {
+    const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
+    const draftCount = draftTaskIds.size + draftProjectIds.size;
+
+    // Locking during draft mode: a drafted item stays fully interactive.
+    // Only an in-flight Save (global — the whole board pauses while
+    // committing) or an externally-locked project (the legacy StartDateRow
+    // mutating that same project directly) ever blocks an edit.
+    const isProjectLocked = useCallback((projectId: string) => (
+        isSaving || isProjectExternallyPending(projectId)
+    ), [isSaving, isProjectExternallyPending]);
+    const isTaskLocked = useCallback((taskId: string) => {
+        if (isSaving) return true;
         const projectId = canonicalTaskProjectById.get(taskId);
-        return effectivePendingTaskIdsRef.current.has(taskId) || Boolean(projectId && isProjectPending(projectId));
-    };
-    const projectRefreshCount = Object.keys(projectRefreshExpectations).length;
-    const pendingRefreshKinds = [
-        projectRefreshCount > 0 ? "project" : null,
-        awaitingTaskRefreshIds.size > 0 ? "task" : null,
-    ].filter((kind): kind is string => Boolean(kind));
+        return Boolean(projectId && isProjectExternallyPending(projectId));
+    }, [isSaving, isProjectExternallyPending, canonicalTaskProjectById]);
+
+    useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
+
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
         return {
@@ -261,36 +267,6 @@ export function ScheduleBoard({
         overlays: data.overlays ? previewOverlays : null,
     };
 
-    function setProjectPending(projectId: string, pending: boolean) {
-        if (pending) {
-            const next = new Set(effectivePendingProjectIdsRef.current).add(projectId);
-            publishEffectivePendingProjectIds(next);
-        }
-        setPendingProjectIds(current => {
-            const next = new Set(current);
-            if (pending) next.add(projectId);
-            else next.delete(projectId);
-            return next;
-        });
-    }
-
-    function setTaskPending(taskId: string, pending: boolean) {
-        if (pending) {
-            effectivePendingTaskIdsRef.current = new Set(effectivePendingTaskIdsRef.current).add(taskId);
-            const projectId = canonicalTaskProjectById.get(taskId);
-            if (projectId) {
-                const next = new Set(effectivePendingProjectIdsRef.current).add(projectId);
-                publishEffectivePendingProjectIds(next);
-            }
-        }
-        setPendingTaskIds(current => {
-            const next = new Set(current);
-            if (pending) next.add(taskId);
-            else next.delete(taskId);
-            return next;
-        });
-    }
-
     function setTaskKeyboardState(next: TaskKeyboardEditState | null) {
         taskKeyboardEditRef.current = next;
         setTaskKeyboardEdit(next);
@@ -300,7 +276,42 @@ export function ScheduleBoard({
         setTaskDateOverrides(current => ({ ...current, [taskId]: dates }));
     }
 
+    // Shared by the board's own save loop AND external (legacy StartDateRow)
+    // shifts: saved-awaiting overrides pinned to pre-shift dates can never
+    // reconcile — rewrite them to the persisted shifted dates.
+    function rewriteAwaitingOverridesFromShift(taskDates: { id: string; startDate: string; endDate: string }[]) {
+        if (taskDates.length === 0) return;
+        const shiftedById = new Map(taskDates.map(row => [row.id, row]));
+        setTaskDateOverrides(current => {
+            let changed = false;
+            const next = { ...current };
+            for (const taskId of awaitingTaskRefreshIds) {
+                const shifted = shiftedById.get(taskId);
+                if (!shifted || !(taskId in next)) continue;
+                next[taskId] = { startDate: shifted.startDate.slice(0, 10), endDate: shifted.endDate.slice(0, 10) };
+                changed = true;
+            }
+            return changed ? next : current;
+        });
+    }
+
+    // External writers (the legacy waiting-list date setter) report their
+    // persisted shifts here; every unseen nonce is applied exactly once, in
+    // order — so two shifts landing in one React batch both take effect.
+    const lastExternalShiftNonceRef = useRef(0);
+    useEffect(() => {
+        const unseen = externalShiftEvents.filter(event => event.nonce > lastExternalShiftNonceRef.current);
+        if (unseen.length === 0) return;
+        lastExternalShiftNonceRef.current = Math.max(...unseen.map(event => event.nonce));
+        rewriteAwaitingOverridesFromShift(unseen.flatMap(event => event.taskDates));
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- rewrite reads current awaiting state by design
+    }, [externalShiftEvents]);
+
     function clearTaskPreview(taskId: string) {
+        // A saved-awaiting task's override IS its committed state pending
+        // refresh — cancelling a speculative edit must restore it, never
+        // delete it (deleting strands the awaiting id and the refresh poll).
+        if (awaitingTaskRefreshIds.has(taskId)) return;
         setTaskDateOverrides(current => {
             if (!(taskId in current)) return current;
             const next = { ...current };
@@ -313,24 +324,16 @@ export function ScheduleBoard({
         const pointerEdit = activeTaskPointerRef.current;
         if (pointerEdit && projectIds.has(pointerEdit.projectId)) {
             pointerEdit.cleanup();
-            clearTaskPreview(pointerEdit.taskId);
         }
         const keyboardEdit = taskKeyboardEditRef.current;
         if (keyboardEdit && projectIds.has(keyboardEdit.projectId)) {
-            clearTaskPreview(keyboardEdit.taskId);
             taskKeyboardCleanupRef.current?.();
             setTaskKeyboardState(null);
         }
     }
 
     function cancelActiveTaskEdit() {
-        const pointerEdit = activeTaskPointerRef.current;
-        if (pointerEdit) {
-            pointerEdit.cleanup();
-            clearTaskPreview(pointerEdit.taskId);
-        }
-        const keyboardEdit = taskKeyboardEditRef.current;
-        if (keyboardEdit) clearTaskPreview(keyboardEdit.taskId);
+        activeTaskPointerRef.current?.cleanup();
         taskKeyboardCleanupRef.current?.();
         setTaskKeyboardState(null);
     }
@@ -350,14 +353,12 @@ export function ScheduleBoard({
         if (reconciledTaskIds.length === 0) return;
 
         // Prop reconciliation is intentionally deferred out of the effect body.
-        // Until refreshed canonical rows match, saved overrides stay rendered and
-        // the task remains gated against stale-base sequential edits.
+        // Until refreshed canonical rows match, saved overrides stay rendered.
         const timeoutId = window.setTimeout(() => {
             const reconciled = new Set(reconciledTaskIds);
             setTaskDateOverrides(current => Object.fromEntries(
                 Object.entries(current).filter(([taskId]) => !reconciled.has(taskId)),
             ));
-            setPendingTaskIds(current => new Set([...current].filter(taskId => !reconciled.has(taskId))));
             setAwaitingTaskRefreshIds(current => new Set([...current].filter(taskId => !reconciled.has(taskId))));
         }, 0);
         return () => window.clearTimeout(timeoutId);
@@ -374,7 +375,6 @@ export function ScheduleBoard({
             setProjectPreviewOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
             setProjectIncomeOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
             setProjectRefreshExpectations(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
-            setPendingProjectIds(current => new Set([...current].filter(id => !reconciled.has(id))));
         }, 0);
         return () => window.clearTimeout(timeoutId);
     }, [canonicalProjectById, projectRefreshExpectations]);
@@ -432,25 +432,20 @@ export function ScheduleBoard({
         });
     }
 
-    function awaitProjectRefresh(
-        project: DashboardProjectRow,
-        expectation: ProjectRefreshExpectation,
-        income: OverlayIncomeItem[] | null,
-    ) {
-        setProjectPreviewOverrides(current => ({ ...current, [project.id]: project }));
-        if (income) setProjectIncomeOverrides(current => ({ ...current, [project.id]: income }));
-        else setProjectIncomeOverrides(current => {
+    function clearProjectDraft(projectId: string) {
+        setProjectDrafts(current => {
+            if (!(projectId in current)) return current;
             const next = { ...current };
-            delete next[project.id];
+            delete next[projectId];
             return next;
         });
-        setProjectRefreshExpectations(current => ({ ...current, [project.id]: expectation }));
-        router.refresh();
     }
 
-    async function commitTaskDates(taskId: string, dates: TaskDateOverride): Promise<void> {
+    // ── Draft-mode writers: accumulate locally, never touch the server. ──
+
+    function draftTaskChange(taskId: string, dates: TaskDateOverride) {
         const canonicalTask = canonicalTaskById.get(taskId);
-        if (!data.canEdit || isTaskOrProjectPending(taskId) || !canonicalTask) {
+        if (!data.canEdit || isTaskLocked(taskId) || !canonicalTask) {
             clearTaskPreview(taskId);
             return;
         }
@@ -470,168 +465,300 @@ export function ScheduleBoard({
             startDate: canonicalTask.startDate.slice(0, 10),
             endDate: canonicalTask.endDate.slice(0, 10),
         };
-        if (normalizedDates.startDate === originalDates.startDate && normalizedDates.endDate === originalDates.endDate) {
+        // The back-to-canonical shortcut only applies to live drafts: for a
+        // saved-awaiting task the canonical props are STALE, so "back to the
+        // old date" is a real revert that must become a draft — shortcutting
+        // would delete the pinned override and strand the awaiting id.
+        if (!awaitingTaskRefreshIds.has(taskId)
+            && normalizedDates.startDate === originalDates.startDate
+            && normalizedDates.endDate === originalDates.endDate) {
             clearTaskPreview(taskId);
             return;
         }
-
-        dates = normalizedDates;
+        // Re-editing a saved-awaiting task turns it back into a live draft.
+        setAwaitingTaskRefreshIds(current => {
+            if (!current.has(taskId)) return current;
+            return new Set([...current].filter(id => id !== taskId));
+        });
         setTaskPreview(taskId, normalizedDates);
-        setTaskPending(taskId, true);
-        try {
-            const saved = await updateCompanyScheduleTaskDatesAction(taskId, { startDate: dates.startDate, endDate: dates.endDate });
-            const persistedDates = { startDate: formatDate(saved.startDate), endDate: formatDate(saved.endDate) };
-            setTaskPreview(taskId, persistedDates);
-            toast.success("Task dates updated");
-            setAwaitingTaskRefreshIds(current => new Set(current).add(taskId));
-            router.refresh();
-        } catch (error) {
-            clearTaskPreview(taskId);
-            setAwaitingTaskRefreshIds(current => {
-                const next = new Set(current);
-                next.delete(taskId);
-                return next;
-            });
-            setTaskPending(taskId, false);
-            toast.error(error instanceof Error ? error.message : "Failed to update task dates");
-        }
     }
 
-    function showSuccess(message: string, notes: string[]) {
-        if (notes.length > 0) toast.success(message, { description: notes.join(" ") });
-        else toast.success(message);
-    }
-
-    function showFailure(error: unknown, fallback: string) {
-        toast.error(error instanceof Error ? error.message : fallback);
-    }
-
-    function scheduleUnscheduledProject(project: DashboardProjectRow, targetStart: string) {
+    function draftProjectMove(project: DashboardProjectRow, targetStart: string) {
         const canonicalProject = canonicalProjectById.get(project.id);
-        if (!data.canEdit || !canonicalProject || isProjectPending(project.id)) return;
-        cancelActiveTaskEdit();
-        const normalizedTarget = formatDate(parseUTCDate(targetStart));
-        setProjectPreview(canonicalProject, normalizedTarget);
-        setProjectPending(project.id, true);
-        startTransition(async () => {
-            try {
-                const result = await updateProjectStartDateAction(project.id, normalizedTarget, true);
-                toast.success("Project scheduled", result.notes.length > 0 ? { description: result.notes.join(" ") } : undefined);
-                const preview = previewProjectWithPersistedTaskDates(canonicalProject, result.startDate, result.shiftedTaskDates);
-                awaitProjectRefresh(preview, {
-                    projectStartDate: result.startDate,
-                    taskDates: result.shiftedTaskDates,
-                }, data.overlays?.income ?? null);
-            } catch (error) {
-                clearProjectPreview(project.id);
-                showFailure(error, "Failed to schedule project");
-            } finally {
-                setProjectPending(project.id, false);
-            }
-        });
-    }
-
-    function commitWaitingProjectMove(intent: ProjectDropIntent) {
-        if (!data.canEdit || isProjectPending(intent.project.id)) {
-            clearProjectPreview(intent.project.id);
-            return;
-        }
-        cancelActiveTaskEdit();
-        setProjectPending(intent.project.id, true);
-        startTransition(async () => {
-            try {
-                const result = await updateProjectStartDateAction(intent.project.id, intent.targetStart, true);
-                showSuccess("Project moved", result.notes);
-                const expected = previewProjectWithPersistedTaskDates(intent.project, result.startDate, result.shiftedTaskDates);
-                const income = data.overlays
-                    ? previewProjectIncomeOverlays(data.overlays.income, intent.project.id, intent.deltaDays)
-                    : null;
-                awaitProjectRefresh(expected, {
-                    projectStartDate: result.startDate,
-                    taskDates: result.shiftedTaskDates,
-                }, income);
-            } catch (error) {
-                clearProjectPreview(intent.project.id);
-                showFailure(error, "Failed to move project");
-            } finally {
-                setProjectPending(intent.project.id, false);
-            }
-        });
-    }
-
-    function handleProjectMovePreview(project: DashboardProjectRow, targetStart: string) {
-        const canonicalProject = canonicalProjectById.get(project.id);
-        if (!data.canEdit || !canonicalProject || isProjectPending(project.id)) {
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) {
             clearProjectPreview(project.id);
             return;
         }
-        const intent = createProjectDropIntent(canonicalProject, targetStart);
-        if (!intent || intent.deltaDays === 0) clearProjectPreview(project.id);
-        else setProjectPreview(canonicalProject, intent.targetStart);
-    }
-
-    function handleProjectMoveCommit(project: DashboardProjectRow, targetStart: string) {
-        const canonicalProject = canonicalProjectById.get(project.id);
-        if (!data.canEdit || !canonicalProject || isProjectPending(project.id)) {
-            clearProjectPreview(project.id);
-            setConfirmIntent(null);
-            return;
-        }
-        cancelActiveTaskEdit();
         const intent = createProjectDropIntent(canonicalProject, targetStart);
         if (!intent || intent.deltaDays === 0) {
+            // Cancelling a project draft must also UNDO the rebase it applied
+            // to this project's task drafts, or they'd save shifted for a
+            // project move that never happened.
+            const previousDelta = projectDrafts[project.id]?.deltaDays ?? 0;
+            if (previousDelta !== 0 && canonicalProject.status !== "In Progress") {
+                const projectTaskIds = new Set(canonicalProject.tasks.map(task => task.id));
+                setTaskDateOverrides(current => Object.fromEntries(Object.entries(current).map(([taskId, dates]) => {
+                    if (!projectTaskIds.has(taskId) || awaitingTaskRefreshIds.has(taskId)) return [taskId, dates];
+                    return [taskId, {
+                        startDate: formatDate(addDays(parseUTCDate(dates.startDate), -previousDelta)),
+                        endDate: formatDate(addDays(parseUTCDate(dates.endDate), -previousDelta)),
+                    }];
+                })));
+            }
             clearProjectPreview(project.id);
-            setConfirmIntent(null);
+            clearProjectDraft(project.id);
             return;
         }
-
         setProjectPreview(canonicalProject, intent.targetStart);
-        if (canonicalProject.status === "In Progress") setConfirmIntent(intent);
-        else commitWaitingProjectMove(intent);
+        // Rebase this project's existing task drafts by the CHANGE in project
+        // delta (full-shift projects only — the preview shifts their tasks, so
+        // a task drafted at X before a +D project drag must follow to X+D or
+        // Save would write the stale pre-shift date over the shifted schedule).
+        // In Progress previews never move tasks, so their drafts stay absolute.
+        if (canonicalProject.status !== "In Progress") {
+            const previousDelta = projectDrafts[project.id]?.deltaDays ?? 0;
+            const deltaChange = intent.deltaDays - previousDelta;
+            if (deltaChange !== 0) {
+                const projectTaskIds = new Set(canonicalProject.tasks.map(task => task.id));
+                setTaskDateOverrides(current => Object.fromEntries(Object.entries(current).map(([taskId, dates]) => {
+                    // Saved-awaiting overrides are persisted state, not drafts —
+                    // never rebase them.
+                    if (!projectTaskIds.has(taskId) || awaitingTaskRefreshIds.has(taskId)) return [taskId, dates];
+                    return [taskId, {
+                        startDate: formatDate(addDays(parseUTCDate(dates.startDate), deltaChange)),
+                        endDate: formatDate(addDays(parseUTCDate(dates.endDate), deltaChange)),
+                    }];
+                })));
+            }
+        }
+        setProjectDrafts(current => ({
+            ...current,
+            [project.id]: { originalStart: intent.originalStart, targetStart: intent.targetStart, deltaDays: intent.deltaDays },
+        }));
+    }
+
+    function discardAllDrafts() {
+        cancelActiveTaskEdit();
+        cancelActiveProjectEdit();
+        for (const projectId of Object.keys(projectDrafts)) clearProjectPreview(projectId);
+        setProjectDrafts({});
+        // Discard clears UNSAVED drafts only. Saved-awaiting overrides are
+        // committed state pending refresh — removing them here would strand
+        // their awaiting ids and the refresh poll forever.
+        setTaskDateOverrides(current => Object.fromEntries(
+            Object.entries(current).filter(([taskId]) => awaitingTaskRefreshIds.has(taskId)),
+        ));
+    }
+
+    function waitForConfirmChoice(): Promise<ProjectMoveChoice | "cancel"> {
+        return new Promise(resolve => {
+            confirmResolverRef.current = resolve;
+        });
     }
 
     function handleMoveChoice(choice: ProjectMoveChoice) {
-        const intent = confirmIntent;
-        if (!data.canEdit || !intent) return;
-        if (isProjectPending(intent.project.id)) {
-            clearProjectPreview(intent.project.id);
-            setConfirmIntent(null);
-            return;
-        }
-        cancelActiveTaskEdit();
-        setProjectPending(intent.project.id, true);
-        startTransition(async () => {
-            try {
-                if (choice === "marker-only") {
-                    const result = await updateProjectStartDateAction(intent.project.id, intent.targetStart, false);
-                    showSuccess("Start marker moved", result.notes);
-                    const preview = previewProjectWithPersistedTaskDates(intent.project, result.startDate, []);
-                    awaitProjectRefresh(preview, { projectStartDate: result.startDate, taskDates: [] }, data.overlays?.income ?? null);
-                } else {
-                    const result = await shiftNotStartedTasksAction(intent.project.id, intent.deltaDays);
-                    showSuccess("Not Started tasks shifted", result.notes);
-                    const shiftedTaskIds = new Set(result.shiftedTaskIds);
-                    const expected = previewProjectWithPersistedTaskDates(intent.project, intent.project.startDate, result.shiftedTaskDates);
-                    const income = data.overlays
-                        ? previewShiftedTaskIncomeOverlays(data.overlays.income, intent.project.id, intent.deltaDays, shiftedTaskIds)
-                        : null;
-                    awaitProjectRefresh(expected, { taskDates: result.shiftedTaskDates }, income);
-                }
-                setConfirmIntent(null);
-            } catch (error) {
-                setConfirmIntent(null);
-                clearProjectPreview(intent.project.id);
-                showFailure(error, "Failed to move project");
-            } finally {
-                setProjectPending(intent.project.id, false);
-            }
-        });
+        confirmResolverRef.current?.(choice);
+        confirmResolverRef.current = null;
     }
 
     function cancelConfirmedMove() {
-        if (!confirmIntent || pendingProjectIds.has(confirmIntent.project.id)) return;
-        clearProjectPreview(confirmIntent.project.id);
-        setConfirmIntent(null);
+        confirmResolverRef.current?.("cancel");
+        confirmResolverRef.current = null;
+    }
+
+    // Commits every drafted change in one Save gesture: project-start moves
+    // via the existing single-project actions (In Progress projects get their
+    // marker-only vs shift-Not-Started-tasks confirmation HERE, one project at
+    // a time — deferred from drag time), then every drafted task-date change
+    // in ONE batch call. Failures are isolated per item; only one
+    // router.refresh() fires, after everything settles.
+    async function saveAllDrafts() {
+        if (isSaving) return;
+        // Drafts on a project the legacy StartDateRow is mutating RIGHT NOW are
+        // retained (not sent) — the board must never serialize over a sibling
+        // writer's in-flight result. They save on the next click.
+        const retainedForExternalLock: string[] = [];
+        const projectEntries = Object.entries(projectDrafts).filter(([projectId]) => {
+            if (!isProjectExternallyPending(projectId)) return true;
+            retainedForExternalLock.push(canonicalProjectById.get(projectId)?.name ?? projectId);
+            return false;
+        });
+        const taskEntries = Object.entries(taskDateOverrides).filter(([taskId]) => {
+            if (awaitingTaskRefreshIds.has(taskId)) return false; // already saved, awaiting refresh
+            const projectId = canonicalTaskProjectById.get(taskId);
+            if (!projectId || !isProjectExternallyPending(projectId)) return true;
+            retainedForExternalLock.push(canonicalTaskById.get(taskId)?.name ?? taskId);
+            return false;
+        });
+        if (retainedForExternalLock.length > 0) {
+            toast.info(`${retainedForExternalLock.length} draft${retainedForExternalLock.length === 1 ? "" : "s"} kept unsaved while another edit finishes: ${retainedForExternalLock.join(", ")}`);
+        }
+        if (projectEntries.length === 0 && taskEntries.length === 0) return;
+        // The batch below reconciles these tasks itself (override + awaiting
+        // id); project-shift expectations must not also claim them or the two
+        // mechanisms deadlock the refresh poll on conflicting dates.
+        const batchedTaskIds = new Set(taskEntries.map(([taskId]) => taskId));
+
+        setIsSaving(true);
+        const lockedProjectIds = new Set<string>([
+            ...projectEntries.map(([projectId]) => projectId),
+            ...taskEntries
+                .map(([taskId]) => canonicalTaskProjectById.get(taskId))
+                .filter((id): id is string => Boolean(id)),
+        ]);
+        onEffectivePendingProjectIdsChange(lockedProjectIds);
+
+        const failedProjectNames: string[] = [];
+        const succeededProjectIds: string[] = [];
+        const failedProjectIds = new Set<string>();
+        const projectExpectations: Record<string, ProjectRefreshExpectation> = {};
+        // Persisted task dates from successful shifts — saved-awaiting tasks
+        // caught in a shift must have their pinned overrides rewritten to the
+        // shifted dates or their awaiting ids can never reconcile.
+        const shiftedPersistedDates: { id: string; startDate: string; endDate: string }[] = [];
+
+        for (const [projectId, draft] of projectEntries) {
+            const canonicalProject = canonicalProjectById.get(projectId);
+            if (!canonicalProject) {
+                failedProjectNames.push(projectId);
+                failedProjectIds.add(projectId);
+                continue;
+            }
+            let choice: ProjectMoveChoice = "not-started-tasks";
+            if (canonicalProject.status === "In Progress") {
+                setConfirmIntent({ project: canonicalProject, originalStart: draft.originalStart, targetStart: draft.targetStart, deltaDays: draft.deltaDays });
+                const resolved = await waitForConfirmChoice();
+                setConfirmIntent(null);
+                if (resolved === "cancel") continue; // leave this draft in place for later
+                choice = resolved;
+            }
+            try {
+                if (canonicalProject.status === "In Progress") {
+                    if (choice === "marker-only") {
+                        const result = await updateProjectStartDateAction(projectId, draft.targetStart, false);
+                        projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: [] };
+                    } else {
+                        // Owner-decided semantics: the bar drag moves the start
+                        // marker AND the not-started work — the whole future of
+                        // the job follows the drag; started work stays put.
+                        const markerResult = await updateProjectStartDateAction(projectId, draft.targetStart, false);
+                        const shiftResult = await shiftNotStartedTasksAction(projectId, draft.deltaDays);
+                        shiftedPersistedDates.push(...shiftResult.shiftedTaskDates);
+                        projectExpectations[projectId] = {
+                            projectStartDate: markerResult.startDate,
+                            taskDates: shiftResult.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)),
+                        };
+                    }
+                } else {
+                    const result = await updateProjectStartDateAction(projectId, draft.targetStart, true);
+                    shiftedPersistedDates.push(...result.shiftedTaskDates);
+                    projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
+                }
+                succeededProjectIds.push(projectId);
+            } catch (error) {
+                failedProjectNames.push(canonicalProject.name);
+                failedProjectIds.add(projectId);
+            }
+        }
+
+        if (succeededProjectIds.length > 0) {
+            const succeeded = new Set(succeededProjectIds);
+            setProjectDrafts(current => Object.fromEntries(Object.entries(current).filter(([id]) => !succeeded.has(id))));
+            setProjectRefreshExpectations(current => ({ ...current, ...projectExpectations }));
+            // Rewrite saved-awaiting overrides that a shift just moved: their
+            // pinned dates must track the PERSISTED (shifted) dates or their
+            // awaiting ids never match refreshed canonical rows.
+            rewriteAwaitingOverridesFromShift(shiftedPersistedDates);
+        }
+
+        let failedTaskNames: string[] = [];
+        let succeededTaskCount = 0;
+        // Task drafts on a project whose shift FAILED stay drafted (their
+        // overrides are stored rebased against that shift; saving them now
+        // would write post-shift dates onto an unshifted schedule). They save
+        // with the project on the next attempt.
+        const sendableTaskEntries = taskEntries.filter(([taskId]) => {
+            const projectId = canonicalTaskProjectById.get(taskId);
+            return !projectId || !failedProjectIds.has(projectId);
+        });
+        if (sendableTaskEntries.length > 0) {
+            const changes = sendableTaskEntries.map(([taskId, dates]) => ({ taskId, startDate: dates.startDate, endDate: dates.endDate }));
+            try {
+                // Chunked to the server's 200-change cap so any draft count
+                // saves in one gesture. Failures are isolated PER CHUNK: a
+                // rejected chunk synthesizes failure rows for its own tasks
+                // only — earlier chunks' successes are never discarded or
+                // retried as if unsaved.
+                const allResults = [] as Awaited<ReturnType<typeof saveCompanyScheduleTaskDatesAction>>["results"];
+                for (let offset = 0; offset < changes.length; offset += 200) {
+                    const chunk = changes.slice(offset, offset + 200);
+                    try {
+                        const batchResult = await saveCompanyScheduleTaskDatesAction(chunk);
+                        allResults.push(...batchResult.results);
+                    } catch (chunkError: any) {
+                        const message = chunkError?.message ?? "Save failed";
+                        allResults.push(...chunk.map(change => ({ taskId: change.taskId, ok: false as const, error: message })));
+                    }
+                }
+                const succeededRows = allResults.filter(row => row.ok);
+                failedTaskNames = allResults
+                    .filter(row => !row.ok)
+                    .map(row => canonicalTaskById.get(row.taskId)?.name ?? row.taskId);
+                succeededTaskCount = succeededRows.length;
+                if (succeededRows.length > 0) {
+                    // Keep the override (pinned to the PERSISTED dates) until the
+                    // refresh poll sees matching canonical rows — reconciliation
+                    // requires the override to exist; deleting it here would
+                    // leave awaiting ids stranded and the poll running forever.
+                    const savedById = new Map(succeededRows.map(row => [row.taskId, {
+                        startDate: row.startDate!.slice(0, 10),
+                        endDate: row.endDate!.slice(0, 10),
+                    }]));
+                    setTaskDateOverrides(current => {
+                        const next = { ...current };
+                        for (const [taskId, dates] of savedById) next[taskId] = dates;
+                        return next;
+                    });
+                    setAwaitingTaskRefreshIds(current => new Set([...current, ...savedById.keys()]));
+                }
+            } catch (error) {
+                failedTaskNames = taskEntries.map(([taskId]) => canonicalTaskById.get(taskId)?.name ?? taskId);
+            }
+        }
+
+        setIsSaving(false);
+        onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS);
+        router.refresh();
+
+        const totalSucceeded = succeededProjectIds.length + succeededTaskCount;
+        const totalFailed = failedProjectNames.length + failedTaskNames.length;
+        if (totalFailed === 0 && totalSucceeded > 0) {
+            toast.success(`Saved ${totalSucceeded} change${totalSucceeded === 1 ? "" : "s"}`);
+        } else if (totalFailed > 0) {
+            const failedNames = [...failedProjectNames, ...failedTaskNames];
+            toast.error(
+                `${totalFailed} change${totalFailed === 1 ? "" : "s"} failed to save: ${failedNames.join(", ")}`,
+                totalSucceeded > 0 ? { description: `${totalSucceeded} other change${totalSucceeded === 1 ? "" : "s"} saved.` } : undefined,
+            );
+        }
+    }
+
+    function cancelProjectEditsForProjects(projectIds: ReadonlySet<string>) {
+        const pointerEdit = activeProjectPointerRef.current;
+        if (pointerEdit && projectIds.has(pointerEdit.projectId)) {
+            pointerEdit.cleanup();
+        }
+        const keyboardEdit = projectKeyboardEditRef.current;
+        if (keyboardEdit && projectIds.has(keyboardEdit.projectId)) {
+            projectKeyboardCleanupRef.current?.();
+            setProjectKeyboardState(null);
+        }
+    }
+
+    function cancelActiveProjectEdit() {
+        activeProjectPointerRef.current?.cleanup();
+        projectKeyboardCleanupRef.current?.();
+        setProjectKeyboardState(null);
     }
 
     function setProjectKeyboardState(next: ProjectKeyboardEditState | null) {
@@ -639,40 +766,9 @@ export function ScheduleBoard({
         setProjectKeyboardEdit(next);
     }
 
-    function cancelProjectEditsForProjects(projectIds: ReadonlySet<string>) {
-        const pointerEdit = activeProjectPointerRef.current;
-        if (pointerEdit && projectIds.has(pointerEdit.projectId)) {
-            pointerEdit.cleanup();
-            clearProjectPreview(pointerEdit.projectId);
-        }
-        const keyboardEdit = projectKeyboardEditRef.current;
-        if (keyboardEdit && projectIds.has(keyboardEdit.projectId)) {
-            clearProjectPreview(keyboardEdit.projectId);
-            projectKeyboardCleanupRef.current?.();
-            setProjectKeyboardState(null);
-        }
-    }
-
-    function cancelActiveProjectEdit() {
-        const pointerEdit = activeProjectPointerRef.current;
-        if (pointerEdit) {
-            pointerEdit.cleanup();
-            clearProjectPreview(pointerEdit.projectId);
-        }
-        const keyboardEdit = projectKeyboardEditRef.current;
-        if (keyboardEdit) clearProjectPreview(keyboardEdit.projectId);
-        projectKeyboardCleanupRef.current?.();
-        setProjectKeyboardState(null);
-    }
-
     const cancelExternallyLockedProjectEdits = useEffectEvent((newlyPendingProjectIds: ReadonlySet<string>) => {
         cancelProjectEditsForProjects(newlyPendingProjectIds);
         cancelTaskEditsForProjects(newlyPendingProjectIds);
-        const intent = confirmIntentRef.current;
-        if (intent && newlyPendingProjectIds.has(intent.project.id)) {
-            clearProjectPreview(intent.project.id);
-            setConfirmIntent(null);
-        }
     });
 
     useEffect(() => {
@@ -688,7 +784,7 @@ export function ScheduleBoard({
 
     function handleProjectPointerEditStart(project: DashboardProjectRow, start: ProjectPointerEditStart) {
         const canonicalProject = canonicalProjectById.get(project.id);
-        if (!data.canEdit || !canonicalProject || isProjectPending(project.id)) return;
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) return;
         cancelActiveProjectEdit();
         cancelActiveTaskEdit();
         const drag: ActiveProjectPointerEdit = {
@@ -750,7 +846,7 @@ export function ScheduleBoard({
                 drag.originX -= container.scrollLeft - before;
             }
             const candidate = calculateProjectPointerCandidate();
-            if (candidate) handleProjectMovePreview(drag.project, candidate);
+            if (candidate) setProjectPreview(drag.project, candidate);
             else clearProjectPreview(drag.projectId);
             if (getProjectAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runProjectPointerFrame);
@@ -781,11 +877,12 @@ export function ScheduleBoard({
             drag.animationFrameId = null;
             const candidate = drag.active && !cancelled ? calculateProjectPointerCandidate() : null;
             drag.cleanup();
-            if (!drag.active || cancelled || !candidate) {
+            if (!drag.active) return;
+            if (cancelled || !candidate) {
                 clearProjectPreview(drag.projectId);
                 return;
             }
-            handleProjectMoveCommit(drag.project, candidate);
+            draftProjectMove(drag.project, candidate);
         };
         const onPointerUp = (event: PointerEvent) => {
             if (event.pointerId === drag.pointerId) finish(false, event);
@@ -823,7 +920,7 @@ export function ScheduleBoard({
 
     function handleProjectKeyboardStart(project: DashboardProjectRow, sourceElement: HTMLElement) {
         const canonicalProject = canonicalProjectById.get(project.id);
-        if (!data.canEdit || !canonicalProject || isProjectPending(project.id)) return;
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) return;
         const range = getEffectiveProjectRange(canonicalProject);
         if (!range) return;
         const intent = createProjectDropIntent(canonicalProject, formatDate(range.start));
@@ -867,22 +964,23 @@ export function ScheduleBoard({
 
     function handleProjectKeyboardAdjust(project: DashboardProjectRow, deltaDays: number) {
         const current = projectKeyboardEditRef.current;
-        if (!current || current.projectId !== project.id || isProjectPending(project.id)) return;
+        if (!current || current.projectId !== project.id || isProjectLocked(project.id)) return;
         const targetStart = formatDate(addDays(parseUTCDate(current.targetStart), deltaDays));
         setProjectKeyboardState({ ...current, targetStart });
-        handleProjectMovePreview(project, targetStart);
+        const canonicalProject = canonicalProjectById.get(project.id);
+        if (canonicalProject) setProjectPreview(canonicalProject, targetStart);
     }
 
     function handleProjectKeyboardCommit(project: DashboardProjectRow) {
         const current = projectKeyboardEditRef.current;
         if (!current || current.projectId !== project.id) return;
-        if (isProjectPending(project.id)) {
+        if (isProjectLocked(project.id)) {
             handleProjectKeyboardCancel(project);
             return;
         }
         projectKeyboardCleanupRef.current?.();
         setProjectKeyboardState(null);
-        handleProjectMoveCommit(project, current.targetStart);
+        draftProjectMove(project, current.targetStart);
     }
 
     function handleProjectKeyboardCancel(project: DashboardProjectRow) {
@@ -895,7 +993,7 @@ export function ScheduleBoard({
     function handleTaskPointerEditStart(task: DashboardTaskRow, mode: TaskEditMode, start: TaskPointerEditStart) {
         const canonicalTask = canonicalTaskById.get(task.id);
         const projectId = canonicalTaskProjectById.get(task.id);
-        if (!data.canEdit || isTaskOrProjectPending(task.id) || !canonicalTask || !projectId) return;
+        if (!data.canEdit || isTaskLocked(task.id) || !canonicalTask || !projectId) return;
         if (canonicalTask.type === "milestone" && mode !== "move") return;
 
         cancelActiveTaskEdit();
@@ -1010,8 +1108,7 @@ export function ScheduleBoard({
                 clearTaskPreview(task.id);
                 return;
             }
-            setTaskPreview(task.id, candidate);
-            void commitTaskDates(task.id, candidate);
+            draftTaskChange(task.id, candidate);
         };
         const onPointerUp = (event: PointerEvent) => {
             if (event.pointerId === drag.pointerId) finish(false, event);
@@ -1051,7 +1148,7 @@ export function ScheduleBoard({
     function handleTaskKeyboardStart(task: DashboardTaskRow, mode: TaskEditMode, sourceElement: HTMLElement) {
         const canonicalTask = canonicalTaskById.get(task.id);
         const projectId = canonicalTaskProjectById.get(task.id);
-        if (!data.canEdit || isTaskOrProjectPending(task.id) || !canonicalTask || !projectId) return;
+        if (!data.canEdit || isTaskLocked(task.id) || !canonicalTask || !projectId) return;
         if (canonicalTask.type === "milestone" && mode !== "move") return;
         cancelActiveTaskEdit();
         cancelActiveProjectEdit();
@@ -1095,7 +1192,7 @@ export function ScheduleBoard({
     function handleTaskKeyboardAdjust(task: DashboardTaskRow, mode: TaskEditMode, deltaDays: number) {
         const canonicalTask = canonicalTaskById.get(task.id);
         const current = taskKeyboardEditRef.current;
-        if (!data.canEdit || isTaskOrProjectPending(task.id) || !canonicalTask || current?.taskId !== task.id || current.mode !== mode) return;
+        if (!data.canEdit || isTaskLocked(task.id) || !canonicalTask || current?.taskId !== task.id || current.mode !== mode) return;
         const nextDeltaDays = current.deltaDays + deltaDays;
         const dates = previewTaskDates(canonicalTask, mode, nextDeltaDays);
         if (!dates) return;
@@ -1108,11 +1205,11 @@ export function ScheduleBoard({
     function handleTaskKeyboardCommit(task: DashboardTaskRow, mode: TaskEditMode) {
         const canonicalTask = canonicalTaskById.get(task.id);
         const current = taskKeyboardEditRef.current;
-        if (!data.canEdit || isTaskOrProjectPending(task.id) || !canonicalTask || current?.taskId !== task.id || current.mode !== mode) return;
+        if (!data.canEdit || isTaskLocked(task.id) || !canonicalTask || current?.taskId !== task.id || current.mode !== mode) return;
         const dates = previewTaskDates(canonicalTask, mode, current.deltaDays);
         taskKeyboardCleanupRef.current?.();
         setTaskKeyboardState(null);
-        if (dates) void commitTaskDates(task.id, dates);
+        if (dates) draftTaskChange(task.id, dates);
     }
 
     function handleTaskKeyboardCancel(task: DashboardTaskRow) {
@@ -1123,25 +1220,79 @@ export function ScheduleBoard({
     }
 
     function handleTaskDatesCommit(task: DashboardTaskRow, dates: TaskDateOverride) {
-        if (!data.canEdit || isTaskOrProjectPending(task.id) || !canonicalTaskById.has(task.id)) return;
+        if (!data.canEdit || isTaskLocked(task.id) || !canonicalTaskById.has(task.id)) return;
         cancelActiveTaskEdit();
         cancelActiveProjectEdit();
-        void commitTaskDates(task.id, dates);
+        draftTaskChange(task.id, dates);
     }
 
     function handleTaskMoveBy(task: DashboardTaskRow, deltaDays: number) {
         const canonicalTask = canonicalTaskById.get(task.id);
-        if (!data.canEdit || isTaskOrProjectPending(task.id) || !canonicalTask) return;
+        if (!data.canEdit || isTaskLocked(task.id) || !canonicalTask) return;
         cancelActiveTaskEdit();
         cancelActiveProjectEdit();
         const dates = previewTaskDates(canonicalTask, "move", deltaDays);
-        if (dates) void commitTaskDates(task.id, dates);
+        if (dates) draftTaskChange(task.id, dates);
     }
+
+    // Tray drop for an unscheduled (Waiting-to-Start, no startDate yet)
+    // project — drafts the move the same as any other project drag.
+    function scheduleUnscheduledProject(project: DashboardProjectRow, targetStart: string) {
+        const canonicalProject = canonicalProjectById.get(project.id);
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) return;
+        cancelActiveTaskEdit();
+        const normalizedTarget = formatDate(parseUTCDate(targetStart));
+        if (!canonicalProject.startDate) {
+            // No prior date to diff against — preview + draft directly from the
+            // unscheduled state (createProjectDropIntent needs an existing
+            // range, which an unscheduled project's task-only range still
+            // provides when tasks exist; otherwise seed a bare marker draft).
+            const preview = { ...canonicalProject, startDate: normalizedTarget };
+            setProjectPreviewOverrides(current => ({ ...current, [project.id]: preview }));
+            setProjectDrafts(current => ({
+                ...current,
+                [project.id]: { originalStart: normalizedTarget, targetStart: normalizedTarget, deltaDays: 0 },
+            }));
+            return;
+        }
+        draftProjectMove(canonicalProject, normalizedTarget);
+    }
+
+    function handleProjectMovePreview(project: DashboardProjectRow, targetStart: string) {
+        const canonicalProject = canonicalProjectById.get(project.id);
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) {
+            clearProjectPreview(project.id);
+            return;
+        }
+        const intent = createProjectDropIntent(canonicalProject, targetStart);
+        if (!intent || intent.deltaDays === 0) clearProjectPreview(project.id);
+        else setProjectPreview(canonicalProject, intent.targetStart);
+    }
+
+    function handleProjectMoveCommit(project: DashboardProjectRow, targetStart: string) {
+        const canonicalProject = canonicalProjectById.get(project.id);
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) {
+            clearProjectPreview(project.id);
+            return;
+        }
+        cancelActiveTaskEdit();
+        draftProjectMove(canonicalProject, targetStart);
+    }
+
+    const pendingRefreshKinds = [
+        Object.keys(projectRefreshExpectations).length > 0 ? "project" : null,
+        awaitingTaskRefreshIds.size > 0 ? "task" : null,
+    ].filter((kind): kind is string => Boolean(kind));
 
     return (
         <div className="hui-card mb-6 overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-hui-border">
-                <h2 className="text-base font-semibold text-hui-textMain">Project Schedule — {monthLabel}</h2>
+                <div className="flex items-baseline gap-3">
+                    <h2 className="text-base font-semibold text-hui-textMain">Project Schedule — {monthLabel}</h2>
+                    <Link href="/company-dashboard/guide" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
+                        How to use
+                    </Link>
+                </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
                     <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Schedule view">
                         <button
@@ -1174,14 +1325,26 @@ export function ScheduleBoard({
                     <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, 1))} className="hui-btn hui-btn-secondary text-sm">Next →</button>
                 </div>
             </div>
+            {draftCount > 0 && (
+                <div role="status" className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">
+                    <span>{draftCount} unsaved change{draftCount === 1 ? "" : "s"}</span>
+                    <div className="flex items-center gap-2">
+                        <button type="button" onClick={discardAllDrafts} disabled={isSaving} className="hui-btn hui-btn-secondary text-xs disabled:cursor-wait disabled:opacity-60">
+                            Discard
+                        </button>
+                        <button type="button" onClick={() => void saveAllDrafts()} disabled={isSaving} className="hui-btn hui-btn-green text-xs disabled:cursor-wait disabled:opacity-60">
+                            {isSaving ? "Saving..." : "Save"}
+                        </button>
+                    </div>
+                </div>
+            )}
             <UnscheduledTray
-                estimating={data.pipeline.estimating}
                 projects={data.pipeline.waitingToStart}
                 canEdit={data.canEdit}
-                pendingProjectIds={effectivePendingProjectIds}
+                pendingProjectIds={externallyPendingProjectIds}
                 onMoveProject={scheduleUnscheduledProject}
             />
-            {(projectRefreshCount > 0 || awaitingTaskRefreshIds.size > 0) && (
+            {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0) && (
                 <div className="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">
                     <span>Refreshing saved {pendingRefreshKinds.join(" and ")} schedule changes...</span>
                     <button type="button" className="font-semibold underline" onClick={() => router.refresh()}>Retry now</button>
@@ -1200,8 +1363,11 @@ export function ScheduleBoard({
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
                     showHours={showHours}
-                    pendingProjectIds={effectivePendingProjectIds}
-                    pendingTaskIds={effectivePendingTaskIds}
+                    pendingProjectIds={externallyPendingProjectIds}
+                    pendingTaskIds={EMPTY_PROJECT_IDS}
+                    draftProjectIds={draftProjectIds}
+                    draftTaskIds={draftTaskIds}
+                    isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
@@ -1226,8 +1392,11 @@ export function ScheduleBoard({
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
                     showHours={showHours}
-                    pendingProjectIds={effectivePendingProjectIds}
-                    pendingTaskIds={effectivePendingTaskIds}
+                    pendingProjectIds={externallyPendingProjectIds}
+                    pendingTaskIds={EMPTY_PROJECT_IDS}
+                    draftProjectIds={draftProjectIds}
+                    draftTaskIds={draftTaskIds}
+                    isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
@@ -1248,7 +1417,7 @@ export function ScheduleBoard({
             )}
             <ShiftConfirmDialog
                 intent={confirmIntent}
-                isPending={Boolean(confirmIntent && isProjectPending(confirmIntent.project.id))}
+                isPending={false}
                 onChoice={handleMoveChoice}
                 onCancel={cancelConfirmedMove}
             />

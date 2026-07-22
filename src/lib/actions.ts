@@ -9,7 +9,7 @@ import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
@@ -5778,7 +5778,7 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[], expectedFingerprint?: string) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5788,6 +5788,20 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     });
 
     if (!contract) throw new Error("Contract not found");
+
+    // MCP confirm-token guard: the caller previewed a specific document to the user and
+    // binds that snapshot's hash here. If the contract changed between their preview and
+    // this read (a concurrent edit), refuse — never email a legal document whose text
+    // differs from what the user approved. Must hash the SAME fields, the same way, as
+    // the send_contract tool in src/app/api/mcp/[transport]/route.ts.
+    if (expectedFingerprint) {
+        const fresh = createHash("sha256")
+            .update(JSON.stringify({ title: contract.title, body: contract.body, status: contract.status, requiresCountersign: contract.requiresCountersign }))
+            .digest("hex").slice(0, 24);
+        if (fresh !== expectedFingerprint) {
+            throw new Error("The contract changed after the preview — run the send preview again and re-confirm.");
+        }
+    }
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
@@ -7408,6 +7422,71 @@ export async function updateTaskCrewAction(taskId: string, userIds: string[]) {
     revalidatePath("/company-dashboard");
     revalidatePath(`/projects/${result.projectId}/schedule`);
     return result;
+}
+
+export interface SaveCompanyScheduleTaskDatesInput {
+    taskId: string;
+    startDate: string; // YYYY-MM-DD
+    endDate: string;   // YYYY-MM-DD
+}
+
+export interface SaveCompanyScheduleTaskDateResult {
+    taskId: string;
+    ok: boolean;
+    startDate?: string;
+    endDate?: string;
+    error?: string;
+}
+
+export interface SaveCompanyScheduleTaskDatesResult {
+    results: SaveCompanyScheduleTaskDateResult[];
+    succeeded: number;
+    failed: number;
+}
+
+// Commit the company schedule board's draft-mode edits in one batch. ADMIN/
+// MANAGER only, same gate as the other dashboard batch actions. Loops the
+// canonical updateScheduleTask per task — deliberately NOT a second mutation
+// core — so every existing lock/validation/ActivityLog path applies
+// unchanged. One task's failure never blocks the rest: each change is applied
+// independently and reported in `results`, so the client can clear succeeded
+// drafts and keep failed ones pending for retry.
+export async function saveCompanyScheduleTaskDatesAction(
+    changes: SaveCompanyScheduleTaskDatesInput[],
+): Promise<SaveCompanyScheduleTaskDatesResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    if (changes.length > 200) throw new Error("Too many schedule changes in one save (max 200) — save in smaller batches");
+    // Deterministic dedupe: the LAST occurrence of a taskId wins and is applied
+    // exactly once (no duplicate activity records or inflated success counts).
+    const deduped = [...new Map(changes.map(change => [change.taskId, change])).values()];
+
+    const results: SaveCompanyScheduleTaskDateResult[] = [];
+    for (const change of deduped) {
+        try {
+            const task = await updateScheduleTask(change.taskId, {
+                startDate: change.startDate,
+                endDate: change.endDate,
+            });
+            results.push({
+                taskId: change.taskId,
+                ok: true,
+                startDate: task.startDate.toISOString(),
+                endDate: task.endDate.toISOString(),
+            });
+        } catch (err: any) {
+            results.push({ taskId: change.taskId, ok: false, error: err?.message ?? String(err) });
+        }
+    }
+
+    return {
+        results,
+        succeeded: results.filter(r => r.ok).length,
+        failed: results.filter(r => !r.ok).length,
+    };
 }
 
 export async function updateProjectColor(projectId: string, color: string) {

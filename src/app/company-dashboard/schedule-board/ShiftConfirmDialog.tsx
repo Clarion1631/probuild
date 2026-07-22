@@ -40,7 +40,7 @@ export function ShiftConfirmDialog({ intent, isPending, onChoice, onCancel }: Sh
                             onClick={() => onChoice("not-started-tasks")}
                             className="hui-btn hui-btn-secondary w-full justify-center text-sm disabled:cursor-wait disabled:opacity-60"
                         >
-                            Also shift all Not Started tasks by {magnitude} day{magnitude === 1 ? "" : "s"} {direction}
+                            Move the start marker AND shift all Not Started tasks by {magnitude} day{magnitude === 1 ? "" : "s"} {direction}
                         </button>
                     </div>
                     <div className="mt-4 flex justify-end">
