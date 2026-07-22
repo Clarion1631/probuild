@@ -423,7 +423,13 @@ export function ScheduleBoard({
             startDate: canonicalTask.startDate.slice(0, 10),
             endDate: canonicalTask.endDate.slice(0, 10),
         };
-        if (normalizedDates.startDate === originalDates.startDate && normalizedDates.endDate === originalDates.endDate) {
+        // The back-to-canonical shortcut only applies to live drafts: for a
+        // saved-awaiting task the canonical props are STALE, so "back to the
+        // old date" is a real revert that must become a draft — shortcutting
+        // would delete the pinned override and strand the awaiting id.
+        if (!awaitingTaskRefreshIds.has(taskId)
+            && normalizedDates.startDate === originalDates.startDate
+            && normalizedDates.endDate === originalDates.endDate) {
             clearTaskPreview(taskId);
             return;
         }
@@ -443,6 +449,20 @@ export function ScheduleBoard({
         }
         const intent = createProjectDropIntent(canonicalProject, targetStart);
         if (!intent || intent.deltaDays === 0) {
+            // Cancelling a project draft must also UNDO the rebase it applied
+            // to this project's task drafts, or they'd save shifted for a
+            // project move that never happened.
+            const previousDelta = projectDrafts[project.id]?.deltaDays ?? 0;
+            if (previousDelta !== 0 && canonicalProject.status !== "In Progress") {
+                const projectTaskIds = new Set(canonicalProject.tasks.map(task => task.id));
+                setTaskDateOverrides(current => Object.fromEntries(Object.entries(current).map(([taskId, dates]) => {
+                    if (!projectTaskIds.has(taskId) || awaitingTaskRefreshIds.has(taskId)) return [taskId, dates];
+                    return [taskId, {
+                        startDate: formatDate(addDays(parseUTCDate(dates.startDate), -previousDelta)),
+                        endDate: formatDate(addDays(parseUTCDate(dates.endDate), -previousDelta)),
+                    }];
+                })));
+            }
             clearProjectPreview(project.id);
             clearProjectDraft(project.id);
             return;
@@ -459,7 +479,9 @@ export function ScheduleBoard({
             if (deltaChange !== 0) {
                 const projectTaskIds = new Set(canonicalProject.tasks.map(task => task.id));
                 setTaskDateOverrides(current => Object.fromEntries(Object.entries(current).map(([taskId, dates]) => {
-                    if (!projectTaskIds.has(taskId)) return [taskId, dates];
+                    // Saved-awaiting overrides are persisted state, not drafts —
+                    // never rebase them.
+                    if (!projectTaskIds.has(taskId) || awaitingTaskRefreshIds.has(taskId)) return [taskId, dates];
                     return [taskId, {
                         startDate: formatDate(addDays(parseUTCDate(dates.startDate), deltaChange)),
                         endDate: formatDate(addDays(parseUTCDate(dates.endDate), deltaChange)),
@@ -478,7 +500,12 @@ export function ScheduleBoard({
         cancelActiveProjectEdit();
         for (const projectId of Object.keys(projectDrafts)) clearProjectPreview(projectId);
         setProjectDrafts({});
-        setTaskDateOverrides({});
+        // Discard clears UNSAVED drafts only. Saved-awaiting overrides are
+        // committed state pending refresh — removing them here would strand
+        // their awaiting ids and the refresh poll forever.
+        setTaskDateOverrides(current => Object.fromEntries(
+            Object.entries(current).filter(([taskId]) => awaitingTaskRefreshIds.has(taskId)),
+        ));
     }
 
     function waitForConfirmChoice(): Promise<ProjectMoveChoice | "cancel"> {
@@ -541,12 +568,14 @@ export function ScheduleBoard({
 
         const failedProjectNames: string[] = [];
         const succeededProjectIds: string[] = [];
+        const failedProjectIds = new Set<string>();
         const projectExpectations: Record<string, ProjectRefreshExpectation> = {};
 
         for (const [projectId, draft] of projectEntries) {
             const canonicalProject = canonicalProjectById.get(projectId);
             if (!canonicalProject) {
                 failedProjectNames.push(projectId);
+                failedProjectIds.add(projectId);
                 continue;
             }
             let choice: ProjectMoveChoice = "not-started-tasks";
@@ -563,8 +592,15 @@ export function ScheduleBoard({
                         const result = await updateProjectStartDateAction(projectId, draft.targetStart, false);
                         projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: [] };
                     } else {
-                        const result = await shiftNotStartedTasksAction(projectId, draft.deltaDays);
-                        projectExpectations[projectId] = { taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
+                        // Owner-decided semantics: the bar drag moves the start
+                        // marker AND the not-started work — the whole future of
+                        // the job follows the drag; started work stays put.
+                        const markerResult = await updateProjectStartDateAction(projectId, draft.targetStart, false);
+                        const shiftResult = await shiftNotStartedTasksAction(projectId, draft.deltaDays);
+                        projectExpectations[projectId] = {
+                            projectStartDate: markerResult.startDate,
+                            taskDates: shiftResult.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)),
+                        };
                     }
                 } else {
                     const result = await updateProjectStartDateAction(projectId, draft.targetStart, true);
@@ -573,6 +609,7 @@ export function ScheduleBoard({
                 succeededProjectIds.push(projectId);
             } catch (error) {
                 failedProjectNames.push(canonicalProject.name);
+                failedProjectIds.add(projectId);
             }
         }
 
@@ -584,12 +621,26 @@ export function ScheduleBoard({
 
         let failedTaskNames: string[] = [];
         let succeededTaskCount = 0;
-        if (taskEntries.length > 0) {
-            const changes = taskEntries.map(([taskId, dates]) => ({ taskId, startDate: dates.startDate, endDate: dates.endDate }));
+        // Task drafts on a project whose shift FAILED stay drafted (their
+        // overrides are stored rebased against that shift; saving them now
+        // would write post-shift dates onto an unshifted schedule). They save
+        // with the project on the next attempt.
+        const sendableTaskEntries = taskEntries.filter(([taskId]) => {
+            const projectId = canonicalTaskProjectById.get(taskId);
+            return !projectId || !failedProjectIds.has(projectId);
+        });
+        if (sendableTaskEntries.length > 0) {
+            const changes = sendableTaskEntries.map(([taskId, dates]) => ({ taskId, startDate: dates.startDate, endDate: dates.endDate }));
             try {
-                const batchResult = await saveCompanyScheduleTaskDatesAction(changes);
-                const succeededRows = batchResult.results.filter(row => row.ok);
-                failedTaskNames = batchResult.results
+                // Chunked to the server's 200-change cap so any draft count
+                // saves in one gesture.
+                const allResults = [] as Awaited<ReturnType<typeof saveCompanyScheduleTaskDatesAction>>["results"];
+                for (let offset = 0; offset < changes.length; offset += 200) {
+                    const batchResult = await saveCompanyScheduleTaskDatesAction(changes.slice(offset, offset + 200));
+                    allResults.push(...batchResult.results);
+                }
+                const succeededRows = allResults.filter(row => row.ok);
+                failedTaskNames = allResults
                     .filter(row => !row.ok)
                     .map(row => canonicalTaskById.get(row.taskId)?.name ?? row.taskId);
                 succeededTaskCount = succeededRows.length;

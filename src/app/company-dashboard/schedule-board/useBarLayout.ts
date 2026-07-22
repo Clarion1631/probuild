@@ -121,6 +121,12 @@ export function previewProjectMove(project: DashboardProjectRow, targetStart: st
     const normalizedTarget = formatDate(parseSerializedUTCDay(targetStart));
     if (!project.startDate) return { ...project, startDate: normalizedTarget };
 
+    // In Progress: the preview moves the start marker ONLY. Neither save
+    // choice shifts started work, and the "also shift" choice (marker +
+    // Not Started tasks) is explicitly consented to in the confirm dialog —
+    // the preview shows the minimum guaranteed effect, never more.
+    if (project.status === "In Progress") return { ...project, startDate: normalizedTarget };
+
     const range = getEffectiveProjectRange(project);
     if (!range) return { ...project, startDate: normalizedTarget };
 

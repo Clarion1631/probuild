@@ -56,11 +56,22 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
             const fitsBelow = spaceBelow >= panelHeight;
             const fitsAbove = spaceAbove >= panelHeight;
             const openAbove = !fitsBelow && (fitsAbove || spaceAbove > spaceBelow);
-            const available = Math.max(openAbove ? spaceAbove : spaceBelow, 120);
-            const effectiveHeight = Math.min(panelHeight, available);
-            const top = openAbove
-                ? Math.max(rect.top - effectiveHeight - ANCHOR_GAP_PX, VIEWPORT_MARGIN_PX)
-                : rect.bottom + ANCHOR_GAP_PX;
+            const available = Math.max(openAbove ? spaceAbove : spaceBelow, 0);
+            let top: number;
+            let effectiveHeight: number;
+            if (available >= 40) {
+                // Anchor-attached: capped to the chosen side's real room (no
+                // artificial floor — a floor larger than the room overflows).
+                effectiveHeight = Math.min(panelHeight, available);
+                top = openAbove
+                    ? Math.max(rect.top - effectiveHeight - ANCHOR_GAP_PX, VIEWPORT_MARGIN_PX)
+                    : rect.bottom + ANCHOR_GAP_PX;
+            } else {
+                // Degenerate viewport (anchor pinned to an edge, no room either
+                // side): detach from the anchor and use the full viewport.
+                effectiveHeight = Math.min(panelHeight, viewportHeight - 2 * VIEWPORT_MARGIN_PX);
+                top = VIEWPORT_MARGIN_PX;
+            }
 
             setPosition({ top, left, maxHeight: effectiveHeight });
         }

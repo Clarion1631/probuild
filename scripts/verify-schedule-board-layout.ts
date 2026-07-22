@@ -77,6 +77,13 @@ assert.deepEqual(preview.tasks.map(task => [task.startDate, task.endDate]), [
 assert.equal(new Date(preview.tasks[0].endDate).getTime() - new Date(preview.tasks[0].startDate).getTime(), 3 * 86_400_000);
 const unscheduledPreview = previewProjectMove({ ...project, id: "p-unscheduled", startDate: null, tasks: [] }, "2037-03-15");
 assert.equal(unscheduledPreview.startDate, "2037-03-15");
+// In Progress preview moves the start marker ONLY (owner-decided semantics):
+// neither save choice shifts started work, and the "also shift" choice is
+// consented to in the dialog — the preview never promises more than the
+// guaranteed minimum.
+const inProgressPreview = previewProjectMove({ ...project, id: "p-in-progress", status: "In Progress", startDate: "2037-01-03T00:00:00.000Z" }, "2037-03-15");
+assert.equal(inProgressPreview.startDate, "2037-03-15");
+assert.deepEqual(inProgressPreview.tasks, project.tasks, "In Progress preview must not shift tasks");
 
 type TaskEditMode = import("../src/app/company-dashboard/schedule-board/useBarLayout").TaskEditMode;
 const taskEditModes: TaskEditMode[] = ["move", "resize-left", "resize-right"];

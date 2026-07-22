@@ -56,7 +56,7 @@ const saveAllDraftsStart = boardSource.indexOf("async function saveAllDrafts()")
 const saveAllDraftsEnd = boardSource.indexOf("function cancelProjectEditsForProjects", saveAllDraftsStart);
 const saveAllDraftsBody = boardSource.slice(saveAllDraftsStart, saveAllDraftsEnd);
 assert.ok(saveAllDraftsStart >= 0, "saveAllDrafts must exist");
-assert.match(saveAllDraftsBody, /saveCompanyScheduleTaskDatesAction\(changes\)/);
+assert.match(saveAllDraftsBody, /saveCompanyScheduleTaskDatesAction\(changes\.slice\(offset, offset \+ 200\)\)/, "Save batches task changes through the one canonical action, chunked to the server cap");
 assert.match(saveAllDraftsBody, /updateProjectStartDateAction\(/);
 assert.match(saveAllDraftsBody, /shiftNotStartedTasksAction\(/);
 assert.equal((saveAllDraftsBody.match(/router\.refresh\(\)/g) ?? []).length, 1, "exactly one router.refresh() after the whole batch settles");
@@ -71,7 +71,7 @@ assert.match(boardSource, /function waitForConfirmChoice\(\): Promise<ProjectMov
 // Failures are isolated and reported per item; succeeded drafts clear,
 // failed ones remain pending for retry.
 assert.match(saveAllDraftsBody, /catch \(error\) \{\s*failedProjectNames\.push/);
-assert.match(boardSource, /failedTaskNames = batchResult\.results/);
+assert.match(boardSource, /failedTaskNames = allResults/, "per-task failures are collected across all chunks");
 assert.match(boardSource, /toast\.error\(/);
 assert.match(boardSource, /toast\.success\(`Saved \$\{totalSucceeded\}/);
 
@@ -114,9 +114,20 @@ assert.match(popoverSource, /anchorRef\.current\?\.focus\(\)/);
 // Vertical placement must handle the neither-side-fits case (open on the
 // larger side, capped + scrollable) and the horizontal floor must be applied
 // last so narrow viewports pin to the margin instead of going negative.
-assert.match(popoverSource, /openAbove/);
+assert.match(popoverSource, /const openAbove = !fitsBelow && \(fitsAbove \|\| spaceAbove > spaceBelow\)/, "vertical placement must compare which side has more room");
 assert.match(popoverSource, /maxHeight: effectiveHeight/);
+assert.match(popoverSource, /overflowY: "auto"/, "capped popover must scroll internally");
+assert.match(popoverSource, /Math\.max\(openAbove \? spaceAbove : spaceBelow, 0\)/, "no artificial floor larger than the side's real room");
+assert.match(popoverSource, /viewportHeight - 2 \* VIEWPORT_MARGIN_PX/, "degenerate viewports detach from the anchor and use the full viewport");
 assert.match(popoverSource, /Math\.max\(Math\.min\(left, viewportWidth - panelWidth - VIEWPORT_MARGIN_PX\), VIEWPORT_MARGIN_PX\)/);
+
+// Draft/save state-machine contracts from the codex round-2 blockers:
+assert.match(boardSource, /!awaitingTaskRefreshIds\.has\(taskId\)\s*&&\s*normalizedDates\.startDate === originalDates\.startDate/, "back-to-canonical shortcut must not apply to saved-awaiting tasks");
+assert.match(boardSource, /Object\.entries\(current\)\.filter\(\(\[taskId\]\) => awaitingTaskRefreshIds\.has\(taskId\)\)/, "Discard must preserve saved-awaiting overrides");
+assert.match(boardSource, /-previousDelta/, "cancelling a project draft must undo its task-draft rebase");
+assert.match(boardSource, /failedProjectIds\.has\(projectId\)/, "task drafts of failed project shifts must be retained, not batched");
+assert.match(boardSource, /changes\.slice\(offset, offset \+ 200\)/, "client saves chunk to the server's 200 cap");
+assert.match(boardSource, /const markerResult = await updateProjectStartDateAction\(projectId, draft\.targetStart, false\);\s*\n\s*const shiftResult = await shiftNotStartedTasksAction\(projectId, draft\.deltaDays\)/, "In Progress shift choice moves the marker AND the not-started work");
 assert.match(popoverSource, /VIEWPORT_MARGIN_PX/);
 assert.match(projectBarSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);
 assert.match(taskBlockSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);
@@ -165,7 +176,7 @@ assert.match(timelineSource, />\s*By crew\s*</);
 
 // ── Cross-cutting: the ShiftConfirmDialog contract is unchanged in shape ──
 assert.match(dialogSource, /Move start marker only/);
-assert.match(dialogSource, /Also shift all Not Started tasks by/);
+assert.match(dialogSource, /Move the start marker AND shift all Not Started tasks by/);
 assert.match(boardSource, /<ShiftConfirmDialog[\s\S]*?intent=\{confirmIntent\}[\s\S]*?onChoice=\{handleMoveChoice\}[\s\S]*?onCancel=\{cancelConfirmedMove\}/);
 
 // ── Money-path invariants: unchanged by this feature round ──
