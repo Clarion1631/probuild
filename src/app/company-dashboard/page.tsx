@@ -9,9 +9,9 @@ import CompanyDashboardClient from "./CompanyDashboardClient";
 // funnel, start calendar with crew + money/hours overlays, waiting-to-start
 // editor, crew conflicts, and the ADMIN-only cashflow/per-project strips.
 //
-// Authorization (unchanged from P1): the page admits anyone holding the
-// `financialReports` permission (hasPermission — honors explicit per-user
-// overrides, so nav and page can never disagree). Overlays and per-project
+// Authorization: the page admits anyone holding `financialReports` or
+// `schedules` (hasPermission honors explicit per-user overrides, so nav and
+// page can never disagree). Overlays and per-project
 // financial data are only QUERIED and serialized when role === "ADMIN"
 // (enforced inside getCompanyDashboardData); editing is ADMIN/MANAGER only.
 export default async function CompanyDashboardPage({
@@ -26,7 +26,7 @@ export default async function CompanyDashboardPage({
     // Dev sessions can exist without a matching User row (same passthrough the
     // reports pages use); production always has the row.
     const effectiveUser = user ?? (process.env.NODE_ENV === "development" ? { role: "ADMIN", permissions: null } : null);
-    if (!effectiveUser || !hasPermission(effectiveUser, "financialReports")) {
+    if (!effectiveUser || (!hasPermission(effectiveUser, "financialReports") && !hasPermission(effectiveUser, "schedules"))) {
         return <div className="p-8 text-red-500">Access Denied.</div>;
     }
 
@@ -38,6 +38,9 @@ export default async function CompanyDashboardPage({
     const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
     const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(rawMonth) ? rawMonth : currentMonth;
 
-    const data = await getCompanyDashboardData(effectiveUser, month);
+    const data = await getCompanyDashboardData(
+        { role: effectiveUser.role, canSeeFinancials: hasPermission(effectiveUser, "financialReports") },
+        month,
+    );
     return <CompanyDashboardClient data={data} />;
 }

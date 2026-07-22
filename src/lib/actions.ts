@@ -17,7 +17,9 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
-import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
+import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
+import { CLOSED_PROJECT_STATUSES } from "./gpt-estimate";
+import type { ShiftNotStartedTasksResult } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -6543,11 +6545,10 @@ export async function updateScheduleTask(taskId: string, data: {
     type?: string;
     estimateItemId?: string | null;
 }) {
-    await assertScheduleTaskAccess(taskId);
+    const hasDatePatch = data.startDate !== undefined || data.endDate !== undefined;
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
-    if (data.startDate !== undefined) updateData.startDate = new Date(data.startDate);
-    if (data.endDate !== undefined) updateData.endDate = new Date(data.endDate);
     if (data.color !== undefined) updateData.color = data.color;
     if (data.progress !== undefined) updateData.progress = data.progress;
     if (data.status !== undefined) updateData.status = data.status;
@@ -6572,9 +6573,67 @@ export async function updateScheduleTask(taskId: string, data: {
             }
         }
     }
-    // Milestones always have same start and end date
-    if (data.type === "milestone" && updateData.startDate) {
-        updateData.endDate = updateData.startDate;
+    if (hasDatePatch) {
+        const suppliedStartDate = data.startDate === undefined ? null : parseStartDateInput(data.startDate);
+        const suppliedEndDate = data.endDate === undefined ? null : parseStartDateInput(data.endDate);
+        const task = await withTxRetry(() => prisma.$transaction(async (tx) => {
+            // Canonical lock family: parent Project first, then the task row.
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+            await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+            const persistedTask = await tx.scheduleTask.findUnique({
+                where: { id: taskId },
+                select: {
+                    id: true, name: true, projectId: true, type: true,
+                    startDate: true, endDate: true,
+                    project: { select: { status: true } },
+                },
+            });
+            if (!persistedTask) throw new Error("Task not found");
+            if (!persistedTask.projectId || persistedTask.projectId !== projectId) {
+                throw new Error("Task moved to another project; refresh and retry");
+            }
+            if (!persistedTask.project) throw new Error("Task is not attached to a project");
+            if (CLOSED_PROJECT_STATUSES.includes(persistedTask.project.status)) {
+                throw new Error(`Cannot update a task on a closed project (${persistedTask.project.status})`);
+            }
+            if (data.type !== undefined && data.type !== persistedTask.type) {
+                throw new Error("Change task type separately before editing its dates");
+            }
+
+            const startDate = suppliedStartDate ?? persistedTask.startDate;
+            const requestedEndDate = suppliedEndDate ?? persistedTask.endDate;
+            const endDate = persistedTask.type === "milestone" ? startDate : requestedEndDate;
+            if (persistedTask.type !== "milestone" && endDate <= startDate) {
+                throw new Error("Task end date must be after its start date");
+            }
+
+            const saved = await tx.scheduleTask.update({
+                where: { id: taskId },
+                data: { ...updateData, startDate, endDate },
+            });
+            await tx.activityLog.create({
+                data: {
+                    projectId,
+                    actorType: "TEAM",
+                    actorName: user.name || user.email,
+                    action: "updated_company_schedule_task_dates",
+                    entityType: "task",
+                    entityId: taskId,
+                    entityName: persistedTask.name,
+                    metadata: JSON.stringify({
+                        previousStartDate: persistedTask.startDate.toISOString().slice(0, 10),
+                        previousEndDate: persistedTask.endDate.toISOString().slice(0, 10),
+                        startDate: startDate.toISOString().slice(0, 10),
+                        endDate: endDate.toISOString().slice(0, 10),
+                        type: persistedTask.type,
+                    }),
+                },
+            });
+            return saved;
+        }));
+        revalidatePath("/company-dashboard");
+        revalidatePath(`/projects/${task.projectId}/schedule`);
+        return task;
     }
 
     const task = await prisma.scheduleTask.update({
@@ -7107,6 +7166,20 @@ export async function getActiveSubcontractors() {
 
 // ========== PROJECT BOARD ACTIONS ==========
 
+// Company-board authorization adapter only. updateScheduleTask remains the
+// single validation, locking, mutation, audit, and revalidation capability.
+export async function updateCompanyScheduleTaskDatesAction(taskId: string, dates: {
+    startDate: string;
+    endDate: string;
+}) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    return updateScheduleTask(taskId, dates);
+}
+
 export async function updateProjectStatus(projectId: string, status: string) {
     await assertActiveStaff();
     await prisma.project.update({
@@ -7131,6 +7204,24 @@ export async function updateProjectStartDateAction(projectId: string, startDateI
         projectId,
         startDate: startDateISO ? parseStartDateInput(startDateISO) : null,
         shiftJobTasks,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
+}
+
+// Shift unfinished work on an active project without moving its company-level
+// start marker or any payment milestone. ADMIN/MANAGER only.
+export async function shiftNotStartedTasksAction(projectId: string, deltaDays: number): Promise<ShiftNotStartedTasksResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await shiftNotStartedTasks({
+        projectId,
+        deltaDays,
         actor: { type: "TEAM", name: caller.name || caller.email },
     });
     revalidatePath("/company-dashboard");
