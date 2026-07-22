@@ -307,7 +307,11 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
     const boardPendingProjectIdsRef = useRef<Set<string>>(new Set());
     const legacyProjectMutationsRef = useRef<Map<string, LegacyProjectMutation>>(new Map());
     const externalShiftNonceRef = useRef(0);
-    const [externalShiftedTaskDates, setExternalShiftedTaskDates] = useState<{ nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] } | null>(null);
+    // Append-only event queue (functional updates compose within a React
+    // batch — a single "latest payload" slot would drop one of two legacy
+    // shifts resolving in the same batch). Capped: the board applies events
+    // within a render, so older entries are long-consumed.
+    const [externalShiftEvents, setExternalShiftEvents] = useState<{ nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] }[]>([]);
     const [boardPendingProjectIds, setBoardPendingProjectIds] = useState<Set<string>>(() => new Set());
     const [legacyProjectMutations, setLegacyProjectMutations] = useState<Map<string, LegacyProjectMutation>>(() => new Map());
     const canonicalProjects = useMemo(() => [
@@ -359,7 +363,8 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
         // its pinned override must follow the persisted dates to reconcile.
         if (expectation.taskDates.length > 0) {
             externalShiftNonceRef.current += 1;
-            setExternalShiftedTaskDates({ nonce: externalShiftNonceRef.current, taskDates: expectation.taskDates });
+            const event = { nonce: externalShiftNonceRef.current, taskDates: expectation.taskDates };
+            setExternalShiftEvents(current => [...current, event].slice(-20));
         }
     }, []);
 
@@ -430,7 +435,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                 externallyPendingProjectIds={legacyPendingProjectIds}
                 isProjectExternallyPending={isPageProjectPending}
                 onEffectivePendingProjectIdsChange={publishBoardPendingProjectIds}
-                externalShiftedTaskDates={externalShiftedTaskDates}
+                externalShiftEvents={externalShiftEvents}
             />
 
             {legacyRefreshCount > 0 && (

@@ -129,9 +129,10 @@ assert.match(boardSource, /failedProjectIds\.has\(projectId\)/, "task drafts of 
 assert.match(boardSource, /changes\.slice\(offset, offset \+ 200\)/, "client saves chunk to the server's 200 cap");
 assert.match(boardSource, /function clearTaskPreview\(taskId: string\) \{\n[^}]*if \(awaitingTaskRefreshIds\.has\(taskId\)\) return;/, "cancelling a speculative edit must never delete a saved-awaiting override");
 assert.match(boardSource, /rewriteAwaitingOverridesFromShift\(shiftedPersistedDates\)/, "board-owned shifts must rewrite saved-awaiting overrides to the persisted dates");
-assert.match(boardSource, /rewriteAwaitingOverridesFromShift\(externalShiftedTaskDates\.taskDates\)/, "external (legacy StartDateRow) shifts must ALSO rewrite saved-awaiting overrides");
-assert.match(companyDashboardSource, /setExternalShiftedTaskDates\(\{ nonce: externalShiftNonceRef\.current, taskDates: expectation\.taskDates \}\)/, "the legacy path must publish its persisted shifts to the board");
-assert.match(companyDashboardSource, /externalShiftedTaskDates=\{externalShiftedTaskDates\}/, "the board must receive the external-shift prop");
+assert.match(boardSource, /rewriteAwaitingOverridesFromShift\(unseen\.flatMap\(event => event\.taskDates\)\)/, "external (legacy StartDateRow) shifts must ALSO rewrite saved-awaiting overrides — ALL unseen events, not just the latest");
+assert.match(boardSource, /externalShiftEvents\.filter\(event => event\.nonce > lastExternalShiftNonceRef\.current\)/, "every unseen external-shift nonce is applied exactly once");
+assert.match(companyDashboardSource, /setExternalShiftEvents\(current => \[\.\.\.current, event\]\.slice\(-20\)\)/, "the legacy path publishes shifts via a functional append (batch-safe queue), never a latest-payload slot");
+assert.match(companyDashboardSource, /externalShiftEvents=\{externalShiftEvents\}/, "the board must receive the external-shift event queue");
 assert.match(boardSource, /catch \(chunkError: any\) \{/, "chunk failures are isolated per chunk");
 assert.match(boardSource, /chunk\.map\(change => \(\{ taskId: change\.taskId, ok: false as const, error: message \}\)\)/, "a rejected chunk synthesizes failures for its own tasks only");
 assert.match(boardSource, /const markerResult = await updateProjectStartDateAction\(projectId, draft\.targetStart, false\);\s*\n\s*const shiftResult = await shiftNotStartedTasksAction\(projectId, draft\.deltaDays\)/, "In Progress shift choice moves the marker AND the not-started work");

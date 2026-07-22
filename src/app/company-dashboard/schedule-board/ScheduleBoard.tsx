@@ -52,7 +52,10 @@ interface ScheduleBoardProps {
     onEffectivePendingProjectIdsChange: (projectIds: ReadonlySet<string>) => void;
     // Persisted task shifts from sibling writers (legacy StartDateRow) so the
     // board can rewrite saved-awaiting overrides caught in an external shift.
-    externalShiftedTaskDates: { nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] } | null;
+    // An append-only event queue: concurrent legacy shifts resolving in one
+    // React batch each keep their event (a single latest-payload slot would
+    // drop all but the last).
+    externalShiftEvents: { nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] }[];
 }
 
 interface TaskKeyboardEditState {
@@ -152,7 +155,7 @@ export function ScheduleBoard({
     externallyPendingProjectIds,
     isProjectExternallyPending,
     onEffectivePendingProjectIdsChange,
-    externalShiftedTaskDates,
+    externalShiftEvents,
 }: ScheduleBoardProps) {
     const router = useRouter();
     const { month, isAdmin, overlays } = data;
@@ -293,14 +296,16 @@ export function ScheduleBoard({
     }
 
     // External writers (the legacy waiting-list date setter) report their
-    // persisted shifts here; each nonce is applied exactly once.
+    // persisted shifts here; every unseen nonce is applied exactly once, in
+    // order — so two shifts landing in one React batch both take effect.
     const lastExternalShiftNonceRef = useRef(0);
     useEffect(() => {
-        if (!externalShiftedTaskDates || externalShiftedTaskDates.nonce === lastExternalShiftNonceRef.current) return;
-        lastExternalShiftNonceRef.current = externalShiftedTaskDates.nonce;
-        rewriteAwaitingOverridesFromShift(externalShiftedTaskDates.taskDates);
+        const unseen = externalShiftEvents.filter(event => event.nonce > lastExternalShiftNonceRef.current);
+        if (unseen.length === 0) return;
+        lastExternalShiftNonceRef.current = Math.max(...unseen.map(event => event.nonce));
+        rewriteAwaitingOverridesFromShift(unseen.flatMap(event => event.taskDates));
         // eslint-disable-next-line react-hooks/exhaustive-deps -- rewrite reads current awaiting state by design
-    }, [externalShiftedTaskDates]);
+    }, [externalShiftEvents]);
 
     function clearTaskPreview(taskId: string) {
         // A saved-awaiting task's override IS its committed state pending
