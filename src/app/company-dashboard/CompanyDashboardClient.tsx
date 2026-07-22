@@ -306,6 +306,8 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
     const pageMountedRef = useRef(true);
     const boardPendingProjectIdsRef = useRef<Set<string>>(new Set());
     const legacyProjectMutationsRef = useRef<Map<string, LegacyProjectMutation>>(new Map());
+    const externalShiftNonceRef = useRef(0);
+    const [externalShiftedTaskDates, setExternalShiftedTaskDates] = useState<{ nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] } | null>(null);
     const [boardPendingProjectIds, setBoardPendingProjectIds] = useState<Set<string>>(() => new Set());
     const [legacyProjectMutations, setLegacyProjectMutations] = useState<Map<string, LegacyProjectMutation>>(() => new Map());
     const canonicalProjects = useMemo(() => [
@@ -352,6 +354,13 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
         next.set(projectId, { expectation });
         legacyProjectMutationsRef.current = next;
         setLegacyProjectMutations(next);
+        // Publish the persisted shift to the board: a saved-awaiting task the
+        // board is tracking may have just been moved by this legacy shift, and
+        // its pinned override must follow the persisted dates to reconcile.
+        if (expectation.taskDates.length > 0) {
+            externalShiftNonceRef.current += 1;
+            setExternalShiftedTaskDates({ nonce: externalShiftNonceRef.current, taskDates: expectation.taskDates });
+        }
     }, []);
 
     const clearLegacyProjectMutation = useCallback((projectId: string) => {
@@ -421,6 +430,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                 externallyPendingProjectIds={legacyPendingProjectIds}
                 isProjectExternallyPending={isPageProjectPending}
                 onEffectivePendingProjectIdsChange={publishBoardPendingProjectIds}
+                externalShiftedTaskDates={externalShiftedTaskDates}
             />
 
             {legacyRefreshCount > 0 && (

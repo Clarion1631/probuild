@@ -50,6 +50,9 @@ interface ScheduleBoardProps {
     externallyPendingProjectIds: ReadonlySet<string>;
     isProjectExternallyPending: (projectId: string) => boolean;
     onEffectivePendingProjectIdsChange: (projectIds: ReadonlySet<string>) => void;
+    // Persisted task shifts from sibling writers (legacy StartDateRow) so the
+    // board can rewrite saved-awaiting overrides caught in an external shift.
+    externalShiftedTaskDates: { nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] } | null;
 }
 
 interface TaskKeyboardEditState {
@@ -149,6 +152,7 @@ export function ScheduleBoard({
     externallyPendingProjectIds,
     isProjectExternallyPending,
     onEffectivePendingProjectIdsChange,
+    externalShiftedTaskDates,
 }: ScheduleBoardProps) {
     const router = useRouter();
     const { month, isAdmin, overlays } = data;
@@ -268,6 +272,35 @@ export function ScheduleBoard({
     function setTaskPreview(taskId: string, dates: TaskDateOverride) {
         setTaskDateOverrides(current => ({ ...current, [taskId]: dates }));
     }
+
+    // Shared by the board's own save loop AND external (legacy StartDateRow)
+    // shifts: saved-awaiting overrides pinned to pre-shift dates can never
+    // reconcile — rewrite them to the persisted shifted dates.
+    function rewriteAwaitingOverridesFromShift(taskDates: { id: string; startDate: string; endDate: string }[]) {
+        if (taskDates.length === 0) return;
+        const shiftedById = new Map(taskDates.map(row => [row.id, row]));
+        setTaskDateOverrides(current => {
+            let changed = false;
+            const next = { ...current };
+            for (const taskId of awaitingTaskRefreshIds) {
+                const shifted = shiftedById.get(taskId);
+                if (!shifted || !(taskId in next)) continue;
+                next[taskId] = { startDate: shifted.startDate.slice(0, 10), endDate: shifted.endDate.slice(0, 10) };
+                changed = true;
+            }
+            return changed ? next : current;
+        });
+    }
+
+    // External writers (the legacy waiting-list date setter) report their
+    // persisted shifts here; each nonce is applied exactly once.
+    const lastExternalShiftNonceRef = useRef(0);
+    useEffect(() => {
+        if (!externalShiftedTaskDates || externalShiftedTaskDates.nonce === lastExternalShiftNonceRef.current) return;
+        lastExternalShiftNonceRef.current = externalShiftedTaskDates.nonce;
+        rewriteAwaitingOverridesFromShift(externalShiftedTaskDates.taskDates);
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- rewrite reads current awaiting state by design
+    }, [externalShiftedTaskDates]);
 
     function clearTaskPreview(taskId: string) {
         // A saved-awaiting task's override IS its committed state pending
@@ -630,18 +663,7 @@ export function ScheduleBoard({
             // Rewrite saved-awaiting overrides that a shift just moved: their
             // pinned dates must track the PERSISTED (shifted) dates or their
             // awaiting ids never match refreshed canonical rows.
-            const shiftedById = new Map(shiftedPersistedDates.map(row => [row.id, row]));
-            setTaskDateOverrides(current => {
-                let changed = false;
-                const next = { ...current };
-                for (const taskId of awaitingTaskRefreshIds) {
-                    const shifted = shiftedById.get(taskId);
-                    if (!shifted || !(taskId in next)) continue;
-                    next[taskId] = { startDate: shifted.startDate.slice(0, 10), endDate: shifted.endDate.slice(0, 10) };
-                    changed = true;
-                }
-                return changed ? next : current;
-            });
+            rewriteAwaitingOverridesFromShift(shiftedPersistedDates);
         }
 
         let failedTaskNames: string[] = [];
