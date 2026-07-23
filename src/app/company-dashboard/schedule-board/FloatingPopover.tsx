@@ -6,9 +6,17 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefO
 const VIEWPORT_MARGIN_PX = 8;
 const ANCHOR_GAP_PX = 4;
 
+export interface FloatingPopoverAnchorPoint {
+    x: number;
+    y: number;
+}
+
 export interface FloatingPopoverProps {
     open: boolean;
-    anchorRef: RefObject<HTMLElement | null>;
+    /** Anchor to a trigger element's live bounding rect — the panel right-aligns to it. Ignored when `anchorPoint` is also given. */
+    anchorRef?: RefObject<HTMLElement | null>;
+    /** Anchor to an explicit viewport point (e.g. a `contextmenu` event's clientX/clientY) instead of an element — the panel's top-left opens at the point, like a native context menu. Takes precedence over `anchorRef` when both are given. */
+    anchorPoint?: FloatingPopoverAnchorPoint | null;
     onClose: () => void;
     children: ReactNode;
     /** Panel width in px — the panel right-aligns to the trigger by default (matching the prior `absolute right-0` menus), then clamps into the viewport. */
@@ -16,15 +24,16 @@ export interface FloatingPopoverProps {
 }
 
 /**
- * A portal-rendered dropdown/menu anchored to a trigger element. Fixes the
+ * A portal-rendered dropdown/menu anchored to a trigger element OR an
+ * explicit point (right-click / ContextMenu-key position). Fixes the
  * schedule board's popover clipping: rendered to document.body (escapes any
  * clipping/overflow ancestor and any CSS containment from a drag/scroll
- * container), positioned from the trigger's live bounding rect, flipped
- * above the trigger when there isn't room below, and clamped horizontally
- * with an 8px viewport margin. Escape closes and returns focus to the
- * trigger; a pointerdown outside the panel and trigger also closes it.
+ * container), positioned from the trigger's live bounding rect (or the given
+ * point), flipped above the trigger when there isn't room below, and clamped
+ * horizontally with an 8px viewport margin. Escape closes and returns focus
+ * to the trigger; a pointerdown outside the panel and trigger also closes it.
  */
-export function FloatingPopover({ open, anchorRef, onClose, children, width = 224 }: FloatingPopoverProps) {
+export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224 }: FloatingPopoverProps) {
     const panelRef = useRef<HTMLDivElement | null>(null);
     const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
@@ -33,11 +42,13 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
             setPosition(null);
             return;
         }
-        const anchor = anchorRef.current;
-        if (!anchor) return;
+        const anchor = anchorRef?.current ?? null;
+        if (!anchorPoint && !anchor) return;
 
         function place() {
-            const rect = anchor!.getBoundingClientRect();
+            const rect = anchorPoint
+                ? { left: anchorPoint.x, right: anchorPoint.x, top: anchorPoint.y, bottom: anchorPoint.y }
+                : anchor!.getBoundingClientRect();
             const viewportWidth = window.innerWidth;
             const viewportHeight = window.innerHeight;
             const panelWidth = panelRef.current?.offsetWidth ?? width;
@@ -45,8 +56,10 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
 
             // Clamp order matters: the left-edge floor is applied LAST so a
             // viewport narrower than the panel pins to the margin instead of
-            // going negative off-screen.
-            let left = rect.right - panelWidth;
+            // going negative off-screen. A point anchor opens its LEFT edge at
+            // the point (native context-menu convention) instead of
+            // right-aligning to it.
+            let left = anchorPoint ? rect.left : rect.right - panelWidth;
             left = Math.max(Math.min(left, viewportWidth - panelWidth - VIEWPORT_MARGIN_PX), VIEWPORT_MARGIN_PX);
 
             const spaceBelow = viewportHeight - rect.bottom - ANCHOR_GAP_PX - VIEWPORT_MARGIN_PX;
@@ -82,7 +95,7 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
             window.removeEventListener("resize", place);
             window.removeEventListener("scroll", place, true);
         };
-    }, [open, anchorRef, width]);
+    }, [open, anchorRef, anchorPoint, width]);
 
     useEffect(() => {
         if (!open) return;
@@ -90,12 +103,12 @@ export function FloatingPopover({ open, anchorRef, onClose, children, width = 22
             if (event.key !== "Escape") return;
             event.preventDefault();
             onClose();
-            anchorRef.current?.focus();
+            anchorRef?.current?.focus();
         }
         function onPointerDownOutside(event: PointerEvent) {
             const target = event.target as Node;
             if (panelRef.current?.contains(target)) return;
-            if (anchorRef.current?.contains(target)) return;
+            if (anchorRef?.current?.contains(target)) return;
             onClose();
         }
         window.addEventListener("keydown", onKeyDown);

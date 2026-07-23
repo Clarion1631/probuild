@@ -13,7 +13,7 @@ import { addDays, formatDate, parseUTCDate } from "../src/app/projects/[id]/sche
 
 const project = {
     id: "p1", name: "Shop", client: null, status: "In Progress",
-    startDate: null, color: "#123456", contractValue: null, crew: [],
+    startDate: null, endDate: null, color: "#123456", contractValue: null, crew: [],
     taskCount: 2, hasQualifyingEstimate: false, unappliedChangeOrders: { count: 0, items: [] },
     tasks: [
         { id: "t1", name: "Frame", startDate: "2037-01-03T00:00:00.000Z", endDate: "2037-01-06T00:00:00.000Z", color: "#111111", parentId: null, progress: 0, status: "Not Started", type: "task", assignments: [] },
@@ -42,6 +42,25 @@ assert.deepEqual(getEffectiveProjectRange(taskDerivedProject), {
     start: new Date("2037-01-03T00:00:00.000Z"),
     end: new Date("2037-01-06T00:00:00.000Z"),
 });
+
+// Item 3: Project.endDate as an end candidate — mirrors schedule-core's
+// effectiveWorkEnd, which takes Project.endDate DIRECTLY (no +1 day) as an
+// already end-exclusive bound.
+const endDateBeyondTasksProject = { ...project, id: "p-enddate-beyond", endDate: "2037-01-15T00:00:00.000Z" };
+assert.deepEqual(getEffectiveProjectRange(endDateBeyondTasksProject), {
+    start: new Date("2037-01-03T00:00:00.000Z"),
+    end: new Date("2037-01-15T00:00:00.000Z"),
+}, "an endDate beyond every task/marker candidate wins the range's end");
+const endDateBeforeTasksProject = { ...project, id: "p-enddate-before", endDate: "2037-01-04T00:00:00.000Z" };
+assert.deepEqual(getEffectiveProjectRange(endDateBeforeTasksProject), {
+    start: new Date("2037-01-03T00:00:00.000Z"),
+    end: new Date("2037-01-06T00:00:00.000Z"),
+}, "an endDate before the latest task end never shrinks the range");
+const endDateNullProject = { ...project, id: "p-enddate-null", endDate: null };
+assert.deepEqual(getEffectiveProjectRange(endDateNullProject), {
+    start: new Date("2037-01-03T00:00:00.000Z"),
+    end: new Date("2037-01-06T00:00:00.000Z"),
+}, "a null endDate falls back to the task/marker candidates exactly as before");
 
 assert.equal(typeof (barLayout as Record<string, unknown>).createProjectDropIntent, "function", "createProjectDropIntent must be exported");
 assert.equal(typeof (barLayout as Record<string, unknown>).previewProjectMove, "function", "previewProjectMove must be exported");

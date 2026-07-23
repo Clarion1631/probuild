@@ -1,10 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { useCallback, useEffect, useId, useRef, useState, useTransition, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import type { DashboardTaskRow } from "@/lib/schedule-core";
+import { deleteScheduleTask } from "@/lib/actions";
 import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } from "./useBarLayout";
 import { FloatingPopover } from "./FloatingPopover";
+import { TaskCrewPicker } from "./CrewPickers";
+import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
 
 export interface TaskPointerEditStart {
     pointerId: number;
@@ -50,6 +55,9 @@ export interface TaskBlockSegmentProps extends TaskEditCallbacks {
     // Omitted (default) fills the parent's full height, as before.
     laneTop?: number;
     laneHeight?: number;
+    // Context-menu "Task crew…" (item 1) reuses the exact TaskCrewPicker the
+    // Schedule & crew table uses.
+    teamMembers: { id: string; name: string; email: string }[];
 }
 
 function readableText(color: string): string {
@@ -65,6 +73,17 @@ function initials(name: string): string {
     return name.trim().split(/\s+/).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
+// Readability pass (2026-07-22): a task chip only shows its text label once
+// it's wide enough for roughly 3 characters at the bumped 11px label font —
+// narrower than that, the label is dropped in favor of the milestone's own
+// diamond icon (or, for a plain task, the existing title tooltip alone).
+const MIN_LABEL_WIDTH_PX = 28;
+
+// Same single-popover, view-switching pattern as ProjectBar (item 1): one
+// FloatingPopover instance whose content swaps between the top-level menu
+// list and each item's own sub-view.
+type TaskMenuView = "main" | "dates" | "crew";
+
 export function TaskBlockSegment({
     task,
     projectRange,
@@ -79,6 +98,7 @@ export function TaskBlockSegment({
     timelineScrollContainerRef,
     laneTop,
     laneHeight,
+    teamMembers,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
     onTaskKeyboardAdjust,
@@ -87,11 +107,15 @@ export function TaskBlockSegment({
     onTaskDatesCommit,
     onTaskMoveBy,
 }: TaskBlockSegmentProps) {
+    const router = useRouter();
     const observerRef = useRef<ResizeObserver | null>(null);
     const fragmentId = useId().replace(/:/g, "");
     const [allocatedWidth, setAllocatedWidth] = useState(0);
     const actionTriggerRef = useRef<HTMLButtonElement>(null);
     const [menuOpen, setMenuOpen] = useState(false);
+    const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number } | null>(null);
+    const [menuView, setMenuView] = useState<TaskMenuView>("main");
+    const [isDeletePending, startDeleteTransition] = useTransition();
     const actionResetKey = `${isPending ? "pending" : "ready"}:${task.startDate}:${task.endDate}`;
     const [menuDraft, setMenuDraft] = useState<{ resetKey: string; dates: TaskDateOverride | null }>(() => ({
         resetKey: actionResetKey,
@@ -126,6 +150,18 @@ export function TaskBlockSegment({
     useEffect(() => {
         setMenuOpen(false);
     }, [actionResetKey]);
+    // Only one schedule-board menu open at a time (item 1) — including across
+    // a right-click/context menu vs the click-triggered "⋯" menu.
+    useEffect(() => {
+        if (!menuOpen) {
+            setMenuView("main");
+            setMenuAnchorPoint(null);
+            return;
+        }
+        const close = () => setMenuOpen(false);
+        activateExclusiveMenu(close);
+        return () => deactivateExclusiveMenu(close);
+    }, [menuOpen]);
 
     if (!clipped || (!isMilestone && taskEnd <= taskStart)) return null;
 
@@ -155,10 +191,24 @@ export function TaskBlockSegment({
         });
     }
 
+    function openMenu(anchorPoint: { x: number; y: number } | null) {
+        setMenuAnchorPoint(anchorPoint);
+        setMenuView("main");
+        setMenuOpen(true);
+    }
+
     function handleKeyboard(event: KeyboardEvent<HTMLElement>, mode: TaskEditMode) {
         if (event.target !== event.currentTarget) return;
         if (!canEdit || isPending) return;
         const editing = activeMode === mode;
+        // ContextMenu key / Shift+F10 (item 1) on the block itself (move
+        // target) — the keyboard equivalent of a right-click.
+        if (mode === "move" && !editing && (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey))) {
+            event.preventDefault();
+            event.stopPropagation();
+            openMenu(null);
+            return;
+        }
         if (!editing && (event.key === " " || event.key === "Enter")) {
             event.preventDefault();
             event.stopPropagation();
@@ -190,6 +240,16 @@ export function TaskBlockSegment({
         }
     }
 
+    // Right-click (item 1): canEdit-gated — read-only roles get the browser's
+    // default context menu instead.
+    function handleContextMenu(event: ReactMouseEvent<HTMLDivElement>) {
+        if (!canEdit || isPending) return;
+        if ((event.target as HTMLElement).closest("input,summary,form,details")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        openMenu({ x: event.clientX, y: event.clientY });
+    }
+
     function handleDateSubmit(event: FormEvent<HTMLFormElement>) {
         event.preventDefault();
         event.stopPropagation();
@@ -202,6 +262,23 @@ export function TaskBlockSegment({
         setMenuOpen(false);
     }
 
+    // Delete is an IMMEDIATE action (item 1) — goes through the existing
+    // deleteScheduleTask action right away, NOT part of the board's
+    // draft-mode/Save system (unlike a date drag, which drafts until Save).
+    function handleDeleteTask() {
+        if (!window.confirm(`Delete "${task.name}"? Deletes now — not part of unsaved changes. This can't be undone.`)) return;
+        startDeleteTransition(async () => {
+            try {
+                await deleteScheduleTask(task.id);
+                router.refresh();
+                toast.success(`Deleted "${task.name}"`);
+            } catch (err: any) {
+                toast.error(err?.message || "Failed to delete task");
+            }
+        });
+        setMenuOpen(false);
+    }
+
     const laneStyle = laneTop != null && laneHeight != null
         ? { top: laneTop, height: laneHeight }
         : undefined;
@@ -209,7 +286,7 @@ export function TaskBlockSegment({
     return (
         <div
             ref={setMeasuredElement}
-            className={`group/task absolute ${laneStyle ? "" : "inset-y-0"} touch-pan-y select-none overflow-visible rounded-sm border text-[9px] font-semibold leading-[16px] shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${canEdit && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
+            className={`group/task absolute ${laneStyle ? "" : "inset-y-0"} touch-pan-y select-none overflow-visible rounded-sm border text-[11px] font-semibold leading-[20px] shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${canEdit && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
             style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color, color: readableText(color), ...laneStyle }}
             title={title}
             role="group"
@@ -222,11 +299,14 @@ export function TaskBlockSegment({
             data-can-edit={canEdit ? "true" : "false"}
             onPointerDown={event => beginPointerEdit(event, "move")}
             onKeyDown={event => handleKeyboard(event, "move")}
+            onContextMenu={handleContextMenu}
         >
             <div className="absolute inset-0 overflow-hidden rounded-sm">
                 <span className="absolute inset-y-0 left-0 bg-white/25" style={{ width: `${progress}%` }} aria-hidden="true" />
                 <span className="relative z-10 flex min-w-0 items-center justify-between gap-0.5 px-1">
-                    {allocatedWidth >= 48 && <span className="min-w-0 truncate">{isMilestone ? `◆ ${task.name}` : task.name}</span>}
+                    {allocatedWidth >= MIN_LABEL_WIDTH_PX
+                        ? <span className="min-w-0 truncate">{isMilestone ? `◆ ${task.name}` : task.name}</span>
+                        : isMilestone && <span className="min-w-0 truncate" aria-hidden="true">◆</span>}
                     {assignmentInitials && <span className="ml-auto shrink-0 text-[8px] opacity-90" title={`Task crew: ${crew}`}>{assignmentInitials}</span>}
                 </span>
             </div>
@@ -261,7 +341,7 @@ export function TaskBlockSegment({
                 <button
                     ref={actionTriggerRef}
                     type="button"
-                    onClick={event => { event.stopPropagation(); setMenuOpen(value => !value); }}
+                    onClick={event => { event.stopPropagation(); if (menuOpen) setMenuOpen(false); else openMenu(null); }}
                     onPointerDown={event => event.stopPropagation()}
                     aria-expanded={menuOpen}
                     className="absolute right-0 top-0 z-30 cursor-pointer rounded bg-white/85 px-1 text-[8px] font-bold text-slate-800 opacity-0 shadow transition group-hover/task:opacity-100 group-focus-within/task:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
@@ -269,45 +349,74 @@ export function TaskBlockSegment({
                 >
                     ⋯
                 </button>
-                <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} onClose={() => setMenuOpen(false)} width={240}>
-                    <form onSubmit={handleDateSubmit} onPointerDown={event => event.stopPropagation()} className="space-y-2">
-                        <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-start-${task.id}-${fragmentId}`}>Start date</label>
-                        <input
-                            id={`task-start-${task.id}-${fragmentId}`}
-                            type="date"
-                            value={menuStartDate}
-                            max={!isMilestone && menuEndDate ? formatDate(addDays(parseUTCDate(menuEndDate), -1)) : undefined}
-                            onChange={event => {
-                                const nextStartDate = event.target.value;
-                                setMenuDraft({
-                                    resetKey: actionResetKey,
-                                    dates: { startDate: nextStartDate, endDate: isMilestone ? nextStartDate : menuEndDate },
-                                });
-                            }}
-                            disabled={mutationDisabled}
-                            className="hui-input w-full px-2 py-1 text-xs"
-                        />
-                        <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-end-${task.id}-${fragmentId}`}>End date</label>
-                        <input
-                            id={`task-end-${task.id}-${fragmentId}`}
-                            type="date"
-                            value={isMilestone ? menuStartDate : menuEndDate}
-                            min={!isMilestone && menuStartDate ? formatDate(addDays(parseUTCDate(menuStartDate), 1)) : undefined}
-                            onChange={event => setMenuDraft({
-                                resetKey: actionResetKey,
-                                dates: { startDate: menuStartDate, endDate: event.target.value },
-                            })}
-                            disabled={mutationDisabled || isMilestone}
-                            className="hui-input w-full px-2 py-1 text-xs"
-                        />
-                        <div className="grid grid-cols-2 gap-2">
-                            <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, -1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Earlier</button>
-                            <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, 1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Later</button>
+                <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
+                    {menuView === "main" && (
+                        <div className="space-y-1" onPointerDown={event => event.stopPropagation()}>
+                            <button type="button" onClick={() => setMenuView("dates")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
+                                Edit dates…
+                            </button>
+                            <button type="button" onClick={() => setMenuView("crew")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
+                                Task crew…
+                            </button>
+                            <button
+                                type="button"
+                                disabled={isDeletePending}
+                                onClick={handleDeleteTask}
+                                className="block w-full rounded px-2 py-1.5 text-left text-xs text-red-600 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-60"
+                            >
+                                Delete task
+                            </button>
+                            <p className="px-2 text-[9px] text-hui-textMuted">Deletes now — not part of unsaved changes.</p>
                         </div>
-                        <button type="submit" disabled={mutationDisabled || !menuStartDate || (!isMilestone && !menuEndDate)} className="hui-btn hui-btn-primary w-full text-xs disabled:opacity-60">
-                            Save task dates
-                        </button>
-                    </form>
+                    )}
+                    {menuView === "dates" && (
+                        <form onSubmit={handleDateSubmit} onPointerDown={event => event.stopPropagation()} className="space-y-2">
+                            <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
+                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-start-${task.id}-${fragmentId}`}>Start date</label>
+                            <input
+                                id={`task-start-${task.id}-${fragmentId}`}
+                                type="date"
+                                value={menuStartDate}
+                                max={!isMilestone && menuEndDate ? formatDate(addDays(parseUTCDate(menuEndDate), -1)) : undefined}
+                                onChange={event => {
+                                    const nextStartDate = event.target.value;
+                                    setMenuDraft({
+                                        resetKey: actionResetKey,
+                                        dates: { startDate: nextStartDate, endDate: isMilestone ? nextStartDate : menuEndDate },
+                                    });
+                                }}
+                                disabled={mutationDisabled}
+                                className="hui-input w-full px-2 py-1 text-xs"
+                            />
+                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-end-${task.id}-${fragmentId}`}>End date</label>
+                            <input
+                                id={`task-end-${task.id}-${fragmentId}`}
+                                type="date"
+                                value={isMilestone ? menuStartDate : menuEndDate}
+                                min={!isMilestone && menuStartDate ? formatDate(addDays(parseUTCDate(menuStartDate), 1)) : undefined}
+                                onChange={event => setMenuDraft({
+                                    resetKey: actionResetKey,
+                                    dates: { startDate: menuStartDate, endDate: event.target.value },
+                                })}
+                                disabled={mutationDisabled || isMilestone}
+                                className="hui-input w-full px-2 py-1 text-xs"
+                            />
+                            <div className="grid grid-cols-2 gap-2">
+                                <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, -1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Earlier</button>
+                                <button type="button" disabled={mutationDisabled} onClick={() => onTaskMoveBy(task, 1)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">Move Later</button>
+                            </div>
+                            <button type="submit" disabled={mutationDisabled || !menuStartDate || (!isMilestone && !menuEndDate)} className="hui-btn hui-btn-primary w-full text-xs disabled:opacity-60">
+                                Save task dates
+                            </button>
+                        </form>
+                    )}
+                    {menuView === "crew" && (
+                        <div className="space-y-2" onPointerDown={event => event.stopPropagation()}>
+                            <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
+                            <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Task crew</p>
+                            <TaskCrewPicker task={task} teamMembers={teamMembers} />
+                        </div>
+                    )}
                 </FloatingPopover>
             </>
             )}

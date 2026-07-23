@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
 import Link from "next/link";
 import type { CompanyDashboardData, DashboardProjectRow } from "@/lib/schedule-core";
 import {
@@ -8,24 +8,45 @@ import {
     formatCurrency,
     formatDate,
     getDaysBetween,
+    getFallbackProjectColor,
     getMonthGrid,
     isSameUTCDay,
     isWeekend,
     parseUTCDate,
     todayUTC,
 } from "@/app/projects/[id]/schedule/schedule-utils";
+import { FloatingPopover } from "./FloatingPopover";
+import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
 import { MilestoneMarker } from "./MilestoneMarker";
 import { ProjectBar, ProjectBarGridStartContext, computeTaskLaneLayout, type ProjectEditCallbacks } from "./ProjectBar";
 import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks } from "./TaskBlockSegment";
 import { PROJECT_DRAG_MIME } from "./UnscheduledTray";
 import { assignTaskLanes, clipRange, getEffectiveProjectRange, toTimelineRect, type WeekSegment } from "./useBarLayout";
 
-const DAY_WIDTH = 20;
-const TIMELINE_DAYS = 42;
+// Item 4 (2026-07-22 owner addendum): the canvas spans 28 days BEFORE the
+// anchor month's own grid start through 112 days after it — ~20 weeks total,
+// horizontally scrollable. TIMELINE_DAYS_TOTAL is always a multiple of 7
+// (both halves are), so the week-header grid divides evenly.
+const TIMELINE_DAYS_BEFORE_ANCHOR = 28;
+const TIMELINE_DAYS_AFTER_ANCHOR = 112;
+const TIMELINE_DAYS_TOTAL = TIMELINE_DAYS_BEFORE_ANCHOR + TIMELINE_DAYS_AFTER_ANCHOR; // 140 = 20 weeks
 const LABEL_WIDTH = 240;
-const CANVAS_WIDTH = DAY_WIDTH * TIMELINE_DAYS;
-const FALLBACK_COLORS = ["#2563eb", "#7c3aed", "#0f766e", "#c2410c", "#be123c", "#4338ca", "#047857", "#a21caf"];
-const CREW_MODE_STORAGE_KEY = "gtr-company-schedule-board-crew-mode";
+
+// Three-state zoom (item 4): Compact/Normal/Wide day widths. Persisted in its
+// own localStorage key, separate from the board-view/crew-mode keys. Every
+// px-per-day consumer below reads the CURRENT `dayWidth` local — never a
+// hardcoded constant — so drag math (which reads the `timelineDayWidth` prop
+// threaded through ProjectBar/TaskBlockSegment into ScheduleBoard's generic
+// pointer-drag handlers) stays correct at any zoom level.
+type TimelineZoom = "compact" | "normal" | "wide";
+const ZOOM_DAY_WIDTHS: Record<TimelineZoom, number> = { compact: 12, normal: 20, wide: 36 };
+const ZOOM_LABELS: Record<TimelineZoom, string> = { compact: "Compact", normal: "Normal", wide: "Wide" };
+const TIMELINE_ZOOM_STORAGE_KEY = "gtr-company-schedule-board-timeline-zoom";
+
+// Owned by ScheduleBoard (lifted so the availability panel's drill-down can
+// force Timeline + By-crew mode even when this component is already
+// mounted) — exported so ScheduleBoard reads/writes the same storage key.
+export const CREW_MODE_STORAGE_KEY = "gtr-company-schedule-board-crew-mode";
 
 interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     data: CompanyDashboardData;
@@ -40,6 +61,19 @@ interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     isSaving: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     onTrayProjectDrop: (_project: DashboardProjectRow, _targetStart: string) => void;
+    // Lifted to ScheduleBoard (see CREW_MODE_STORAGE_KEY) so the availability
+    // panel's drill-down can force crew mode on even when this view is
+    // already mounted.
+    groupByCrew: boolean;
+    onToggleGroupByCrew: () => void;
+    // Bumped by ScheduleBoard's "Today" button (item 4) so the Timeline
+    // re-scrolls to today even when the anchor month itself doesn't change
+    // (e.g. the user scrolled elsewhere in the wide canvas and wants back).
+    scrollToTodayNonce: number;
+    // team/crew list for the context-menu "Project crew…"/"Task crew…"
+    // pickers (item 1) — reuses the exact CrewPicker/TaskCrewPicker the
+    // Schedule & crew table uses.
+    teamMembers: { id: string; name: string; email: string }[];
 }
 
 interface CrewTaskBlock {
@@ -134,6 +168,10 @@ export function TimelineView({
     isSaving,
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
+    groupByCrew,
+    onToggleGroupByCrew,
+    scrollToTodayNonce,
+    teamMembers,
     onProjectMoveCommit,
     activeProjectKeyboardId,
     onProjectPointerEditStart,
@@ -151,39 +189,86 @@ export function TimelineView({
 }: TimelineViewProps) {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const [dragOverDate, setDragOverDate] = useState<string | null>(null);
-    const [groupByCrew, setGroupByCrew] = useState(false);
+    // Empty-day-cell "Schedule here…" context menu (item 1) — one instance
+    // for the whole view (only one day's menu can be open at a time), point-
+    // anchored to the right-click location.
+    const [dayContextMenu, setDayContextMenu] = useState<{ date: string; point: { x: number; y: number } } | null>(null);
+    useEffect(() => {
+        if (!dayContextMenu) return;
+        const close = () => setDayContextMenu(null);
+        activateExclusiveMenu(close);
+        return () => deactivateExclusiveMenu(close);
+    }, [dayContextMenu]);
+    function handleDayContextMenu(dayKey: string, event: ReactMouseEvent<HTMLDivElement>) {
+        if (!data.canEdit) return; // read-only roles get the browser's default menu
+        event.preventDefault();
+        setDayContextMenu({ date: dayKey, point: { x: event.clientX, y: event.clientY } });
+    }
+    const [zoom, setZoom] = useState<TimelineZoom>("normal");
     useEffect(() => {
         try {
-            const stored = localStorage.getItem(CREW_MODE_STORAGE_KEY);
-            if (stored === "true") setGroupByCrew(true);
+            const stored = localStorage.getItem(TIMELINE_ZOOM_STORAGE_KEY);
+            if (stored === "compact" || stored === "normal" || stored === "wide") setZoom(stored);
         } catch {
             // Storage can be unavailable in privacy-restricted browser contexts.
         }
     }, []);
+    function selectZoom(next: TimelineZoom) {
+        setZoom(next);
+        try {
+            localStorage.setItem(TIMELINE_ZOOM_STORAGE_KEY, next);
+        } catch {
+            // The selected zoom still applies for this session when persistence fails.
+        }
+    }
+    const dayWidth = ZOOM_DAY_WIDTHS[zoom];
+    const CANVAS_WIDTH = dayWidth * TIMELINE_DAYS_TOTAL;
+    // groupByCrew is now owned by ScheduleBoard (see CREW_MODE_STORAGE_KEY) —
+    // this thin wrapper keeps the button's call site unchanged.
     function toggleGroupByCrew() {
-        setGroupByCrew(value => {
-            const next = !value;
-            try {
-                localStorage.setItem(CREW_MODE_STORAGE_KEY, String(next));
-            } catch {
-                // The selected mode still applies for this session when persistence fails.
-            }
-            return next;
-        });
+        onToggleGroupByCrew();
     }
     const anchor = parseUTCDate(`${data.month}-01`);
-    const days = getMonthGrid(anchor).slice(0, TIMELINE_DAYS);
-    const gridStart = days[0];
-    const gridEnd = addDays(gridStart, TIMELINE_DAYS);
+    // The anchor MONTH's own Monday-aligned 42-day grid start — the point the
+    // canvas is built around and the point "Today"/mount auto-scroll to.
+    const monthGridStart = getMonthGrid(anchor)[0];
+    const gridStart = addDays(monthGridStart, -TIMELINE_DAYS_BEFORE_ANCHOR);
+    const gridEnd = addDays(gridStart, TIMELINE_DAYS_TOTAL);
+    const days = Array.from({ length: TIMELINE_DAYS_TOTAL }, (_, index) => addDays(gridStart, index));
     const visibleRange = { start: gridStart, end: gridEnd };
     const today = todayUTC();
+
+    // On mount and whenever the anchor month changes (Prev/Next/Today), bring
+    // the anchor month's first day to the canvas's left edge. Re-anchors on
+    // zoom change too, so switching zoom doesn't leave the view pointed at an
+    // arbitrary pixel offset from a different day width.
+    useEffect(() => {
+        const container = scrollContainerRef.current;
+        if (!container) return;
+        container.scrollLeft = TIMELINE_DAYS_BEFORE_ANCHOR * dayWidth;
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed on the anchor month + zoom only
+    }, [data.month, dayWidth]);
+
+    // "Today" button (ScheduleBoard header): scroll today into view even when
+    // the anchor month itself doesn't change (the primary case — the user
+    // scrolled elsewhere in the wide canvas and wants back to today).
+    useEffect(() => {
+        if (scrollToTodayNonce === 0) return;
+        if (today < gridStart || today >= gridEnd) return;
+        const container = scrollContainerRef.current;
+        if (!container) return;
+        const todayOffsetDays = getDaysBetween(gridStart, today);
+        container.scrollLeft = Math.max(0, (todayOffsetDays - 3) * dayWidth);
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- fire only on an explicit Today click, using the render's current range/zoom
+    }, [scrollToTodayNonce]);
+
     const projects: DashboardProjectRow[] = [
         ...data.pipeline.waitingToStart,
         ...data.pipeline.scheduled,
         ...data.pipeline.inProgress,
         ...data.pipeline.substantialCompletion,
     ];
-    const colorForProject = (project: DashboardProjectRow) => project.color || FALLBACK_COLORS[projects.indexOf(project) % FALLBACK_COLORS.length];
+    const colorForProject = (project: DashboardProjectRow) => project.color || getFallbackProjectColor(project.id);
     const crewRows = groupByCrew ? buildCrewTimelineRows(projects, colorForProject) : [];
     const adminOverlays = data.isAdmin ? data.overlays : null;
     const visibleIncomeMilestones = adminOverlays && showIncome ? adminOverlays.income : [];
@@ -236,29 +321,44 @@ export function TimelineView({
             <div ref={scrollContainerRef} className="overflow-x-auto" aria-label="Project schedule timeline">
                 <div style={{ width: LABEL_WIDTH + CANVAS_WIDTH }}>
                     <div className="flex border-b border-hui-border bg-white">
-                        <div data-timeline-sticky-label="true" className="sticky left-0 z-50 flex shrink-0 items-end justify-between gap-2 border-r border-hui-border bg-white px-3 pb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500" style={{ width: LABEL_WIDTH }}>
-                            <span>{groupByCrew ? "Crew" : "Project"}</span>
-                            <button
-                                type="button"
-                                onClick={toggleGroupByCrew}
-                                aria-pressed={groupByCrew}
-                                className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold normal-case tracking-normal transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${groupByCrew ? "border-indigo-300 bg-indigo-100 text-indigo-700" : "border-hui-border bg-white text-hui-textMuted hover:bg-slate-50"}`}
-                            >
-                                By crew
-                            </button>
+                        <div data-timeline-sticky-label="true" className="sticky left-0 z-50 flex shrink-0 flex-col justify-end gap-1 border-r border-hui-border bg-white px-3 pb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500" style={{ width: LABEL_WIDTH }}>
+                            <div className="flex items-center justify-between gap-2">
+                                <span>{groupByCrew ? "Crew" : "Project"}</span>
+                                <button
+                                    type="button"
+                                    onClick={toggleGroupByCrew}
+                                    aria-pressed={groupByCrew}
+                                    className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold normal-case tracking-normal transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${groupByCrew ? "border-indigo-300 bg-indigo-100 text-indigo-700" : "border-hui-border bg-white text-hui-textMuted hover:bg-slate-50"}`}
+                                >
+                                    By crew
+                                </button>
+                            </div>
+                            <div className="inline-flex self-start rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Timeline zoom">
+                                {(Object.keys(ZOOM_DAY_WIDTHS) as TimelineZoom[]).map(z => (
+                                    <button
+                                        key={z}
+                                        type="button"
+                                        onClick={() => selectZoom(z)}
+                                        aria-pressed={zoom === z}
+                                        className={`rounded px-1.5 py-0.5 text-[9px] font-semibold normal-case tracking-normal transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${zoom === z ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                                    >
+                                        {ZOOM_LABELS[z]}
+                                    </button>
+                                ))}
+                            </div>
                         </div>
                         <div className="shrink-0" style={{ width: CANVAS_WIDTH }}>
-                            <div className="grid grid-cols-6 border-b border-hui-border">
-                                {Array.from({ length: 6 }, (_, weekIndex) => {
+                            <div className="grid border-b border-hui-border" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL / 7}, ${dayWidth * 7}px)` }}>
+                                {Array.from({ length: TIMELINE_DAYS_TOTAL / 7 }, (_, weekIndex) => {
                                     const weekStart = days[weekIndex * 7];
                                     return (
-                                        <div key={formatDate(weekStart)} className="border-r border-hui-border px-1 py-1 text-[9px] font-semibold text-slate-500 last:border-r-0" style={{ width: DAY_WIDTH * 7 }}>
+                                        <div key={formatDate(weekStart)} className="border-r border-hui-border px-1 py-1 text-[9px] font-semibold text-slate-500 last:border-r-0" style={{ width: dayWidth * 7 }}>
                                             Week of {formatDate(weekStart)}
                                         </div>
                                     );
                                 })}
                             </div>
-                            <div className="grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS}, ${DAY_WIDTH}px)` }}>
+                            <div className="grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }}>
                                 {days.map(day => {
                                     const dayKey = formatDate(day);
                                     const isToday = isSameUTCDay(day, today);
@@ -277,7 +377,7 @@ export function TimelineView({
                             <div data-timeline-sticky-label="true" className="sticky left-0 z-40 shrink-0 border-r border-hui-border bg-slate-50 px-3 py-2 text-[10px] font-semibold text-slate-500" style={{ width: LABEL_WIDTH }}>
                                 Overlay summary
                             </div>
-                            <div className="grid h-14 shrink-0" style={{ width: CANVAS_WIDTH, gridTemplateColumns: `repeat(${TIMELINE_DAYS}, ${DAY_WIDTH}px)` }}>
+                            <div className="grid h-14 shrink-0" style={{ width: CANVAS_WIDTH, gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }}>
                                 {days.map(day => {
                                     const dayKey = formatDate(day);
                                     const labels = [
@@ -315,7 +415,8 @@ export function TimelineView({
                             const { laneByTaskId, laneCount: rawLaneCount } = assignTaskLanes(row.taskBlocks.map(block => ({ id: block.taskId, start: block.start, end: block.end })));
                             const laneCount = Math.max(1, rawLaneCount);
                             const TASK_LANE_TOP = 20;
-                            const TASK_LANE_HEIGHT = 16;
+                            // Readability pass (2026-07-22): 16->20px per lane for the bumped 11px chip labels (item 5).
+                            const TASK_LANE_HEIGHT = 20;
                             const coverageTop = TASK_LANE_TOP + laneCount * TASK_LANE_HEIGHT + 4;
                             const rowHeight = Math.max(64, coverageTop + (row.coverageBlocks.length > 0 ? TASK_LANE_HEIGHT + 8 : 8));
                             return (
@@ -324,24 +425,24 @@ export function TimelineView({
                                         <span className="truncate text-xs font-semibold text-hui-textMain" title={row.name}>{row.name}</span>
                                     </div>
                                     <div className="relative shrink-0" style={{ width: CANVAS_WIDTH, height: rowHeight }}>
-                                        <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS}, ${DAY_WIDTH}px)` }} aria-hidden="true">
+                                        <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }} aria-hidden="true">
                                             {days.map(day => (
                                                 <div key={formatDate(day)} className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`} />
                                             ))}
                                         </div>
                                         {today >= gridStart && today < gridEnd && (
-                                            <span className="pointer-events-none absolute inset-y-0 z-20 w-px bg-indigo-500" style={{ left: toTimelineRect({ start: today, end: addDays(today, 1) }, gridStart, DAY_WIDTH).left + DAY_WIDTH / 2 }} aria-hidden="true" />
+                                            <span className="pointer-events-none absolute inset-y-0 z-20 w-px bg-indigo-500" style={{ left: toTimelineRect({ start: today, end: addDays(today, 1) }, gridStart, dayWidth).left + dayWidth / 2 }} aria-hidden="true" />
                                         )}
                                         {row.taskBlocks.filter(block => laneByTaskId.has(block.taskId)).map(block => {
                                             const clipped = clipRange({ start: block.start, end: block.end }, visibleRange);
                                             if (!clipped) return null;
-                                            const rect = toTimelineRect(clipped, gridStart, DAY_WIDTH);
+                                            const rect = toTimelineRect(clipped, gridStart, dayWidth);
                                             const lane = laneByTaskId.get(block.taskId)!;
                                             return (
                                                 <div
                                                     key={block.taskId}
-                                                    className="absolute z-10 overflow-hidden rounded-sm text-[9px] font-semibold leading-[15px] text-white shadow-sm"
-                                                    style={{ left: rect.left, top: TASK_LANE_TOP + lane * TASK_LANE_HEIGHT, width: Math.max(rect.width, DAY_WIDTH), height: TASK_LANE_HEIGHT - 2, backgroundColor: block.projectColor }}
+                                                    className="absolute z-10 overflow-hidden rounded-sm text-[11px] font-semibold leading-[18px] text-white shadow-sm"
+                                                    style={{ left: rect.left, top: TASK_LANE_TOP + lane * TASK_LANE_HEIGHT, width: Math.max(rect.width, dayWidth), height: TASK_LANE_HEIGHT - 2, backgroundColor: block.projectColor }}
                                                     title={`${block.projectName} — ${block.name} — UTC ${formatDate(block.start)} → ${formatDate(block.end)}`}
                                                 >
                                                     <span className="block truncate px-1">{block.name}</span>
@@ -351,12 +452,12 @@ export function TimelineView({
                                         {row.coverageBlocks.map(block => {
                                             const clipped = clipRange({ start: block.start, end: block.end }, visibleRange);
                                             if (!clipped) return null;
-                                            const rect = toTimelineRect(clipped, gridStart, DAY_WIDTH);
+                                            const rect = toTimelineRect(clipped, gridStart, dayWidth);
                                             return (
                                                 <div
                                                     key={`coverage-${block.projectId}`}
-                                                    className="absolute z-10 overflow-hidden rounded-sm border-2 border-dashed text-[9px] font-semibold leading-[13px]"
-                                                    style={{ left: rect.left, top: coverageTop, width: Math.max(rect.width, DAY_WIDTH), height: TASK_LANE_HEIGHT - 2, borderColor: block.projectColor, backgroundColor: `${block.projectColor}22`, color: block.projectColor }}
+                                                    className="absolute z-10 overflow-hidden rounded-sm border-2 border-dashed text-[11px] font-semibold leading-[16px]"
+                                                    style={{ left: rect.left, top: coverageTop, width: Math.max(rect.width, dayWidth), height: TASK_LANE_HEIGHT - 2, borderColor: block.projectColor, backgroundColor: `${block.projectColor}22`, color: block.projectColor }}
                                                     title={`${block.projectName} — on the project crew, no task assignment in range`}
                                                 >
                                                     <span className="block truncate px-1">{block.projectName}</span>
@@ -371,7 +472,7 @@ export function TimelineView({
                     {projects.map((project, projectIndex) => {
                         const range = getEffectiveProjectRange(project);
                         const clipped = range ? clipRange(range, visibleRange) : null;
-                        const rect = clipped ? toTimelineRect(clipped, gridStart, DAY_WIDTH) : null;
+                        const rect = clipped ? toTimelineRect(clipped, gridStart, dayWidth) : null;
                         const startOffset = clipped ? getDaysBetween(gridStart, clipped.start) : 0;
                         const segment: WeekSegment | null = range
                             ? clipped
@@ -401,7 +502,7 @@ export function TimelineView({
                         ))];
                         const crewLabel = project.crew.length > 0 ? project.crew.map(member => member.name).join(", ") : "No project crew";
                         // Row must fit the bar: wrapper sits at top 8 + py-1 (4),
-                        // so a laneCount-3 bar (60px) needs 12 + 60 + 8 = 80px.
+                        // so a laneCount-3 bar (72px) needs 12 + 72 + 8 = 92px.
                         const rowHeight = Math.max(64, 12 + computeTaskLaneLayout(project.tasks).barHeight + 8);
                         const milestoneRows = [
                             ...visibleIncomeMilestones.filter(item => item.projectId === project.id).map(item => ({
@@ -441,7 +542,7 @@ export function TimelineView({
                                     )}
                                 </div>
                                 <div data-timeline-schedule-grid="true" className="relative shrink-0" style={{ width: CANVAS_WIDTH, height: rowHeight }}>
-                                    <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS}, ${DAY_WIDTH}px)` }} aria-hidden="true">
+                                    <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }} aria-hidden="true">
                                         {days.map(day => {
                                             const dayKey = formatDate(day);
                                             return (
@@ -451,20 +552,21 @@ export function TimelineView({
                                                     onDragOver={event => handleDayDragOver(dayKey, event)}
                                                     onDragLeave={() => setDragOverDate(current => current === dayKey ? null : current)}
                                                     onDrop={event => handleDayDrop(dayKey, event)}
+                                                    onContextMenu={event => handleDayContextMenu(dayKey, event)}
                                                     className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"} ${dragOverDate === dayKey ? "bg-indigo-100 ring-1 ring-inset ring-indigo-500" : ""}`}
                                                 />
                                             );
                                         })}
                                     </div>
                                     {today >= gridStart && today < gridEnd && (
-                                        <span className="pointer-events-none absolute inset-y-0 z-20 w-px bg-indigo-500" style={{ left: toTimelineRect({ start: today, end: addDays(today, 1) }, gridStart, DAY_WIDTH).left + DAY_WIDTH / 2 }} aria-hidden="true" />
+                                        <span className="pointer-events-none absolute inset-y-0 z-20 w-px bg-indigo-500" style={{ left: toTimelineRect({ start: today, end: addDays(today, 1) }, gridStart, dayWidth).left + dayWidth / 2 }} aria-hidden="true" />
                                     )}
                                     {segment && (
-                                        <div className={`absolute z-10 py-1 ${rect ? "" : "invisible pointer-events-none"}`} style={{ left: rect?.left ?? 0, top: 8, width: Math.max(rect?.width ?? DAY_WIDTH, DAY_WIDTH) }}>
+                                        <div className={`absolute z-10 py-1 ${rect ? "" : "invisible pointer-events-none"}`} style={{ left: rect?.left ?? 0, top: 8, width: Math.max(rect?.width ?? dayWidth, dayWidth) }}>
                                             <ProjectBar
                                                 project={project}
                                                 segment={segment}
-                                                projectColor={project.color || FALLBACK_COLORS[projectIndex % FALLBACK_COLORS.length]}
+                                                projectColor={project.color || getFallbackProjectColor(project.id)}
                                                 conflictNames={conflictNames}
                                                 incomeMilestones={[]}
                                                 changeOrderMilestones={[]}
@@ -476,9 +578,10 @@ export function TimelineView({
                                                 draftTaskIds={draftTaskIds}
                                                 activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                 activeProjectKeyboardId={activeProjectKeyboardId}
-                                                timelineDayWidth={DAY_WIDTH}
+                                                timelineDayWidth={dayWidth}
                                                 timelineLeftInset={LABEL_WIDTH}
                                                 timelineScrollContainerRef={scrollContainerRef}
+                                                teamMembers={teamMembers}
                                                 onProjectPointerEditStart={onProjectPointerEditStart}
                                                 onProjectKeyboardStart={onProjectKeyboardStart}
                                                 onProjectKeyboardAdjust={onProjectKeyboardAdjust}
@@ -499,19 +602,20 @@ export function TimelineView({
                                         const milestoneStart = parseUTCDate(task.startDate.slice(0, 10));
                                         const milestoneRange = { start: milestoneStart, end: addDays(milestoneStart, 1) };
                                         return (
-                                            <div key={`task-milestone-${task.id}`} className="absolute z-30 h-[18px]" style={{ left: toTimelineRect(milestoneRange, gridStart, DAY_WIDTH).left, top: 26, width: DAY_WIDTH }}>
+                                            <div key={`task-milestone-${task.id}`} className="absolute z-30 h-[22px]" style={{ left: toTimelineRect(milestoneRange, gridStart, dayWidth).left, top: 26, width: dayWidth }}>
                                                 <TaskBlockSegment
                                                     task={task}
                                                     projectRange={range ?? milestoneRange}
                                                     visibleRange={milestoneRange}
-                                                    projectColor={project.color || FALLBACK_COLORS[projectIndex % FALLBACK_COLORS.length]}
+                                                    projectColor={project.color || getFallbackProjectColor(project.id)}
                                                     canEdit={data.canEdit}
                                                     isPending={isSaving || pendingProjectIds.has(project.id) || pendingTaskIds.has(task.id)}
                                                     isDraft={draftProjectIds.has(project.id) || draftTaskIds.has(task.id)}
                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
-                                                    timelineDayWidth={DAY_WIDTH}
+                                                    timelineDayWidth={dayWidth}
                                                     timelineLeftInset={LABEL_WIDTH}
                                                     timelineScrollContainerRef={scrollContainerRef}
+                                                    teamMembers={teamMembers}
                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                     onTaskKeyboardStart={onTaskKeyboardStart}
                                                     onTaskKeyboardAdjust={onTaskKeyboardAdjust}
@@ -536,7 +640,7 @@ export function TimelineView({
                                                 kind={marker.kind}
                                                 offsetPixels={(sameDayIndex - (sameDayMarkers.length - 1) / 2) * 8}
                                                 timelineOrigin={gridStart}
-                                                dayWidth={DAY_WIDTH}
+                                                dayWidth={dayWidth}
                                             />
                                         );
                                     })}
@@ -548,6 +652,31 @@ export function TimelineView({
                     </>)}
                 </div>
             </div>
+            <FloatingPopover open={dayContextMenu != null} anchorPoint={dayContextMenu?.point ?? null} onClose={() => setDayContextMenu(null)} width={220}>
+                <p className="px-1 text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">
+                    Schedule here — {dayContextMenu?.date}
+                </p>
+                {data.pipeline.waitingToStart.length === 0 ? (
+                    <p className="px-1 py-1 text-xs text-hui-textMuted">No unscheduled projects</p>
+                ) : (
+                    <ul className="max-h-56 space-y-0.5 overflow-y-auto">
+                        {data.pipeline.waitingToStart.map(project => (
+                            <li key={project.id}>
+                                <button
+                                    type="button"
+                                    className="block w-full truncate rounded px-2 py-1 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                                    onClick={() => {
+                                        if (dayContextMenu) onTrayProjectDrop(project, dayContextMenu.date);
+                                        setDayContextMenu(null);
+                                    }}
+                                >
+                                    {project.name}
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                )}
+            </FloatingPopover>
         </ProjectBarGridStartContext.Provider>
     );
 }

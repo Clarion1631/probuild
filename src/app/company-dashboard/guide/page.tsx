@@ -72,6 +72,16 @@ export default async function CompanyDashboardGuidePage() {
                 </ul>
             </div>
 
+            <div className="hui-card p-6 mb-6">
+                <h2 className="text-base font-semibold text-hui-textMain mb-4">Planning with the availability grid</h2>
+                <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
+                    <li>Below the calendar, <strong>Crew availability</strong> shows the next 14 days per person. A solid chip means they&apos;re assigned to a task that day; an outlined chip means they&apos;re on the job crew with no specific task yet; a blank cell means they&apos;re free.</li>
+                    <li>A car icon on a chip means that job is far enough from the shop to plan for a longer day (drive time eats into the work day).</li>
+                    <li>The <strong>Planned $/day</strong> row (admin/manager only) is what that day costs in labor — everyone with a chip that day, at their burdened rate for an 8-hour paid day.</li>
+                    <li>Click a person&apos;s name to jump to their week on the Timeline&apos;s <strong>By crew</strong> view.</li>
+                </ul>
+            </div>
+
             <Link href="/company-dashboard" className="hui-btn hui-btn-primary">Open the schedule board →</Link>
         </div>
     );
