@@ -2232,7 +2232,10 @@ export async function getCompanyDashboardData(
     // appended so the picker stays unambiguous.
     const teamMembersRaw = canEdit
         ? await prisma.user.findMany({
-            where: { status: "ACTIVATED", role: { not: "FINANCE" } },
+            // Owner call 2026-07-23: only people DESIGNATED as crew are
+            // schedulable — no admins/office in the pickers or availability.
+            // Already-assigned non-crew still render as removable entries.
+            where: { status: "ACTIVATED", role: "FIELD_CREW" },
             orderBy: { name: "asc" },
             select: { id: true, name: true, email: true, role: true, hourlyRate: true, burdenRate: true },
         })
@@ -2249,9 +2252,12 @@ export async function getCompanyDashboardData(
                 // ignores the extra field).
                 ...(canSeeFinancials ? { burdenedHourlyRate: round2(Number(u.hourlyRate) + Number(u.burdenRate)) } : {}),
             }));
-            const nameCounts = new Map<string, number>();
-            for (const r of rows) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1);
-            return rows.map(r => (nameCounts.get(r.name)! > 1 ? { ...r, name: `${r.name} (${r.email})` } : r));
+            // Names stay bare — no email disambiguation (owner call 2026-07-23:
+            // full addresses wrapped across six lines in the crew checklist and
+            // a 9-person crew knows who's who; duplicate-name accounts simply
+            // render twice, and the email remains in the serialized field for
+            // any UI that ever needs a tooltip).
+            return rows;
         })()
         : null;
 
