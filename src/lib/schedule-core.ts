@@ -361,7 +361,7 @@ export async function setProjectStartDate(input: {
 
         const project = await tx.project.findUnique({
             where: { id: projectId },
-            select: { id: true, name: true, status: true, startDate: true },
+            select: { id: true, name: true, status: true, startDate: true, endDate: true },
         });
         if (!project) throw new Error("Project not found");
         if (CLOSED_PROJECT_STATUSES.includes(project.status)) {
@@ -372,6 +372,14 @@ export async function setProjectStartDate(input: {
         await tx.project.update({ where: { id: projectId }, data: { startDate } });
 
         const notes: string[] = [];
+        // Preserve the endDate > startDate invariant under the same lock: a
+        // start moved past a saved end would flip the window negative and
+        // collapse estimate-generation windowDays to the 1-day clamp. Clearing
+        // (not silently shifting) keeps the human in charge of the new end.
+        if (startDate && project.endDate && project.endDate.getTime() <= startDate.getTime()) {
+            await tx.project.update({ where: { id: projectId }, data: { endDate: null } });
+            notes.push(`Saved end date ${project.endDate.toISOString().slice(0, 10)} was on or before the new start — cleared; set a new end date if needed.`);
+        }
         const skippedQbMilestones: SkippedQbMilestone[] = [];
         let shiftedTasks = 0;
         let shiftedTaskDates: PersistedScheduleTaskDate[] = [];
@@ -2097,7 +2105,20 @@ export async function getCompanyDashboardData(
         // the calendar fetch stays financial-free here.
         getStartCalendar(from, to, { includeFinancials: false }),
         isAdmin ? getCashflowOutlook() : Promise.resolve(null),
-        canEdit ? getCrewConflicts(from, to) : Promise.resolve(null),
+        // Conflicts feed BOTH the month-scoped conflicts card AND the
+        // availability grid (always today..today+14, regardless of the viewed
+        // month) — fetch the UNION window, with a ±1-day margin for client/
+        // server calendar-day drift, so off-month viewing can't produce
+        // false-negative conflict rings.
+        canEdit ? (() => {
+            const now = new Date();
+            const localToday = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+            const availabilityFrom = addDays(localToday, -1);
+            const availabilityTo = addDays(localToday, 15);
+            const conflictsFrom = availabilityFrom < from ? availabilityFrom : from;
+            const conflictsTo = availabilityTo > to ? availabilityTo : to;
+            return getCrewConflicts(conflictsFrom, conflictsTo);
+        })() : Promise.resolve(null),
         isAdmin ? coRowsPromise.then(rows => getCalendarOverlays(from, to, rows)) : Promise.resolve(null),
         isAdmin ? coRowsPromise.then(rows => getProjectMonthStrip(from, to, rows)) : Promise.resolve(null),
     ]);

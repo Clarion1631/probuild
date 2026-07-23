@@ -180,6 +180,14 @@ export function ProjectBar({
         activateExclusiveMenu(close);
         return () => deactivateExclusiveMenu(close);
     }, [menuOpen]);
+    // The "+N" overflow popover is a menu too — register it so opening any
+    // other menu (mouse OR keyboard) closes it, preserving one-menu-at-a-time.
+    useEffect(() => {
+        if (!overflowOpen) return;
+        const close = () => setOverflowOpen(false);
+        activateExclusiveMenu(close);
+        return () => deactivateExclusiveMenu(close);
+    }, [overflowOpen]);
     if (!gridStart || !projectRange) return null;
 
     const visibleStart = addDays(gridStart, segment.weekIndex * 7 + segment.startColumn);

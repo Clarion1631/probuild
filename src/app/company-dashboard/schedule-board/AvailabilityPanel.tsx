@@ -2,7 +2,7 @@
 
 import { Fragment } from "react";
 import type { CompanyDashboardData, CrewConflict, DashboardProjectRow } from "@/lib/schedule-core";
-import { addDays, formatCurrency, formatDate, isSameUTCDay, isWeekend, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addDays, formatCurrency, formatDate, getFallbackProjectColor, isSameUTCDay, isWeekend, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { getEffectiveProjectRange } from "./useBarLayout";
 
 // Planning panel for Richard (ops manager): "a small dashboard of
@@ -14,7 +14,6 @@ import { getEffectiveProjectRange } from "./useBarLayout";
 const AVAILABILITY_DAYS = 14;
 const FAR_JOB_MILES_THRESHOLD = 25;
 const PAID_HOURS_PER_DAY = 8;
-const FALLBACK_PROJECT_COLOR = "#2563eb";
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const CAR_GLYPH = "\u{1F697}"; // far-job indicator — plan for a longer day
 
@@ -66,7 +65,7 @@ function buildAvailabilityRows(members: AvailabilityMember[], projects: Dashboar
     };
 
     for (const project of projects) {
-        const projectColor = project.color || FALLBACK_PROJECT_COLOR;
+        const projectColor = project.color || getFallbackProjectColor(project.id);
         const bookedDaysByUser = new Map<string, Set<string>>();
 
         for (const task of project.tasks) {

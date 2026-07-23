@@ -7346,18 +7346,22 @@ export async function updateProjectEndDateAction(projectId: string, endDateISO: 
         : null;
     if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
 
-    const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { id: true, name: true, startDate: true, endDate: true },
-    });
-    if (!project) throw new Error("Project not found");
-
     const endDate = endDateISO ? parseStartDateInput(endDateISO) : null;
-    if (endDate && project.startDate && endDate.getTime() <= project.startDate.getTime()) {
-        throw new Error("End date must be after the project's start date");
-    }
-
-    await prisma.project.update({ where: { id: projectId }, data: { endDate } });
+    // Same lock family as setProjectStartDate: validate against the LOCKED
+    // startDate so a concurrent start move can't slip past the invariant.
+    const project = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const locked = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { id: true, name: true, startDate: true, endDate: true },
+        });
+        if (!locked) throw new Error("Project not found");
+        if (endDate && locked.startDate && endDate.getTime() <= locked.startDate.getTime()) {
+            throw new Error("End date must be after the project's start date");
+        }
+        await tx.project.update({ where: { id: projectId }, data: { endDate } });
+        return locked;
+    }));
     await prisma.activityLog.create({
         data: {
             projectId,

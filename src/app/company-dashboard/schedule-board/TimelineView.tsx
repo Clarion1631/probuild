@@ -425,10 +425,17 @@ export function TimelineView({
                                         <span className="truncate text-xs font-semibold text-hui-textMain" title={row.name}>{row.name}</span>
                                     </div>
                                     <div className="relative shrink-0" style={{ width: CANVAS_WIDTH, height: rowHeight }}>
-                                        <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }} aria-hidden="true">
-                                            {days.map(day => (
-                                                <div key={formatDate(day)} className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`} />
-                                            ))}
+                                        <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }}>
+                                            {days.map(day => {
+                                                const dayKey = formatDate(day);
+                                                return (
+                                                    <div
+                                                        key={dayKey}
+                                                        onContextMenu={event => handleDayContextMenu(dayKey, event)}
+                                                        className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`}
+                                                    />
+                                                );
+                                            })}
                                         </div>
                                         {today >= gridStart && today < gridEnd && (
                                             <span className="pointer-events-none absolute inset-y-0 z-20 w-px bg-indigo-500" style={{ left: toTimelineRect({ start: today, end: addDays(today, 1) }, gridStart, dayWidth).left + dayWidth / 2 }} aria-hidden="true" />

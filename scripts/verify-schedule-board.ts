@@ -515,9 +515,11 @@ async function main() {
         const endDateActionBody = actionsSource.slice(endDateActionStart, endDateActionEnd);
         check("updateProjectEndDateAction exists and is ADMIN/MANAGER gated",
             endDateActionStart >= 0 && endDateActionBody.includes('["ADMIN", "MANAGER"].includes(caller.role)'));
-        check("updateProjectEndDateAction validates with parseStartDateInput, rejects end <= start, writes one set_project_end_date ActivityLog row, and revalidates both boards",
+        check("updateProjectEndDateAction validates with parseStartDateInput, rejects end <= start under the Project row lock, writes one set_project_end_date ActivityLog row, and revalidates both boards",
             endDateActionBody.includes("parseStartDateInput(endDateISO)")
-            && endDateActionBody.includes("endDate.getTime() <= project.startDate.getTime()")
+            && endDateActionBody.includes('FOR UPDATE')
+            && endDateActionBody.includes("withTxRetry")
+            && endDateActionBody.includes("endDate.getTime() <= locked.startDate.getTime()")
             && endDateActionBody.includes('throw new Error("End date must be after the project\'s start date")')
             && endDateActionBody.includes('action: "set_project_end_date"')
             && endDateActionBody.includes("previousEndDate:")
