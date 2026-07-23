@@ -20,6 +20,14 @@ export function coTaxRate(estimate: EstimateTaxInfo): number {
     return Number.isFinite(pct) ? pct / 100 : DEFAULT_CO_TAX_RATE;
 }
 
+// Match billing-core's invoice math exactly: totalAmount is the pre-tax signed
+// subtotal, then both subtotal and tax are rounded to cents before addition.
+export function coSignedAmount(totalAmount: number, estimate: EstimateTaxInfo): number {
+    const subtotal = Math.round((Number(totalAmount) || 0) * 100) / 100;
+    const taxAmount = Math.round(subtotal * coTaxRate(estimate) * 100) / 100;
+    return Math.round((subtotal + taxAmount) * 100) / 100;
+}
+
 // Integer-cents line math shared by the CO editor, the portal signature page,
 // and the item sync in updateChangeOrder, so the amount the customer sees is
 // bit-identical to the amount persisted and billed. toPrecision strips float
@@ -42,14 +50,4 @@ export function coTaxLabel(estimate: EstimateTaxInfo): string {
     return estimate?.taxRateName
         ? `${estimate.taxRateName} (${pctDisplay}%)`
         : `Estimated Tax (${pctDisplay}%)`;
-}
-
-// The amount the customer signs (and billing invoices): the PRE-TAX subtotal
-// plus tax at the estimate's rate. Same cents-rounding steps billing-core's
-// billChangeOrderCore uses, so a projected amount matches the later billed
-// amount bit-for-bit. Used by the CO→schedule zero-row milestone projection.
-export function coSignedAmount(totalAmount: number, estimate: EstimateTaxInfo): number {
-    const subtotal = Math.round(totalAmount * 100) / 100;
-    const taxAmount = Math.round(subtotal * coTaxRate(estimate) * 100) / 100;
-    return Math.round((subtotal + taxAmount) * 100) / 100;
 }

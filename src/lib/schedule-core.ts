@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { withTxRetry } from "./tx-retry";
 import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
+import { coSignedAmount, coTaxRate } from "./co-tax";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
@@ -12,10 +13,10 @@ import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTask
 // "use server", so every export there is a remotely invokable endpoint —
 // auth-free logic must live here, NOT there.
 //
-// Money-path discipline: the ONLY money-model field this module ever writes is
-// `dueDate` on EstimatePaymentSchedule and on non-QuickBooks-pushed, unpaid
-// PaymentSchedule rows — never amounts, statuses, or QB fields, and never a
-// partial shift of a QB-pushed mirror group.
+// Money-path discipline: this module writes `dueDate` only for the guarded P1
+// start-date shift, and `scheduleTaskId` for estimate/CO milestone linking.
+// It never writes amounts, statuses, or QB fields, and never partially shifts
+// a QB-pushed mirror group. Phase 3 CO paths write scheduleTaskId only.
 
 // Estimate statuses that count as the project's contract value (plan R1 fix 10,
 // R2 fix 4): the job is sold and the number is real. Also the qualifying set
@@ -47,6 +48,9 @@ export interface PipelineCrewMember {
     // User status (PENDING/ACTIVATED/DISABLED) — the dashboard picker renders
     // assigned non-ACTIVATED members as removable "(inactive)" entries.
     status: string;
+    // User role — the picker renders an assigned FINANCE user (excluded from
+    // the pickable teamMembers list) as a removable "(finance)" entry.
+    role: string;
 }
 
 export interface PipelineProject {
@@ -55,6 +59,7 @@ export interface PipelineProject {
     client: string | null;
     status: string;
     startDate: string | null;
+    color: string | null;
     // totalAmount of the project's most recent Approved/Invoiced/Partially
     // Paid/Paid estimate; null when none exists.
     contractValue: number | null;
@@ -105,9 +110,9 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             where: { status: { in: OPEN_PROJECT_STATUSES } },
             orderBy: { createdAt: "desc" },
             select: {
-                id: true, name: true, status: true, startDate: true,
+                id: true, name: true, status: true, startDate: true, color: true,
                 client: { select: { name: true } },
-                crew: { select: { id: true, name: true, email: true, status: true } },
+                crew: { select: { id: true, name: true, email: true, status: true, role: true } },
                 estimates: {
                     where: { status: { in: CONTRACT_ESTIMATE_STATUSES } },
                     orderBy: { createdAt: "desc" },
@@ -124,8 +129,9 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         client: p.client?.name ?? null,
         status: p.status,
         startDate: p.startDate ? p.startDate.toISOString() : null,
+        color: p.color,
         contractValue: p.estimates[0] ? Number(p.estimates[0].totalAmount) : null,
-        crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status })),
+        crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status, role: u.role })),
     });
 
     const waitingToStart: PipelineProject[] = [];
@@ -273,11 +279,18 @@ export interface SkippedQbMilestone {
     paymentScheduleIds: string[];
 }
 
+export interface PersistedScheduleTaskDate {
+    id: string;
+    startDate: string;
+    endDate: string;
+}
+
 export interface SetProjectStartDateResult {
     projectId: string;
     previousStartDate: string | null;
     startDate: string | null;
     shiftedTasks: number;
+    shiftedTaskDates: PersistedScheduleTaskDate[];
     shiftedMilestones: number;
     skippedQbMilestones: SkippedQbMilestone[];
     notes: string[];
@@ -310,7 +323,7 @@ export async function setProjectStartDate(input: {
 
     // Retry wrapper per the repo's money-path convention (see tx-retry.ts): a
     // rolled-back write-conflict on the shared pooler re-runs against fresh state.
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Serialize concurrent start-date moves: lock the project row BEFORE
         // reading the current marker, so two moves can never compute their
         // deltas from the same stale startDate (lost-update / double-shift race).
@@ -331,6 +344,7 @@ export async function setProjectStartDate(input: {
         const notes: string[] = [];
         const skippedQbMilestones: SkippedQbMilestone[] = [];
         let shiftedTasks = 0;
+        let shiftedTaskDates: PersistedScheduleTaskDate[] = [];
         let shiftedMilestones = 0;
 
         // Delta shift only applies to a Waiting-to-Start project with both an
@@ -355,13 +369,22 @@ export async function setProjectStartDate(input: {
             const daysParam = String(shiftDays);
 
             // (a) Every job task shifts in ONE update.
-            shiftedTasks = await tx.$executeRaw`
+            const shiftedTaskRows = await tx.$queryRaw<{ id: string; startDate: Date; endDate: Date }[]>`
                 UPDATE "ScheduleTask"
                 SET "startDate" = "startDate" + (${daysParam} || ' days')::interval,
                     "endDate" = "endDate" + (${daysParam} || ' days')::interval,
                     "updatedAt" = NOW()
                 WHERE "projectId" = ${projectId}
+                RETURNING "id", "startDate", "endDate"
             `;
+            shiftedTaskDates = shiftedTaskRows
+                .map(task => ({
+                    id: task.id,
+                    startDate: task.startDate.toISOString(),
+                    endDate: task.endDate.toISOString(),
+                }))
+                .sort((a, b) => a.id.localeCompare(b.id));
+            shiftedTasks = shiftedTaskDates.length;
 
             // (b) Milestone mirror groups anchored to this project's tasks:
             // two bounded reads, then skip/shift computed in memory. The
@@ -539,8 +562,184 @@ export async function setProjectStartDate(input: {
             previousStartDate: previousStartDate ? previousStartDate.toISOString() : null,
             startDate: startDate ? startDate.toISOString() : null,
             shiftedTasks,
+            shiftedTaskDates,
             shiftedMilestones,
             skippedQbMilestones,
+            notes,
+        };
+    }));
+
+    // Post-commit best-effort generation hook (PB-pipeline-003): sign first,
+    // date later ⇒ the schedule appears by itself. Fires when the project ends
+    // up dated with zero tasks and a qualifying estimate; failures are caught
+    // and surface in notes[], never fail the date move.
+    if (startDate !== null) {
+        try {
+            const [taskCount, qualifying] = await Promise.all([
+                prisma.scheduleTask.count({ where: { projectId } }),
+                prisma.estimate.findFirst({
+                    where: { projectId, status: { in: CONTRACT_ESTIMATE_STATUSES } },
+                    orderBy: { createdAt: "desc" },
+                    select: { id: true, code: true },
+                }),
+            ]);
+            if (taskCount === 0 && qualifying) {
+                const gen = await generateScheduleFromEstimate({
+                    estimateId: qualifying.id,
+                    mode: "merge",
+                    requireEmptyProject: true,
+                    actor,
+                });
+                result.notes.push(`Schedule auto-generated from estimate ${qualifying.code} (${gen.created.length} task${gen.created.length === 1 ? "" : "s"}).`);
+            }
+        } catch (e: any) {
+            result.notes.push(`Schedule auto-generation failed (the date move succeeded): ${e?.message ?? e}`);
+        }
+    }
+
+    return result;
+}
+
+export interface ShiftNotStartedTasksInput {
+    projectId: string;
+    deltaDays: number;
+    actor: { type: "TEAM" | "SYSTEM"; name: string };
+}
+
+export interface ShiftNotStartedTasksResult {
+    projectId: string;
+    deltaDays: number;
+    shiftedTaskIds: string[];
+    shiftedTaskDates: PersistedScheduleTaskDate[];
+    shiftedTasks: number;
+    notes: string[];
+}
+
+/**
+ * Shift only exact `Not Started` tasks on an active project. Explicitly dated
+ * Pending payment milestones stay fixed and are returned as operator notes;
+ * this path never changes the project marker or any payment/money row.
+ */
+export async function shiftNotStartedTasks(
+    input: ShiftNotStartedTasksInput,
+): Promise<ShiftNotStartedTasksResult> {
+    const { projectId, deltaDays, actor } = input;
+    if (!Number.isSafeInteger(deltaDays) || deltaDays === 0) {
+        throw new Error("deltaDays must be a nonzero whole integer");
+    }
+    // Hard magnitude cap: a schedule never legitimately moves more than a year
+    // in one gesture, and an unbounded delta from a direct action call could
+    // push dates outside representable ranges.
+    if (Math.abs(deltaDays) > 365) {
+        throw new Error("deltaDays cannot exceed 365 days in a single shift");
+    }
+
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Keep this lock first: all schedule moves serialize on Project before
+        // selecting child tasks, matching setProjectStartDate's lock family.
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const project = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { id: true, name: true, status: true },
+        });
+        if (!project) throw new Error("Project not found");
+        if (project.status !== "In Progress") {
+            throw new Error("Only In Progress projects can shift Not Started tasks");
+        }
+
+        const tasks = await tx.$queryRaw<{ id: string; startDate: Date; endDate: Date }[]>`
+            SELECT "id", "startDate", "endDate"
+            FROM "ScheduleTask"
+            WHERE "projectId" = ${projectId}
+              AND "status" = 'Not Started'
+            ORDER BY "id"
+            FOR UPDATE
+        `;
+        const shiftedTaskIds = tasks.map(task => task.id);
+        const shiftedTaskDates: PersistedScheduleTaskDate[] = [];
+
+        for (const task of tasks) {
+            const shiftedStartDate = addDays(task.startDate, deltaDays);
+            const shiftedEndDate = addDays(task.endDate, deltaDays);
+            await tx.$executeRaw`
+                UPDATE "ScheduleTask"
+                SET "startDate" = ${shiftedStartDate},
+                    "endDate" = ${shiftedEndDate},
+                    "updatedAt" = NOW()
+                WHERE "id" = ${task.id}
+            `;
+            shiftedTaskDates.push({
+                id: task.id,
+                startDate: shiftedStartDate.toISOString(),
+                endDate: shiftedEndDate.toISOString(),
+            });
+        }
+
+        const notes: string[] = [];
+        if (shiftedTaskIds.length > 0) {
+            const estimateMilestones = await tx.estimatePaymentSchedule.findMany({
+                where: {
+                    scheduleTaskId: { in: shiftedTaskIds },
+                    status: "Pending",
+                    dueDate: { not: null },
+                },
+                orderBy: { id: "asc" },
+                select: { id: true, name: true },
+            });
+            const invoiceMilestones = await tx.paymentSchedule.findMany({
+                where: {
+                    scheduleTaskId: { in: shiftedTaskIds },
+                    status: "Pending",
+                    dueDate: { not: null },
+                },
+                orderBy: { id: "asc" },
+                select: { id: true, name: true },
+            });
+            // CO payment rows carry the same task link since PB-pipeline-003 and
+            // have no status column — any explicit dueDate is billing's authority.
+            const coMilestones = await tx.changeOrderPaymentSchedule.findMany({
+                where: {
+                    scheduleTaskId: { in: shiftedTaskIds },
+                    dueDate: { not: null },
+                },
+                orderBy: { id: "asc" },
+                select: { id: true, name: true },
+            });
+            for (const milestone of estimateMilestones) {
+                notes.push(`Estimate milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
+            }
+            for (const milestone of invoiceMilestones) {
+                notes.push(`Invoice milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
+            }
+            for (const milestone of coMilestones) {
+                notes.push(`Change-order milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
+            }
+        }
+
+        await tx.activityLog.create({
+            data: {
+                projectId,
+                actorType: actor.type,
+                actorName: actor.name,
+                action: "shift_not_started_tasks",
+                entityType: "project",
+                entityId: projectId,
+                entityName: project.name,
+                metadata: JSON.stringify({
+                    deltaDays,
+                    shiftedTasks: shiftedTaskIds.length,
+                    shiftedTaskIds,
+                    explicitDueDateMilestones: notes.length,
+                }),
+            },
+        });
+
+        return {
+            projectId,
+            deltaDays,
+            shiftedTaskIds,
+            shiftedTaskDates,
+            shiftedTasks: shiftedTaskIds.length,
             notes,
         };
     }));
@@ -653,6 +852,10 @@ export interface GeneratedTaskRow {
     parentId: string | null;
 }
 
+// Thrown when an automatic-path precondition fails (zero-task enforcement).
+// Hooks treat this class as an expected quiet skip; anything else is a failure.
+export class ScheduleGenerationPreconditionError extends Error {}
+
 export interface GenerateScheduleResult {
     estimateCode: string;
     created: GeneratedTaskRow[];
@@ -693,6 +896,7 @@ export interface GenerateScheduleResult {
 export async function generateScheduleFromEstimate(input: {
     estimateId: string;
     mode?: "merge" | "regenerate";
+    requireEmptyProject?: boolean;
     actor: ScheduleActor;
 }): Promise<GenerateScheduleResult> {
     const mode = input.mode ?? "merge";
@@ -727,6 +931,20 @@ export async function generateScheduleFromEstimate(input: {
         if (!project) throw new Error("Project not found");
         if (!project.startDate) {
             throw new Error(`Project "${project.name}" has no start date yet — set one on the company dashboard before generating its schedule.`);
+        }
+
+        // Automatic paths (approveEstimate hook, setProjectStartDate hook,
+        // dashboard button) pass requireEmptyProject: generation only fires on
+        // a zero-task schedule, enforced HERE under the Project lock so a
+        // concurrent manual task can't stack a generated schedule on top
+        // (P2's merge mode alone only skips already-linked estimate items).
+        if (input.requireEmptyProject) {
+            const existingTaskCount = await tx.scheduleTask.count({ where: { projectId } });
+            if (existingTaskCount > 0) {
+                throw new ScheduleGenerationPreconditionError(
+                    `Project "${project.name}" already has ${existingTaskCount} schedule task${existingTaskCount === 1 ? "" : "s"} — automatic generation only runs on an empty schedule.`
+                );
+            }
         }
 
         // Full estimate read INSIDE the lock.
@@ -1162,14 +1380,18 @@ export async function setProjectCrew(input: {
         const byId = new Map(users.map(u => [u.id, u]));
         const missing = wanted.filter(id => !byId.has(id));
         if (missing.length > 0) throw new Error(`Unknown user id(s): ${missing.join(", ")}`);
-        const notActivated = users.filter(u => u.status !== "ACTIVATED");
-        if (notActivated.length > 0) {
-            throw new Error(`Crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
-        }
 
         const current = project.crew.map(u => u.id);
         const toConnect = wanted.filter(id => !current.includes(id));
         const toDisconnect = current.filter(id => !wanted.includes(id));
+
+        // ACTIVATED is required only for users being ADDED — a project already
+        // carrying a legacy inactive/finance crew member (kept or removed) must
+        // never throw; only a NEW non-ACTIVATED addition is rejected.
+        const notActivated = toConnect.map(id => byId.get(id)!).filter(u => u.status !== "ACTIVATED");
+        if (notActivated.length > 0) {
+            throw new Error(`Crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
+        }
         await tx.project.update({
             where: { id: input.projectId },
             data: {
@@ -1205,6 +1427,9 @@ export interface CrewConflictPair {
     projectB: { id: string; name: string };
     overlapStart: string;
     overlapEnd: string;
+    // Present for TaskAssignment-window conflicts (v2 precision).
+    taskA?: { id: string; name: string; startDate: string; endDate: string };
+    taskB?: { id: string; name: string; startDate: string; endDate: string };
 }
 
 export interface CrewConflict {
@@ -1214,30 +1439,107 @@ export interface CrewConflict {
 }
 
 /**
- * Crew double-bookings within [from, to): a conflict = one user in the crew of
- * two different projects whose windows overlap within the range. Window =
- * startDate → (endDate ?? latest task endDate ?? startDate + 1 day) — the
- * 1-day fallback means two crews booked on the same day DO conflict; overlaps
- * use half-open [start, end) bounds. Bounded queries; overlap computed in
- * memory. (TaskAssignment-level precision is Phase 3.)
+ * Crew double-bookings within [from, to), v2 (PB-pipeline-003):
+ *  1. TaskAssignment windows — a user assigned to tasks on DIFFERENT projects
+ *     whose [start, end) windows overlap within the range → pairs with task
+ *     names + dates.
+ *  2. Per-(userId, projectId) project-window fallback (R1 fix 6): only
+ *     user–project pairs with NO task assignments in range use the P2
+ *     project-window rule, so task coverage on project A never suppresses
+ *     fallback coverage on project B. Windows: startDate → effectiveWorkEnd
+ *     (startDate+1d remains only the duration fallback for empty projects).
+ * Union of both, deduped per project pair (task-based entries win).
  */
 export async function getCrewConflicts(from: Date, to: Date): Promise<CrewConflict[]> {
-    const projects = await prisma.project.findMany({
-        where: { startDate: { not: null }, crew: { some: {} } },
-        select: {
-            id: true, name: true, startDate: true, endDate: true,
-            crew: { select: { id: true, name: true, email: true } },
-            scheduleTasks: { orderBy: { endDate: "desc" }, take: 1, select: { endDate: true } },
-        },
-    });
+    const [assignments, projects] = await Promise.all([
+        prisma.taskAssignment.findMany({
+            where: { task: { projectId: { not: null }, startDate: { lt: to }, endDate: { gt: from } } },
+            select: {
+                userId: true,
+                user: { select: { id: true, name: true, email: true } },
+                task: {
+                    select: {
+                        id: true, name: true, startDate: true, endDate: true, projectId: true,
+                        project: { select: { id: true, name: true } },
+                    },
+                },
+            },
+        }),
+        prisma.project.findMany({
+            where: { startDate: { not: null }, crew: { some: {} } },
+            select: {
+                id: true, name: true, startDate: true, endDate: true,
+                crew: { select: { id: true, name: true, email: true } },
+                scheduleTasks: { where: { type: { not: "milestone" } }, orderBy: { endDate: "desc" }, take: 1, select: { endDate: true } },
+            },
+        }),
+    ]);
 
-    const windows = projects.map(p => {
+    // Half-open [start, end) overlap, intersected with the visible range.
+    const overlaps = (aS: Date, aE: Date, bS: Date, bE: Date): [Date, Date] | null => {
+        const s = aS > bS ? aS : bS;
+        const e = aE < bE ? aE : bE;
+        if (s >= e) return null;
+        if (e <= from || s >= to) return null;
+        return [s, e];
+    };
+
+    const byUser = new Map<string, CrewConflict>();
+    const pushPair = (userId: string, name: string, pair: CrewConflictPair, taskBased: boolean) => {
+        let entry = byUser.get(userId);
+        if (!entry) {
+            entry = { userId, name, pairs: [] };
+            byUser.set(userId, entry);
+        }
+        const key = [pair.projectA.id, pair.projectB.id].sort().join("|");
+        const existingIdx = entry.pairs.findIndex(p => [p.projectA.id, p.projectB.id].sort().join("|") === key);
+        if (existingIdx >= 0) {
+            // Task-based precision wins over the fallback for the same pair.
+            if (taskBased && !entry.pairs[existingIdx].taskA && !entry.pairs[existingIdx].taskB) entry.pairs[existingIdx] = pair;
+        } else {
+            entry.pairs.push(pair);
+        }
+    };
+
+    // (1) TaskAssignment windows.
+    type UserWindow = {
+        projectId: string;
+        projectName: string;
+        start: Date;
+        end: Date;
+        task?: { id: string; name: string; startDate: string; endDate: string };
+    };
+    const windowsByUser = new Map<string, { name: string; windows: UserWindow[] }>();
+    const addWindow = (userId: string, name: string, window: UserWindow) => {
+        let entry = windowsByUser.get(userId);
+        if (!entry) {
+            entry = { name, windows: [] };
+            windowsByUser.set(userId, entry);
+        }
+        entry.windows.push(window);
+    };
+    const assignedUserProjects = new Set<string>(); // "userId|projectId" with ≥1 assignment in range
+    for (const a of assignments) {
+        const projectId = a.task.projectId!;
+        assignedUserProjects.add(`${a.userId}|${projectId}`);
+        addWindow(a.userId, a.user.name || a.user.email, {
+            projectId,
+            projectName: a.task.project?.name ?? "",
+            start: a.task.startDate,
+            end: a.task.endDate,
+            task: {
+                id: a.task.id,
+                name: a.task.name,
+                startDate: a.task.startDate.toISOString(),
+                endDate: a.task.endDate.toISOString(),
+            },
+        });
+    }
+
+    // (2) Project-window fallback per (userId, projectId).
+    const fallbackWindows = projects.map(p => {
         const start = utcDay(p.startDate!);
-        const rawEnd = p.endDate
-            ? utcDay(p.endDate)
-            : p.scheduleTasks[0]
-                ? utcDay(p.scheduleTasks[0].endDate)
-                : addDays(start, 1);
+        const rawEnd = effectiveWorkEnd(p, p.scheduleTasks[0]?.endDate ?? null);
         return {
             id: p.id,
             name: p.name,
@@ -1246,41 +1548,39 @@ export async function getCrewConflicts(from: Date, to: Date): Promise<CrewConfli
             crew: p.crew,
         };
     });
-
-    // Group windows by crew user, then check each pair of that user's projects.
-    const byUser = new Map<string, { name: string; windows: typeof windows }>();
-    for (const w of windows) {
+    for (const w of fallbackWindows) {
         for (const u of w.crew) {
-            const entry = byUser.get(u.id) ?? { name: u.name || u.email, windows: [] };
-            entry.windows.push(w);
-            byUser.set(u.id, entry);
+            if (assignedUserProjects.has(`${u.id}|${w.id}`)) continue; // task windows cover this pair
+            addWindow(u.id, u.name || u.email, {
+                projectId: w.id,
+                projectName: w.name,
+                start: w.start,
+                end: w.end,
+            });
         }
     }
-
-    const conflicts: CrewConflict[] = [];
-    for (const [userId, { name, windows: userWindows }] of byUser) {
-        if (userWindows.length < 2) continue;
-        const pairs: CrewConflictPair[] = [];
+    // Compare the complete per-user union so task A is tested against fallback B.
+    for (const [userId, { name, windows: userWindows }] of windowsByUser) {
         for (let i = 0; i < userWindows.length; i++) {
             for (let j = i + 1; j < userWindows.length; j++) {
                 const a = userWindows[i];
                 const b = userWindows[j];
-                const oStart = a.start > b.start ? a.start : b.start;
-                const oEnd = a.end < b.end ? a.end : b.end;
-                if (oStart >= oEnd) continue; // half-open: no overlap
-                // The overlap must intersect the visible range.
-                if (oEnd <= from || oStart >= to) continue;
-                pairs.push({
-                    projectA: { id: a.id, name: a.name },
-                    projectB: { id: b.id, name: b.name },
-                    overlapStart: oStart.toISOString(),
-                    overlapEnd: oEnd.toISOString(),
-                });
+                if (a.projectId === b.projectId) continue;
+                const o = overlaps(a.start, a.end, b.start, b.end);
+                if (!o) continue;
+                pushPair(userId, name, {
+                    projectA: { id: a.projectId, name: a.projectName },
+                    projectB: { id: b.projectId, name: b.projectName },
+                    overlapStart: o[0].toISOString(),
+                    overlapEnd: o[1].toISOString(),
+                    taskA: a.task,
+                    taskB: b.task,
+                }, !!a.task || !!b.task);
             }
         }
-        if (pairs.length > 0) conflicts.push({ userId, name, pairs });
     }
-    return conflicts;
+
+    return [...byUser.values()];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1300,6 +1600,7 @@ export interface OverlayIncomeItem {
     invoiceCode: string;
     projectId: string | null;
     projectName: string | null;
+    scheduleTaskId: string | null;
     anchoredToTask: boolean;
     inQuickBooks: boolean;
 }
@@ -1323,10 +1624,105 @@ export interface OverlayHoursItem {
     durationHours: number;
 }
 
+export interface OverlayChangeOrderItem {
+    paymentScheduleId: string;
+    changeOrderId: string;
+    code: string;
+    title: string;
+    name: string;
+    amount: number;
+    // Per-row effectiveDueDate (dueDate ?? linkedTask.startDate), or — for a
+    // zero-payment-row CO — the synthesized milestone task's date.
+    effectiveDueDate: string;
+    projectId: string | null;
+    projectName: string | null;
+    // Always true here: billed COs are EXCLUDED (their invoice clones flow
+    // through the existing PaymentSchedule income queries — no double counting).
+    projected: true;
+}
+
 export interface CalendarOverlays {
     income: OverlayIncomeItem[];
     expenses: OverlayExpenseItem[];
     hours: OverlayHoursItem[];
+    changeOrders: OverlayChangeOrderItem[];
+}
+
+/**
+ * Approved-but-unbilled change-order money as projected income (PB-pipeline-003):
+ * each ChangeOrderPaymentSchedule row at its effectiveDueDate, or — for a CO
+ * with ZERO payment rows — the CO's signedAmount (totalAmount + tax via
+ * co-tax.ts) at the synthesized milestone task's date. Billed COs (detected by
+ * the billing-core name-prefix convention) are excluded so the same money
+ * never appears twice.
+ */
+export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<OverlayChangeOrderItem[]> {
+    const cos = await prisma.changeOrder.findMany({
+        where: { status: "Approved" },
+        select: {
+            id: true, code: true, title: true, totalAmount: true, projectId: true,
+            estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
+            project: { select: { id: true, name: true } },
+            paymentSchedules: {
+                orderBy: [{ order: "asc" }, { id: "asc" }],
+                select: { id: true, name: true, amount: true, dueDate: true, scheduleTaskId: true },
+            },
+            generatedScheduleTasks: { where: { type: "milestone" }, orderBy: [{ order: "asc" }, { id: "asc" }], select: { id: true, startDate: true } },
+        },
+    });
+    if (cos.length === 0) return [];
+
+    // Billed detection: a milestone named `${code} — …` on the CO's project
+    // (billing-core convention), same as billChangeOrderCore's idempotency check.
+    const projectIds = [...new Set(cos.map(c => c.projectId))];
+    const billedMilestones = await prisma.paymentSchedule.findMany({
+        where: { invoice: { projectId: { in: projectIds } }, name: { startsWith: "CO-" }, status: { not: "Canceled" } },
+        select: { name: true, invoice: { select: { projectId: true } } },
+    });
+    // Billing idempotency is scoped to the project; CO codes are not globally unique.
+    const isBilled = (projectId: string, code: string) => billedMilestones.some(
+        m => m.invoice.projectId === projectId && m.name.startsWith(`${code} `),
+    );
+    const rows: OverlayChangeOrderItem[] = [];
+    for (const co of cos) {
+        if (isBilled(co.projectId, co.code)) continue;
+        const taskStartById = new Map(co.generatedScheduleTasks.map(t => [t.id, t.startDate]));
+        if (co.paymentSchedules.length > 0) {
+            for (const row of co.paymentSchedules) {
+                const effective = row.dueDate ?? (row.scheduleTaskId ? taskStartById.get(row.scheduleTaskId) : undefined) ?? null;
+                if (!effective || effective < from || effective >= to) continue;
+                rows.push({
+                    paymentScheduleId: row.id,
+                    changeOrderId: co.id,
+                    code: co.code,
+                    title: co.title,
+                    name: row.name,
+                    amount: Number(row.amount),
+                    effectiveDueDate: effective.toISOString(),
+                    projectId: co.project?.id ?? null,
+                    projectName: co.project?.name ?? null,
+                    projected: true,
+                });
+            }
+        } else {
+            const signedAmount = coSignedAmount(Number(co.totalAmount), co.estimate);
+            const synthDate = co.generatedScheduleTasks[0]?.startDate ?? null;
+            if (!synthDate || synthDate < from || synthDate >= to) continue;
+            rows.push({
+                paymentScheduleId: `synthetic:${co.id}`,
+                changeOrderId: co.id,
+                code: co.code,
+                title: co.title,
+                name: `${co.code} payment`,
+                amount: signedAmount,
+                effectiveDueDate: synthDate.toISOString(),
+                projectId: co.project?.id ?? null,
+                projectName: co.project?.name ?? null,
+                projected: true,
+            });
+        }
+    }
+    return rows;
 }
 
 /**
@@ -1334,8 +1730,12 @@ export interface CalendarOverlays {
  * effectiveDueDate rule), expenses (Expense.date in range, project via
  * estimate), hours (TimeEntry.startTime date in range). Read-only.
  */
-export async function getCalendarOverlays(from: Date, to: Date): Promise<CalendarOverlays> {
-    const [milestones, expenses, hours] = await Promise.all([
+export async function getCalendarOverlays(
+    from: Date,
+    to: Date,
+    suppliedChangeOrders?: OverlayChangeOrderItem[],
+): Promise<CalendarOverlays> {
+    const [milestones, expenses, hours, changeOrders] = await Promise.all([
         prisma.paymentSchedule.findMany({
             where: {
                 status: "Pending",
@@ -1368,6 +1768,7 @@ export async function getCalendarOverlays(from: Date, to: Date): Promise<Calenda
                 project: { select: { id: true, name: true } },
             },
         }),
+        suppliedChangeOrders ?? getChangeOrderOverlayRows(from, to),
     ]);
 
     return {
@@ -1383,6 +1784,7 @@ export async function getCalendarOverlays(from: Date, to: Date): Promise<Calenda
                 invoiceCode: m.invoice.code,
                 projectId: m.invoice.project?.id ?? null,
                 projectName: m.invoice.project?.name ?? null,
+                scheduleTaskId: m.scheduleTaskId,
                 anchoredToTask: !!m.scheduleTaskId,
                 inQuickBooks: !!m.qbInvoiceId,
             };
@@ -1404,6 +1806,7 @@ export async function getCalendarOverlays(from: Date, to: Date): Promise<Calenda
             startTime: h.startTime.toISOString(),
             durationHours: h.durationHours ?? 0,
         })),
+        changeOrders,
     };
 }
 
@@ -1411,9 +1814,63 @@ export async function getCalendarOverlays(from: Date, to: Date): Promise<Calenda
 // Dashboard page assembly (PB-pipeline-002, R1 fix 10 — directly testable)
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface UnappliedChangeOrderSummary {
+    count: number;
+    items: { id: string; code: string }[];
+}
+
+export async function getUnappliedChangeOrders(
+    projectIds: string[],
+): Promise<Record<string, UnappliedChangeOrderSummary>> {
+    if (projectIds.length === 0) return {};
+    const rows = await prisma.changeOrder.findMany({
+        where: {
+            projectId: { in: projectIds },
+            status: "Approved",
+            generatedScheduleTasks: { none: {} },
+        },
+        orderBy: [{ approvedAt: "asc" }, { id: "asc" }],
+        select: { id: true, code: true, projectId: true },
+    });
+    const result: Record<string, UnappliedChangeOrderSummary> = {};
+    for (const row of rows) {
+        const summary = result[row.projectId] ?? { count: 0, items: [] };
+        summary.count++;
+        summary.items.push({ id: row.id, code: row.code });
+        result[row.projectId] = summary;
+    }
+    return result;
+}
+
+export interface DashboardTaskAssignment {
+    id: string;
+    userId: string;
+    name: string;
+    status: string;
+    role: string;
+}
+
+export interface DashboardTaskRow {
+    id: string;
+    name: string;
+    startDate: string;
+    endDate: string;
+    color: string | null;
+    parentId: string | null;
+    progress: number;
+    status: string;
+    type: string;
+    assignments: DashboardTaskAssignment[];
+}
+
 export interface DashboardProjectRow extends PipelineProject {
     taskCount: number;
     hasQualifyingEstimate: boolean;
+    // Approved COs with no provenance tasks yet (the "Apply CO" affordance).
+    unappliedChangeOrders: { count: number; items: { id: string; code: string }[] };
+    // Expandable task list with per-task crew (assignments carry user status so
+    // the picker can render inactive-removable entries).
+    tasks: DashboardTaskRow[];
 }
 
 export interface ProjectMonthStripRow {
@@ -1426,6 +1883,9 @@ export interface ProjectMonthStripRow {
     hoursActual: number;
     hoursEstimated: number;
     net: number;
+    // Approved-unbilled CO money projected in range (billed COs flow through
+    // incomeDue via their PaymentSchedule clones — no double counting).
+    coProjected: number;
 }
 
 export interface CompanyDashboardData {
@@ -1433,12 +1893,17 @@ export interface CompanyDashboardData {
     role: string;
     canEdit: boolean;
     isAdmin: boolean;
+    // Pipeline money (contractValue, targetRevenue, latestEstimateTotal) is
+    // serialized only for holders of financialReports; schedules-only viewers
+    // (FIELD_CREW/EMPLOYEE read-only board) get nulls — redaction happens at
+    // serialization, matching the overlays/cashflow/strip rule.
+    canSeeFinancials: boolean;
     pipeline: {
         estimating: CompanyPipeline["estimating"];
         waitingToStart: DashboardProjectRow[];
         scheduled: DashboardProjectRow[];
         inProgress: DashboardProjectRow[];
-        substantialCompletion: CompanyPipeline["substantialCompletion"];
+        substantialCompletion: DashboardProjectRow[];
     };
     calendar: StartCalendar;
     cashflow: CashflowOutlook | null;
@@ -1456,8 +1921,9 @@ export interface CompanyDashboardData {
  *   Labor (actual, burdened) = laborCost + burdenCost sums
  *   Hours      = actual TimeEntry hours vs estimatedHours of month-overlapping tasks
  *   Net        = Received − Expenses − burdened Labor (profitability convention)
+ *   CO (projected) = Approved-unbilled CO money in range (billed flows via incomeDue)
  */
-async function getProjectMonthStrip(from: Date, to: Date): Promise<ProjectMonthStripRow[]> {
+async function getProjectMonthStrip(from: Date, to: Date, coRows: OverlayChangeOrderItem[]): Promise<ProjectMonthStripRow[]> {
     const openProjects = await prisma.project.findMany({
         where: { status: { in: OPEN_PROJECT_STATUSES } },
         select: { id: true, name: true },
@@ -1509,6 +1975,7 @@ async function getProjectMonthStrip(from: Date, to: Date): Promise<ProjectMonthS
                 projectName: nameOf.get(projectId) ?? "Unknown",
                 incomeDue: 0, received: 0, expenses: 0,
                 laborBurdened: 0, hoursActual: 0, hoursEstimated: 0, net: 0,
+                coProjected: 0,
             };
             sums.set(projectId, r);
         }
@@ -1542,6 +2009,10 @@ async function getProjectMonthStrip(from: Date, to: Date): Promise<ProjectMonthS
         if (!t.projectId || !nameOf.has(t.projectId)) continue;
         row(t.projectId).hoursEstimated += t.estimatedHours ?? 0;
     }
+    for (const c of coRows) {
+        if (!c.projectId || !nameOf.has(c.projectId)) continue;
+        row(c.projectId).coProjected += c.amount;
+    }
 
     const round2 = (n: number) => Math.round(n * 100) / 100;
     return [...sums.values()]
@@ -1554,8 +2025,9 @@ async function getProjectMonthStrip(from: Date, to: Date): Promise<ProjectMonthS
             hoursActual: round2(r.hoursActual),
             hoursEstimated: round2(r.hoursEstimated),
             net: round2(r.received - r.expenses - r.laborBurdened),
+            coProjected: round2(r.coProjected),
         }))
-        .filter(r => r.incomeDue !== 0 || r.received !== 0 || r.expenses !== 0 || r.laborBurdened !== 0 || r.hoursActual !== 0 || r.hoursEstimated !== 0)
+        .filter(r => r.incomeDue !== 0 || r.received !== 0 || r.expenses !== 0 || r.laborBurdened !== 0 || r.hoursActual !== 0 || r.hoursEstimated !== 0 || r.coProjected !== 0)
         .sort((a, b) => a.projectName.localeCompare(b.projectName));
 }
 
@@ -1567,18 +2039,25 @@ async function getProjectMonthStrip(from: Date, to: Date): Promise<ProjectMonthS
  * `month` must be a validated "YYYY-MM" string (the page validates).
  */
 export async function getCompanyDashboardData(
-    userLike: { role: string },
+    userLike: { role: string; canSeeFinancials?: boolean },
     month: string,
 ): Promise<CompanyDashboardData> {
     const role = userLike.role;
     const isAdmin = role === "ADMIN";
     const canEdit = role === "ADMIN" || role === "MANAGER";
+    // Explicit flag wins (the page computes hasPermission(user, "financialReports")
+    // so per-user overrides are honored); the role fallback mirrors the default
+    // permission matrix for callers that don't pass it.
+    const canSeeFinancials = userLike.canSeeFinancials ?? !["FIELD_CREW", "EMPLOYEE"].includes(role);
 
     // Same 42-day grid as the calendar; `to` exclusive (getStartCalendar rule).
     const grid = getMonthGrid(parseUTCDate(`${month}-01`));
     const from = grid[0];
     const to = new Date(grid[grid.length - 1].getTime() + 86_400_000);
 
+    const coRowsPromise = isAdmin
+        ? getChangeOrderOverlayRows(from, to)
+        : Promise.resolve([] as OverlayChangeOrderItem[]);
     const [pipeline, calendar, cashflow, crewConflicts, overlays, strip] = await Promise.all([
         getCompanyPipeline(),
         // The income layer comes from overlays (effectiveDueDate) for ADMIN, so
@@ -1586,8 +2065,8 @@ export async function getCompanyDashboardData(
         getStartCalendar(from, to, { includeFinancials: false }),
         isAdmin ? getCashflowOutlook() : Promise.resolve(null),
         canEdit ? getCrewConflicts(from, to) : Promise.resolve(null),
-        isAdmin ? getCalendarOverlays(from, to) : Promise.resolve(null),
-        isAdmin ? getProjectMonthStrip(from, to) : Promise.resolve(null),
+        isAdmin ? coRowsPromise.then(rows => getCalendarOverlays(from, to, rows)) : Promise.resolve(null),
+        isAdmin ? coRowsPromise.then(rows => getProjectMonthStrip(from, to, rows)) : Promise.resolve(null),
     ]);
 
     // Button data for "Generate schedule": Waiting/Scheduled rows show it only
@@ -1596,40 +2075,97 @@ export async function getCompanyDashboardData(
         ...pipeline.waitingToStart.map(p => p.id),
         ...pipeline.scheduled.map(p => p.id),
         ...pipeline.inProgress.map(p => p.id),
+        ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskCounts, qualifying] = await Promise.all([
-        prisma.scheduleTask.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds } }, _count: { id: true } }),
+    const [taskRows, qualifying, unappliedByProject] = await Promise.all([
+        prisma.scheduleTask.findMany({
+            where: { projectId: { in: rowIds } },
+            orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
+            select: {
+                id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
+                assignments: {
+                    orderBy: { createdAt: "asc" },
+                    select: { id: true, userId: true, user: { select: { name: true, email: true, status: true, role: true } } },
+                },
+            },
+        }),
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
+        getUnappliedChangeOrders(rowIds),
     ]);
-    const taskCountOf = new Map(taskCounts.map(t => [t.projectId, t._count.id]));
+    const tasksByProject = new Map<string, DashboardTaskRow[]>();
+    for (const task of taskRows) {
+        if (!task.projectId) continue;
+        const rows = tasksByProject.get(task.projectId) ?? [];
+        rows.push({
+            id: task.id,
+            name: task.name,
+            startDate: task.startDate.toISOString(),
+            endDate: task.endDate.toISOString(),
+            color: task.color,
+            parentId: task.parentId,
+            progress: task.progress,
+            status: task.status,
+            type: task.type,
+            assignments: task.assignments.map(a => ({
+                id: a.id,
+                userId: a.userId,
+                name: a.user.name || a.user.email,
+                status: a.user.status,
+                role: a.user.role,
+            })),
+        });
+        tasksByProject.set(task.projectId, rows);
+    }
     const hasQualifying = new Set(qualifying.map(q => q.projectId));
     const enrich = (p: PipelineProject): DashboardProjectRow => ({
         ...p,
-        taskCount: taskCountOf.get(p.id) ?? 0,
+        taskCount: tasksByProject.get(p.id)?.length ?? 0,
         hasQualifyingEstimate: hasQualifying.has(p.id),
+        tasks: tasksByProject.get(p.id) ?? [],
+        unappliedChangeOrders: unappliedByProject[p.id] ?? { count: 0, items: [] },
     });
 
-    // Picker list is pre-filtered to ACTIVATED (getTeamMembers stays unchanged
-    // for other callers) and only sent to roles that can edit.
-    const teamMembers = canEdit
-        ? (await prisma.user.findMany({
-            where: { status: "ACTIVATED" },
+    // Picker list is pre-filtered to ACTIVATED, non-FINANCE (getTeamMembers
+    // stays unchanged for other callers) and only sent to roles that can edit
+    // — bookkeeper accounts must never be offered as job crew. Display names
+    // that collide (e.g. two "Justin Adkins" accounts) get their email
+    // appended so the picker stays unambiguous.
+    const teamMembersRaw = canEdit
+        ? await prisma.user.findMany({
+            where: { status: "ACTIVATED", role: { not: "FINANCE" } },
             orderBy: { name: "asc" },
             select: { id: true, name: true, email: true },
-        })).map(u => ({ id: u.id, name: u.name || u.email, email: u.email }))
+        })
+        : [];
+    const teamMembers = canEdit
+        ? (() => {
+            const rows = teamMembersRaw.map(u => ({ id: u.id, name: u.name || u.email, email: u.email }));
+            const nameCounts = new Map<string, number>();
+            for (const r of rows) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1);
+            return rows.map(r => (nameCounts.get(r.name)! > 1 ? { ...r, name: `${r.name} (${r.email})` } : r));
+        })()
         : null;
+
+    // Money redaction for schedules-only viewers: null out pipeline dollar
+    // fields at serialization (the UI renders "—" for null). Task/crew/date
+    // data stays intact — that's what the read-only board needs.
+    const redactProject = (p: DashboardProjectRow): DashboardProjectRow =>
+        canSeeFinancials ? p : { ...p, contractValue: null };
+    const redactLead = (l: CompanyPipeline["estimating"][number]): CompanyPipeline["estimating"][number] =>
+        canSeeFinancials ? l : { ...l, targetRevenue: null, latestEstimateTotal: null };
 
     return {
         month,
         role,
         canEdit,
         isAdmin,
+        canSeeFinancials,
         pipeline: {
-            estimating: pipeline.estimating,
-            waitingToStart: pipeline.waitingToStart.map(enrich),
-            scheduled: pipeline.scheduled.map(enrich),
-            inProgress: pipeline.inProgress.map(enrich),
-            substantialCompletion: pipeline.substantialCompletion,
+            estimating: pipeline.estimating.map(redactLead),
+            waitingToStart: pipeline.waitingToStart.map(enrich).map(redactProject),
+            scheduled: pipeline.scheduled.map(enrich).map(redactProject),
+            inProgress: pipeline.inProgress.map(enrich).map(redactProject),
+            substantialCompletion: pipeline.substantialCompletion.map(enrich).map(redactProject),
         },
         calendar,
         cashflow,
@@ -1638,4 +2174,630 @@ export async function getCompanyDashboardData(
         overlays,
         strip,
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Workstream A hook — auto-generate on estimate signature (PB-pipeline-003)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Best-effort post-approval schedule generation. Fires only when the estimate
+ * belongs to a project WITH a start date (the setProjectStartDate hook covers
+ * the "sign first, date later" loop); the generator's requireEmptyProject
+ * enforcement decides inside its own locked tx. NEVER throws: the zero-task
+ * precondition is an expected quiet skip, and any real failure is logged
+ * (console + ActivityLog where possible) — approval can never roll back.
+ */
+export async function autoGenerateScheduleForApprovedEstimate(
+    estimateId: string,
+): Promise<{ generated: boolean; note: string | null }> {
+    let estimate: { id: string; code: string; projectId: string | null; project: { startDate: Date | null } | null } | null = null;
+    try {
+        estimate = await prisma.estimate.findUnique({
+            where: { id: estimateId },
+            select: { id: true, code: true, projectId: true, project: { select: { startDate: true } } },
+        });
+        if (!estimate?.projectId || !estimate.project?.startDate) return { generated: false, note: null };
+        const result = await generateScheduleFromEstimate({
+            estimateId,
+            mode: "merge",
+            requireEmptyProject: true,
+            actor: { type: "SYSTEM", name: "system" },
+        });
+        return { generated: result.created.length > 0, note: null };
+    } catch (e: any) {
+        if (e instanceof ScheduleGenerationPreconditionError) {
+            // Manual tasks already exist — the auto path simply doesn't fire.
+            return { generated: false, note: null };
+        }
+        console.error("[autoGenerateScheduleForApprovedEstimate] generation failed (approval unaffected):", e?.message ?? e);
+        try {
+            if (!estimate?.projectId) return { generated: false, note: String(e?.message ?? e) };
+            await prisma.activityLog.create({
+                data: {
+                    projectId: estimate.projectId,
+                    actorType: "SYSTEM",
+                    actorName: "system",
+                    action: "schedule_autogen_failed",
+                    entityType: "project",
+                    entityId: estimate.projectId,
+                    metadata: JSON.stringify({ estimateId, estimateCode: estimate.code, error: String(e?.message ?? e).slice(0, 500) }),
+                },
+            });
+        } catch { /* best-effort */ }
+        return { generated: false, note: String(e?.message ?? e) };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Workstream B — Change orders adjust the schedule + cash (PB-pipeline-003)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Thrown when a CO-application precondition fails (not Approved / no startDate).
+// The billing auto-hook skips this class quietly; anything else is an issue.
+export class CoSchedulePreconditionError extends Error {}
+
+/**
+ * One shared definition (R1 fix 3): the end of actual WORK on the project —
+ * max(Project.endDate, max(endDate of NON-milestone tasks)) ?? startDate.
+ * Payment milestone tasks never extend the work window, and an empty project
+ * falls back to startDate. Used by BOTH CO placement and the project-window
+ * conflict rule.
+ */
+function effectiveWorkEnd(
+    project: { startDate: Date | null; endDate: Date | null },
+    latestWorkEnd: Date | null,
+): Date {
+    const candidates = [project.endDate, latestWorkEnd].filter((d): d is Date => !!d);
+    if (candidates.length === 0) return utcDay(project.startDate!);
+    return utcDay(new Date(Math.max(...candidates.map(d => d.getTime()))));
+}
+
+async function computeEffectiveWorkEnd(
+    tx: Prisma.TransactionClient,
+    project: { id: string; startDate: Date | null; endDate: Date | null },
+): Promise<Date> {
+    const latestWork = await tx.scheduleTask.aggregate({
+        where: { projectId: project.id, type: { not: "milestone" } },
+        _max: { endDate: true },
+    });
+    return effectiveWorkEnd(project, latestWork._max.endDate);
+}
+
+export interface ApplyChangeOrderResult {
+    changeOrderCode: string;
+    projectId: string;
+    created: GeneratedTaskRow[];
+    skipped: number;
+    milestonesLinked: number;
+    notes: string[];
+}
+
+/**
+ * Apply an Approved change order to the project schedule: one parent task
+ * `CO-##### · title` + flat children from its items (deductions create NO task
+ * — noted for manual trimming), placed as a contiguous block starting exactly
+ * at effectiveWorkEnd (end-exclusive bounds, so no empty day). The CO window
+ * is labor-calibrated from the CO's POSITIVE labor lines vs the original
+ * estimate's burn rate (fallback: 1 day per non-negative item, packed).
+ * Milestone tasks per ChangeOrderPaymentSchedule row (canonical dueDate ??
+ * cumulative amount-share of the CO window by (order, id)); a CO with ZERO
+ * payment rows gets one synthesized `CO-##### payment` milestone at the block
+ * end projecting signedAmount (totalAmount + tax via co-tax.ts).
+ *
+ * Money-path: sets scheduleTaskId on CO payment rows AND billed clones
+ * (name-prefix match) regardless of QB state; NO amount/status/QB/dueDate
+ * writes anywhere. mode "merge" (default) skips task creation when provenance
+ * tasks exist (linking still converges); "regenerate" rebuilds only
+ * provenance-tagged subtrees passing the P2 full eligibility predicate.
+ */
+export async function applyChangeOrderToSchedule(input: {
+    changeOrderId: string;
+    mode?: "merge" | "regenerate";
+    actor: ScheduleActor;
+}): Promise<ApplyChangeOrderResult> {
+    const mode = input.mode ?? "merge";
+    if (mode !== "merge" && mode !== "regenerate") throw new Error(`Unknown mode "${mode}"`);
+
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Lock-then-read (same discipline as generation and start-date moves).
+        const coRef = await tx.changeOrder.findUnique({
+            where: { id: input.changeOrderId },
+            select: { id: true, projectId: true },
+        });
+        if (!coRef) throw new CoSchedulePreconditionError("Change order not found");
+        const projectId = coRef.projectId;
+
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const project = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { id: true, name: true, startDate: true, endDate: true },
+        });
+        if (!project) throw new CoSchedulePreconditionError("Project not found");
+        // Parent-before-child lock order: Project first, then the CO snapshot.
+        await tx.$queryRaw`SELECT id FROM "ChangeOrder" WHERE id = ${input.changeOrderId} FOR UPDATE`;
+        if (!project.startDate) {
+            throw new CoSchedulePreconditionError(`Project "${project.name}" has no start date yet — set one on the company dashboard before applying change orders to its schedule.`);
+        }
+
+        // Full CO read INSIDE the lock (items, payment rows, estimate tax + labor).
+        const co = await tx.changeOrder.findUniqueOrThrow({
+            where: { id: input.changeOrderId },
+            include: {
+                items: { orderBy: { order: "asc" }, include: { costType: { select: { name: true } } } },
+                paymentSchedules: { orderBy: [{ order: "asc" }, { id: "asc" }] },
+                estimate: {
+                    select: {
+                        id: true, taxExempt: true, taxRatePercent: true, taxRateName: true,
+                        items: { include: { costType: { select: { name: true } } } },
+                    },
+                },
+            },
+        });
+        if (co.status !== "Approved") {
+            throw new CoSchedulePreconditionError(`Change order ${co.code} is "${co.status}" — only Approved change orders adjust the schedule.`);
+        }
+
+        const notes: string[] = [];
+        const createdRows: GeneratedTaskRow[] = [];
+        let skipped = 0;
+        let milestonesLinked = 0;
+
+        // ── regenerate: delete eligible CO-provenance subtrees first ──
+        if (mode === "regenerate") {
+            // Freeze the task decision set before inspecting child counts. FK
+            // inserts cannot slip between the eligibility snapshot and delete.
+            await tx.$queryRaw`
+                SELECT id FROM "ScheduleTask"
+                WHERE "projectId" = ${projectId}
+                ORDER BY id
+                FOR UPDATE
+            `;
+            const allTasks = await tx.scheduleTask.findMany({
+                where: { projectId },
+                select: {
+                    id: true, parentId: true, generatedFromChangeOrderId: true, progress: true, status: true,
+                    _count: {
+                        select: {
+                            timeEntries: true, comments: true, punchItems: true,
+                            assignments: true, subAssignments: true,
+                            dependencies: true, dependents: true,
+                        },
+                    },
+                },
+            });
+            const byParent = new Map<string | null, typeof allTasks>();
+            for (const t of allTasks) {
+                const arr = byParent.get(t.parentId) ?? [];
+                arr.push(t);
+                byParent.set(t.parentId, arr);
+            }
+            const generatedIds = new Set(allTasks.filter(t => t.generatedFromChangeOrderId === co.id).map(t => t.id));
+            const isDeletable = (t: (typeof allTasks)[number]) =>
+                t.generatedFromChangeOrderId === co.id &&
+                t.progress === 0 &&
+                t.status === "Not Started" &&
+                t._count.timeEntries === 0 &&
+                t._count.comments === 0 &&
+                t._count.punchItems === 0 &&
+                t._count.assignments === 0 &&
+                t._count.subAssignments === 0 &&
+                t._count.dependencies === 0 &&
+                t._count.dependents === 0;
+            const roots = allTasks.filter(t => generatedIds.has(t.id) && (!t.parentId || !generatedIds.has(t.parentId)));
+            let keptSubtrees = 0;
+            for (const root of roots) {
+                const subtree: typeof allTasks = [];
+                const stack = [root];
+                while (stack.length) {
+                    const cur = stack.pop()!;
+                    subtree.push(cur);
+                    for (const child of byParent.get(cur.id) ?? []) stack.push(child);
+                }
+                if (subtree.every(isDeletable)) {
+                    await tx.scheduleTask.delete({ where: { id: root.id } });
+                } else {
+                    keptSubtrees++;
+                }
+            }
+            if (keptSubtrees > 0) {
+                notes.push(`Kept ${keptSubtrees} generated CO subtree${keptSubtrees === 1 ? "" : "s"} untouched — work was logged or edits made.`);
+            }
+        }
+
+        const start = utcDay(project.startDate);
+        const workEnd = await computeEffectiveWorkEnd(tx, project);
+        const coWindowStart = workEnd;
+
+        // Milestone task lookup used for linking — by CO payment row id, plus
+        // the ordered list of CO milestone tasks (for billed-clone linking).
+        const milestoneTaskIdByRowId = new Map<string, string>();
+        const milestoneTaskIds: string[] = [];
+        let coWindowDays = 0;
+
+        const maxOrder = await tx.scheduleTask.aggregate({ where: { projectId }, _max: { order: true } });
+        let nextOrder = (maxOrder._max.order ?? -1) + 1;
+        const createTask = async (data: {
+            name: string; startDate: Date; endDate: Date; color: string; order: number;
+            type: string; parentId: string | null;
+        }) => {
+            const row = await tx.scheduleTask.create({
+                data: {
+                    projectId,
+                    status: "Not Started",
+                    progress: 0,
+                    generatedFromChangeOrderId: co.id,
+                    estimatedHours: null,
+                    estimateItemId: null,
+                    ...data,
+                },
+            });
+            createdRows.push({
+                id: row.id,
+                name: row.name,
+                startDate: row.startDate.toISOString(),
+                endDate: row.endDate.toISOString(),
+                type: row.type,
+                color: row.color,
+                order: row.order,
+                status: row.status,
+                progress: row.progress,
+                estimatedHours: row.estimatedHours,
+                estimateItemId: row.estimateItemId,
+                parentId: row.parentId,
+            });
+            return row;
+        };
+
+        const items = co.items.map(i => ({
+            id: i.id, name: i.name, type: i.type, total: Number(i.total), costTypeName: i.costType?.name ?? null,
+        }));
+        const taskItems = items.filter(i => i.total >= 0);
+        const estimateWindowEnd = project.endDate ? utcDay(project.endDate) : addDays(start, 42);
+        const estimateWindowDays = Math.max(1, Math.round((estimateWindowEnd.getTime() - start.getTime()) / 86_400_000));
+        const estimateLaborDollars = co.estimate.items.reduce((sum, item) => {
+            const labor = (item.costType?.name ?? item.type ?? "").toLowerCase() === "labor";
+            const total = Number(item.total);
+            return sum + (labor && total > 0 ? total : 0);
+        }, 0);
+        const coLaborDollars = items.reduce((sum, item) => {
+            const labor = (item.costTypeName ?? item.type ?? "").toLowerCase() === "labor";
+            return sum + (labor && item.total > 0 ? item.total : 0);
+        }, 0);
+        const burnRate = estimateLaborDollars > 0 ? estimateLaborDollars / estimateWindowDays : 0;
+        const laborDays = burnRate > 0 && coLaborDollars > 0 ? Math.max(1, Math.round(coLaborDollars / burnRate)) : 0;
+        const calculatedWindowDays = Math.max(1, laborDays || taskItems.length);
+
+        const provenanceCount = await tx.scheduleTask.count({ where: { generatedFromChangeOrderId: co.id } });
+
+        if (provenanceCount > 0) {
+            skipped++;
+            notes.push(`${co.code} is already on the schedule — existing protected/provenance tasks were preserved.`);
+            let existingParent = await tx.scheduleTask.findFirst({
+                where: { generatedFromChangeOrderId: co.id, type: { not: "milestone" }, parentId: null },
+                orderBy: [{ order: "asc" }, { id: "asc" }],
+                select: { id: true, startDate: true, endDate: true },
+            });
+            if (!existingParent && mode === "regenerate") {
+                coWindowDays = calculatedWindowDays;
+                existingParent = await createTask({
+                    name: `${co.code} · ${co.title}`,
+                    startDate: coWindowStart,
+                    endDate: addDays(coWindowStart, coWindowDays),
+                    color: "#8b5cf6",
+                    order: nextOrder++,
+                    type: "task",
+                    parentId: null,
+                });
+                const n = taskItems.length;
+                for (let k = 0; k < n; k++) {
+                    const childStart = addDays(coWindowStart, Math.floor((k * coWindowDays) / n));
+                    const proportionalEnd = addDays(coWindowStart, Math.floor(((k + 1) * coWindowDays) / n));
+                    await createTask({
+                        name: taskItems[k].name,
+                        startDate: childStart,
+                        endDate: proportionalEnd > childStart ? proportionalEnd : addDays(childStart, 1),
+                        color: "#8b5cf6",
+                        order: nextOrder++,
+                        type: "task",
+                        parentId: existingParent.id,
+                    });
+                }
+                for (const item of items.filter(item => item.total < 0)) {
+                    notes.push(`Deduction "${item.name}" reduces scope — no task created; trim existing tasks manually if needed.`);
+                }
+            }
+            const milestoneBase = existingParent?.startDate ?? coWindowStart;
+            coWindowDays = existingParent
+                ? Math.max(1, Math.round((existingParent.endDate.getTime() - existingParent.startDate.getTime()) / 86_400_000))
+                : calculatedWindowDays;
+            const existingMilestones = await tx.scheduleTask.findMany({
+                where: { generatedFromChangeOrderId: co.id, type: "milestone" },
+                orderBy: [{ order: "asc" }, { id: "asc" }],
+                select: { id: true },
+            });
+            const existingIds = new Set(existingMilestones.map(task => task.id));
+            const usedIds = new Set<string>();
+            for (const row of co.paymentSchedules) {
+                if (row.scheduleTaskId && existingIds.has(row.scheduleTaskId)) {
+                    milestoneTaskIdByRowId.set(row.id, row.scheduleTaskId);
+                    usedIds.add(row.scheduleTaskId);
+                }
+            }
+            const available = existingMilestones.filter(task => !usedIds.has(task.id));
+            for (const row of co.paymentSchedules) {
+                if (milestoneTaskIdByRowId.has(row.id)) continue;
+                const task = available.shift();
+                if (task) milestoneTaskIdByRowId.set(row.id, task.id);
+            }
+            if (mode === "regenerate") {
+                const totalRowsAmount = co.paymentSchedules.reduce((sum, row) => sum + Number(row.amount), 0);
+                let cumulative = 0;
+                for (const row of co.paymentSchedules) {
+                    cumulative += Number(row.amount);
+                    if (milestoneTaskIdByRowId.has(row.id)) continue;
+                    const derived = totalRowsAmount > 0
+                        ? addDays(milestoneBase, Math.round((Math.min(cumulative, totalRowsAmount) / totalRowsAmount) * coWindowDays))
+                        : addDays(milestoneBase, coWindowDays);
+                    const canonical = row.dueDate ? utcDay(row.dueDate) : derived;
+                    const task = await createTask({
+                        name: row.name,
+                        startDate: canonical,
+                        endDate: addDays(canonical, 1),
+                        color: "#f59e0b",
+                        order: nextOrder++,
+                        type: "milestone",
+                        parentId: null,
+                    });
+                    milestoneTaskIdByRowId.set(row.id, task.id);
+                }
+                if (co.paymentSchedules.length === 0 && existingMilestones.length === 0) {
+                    const blockEnd = addDays(milestoneBase, coWindowDays);
+                    const task = await createTask({
+                        name: `${co.code} payment`,
+                        startDate: blockEnd,
+                        endDate: addDays(blockEnd, 1),
+                        color: "#f59e0b",
+                        order: nextOrder++,
+                        type: "milestone",
+                        parentId: null,
+                    });
+                    milestoneTaskIds.push(task.id);
+                }
+            }
+            if (co.paymentSchedules.length > 0) {
+                milestoneTaskIds.push(...co.paymentSchedules.map(row => milestoneTaskIdByRowId.get(row.id)).filter((id): id is string => !!id));
+            } else if (milestoneTaskIds.length === 0) {
+                milestoneTaskIds.push(...existingMilestones.map(task => task.id));
+            }
+        } else {
+            // Deduction items create NO task — they reduce scope (Phase 4 trims;
+            // for now the PM adjusts existing tasks manually).
+            for (const i of items.filter(i => i.total < 0)) {
+                notes.push(`Deduction "${i.name}" (−$${Math.abs(i.total).toFixed(2)}) reduces scope — no task created; trim existing tasks manually if needed.`);
+                skipped++;
+            }
+
+            // Labor-calibrated CO window: the CO's POSITIVE labor dollars
+            // (negative labor lines excluded so a mixed addition/deduction CO
+            // doesn't shorten the block) vs the ORIGINAL estimate's burn rate.
+            // Fallback: 1 day per non-negative item, packed. Every child gets a
+            // 1-day minimum, so the window never shrinks below the child count.
+            coWindowDays = calculatedWindowDays;
+
+            // Parent task: the contiguous block starting exactly at
+            // effectiveWorkEnd (end-exclusive bounds — no empty day).
+            const parentTask = await createTask({
+                name: `${co.code} · ${co.title}`,
+                startDate: coWindowStart,
+                endDate: addDays(coWindowStart, coWindowDays),
+                color: "#8b5cf6",
+                order: nextOrder++,
+                type: "task",
+                parentId: null,
+            });
+
+            // Children: P2 proportional-boundary rule inside the CO window.
+            const n = taskItems.length;
+            for (let k = 0; k < n; k++) {
+                const line = taskItems[k];
+                const childStart = addDays(coWindowStart, Math.floor((k * coWindowDays) / n));
+                const proportionalEnd = addDays(coWindowStart, Math.floor(((k + 1) * coWindowDays) / n));
+                await createTask({
+                    name: line.name,
+                    startDate: childStart,
+                    endDate: proportionalEnd > childStart ? proportionalEnd : addDays(childStart, 1),
+                    color: "#8b5cf6",
+                    order: nextOrder++,
+                    type: "task",
+                    parentId: parentTask.id,
+                });
+            }
+
+            // Milestones: canonical date = dueDate if set, else cumulative
+            // amount-share of the CO window by (order, id).
+            const totalRowsAmount = co.paymentSchedules.reduce((s, r) => s + Number(r.amount), 0);
+            if (co.paymentSchedules.length > 0) {
+                let cumAmount = 0;
+                for (const row of co.paymentSchedules) {
+                    cumAmount += Number(row.amount);
+                    const derived = totalRowsAmount > 0
+                        ? addDays(coWindowStart, Math.round((Math.min(cumAmount, totalRowsAmount) / totalRowsAmount) * coWindowDays))
+                        : addDays(coWindowStart, coWindowDays);
+                    const canonical = row.dueDate ? utcDay(row.dueDate) : derived;
+                    const mTask = await createTask({
+                        name: row.name,
+                        startDate: canonical,
+                        endDate: addDays(canonical, 1),
+                        color: "#f59e0b",
+                        order: nextOrder++,
+                        type: "milestone",
+                        parentId: null,
+                    });
+                    milestoneTaskIds.push(mTask.id);
+                    milestoneTaskIdByRowId.set(row.id, mTask.id);
+                }
+            } else {
+                // Zero-row fallback (R1 fix 4): one synthesized milestone at the
+                // CO block's end projecting signedAmount (totalAmount + tax via
+                // co-tax.ts — the same amount billing will invoice).
+                const signedAmount = coSignedAmount(Number(co.totalAmount), co.estimate);
+                const blockEnd = addDays(coWindowStart, coWindowDays);
+                const mTask = await createTask({
+                    name: `${co.code} payment`,
+                    startDate: blockEnd,
+                    endDate: addDays(blockEnd, 1),
+                    color: "#f59e0b",
+                    order: nextOrder++,
+                    type: "milestone",
+                    parentId: null,
+                });
+                milestoneTaskIds.push(mTask.id);
+                notes.push(`${co.code} has no payment schedule rows — synthesized one "${co.code} payment" milestone ($${signedAmount.toFixed(2)} projected) at the block end.`);
+            }
+        }
+
+        // ── Linking (fresh + merge-converged): set scheduleTaskId on the CO
+        // payment rows AND the billed clone(s), regardless of billing/QB state
+        // (linking is not a money mutation). NO dueDate writes anywhere.
+        for (const row of co.paymentSchedules) {
+            const taskId = milestoneTaskIdByRowId.get(row.id);
+            if (!taskId) continue;
+            milestonesLinked += await tx.$executeRaw`
+                UPDATE "ChangeOrderPaymentSchedule"
+                SET "scheduleTaskId" = ${taskId}
+                WHERE "id" = ${row.id}
+                  AND "scheduleTaskId" IS DISTINCT FROM ${taskId}
+            `;
+        }
+        // Billed clones are linked deterministically by creation order to the
+        // corresponding ordered CO milestone (today billing creates one clone).
+        const billedClones = await tx.paymentSchedule.findMany({
+            where: {
+                invoice: { projectId },
+                name: { startsWith: `${co.code} — ` },
+                status: { not: "Canceled" },
+            },
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+            select: { id: true },
+        });
+        for (let idx = 0; idx < billedClones.length; idx++) {
+            const cloneTarget = milestoneTaskIds[Math.min(idx, milestoneTaskIds.length - 1)];
+            if (!cloneTarget) continue;
+            milestonesLinked += await tx.$executeRaw`
+                UPDATE "PaymentSchedule"
+                SET "scheduleTaskId" = ${cloneTarget}
+                WHERE "id" = ${billedClones[idx].id}
+                  AND "scheduleTaskId" IS DISTINCT FROM ${cloneTarget}
+            `;
+        }
+
+        await tx.activityLog.create({
+            data: {
+                projectId,
+                actorType: input.actor.type,
+                actorName: input.actor.name,
+                action: "applied_change_order_schedule",
+                entityType: "project",
+                entityId: projectId,
+                entityName: project.name,
+                metadata: JSON.stringify({
+                    changeOrderId: co.id,
+                    changeOrderCode: co.code,
+                    mode,
+                    created: createdRows.length,
+                    skipped,
+                    milestonesLinked,
+                }),
+            },
+        });
+
+        return { changeOrderCode: co.code, projectId, created: createdRows, skipped, milestonesLinked, notes };
+    }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Workstream C — Task-level crew (PB-pipeline-003)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Replace a task's crew (TaskAssignment rows) via a delete/create diff. Every
+ * id must be an ACTIVATED user (same validation as setProjectCrew); role stays
+ * "assigned". Idempotent; writes a "set_task_crew" ActivityLog row.
+ */
+export async function setTaskCrew(input: {
+    taskId: string;
+    userIds: string[];
+    actor: ScheduleActor;
+}): Promise<{ taskId: string; projectId: string; assignments: { id: string; userId: string; name: string }[] }> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        const taskRef = await tx.scheduleTask.findUnique({
+            where: { id: input.taskId },
+            select: { projectId: true },
+        });
+        if (!taskRef) throw new Error("Task not found");
+        if (!taskRef.projectId) throw new Error("Task is not attached to a project");
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${taskRef.projectId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${input.taskId} FOR UPDATE`;
+        const task = await tx.scheduleTask.findUnique({
+            where: { id: input.taskId },
+            select: {
+                id: true, name: true, projectId: true,
+                project: { select: { name: true } },
+                assignments: { select: { id: true, userId: true } },
+            },
+        });
+        if (!task) throw new Error("Task not found");
+        if (!task.projectId) throw new Error("Task is not attached to a project");
+        if (task.projectId !== taskRef.projectId) throw new Error("Task moved to another project; refresh and retry");
+
+        const wanted = [...new Set(input.userIds)];
+        const users = wanted.length
+            ? await tx.user.findMany({ where: { id: { in: wanted } }, select: { id: true, name: true, email: true, status: true } })
+            : [];
+        const byId = new Map(users.map(u => [u.id, u]));
+        const missing = wanted.filter(id => !byId.has(id));
+        if (missing.length > 0) throw new Error(`Unknown user id(s): ${missing.join(", ")}`);
+
+        const current = task.assignments.map(a => a.userId);
+        const toAdd = wanted.filter(id => !current.includes(id));
+        const toRemove = current.filter(id => !wanted.includes(id));
+
+        // ACTIVATED is required only for users being ADDED — same added-only
+        // rule as setProjectCrew, so a task already carrying an inactive
+        // assignee never blocks unrelated edits.
+        const notActivated = toAdd.map(id => byId.get(id)!).filter(u => u.status !== "ACTIVATED");
+        if (notActivated.length > 0) {
+            throw new Error(`Task crew members must be ACTIVATED users: ${notActivated.map(u => u.name || u.email).join(", ")}`);
+        }
+        if (toRemove.length > 0) {
+            await tx.taskAssignment.deleteMany({ where: { taskId: input.taskId, userId: { in: toRemove } } });
+        }
+        for (const userId of toAdd) {
+            await tx.taskAssignment.create({ data: { taskId: input.taskId, userId, role: "assigned" } });
+        }
+
+        await tx.activityLog.create({
+            data: {
+                projectId: task.projectId,
+                actorType: input.actor.type,
+                actorName: input.actor.name,
+                action: "set_task_crew",
+                entityType: "project",
+                entityId: task.projectId,
+                entityName: task.project?.name ?? null,
+                metadata: JSON.stringify({ taskId: input.taskId, taskName: task.name, added: toAdd, removed: toRemove, userIds: wanted }),
+            },
+        });
+
+        const final = await tx.taskAssignment.findMany({
+            where: { taskId: input.taskId },
+            select: { id: true, userId: true, user: { select: { name: true, email: true } } },
+        });
+        return {
+            taskId: input.taskId,
+            projectId: task.projectId,
+            assignments: final.map(a => ({ id: a.id, userId: a.userId, name: a.user.name || a.user.email })),
+        };
+    }));
 }

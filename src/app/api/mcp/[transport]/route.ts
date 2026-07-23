@@ -1,10 +1,11 @@
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { createMcpHandler } from "mcp-handler";
+import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
-import { getCompanyPipeline, getStartCalendar, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, getCrewConflicts } from "@/lib/schedule-core";
+import { applyChangeOrderToSchedule, getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, getCrewConflicts } from "@/lib/schedule-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 
@@ -848,6 +849,301 @@ const handler = createMcpHandler(
             },
         );
 
+        // ── Contracts ──────────────────────────────────────────────────────
+        // Standalone legal documents (separate from estimates): HTML body with
+        // {{merge_field}} placeholders, client e-sign via portal magic link,
+        // optional contractor pre-sign + company countersign. Creation resolves
+        // data merge fields immediately; signing keys ({{SIGNATURE_BLOCK}} etc.)
+        // stay raw in the body — the portal renders them as tap-to-sign fields.
+
+        const CONTRACTOR_BLOCK_RE = /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|data-merge-field=["']CONTRACTOR_SIGNATURE_BLOCK["']/i;
+        const CLIENT_SIGN_BLOCK_RE = /\{\{SIGNATURE_BLOCK\}\}/;
+        const contractSummary = (c: {
+            id: string; title: string; status: string; sentAt: Date | null;
+            approvedBy: string | null; approvedAt: Date | null;
+            contractorSignedAt: Date | null; requiresCountersign: boolean; companySignedAt: Date | null;
+            recurringDays: number | null; originalPdfPath: string | null; createdAt: Date;
+        }) => ({
+            contractId: c.id,
+            title: c.title,
+            status: c.status, // Draft, Sent, Viewed, Signed, Declined (+ Finalized after countersign)
+            sentAt: c.sentAt,
+            signedBy: c.approvedBy,
+            signedAt: c.approvedAt,
+            contractorSignedAt: c.contractorSignedAt,
+            requiresCountersign: c.requiresCountersign,
+            companyCountersignedAt: c.companySignedAt,
+            recurringDays: c.recurringDays,
+            isPdfContract: !!c.originalPdfPath,
+            createdAt: c.createdAt,
+        });
+
+        server.registerTool(
+            "list_contract_templates",
+            {
+                title: "List contract/document templates",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Lists the document templates saved in ProBuild (type: contract, terms, or disclaimer). " +
+                    "Pass a template's id to create_contract to generate a contract from it with the job's client/company/pricing data merged in.",
+                inputSchema: {},
+            },
+            async () => {
+                const templates = await prisma.documentTemplate.findMany({
+                    orderBy: [{ type: "asc" }, { name: "asc" }],
+                    select: { id: true, name: true, type: true, isDefault: true, updatedAt: true },
+                });
+                return textResult(templates);
+            },
+        );
+
+        server.registerTool(
+            "list_contracts",
+            {
+                title: "List contracts for a job (or company-wide)",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Lists contracts with their signing status. Filter by projectId or leadId (from find_job), or omit both for the 50 most recent across the company. " +
+                    "Statuses: Draft → Sent → Viewed → Signed (→ Finalized once the company countersigns, when required).",
+                inputSchema: {
+                    projectId: z.string().max(50).optional(),
+                    leadId: z.string().max(50).optional(),
+                },
+            },
+            async ({ projectId, leadId }) => {
+                const contracts = await prisma.contract.findMany({
+                    where: { ...(projectId ? { projectId } : {}), ...(leadId ? { leadId } : {}) },
+                    take: 50,
+                    orderBy: { createdAt: "desc" },
+                    include: {
+                        project: { select: { name: true, client: { select: { name: true } } } },
+                        lead: { select: { name: true, client: { select: { name: true } } } },
+                    },
+                });
+                return textResult(contracts.map(c => ({
+                    ...contractSummary(c),
+                    job: c.project?.name ?? c.lead?.name ?? null,
+                    client: c.project?.client?.name ?? c.lead?.client?.name ?? null,
+                })));
+            },
+        );
+
+        server.registerTool(
+            "get_contract",
+            {
+                title: "Read a contract (full text + signing state)",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns one contract's full HTML body and signing state. Signing placeholders appear raw in the body " +
+                    "({{SIGNATURE_BLOCK}}, {{INITIAL_BLOCK}}, {{DATE_BLOCK}}, {{CONTRACTOR_SIGNATURE_BLOCK}}) — the client portal renders them as signature fields.",
+                inputSchema: {
+                    contractId: z.string().max(50).describe("Contract id from list_contracts or create_contract"),
+                },
+            },
+            async ({ contractId }) => {
+                const c = await prisma.contract.findUnique({
+                    where: { id: contractId },
+                    include: {
+                        project: { select: { name: true, client: { select: { name: true, email: true } } } },
+                        lead: { select: { name: true, client: { select: { name: true, email: true } } } },
+                    },
+                });
+                if (!c) return { ...textResult({ error: "Contract not found" }), isError: true };
+                const MAX_BODY = 60_000;
+                const body = c.body || "";
+                return textResult({
+                    ...contractSummary(c),
+                    job: c.project?.name ?? c.lead?.name ?? null,
+                    client: c.project?.client?.name ?? c.lead?.client?.name ?? null,
+                    clientEmail: c.project?.client?.email ?? c.lead?.client?.email ?? null,
+                    hasClientSignatureBlock: CLIENT_SIGN_BLOCK_RE.test(body),
+                    hasContractorSignatureBlock: CONTRACTOR_BLOCK_RE.test(body),
+                    body: body.length > MAX_BODY ? body.slice(0, MAX_BODY) : body,
+                    ...(body.length > MAX_BODY ? { bodyTruncated: `Body is ${body.length} chars; showing the first ${MAX_BODY}.` } : {}),
+                });
+            },
+        );
+
+        server.registerTool(
+            "create_contract",
+            {
+                title: "Create a contract (Draft)",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                description:
+                    "Creates a Draft contract on a project or lead — nothing is emailed until send_contract. " +
+                    "EITHER pass templateId (from list_contract_templates) to instantiate a saved template, OR pass title + bodyHtml to write one from scratch. " +
+                    "In bodyHtml, use merge placeholders and they resolve from the job's data at creation: {{client_name}}, {{client_address}}, {{company_name}}, {{company_license}}, " +
+                    "{{project_name}}, {{location}}, {{estimate_total}}, {{estimate_number}}, {{payment_schedule}} (formatted milestone table), {{date}}. " +
+                    "Include the signing fields where signatures belong: {{SIGNATURE_BLOCK}} (client signs), {{DATE_BLOCK}}, and optionally {{INITIAL_BLOCK}} per section " +
+                    "and {{CONTRACTOR_SIGNATURE_BLOCK}} (company must pre-sign in ProBuild before the contract can be sent).",
+                inputSchema: {
+                    projectId: z.string().max(50).optional().describe("Project id from find_job (use exactly one of projectId/leadId)"),
+                    leadId: z.string().max(50).optional().describe("Lead id from find_job, for jobs with no project yet"),
+                    templateId: z.string().max(50).optional().describe("Template id from list_contract_templates"),
+                    title: z.string().min(1).max(300).optional().describe("Contract title (required without templateId; optional override with one)"),
+                    bodyHtml: z.string().min(1).max(400_000).optional().describe("Full HTML body of the agreement (required without templateId; ignored with one)"),
+                },
+            },
+            async ({ projectId, leadId, templateId, title, bodyHtml }) => {
+                if (!!projectId === !!leadId) return { ...textResult({ error: "Pass exactly one of projectId or leadId." }), isError: true };
+                if (!templateId && (!title || !bodyHtml)) return { ...textResult({ error: "Without templateId, both title and bodyHtml are required." }), isError: true };
+                const context = projectId ? { type: "project" as const, id: projectId } : { type: "lead" as const, id: leadId! };
+                const exists = projectId
+                    ? await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } })
+                    : await prisma.lead.findUnique({ where: { id: leadId! }, select: { id: true } });
+                if (!exists) return { ...textResult({ error: `${context.type} not found: ${context.id}` }), isError: true };
+
+                const { createContractFromTemplate, createContractBlank } = await import("@/lib/actions");
+                const contract = templateId
+                    ? await createContractFromTemplate(templateId, context, title)
+                    : await createContractBlank(context, title!, bodyHtml!);
+
+                const warnings: string[] = [];
+                if (!CLIENT_SIGN_BLOCK_RE.test(contract.body || "")) {
+                    warnings.push("The body has no {{SIGNATURE_BLOCK}} — the client can still finalize via the portal's confirm step, but there will be no signature line in the document. Add one via update_contract if a drawn signature should appear.");
+                }
+                if (CONTRACTOR_BLOCK_RE.test(contract.body || "")) {
+                    warnings.push("The body has a {{CONTRACTOR_SIGNATURE_BLOCK}} — someone at the company must sign it in ProBuild (Contracts tab) before send_contract will send it.");
+                }
+                return textResult({
+                    contractId: contract.id,
+                    title: contract.title,
+                    status: contract.status,
+                    requiresCountersign: contract.requiresCountersign,
+                    url: projectId
+                        ? `https://probuild.goldentouchremodeling.com/projects/${projectId}/contracts`
+                        : `https://probuild.goldentouchremodeling.com/leads/${leadId}/contracts`,
+                    warnings,
+                    note: "Draft only — review with get_contract, edit with update_contract, then send_contract to email it for signature.",
+                });
+            },
+        );
+
+        server.registerTool(
+            "update_contract",
+            {
+                title: "Edit a contract's title or body",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                description:
+                    "Updates a contract's title and/or HTML body. Refused once the contract is Signed or Finalized. " +
+                    "Note: merge placeholders like {{client_name}} in an updated body resolve when the client OPENS the contract, not at save time (signing blocks always stay raw until signed).",
+                inputSchema: {
+                    contractId: z.string().max(50),
+                    title: z.string().min(1).max(300).optional(),
+                    bodyHtml: z.string().min(1).max(400_000).optional(),
+                },
+            },
+            async ({ contractId, title, bodyHtml }) => {
+                if (title === undefined && bodyHtml === undefined) return { ...textResult({ error: "Pass title and/or bodyHtml." }), isError: true };
+                // Same save-time normalization as updateContract in actions.ts: the portal
+                // locates signing blocks by grepping for raw {{KEY}}, so any TipTap
+                // merge-field spans must be folded back before the body is stored.
+                const normalizedBody = bodyHtml === undefined
+                    ? undefined
+                    : bodyHtml.replace(/<span[^>]*data-merge-field=["'](\w+)["'][^>]*>[\s\S]*?<\/span>/g, "{{$1}}");
+                // Atomic guard (not read-then-write): the update only lands while the row is
+                // still unsigned by ANYONE. Editing after the contractor pre-signed would send
+                // an altered document over their signature; after the client signed it's the
+                // executed agreement. A signature landing concurrently makes count = 0.
+                const res = await prisma.contract.updateMany({
+                    where: { id: contractId, contractorSignedAt: null, status: { notIn: ["Signed", "Finalized"] } },
+                    data: {
+                        ...(title !== undefined ? { title } : {}),
+                        ...(normalizedBody !== undefined ? { body: normalizedBody } : {}),
+                    },
+                });
+                if (res.count === 0) {
+                    const now = await prisma.contract.findUnique({ where: { id: contractId }, select: { status: true, contractorSignedAt: true } });
+                    if (!now) return { ...textResult({ error: "Contract not found" }), isError: true };
+                    if (now.contractorSignedAt) {
+                        return { ...textResult({ error: "The contractor has already signed this contract, so its text can no longer be edited here — the signature would misrepresent what was signed. Edit it in ProBuild (job → Contracts) where the signature can be redone, or create a new contract." }), isError: true };
+                    }
+                    return { ...textResult({ error: `Cannot edit a contract that is already ${now.status}.` }), isError: true };
+                }
+                const updated = await prisma.contract.findUnique({ where: { id: contractId }, select: { id: true, title: true, status: true } });
+                revalidatePath("/");
+                return textResult({
+                    contractId: updated!.id,
+                    title: updated!.title,
+                    status: updated!.status,
+                    ...(updated!.status !== "Draft" ? { note: `This contract was already ${updated!.status} — anyone opening the previously emailed link now sees the updated text.` } : {}),
+                });
+            },
+        );
+
+        server.registerTool(
+            "send_contract",
+            {
+                title: "Send a contract to the client for signature",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Emails the client a magic link to review and e-sign the contract in their portal. " +
+                    "TWO-STEP: call without confirmToken for a preview (recipient, cc, title); show the user, then echo the confirmToken after they explicitly approve. " +
+                    "Sends to the client on file (cc: their additional email + the assigned manager). Resending an already-signed contract re-emails the link without reopening it.",
+                inputSchema: {
+                    contractId: z.string().max(50).describe("Contract id from list_contracts or create_contract"),
+                    confirmToken: z.string().max(40).optional().describe("Token from the preview response; supplying it executes the send"),
+                },
+            },
+            async ({ contractId, confirmToken }) => {
+                const c = await prisma.contract.findUnique({
+                    where: { id: contractId },
+                    include: {
+                        project: { include: { client: { select: { name: true, email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+                        lead: { include: { client: { select: { name: true, email: true, additionalEmail: true } }, manager: { select: { email: true } } } },
+                    },
+                });
+                if (!c) return { ...textResult({ error: "Contract not found" }), isError: true };
+                const client = c.project?.client ?? c.lead?.client;
+                if (!client?.email) return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
+                if (CONTRACTOR_BLOCK_RE.test(c.body || "") && !c.contractorSignedAt) {
+                    return { ...textResult({ error: "This contract has a contractor signature block that hasn't been signed yet. Someone at the company must sign it in ProBuild (job → Contracts) before it can be sent." }), isError: true };
+                }
+
+                // Bind the token to exactly what the preview showed: recipient set + full document text.
+                const fingerprint = createHash("sha256")
+                    .update(JSON.stringify({ title: c.title, body: c.body, status: c.status, requiresCountersign: c.requiresCountersign }))
+                    .digest("hex").slice(0, 24);
+                // Same normalization as buildCc in sendContractToClient (trim, case-insensitive
+                // dedupe, drop the primary recipient) so the preview's cc list is exactly what
+                // the email will carry.
+                const primaryKey = client.email.trim().toLowerCase();
+                const ccSeen = new Set<string>();
+                const cc: string[] = [];
+                for (const candidate of [client.additionalEmail, c.project?.manager?.email || c.lead?.manager?.email || null]) {
+                    const e = candidate?.trim();
+                    if (!e) continue;
+                    const key = e.toLowerCase();
+                    if (key === primaryKey || ccSeen.has(key)) continue;
+                    ccSeen.add(key);
+                    cc.push(e);
+                }
+                const payload = JSON.stringify({ contractId, recipient: client.email, cc, fingerprint });
+
+                if (!verifyPreviewToken(confirmToken, payload)) {
+                    return textResult({
+                        preview: true,
+                        contract: { title: c.title, status: c.status, requiresCountersign: c.requiresCountersign },
+                        job: c.project?.name ?? c.lead?.name,
+                        recipient: client.email,
+                        clientName: client.name,
+                        cc,
+                        confirmToken: mintPreviewToken(payload),
+                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve the send.",
+                    });
+                }
+                const { sendContractToClient } = await import("@/lib/actions");
+                try {
+                    // Pass the approved snapshot's fingerprint — the send action re-reads the
+                    // contract and refuses if the text no longer matches what the user confirmed.
+                    const result = await sendContractToClient(contractId, undefined, fingerprint);
+                    return textResult({ ...result, note: "The client reviews and signs via the emailed portal link. Track status with list_contracts / get_contract." });
+                } catch (e) {
+                    return { ...textResult({ error: e instanceof Error ? e.message : "Send failed" }), isError: true };
+                }
+            },
+        );
+
         server.registerTool(
             "get_company_schedule",
             {
@@ -873,6 +1169,8 @@ const handler = createMcpHandler(
                     getStartCalendar(from, to, { includeFinancials: false }),
                     getCrewConflicts(from, to),
                 ]);
+                const openProjects = [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress];
+                const unappliedChangeOrders = await getUnappliedChangeOrders(openProjects.map(project => project.id));
                 // Crew per project (ids + names) — joined onto the start list too.
                 const crewOf = new Map<string, { id: string; name: string }[]>();
                 for (const p of [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress, ...pipeline.substantialCompletion]) {
@@ -888,19 +1186,29 @@ const handler = createMcpHandler(
                     },
                     waitingToStart: pipeline.waitingToStart.map(p => ({
                         projectId: p.id, name: p.name, client: p.client, contractValue: p.contractValue, crew: p.crew,
+                        unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
+                    })),
+                    projects: openProjects.map(p => ({
+                        projectId: p.id,
+                        name: p.name,
+                        status: p.status,
+                        startDate: p.startDate?.slice(0, 10) ?? null,
+                        crew: p.crew,
+                        unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
                     })),
                     upcomingStarts: {
                         windowDays: horizonDays,
                         projects: calendar.projectStarts.map(p => ({
                             projectId: p.id, name: p.name, client: p.client, status: p.status, startDate: p.startDate.slice(0, 10),
                             crew: crewOf.get(p.id) ?? [],
+                            unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
                         })),
                         leads: calendar.leadStarts.map(l => ({
                             leadId: l.id, name: l.name, client: l.client, stage: l.stage, expectedStartDate: l.expectedStartDate.slice(0, 10),
                         })),
                     },
-                    // Double-booked crew from project windows (startDate →
-                    // endDate ?? latest task end ?? startDate+1d, half-open).
+                    // Conflict v2: assigned task windows plus per-(user,project)
+                    // effective-work-window fallback, deduped per project pair.
                     crewConflicts,
                 });
             },
@@ -994,9 +1302,36 @@ const handler = createMcpHandler(
                 }
             },
         );
+
+        server.registerTool(
+            "apply_change_order_to_schedule",
+            {
+                title: "Apply an approved change order to the project schedule",
+                description:
+                    "Adds an Approved change order's positive-scope tasks and payment milestones to its project's schedule. " +
+                    "Deductions are reported for manual trimming and never remove existing tasks automatically. " +
+                    "Default merge mode is idempotent; regenerate rebuilds only untouched CO-generated task subtrees.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).describe("Approved change-order id"),
+                    mode: z.enum(["merge", "regenerate"]).optional().describe("'merge' (default) applies once; 'regenerate' rebuilds only untouched generated work"),
+                },
+            },
+            async ({ changeOrderId, mode }) => {
+                try {
+                    const result = await applyChangeOrderToSchedule({
+                        changeOrderId,
+                        mode: mode ?? "merge",
+                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
+                    });
+                    return textResult(result);
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to apply change order to schedule" }), isError: true };
+                }
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.8.0" },
+        serverInfo: { name: "probuild", version: "1.10.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -1025,6 +1360,7 @@ const handler = createMcpHandler(
             "to QuickBooks are never shifted and come back in skippedQbMilestones for manual fixing. " +
             "generate_project_schedule builds a project's schedule from its estimate (the estimate must be Approved/Invoiced/Partially Paid/Paid and " +
             "the project needs a start date first — set one with set_project_start_date); default 'merge' mode is idempotent, 'regenerate' rebuilds untouched generated tasks. " +
+            "change orders adjust the schedule — approve in ProBuild (auto) or call apply_change_order_to_schedule; deductions never auto-remove tasks. " +
             "assign_project_crew replaces a project's crew with the given ACTIVATED user ids (full list, not a delta). " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },

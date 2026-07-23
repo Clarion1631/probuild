@@ -106,3 +106,10 @@ qa-screenshots/
 
 # ChatGPT MCP connector local secret
 .mcp-secret
+
+# Local session scratch (shared by concurrent agent sessions; Vercel-excluded).
+# Also keeps Tailwind v4 source scanning out of these dirs - scratch files with
+# Windows paths (backslash + hex-ish session ids) parse as invalid CSS escapes
+# and break `next build`.
+/gtr-probuild/
+/_context/

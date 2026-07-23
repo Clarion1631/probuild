@@ -9,7 +9,7 @@ import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
@@ -17,7 +17,9 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
-import { setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
+import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
+import { CLOSED_PROJECT_STATUSES } from "./gpt-estimate";
+import type { ShiftNotStartedTasksResult } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -2569,6 +2571,13 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
         revalidatePath(`/projects/${estimate.projectId}/files`);
     }
+    // Post-commit best effort: approval/invoice/budget work above must stand even
+    // if schedule generation is skipped or fails.
+    try {
+        await autoGenerateScheduleForApprovedEstimate(estimateId);
+    } catch (error) {
+        console.error("[approveEstimate] schedule auto-generation failed (approval unaffected):", error);
+    }
     revalidatePath(`/portal/estimates/${estimateId}`);
     return { success: true };
 }
@@ -4042,6 +4051,19 @@ async function assertInvoicePermission() {
 
 async function assertChangeOrderPermission() {
     return assertStaffPermission("changeOrders");
+}
+
+async function assertScheduleProjectAccess(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules") || !canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+async function assertScheduleTaskAccess(taskId: string) {
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId }, select: { projectId: true } });
+    if (!task?.projectId) throw new Error("Task not found");
+    const user = await assertScheduleProjectAccess(task.projectId);
+    return { user, projectId: task.projectId };
 }
 
 async function assertFinancialPermission() {
@@ -5748,18 +5770,72 @@ export async function createContractFromPdf(
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
-    const existing = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
-    if (existing && ["Signed", "Finalized"].includes(existing.status)) {
-        if (data.title !== undefined || data.body !== undefined) {
-            throw new Error("Cannot edit a contract that has already been signed or finalized");
-        }
-    }
+    const existing = await prisma.contract.findUnique({
+        where: { id },
+        select: { status: true, title: true, body: true, contractorSignedBy: true, contractorSignedAt: true },
+    });
+    if (!existing) throw new Error("Contract not found");
 
     // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
     // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
     const safeData = { ...data };
     if (typeof safeData.body === "string") safeData.body = normalizeContractBody(safeData.body);
-    const contract = await prisma.contract.update({ where: { id }, data: safeData });
+
+    const editsText = safeData.title !== undefined || safeData.body !== undefined;
+    if (!editsText) {
+        const contract = await prisma.contract.update({ where: { id }, data: safeData });
+        revalidatePath(`/`);
+        return contract;
+    }
+
+    // A contractor pre-signature (signContractAsContractor) covers the document text as it
+    // stood when signed — the send/approve gates only check that contractorSignedAt exists,
+    // so an edit after pre-sign would present altered text over the old signature. Text
+    // edits therefore clear the contractor signature fields (forcing a re-sign of the new
+    // text) in the SAME write, and the write is a full compare-and-swap on the snapshot we
+    // diffed against (title/body/signature state): any concurrent edit or signature landing
+    // between our read and this write makes the CAS miss and the save is rejected, instead
+    // of silently reverting someone else's text under a live signature (Codex round-1
+    // blocker: a stale no-op save must not retain a signature made over newer text).
+    const textChanged =
+        (safeData.title !== undefined && safeData.title !== existing.title) ||
+        (safeData.body !== undefined && safeData.body !== (existing.body ?? ""));
+    const clearingSignature = textChanged && !!existing.contractorSignedAt;
+    await prisma.$transaction(async (tx) => {
+        const res = await tx.contract.updateMany({
+            where: {
+                id,
+                status: { notIn: ["Signed", "Finalized"] },
+                title: existing.title,
+                body: existing.body,
+                contractorSignedAt: existing.contractorSignedAt,
+            },
+            data: {
+                ...safeData,
+                ...(textChanged ? { contractorSignedBy: null, contractorSignedAt: null, contractorSignatureUrl: null } : {}),
+            },
+        });
+        if (res.count === 0) {
+            const current = await tx.contract.findUnique({ where: { id }, select: { status: true } });
+            if (current && ["Signed", "Finalized"].includes(current.status)) {
+                throw new Error("Cannot edit a contract that has already been signed or finalized");
+            }
+            throw new Error("Contract changed while you were editing (someone edited or signed it) — reload and try again.");
+        }
+        // The cleared signature's original audit row stays; append an invalidation marker so
+        // the e-sign trail shows the pre-edit signature no longer covers the current text.
+        if (clearingSignature) {
+            await tx.contractSigningRecord.create({
+                data: {
+                    contractId: id,
+                    signedBy: existing.contractorSignedBy || "Contractor",
+                    notes: "Contractor signature invalidated — contract text was edited after signing; re-sign required",
+                },
+            });
+        }
+    });
+    const contract = await prisma.contract.findUnique({ where: { id } });
+    if (!contract) throw new Error("Contract not found");
     revalidatePath(`/`);
     return contract;
 }
@@ -5771,7 +5847,7 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[], expectedFingerprint?: string) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5781,6 +5857,20 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     });
 
     if (!contract) throw new Error("Contract not found");
+
+    // MCP confirm-token guard: the caller previewed a specific document to the user and
+    // binds that snapshot's hash here. If the contract changed between their preview and
+    // this read (a concurrent edit), refuse — never email a legal document whose text
+    // differs from what the user approved. Must hash the SAME fields, the same way, as
+    // the send_contract tool in src/app/api/mcp/[transport]/route.ts.
+    if (expectedFingerprint) {
+        const fresh = createHash("sha256")
+            .update(JSON.stringify({ title: contract.title, body: contract.body, status: contract.status, requiresCountersign: contract.requiresCountersign }))
+            .digest("hex").slice(0, 24);
+        if (fresh !== expectedFingerprint) {
+            throw new Error("The contract changed after the preview — run the send preview again and re-confirm.");
+        }
+    }
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
@@ -5821,16 +5911,32 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     // the email so the client gets their link, but we do NOT clobber status).
     // Recurring contracts that the cron re-arms legitimately re-enter "Sent"
     // from an earlier "Sent"/"Viewed" cycle — the whitelist includes those.
-    await prisma.contract.updateMany({
+    //
+    // The transition also CAS-binds the body we validated above (and, when the text
+    // carries a contractor block, that the contractor signature still exists) — an
+    // edit landing between the gate check and here now clears the pre-signature, so
+    // without this binding we could email a link to altered, unsigned text that the
+    // upfront gate never saw. A CAS miss on a still-unsigned contract aborts the
+    // send; a miss on an already-Signed/Finalized row keeps the old resend-as-no-op
+    // behavior (email the executed contract's link, never clobber status).
+    const sendTransition = await prisma.contract.updateMany({
         where: {
             id: contractId,
             status: { in: ["Draft", "Sent", "Viewed"] },
+            body: contract.body,
+            ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
         },
         data: {
             status: "Sent",
             sentAt: new Date(),
         }
     });
+    if (sendTransition.count === 0) {
+        const current = await prisma.contract.findUnique({ where: { id: contractId }, select: { status: true } });
+        if (!current || !["Signed", "Finalized"].includes(current.status)) {
+            throw new Error("Contract changed while sending (text edited or signature cleared) — reload and try again.");
+        }
+    }
 
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     const portalUrl = `${appUrl}/portal/contracts/${contractId}?token=${accessToken}`;
@@ -5918,7 +6024,7 @@ export async function getContractSendDefaults(contractId: string): Promise<{ toE
     return { toEmail: client?.email || null, autoCc };
 }
 
-export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
+export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string, expectedTitle: string, expectedBody: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
 
@@ -5946,16 +6052,29 @@ export async function signContractAsContractor(contractId: string, signerName: s
     // the signature write back too — a retry then redoes BOTH (never leaves contractorSignedAt set
     // with no audit row). updateMany only matches rows where contractorSignedAt IS NULL, so two
     // concurrent requests can't both succeed (eliminates TOCTOU race).
+    // The guard also CAS-checks the title and body the signer saw (both are cleared-signature
+    // triggers in updateContract), so a signature can never commit over a document that was
+    // edited after the signer last saw it (Codex blockers: a sign request based on an old
+    // document must not reintroduce a live signature on changed text OR a changed title).
     await prisma.$transaction(async (tx) => {
         const guard = await tx.contract.updateMany({
-            where: { id: contractId, contractorSignedAt: null },
+            where: {
+                id: contractId,
+                contractorSignedAt: null,
+                title: expectedTitle,
+                body: expectedBody,
+            },
             data: {
                 contractorSignedBy: signerName,
                 contractorSignedAt: signedAt,
                 contractorSignatureUrl,
             },
         });
-        if (guard.count === 0) throw new Error("Contract already signed by contractor");
+        if (guard.count === 0) {
+            const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+            if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
+            throw new Error("The contract text changed after you opened it — review the current text and sign again.");
+        }
         // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
         await tx.contractSigningRecord.create({
             data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
@@ -6137,10 +6256,17 @@ export async function approveContract(contractId: string, signatureName: string,
 
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
+            // CAS-bind the body we validated (and, when it carries a contractor block, that
+            // the contractor pre-signature still exists) into the transition — text edits now
+            // clear the pre-signature, so without this a contract could flip to Signed over
+            // text the upfront gate never validated, or without the required contractor
+            // signature at commit time.
             const transition = await tx.contract.updateMany({
                 where: {
                     id: contractId,
                     status: { in: ["Draft", "Sent", "Viewed"] },
+                    body: contract.body,
+                    ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
                 },
                 data: {
                     status: "Signed",
@@ -6153,15 +6279,27 @@ export async function approveContract(contractId: string, signatureName: string,
             });
             if (transition.count === 0) {
                 // Already signed — allow finalize retry without overwriting audit data.
-                // If status is anything other than "Signed", the contract is finalized and immutable.
                 const current = await tx.contract.findUnique({ where: { id: contractId }, select: { status: true } });
                 if (current?.status === "Signed") return;
+                if (current && ["Draft", "Sent", "Viewed"].includes(current.status)) {
+                    // Still signable ⇒ the CAS missed: text was edited (or the contractor
+                    // signature was cleared) between validation and commit.
+                    throw new Error("The contract changed while you were signing — please reload and review the current text.");
+                }
                 throw new Error("Contract is not in a signable state (already finalized)");
             }
         } else {
             const nextDue = new Date(now.getTime() + contract.recurringDays! * 86400000);
-            await tx.contract.update({
-                where: { id: contractId },
+            // Recurring signs tolerate duplicate same-cycle audit rows, but they get the same
+            // content/signature CAS as the one-time branch: both concurrent signers see the
+            // same body so both still match, while an edit (which clears the contractor
+            // pre-signature) between validation and commit makes the CAS miss and rejects.
+            const recurringTransition = await tx.contract.updateMany({
+                where: {
+                    id: contractId,
+                    body: contract.body,
+                    ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
+                },
                 data: {
                     approvedBy: signatureName,
                     approvedAt: now,
@@ -6173,6 +6311,9 @@ export async function approveContract(contractId: string, signatureName: string,
                     nextDueDate: nextDue,
                 }
             });
+            if (recurringTransition.count === 0) {
+                throw new Error("The contract changed while you were signing — please reload and review the current text.");
+            }
         }
 
         // Audit record — inside the same transaction as the state flip, so
@@ -6555,6 +6696,7 @@ export async function createScheduleTask(projectId: string, data: {
     parentId?: string;
     type?: string;
 }) {
+    await assertScheduleProjectAccess(projectId);
     const maxOrder = await prisma.scheduleTask.aggregate({
         where: { projectId },
         _max: { order: true },
@@ -6591,10 +6733,10 @@ export async function updateScheduleTask(taskId: string, data: {
     type?: string;
     estimateItemId?: string | null;
 }) {
+    const hasDatePatch = data.startDate !== undefined || data.endDate !== undefined;
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
-    if (data.startDate !== undefined) updateData.startDate = new Date(data.startDate);
-    if (data.endDate !== undefined) updateData.endDate = new Date(data.endDate);
     if (data.color !== undefined) updateData.color = data.color;
     if (data.progress !== undefined) updateData.progress = data.progress;
     if (data.status !== undefined) updateData.status = data.status;
@@ -6619,9 +6761,67 @@ export async function updateScheduleTask(taskId: string, data: {
             }
         }
     }
-    // Milestones always have same start and end date
-    if (data.type === "milestone" && updateData.startDate) {
-        updateData.endDate = updateData.startDate;
+    if (hasDatePatch) {
+        const suppliedStartDate = data.startDate === undefined ? null : parseStartDateInput(data.startDate);
+        const suppliedEndDate = data.endDate === undefined ? null : parseStartDateInput(data.endDate);
+        const task = await withTxRetry(() => prisma.$transaction(async (tx) => {
+            // Canonical lock family: parent Project first, then the task row.
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+            await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+            const persistedTask = await tx.scheduleTask.findUnique({
+                where: { id: taskId },
+                select: {
+                    id: true, name: true, projectId: true, type: true,
+                    startDate: true, endDate: true,
+                    project: { select: { status: true } },
+                },
+            });
+            if (!persistedTask) throw new Error("Task not found");
+            if (!persistedTask.projectId || persistedTask.projectId !== projectId) {
+                throw new Error("Task moved to another project; refresh and retry");
+            }
+            if (!persistedTask.project) throw new Error("Task is not attached to a project");
+            if (CLOSED_PROJECT_STATUSES.includes(persistedTask.project.status)) {
+                throw new Error(`Cannot update a task on a closed project (${persistedTask.project.status})`);
+            }
+            if (data.type !== undefined && data.type !== persistedTask.type) {
+                throw new Error("Change task type separately before editing its dates");
+            }
+
+            const startDate = suppliedStartDate ?? persistedTask.startDate;
+            const requestedEndDate = suppliedEndDate ?? persistedTask.endDate;
+            const endDate = persistedTask.type === "milestone" ? startDate : requestedEndDate;
+            if (persistedTask.type !== "milestone" && endDate <= startDate) {
+                throw new Error("Task end date must be after its start date");
+            }
+
+            const saved = await tx.scheduleTask.update({
+                where: { id: taskId },
+                data: { ...updateData, startDate, endDate },
+            });
+            await tx.activityLog.create({
+                data: {
+                    projectId,
+                    actorType: "TEAM",
+                    actorName: user.name || user.email,
+                    action: "updated_company_schedule_task_dates",
+                    entityType: "task",
+                    entityId: taskId,
+                    entityName: persistedTask.name,
+                    metadata: JSON.stringify({
+                        previousStartDate: persistedTask.startDate.toISOString().slice(0, 10),
+                        previousEndDate: persistedTask.endDate.toISOString().slice(0, 10),
+                        startDate: startDate.toISOString().slice(0, 10),
+                        endDate: endDate.toISOString().slice(0, 10),
+                        type: persistedTask.type,
+                    }),
+                },
+            });
+            return saved;
+        }));
+        revalidatePath("/company-dashboard");
+        revalidatePath(`/projects/${task.projectId}/schedule`);
+        return task;
     }
 
     const task = await prisma.scheduleTask.update({
@@ -6633,12 +6833,14 @@ export async function updateScheduleTask(taskId: string, data: {
 }
 
 export async function deleteScheduleTask(taskId: string) {
+    await assertScheduleTaskAccess(taskId);
     const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
     revalidatePath(`/projects/${task.projectId}/schedule`);
     return task;
 }
 
 export async function reorderScheduleTasks(projectId: string, orderedIds: string[]) {
+    await assertScheduleProjectAccess(projectId);
     if (new Set(orderedIds).size !== orderedIds.length) {
         throw new Error("Duplicate task IDs in reorder request");
     }
@@ -6665,6 +6867,11 @@ export async function reorderScheduleTasks(projectId: string, orderedIds: string
 }
 
 export async function linkTasks(predecessorId: string, dependentId: string) {
+    const [predecessor, dependent] = await Promise.all([
+        assertScheduleTaskAccess(predecessorId),
+        assertScheduleTaskAccess(dependentId),
+    ]);
+    if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
     const dep = await prisma.taskDependency.create({
         data: { predecessorId, dependentId },
     });
@@ -6674,6 +6881,11 @@ export async function linkTasks(predecessorId: string, dependentId: string) {
 }
 
 export async function unlinkTasks(predecessorId: string, dependentId: string) {
+    const [predecessor, dependent] = await Promise.all([
+        assertScheduleTaskAccess(predecessorId),
+        assertScheduleTaskAccess(dependentId),
+    ]);
+    if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
     await prisma.taskDependency.deleteMany({
         where: { predecessorId, dependentId },
     });
@@ -6899,6 +7111,9 @@ export async function getTaskPunchItems(taskId: string) {
 // ========== TASK ASSIGNMENTS ==========
 
 export async function assignUserToTask(taskId: string, userId: string) {
+    await assertScheduleTaskAccess(taskId);
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
+    if (!user || user.status !== "ACTIVATED") throw new Error("Task crew members must be ACTIVATED users");
     const assignment = await prisma.taskAssignment.create({
         data: { taskId, userId },
         include: { user: { select: { id: true, name: true, email: true } } },
@@ -6909,6 +7124,7 @@ export async function assignUserToTask(taskId: string, userId: string) {
 }
 
 export async function unassignUserFromTask(taskId: string, userId: string) {
+    await assertScheduleTaskAccess(taskId);
     await prisma.taskAssignment.deleteMany({
         where: { taskId, userId },
     });
@@ -6917,6 +7133,7 @@ export async function unassignUserFromTask(taskId: string, userId: string) {
 }
 
 export async function assignSubToTask(taskId: string, subcontractorId: string) {
+    await assertScheduleTaskAccess(taskId);
     const assignment = await prisma.subTaskAssignment.create({
         data: { taskId, subcontractorId },
         include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } },
@@ -6927,6 +7144,7 @@ export async function assignSubToTask(taskId: string, subcontractorId: string) {
 }
 
 export async function unassignSubFromTask(taskId: string, subcontractorId: string) {
+    await assertScheduleTaskAccess(taskId);
     await prisma.subTaskAssignment.deleteMany({
         where: { taskId, subcontractorId },
     });
@@ -7136,6 +7354,20 @@ export async function getActiveSubcontractors() {
 
 // ========== PROJECT BOARD ACTIONS ==========
 
+// Company-board authorization adapter only. updateScheduleTask remains the
+// single validation, locking, mutation, audit, and revalidation capability.
+export async function updateCompanyScheduleTaskDatesAction(taskId: string, dates: {
+    startDate: string;
+    endDate: string;
+}) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    return updateScheduleTask(taskId, dates);
+}
+
 export async function updateProjectStatus(projectId: string, status: string) {
     await assertActiveStaff();
     await prisma.project.update({
@@ -7167,6 +7399,24 @@ export async function updateProjectStartDateAction(projectId: string, startDateI
     return result;
 }
 
+// Shift unfinished work on an active project without moving its company-level
+// start marker or any payment milestone. ADMIN/MANAGER only.
+export async function shiftNotStartedTasksAction(projectId: string, deltaDays: number): Promise<ShiftNotStartedTasksResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await shiftNotStartedTasks({
+        projectId,
+        deltaDays,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
+}
+
 // Generate a project's schedule from its most recent qualifying estimate
 // (the same deterministic selection contractValue uses). ADMIN/MANAGER only.
 export async function generateProjectScheduleAction(projectId: string) {
@@ -7186,6 +7436,7 @@ export async function generateProjectScheduleAction(projectId: string) {
     const result = await generateScheduleFromEstimate({
         estimateId: estimate.id,
         mode: "merge",
+        requireEmptyProject: true,
         actor: { type: "TEAM", name: caller.name || caller.email },
     });
     revalidatePath("/company-dashboard");
@@ -7208,6 +7459,103 @@ export async function updateProjectCrewAction(projectId: string, userIds: string
     });
     revalidatePath("/company-dashboard");
     return result;
+}
+
+export async function applyChangeOrderToScheduleAction(changeOrderId: string, mode: "merge" | "regenerate" = "merge") {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await applyChangeOrderToSchedule({
+        changeOrderId,
+        mode,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${result.projectId}/schedule`);
+    return result;
+}
+
+export async function updateTaskCrewAction(taskId: string, userIds: string[]) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setTaskCrew({
+        taskId,
+        userIds,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${result.projectId}/schedule`);
+    return result;
+}
+
+export interface SaveCompanyScheduleTaskDatesInput {
+    taskId: string;
+    startDate: string; // YYYY-MM-DD
+    endDate: string;   // YYYY-MM-DD
+}
+
+export interface SaveCompanyScheduleTaskDateResult {
+    taskId: string;
+    ok: boolean;
+    startDate?: string;
+    endDate?: string;
+    error?: string;
+}
+
+export interface SaveCompanyScheduleTaskDatesResult {
+    results: SaveCompanyScheduleTaskDateResult[];
+    succeeded: number;
+    failed: number;
+}
+
+// Commit the company schedule board's draft-mode edits in one batch. ADMIN/
+// MANAGER only, same gate as the other dashboard batch actions. Loops the
+// canonical updateScheduleTask per task — deliberately NOT a second mutation
+// core — so every existing lock/validation/ActivityLog path applies
+// unchanged. One task's failure never blocks the rest: each change is applied
+// independently and reported in `results`, so the client can clear succeeded
+// drafts and keep failed ones pending for retry.
+export async function saveCompanyScheduleTaskDatesAction(
+    changes: SaveCompanyScheduleTaskDatesInput[],
+): Promise<SaveCompanyScheduleTaskDatesResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    if (changes.length > 200) throw new Error("Too many schedule changes in one save (max 200) — save in smaller batches");
+    // Deterministic dedupe: the LAST occurrence of a taskId wins and is applied
+    // exactly once (no duplicate activity records or inflated success counts).
+    const deduped = [...new Map(changes.map(change => [change.taskId, change])).values()];
+
+    const results: SaveCompanyScheduleTaskDateResult[] = [];
+    for (const change of deduped) {
+        try {
+            const task = await updateScheduleTask(change.taskId, {
+                startDate: change.startDate,
+                endDate: change.endDate,
+            });
+            results.push({
+                taskId: change.taskId,
+                ok: true,
+                startDate: task.startDate.toISOString(),
+                endDate: task.endDate.toISOString(),
+            });
+        } catch (err: any) {
+            results.push({ taskId: change.taskId, ok: false, error: err?.message ?? String(err) });
+        }
+    }
+
+    return {
+        results,
+        succeeded: results.filter(r => r.ok).length,
+        failed: results.filter(r => !r.ok).length,
+    };
 }
 
 export async function updateProjectColor(projectId: string, color: string) {
@@ -7800,7 +8148,7 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         const runAutomation = async () => {
             try {
                 const { handleChangeOrderApproved } = await import("./billing-core");
-                await handleChangeOrderApproved(id);
+                await handleChangeOrderApproved(id, { freshlyApproved: true });
             } catch (err) {
                 console.error("[approveChangeOrder] post-approval automation failed:", err);
             }
