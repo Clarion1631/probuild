@@ -125,13 +125,30 @@ export async function ensureQBCustomer(
         if (existing.length > 0) return client.qbCustomerId;
     }
 
-    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(client.name)}'`);
+    const name = client.name.trim();
+    if (!name) throw new Error("Client name is empty — cannot sync customer to QuickBooks.");
+    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`);
     if (byName.length > 0) return byName[0].Id;
+
+    // QBO normalizes whitespace when enforcing DisplayName uniqueness, so an
+    // exact match can miss while create still rejects as a duplicate (fault 6240).
+    // Prefix on the first word only, so internal-whitespace variants still match.
+    const normalize = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+    const prefix = name.split(/\s+/)[0];
+    const candidates = await qbQuery<{ Id: string; DisplayName?: string }>(
+        tokens,
+        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`
+    );
+    const matches = candidates.filter(c => normalize(c.DisplayName ?? "") === normalize(name));
+    if (matches.length > 1) {
+        throw new Error(`QB customer lookup for "${name}" matched ${matches.length} customers — resolve the duplicate in QuickBooks.`);
+    }
+    if (matches.length === 1) return matches[0].Id;
 
     const res = await qbFetch("/customer", tokens, {
         method: "POST",
         body: JSON.stringify({
-            DisplayName: client.name,
+            DisplayName: name,
             ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
         }),
     });
