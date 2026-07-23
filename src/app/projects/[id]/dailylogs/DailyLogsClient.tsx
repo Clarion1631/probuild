@@ -245,7 +245,6 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                         workPerformed: formWork,
                         materialsDelivered: formMaterials || undefined,
                         issues: formIssues || undefined,
-                        createdById: currentUserId,
                         photoUrls: photoUrls.length > 0 ? photoUrls : undefined,
                     });
                     toast.success("Daily log created!");

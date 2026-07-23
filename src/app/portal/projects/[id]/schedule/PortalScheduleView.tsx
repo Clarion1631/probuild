@@ -5,8 +5,8 @@ import PortalGanttChart from "./PortalGanttChart";
 import PortalCalendarView from "./PortalCalendarView";
 
 type Dependency = { id: string; predecessorId: string; dependentId: string };
-type TeamMember = { id: string; name: string | null; email: string };
-type Assignment = { id: string; userId: string; user: TeamMember };
+type Assignment = { id: string; userId: string; firstName: string };
+type SubAssignment = { id: string; companyName: string };
 type Comment = { id: string; text: string; createdAt: string; authorName: string };
 
 export type PortalTask = {
@@ -21,6 +21,7 @@ export type PortalTask = {
     order: number;
     dependencies: Dependency[];
     assignments?: Assignment[];
+    subAssignments?: SubAssignment[];
     comments?: Comment[];
 };
 

@@ -1886,7 +1886,8 @@ export interface DashboardTaskAssignment {
     userId: string;
     name: string;
     status: string;
-    role: string;
+    userRole: string;
+    assignmentRole: string;
 }
 
 export interface DashboardTaskComment {
@@ -2172,7 +2173,7 @@ export async function getCompanyDashboardData(
                 id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
-                    select: { id: true, userId: true, user: { select: { name: true, email: true, status: true, role: true } } },
+                    select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true } } },
                 },
                 // Hover-card notes (item 3): capped at 2, newest first — same
                 // audience as the project schedule page's own comment thread
@@ -2206,7 +2207,8 @@ export async function getCompanyDashboardData(
                 userId: a.userId,
                 name: a.user.name || a.user.email,
                 status: a.user.status,
-                role: a.user.role,
+                userRole: a.user.role,
+                assignmentRole: a.role,
             })),
             latestComments: task.comments.map(c => ({
                 text: c.text,
@@ -2889,6 +2891,7 @@ export async function setTaskCrew(input: {
             await tx.taskAssignment.deleteMany({ where: { taskId: input.taskId, userId: { in: toRemove } } });
         }
         for (const userId of toAdd) {
+            // Lead assignment is intentionally not settable here yet; task crew changes remain assigned until the later lead-management PR.
             await tx.taskAssignment.create({ data: { taskId: input.taskId, userId, role: "assigned" } });
         }
 

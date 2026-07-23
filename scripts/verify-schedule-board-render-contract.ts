@@ -257,8 +257,8 @@ assert.match(coreSource, /where: \{ status: "ACTIVATED", role: "FIELD_CREW" \}/)
 // addresses wrapped across six lines in the crew checklist).
 assert.doesNotMatch(coreSource, /name: `\$\{r\.name\} \(\$\{r\.email\}\)`/, "picker names must never carry email decorations");
 assert.match(crewPickersSource, /c\.status !== "ACTIVATED" \? "inactive" : c\.role\.toLowerCase\(\)\.replace\("_", " "\)/, "CrewPicker labels removable non-crew entries by role (or inactive)");
-assert.match(crewPickersSource, /a\.status !== "ACTIVATED" \? "inactive" : a\.role\.toLowerCase\(\)\.replace\("_", " "\)/, "TaskCrewPicker labels removable non-crew entries by role (or inactive)");
-assert.match(companyDashboardSource, /a\.role === "FINANCE" \? " \(finance\)"/, "the Schedule & crew task-row display keeps its own FINANCE label");
+assert.match(crewPickersSource, /a\.status !== "ACTIVATED" \? "inactive" : a\.userRole\.toLowerCase\(\)\.replace\("_", " "\)/, "TaskCrewPicker labels removable non-crew entries by role (or inactive)");
+assert.match(companyDashboardSource, /a\.userRole === "FINANCE" \? " \(finance\)"/, "the Schedule & crew task-row display keeps its own FINANCE label");
 assert.match(companyDashboardSource, /import \{ CrewPicker, TaskCrewPicker \} from "\.\/schedule-board\/CrewPickers"/, "the Schedule & crew table must reuse the extracted pickers, not redefine them");
 
 // ── Item 8: crew-grouped Timeline toggle ──
