@@ -2275,8 +2275,15 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         try {
             const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
             for (const milestone of pendingMilestones) {
-                const pushed = await pushMilestoneToQuickBooks(milestone.id);
-                if (milestone.id === deposit?.id) payLink = pushed.payLink;
+                // Per-milestone catch: one milestone failing (e.g. it changed mid-push
+                // and the conditional link claim refused) must not stop the remaining
+                // milestones from getting their QuickBooks links.
+                try {
+                    const pushed = await pushMilestoneToQuickBooks(milestone.id);
+                    if (milestone.id === deposit?.id) payLink = pushed.payLink;
+                } catch (e) {
+                    console.warn(`[approveEstimate] QuickBooks push skipped for milestone "${milestone.name}":`, e instanceof Error ? e.message : e);
+                }
             }
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
@@ -3614,27 +3621,11 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
-    // Claim the unlink atomically: the guard fields go in the WHERE, so if the QB
-    // sync settles this milestone (status→Paid, qbPaymentId set) between the read
-    // above and this write, the claim matches 0 rows and we never strip QB fields
-    // off a now-paid row. `qbInvoiceId` is pinned to the value we read so a
-    // concurrent re-push (new id) can't be clobbered either.
-    const cleared = await prisma.paymentSchedule.updateMany({
-        where: {
-            id: schedule.id,
-            status: { not: "Paid" },
-            qbPaymentId: null,
-            qbInvoiceId: schedule.qbInvoiceId,
-        },
-        data: {
-            qbInvoiceId: null,
-            qbInvoiceLink: null,
-            qbInvoiceSentAt: null,
-            qbSyncedAt: null,
-            qbSyncError: null,
-        },
-    });
-    if (cleared.count !== 1) {
+    // Claim the unlink atomically via the shared helper (also used by
+    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
+    const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
+    const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
+    if (!cleared) {
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
 
@@ -4145,81 +4136,57 @@ export async function splitInvoiceMilestones(
 ) {
     await assertInvoicePermission();
 
-    if (!milestones.length) throw new Error("At least one milestone is required");
-
-    const validated = milestones.map((m, i) => {
-        const name = (m.name || "").trim();
-        const amount = Math.round(Number(m.amount) * 100) / 100;
-        if (!name) throw new Error(`Milestone ${i + 1}: name is required`);
-        if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Milestone ${i + 1}: amount must be greater than zero`);
-        return { name, amount, dueDate: m.dueDate || null };
-    });
-
-    const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
-
-    // Interactive tx, invoice locked FIRST (canonical Estimate → Invoice order; this flow touches
-    // only the invoice). The paid portion is re-read from the LOCKED invoice, so a concurrent
-    // settle on a surviving Paid milestone can't leave paidAmount stale and get its balance
-    // overwritten. Arithmetic is otherwise unchanged from the original array-form transaction.
-    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(tx, { invoiceId });
-        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
-        if (!invoice) throw new Error("Invoice not found");
-
-        // Refuse to re-split while a payment is in flight on a non-Paid milestone. The delete
-        // below drops every non-Paid schedule; if one has an open Stripe checkout or a sent
-        // QuickBooks invoice, a settlement landing afterward would find no row to claim and the
-        // customer would be charged with nothing to reconcile against. Checked under the invoice
-        // lock so a checkout/QB-send starting concurrently can't slip in after this guard.
-        const inFlight = await tx.paymentSchedule.findFirst({
-            where: {
-                invoiceId,
-                status: { not: "Paid" },
-                OR: [
-                    { stripeSessionId: { not: null } },
-                    { stripePaymentIntentId: { not: null } },
-                    { qbInvoiceId: { not: null } },
-                ],
-            },
-            select: { name: true },
-        });
-        if (inFlight) {
-            throw new Error(
-                `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
-            );
-        }
-
-        // Recalculate balanceDue: paid amount stays the same, only pending changes
-        const paidAmount = Math.round(
-            (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
-        ) / 100;
-        const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : invoice.status === "Draft" ? "Draft"
-            : invoice.status === "Overdue" ? "Overdue"
-            : "Issued";
-
-        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
-        await tx.paymentSchedule.createMany({
-            data: validated.map((m) => ({
-                invoiceId,
-                name: m.name,
-                amount: m.amount,
-                status: "Pending",
-                dueDate: m.dueDate ? new Date(m.dueDate) : null,
-            })),
-        });
-        await tx.invoice.update({
-            where: { id: invoiceId },
-            data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
-        });
-        return invoice.projectId;
-    }));
+    const { splitInvoiceMilestonesCore } = await import("./billing-core");
+    const projectId = await splitInvoiceMilestonesCore(invoiceId, milestones);
 
     revalidatePath(`/projects/${projectId}/invoices`);
     revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
+
+    return { success: true };
+}
+
+/**
+ * Re-price the Pending milestones on an invoice without changing the invoice
+ * total ("Edit amounts"). See `updatePendingMilestoneAmountsCore` for the
+ * validation, mirror-sync, and QuickBooks re-stage details.
+ */
+export async function updatePendingMilestoneAmounts(
+    invoiceId: string,
+    rows: { scheduleId: string; name: string; amount: number; dueDate?: string | null }[],
+) {
+    await assertInvoicePermission();
+
+    const { updatePendingMilestoneAmountsCore } = await import("./billing-core");
+    const result = await updatePendingMilestoneAmountsCore(invoiceId, rows);
+
+    // Same paths splitInvoiceMilestones revalidates.
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
+    if (invoice) {
+        revalidatePath(`/projects/${invoice.projectId}/invoices`);
+        revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    }
+    revalidatePath(`/invoices`);
+
+    return result;
+}
+
+/**
+ * Delete a Pending, non-mirrored, non-QB-linked "extra charge" milestone —
+ * the inverse of `addInvoiceMilestone`. QB-linked rows must be unlinked via
+ * Break QB Link first; this action is DB-only.
+ */
+export async function deleteInvoiceMilestone(scheduleId: string) {
+    await assertInvoicePermission();
+
+    const { deleteInvoiceMilestoneCore } = await import("./billing-core");
+    const result = await deleteInvoiceMilestoneCore(scheduleId);
+
+    revalidatePath(`/projects/${result.projectId}/invoices`);
+    revalidatePath(`/projects/${result.projectId}/invoices/${result.invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/open-invoices`);
 
     return { success: true };
 }
