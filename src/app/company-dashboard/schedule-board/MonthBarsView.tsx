@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type DragEvent } from "react";
+import { useEffect, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
 import type {
     CalendarOverlays,
     CompanyDashboardData,
@@ -12,12 +12,15 @@ import {
     addDays,
     formatCurrency,
     formatDate,
+    getFallbackProjectColor,
     getMonthGrid,
     isSameUTCDay,
     isWeekend,
     parseUTCDate,
     todayUTC,
 } from "@/app/projects/[id]/schedule/schedule-utils";
+import { FloatingPopover } from "./FloatingPopover";
+import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
 import { ProjectBar, ProjectBarGridStartContext, type ProjectEditCallbacks } from "./ProjectBar";
 import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks } from "./TaskBlockSegment";
 import { MilestoneMarker } from "./MilestoneMarker";
@@ -25,7 +28,6 @@ import { PROJECT_DRAG_MIME } from "./UnscheduledTray";
 import { assignMonthProjectLanes, getEffectiveProjectRange, segmentProjectRange } from "./useBarLayout";
 
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const PROJECT_FALLBACK_COLORS = ["#2563eb", "#7c3aed", "#0f766e", "#c2410c", "#be123c", "#4338ca", "#047857", "#a21caf"];
 const EMPTY_INCOME: OverlayIncomeItem[] = [];
 const EMPTY_CHANGE_ORDERS: OverlayChangeOrderItem[] = [];
 
@@ -45,18 +47,23 @@ interface MonthBarsViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     isSaving: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     onTrayProjectDrop: (_project: DashboardProjectRow, _targetStart: string) => void;
+    // team/crew list for the context-menu "Project crew…"/"Task crew…"
+    // pickers (item 1) — reuses the exact CrewPicker/TaskCrewPicker the
+    // Schedule & crew table uses.
+    teamMembers: { id: string; name: string; email: string }[];
 }
 
-function fallbackProjectColor(projectId: string): string {
-    let hash = 0;
-    for (let index = 0; index < projectId.length; index++) hash = (hash * 31 + projectId.charCodeAt(index)) >>> 0;
-    return PROJECT_FALLBACK_COLORS[hash % PROJECT_FALLBACK_COLORS.length];
-}
-
-function projectConflictNames(projectId: string, conflicts: CompanyDashboardData["crewConflicts"]): string[] {
+// window: badges only reflect conflicts intersecting the visible grid — the
+// merged conflict list also carries availability-window pairs that may be
+// months away from the viewed grid.
+function projectConflictNames(projectId: string, conflicts: CompanyDashboardData["crewConflicts"], window: { start: Date; end: Date }): string[] {
     if (!conflicts) return [];
     return [...new Set(conflicts.flatMap(conflict =>
-        conflict.pairs.some(pair => pair.projectA.id === projectId || pair.projectB.id === projectId)
+        conflict.pairs.some(pair =>
+            (pair.projectA.id === projectId || pair.projectB.id === projectId)
+            && new Date(pair.overlapStart) < window.end
+            && new Date(pair.overlapEnd) > window.start,
+        )
             ? [conflict.name]
             : [],
     ))];
@@ -104,6 +111,7 @@ export function MonthBarsView({
     isSaving,
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
+    teamMembers,
     onProjectMoveCommit,
     activeProjectKeyboardId,
     onProjectPointerEditStart,
@@ -121,6 +129,20 @@ export function MonthBarsView({
 }: MonthBarsViewProps) {
     const [expandedWeeks, setExpandedWeeks] = useState<Set<number>>(() => new Set());
     const [dragOverDate, setDragOverDate] = useState<string | null>(null);
+    // Empty-day-cell "Schedule here…" context menu (item 1) — one instance
+    // for the whole view, point-anchored to the right-click location.
+    const [dayContextMenu, setDayContextMenu] = useState<{ date: string; point: { x: number; y: number } } | null>(null);
+    useEffect(() => {
+        if (!dayContextMenu) return;
+        const close = () => setDayContextMenu(null);
+        activateExclusiveMenu(close);
+        return () => deactivateExclusiveMenu(close);
+    }, [dayContextMenu]);
+    function handleDayContextMenu(dayKey: string, event: ReactMouseEvent<HTMLDivElement>) {
+        if (!data.canEdit) return; // read-only roles get the browser's default menu
+        event.preventDefault();
+        setDayContextMenu({ date: dayKey, point: { x: event.clientX, y: event.clientY } });
+    }
     const anchor = parseUTCDate(`${data.month}-01`);
     const days = getMonthGrid(anchor);
     const gridStart = days[0];
@@ -242,7 +264,7 @@ export function MonthBarsView({
                         const expanded = expandedWeeks.has(weekIndex);
 
                         return (
-                            <div key={weekIndex} className="relative grid min-h-[350px] grid-cols-7 border-b border-hui-border last:border-b-0">
+                            <div key={weekIndex} className="relative grid min-h-[414px] grid-cols-7 border-b border-hui-border last:border-b-0">
                                 {weekDays.map(day => {
                                     const dayKey = formatDate(day);
                                     const isToday = isSameUTCDay(day, today);
@@ -258,10 +280,11 @@ export function MonthBarsView({
                                             onDragOver={event => handleDayDragOver(dayKey, event)}
                                             onDragLeave={event => handleDayDragLeave(dayKey, event)}
                                             onDrop={event => handleDayDrop(dayKey, event)}
+                                            onContextMenu={event => handleDayContextMenu(dayKey, event)}
                                             className={`min-w-0 border-r border-hui-border p-1.5 last:border-r-0 ${isCurrentMonth ? (isWeekend(day) ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""} ${dragOverDate === dayKey ? "bg-indigo-50 ring-2 ring-inset ring-indigo-500" : ""}`}
                                         >
                                             <span className={`text-xs font-semibold ${isToday ? "inline-flex h-6 w-6 items-center justify-center rounded-full bg-indigo-600 text-white" : isCurrentMonth ? "text-hui-textMain" : "text-slate-400"}`}>{day.getUTCDate()}</span>
-                                            <div className="space-y-0.5 pt-[268px]">
+                                            <div className="space-y-0.5 pt-[332px]">
                                                 {incomeTotal != null && incomeTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-green-700" title="Income due this day (effective due date)">{formatCurrency(incomeTotal)} due</div>}
                                                 {projectedCoTotal != null && projectedCoTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-amber-700" title="Approved, unbilled change-order income projected this day">{formatCurrency(projectedCoTotal)} projected CO</div>}
                                                 {expenseTotal != null && expenseTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-red-700" title="Expenses this day">−{formatCurrency(expenseTotal)}</div>}
@@ -270,7 +293,10 @@ export function MonthBarsView({
                                         </div>
                                     );
                                 })}
-                                <div className="pointer-events-none absolute inset-x-0 top-8 grid h-[256px] grid-cols-7 grid-rows-[repeat(4,64px)] gap-y-0 px-0.5">
+                                {/* Readability pass (2026-07-22): row height 64->80px, sized for
+                                the new max bar height (18 top strip + 3 lanes * 18px = 72px, item
+                                5). pt-[332px]/top-[348px] below scale with this — see item 5. */}
+                                <div className="pointer-events-none absolute inset-x-0 top-8 grid h-[320px] grid-cols-7 grid-rows-[repeat(4,80px)] gap-y-0 px-0.5">
                                     {visibleSegments.map(segment => {
                                         const project = projectById.get(segment.projectId);
                                         if (!project) return null;
@@ -283,8 +309,8 @@ export function MonthBarsView({
                                                 <ProjectBar
                                                     project={project}
                                                     segment={segment}
-                                                    projectColor={project.color || fallbackProjectColor(project.id)}
-                                                    conflictNames={projectConflictNames(project.id, data.crewConflicts)}
+                                                    projectColor={project.color || getFallbackProjectColor(project.id)}
+                                                    conflictNames={projectConflictNames(project.id, data.crewConflicts, { start: gridStart, end: addDays(gridStart, 42) })}
                                                     incomeMilestones={milestoneMaps?.income.get(project.id) ?? EMPTY_INCOME}
                                                     changeOrderMilestones={milestoneMaps?.changeOrders.get(project.id) ?? EMPTY_CHANGE_ORDERS}
                                                     canEdit={data.canEdit}
@@ -295,6 +321,7 @@ export function MonthBarsView({
                                                     draftTaskIds={draftTaskIds}
                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                     activeProjectKeyboardId={activeProjectKeyboardId}
+                                                    teamMembers={teamMembers}
                                                     onProjectPointerEditStart={onProjectPointerEditStart}
                                                     onProjectKeyboardStart={onProjectKeyboardStart}
                                                     onProjectKeyboardAdjust={onProjectKeyboardAdjust}
@@ -336,18 +363,19 @@ export function MonthBarsView({
                                                         />
                                                     ))}
                                                     {project && taskMilestones.length > 0 && (
-                                                        <div className="absolute inset-x-0 bottom-0 h-[18px]">
+                                                        <div className="absolute inset-x-0 bottom-0 h-[22px]">
                                                             {taskMilestones.map(task => (
                                                                 <TaskBlockSegment
                                                                     key={task.id}
                                                                     task={task}
                                                                     projectRange={getEffectiveProjectRange(project) ?? visibleRange}
                                                                     visibleRange={visibleRange}
-                                                                    projectColor={project.color || fallbackProjectColor(project.id)}
+                                                                    projectColor={project.color || getFallbackProjectColor(project.id)}
                                                                     canEdit={data.canEdit}
                                                                     isPending={isSaving || pendingProjectIds.has(project.id) || pendingTaskIds.has(task.id)}
                                                                     isDraft={draftProjectIds.has(project.id) || draftTaskIds.has(task.id)}
                                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
+                                                                    teamMembers={teamMembers}
                                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                                     onTaskKeyboardStart={onTaskKeyboardStart}
                                                                     onTaskKeyboardAdjust={onTaskKeyboardAdjust}
@@ -365,7 +393,7 @@ export function MonthBarsView({
                                     })}
                                 </div>
                                 {hiddenCount > 0 && (
-                                    <div className="absolute right-2 top-[284px] z-40 text-right">
+                                    <div className="absolute right-2 top-[348px] z-40 text-right">
                                         <button
                                             type="button"
                                             onClick={() => setExpandedWeeks(current => {
@@ -394,6 +422,31 @@ export function MonthBarsView({
                     </div>
                 </div>
             </div>
+            <FloatingPopover open={dayContextMenu != null} anchorPoint={dayContextMenu?.point ?? null} onClose={() => setDayContextMenu(null)} width={220}>
+                <p className="px-1 text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">
+                    Schedule here — {dayContextMenu?.date}
+                </p>
+                {data.pipeline.waitingToStart.length === 0 ? (
+                    <p className="px-1 py-1 text-xs text-hui-textMuted">No unscheduled projects</p>
+                ) : (
+                    <ul className="max-h-56 space-y-0.5 overflow-y-auto">
+                        {data.pipeline.waitingToStart.map(project => (
+                            <li key={project.id}>
+                                <button
+                                    type="button"
+                                    className="block w-full truncate rounded px-2 py-1 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                                    onClick={() => {
+                                        if (dayContextMenu) onTrayProjectDrop(project, dayContextMenu.date);
+                                        setDayContextMenu(null);
+                                    }}
+                                >
+                                    {project.name}
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                )}
+            </FloatingPopover>
         </ProjectBarGridStartContext.Provider>
     );
 }

@@ -7297,6 +7297,58 @@ export async function updateProjectStartDateAction(projectId: string, startDateI
     return result;
 }
 
+// Set (or clear) a project's target end date — an IMMEDIATE write, unlike
+// task/project START dates on the company board, which route through the
+// draft-mode system (see ScheduleBoard.tsx). ADMIN/MANAGER only, same gate
+// pattern as updateProjectStartDateAction.
+//
+// Project.endDate feeds getEffectiveProjectRange (bar rendering, see
+// useBarLayout.ts) AND effectiveWorkEnd (schedule-core.ts — CO placement +
+// the project-window conflict rule) via the same raw value — moving it
+// changes where future CO blocks land. That's intentional, not a bug.
+export async function updateProjectEndDateAction(projectId: string, endDateISO: string | null) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+
+    const endDate = endDateISO ? parseStartDateInput(endDateISO) : null;
+    // Same lock family as setProjectStartDate: validate against the LOCKED
+    // startDate so a concurrent start move can't slip past the invariant.
+    const project = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const locked = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { id: true, name: true, startDate: true, endDate: true },
+        });
+        if (!locked) throw new Error("Project not found");
+        if (endDate && locked.startDate && endDate.getTime() <= locked.startDate.getTime()) {
+            throw new Error("End date must be after the project's start date");
+        }
+        await tx.project.update({ where: { id: projectId }, data: { endDate } });
+        return locked;
+    }));
+    await prisma.activityLog.create({
+        data: {
+            projectId,
+            actorType: "TEAM",
+            actorName: caller.name || caller.email,
+            action: "set_project_end_date",
+            entityType: "project",
+            entityId: projectId,
+            entityName: project.name,
+            metadata: JSON.stringify({
+                previousEndDate: project.endDate ? project.endDate.toISOString() : null,
+                endDate: endDate ? endDate.toISOString() : null,
+            }),
+        },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return { projectId, endDate: endDate ? endDate.toISOString() : null };
+}
+
 // Shift unfinished work on an active project without moving its company-level
 // start marker or any payment milestone. ADMIN/MANAGER only.
 export async function shiftNotStartedTasksAction(projectId: string, deltaDays: number): Promise<ShiftNotStartedTasksResult> {
@@ -7456,7 +7508,17 @@ export async function saveCompanyScheduleTaskDatesAction(
     };
 }
 
+// PB-schedule-002 item 2: this action previously had NO auth check at all
+// (not even assertActiveStaff) and, as of this change, no UI caller in the
+// repo either — tightened to the same schedule-permission gate as the other
+// per-project schedule mutations (deleteScheduleTask, reorderScheduleTasks,
+// etc.) rather than the weaker assertActiveStaff, since the company
+// schedule board's Color… menu item is schedules-scoped. The board's canEdit
+// is ADMIN/MANAGER-only (schedule-core.ts), and both hasPermission and
+// canAccessProject auto-pass ADMIN/MANAGER, so this is a no-op for that
+// caller.
 export async function updateProjectColor(projectId: string, color: string) {
+    await assertScheduleProjectAccess(projectId);
     await prisma.project.update({
         where: { id: projectId },
         data: { color }

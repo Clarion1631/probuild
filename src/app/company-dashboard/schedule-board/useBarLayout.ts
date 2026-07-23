@@ -96,7 +96,13 @@ export function getEffectiveProjectRange(project: DashboardProjectRow): DateRang
     // The marker day itself must stay visible even when it sits beyond the
     // last task (end-exclusive, so marker + 1 day).
     const markerEnd = markerStart ? addDays(markerStart, 1) : null;
-    const end = [latestTaskEnd, markerEnd].reduce<Date | null>(
+    // Project.endDate as an end candidate (item 3): mirrors schedule-core's
+    // effectiveWorkEnd, which takes Project.endDate DIRECTLY (no +1) as an
+    // already end-exclusive bound — the same value CO placement starts new
+    // work at. Using the same raw value here keeps the bar's visible range
+    // and the CO-placement window in agreement.
+    const projectEndDate = project.endDate ? parseSerializedUTCDay(project.endDate) : null;
+    const end = [latestTaskEnd, markerEnd, projectEndDate].reduce<Date | null>(
         (latest, candidate) => candidate && (!latest || candidate > latest) ? candidate : latest,
         null,
     );
