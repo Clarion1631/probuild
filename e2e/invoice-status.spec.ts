@@ -55,6 +55,6 @@ test.describe("canonical invoice status", () => {
         expect(migration).not.toContain('SET "firstViewedAt"');
 
         const importer = readFileSync(resolve(__dirname, "..", "scripts", "import-houzz.mjs"), "utf8");
-        expect(importer).toContain('"Partially Paid"');
+        expect(importer).toContain("status = 'Partially Paid'");
     });
 });
