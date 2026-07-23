@@ -7,7 +7,7 @@ import { prisma } from "../src/lib/prisma";
 import { getCompanyDashboardData, setProjectCrew, setProjectStartDate, setTaskCrew, shiftNotStartedTasks } from "../src/lib/schedule-core";
 import { canAccessProject, hasPermission } from "../src/lib/permissions";
 import { withTxRetry } from "../src/lib/tx-retry";
-import { saveCompanyScheduleTaskDatesAction, updateProjectEndDateAction } from "../src/lib/actions";
+import { addTaskComment, saveCompanyScheduleTaskDatesAction, updateProjectEndDateAction } from "../src/lib/actions";
 
 type Check = [label: string, passed: boolean];
 
@@ -295,6 +295,56 @@ async function main() {
             .find(candidate => candidate.id === waitingProject.id);
         check("dashboard computes distanceMilesFromShop for a known 1-degree-latitude offset (~69 mi)",
             waitingRowForDistance?.distanceMilesFromShop === 69);
+
+        // ── Owner-feedback round (2026-07-22), item 3: hover-card notes ──
+        // latestComments serialization — newest-first, capped at 2, author
+        // fallback chain (user.name -> user.email -> subcontractorName ->
+        // "Unknown"). Explicit createdAt values keep ordering deterministic
+        // regardless of DB clock precision.
+        const commentNamedUser = await prisma.user.create({
+            data: { email: `board-comment-named-${tag}@example.invalid`, name: `Board Commenter ${tag}`, role: "FIELD_CREW", status: "ACTIVATED" },
+        });
+        const commentUnnamedUser = await prisma.user.create({
+            data: { email: `board-comment-unnamed-${tag}@example.invalid`, name: null, role: "FIELD_CREW", status: "ACTIVATED" },
+        });
+        userIds.push(commentNamedUser.id, commentUnnamedUser.id);
+        const oldestComment = await prisma.taskComment.create({
+            data: { taskId: notStarted.id, text: `Oldest note ${tag} — capped out of latestComments`, subcontractorName: `Sub Crew ${tag}`, createdAt: at(-3) },
+        });
+        const middleComment = await prisma.taskComment.create({
+            data: { taskId: notStarted.id, text: `Middle note ${tag}`, userId: commentUnnamedUser.id, createdAt: at(-2) },
+        });
+        const newestComment = await prisma.taskComment.create({
+            data: { taskId: notStarted.id, text: `Newest note ${tag}`, userId: commentNamedUser.id, createdAt: at(-1) },
+        });
+        const commentsDashboard = await getCompanyDashboardData({ role: "ADMIN" }, month);
+        const commentsRow = commentsDashboard.pipeline.inProgress.find(candidate => candidate.id === project.id);
+        const commentsTask = commentsRow?.tasks.find(candidate => candidate.id === notStarted.id);
+        check("latestComments is capped at 2, newest first",
+            commentsTask?.latestComments.length === 2
+            && commentsTask.latestComments[0].text === newestComment.text
+            && commentsTask.latestComments[1].text === middleComment.text
+            && commentsTask.latestComments.every(c => c.text !== oldestComment.text));
+        check("latestComments falls back to user.email when the user has no name",
+            commentsTask?.latestComments[1].authorName === commentUnnamedUser.email);
+        check("latestComments uses user.name when present",
+            commentsTask?.latestComments[0].authorName === commentNamedUser.name);
+
+        // addTaskComment previously had NO auth check at all — hardened to
+        // assertScheduleTaskAccess (same gate updateScheduleTask/every other
+        // per-task mutation in this file uses). Reachability asserted the
+        // same way as the other actions above: this script runs outside a
+        // request scope, so a real auth wall is the expected outcome.
+        let addTaskCommentRan = false;
+        let addTaskCommentErr = "";
+        try {
+            await addTaskComment(notStarted.id, `Reachability probe ${tag}`);
+            addTaskCommentRan = true;
+        } catch (error) {
+            addTaskCommentErr = String((error as Error)?.message ?? error);
+        }
+        check("addTaskComment is reachable (runs, or hits the expected script auth wall outside a request scope)",
+            addTaskCommentRan || /Forbidden|Unauthorized|outside a request scope|headers/i.test(addTaskCommentErr));
 
         const allTasksBeforeZero = snapshot(await prisma.scheduleTask.findMany({
             where: { projectId: project.id },

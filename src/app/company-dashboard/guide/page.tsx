@@ -52,7 +52,8 @@ export default async function CompanyDashboardGuidePage() {
                     <p>Jobs that are ready but have no start date sit in the <strong>Unscheduled</strong> shelf above the calendar. Drag one onto the day it starts — its whole task schedule comes with it.</p>
                 </Step>
                 <Step n={2} title="Adjust dates by dragging">
-                    <p>Drag a whole bar to move the job. Drag a single phase block to move just that phase. Drag a block&apos;s edge to make it longer or shorter. Nothing is saved yet while you do this — pending moves show with a dashed outline.</p>
+                    <p>Drag a whole bar to move the job. Drag a single phase block to move just that phase, or its edge to make it longer or shorter. None of that is saved yet while you do this — pending moves show with a dashed outline.</p>
+                    <p>Drag the <strong>bar&apos;s own right edge</strong> to change the job&apos;s finish date — that one saves right away, no Save click needed.</p>
                 </Step>
                 <Step n={3} title="Hit Save when it looks right">
                     <p>A bar appears showing how many unsaved changes you have — <strong>Save</strong> writes them all at once, <strong>Discard</strong> puts everything back. If you move a job that&apos;s already In Progress, it asks whether to move just the start marker or also shift the work that hasn&apos;t started yet.</p>
@@ -65,7 +66,8 @@ export default async function CompanyDashboardGuidePage() {
             <div className="hui-card p-6 mb-6">
                 <h2 className="text-base font-semibold text-hui-textMain mb-4">Good to know</h2>
                 <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
-                    <li>Clicking a bar opens its menu (dates, crew, <em>Open project</em>). It never jumps you into the project by accident.</li>
+                    <li>Clicking a bar opens its menu (dates, crew, <em>Open project</em>). It never jumps you into the project by accident. Right-click anywhere for the same menus a click opens.</li>
+                    <li>Hover any phase block to see its latest notes. Add one from its menu with <em>Add note…</em>.</li>
                     <li>Every move is logged on the project&apos;s activity feed — nothing here emails a customer.</li>
                     <li>Diamond markers and the money toggles (Income, Expenses, Projected CO, Hours) only appear for admin logins.</li>
                     <li>Anything more detailed — dependencies, baselines, punch lists — lives on the job&apos;s own Schedule page (menu → Open project → Schedule).</li>

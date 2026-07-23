@@ -74,6 +74,9 @@ interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     // pickers (item 1) — reuses the exact CrewPicker/TaskCrewPicker the
     // Schedule & crew table uses.
     teamMembers: { id: string; name: string; email: string }[];
+    // Suppresses every task hover card while ANY schedule-board drag is
+    // active (item 3).
+    isAnyDragActive: boolean;
 }
 
 interface CrewTaskBlock {
@@ -172,6 +175,7 @@ export function TimelineView({
     onToggleGroupByCrew,
     scrollToTodayNonce,
     teamMembers,
+    isAnyDragActive,
     onProjectMoveCommit,
     activeProjectKeyboardId,
     onProjectPointerEditStart,
@@ -179,6 +183,7 @@ export function TimelineView({
     onProjectKeyboardAdjust,
     onProjectKeyboardCommit,
     onProjectKeyboardCancel,
+    onProjectEndResizeStart,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
     onTaskKeyboardAdjust,
@@ -595,12 +600,14 @@ export function TimelineView({
                                                 timelineLeftInset={LABEL_WIDTH}
                                                 timelineScrollContainerRef={scrollContainerRef}
                                                 teamMembers={teamMembers}
+                                                isAnyDragActive={isAnyDragActive}
                                                 onProjectPointerEditStart={onProjectPointerEditStart}
                                                 onProjectKeyboardStart={onProjectKeyboardStart}
                                                 onProjectKeyboardAdjust={onProjectKeyboardAdjust}
                                                 onProjectKeyboardCommit={onProjectKeyboardCommit}
                                                 onProjectKeyboardCancel={onProjectKeyboardCancel}
                                                 onMoveCommit={onProjectMoveCommit}
+                                                onProjectEndResizeStart={onProjectEndResizeStart}
                                                 onTaskPointerEditStart={onTaskPointerEditStart}
                                                 onTaskKeyboardStart={onTaskKeyboardStart}
                                                 onTaskKeyboardAdjust={onTaskKeyboardAdjust}
@@ -629,6 +636,7 @@ export function TimelineView({
                                                     timelineLeftInset={LABEL_WIDTH}
                                                     timelineScrollContainerRef={scrollContainerRef}
                                                     teamMembers={teamMembers}
+                                                    isAnyDragActive={isAnyDragActive}
                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                     onTaskKeyboardStart={onTaskKeyboardStart}
                                                     onTaskKeyboardAdjust={onTaskKeyboardAdjust}

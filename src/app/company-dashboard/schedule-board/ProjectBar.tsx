@@ -50,6 +50,10 @@ export interface ProjectEditCallbacks {
     onProjectKeyboardCommit: (_project: DashboardProjectRow) => void;
     onProjectKeyboardCancel: (_project: DashboardProjectRow) => void;
     onProjectMoveCommit: (_project: DashboardProjectRow, _targetStart: string) => void;
+    // Right-edge drag-to-resize the project's end date (item 2) — a SEPARATE
+    // pointer-drag from the whole-bar move above; it never joins the draft
+    // system, it commits immediately via updateProjectEndDateAction.
+    onProjectEndResizeStart: (_project: DashboardProjectRow, _start: ProjectEndResizePointerStart) => void;
 }
 
 export interface ProjectBarProps extends TaskEditCallbacks {
@@ -74,6 +78,9 @@ export interface ProjectBarProps extends TaskEditCallbacks {
     // Context-menu "Project crew…" / TaskBlockSegment's "Task crew…" (item 1)
     // reuse the exact CrewPicker/TaskCrewPicker the Schedule & crew table uses.
     teamMembers: { id: string; name: string; email: string }[];
+    // Suppresses every task's hover card while ANY schedule-board drag is
+    // active (item 3) — threaded through to this bar's own task renders.
+    isAnyDragActive: boolean;
     activeProjectKeyboardId: ProjectEditCallbacks["activeProjectKeyboardId"];
     onProjectPointerEditStart: ProjectEditCallbacks["onProjectPointerEditStart"];
     onProjectKeyboardStart: ProjectEditCallbacks["onProjectKeyboardStart"];
@@ -81,6 +88,7 @@ export interface ProjectBarProps extends TaskEditCallbacks {
     onProjectKeyboardCommit: ProjectEditCallbacks["onProjectKeyboardCommit"];
     onProjectKeyboardCancel: ProjectEditCallbacks["onProjectKeyboardCancel"];
     onMoveCommit: ProjectEditCallbacks["onProjectMoveCommit"];
+    onProjectEndResizeStart: ProjectEditCallbacks["onProjectEndResizeStart"];
 }
 
 export const ProjectBarGridStartContext = createContext<Date | null>(null);
@@ -97,6 +105,23 @@ export interface ProjectPointerEditStart {
     timelineScrollContainerRef?: RefObject<HTMLDivElement | null>;
 }
 
+// Right-edge resize drag (item 2) — deliberately separate from
+// ProjectPointerEditStart: no fallbackGrabDate (px→day math only, never
+// cell hit-testing), and it carries the project's CURRENT end so the drag
+// can compute a delta without re-deriving it from segment geometry.
+export interface ProjectEndResizePointerStart {
+    pointerId: number;
+    pointerType: string;
+    clientX: number;
+    clientY: number;
+    sourceElement: HTMLElement;
+    originalStart: string;
+    originalEnd: string;
+    timelineDayWidth?: number;
+    timelineLeftInset?: number;
+    timelineScrollContainerRef?: RefObject<HTMLDivElement | null>;
+}
+
 function initials(name: string): string {
     return name.trim().split(/\s+/).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
@@ -105,7 +130,7 @@ function initials(name: string): string {
 // CONTENT switches between a top-level list and each item's own sub-view
 // (item 1) — simpler and more robust than nesting flyout panels, and keeps
 // every item reachable by keyboard from the same panel.
-type BarMenuView = "main" | "dates" | "crew" | "color" | "end-date";
+type BarMenuView = "main" | "dates" | "crew" | "color";
 
 export function ProjectBar({
     project,
@@ -125,6 +150,7 @@ export function ProjectBar({
     timelineLeftInset,
     timelineScrollContainerRef,
     teamMembers,
+    isAnyDragActive,
     activeProjectKeyboardId,
     onProjectPointerEditStart,
     onProjectKeyboardStart,
@@ -132,6 +158,7 @@ export function ProjectBar({
     onProjectKeyboardCommit,
     onProjectKeyboardCancel,
     onMoveCommit,
+    onProjectEndResizeStart,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
     onTaskKeyboardAdjust,
@@ -235,6 +262,29 @@ export function ProjectBar({
         });
     }
 
+    // Right-edge grab handle (item 2): a SEPARATE pointer-drag from the
+    // whole-bar move above — stopPropagation so it wins over handlePointerDown
+    // within its own hit area instead of also starting a move-drag. Available
+    // whenever the bar's Actions menu is (canEdit), independent of
+    // canMoveProject — a Substantial Completion project can't have its START
+    // dragged, but its finish date is still editable, same as "Edit dates…".
+    function handleEndResizePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+        if (!canEdit || isPending || !event.isPrimary || (event.pointerType === "mouse" && event.button !== 0)) return;
+        event.stopPropagation();
+        onProjectEndResizeStart(project, {
+            pointerId: event.pointerId,
+            pointerType: event.pointerType,
+            clientX: event.clientX,
+            clientY: event.clientY,
+            sourceElement: event.currentTarget,
+            originalStart: formatDate(projectRange!.start),
+            originalEnd: formatDate(projectRange!.end),
+            timelineDayWidth,
+            timelineLeftInset,
+            timelineScrollContainerRef,
+        });
+    }
+
     function openMenu(anchorPoint: { x: number; y: number } | null) {
         setMenuAnchorPoint(anchorPoint);
         setMenuView("main");
@@ -284,10 +334,20 @@ export function ProjectBar({
         openMenu({ x: event.clientX, y: event.clientY });
     }
 
+    // Merged "Edit dates…" submit (item 1): a Start change and an End change
+    // are TWO INDEPENDENT writers fired from the same form. Start joins the
+    // existing draft system (onMoveCommit -> draftProjectMove — unsaved until
+    // Save); End calls updateProjectEndDateAction immediately and ONLY when
+    // it actually changed (the Clear button below fires the same action
+    // directly, unconditionally).
     function handleDateSubmit(event: FormEvent<HTMLFormElement>) {
         event.preventDefault();
-        if (!targetStart || isPending) return;
-        onMoveCommit(project, targetStart);
+        if (canMoveProject && targetStart && !isPending) {
+            onMoveCommit(project, targetStart);
+        }
+        if (endDateValue !== projectEndDate) {
+            submitEndDate(endDateValue || null);
+        }
         setMenuOpen(false);
     }
 
@@ -408,19 +468,14 @@ export function ProjectBar({
                                     {project.distanceMilesFromShop != null && (
                                         <p className="px-2 text-[10px] text-hui-textMuted">≈{project.distanceMilesFromShop} mi from shop</p>
                                     )}
-                                    {canMoveProject && (
-                                        <button type="button" onClick={() => setMenuView("dates")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
-                                            Edit dates…
-                                        </button>
-                                    )}
+                                    <button type="button" onClick={() => setMenuView("dates")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
+                                        Edit dates…
+                                    </button>
                                     <button type="button" onClick={() => setMenuView("crew")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
                                         Project crew…
                                     </button>
                                     <button type="button" onClick={() => setMenuView("color")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
                                         Color…
-                                    </button>
-                                    <button type="button" onClick={() => setMenuView("end-date")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
-                                        Set end date…
                                     </button>
                                     {project.status === "Waiting to Start" && (
                                         <button
@@ -434,20 +489,40 @@ export function ProjectBar({
                                     )}
                                 </div>
                             )}
-                            {menuView === "dates" && canMoveProject && (
+                            {menuView === "dates" && (
                                 <form onSubmit={handleDateSubmit} className="space-y-2">
                                     <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
-                                    <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-date-${project.id}-${segment.weekIndex}`}>Start date</label>
-                                    <input
-                                        id={`bar-project-date-${project.id}-${segment.weekIndex}`}
-                                        type="date"
-                                        value={targetStart}
-                                        onChange={event => setTargetStartDraft({ resetKey: actionResetKey, value: event.target.value })}
-                                        disabled={isPending}
-                                        className="hui-input w-full px-2 py-1 text-xs"
-                                    />
-                                    <button type="submit" disabled={isPending || !targetStart} className="hui-btn hui-btn-primary w-full text-xs disabled:cursor-wait disabled:opacity-60">
-                                        Move project
+                                    {canMoveProject && (
+                                        <div>
+                                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-date-${project.id}-${segment.weekIndex}`}>Start date</label>
+                                            <input
+                                                id={`bar-project-date-${project.id}-${segment.weekIndex}`}
+                                                type="date"
+                                                value={targetStart}
+                                                onChange={event => setTargetStartDraft({ resetKey: actionResetKey, value: event.target.value })}
+                                                disabled={isPending}
+                                                className="hui-input w-full px-2 py-1 text-xs"
+                                            />
+                                            <p className="mt-0.5 text-[9px] text-hui-textMuted">Joins unsaved changes — Save to commit.</p>
+                                        </div>
+                                    )}
+                                    <div>
+                                        <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-enddate-${project.id}`}>End date</label>
+                                        <input
+                                            id={`bar-project-enddate-${project.id}`}
+                                            type="date"
+                                            value={endDateValue}
+                                            onChange={event => setEndDateDraft({ resetKey: actionResetKey, value: event.target.value })}
+                                            disabled={isEndDatePending}
+                                            className="hui-input w-full px-2 py-1 text-xs"
+                                        />
+                                        <p className="mt-0.5 text-[9px] text-hui-textMuted">Saves immediately.</p>
+                                    </div>
+                                    <button type="button" disabled={isEndDatePending || !project.endDate} onClick={() => submitEndDate(null)} className="hui-btn hui-btn-secondary w-full text-[10px] disabled:opacity-60">
+                                        Clear end date
+                                    </button>
+                                    <button type="submit" disabled={isEndDatePending || (canMoveProject && (isPending || !targetStart))} className="hui-btn hui-btn-primary w-full text-xs disabled:cursor-wait disabled:opacity-60">
+                                        {isEndDatePending ? "Saving..." : "Save"}
                                     </button>
                                 </form>
                             )}
@@ -455,7 +530,7 @@ export function ProjectBar({
                                 <div className="space-y-2">
                                     <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
                                     <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Project crew</p>
-                                    <CrewPicker projectId={project.id} crew={project.crew} teamMembers={teamMembers} />
+                                    <CrewPicker projectId={project.id} crew={project.crew} teamMembers={teamMembers} variant="inline" />
                                 </div>
                             )}
                             {menuView === "color" && (
@@ -481,34 +556,30 @@ export function ProjectBar({
                                     </div>
                                 </div>
                             )}
-                            {menuView === "end-date" && (
-                                <div className="space-y-2">
-                                    <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
-                                    <p className="text-[10px] text-hui-textMuted">Immediate — not part of unsaved changes.</p>
-                                    <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-enddate-${project.id}`}>End date</label>
-                                    <input
-                                        id={`bar-project-enddate-${project.id}`}
-                                        type="date"
-                                        value={endDateValue}
-                                        onChange={event => setEndDateDraft({ resetKey: actionResetKey, value: event.target.value })}
-                                        disabled={isEndDatePending}
-                                        className="hui-input w-full px-2 py-1 text-xs"
-                                    />
-                                    <div className="grid grid-cols-2 gap-2">
-                                        <button type="button" disabled={isEndDatePending || !project.endDate} onClick={() => submitEndDate(null)} className="hui-btn hui-btn-secondary text-[10px] disabled:opacity-60">
-                                            Clear
-                                        </button>
-                                        <button type="button" disabled={isEndDatePending || !endDateValue} onClick={() => submitEndDate(endDateValue)} className="hui-btn hui-btn-primary text-[10px] disabled:opacity-60">
-                                            {isEndDatePending ? "Saving..." : "Save"}
-                                        </button>
-                                    </div>
-                                </div>
-                            )}
                         </FloatingPopover>
                     </>
                 )}
                 {segment.continuesAfter && <span aria-hidden="true">›</span>}
             </div>
+            {/* Right-edge resize handle (item 2) — confined to the title strip's
+            own 18px band (top-0, h-[18px]) so it can NEVER vertically overlap a
+            task block's own resize-right handle, which lives only inside the
+            task strip below (18px..barHeight). Only rendered on the segment
+            that actually ENDS the project (not a continuation into a future
+            week/timeline clip) — canEdit-gated like every other end-date
+            affordance (item 1), independent of canMoveProject. */}
+            {canEdit && !isPending && !segment.continuesAfter && (
+                <div
+                    role="presentation"
+                    aria-hidden="true"
+                    title={`Drag to change ${project.name}'s end date`}
+                    className="absolute right-0 top-0 z-20 h-[18px] w-1.5 touch-pan-y cursor-ew-resize opacity-0 transition group-hover/project:opacity-100 group-focus-within/project:opacity-100 [@media(hover:none)]:opacity-100"
+                    onPointerDown={handleEndResizePointerDown}
+                >
+                    <span className="absolute inset-y-1 left-0 w-px bg-white/90" />
+                    <span className="absolute inset-y-1 right-0 w-px bg-white/90" />
+                </div>
+            )}
             {hiddenTasks.length > 0 && (
                 <>
                     <button
@@ -549,6 +620,7 @@ export function ProjectBar({
                         timelineLeftInset={timelineLeftInset}
                         timelineScrollContainerRef={timelineScrollContainerRef}
                         teamMembers={teamMembers}
+                        isAnyDragActive={isAnyDragActive}
                         onTaskPointerEditStart={onTaskPointerEditStart}
                         onTaskKeyboardStart={onTaskKeyboardStart}
                         onTaskKeyboardAdjust={onTaskKeyboardAdjust}

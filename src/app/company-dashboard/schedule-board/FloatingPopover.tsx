@@ -21,6 +21,8 @@ export interface FloatingPopoverProps {
     children: ReactNode;
     /** Panel width in px — the panel right-aligns to the trigger by default (matching the prior `absolute right-0` menus), then clamps into the viewport. */
     width?: number;
+    /** Non-interactive hover card mode (schedule-board task hover notes): the panel never captures pointer events, so it can never trap the mouse mid-hover. Default false (normal click/context menu). */
+    pointerEventsNone?: boolean;
 }
 
 /**
@@ -33,7 +35,7 @@ export interface FloatingPopoverProps {
  * horizontally with an 8px viewport margin. Escape closes and returns focus
  * to the trigger; a pointerdown outside the panel and trigger also closes it.
  */
-export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224 }: FloatingPopoverProps) {
+export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224, pointerEventsNone = false }: FloatingPopoverProps) {
     const panelRef = useRef<HTMLDivElement | null>(null);
     const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
@@ -131,10 +133,19 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
                 maxHeight: position?.maxHeight,
                 overflowY: "auto",
                 width,
+                // Crew-picker rebuild (item 5): FloatingPopover is now the ONLY
+                // scroll owner any schedule-board menu ever nests — content
+                // (e.g. CrewChecklist) must never bring its own w-*/max-h-*
+                // scroller, and a viewport narrower than `width` must clip
+                // horizontally rather than overflow the screen.
+                maxWidth: `calc(100vw - ${2 * VIEWPORT_MARGIN_PX}px)`,
+                boxSizing: "border-box",
+                overflowX: "hidden",
+                overscrollBehaviorY: "contain",
                 visibility: position ? "visible" : "hidden",
             }}
-            className="z-[200] space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl"
-            onPointerDown={event => event.stopPropagation()}
+            className={`z-[200] space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl ${pointerEventsNone ? "pointer-events-none" : ""}`}
+            onPointerDown={pointerEventsNone ? undefined : event => event.stopPropagation()}
         >
             {children}
         </div>,

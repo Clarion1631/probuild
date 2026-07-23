@@ -51,6 +51,9 @@ interface MonthBarsViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     // pickers (item 1) — reuses the exact CrewPicker/TaskCrewPicker the
     // Schedule & crew table uses.
     teamMembers: { id: string; name: string; email: string }[];
+    // Suppresses every task hover card while ANY schedule-board drag is
+    // active (item 3).
+    isAnyDragActive: boolean;
 }
 
 // window: badges only reflect conflicts intersecting the visible grid — the
@@ -112,6 +115,7 @@ export function MonthBarsView({
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
     teamMembers,
+    isAnyDragActive,
     onProjectMoveCommit,
     activeProjectKeyboardId,
     onProjectPointerEditStart,
@@ -119,6 +123,7 @@ export function MonthBarsView({
     onProjectKeyboardAdjust,
     onProjectKeyboardCommit,
     onProjectKeyboardCancel,
+    onProjectEndResizeStart,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
     onTaskKeyboardAdjust,
@@ -322,12 +327,14 @@ export function MonthBarsView({
                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                     activeProjectKeyboardId={activeProjectKeyboardId}
                                                     teamMembers={teamMembers}
+                                                    isAnyDragActive={isAnyDragActive}
                                                     onProjectPointerEditStart={onProjectPointerEditStart}
                                                     onProjectKeyboardStart={onProjectKeyboardStart}
                                                     onProjectKeyboardAdjust={onProjectKeyboardAdjust}
                                                     onProjectKeyboardCommit={onProjectKeyboardCommit}
                                                     onProjectKeyboardCancel={onProjectKeyboardCancel}
                                                     onMoveCommit={onProjectMoveCommit}
+                                                    onProjectEndResizeStart={onProjectEndResizeStart}
                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                     onTaskKeyboardStart={onTaskKeyboardStart}
                                                     onTaskKeyboardAdjust={onTaskKeyboardAdjust}
@@ -376,6 +383,7 @@ export function MonthBarsView({
                                                                     isDraft={draftProjectIds.has(project.id) || draftTaskIds.has(task.id)}
                                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                                     teamMembers={teamMembers}
+                                                                    isAnyDragActive={isAnyDragActive}
                                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                                     onTaskKeyboardStart={onTaskKeyboardStart}
                                                                     onTaskKeyboardAdjust={onTaskKeyboardAdjust}
