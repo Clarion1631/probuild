@@ -385,7 +385,7 @@ const handler = createMcpHandler(
                         instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
                     });
                 }
-                const result = await sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, { reconcile }, "ChatGPT connector");
+                const result = await sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, { reconcile }, "ChatGPT connector", `mcp:${confirmToken}`);
                 return textResult(result);
             },
         );

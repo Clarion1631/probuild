@@ -787,6 +787,10 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                     const sentLabel = payment.qbInvoiceSentAt
                                         ? `Sent · ${new Date(payment.qbInvoiceSentAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
                                         : null;
+                                    const delivery = payment.sendAttemptMilestones?.[0]?.sendAttempt;
+                                    const viewLabel = payment.firstViewedAt
+                                        ? `Viewed ${new Date(payment.firstViewedAt).toLocaleString()}${payment.lastViewedAt && payment.lastViewedAt !== payment.firstViewedAt ? ` · last ${new Date(payment.lastViewedAt).toLocaleString()}` : ''}`
+                                        : null;
                                     return (
                                         <tr key={payment.id} className={`hover:bg-slate-50 transition ${isPastDue ? 'bg-red-50/30' : ''}`}>
                                             <td className="px-4 py-4 w-10 text-center">
@@ -834,6 +838,13 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                                 {sentLabel}
                                                             </div>
                                                         )}
+                                                        {delivery && (
+                                                            <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">
+                                                                Delivery: {delivery.lastError === 'interrupted' ? 'interrupted' : delivery.status}
+                                                                {delivery.deliveredAt ? ` · ${new Date(delivery.deliveredAt).toLocaleString()}` : ''}
+                                                            </div>
+                                                        )}
+                                                        {viewLabel && <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{viewLabel}</div>}
                                                     </>
                                                 )}
                                             </td>
@@ -858,9 +869,11 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                     {payment.status !== 'Paid' && payment.qbSyncError && (
                                                         <span
                                                             className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
-                                                            title="The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                            title={payment.qbSyncError === 'realmMismatch'
+                                                                ? 'The linked QuickBooks invoice belongs to a different QuickBooks company (the connection changed after it was staged). Use Break QB Link to clear it, then re-stage.'
+                                                                : 'The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice.'}
                                                         >
-                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : 'voided'}
+                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : payment.qbSyncError === 'realmMismatch' ? 'company changed' : 'voided'}
                                                         </span>
                                                     )}
                                                 </div>

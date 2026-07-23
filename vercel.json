@@ -17,12 +17,20 @@
       "schedule": "*/15 * * * *"
     },
     {
+      "path": "/api/cron/qbo-webhook-drain",
+      "schedule": "* * * * *"
+    },
+    {
       "path": "/api/cron/co-billing-sweep",
       "schedule": "30 * * * *"
     },
     {
       "path": "/api/cron/ar-digest",
       "schedule": "0 15 * * 1"
+    },
+    {
+      "path": "/api/cron/alignment-audit",
+      "schedule": "30 9 * * *"
     },
     {
       "path": "/api/cron/payment-reminders",

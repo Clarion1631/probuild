@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { sendMilestoneInvoices } from "@/lib/actions";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
@@ -24,6 +24,7 @@ export default function SendMilestonesModal({
     const [isSending, setIsSending] = useState(false);
     const [sendToEmail, setSendToEmail] = useState(clientEmail || "");
     const [phase, setPhase] = useState<"compose" | "review">("compose");
+    const sendRequestIdRef = useRef<string | null>(null);
     const [driftRows, setDriftRows] = useState<DriftRow[]>([]);
 
     const totalAmount = selectedPayments.reduce((sum, p) => sum + Number(p.amount), 0);
@@ -39,7 +40,17 @@ export default function SendMilestonesModal({
         const ids = reconcile ? driftRows.map(r => r.id) : selectedPaymentIds;
         setIsSending(true);
         try {
-            const result = await sendMilestoneInvoices(invoiceId, ids, email, reconcile ? { reconcile } : undefined);
+            sendRequestIdRef.current ||= crypto.randomUUID();
+            const result = await sendMilestoneInvoices(
+                invoiceId,
+                ids,
+                email,
+                reconcile ? { reconcile } : undefined,
+                sendRequestIdRef.current,
+            );
+            // A returned result is definitive. A thrown transport error retains the
+            // key so the next click resumes the same provider-idempotent attempt.
+            if (!result.retrySameRequest) sendRequestIdRef.current = null;
 
             // Drift detected → enter (or stay in) the review step. Never close here.
             if (result.needsReview && result.driftReview?.length) {
@@ -91,7 +102,7 @@ export default function SendMilestonesModal({
                     toast.error(`Detail: ${firstBad.error}`);
                 }
             }
-            onClose();
+            if (!result.retrySameRequest) onClose();
         } catch (e: any) {
             toast.error(e.message || "Failed to send invoices");
         } finally {
@@ -113,7 +124,12 @@ export default function SendMilestonesModal({
                                 : "The client will receive one email from your company listing only these milestones, with a link to view and pay online."}
                         </p>
                     </div>
-                    <button onClick={onClose} className="text-hui-textMuted hover:text-hui-textMain transition">
+                    <button
+                        onClick={onClose}
+                        disabled={isSending}
+                        aria-label="Close"
+                        className="text-hui-textMuted hover:text-hui-textMain transition disabled:cursor-not-allowed disabled:opacity-40"
+                    >
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                     </button>
                 </div>

@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions } from "@/lib/permissions";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { toNum } from "@/lib/prisma-helpers";
+import { deriveInvoiceStatus } from "@/lib/invoice-lifecycle";
 import { settleStripeEstimatePayment } from "@/lib/stripe-estimate-settlement";
 
 export const maxDuration = 60;
@@ -169,7 +170,13 @@ async function processSession(session: any, dryRun: boolean, details: BackfillDe
                 if (!invoice) return;
                 const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                 const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-                const newStatus = newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status;
+                const newStatus = deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: newBalance,
+                    issueDate: invoice.issueDate,
+                    sentAt: invoice.sentAt,
+                    paymentStatuses: siblings.map(schedule => schedule.status),
+                });
                 await t.invoice.update({ where: { id: invoiceId }, data: { balanceDue: newBalance, status: newStatus } });
             }));
         }

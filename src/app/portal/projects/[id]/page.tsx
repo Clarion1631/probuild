@@ -10,6 +10,7 @@ import PortalVisitTracker from "@/components/PortalVisitTracker";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
+import { displayInvoiceStatus } from "@/lib/invoice-lifecycle";
 
 const ALLOWED_TABS = [
     "overview", "estimates", "schedule", "invoices",
@@ -474,14 +475,15 @@ export default async function PortalProjectDetail(props: {
 
                 {activeTab === "invoices" && (
                     <div className="space-y-3">
-                        {project.invoices.map(inv => (
-                            <div key={inv.id} className="hui-card p-4">
+                        {project.invoices.map(inv => {
+                            const invoiceStatus = displayInvoiceStatus({ status: inv.status, payments: inv.payments });
+                            return <div key={inv.id} className="hui-card p-4">
                                 <div className="flex justify-between items-start mb-2 gap-2">
                                     <h3 className="font-semibold text-hui-textMain">Invoice #{inv.code}</h3>
-                                    <span className={`text-xs px-2 py-1 rounded-full font-medium shrink-0 ${inv.status === 'Paid' ? 'bg-green-100 text-green-700' :
-                                            inv.status === 'Overdue' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-800'
+                                    <span className={`text-xs px-2 py-1 rounded-full font-medium shrink-0 ${invoiceStatus === 'Paid' ? 'bg-green-100 text-green-700' :
+                                            invoiceStatus === 'Overdue' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-800'
                                         }`}>
-                                        {inv.status}
+                                        {invoiceStatus}
                                     </span>
                                 </div>
                                 <div className="flex justify-between text-sm mb-4">
@@ -530,8 +532,8 @@ export default async function PortalProjectDetail(props: {
                                         ))}
                                     </div>
                                 )}
-                            </div>
-                        ))}
+                            </div>;
+                        })}
                     </div>
                 )}
 

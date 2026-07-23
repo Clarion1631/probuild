@@ -33,7 +33,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // ------------------------------------
     // 1. INCOMING PAYMENTS (Invoices + Retainers)
     // ------------------------------------
-    let validInvoiceStatuses = ["Issued", "Paid", "Overdue", "Partially Paid", "Sent"];
+    let validInvoiceStatuses = ["Issued", "Paid", "Partially Paid"];
     if (includeUnissued) validInvoiceStatuses.push("Draft");
 
     // Include Sent/Viewed for the pendingApproval display bucket; Paid for completeness

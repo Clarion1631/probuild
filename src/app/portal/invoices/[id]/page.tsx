@@ -7,6 +7,7 @@ import { stripe } from "@/lib/stripe";
 import { toNum } from "@/lib/prisma-helpers";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-outbox";
+import { deriveInvoiceStatus } from "@/lib/invoice-lifecycle";
 
 // Fallback settlement for when the client lands back on the portal invoice page with a
 // Stripe session_id before the webhook has processed it. Mirrors the webhook's invoice
@@ -66,7 +67,13 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
                 .filter(s => s.status === "Paid")
                 .reduce((sum, s) => sum + toNum(s.amount), 0);
             const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-            const newStatus = newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status;
+            const newStatus = deriveInvoiceStatus({
+                currentStatus: invoice.status,
+                balanceDue: newBalance,
+                issueDate: invoice.issueDate,
+                sentAt: invoice.sentAt,
+                paymentStatuses: allSchedules.map(schedule => schedule.status),
+            });
             await t.invoice.update({
                 where: { id: invoice.id },
                 data: { balanceDue: newBalance, status: newStatus },

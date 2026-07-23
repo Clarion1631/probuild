@@ -5,6 +5,7 @@ import {
     getQBInvoicePaymentOptions, setQBInvoicePaymentOptions,
     createQBPaymentForInvoice, deleteQBPayment, deleteQBInvoice,
 } from "@/lib/quickbooks";
+import { validateQboMappingIdentity } from "@/lib/qbo-mapping-integrity";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -102,14 +103,30 @@ export async function POST(req: Request) {
 
     const schedules = await prisma.paymentSchedule.findMany({
         where: { qbInvoiceId: { not: null }, status: { not: "Paid" } },
-        select: { id: true, qbInvoiceId: true, name: true, invoice: { select: { code: true } } },
+        select: { id: true, qbInvoiceId: true, qbRealmId: true, name: true, invoice: { select: { code: true } } },
         take: 200,
     });
+    const mappingRows = schedules.length ? await prisma.paymentSchedule.groupBy({
+        by: ["qbRealmId", "qbInvoiceId"],
+        where: { qbInvoiceId: { in: schedules.map(schedule => schedule.qbInvoiceId!) } },
+        _count: { _all: true },
+    }) : [];
+    const mappingCounts = new Map(mappingRows.map(row => [`${row.qbRealmId ?? "<unbound>"}:${row.qbInvoiceId}`, row._count._all]));
 
     const results: { qbInvoiceId: string; code: string; result: string }[] = [];
     for (const s of schedules) {
         const qbId = s.qbInvoiceId!;
         try {
+            const identityIssue = validateQboMappingIdentity({
+                mappingCount: (mappingCounts.get(`${tokens.realmId}:${qbId}`) ?? 0)
+                    + (mappingCounts.get(`<unbound>:${qbId}`) ?? 0),
+                boundRealmId: s.qbRealmId,
+                activeRealmId: tokens.realmId,
+            });
+            if (identityIssue) {
+                results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: `${identityIssue.kind}-quarantined` });
+                continue;
+            }
             const current = await getQBInvoicePaymentOptions(tokens, qbId);
             if (!current) {
                 results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "not-found-in-qbo" });

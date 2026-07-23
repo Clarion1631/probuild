@@ -274,7 +274,7 @@ export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string):
  * so the sync poller can flag stuck milestones without acting on a blip.
  */
 export type QBInvoiceProbe =
-    | { state: "ok"; balance: number; total: number; paymentTxnIds: string[] }
+    | { state: "ok"; balance: number; total: number; paymentTxnIds: string[]; emailStatus: string | null }
     | { state: "voided" } // HTTP 200, exists, total & balance === 0, no linked payments
     | { state: "notFound" } // HTTP 400 Fault 610 or HTTP 404 (authoritative "gone" only)
     | { state: "error"; status: number }; // 401/429/5xx/network/malformed — transient, never act on
@@ -315,7 +315,7 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
             .map((t: any) => String(t.TxnId));
         // Voided invoices come back 200 with TotalAmt=0, Balance=0, and no linked payments.
         if (total === 0 && balance === 0 && paymentTxnIds.length === 0) return { state: "voided" };
-        return { state: "ok", balance, total, paymentTxnIds };
+        return { state: "ok", balance, total, paymentTxnIds, emailStatus: inv.EmailStatus ?? null };
     }
     if (res.status === 404) return { state: "notFound" };
     const body = await res.text().catch(() => "");
@@ -326,10 +326,18 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
 }
 
 /** Read a QBO payment (date / amount / reference) for receipt details. */
+export function extractLinkedInvoiceIds(payment: { Line?: Array<{ LinkedTxn?: Array<{ TxnType?: string; TxnId?: unknown }> }> }) {
+    return Array.from(new Set<string>(
+        (payment.Line || []).flatMap(line => line.LinkedTxn || [])
+            .filter(link => link.TxnType === "Invoice" && link.TxnId)
+            .map(link => String(link.TxnId)),
+    ));
+}
+
 export async function getQBPayment(
     tokens: QBTokens,
     paymentId: string
-): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null> {
+): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null; linkedInvoiceIds: string[] } | null> {
     const res = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
     if (!res.ok) return null;
     const data = await res.json();
@@ -339,6 +347,7 @@ export async function getQBPayment(
         txnDate: p.TxnDate || null,
         amount: Number(p.TotalAmt ?? 0),
         referenceNumber: p.PaymentRefNum || null,
+        linkedInvoiceIds: extractLinkedInvoiceIds(p),
     };
 }
 

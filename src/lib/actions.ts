@@ -32,6 +32,8 @@ import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
+import { deriveInvoiceStatus, displayInvoiceStatus } from "./invoice-lifecycle";
+import { qboRealmMatches } from "./qbo-mapping-integrity";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -2246,9 +2248,23 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     });
     if (!invoice) {
         const created = await createInvoiceFromEstimateInternal(estimateId);
+        const createdInvoice = await prisma.invoice.findUniqueOrThrow({
+            where: { id: created.id },
+            include: { payments: { select: { status: true } } },
+        });
+        const issuedAt = new Date();
         invoice = await prisma.invoice.update({
             where: { id: created.id },
-            data: { status: "Issued", issueDate: new Date() },
+            data: {
+                status: deriveInvoiceStatus({
+                    currentStatus: createdInvoice.status,
+                    balanceDue: Number(createdInvoice.balanceDue),
+                    issueDate: issuedAt,
+                    sentAt: createdInvoice.sentAt,
+                    paymentStatuses: createdInvoice.payments.map(payment => payment.status),
+                }),
+                issueDate: issuedAt,
+            },
             select: { id: true, code: true },
         });
     }
@@ -2619,12 +2635,14 @@ export async function sendMilestoneInvoices(
     // Per-milestone reconcile intents the user explicitly confirmed in the review
     // step: scheduleId -> the QBO total they saw and approved.
     opts?: { reconcile?: Record<string, number> },
+    sendRequestId?: string,
 ) {
     // Permission gate stays here (remotely invokable server action); the send
     // logic lives in billing-core.ts, shared with the MCP connector.
     const actor = await assertInvoicePermission();
     const { sendMilestoneInvoicesCore } = await import("./billing-core");
-    return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "");
+    if (!sendRequestId) throw new Error("sendRequestId is required");
+    return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "", sendRequestId);
 }
 
 export async function getInvoiceForPortal(id: string) {
@@ -2653,6 +2671,7 @@ export async function getInvoiceForPortal(id: string) {
             if (!invoice) return null;
             return {
                 ...invoice,
+                status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
                 projectName: invoice.project?.name || null,
                 clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
                 clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
@@ -2675,6 +2694,7 @@ export async function getInvoiceForPortal(id: string) {
         if (!invoice) return null;
         return {
             ...invoice,
+            status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
             projectName: invoice.project?.name || null,
             clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
             clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
@@ -2689,30 +2709,12 @@ export async function markInvoiceViewed(invoiceId: string) {
     const sessionClientId = await assertInvoicePortalAccess();
     if (!sessionClientId) return;
 
-    const claim = await prisma.invoice.updateMany({
-        where: {
-            id: invoiceId,
-            viewedAt: null,
-            OR: [
-                { clientId: sessionClientId },
-                { project: { clientId: sessionClientId } },
-            ],
-        },
-        data: { viewedAt: new Date() },
-    });
-    if (claim.count === 0) return;
-
-    const invoice = await prisma.invoice.findUnique({
-        where: { id: invoiceId },
-        select: {
-            viewedAt: true, code: true, projectId: true,
-            project: { select: { name: true, client: { select: { name: true } } } },
-            client: { select: { name: true } },
-        },
-    });
-    if (invoice) {
-        const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
-        const projectName = invoice.project?.name || "";
+    const { markInvoiceViewedCore } = await import("./invoice-lifecycle");
+    const view = await markInvoiceViewedCore(invoiceId, sessionClientId);
+    if (view.firstView) {
+        const { invoice } = view;
+        const clientName = invoice.clientName;
+        const projectName = invoice.projectName || "";
         try {
             const settings = await getCachedCompanySettings();
             if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
@@ -2737,7 +2739,7 @@ export async function markInvoiceViewed(invoiceId: string) {
                         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
                             <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${view.viewedAt.toLocaleString()}</p>
                             <div style="text-align: center; margin: 16px 0;">
                                 <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
                                     View Invoice
@@ -2752,15 +2754,6 @@ export async function markInvoiceViewed(invoiceId: string) {
         } catch (e) {
             console.error("[markInvoiceViewed] Notification block failed:", e);
         }
-        await logActivity({
-            projectId: invoice.projectId,
-            actorType: "CLIENT",
-            actorName: clientName,
-            action: "viewed_invoice",
-            entityType: "invoice",
-            entityId: invoiceId,
-            entityName: `Invoice ${invoice.code}`,
-        });
     }
 }
 
@@ -3349,10 +3342,20 @@ export async function getInvoice(id: string) {
             client: true,
             payments: {
                 orderBy: { createdAt: "asc" },
+                include: {
+                    sendAttemptMilestones: {
+                        orderBy: { sendAttempt: { createdAt: "desc" } },
+                        take: 1,
+                        select: { sendAttempt: { select: { status: true, sentAt: true, deliveredAt: true, lastError: true } } },
+                    },
+                },
             },
         },
     });
-    return invoice;
+    return invoice ? {
+        ...invoice,
+        status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
+    } : null;
 }
 
 /** Parse a payment-date input into a Date.
@@ -3451,10 +3454,13 @@ export async function recordPayment(
             .filter((s) => s.status === "Paid")
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : totalPaid > 0 ? "Partially Paid"
-            : invoice.status;
+        const newStatus = deriveInvoiceStatus({
+            currentStatus: invoice.status,
+            balanceDue: newBalance,
+            issueDate: invoice.issueDate,
+            sentAt: invoice.sentAt,
+            paymentStatuses: allSchedules.map(schedule => schedule.status),
+        });
 
         await t.invoice.update({
             where: { id: invoiceId },
@@ -3606,7 +3612,7 @@ export async function breakQBInvoiceLink(
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentId },
         select: {
-            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            id: true, status: true, qbInvoiceId: true, qbRealmId: true, qbPaymentId: true,
             invoiceId: true, invoice: { select: { projectId: true } },
         },
     });
@@ -3621,10 +3627,28 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
-    // Claim the unlink atomically via the shared helper (also used by
-    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
+    // Claim the unlink atomically via the shared realm-aware helper (also used by
+    // updatePendingMilestoneAmountsCore): the guard fields go in the WHERE, so if
+    // the QB sync settles this milestone (status→Paid, qbPaymentId set) between
+    // the read above and this write, the claim matches 0 rows and we never strip
+    // QB fields off a now-paid row. `qbInvoiceId`/`qbRealmId` are pinned to the
+    // values we read so a concurrent re-push (new id/realm) can't be clobbered.
+    // Open alignment findings for the broken link resolve in the same tx.
     const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
-    const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
+    const cleared = await prisma.$transaction(async (tx) => {
+        const claimed = await claimQBInvoiceUnlink(tx, schedule.id, schedule.qbInvoiceId!, schedule.qbRealmId);
+        if (claimed) {
+            await tx.alignmentFinding.updateMany({
+                where: {
+                    paymentScheduleId: schedule.id,
+                    qbInvoiceId: schedule.qbInvoiceId!,
+                    resolvedAt: null,
+                },
+                data: { resolvedAt: new Date() },
+            });
+        }
+        return claimed;
+    });
     if (!cleared) {
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
@@ -3637,8 +3661,12 @@ export async function breakQBInvoiceLink(
             const { getFreshQBTokens } = await import("./quickbooks-payments");
             const { deleteQBInvoice } = await import("./quickbooks");
             const tokens = await getFreshQBTokens();
-            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
+            if (!qboRealmMatches(schedule.qbRealmId, tokens.realmId)) {
+                warning = "Link cleared in ProBuild, but the QuickBooks invoice was not deleted because its company realm is unbound or no longer active.";
+            } else {
+                const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
             if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
+            }
         } catch {
             warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
         }
@@ -3740,7 +3768,13 @@ export async function recordEstimatePayment(
                     where: { id: linkedInvoice.id },
                     data: {
                         balanceDue: invBalance,
-                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : linkedInvoice.status,
+                        status: deriveInvoiceStatus({
+                            currentStatus: linkedInvoice.status,
+                            balanceDue: invBalance,
+                            issueDate: linkedInvoice.issueDate,
+                            sentAt: linkedInvoice.sentAt,
+                            paymentStatuses: allCopies.map(schedule => schedule.status),
+                        }),
                     },
                 });
                 mirroredCopyId = copy.id;
@@ -3950,7 +3984,13 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
                     where: { id: linkedInvoice.id },
                     data: {
                         balanceDue: invBalance,
-                        status: invBalance <= 0 ? "Paid" : invPaid > 0 ? "Partially Paid" : "Issued",
+                        status: deriveInvoiceStatus({
+                            currentStatus: linkedInvoice.status,
+                            balanceDue: invBalance,
+                            issueDate: linkedInvoice.issueDate,
+                            sentAt: linkedInvoice.sentAt,
+                            paymentStatuses: allCopies.map(schedule => schedule.status),
+                        }),
                     },
                 });
             }
@@ -4098,7 +4138,7 @@ export async function addInvoiceMilestone(
     if (!name) throw new Error("Milestone name is required");
     if (!Number.isFinite(amount) || amount <= 0) throw new Error("Milestone amount must be greater than zero");
 
-    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { payments: { select: { status: true } } } });
     if (!invoice) throw new Error("Invoice not found");
 
     await prisma.paymentSchedule.create({
@@ -4111,7 +4151,14 @@ export async function addInvoiceMilestone(
         },
     });
 
-    const nextStatus = invoice.status === "Paid" ? "Partially Paid" : invoice.status;
+    const nextBalance = Number(invoice.balanceDue) + amount;
+    const nextStatus = deriveInvoiceStatus({
+        currentStatus: invoice.status,
+        balanceDue: nextBalance,
+        issueDate: invoice.issueDate,
+        sentAt: invoice.sentAt,
+        paymentStatuses: [...invoice.payments.map(payment => payment.status), "Pending"],
+    });
     await prisma.invoice.update({
         where: { id: invoiceId },
         data: {
@@ -4229,16 +4276,13 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
             .reduce((sum, s) => sum + toNum(s.amount), 0);
         const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
         
-        let newStatus = invoice.status;
-        if (newBalance <= 0) {
-            newStatus = "Paid";
-        } else if (totalPaid > 0) {
-            newStatus = "Partially Paid";
-        } else if (invoice.status === "Overdue") {
-            newStatus = "Overdue";
-        } else {
-            newStatus = "Issued"; // default state for issued invoices with no payments
-        }
+        const newStatus = deriveInvoiceStatus({
+            currentStatus: invoice.status,
+            balanceDue: newBalance,
+            issueDate: invoice.issueDate,
+            sentAt: invoice.sentAt,
+            paymentStatuses: allSchedules.map(schedule => schedule.status),
+        });
 
         await tx.invoice.update({
             where: { id: invoiceId },
@@ -4305,31 +4349,51 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
 
 export async function getProjectInvoices(projectId: string) {
     await assertInvoicePermission();
-    return await prisma.invoice.findMany({
+    const invoices = await prisma.invoice.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
-        include: { client: true },
+        include: { client: true, payments: { select: { dueDate: true, status: true } } },
     });
+    return invoices.map(invoice => ({
+        ...invoice,
+        status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
+    }));
 }
 
 export async function getAllInvoices() {
     await assertInvoicePermission();
-    return await prisma.invoice.findMany({
+    const invoices = await prisma.invoice.findMany({
         orderBy: { createdAt: "desc" },
         include: {
             project: { select: { id: true, name: true } },
             client: { select: { id: true, name: true } },
+            payments: { select: { dueDate: true, status: true } },
         },
     });
+    return invoices.map(invoice => ({
+        ...invoice,
+        status: displayInvoiceStatus({ status: invoice.status, payments: invoice.payments }),
+    }));
 }
 
 export async function issueInvoice(invoiceId: string) {
     await assertInvoicePermission();
+    const current = await prisma.invoice.findUniqueOrThrow({
+        where: { id: invoiceId },
+        include: { payments: { select: { status: true } } },
+    });
+    const issuedAt = new Date();
     const invoice = await prisma.invoice.update({
         where: { id: invoiceId },
         data: {
-            status: "Issued",
-            issueDate: new Date(),
+            status: deriveInvoiceStatus({
+                currentStatus: current.status,
+                balanceDue: Number(current.balanceDue),
+                issueDate: issuedAt,
+                sentAt: current.sentAt,
+                paymentStatuses: current.payments.map(payment => payment.status),
+            }),
+            issueDate: issuedAt,
         },
     });
     revalidatePath(`/projects/${invoice.projectId}/invoices`);
@@ -4397,6 +4461,7 @@ const staffCompanySettingsSelect = {
     letterheadDivider: true,
     notificationToggles: true,
     requireContractCountersign: true,
+    qbAlsoSendIntuitEmail: true,
     updatedAt: true,
 } as const;
 
@@ -4493,6 +4558,7 @@ export async function saveCompanySettings(data: any) {
             enableAffirm: data.enableAffirm,
             enableKlarna: data.enableKlarna,
             passProcessingFee: data.passProcessingFee,
+            qbAlsoSendIntuitEmail: data.qbAlsoSendIntuitEmail,
             cardProcessingRate: data.cardProcessingRate !== undefined ? parseFloat(data.cardProcessingRate) : undefined,
             cardProcessingFlat: data.cardProcessingFlat !== undefined ? parseFloat(data.cardProcessingFlat) : undefined,
             workDays: data.workDays,
@@ -7095,7 +7161,7 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
 
-    let items: string[] = JSON.parse(rawText);
+    const items: string[] = JSON.parse(rawText);
     if (!Array.isArray(items)) throw new Error("Invalid AI response");
 
     const maxOrder = await prisma.taskPunchItem.aggregate({

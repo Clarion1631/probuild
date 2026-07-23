@@ -3,6 +3,7 @@ import { enqueueMilestonePaid } from "@/lib/payment-outbox";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { lockMoneyParents, withTxRetry } from "@/lib/tx-retry";
+import { deriveInvoiceStatus } from "@/lib/invoice-lifecycle";
 
 export type StripeEstimateSettlement = {
     stripeSessionId?: string | null;
@@ -170,9 +171,13 @@ export async function settleStripeEstimatePayment(
                 return paid ? sum + toNum(sibling.amount) : sum;
             }, 0);
             const invoiceBalance = Math.max(0, toNum(invoice.totalAmount) - invoicePaid);
-            const invoiceStatus = invoiceBalance <= 0
-                ? "Paid"
-                : invoicePaid > 0 ? "Partially Paid" : invoice.status;
+            const invoiceStatus = deriveInvoiceStatus({
+                currentStatus: invoice.status,
+                balanceDue: invoiceBalance,
+                issueDate: invoice.issueDate,
+                sentAt: invoice.sentAt,
+                paymentStatuses: invoiceSiblings.map(sibling => sibling.id === mirror.id && mirrorClaimed ? "Paid" : sibling.status),
+            });
             invoiceParentChanged = toNum(invoice.balanceDue) !== invoiceBalance || invoice.status !== invoiceStatus;
 
             if (!input.dryRun && invoiceParentChanged) {

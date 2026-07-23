@@ -22,7 +22,7 @@ export default async function PortalDashboard() {
             include: {
                 client: { select: { name: true } },
                 invoices: {
-                    where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
+                    where: { status: { in: ['Issued', 'Partially Paid'] } },
                     select: { id: true, balanceDue: true }
                 }
             }
@@ -68,7 +68,7 @@ export default async function PortalDashboard() {
                     orderBy: { createdAt: 'desc' },
                     include: {
                         invoices: {
-                            where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
+                            where: { status: { in: ['Issued', 'Partially Paid'] } },
                             select: { id: true, balanceDue: true }
                         }
                     }

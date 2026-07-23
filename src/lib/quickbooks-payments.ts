@@ -16,6 +16,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
+import { deriveInvoiceStatus } from "./invoice-lifecycle";
 import {
     type QBTokens,
     refreshQBToken,
@@ -29,6 +30,7 @@ import {
     deleteQBInvoice,
 } from "./quickbooks";
 import type { QBSyncIssue } from "./payment-notifications";
+import { qboAmountsMatch, validateQboMappingIdentity } from "./qbo-mapping-integrity";
 
 export class QBNotConnectedError extends Error {
     constructor() {
@@ -69,6 +71,7 @@ export async function claimQBInvoiceUnlink(
     client: Prisma.TransactionClient,
     scheduleId: string,
     expectedQbInvoiceId: string,
+    expectedQbRealmId: string | null,
 ): Promise<boolean> {
     const cleared = await client.paymentSchedule.updateMany({
         where: {
@@ -76,9 +79,11 @@ export async function claimQBInvoiceUnlink(
             status: { not: "Paid" },
             qbPaymentId: null,
             qbInvoiceId: expectedQbInvoiceId,
+            qbRealmId: expectedQbRealmId,
         },
         data: {
             qbInvoiceId: null,
+            qbRealmId: null,
             qbInvoiceLink: null,
             qbInvoiceSentAt: null,
             qbSyncedAt: null,
@@ -138,6 +143,21 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     const tokens = passedTokens ?? await getFreshQBTokens();
 
     if (schedule.qbInvoiceId) {
+        const identityIssue = validateQboMappingIdentity({
+            mappingCount: await prisma.paymentSchedule.count({
+                where: {
+                    qbInvoiceId: schedule.qbInvoiceId,
+                    OR: [{ qbRealmId: tokens.realmId }, { qbRealmId: null }],
+                },
+            }),
+            boundRealmId: schedule.qbRealmId,
+            activeRealmId: tokens.realmId,
+        });
+        if (identityIssue) {
+            throw new Error(identityIssue.kind === "duplicate_qbo_mapping"
+                ? "QuickBooks invoice is linked to multiple milestones; break the duplicate link before continuing"
+                : "QuickBooks invoice realm is unbound or changed; run the lifecycle migration or break and recreate the link");
+        }
         const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId));
         const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId);
         const linkChanged = !!payLink && payLink !== schedule.qbInvoiceLink;
@@ -191,7 +211,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     // QBO Automated Sales Tax can recalculate on top of what we send — verify the
     // grand total still equals the milestone. A drift means the client would be
     // asked for a different amount than ProBuild expects; flag it loudly.
-    if (Math.abs(total - amount) > 0.05) {
+    if (!qboAmountsMatch(amount, total)) {
         console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
     }
 
@@ -219,7 +239,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
             dueDate: schedule.dueDate,
         },
         // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
-        data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
+        data: { qbInvoiceId: qbId, qbRealmId: tokens.realmId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
     });
     if (linked.count !== 1) {
         const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
@@ -237,10 +257,11 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
  * Mark a milestone Paid from a QuickBooks settlement. Mirrors the Stripe
  * webhook's claim-then-recalculate transaction so balances never drift.
  */
-async function markMilestonePaidFromQB(
+export async function markMilestonePaidFromQB(
     paymentScheduleId: string,
     invoiceId: string,
-    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null }
+    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null },
+    settlement: { qbInvoiceId: string; realmId: string; qboTotal: number },
 ): Promise<boolean> {
     return withTxRetry(() => prisma.$transaction(async (t) => {
         // Canonical lock order: Estimate → Invoice → schedules. This settle mirrors onto the
@@ -248,6 +269,25 @@ async function markMilestonePaidFromQB(
         // matching recordPayment/recordEstimatePayment so overlapping settles never invert order.
         const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
         await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+
+        // Revalidate the money evidence after taking the invoice lock. This
+        // closes the gap between a worker's QBO probe and the settlement write.
+        const currentSchedule = await t.paymentSchedule.findUnique({ where: { id: paymentScheduleId } });
+        if (!currentSchedule || currentSchedule.invoiceId !== invoiceId
+            || !qboAmountsMatch(toNum(currentSchedule.amount), settlement.qboTotal)) return false;
+        const mappingStillMatches = currentSchedule.qbInvoiceId === settlement.qbInvoiceId
+            && currentSchedule.qbRealmId === settlement.realmId;
+        const linkWasExplicitlyBroken = currentSchedule.qbInvoiceId === null && currentSchedule.qbRealmId === null;
+        if (!mappingStillMatches && !linkWasExplicitlyBroken) return false;
+        if (mappingStillMatches) {
+            const unsafeMappingCount = await t.paymentSchedule.count({
+                where: {
+                    qbInvoiceId: settlement.qbInvoiceId,
+                    OR: [{ qbRealmId: settlement.realmId }, { qbRealmId: null }],
+                },
+            });
+            if (unsafeMappingCount !== 1) return false;
+        }
 
         // INVARIANT: do NOT pin qbInvoiceId in this claim. A real QBO settlement must
         // win over a concurrent breakQBInvoiceLink (which nulls qbInvoiceId): pinning it
@@ -279,7 +319,13 @@ async function markMilestonePaidFromQB(
             where: { id: invoiceId },
             data: {
                 balanceDue: newBalance,
-                status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: newBalance,
+                    issueDate: invoice.issueDate,
+                    sentAt: invoice.sentAt,
+                    paymentStatuses: allSchedules.map(schedule => schedule.status),
+                }),
             },
         });
 
@@ -421,7 +467,13 @@ export async function reconcileMilestoneToQbo(
                 subtotal: tax.subtotal,
                 taxAmount: tax.taxAmount,
                 balanceDue: newBalance,
-                status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: newBalance,
+                    issueDate: invoice.issueDate,
+                    sentAt: invoice.sentAt,
+                    paymentStatuses: allSchedules.map(schedule => schedule.status),
+                }),
             },
         });
 
@@ -496,7 +548,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
             ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
         },
         select: {
-            id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
+            id: true, invoiceId: true, qbInvoiceId: true, qbRealmId: true, qbSyncError: true, name: true, amount: true,
             invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
         },
         take: 100,
@@ -514,10 +566,28 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     // Milestones whose linked QBO invoice was found voided/deleted THIS run (flag was
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
+    const mappingRows = await prisma.paymentSchedule.groupBy({
+        by: ["qbRealmId", "qbInvoiceId"],
+        where: { qbInvoiceId: { in: pending.map(schedule => schedule.qbInvoiceId!) } },
+        _count: { _all: true },
+    });
+    const mappingCounts = new Map(mappingRows.map(row => [`${row.qbRealmId ?? "<unbound>"}:${row.qbInvoiceId}`, row._count._all]));
 
     for (const schedule of pending) {
         result.checked++;
         try {
+            const identityIssue = validateQboMappingIdentity({
+                mappingCount: (mappingCounts.get(`${tokens.realmId}:${schedule.qbInvoiceId}`) ?? 0)
+                    + (mappingCounts.get(`<unbound>:${schedule.qbInvoiceId}`) ?? 0),
+                boundRealmId: schedule.qbRealmId,
+                activeRealmId: tokens.realmId,
+            });
+            if (identityIssue) {
+                result.errors.push(identityIssue.kind === "duplicate_qbo_mapping"
+                    ? `${schedule.invoice.code}/${schedule.name}: duplicate QBO invoice mapping; settlement quarantined`
+                    : `${schedule.invoice.code}/${schedule.name}: QBO realm is unbound or changed; settlement quarantined`);
+                continue;
+            }
             const probe = await probeQBInvoice(tokens, schedule.qbInvoiceId!);
             // Transient error (token/429/5xx/network) — leave untouched and retry next run.
             if (probe.state === "error") continue;
@@ -559,6 +629,10 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
             }
 
             // probe.state === "ok"
+            if (!qboAmountsMatch(Number(schedule.amount), probe.total)) {
+                result.errors.push(`${schedule.invoice.code}/${schedule.name}: QBO total differs from ProBuild; settlement quarantined`);
+                continue;
+            }
             if (probe.total > 0 && probe.balance <= 0) {
                 // Fully settled in QuickBooks (online payment OR a check Vanessa applied)
                 const paymentId = probe.paymentTxnIds[0] || null;
@@ -573,7 +647,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                     paidAt,
                     referenceNumber,
                     qbPaymentId: paymentId,
-                });
+                }, { qbInvoiceId: schedule.qbInvoiceId!, realmId: tokens.realmId, qboTotal: probe.total });
                 if (recorded) {
                     result.settled++;
                     await drainPaymentNotifications({ scheduleId: schedule.id }).catch(() => {});

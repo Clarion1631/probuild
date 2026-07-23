@@ -40,6 +40,7 @@ export default function PaymentMethodsClient({ initialSettings }: { initialSetti
         passProcessingFee: initialSettings?.passProcessingFee ?? false,
         cardProcessingRate: initialSettings?.cardProcessingRate ?? 2.9,
         cardProcessingFlat: initialSettings?.cardProcessingFlat ?? 0.30,
+        qbAlsoSendIntuitEmail: initialSettings?.qbAlsoSendIntuitEmail ?? false,
     });
     const [isPending, startTransition] = useTransition();
 
@@ -56,6 +57,24 @@ export default function PaymentMethodsClient({ initialSettings }: { initialSetti
 
     return (
         <div className="space-y-6">
+            <div className="hui-card p-6">
+                <div className="flex items-start justify-between gap-4">
+                    <div>
+                        <h2 className="text-base font-semibold text-hui-textMain">QuickBooks duplicate email</h2>
+                        <p className="text-sm text-hui-textMuted mt-0.5">Off by default. ProBuild remains the client-facing email; enable only if you also want Intuit to send its own copy.</p>
+                    </div>
+                    <button
+                        type="button"
+                        role="switch"
+                        aria-checked={data.qbAlsoSendIntuitEmail}
+                        onClick={() => setData(prev => ({ ...prev, qbAlsoSendIntuitEmail: !prev.qbAlsoSendIntuitEmail }))}
+                        className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-hui-primary focus:ring-offset-2 ${data.qbAlsoSendIntuitEmail ? "bg-hui-primary" : "bg-slate-300"}`}
+                    >
+                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${data.qbAlsoSendIntuitEmail ? "translate-x-6" : "translate-x-1"}`} />
+                    </button>
+                </div>
+            </div>
+
             {/* Stripe Enable */}
             <div className="hui-card p-6">
                 <div className="flex items-start justify-between gap-4">

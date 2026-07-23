@@ -8,6 +8,7 @@ import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
 import { settleStripeEstimatePayment } from "@/lib/stripe-estimate-settlement";
+import { deriveInvoiceStatus } from "@/lib/invoice-lifecycle";
 
 // Helper function to process a single event by eventId asynchronously
 async function processEvent(eventId: string) {
@@ -87,10 +88,13 @@ async function processEvent(eventId: string) {
                         if (!invoice) return { alreadyPaid, invoice: null as null, paidSchedule: null as null, newBalance: 0 };
                         const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                         const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-                        const newStatus = newBalance <= 0
-                            ? "Paid"
-                            : totalPaid > 0 ? "Partially Paid"
-                            : invoice.status;
+                        const newStatus = deriveInvoiceStatus({
+                            currentStatus: invoice.status,
+                            balanceDue: newBalance,
+                            issueDate: invoice.issueDate,
+                            sentAt: invoice.sentAt,
+                            paymentStatuses: siblings.map(schedule => schedule.status),
+                        });
                         await t.invoice.update({
                             where: { id: invoiceId },
                             data: { balanceDue: newBalance, status: newStatus },
@@ -212,10 +216,13 @@ async function processEvent(eventId: string) {
                                 });
                                 const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
                                 const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-                                const newStatus = newBalance <= 0
-                                    ? "Paid"
-                                    : totalPaid > 0 ? "Partially Paid"
-                                    : "Issued";
+                                const newStatus = deriveInvoiceStatus({
+                                    currentStatus: invoice.status,
+                                    balanceDue: newBalance,
+                                    issueDate: invoice.issueDate,
+                                    sentAt: invoice.sentAt,
+                                    paymentStatuses: siblings.map(schedule => schedule.status),
+                                });
                                 await t.invoice.update({
                                     where: { id: invoice.id },
                                     data: { balanceDue: newBalance, status: newStatus },

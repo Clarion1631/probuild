@@ -524,7 +524,7 @@ model Invoice {
   // Estimate this invoice was generated from (signed-estimate → invoice link; idempotency for auto-invoicing)
   estimateId  String?
   estimate    Estimate? @relation(fields: [estimateId], references: [id], onDelete: SetNull)
-  status      String    @default("Draft") // Draft, Issued, Paid, Overdue
+  status      String    @default("Draft") // Draft, Issued, Partially Paid, Paid, Canceled (Overdue is derived at read time)
   totalAmount Decimal     @default(0)
   subtotal    Decimal     @default(0)  // pre-tax
   taxRate     Decimal     @default(0)  // percent, e.g. 8.8
@@ -534,9 +534,15 @@ model Invoice {
   issueDate   DateTime?
   sentAt      DateTime?
   viewedAt    DateTime?
+  lastViewedAt DateTime?
+  viewCount    Int       @default(0)
+  emailStatus  String?
+  emailBouncedAt DateTime?
   createdAt   DateTime  @default(now())
 
-  payments PaymentSchedule[]
+  payments     PaymentSchedule[]
+  viewEvents   InvoiceViewEvent[]
+  sendAttempts SendAttempt[]
 
   @@index([projectId])
   @@index([createdAt])
@@ -560,10 +566,13 @@ model PaymentSchedule {
   receiptSentAt         DateTime? // last time admin sent the receipt email
   lastReminderAt        DateTime? // last time the automated payment-reminder cron emailed the client for this milestone
   paidAt                DateTime?
+  firstViewedAt         DateTime?
+  lastViewedAt          DateTime?
   createdAt             DateTime  @default(now())
 
   // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
   qbInvoiceId   String?
+  qbRealmId     String? // QBO company realm that owns qbInvoiceId; required before automated settlement
   qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt    DateTime?
@@ -578,12 +587,107 @@ model PaymentSchedule {
   // EstimatePaymentSchedule at invoicing; shifted with the task on start moves).
   scheduleTaskId String?
   scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
+  sendAttemptMilestones SendAttemptMilestone[]
+  alignmentFindings     AlignmentFinding[]
 
   @@index([invoiceId])
   @@index([stripePaymentIntentId])
   @@index([qbInvoiceId])
+  @@unique([qbRealmId, qbInvoiceId])
   @@index([sourceScheduleId])
   @@index([scheduleTaskId])
+}
+
+model InvoiceViewEvent {
+  id        String   @id @default(cuid())
+  invoiceId String
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  viewedAt  DateTime
+  source    String?
+
+  @@index([invoiceId, viewedAt])
+}
+
+model SendAttempt {
+  id            String   @id @default(cuid())
+  invoiceId     String
+  invoice       Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  recipient     String
+  sendRequestId String   @unique
+  payloadHash   String
+  resendEmailId String?  @unique
+  status        String   @default("sending") // sending | sent | delivered | bounced | complained | failed | delayed
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  terminalAt    DateTime?
+  lastError     String?
+  createdAt     DateTime @default(now())
+  milestones    SendAttemptMilestone[]
+
+  @@index([invoiceId, createdAt])
+  @@index([status, createdAt])
+}
+
+model SendAttemptMilestone {
+  sendAttemptId     String
+  sendAttempt       SendAttempt     @relation(fields: [sendAttemptId], references: [id], onDelete: Cascade)
+  paymentScheduleId String
+  paymentSchedule   PaymentSchedule @relation(fields: [paymentScheduleId], references: [id], onDelete: Cascade)
+
+  @@id([sendAttemptId, paymentScheduleId])
+  @@index([paymentScheduleId])
+}
+
+model EmailEvent {
+  id            String    @id @default(cuid())
+  svixId        String    @unique
+  resendEmailId String
+  type          String
+  occurredAt    DateTime
+  payload       Json
+  processedAt   DateTime?
+  claimedAt     DateTime?
+  claimToken    String?
+  attempts      Int       @default(0)
+  lastError     String?
+  createdAt     DateTime  @default(now())
+
+  @@index([resendEmailId, processedAt])
+  @@index([processedAt, claimedAt])
+}
+
+model InboundQboEvent {
+  id          String    @id @default(cuid())
+  realmId     String
+  eventId     String
+  entity      String
+  entityQboId String
+  payload     Json
+  processedAt DateTime?
+  claimedAt   DateTime?
+  claimToken  String?
+  attempts    Int       @default(0)
+  lastError   String?
+
+  @@unique([realmId, eventId])
+  @@index([processedAt, claimedAt])
+}
+
+model AlignmentFinding {
+  id                String          @id @default(cuid())
+  paymentScheduleId String
+  paymentSchedule   PaymentSchedule @relation(fields: [paymentScheduleId], references: [id], onDelete: Cascade)
+  qbInvoiceId       String
+  kind              String
+  detail            Json
+  firstSeenAt       DateTime        @default(now())
+  lastSeenAt        DateTime        @default(now())
+  lastRunId         String
+  resolvedAt        DateTime?
+  reopenedCount     Int             @default(0)
+
+  @@unique([paymentScheduleId, qbInvoiceId, kind])
+  @@index([resolvedAt, lastSeenAt])
 }
 
 model Budget {
@@ -812,6 +916,9 @@ model CompanySettings {
 
   // Contract signing
   requireContractCountersign Boolean @default(false) // default for a new contract's requiresCountersign
+
+  // Invoice delivery: ProBuild is the client-facing front door by default.
+  qbAlsoSendIntuitEmail Boolean @default(false)
 
   updatedAt DateTime @updatedAt
 }

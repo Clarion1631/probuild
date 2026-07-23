@@ -17,6 +17,36 @@ import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
+import { deriveInvoiceStatus, displayInvoiceStatus, executeInvoiceSendAttempt } from "./invoice-lifecycle";
+import { qboAmountsMatch, qboRealmMatches } from "./qbo-mapping-integrity";
+
+type LifecycleAttempt = {
+    status: string;
+    sentAt: Date | null;
+    deliveredAt: Date | null;
+    lastError: string | null;
+};
+
+export function invoiceLifecycleMetrics(
+    attempt: LifecycleAttempt | null,
+    firstViewedAt: Date | null,
+    lastViewedAt: Date | null,
+    now = Date.now(),
+) {
+    const sentAt = attempt?.sentAt ?? null;
+    const daysSinceSent = sentAt ? Math.floor((now - sentAt.getTime()) / 86_400_000) : null;
+    const daysSinceFirstViewed = firstViewedAt ? Math.floor((now - firstViewedAt.getTime()) / 86_400_000) : null;
+    const daysSinceViewed = lastViewedAt ? Math.floor((now - lastViewedAt.getTime()) / 86_400_000) : null;
+    let lifecycleBucket = "Not sent";
+    if (!attempt) return { sentAt, daysSinceSent, daysSinceFirstViewed, daysSinceViewed, lifecycleBucket };
+    if (attempt.lastError === "interrupted") lifecycleBucket = "Send interrupted";
+    else if (attempt && ["bounced", "complained", "failed"].includes(attempt.status)) lifecycleBucket = "Sent not delivered";
+    else if (firstViewedAt) lifecycleBucket = "Viewed not paid";
+    else if (attempt?.status === "delivered") lifecycleBucket = "Delivered not viewed";
+    else if (sentAt && now - sentAt.getTime() >= 86_400_000) lifecycleBucket = "Delivery unknown";
+    else if (sentAt) lifecycleBucket = "Awaiting delivery";
+    return { sentAt, daysSinceSent, daysSinceFirstViewed, daysSinceViewed, lifecycleBucket };
+}
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -76,12 +106,18 @@ export async function getProjectBilling(projectId: string) {
                 orderBy: { createdAt: "desc" },
                 select: {
                     id: true, code: true, status: true, totalAmount: true, balanceDue: true,
-                    issueDate: true, sentAt: true,
+                    issueDate: true, sentAt: true, viewedAt: true, lastViewedAt: true, viewCount: true,
                     payments: {
                         orderBy: { createdAt: "asc" },
                         select: {
                             id: true, name: true, amount: true, status: true, dueDate: true, paidAt: true,
+                            paymentMethod: true, referenceNumber: true, firstViewedAt: true, lastViewedAt: true,
                             qbInvoiceId: true, qbInvoiceLink: true, qbInvoiceSentAt: true, qbSyncError: true,
+                            sendAttemptMilestones: {
+                                orderBy: { sendAttempt: { createdAt: "desc" } },
+                                take: 1,
+                                select: { sendAttempt: { select: { id: true, status: true, sentAt: true, deliveredAt: true, lastError: true } } },
+                            },
                         },
                     },
                 },
@@ -105,17 +141,27 @@ export async function getProjectBilling(projectId: string) {
             total: Number(co.totalAmount), approvedAt: co.approvedAt, sentAt: co.sentAt,
         })),
         invoices: project.invoices.map(inv => ({
-            id: inv.id, code: inv.code, status: inv.status,
+            id: inv.id, code: inv.code, status: displayInvoiceStatus({ status: inv.status, payments: inv.payments }),
             total: Number(inv.totalAmount), balanceDue: Number(inv.balanceDue),
-            sentAt: inv.sentAt, issueDate: inv.issueDate,
-            milestones: inv.payments.map(p => ({
-                id: p.id, name: p.name, amount: Number(p.amount), status: p.status,
-                dueDate: p.dueDate, paidAt: p.paidAt,
-                inQuickBooks: !!p.qbInvoiceId,
-                lastEmailedAt: p.qbInvoiceSentAt,
-                paymentLinkStale: !!p.qbSyncError || (!!p.qbInvoiceId && !p.qbInvoiceLink),
-                qbSyncError: p.qbSyncError,
-            })),
+            sentAt: inv.sentAt, issueDate: inv.issueDate, viewedAt: inv.viewedAt,
+            lastViewedAt: inv.lastViewedAt, viewCount: inv.viewCount,
+            daysSinceFirstViewed: inv.viewedAt ? Math.floor((Date.now() - inv.viewedAt.getTime()) / 86_400_000) : null,
+            daysSinceViewed: inv.lastViewedAt ? Math.floor((Date.now() - inv.lastViewedAt.getTime()) / 86_400_000) : null,
+            milestones: inv.payments.map(p => {
+                const delivery = p.sendAttemptMilestones[0]?.sendAttempt ?? null;
+                return {
+                    id: p.id, name: p.name, amount: Number(p.amount), status: p.status,
+                    dueDate: p.dueDate, paidAt: p.paidAt, paymentMethod: p.paymentMethod,
+                    referenceNumber: p.referenceNumber, firstViewedAt: p.firstViewedAt,
+                    lastViewedAt: p.lastViewedAt,
+                    inQuickBooks: !!p.qbInvoiceId,
+                    lastEmailedAt: p.qbInvoiceSentAt,
+                    delivery,
+                    ...invoiceLifecycleMetrics(delivery, p.firstViewedAt, p.lastViewedAt),
+                    paymentLinkStale: !!p.qbSyncError || (!!p.qbInvoiceId && !p.qbInvoiceLink),
+                    qbSyncError: p.qbSyncError,
+                };
+            }),
         })),
     };
 }
@@ -126,21 +172,36 @@ export async function getProjectBilling(projectId: string) {
 
 export async function listReceivables() {
     const now = Date.now();
-    const invoices = await prisma.invoice.findMany({
-        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft"] } },
+    const [invoices, recentlyPaidRows] = await Promise.all([prisma.invoice.findMany({
+        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft", "Canceled"] } },
         orderBy: { issueDate: "asc" },
         select: {
             id: true, code: true, status: true, totalAmount: true, balanceDue: true,
-            issueDate: true, sentAt: true, createdAt: true,
+            issueDate: true, sentAt: true, createdAt: true, viewedAt: true, lastViewedAt: true, viewCount: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true, email: true } },
             payments: {
                 where: { status: "Pending" },
                 orderBy: { createdAt: "asc" },
-                select: { id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true },
+                select: {
+                    id: true, name: true, amount: true, status: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true,
+                    firstViewedAt: true, lastViewedAt: true,
+                    sendAttemptMilestones: {
+                        orderBy: { sendAttempt: { createdAt: "desc" } },
+                        take: 1,
+                        select: { sendAttempt: { select: { id: true, status: true, sentAt: true, deliveredAt: true, lastError: true, createdAt: true } } },
+                    },
+                },
             },
         },
-    });
+    }), prisma.paymentSchedule.findMany({
+        where: { status: "Paid", paidAt: { gte: new Date(now - 30 * 86_400_000) } },
+        orderBy: { paidAt: "desc" },
+        select: {
+            id: true, name: true, amount: true, paidAt: true, paymentMethod: true, referenceNumber: true,
+            invoice: { select: { id: true, code: true, project: { select: { id: true, name: true } }, client: { select: { name: true } } } },
+        },
+    })]);
 
     const rows = invoices.map(inv => {
         const anchor = inv.issueDate ?? inv.sentAt ?? inv.createdAt;
@@ -151,7 +212,7 @@ export async function listReceivables() {
         return {
             invoiceId: inv.id,
             code: inv.code,
-            status: inv.status,
+            status: displayInvoiceStatus({ status: inv.status, payments: inv.payments, now: new Date(now) }),
             project: inv.project?.name ?? null,
             projectId: inv.project?.id ?? null,
             client: inv.client?.name ?? null,
@@ -159,10 +220,23 @@ export async function listReceivables() {
             total: Number(inv.totalAmount),
             ageDays,
             overdue: pastDue || ageDays > 30,
-            unpaidMilestones: inv.payments.map(p => ({
-                id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
-                lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
-            })),
+            viewedAt: inv.viewedAt,
+            lastViewedAt: inv.lastViewedAt,
+            viewCount: inv.viewCount,
+            daysSinceFirstViewed: inv.viewedAt ? Math.floor((now - inv.viewedAt.getTime()) / 86_400_000) : null,
+            daysSinceViewed: inv.lastViewedAt ? Math.floor((now - inv.lastViewedAt.getTime()) / 86_400_000) : null,
+            unpaidMilestones: inv.payments.map(p => {
+                const attempt = p.sendAttemptMilestones[0]?.sendAttempt ?? null;
+                const metrics = invoiceLifecycleMetrics(attempt, p.firstViewedAt, p.lastViewedAt, now);
+                return {
+                    id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
+                    deliveredAt: attempt?.deliveredAt ?? null,
+                    firstViewedAt: p.firstViewedAt, lastViewedAt: p.lastViewedAt,
+                    invoiceViewCount: inv.viewCount, ...metrics,
+                    sendAttemptStatus: attempt?.status ?? null,
+                    lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
+                };
+            }),
         };
     });
 
@@ -171,6 +245,19 @@ export async function listReceivables() {
         overdueOutstanding: Math.round(rows.filter(r => r.overdue).reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
         invoiceCount: rows.length,
         invoices: rows,
+        recentlyPaid: recentlyPaidRows.map(row => ({
+            id: row.id,
+            invoiceId: row.invoice.id,
+            code: row.invoice.code,
+            projectId: row.invoice.project?.id ?? null,
+            project: row.invoice.project?.name ?? null,
+            client: row.invoice.client?.name ?? null,
+            milestone: row.name,
+            amount: Number(row.amount),
+            paidAt: row.paidAt,
+            paymentMethod: row.paymentMethod,
+            referenceNumber: row.referenceNumber,
+        })),
     };
 }
 
@@ -330,9 +417,11 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
     }));
 
     const newBalanceDue = Math.max(0, total - paidAmount);
-    const invoiceStatus = paidAmount > 0
-        ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
-        : "Draft";
+    const invoiceStatus = deriveInvoiceStatus({
+        currentStatus: invoice.status,
+        balanceDue: newBalanceDue,
+        paymentStatuses: paidAmount > 0 ? ["Paid", ...(newBalanceDue > 0 ? ["Pending"] : [])] : ["Pending"],
+    });
 
     await prisma.invoice.update({
         where: { id: invoice.id },
@@ -423,6 +512,7 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
         include: {
             project: { include: { client: true } },
             client: true,
+            payments: { select: { status: true } },
         },
     });
     if (!invoice) throw new Error("Invoice not found");
@@ -431,9 +521,20 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
     if (!recipientEmail) throw new Error("No email address provided");
 
     if (invoice.status === "Draft") {
+        const sentAt = new Date();
         await prisma.invoice.update({
             where: { id: invoiceId },
-            data: { status: "Issued", issueDate: new Date(), sentAt: new Date() },
+            data: {
+                status: deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: Number(invoice.balanceDue),
+                    issueDate: sentAt,
+                    sentAt,
+                    paymentStatuses: invoice.payments.map(payment => payment.status),
+                }),
+                issueDate: sentAt,
+                sentAt,
+            },
         });
     } else {
         await prisma.invoice.update({
@@ -644,7 +745,7 @@ export function buildMilestoneRequestEmail(input: {
     return { subject, html };
 }
 
-async function sendMilestoneRequestEmail(
+async function composeMilestoneRequestEmail(
     invoice: {
         id: string;
         code: string;
@@ -655,7 +756,11 @@ async function sendMilestoneRequestEmail(
     milestones: Array<{ id: string; name: string; amount: number }>,
     recipient: string,
     companyName: string,
-): Promise<void> {
+): Promise<{
+    subject: string;
+    html: string;
+    emailOptions: { fromName: string; replyTo?: string; cc?: string[]; copyToInternal: true };
+}> {
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
     const clientId = invoice.clientId || invoice.project?.clientId;
     const nextPath = `/portal/invoices/${invoice.id}?milestone=${milestones.map(m => m.id).join(",")}`;
@@ -678,24 +783,16 @@ async function sendMilestoneRequestEmail(
         portalUrl,
     });
 
-    const result = await sendNotification(
-        recipient,
+    return {
         subject,
         html,
-        undefined,
-        {
+        emailOptions: {
             fromName: sanitizeHeaderValue(companyName),
             replyTo: settings?.email || undefined,
             cc: buildCc(recipient, invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null),
             copyToInternal: true,
-        }
-    );
-    // sendNotification reports provider/network failure as { success: false }
-    // rather than throwing — escalate it so no milestone is stamped "sent"
-    // when no email actually left.
-    if (!result.success) {
-        throw new Error("Email provider failed to send the payment request");
-    }
+        },
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,6 +811,7 @@ export async function sendMilestoneInvoicesCore(
     // optimistic-lock token (we only reconcile if the live QBO total still matches).
     opts: { reconcile?: Record<string, number> } | undefined,
     actorName: string,
+    sendRequestId: string,
 ): Promise<{
     success: boolean;
     sent: number;
@@ -725,6 +823,7 @@ export async function sendMilestoneInvoicesCore(
     driftReview?: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }>;
     results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }>;
     error?: string;
+    retrySameRequest?: boolean;
 }> {
     try {
         const invoice = await prisma.invoice.findUnique({
@@ -744,7 +843,7 @@ export async function sendMilestoneInvoicesCore(
         }
 
         const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
-        const { getQBInvoiceStatus, getQBInvoicePaymentLink } = await import("./quickbooks");
+        const { getQBInvoicePaymentLink } = await import("./quickbooks");
 
         let tokens;
         try {
@@ -773,7 +872,7 @@ export async function sendMilestoneInvoicesCore(
         // that goes out after the loop (one email per batch, not one per milestone).
         // effectiveAmount is the verified QuickBooks total — after a reconcile this
         // is the NEW amount, so the email never quotes the stale pre-reconcile one.
-        const sendable: Array<{ schedule: (typeof selectedPayments)[number]; wasReconciled: boolean; effectiveAmount: number }> = [];
+        const sendable: Array<{ schedule: (typeof selectedPayments)[number]; qbInvoiceId: string; wasReconciled: boolean; effectiveAmount: number }> = [];
 
         for (const schedule of selectedPayments) {
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
@@ -790,17 +889,11 @@ export async function sendMilestoneInvoicesCore(
             }
 
             try {
-                let qbInvoiceId = schedule.qbInvoiceId;
-                let qbTotal: number | undefined;
-
-                if (qbInvoiceId) {
-                    const status = await getQBInvoiceStatus(tokens, qbInvoiceId);
-                    qbTotal = status?.total;
-                } else {
-                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
-                    qbInvoiceId = pushRes.qbInvoiceId;
-                    qbTotal = pushRes.qbTotal;
-                }
+                // The push helper is also the canonical identity gate for an
+                // existing mapping (one local row, explicitly bound realm).
+                const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
+                const qbInvoiceId = pushRes.qbInvoiceId;
+                const qbTotal = pushRes.qbTotal;
 
                 if (!qbInvoiceId) {
                     failedCount++;
@@ -827,10 +920,10 @@ export async function sendMilestoneInvoicesCore(
                 // charged. If it has drifted from the ProBuild milestone, do not send
                 // until the user reviews and explicitly approves reconciling ProBuild
                 // to the QBO total (optimistic-locked to the exact qbTotal they saw).
-                if (Math.abs(qbTotal - Number(schedule.amount)) > 0.05) {
+                if (!qboAmountsMatch(Number(schedule.amount), qbTotal)) {
                     const approved = opts?.reconcile?.[schedule.id];
                     // Cent-exact match: only reconcile the precise total the user approved.
-                    const userApprovedThisTotal = approved != null && Math.abs(approved - qbTotal) <= 0.005;
+                    const userApprovedThisTotal = approved != null && qboAmountsMatch(approved, qbTotal);
 
                     if (!userApprovedThisTotal) {
                         // Phase 1 (or a stale confirmation): surface for review, do NOT send.
@@ -877,15 +970,15 @@ export async function sendMilestoneInvoicesCore(
                 }
 
                 const approvedTotal = opts?.reconcile?.[schedule.id];
-                const wasReconciled = Math.abs(qbTotal - Number(schedule.amount)) > 0.05
+                const wasReconciled = !qboAmountsMatch(Number(schedule.amount), qbTotal)
                     && approvedTotal != null
-                    && Math.abs(approvedTotal - qbTotal) <= 0.005;
+                    && qboAmountsMatch(approvedTotal, qbTotal);
 
                 // Amount verified. Queue for the ProBuild-branded request email sent
                 // after the loop, instead of Intuit's own invoice email — the client
                 // is asked for exactly these milestone amounts (never the whole
                 // invoice balance) and the view is tracked on the ProBuild portal.
-                sendable.push({ schedule, wasReconciled, effectiveAmount: qbTotal });
+                sendable.push({ schedule, qbInvoiceId, wasReconciled, effectiveAmount: qbTotal });
             } catch (err: any) {
                 failedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
@@ -898,80 +991,67 @@ export async function sendMilestoneInvoicesCore(
         // nothing is stamped as sent.
         if (sendable.length > 0) {
             const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+            const readyToEmail: typeof sendable = [];
 
-            // Refresh each milestone's live QBO pay link so the portal Pay Now
-            // never hands the client a stale link (best-effort — the portal
-            // still works when a link can't be fetched).
-            for (const { schedule } of sendable) {
-                if (!schedule.qbInvoiceId) continue;
+            // A fresh, non-empty Intuit payment URL is a money-path prerequisite.
+            for (const item of sendable) {
+                const { schedule, qbInvoiceId } = item;
                 try {
-                    const liveLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId);
-                    if (liveLink && liveLink !== schedule.qbInvoiceLink) {
+                    const liveLink = await getQBInvoicePaymentLink(tokens, qbInvoiceId);
+                    if (!liveLink?.trim()) throw new Error("payment-link-unavailable");
+                    if (liveLink !== schedule.qbInvoiceLink) {
                         await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: liveLink } });
                     }
-                } catch { /* link refresh is best-effort */ }
+                    readyToEmail.push(item);
+                } catch {
+                    failedCount++;
+                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "payment-link-unavailable" });
+                }
             }
 
-            let emailFailed = false;
-            try {
-                await sendMilestoneRequestEmail(
+            if (readyToEmail.length > 0) {
+                const composed = await composeMilestoneRequestEmail(
                     invoice,
-                    sendable.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
+                    readyToEmail.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
                     recipient,
                     companyName,
                 );
-            } catch (emailErr: any) {
-                emailFailed = true;
-                for (const { schedule } of sendable) {
-                    failedCount++;
-                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: emailErr?.message || "Failed to send request email" });
-                }
-            }
+                const attempt = await executeInvoiceSendAttempt({
+                    invoiceId,
+                    recipient,
+                    sendRequestId,
+                    milestones: readyToEmail.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
+                    actorName: actorName || companyName,
+                    subject: composed.subject,
+                    html: composed.html,
+                    emailOptions: composed.emailOptions,
+                });
 
-            // The email left — from here on a failure is a BOOKKEEPING failure and
-            // must never be reported as a send failure (that would invite a
-            // duplicate resend to the client). Stamp the batch atomically; if the
-            // stamp fails, milestones still report "sent" with the recording error
-            // attached so staff know to verify, not resend.
-            if (!emailFailed) {
-                const stampedAt = new Date();
-                let stampError: string | null = null;
-                try {
-                    await prisma.$transaction(
-                        sendable.map(({ schedule }) =>
-                            prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceSentAt: stampedAt } })
-                        )
-                    );
-                } catch (e: any) {
-                    stampError = e?.message || "unknown error";
-                    console.error("[sendMilestoneInvoices] email delivered but recording the send failed:", e);
-                }
-                for (const { schedule, wasReconciled } of sendable) {
-                    sentCount++;
-                    results.push({
-                        id: schedule.id,
-                        name: schedule.name,
-                        status: wasReconciled ? "reconciled" : "sent",
-                        sentTo: recipient,
-                        ...(stampError ? { error: `Email delivered, but recording the send failed (${stampError}) — verify in QuickBooks before resending` } : {}),
-                    });
+                if (attempt.status === "failed") {
+                    for (const { schedule } of readyToEmail) {
+                        failedCount++;
+                        results.push({ id: schedule.id, name: schedule.name, status: "failed", error: "Email provider failed to send the payment request" });
+                    }
+                } else {
+                    for (const { schedule, wasReconciled } of readyToEmail) {
+                        sentCount++;
+                        results.push({
+                            id: schedule.id,
+                            name: schedule.name,
+                            status: wasReconciled ? "reconciled" : "sent",
+                            sentTo: recipient,
+                        });
+                    }
 
-                    // Log activity per sent milestone (best-effort — never flips a
-                    // delivered send to "failed")
-                    if (invoice.projectId) {
-                        try {
-                            await logActivityLazy({
-                                projectId: invoice.projectId,
-                                actorType: "TEAM",
-                                actorName: companyName,
-                                action: "sent_invoice",
-                                entityType: "invoice",
-                                entityId: invoiceId,
-                                entityName: `Invoice ${invoice.code}`,
-                                metadata: { milestone: schedule.name, sentTo: recipient },
-                            });
-                        } catch (e) {
-                            console.error("[sendMilestoneInvoices] activity log failed for", schedule.name, e);
+                    if (settings?.qbAlsoSendIntuitEmail && !attempt.resumed) {
+                        const { sendQBInvoice } = await import("./quickbooks");
+                        for (const { qbInvoiceId, schedule } of readyToEmail) {
+                            try {
+                                const qbSent = await sendQBInvoice(tokens, qbInvoiceId, recipient);
+                                if (!qbSent.ok) console.error("[sendMilestoneInvoices] optional Intuit email failed", schedule.id, qbSent.error);
+                            } catch (error) {
+                                console.error("[sendMilestoneInvoices] optional Intuit email failed", schedule.id, error);
+                            }
                         }
                     }
                 }
@@ -986,7 +1066,16 @@ export async function sendMilestoneInvoicesCore(
             try {
                 await prisma.invoice.update({
                     where: { id: invoiceId },
-                    data: { status: "Issued", issueDate: new Date() },
+                    data: {
+                        status: deriveInvoiceStatus({
+                            currentStatus: invoice.status,
+                            balanceDue: Number(invoice.balanceDue),
+                            issueDate: new Date(),
+                            sentAt: invoice.sentAt,
+                            paymentStatuses: invoice.payments.map(payment => payment.status),
+                        }),
+                        issueDate: new Date(),
+                    },
                 });
             } catch (e) {
                 console.error("[sendMilestoneInvoices] email delivered but Draft→Issued flip failed:", e);
@@ -1026,6 +1115,10 @@ export async function sendMilestoneInvoicesCore(
             skipped: 0,
             results: [],
             error: globalErr?.message || "An unexpected error occurred",
+            // The failure may have happened after provider acceptance but before
+            // finalization. Callers must retain sendRequestId so the next click
+            // resumes the same provider-idempotent attempt.
+            retrySameRequest: true,
         };
     }
 }
@@ -1108,7 +1201,13 @@ export async function billChangeOrderCore(changeOrderId: string) {
         // findFirst above — a concurrent settle could otherwise leave it "Paid" with a positive
         // balanceDue after this bump. Reading it under the lock closes that window.
         await lockMoneyParents(tx, { invoiceId: invoice.id });
-        const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+        const lockedInvoice = await tx.invoice.findUnique({
+            where: { id: invoice.id },
+            select: {
+                status: true, balanceDue: true, issueDate: true, sentAt: true,
+                payments: { select: { status: true } },
+            },
+        });
         const curStatus = lockedInvoice?.status ?? invoice.status;
 
         const created = await tx.paymentSchedule.create({
@@ -1116,7 +1215,13 @@ export async function billChangeOrderCore(changeOrderId: string) {
         });
         // Same totals math as addInvoiceMilestone: bump invoice totals; a fully
         // Paid invoice becomes Partially Paid when new work lands on it.
-        const nextStatus = curStatus === "Paid" ? "Partially Paid" : curStatus;
+        const nextStatus = deriveInvoiceStatus({
+            currentStatus: curStatus,
+            balanceDue: Number(lockedInvoice?.balanceDue ?? 0) + amount,
+            issueDate: lockedInvoice?.issueDate,
+            sentAt: lockedInvoice?.sentAt,
+            paymentStatuses: [...(lockedInvoice?.payments.map(payment => payment.status) ?? []), "Pending"],
+        });
         await tx.invoice.update({
             where: { id: invoice.id },
             data: {
@@ -1226,7 +1331,7 @@ export async function handleChangeOrderApproved(
             summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
         } else {
             summary.billed = true;
-            const send = await sendMilestoneInvoicesCore(bill.invoiceId, [bill.milestoneId], undefined, undefined, "Auto (change-order approval)");
+            const send = await sendMilestoneInvoicesCore(bill.invoiceId, [bill.milestoneId], undefined, undefined, "Auto (change-order approval)", `auto-change-order:${changeOrderId}`);
             const resultIssues = send.results.map(r => r.error).filter((e): e is string => !!e);
             summary.sent = send.results.some(r => !!r.sentTo);
             if (resultIssues.length) summary.issues.push(...resultIssues);
@@ -1622,6 +1727,16 @@ export async function updatePendingMilestoneAmountsCore(
             );
         }
         for (const row of preflightChanged) {
+            // Realm gate (fail closed): a QBO invoice id is only meaningful inside
+            // the company realm it was staged in. Probing/deleting a legacy-unbound
+            // or foreign-realm id against the active realm could read or destroy a
+            // DIFFERENT company's invoice.
+            if (!qboRealmMatches(row.qbRealmId, tokens.realmId)) {
+                throw new Error(
+                    `"${row.name}"'s staged QuickBooks invoice is ${row.qbRealmId ? "bound to a different QuickBooks company" : "not bound to a QuickBooks company (legacy link)"} — nothing was changed. ` +
+                    `Use "Break QB Link" on it first, then rebalance.`
+                );
+            }
             const probe = await probeQBInvoice(tokens, row.qbInvoiceId!);
             if (probe.state === "error") {
                 throw new Error(`Couldn't verify "${row.name}"'s staged QuickBooks invoice — nothing was changed. Retry in a moment.`);
@@ -1635,7 +1750,7 @@ export async function updatePendingMilestoneAmountsCore(
         }
     }
 
-    type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string };
+    type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string; oldQbRealmId: string | null };
 
     const qbAffected = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Canonical lock order: Estimate → Invoice → schedules. The mirror sync
@@ -1702,7 +1817,7 @@ export async function updatePendingMilestoneAmountsCore(
             // confirmed still payment-free and actually deleted, so a payment that
             // landed in QBO can never be orphaned behind a cleared link.
             if (row.qbInvoiceId && contentChanged(row, r)) {
-                affected.push({ scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId });
+                affected.push({ scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId, oldQbRealmId: row.qbRealmId });
             }
 
             await tx.paymentSchedule.update({
@@ -1748,6 +1863,34 @@ export async function updatePendingMilestoneAmountsCore(
             const tokens = await getFreshQBTokens();
             for (const row of qbAffected) {
                 try {
+                    // Defensive re-check of the preflight's realm gate: the QBO
+                    // connection could have been re-pointed at a different company
+                    // between the tx and this loop. Never probe/delete across realms.
+                    // The local amounts are already committed at this point, so a
+                    // toast alone isn't enough — stamp qbSyncError (pinned to the
+                    // old link so a concurrent re-push isn't clobbered) to make the
+                    // stale-realm link a durable, visible recovery state; the send
+                    // path's own drift/identity guards refuse the row until it's
+                    // broken and re-staged.
+                    if (!qboRealmMatches(row.oldQbRealmId, tokens.realmId)) {
+                        // qbSyncError holds short state codes (see the probe sweep in
+                        // quickbooks-payments), not prose — "realmMismatch" gets its own
+                        // badge/tooltip in the invoice editor. Pinned on the old link AND
+                        // Pending/unpaid so neither a concurrent re-push nor an old-realm
+                        // settlement that just paid the row gets a stale flag stamped on it.
+                        await prisma.paymentSchedule.updateMany({
+                            where: {
+                                id: row.scheduleId,
+                                status: "Pending",
+                                qbPaymentId: null,
+                                qbInvoiceId: row.oldQbInvoiceId,
+                                qbRealmId: row.oldQbRealmId,
+                            },
+                            data: { qbSyncError: "realmMismatch" },
+                        });
+                        warnings.push(`"${row.name}": its old QuickBooks invoice is bound to a different QuickBooks company — left untouched and flagged. Use "Break QB Link" and re-stage.`);
+                        continue;
+                    }
                     const probe = await probeQBInvoice(tokens, row.oldQbInvoiceId);
                     if (probe.state === "error") {
                         warnings.push(`"${row.name}": couldn't reach QuickBooks to replace the staged invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
@@ -1767,8 +1910,20 @@ export async function updatePendingMilestoneAmountsCore(
                         continue;
                     }
                     // Old QBO invoice is confirmed gone — now clear the link, atomically
-                    // (a concurrent settle still wins the claim and we stop here).
-                    if (!(await claimQBInvoiceUnlink(prisma, row.scheduleId, row.oldQbInvoiceId))) {
+                    // (a concurrent settle still wins the claim and we stop here). Open
+                    // alignment findings for the replaced link resolve in the same tx,
+                    // matching breakQBInvoiceLink's semantics.
+                    const unlinked = await prisma.$transaction(async (tx) => {
+                        const claimed = await claimQBInvoiceUnlink(tx, row.scheduleId, row.oldQbInvoiceId, row.oldQbRealmId);
+                        if (claimed) {
+                            await tx.alignmentFinding.updateMany({
+                                where: { paymentScheduleId: row.scheduleId, qbInvoiceId: row.oldQbInvoiceId, resolvedAt: null },
+                                data: { resolvedAt: new Date() },
+                            });
+                        }
+                        return claimed;
+                    });
+                    if (!unlinked) {
                         warnings.push(`"${row.name}": milestone changed while replacing its QuickBooks invoice — refresh and review before re-staging.`);
                         continue;
                     }
@@ -1828,16 +1983,29 @@ export async function deleteInvoiceMilestoneCore(
         const amount = toNum(locked.amount);
         const newTotal = Math.round((toNum(invoice.totalAmount) - amount) * 100) / 100;
         const newBalance = Math.max(0, Math.round((toNum(invoice.balanceDue) - amount) * 100) / 100);
-        // Inverse of addInvoiceMilestone's ladder: a pure decrement can only ever
-        // free up balance. "Paid" requires actual money received — a zero balance
-        // reached by deleting the only pending row on an invoice with no payments
-        // (e.g. a Draft whose sole extra is removed) keeps its current status
-        // rather than reading as settled.
+        // "Paid" requires actual money received — a zero balance reached by
+        // deleting the only pending row on an invoice with no payments (e.g. a
+        // Draft whose sole extra is removed) keeps its current status rather than
+        // reading as settled. deriveInvoiceStatus can't make that distinction
+        // (balanceDue <= 0 reads as Paid there), so that one case is a deliberate,
+        // guarded exception to the derive-everywhere rule; every other outcome
+        // routes through the canonical helper.
         const paidAmount = Math.round((toNum(invoice.totalAmount) - toNum(invoice.balanceDue)) * 100) / 100;
+        const remaining = await tx.paymentSchedule.findMany({
+            where: { invoiceId: invoice.id },
+            select: { status: true },
+        });
         const nextStatus =
-            newBalance <= 0 ? (paidAmount > 0.005 ? "Paid" : invoice.status)
-            : invoice.status === "Paid" ? "Partially Paid"
-            : invoice.status;
+            newBalance <= 0 && paidAmount <= 0.005
+                ? invoice.status
+                : deriveInvoiceStatus({
+                    currentStatus: invoice.status,
+                    balanceDue: newBalance,
+                    totalAmount: newTotal,
+                    issueDate: invoice.issueDate,
+                    sentAt: invoice.sentAt,
+                    paymentStatuses: remaining.map((schedule) => schedule.status),
+                });
 
         await tx.invoice.update({
             where: { id: invoice.id },
@@ -1920,11 +2088,20 @@ export async function splitInvoiceMilestonesCore(
         ) / 100;
         const newInvoiceTotal = Math.round((paidAmount + newTotal) * 100) / 100;
         const newBalance = newTotal; // validated milestones are all > 0, so this is always positive
-        const newStatus =
-            invoice.status === "Draft" ? "Draft"
-            : invoice.status === "Overdue" ? "Overdue"
-            : paidAmount > 0 ? "Partially Paid"
-            : "Issued";
+        // Canonical status derivation ("Overdue" is a read-time overlay, never
+        // persisted): surviving Paid rows plus the fresh Pending set.
+        const retainedPaid = await tx.paymentSchedule.findMany({
+            where: { invoiceId, status: "Paid" },
+            select: { status: true },
+        });
+        const newStatus = deriveInvoiceStatus({
+            currentStatus: invoice.status,
+            balanceDue: newBalance,
+            totalAmount: newInvoiceTotal,
+            issueDate: invoice.issueDate,
+            sentAt: invoice.sentAt,
+            paymentStatuses: [...retainedPaid.map((payment) => payment.status), ...validated.map(() => "Pending")],
+        });
 
         await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
         // NOTE: this drops sourceScheduleId links on any replaced row — see the
