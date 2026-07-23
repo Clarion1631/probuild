@@ -695,8 +695,11 @@ async function main() {
         check("assigned DISABLED user still appears as a removable crew entry", !!inactiveCrewEntry && inactiveCrewEntry.status !== "ACTIVATED");
 
         const dupeEntries = (dashboardForCrew.teamMembers ?? []).filter(u => u.id === dupeUserA.id || u.id === dupeUserB.id);
-        check("teamMembers disambiguates identical display names with the email",
-            dupeEntries.length === 2 && dupeEntries.every(u => u.name.includes(u.email)) && dupeEntries[0].name !== dupeEntries[1].name);
+        // Owner call 2026-07-23: NO email decoration in picker names ever —
+        // full addresses wrapped across six lines in the crew checklist.
+        // Duplicate display names render as-is (email stays in its own field).
+        check("teamMembers never decorates names with emails, even for duplicates",
+            dupeEntries.length === 2 && dupeEntries.every(u => !u.name.includes("@")) && dupeEntries[0].name === dupeEntries[1].name);
         const soloNamedEntry = (dashboardForCrew.teamMembers ?? []).find(u => u.id === activeUser.id);
         check("teamMembers leaves unique display names unmodified",
             soloNamedEntry?.name === (activeUser.name ?? activeUser.email) && !soloNamedEntry.name.includes("@"));
@@ -712,7 +715,7 @@ async function main() {
         const scheduleCoreTaskCrewBody = scheduleCoreSource.slice(scheduleCoreTaskCrewStart);
         check("source validates ACTIVATED only for users being added to task crew",
             scheduleCoreTaskCrewBody.includes("toAdd.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));
-        check("teamMembers query excludes FINANCE role", scheduleCoreSource.includes('role: { not: "FINANCE" }'));
+        check("teamMembers query is FIELD_CREW-only (no admins/office/finance schedulable)", scheduleCoreSource.includes('where: { status: "ACTIVATED", role: "FIELD_CREW" }'));
 
         // Batch task-date save (fix 2) — ADMIN/MANAGER gated, loops the ONE
         // canonical updateScheduleTask (not a second mutation core), isolates

@@ -169,10 +169,10 @@ export function AvailabilityPanel({ data, onDrillDown }: AvailabilityPanelProps)
     ];
     // Rows = FIELD_CREW, plus any ADMIN who actually does field work (shows
     // up on a project crew) — Richard, not Marge/Justin.
-    const crewMemberIds = new Set(projects.flatMap(project => project.crew.map(member => member.id)));
-    const members: AvailabilityMember[] = (teamMembers ?? []).filter(member => (
-        member.role === "FIELD_CREW" || (member.role === "ADMIN" && crewMemberIds.has(member.id))
-    ));
+    // Owner call 2026-07-23: only members DESIGNATED as crew are planned here
+    // — no admins/office on the availability grid (teamMembers is already
+    // FIELD_CREW-only at serialization; this filter just states the rule).
+    const members: AvailabilityMember[] = (teamMembers ?? []).filter(member => member.role === "FIELD_CREW");
 
     const today = todayUTC();
     const days = Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(today, i));

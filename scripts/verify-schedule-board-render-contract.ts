@@ -250,8 +250,12 @@ assert.doesNotMatch(projectBarSource, /onClick=\{.*router\.push|onClick=\{.*navi
 assert.match(projectBarSource, />\s*Open project\s*<\/Link>/, "Open project must be a menu item inside the Actions dropdown");
 
 // ── Item 7: crew picker hygiene (FINANCE exclusion + name disambiguation) ──
-assert.match(coreSource, /where: \{ status: "ACTIVATED", role: \{ not: "FINANCE" \} \}/);
-assert.match(coreSource, /nameCounts\.get\(r\.name\)! > 1 \? \{ \.\.\.r, name: `\$\{r\.name\} \(\$\{r\.email\}\)` \} : r/);
+// Owner call 2026-07-23: schedulable people = FIELD_CREW only (no admins or
+// office in pickers/availability). Stricter than the earlier FINANCE-exclusion.
+assert.match(coreSource, /where: \{ status: "ACTIVATED", role: "FIELD_CREW" \}/);
+// Owner call 2026-07-23: names stay bare — no email decoration ever (full
+// addresses wrapped across six lines in the crew checklist).
+assert.doesNotMatch(coreSource, /name: `\$\{r\.name\} \(\$\{r\.email\}\)`/, "picker names must never carry email decorations");
 assert.match(crewPickersSource, /c\.role === "FINANCE" \? "finance" : "inactive"/, "CrewPicker (now in CrewPickers.tsx) must still label removable FINANCE crew entries");
 assert.match(crewPickersSource, /a\.role === "FINANCE" \? "finance" : "inactive"/, "TaskCrewPicker (now in CrewPickers.tsx) must still label removable FINANCE task-crew entries");
 assert.match(companyDashboardSource, /a\.role === "FINANCE" \? " \(finance\)"/, "the Schedule & crew task-row display keeps its own FINANCE label");

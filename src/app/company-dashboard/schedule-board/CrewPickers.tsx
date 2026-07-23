@@ -157,7 +157,7 @@ export function CrewPicker({
     const unlistedAssigned = crew.filter(c => !teamMembers.some(m => m.id === c.id));
     const options = [
         ...teamMembers.map(m => ({ id: m.id, label: m.name || m.email })),
-        ...unlistedAssigned.map(c => ({ id: c.id, label: `${c.name} (${c.role === "FINANCE" ? "finance" : "inactive"})` })),
+        ...unlistedAssigned.map(c => ({ id: c.id, label: `${c.name} (${c.status !== "ACTIVATED" ? "inactive" : c.role.toLowerCase().replace("_", " ")})` })),
     ];
     const legend = `Project crew — ${selected.length} assigned`;
 
@@ -205,7 +205,7 @@ export function TaskCrewPicker({
     const unlisted = task.assignments.filter(a => !teamMembers.some(m => m.id === a.userId));
     const options = [
         ...teamMembers.map(member => ({ id: member.id, label: member.name || member.email })),
-        ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.role === "FINANCE" ? "finance" : "inactive"})` })),
+        ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.status !== "ACTIVATED" ? "inactive" : a.role.toLowerCase().replace("_", " ")})` })),
     ];
     const legend = `Task crew — ${selected.length} assigned`;
 
