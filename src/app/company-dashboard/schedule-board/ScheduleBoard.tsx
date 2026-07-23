@@ -223,6 +223,12 @@ export function ScheduleBoard({
     // the pending-to-save payload; nothing writes to the server until Save.
     const [taskDateOverrides, setTaskDateOverrides] = useState<Record<string, TaskDateOverride>>({});
     const [projectDrafts, setProjectDrafts] = useState<Record<string, ProjectDraftMove>>({});
+    // Read at reconciliation-timeout FIRE time (an effect-render snapshot can
+    // miss a just-added draft or resurrect a just-discarded one).
+    const projectDraftsRef = useRef(projectDrafts);
+    useEffect(() => { projectDraftsRef.current = projectDrafts; }, [projectDrafts]);
+    // Batch-save lock set feeding the single derived page-wide publisher.
+    const [saveLockedProjectIds, setSaveLockedProjectIds] = useState<ReadonlySet<string>>(EMPTY_PROJECT_IDS);
     const [isSaving, setIsSaving] = useState(false);
     const [awaitingTaskRefreshIds, setAwaitingTaskRefreshIds] = useState<Set<string>>(() => new Set());
     const [taskKeyboardEdit, setTaskKeyboardEdit] = useState<TaskKeyboardEditState | null>(null);
@@ -335,14 +341,13 @@ export function ScheduleBoard({
     const isAnyDragActive = pointerDragActive || projectKeyboardEdit !== null || taskKeyboardEdit !== null;
 
     useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
-    // Edge-resize saves must lock the project PAGE-WIDE: without publishing,
-    // the legacy StartDateRow can mutate the same project mid-save and reject
-    // or clobber the new end date. (saveAllDrafts publishes its own set
-    // in-line; this effect only speaks while no batch save is running.)
+    // ONE derived publisher for the page-wide lock: the live union of the
+    // running batch save's locked projects and every in-flight end-resize
+    // save. Snapshot-based inline publications left windows where a resize
+    // starting mid-batch went unpublished.
     useEffect(() => {
-        if (isSaving) return;
-        onEffectivePendingProjectIdsChange(endResizeSavingProjectIds);
-    }, [endResizeSavingProjectIds, isSaving, onEffectivePendingProjectIdsChange]);
+        onEffectivePendingProjectIdsChange(mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds));
+    }, [saveLockedProjectIds, endResizeSavingProjectIds, onEffectivePendingProjectIdsChange]);
 
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
@@ -488,13 +493,12 @@ export function ScheduleBoard({
             // visual preview of a still-UNSAVED start draft on the same
             // project — rebuild that preview from fresh canonical data.
             for (const projectId of reconciled) {
-                const draft = projectDrafts[projectId];
+                const draft = projectDraftsRef.current[projectId];
                 const canonical = canonicalProjectById.get(projectId);
                 if (draft && canonical) setProjectPreview(canonical, draft.targetStart);
             }
         }, 0);
         return () => window.clearTimeout(timeoutId);
-        // eslint-disable-next-line react-hooks/exhaustive-deps -- projectDrafts read at fire time by design
     }, [canonicalProjectById, projectRefreshExpectations]);
 
     useEffect(() => {
@@ -725,9 +729,7 @@ export function ScheduleBoard({
                 .map(([taskId]) => canonicalTaskProjectById.get(taskId))
                 .filter((id): id is string => Boolean(id)),
         ]);
-        // The batch's page-wide lock must UNION any in-flight end-resize saves
-        // — replacing the set would unlock a project mid-resize-save.
-        onEffectivePendingProjectIdsChange(mergeProjectPendingIds(lockedProjectIds, endResizeSavingProjectIds));
+        setSaveLockedProjectIds(lockedProjectIds); // the derived publisher unions live resize saves
 
         const failedProjectNames: string[] = [];
         const succeededProjectIds: string[] = [];
@@ -855,10 +857,7 @@ export function ScheduleBoard({
         }
 
         setIsSaving(false);
-        // Reset to the still-in-flight end-resize saves, not blindly to empty
-        // (the isSaving-gated effect re-publishes on the next change anyway,
-        // but the window between here and that effect must not unlock them).
-        onEffectivePendingProjectIdsChange(endResizeSavingProjectIds.size > 0 ? endResizeSavingProjectIds : EMPTY_PROJECT_IDS);
+        setSaveLockedProjectIds(EMPTY_PROJECT_IDS); // derived publisher keeps live resize saves locked
         router.refresh();
 
         if (saveNotes.length > 0) toast.info(saveNotes.join(" "));

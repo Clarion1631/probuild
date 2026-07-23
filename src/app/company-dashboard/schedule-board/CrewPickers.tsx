@@ -42,10 +42,10 @@ interface CrewOption {
 // earlier one racing through the locked server transaction). While one write
 // is in flight, newer lists coalesce into a single queued follow-up.
 function useSerializedCrewSubmit(send: (ids: string[]) => Promise<void>, onError: (message: string) => void) {
-    const [, startTransition] = useTransition();
+    const [isPending, startTransition] = useTransition();
     const inFlightRef = useRef(false);
     const queuedRef = useRef<string[] | null>(null);
-    return (ids: string[]) => {
+    const submit = (ids: string[]) => {
         if (inFlightRef.current) {
             queuedRef.current = ids;
             return;
@@ -67,6 +67,7 @@ function useSerializedCrewSubmit(send: (ids: string[]) => Promise<void>, onError
             }
         });
     };
+    return { submit, isPending };
 }
 
 function CrewChecklist({
@@ -123,7 +124,7 @@ export function CrewPicker({
     const router = useRouter();
     const [open, setOpen] = useState(false);
     const triggerRef = useRef<HTMLButtonElement>(null);
-    const [isPending, startTransition] = useTransition();
+
 
     // Selection mirrors the server crew unless the user just toggled (the
     // override keys on the crew contents, so refreshed props take back over).
@@ -131,7 +132,7 @@ export function CrewPicker({
     const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
     const selected = override && override.key === crewKey ? override.ids : crew.map(c => c.id);
 
-    const submitCrew = useSerializedCrewSubmit(
+    const { submit: submitCrew, isPending } = useSerializedCrewSubmit(
         async ids => {
             await updateProjectCrewAction(projectId, ids);
             router.refresh();
@@ -197,7 +198,6 @@ export function TaskCrewPicker({
     const router = useRouter();
     const [open, setOpen] = useState(false);
     const triggerRef = useRef<HTMLButtonElement>(null);
-    const [isPending, startTransition] = useTransition();
     const assignedIds = task.assignments.map(a => a.userId);
     const assignmentKey = [...assignedIds].sort().join(",");
     const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
@@ -209,7 +209,7 @@ export function TaskCrewPicker({
     ];
     const legend = `Task crew — ${selected.length} assigned`;
 
-    const submitCrew = useSerializedCrewSubmit(
+    const { submit: submitCrew, isPending } = useSerializedCrewSubmit(
         async ids => {
             await updateTaskCrewAction(task.id, ids);
             router.refresh();
