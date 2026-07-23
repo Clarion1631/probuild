@@ -1586,7 +1586,11 @@ export async function updatePendingMilestoneAmountsCore(
     type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string };
 
     const qbAffected = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(tx, { invoiceId });
+        // Canonical lock order: Estimate → Invoice → schedules. The mirror sync
+        // below writes estimate-side rows, so read the estimate link (non-locking)
+        // and lock the Estimate before the Invoice — same pattern as unrecordPayment.
+        const invLink = await tx.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(tx, { estimateId: invLink?.estimateId, invoiceId });
 
         const existing = await tx.paymentSchedule.findMany({ where: { invoiceId } });
         const existingMap = new Map(existing.map((s) => [s.id, s]));
