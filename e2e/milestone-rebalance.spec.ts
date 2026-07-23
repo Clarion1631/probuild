@@ -17,8 +17,10 @@ import {
  *
  * No live QuickBooks connection exists in this test DB (no Integration row),
  * so `getFreshQBTokens()` throws `QBNotConnectedError` for any row that carries
- * a `qbInvoiceId` — the QB-touching test below exercises the DB-side unlink
- * claim and asserts a warning comes back, but never reaches a live QBO call.
+ * a `qbInvoiceId` — the QB-touching test below asserts the row KEEPS its link
+ * (unlinking only ever happens after the old QBO invoice is confirmed deleted,
+ * which can't be reached here) and a warning comes back; no live QBO call is
+ * ever made.
  */
 
 const prisma = new PrismaClient();
@@ -86,14 +88,21 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         const estimateId = `${PFX}-est-${suffix}`;
         const invoiceId = `${PFX}-inv-${suffix}`;
         const epsA = `${PFX}-eps-a-${suffix}`;
+        const epsB = `${PFX}-eps-b-${suffix}`;
         const psA = `${PFX}-ps-a-${suffix}`;
         const psB = `${PFX}-ps-b-${suffix}`;
 
+        // Both rows are estimate-mirrored: rebalancing may only move money WITHIN
+        // a pool (mirrored ↔ mirrored), so a fully-mirrored schedule is the
+        // canonical happy path (this matches Mesplay/Berg's real shape).
         await prisma.estimate.create({
             data: { id: estimateId, title: "MR Estimate", code: `EST-MR-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 1000, balanceDue: 1000 },
         });
         await prisma.estimatePaymentSchedule.create({
             data: { id: epsA, estimateId, name: "Deposit", percentage: 40, amount: 400, status: "Pending", order: 1 },
+        });
+        await prisma.estimatePaymentSchedule.create({
+            data: { id: epsB, estimateId, name: "Final", percentage: 60, amount: 600, status: "Pending", order: 2 },
         });
         await prisma.invoice.create({
             data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 1000, balanceDue: 1000 },
@@ -101,7 +110,9 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         await prisma.paymentSchedule.create({
             data: { id: psA, invoiceId, name: "Deposit", amount: 400, status: "Pending", sourceScheduleId: epsA, dueDate: new Date("2026-01-01") },
         });
-        await prisma.paymentSchedule.create({ data: { id: psB, invoiceId, name: "Final", amount: 600, status: "Pending" } });
+        await prisma.paymentSchedule.create({
+            data: { id: psB, invoiceId, name: "Final", amount: 600, status: "Pending", sourceScheduleId: epsB },
+        });
 
         const res = await updatePendingMilestoneAmountsCore(invoiceId, [
             { scheduleId: psA, name: "Deposit (revised)", amount: 350, dueDate: "2026-02-01" },
@@ -153,7 +164,7 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         expect(num(paid!.amount)).toBe(400); // unchanged
     });
 
-    test("QB-linked row: unlinks locally and reports a warning (no live QuickBooks in this env)", async () => {
+    test("QB-linked row: keeps its link and reports a warning when QuickBooks is unreachable", async () => {
         await ensureClientAndProject();
         const suffix = "qblinked";
         const invoiceId = `${PFX}-inv-${suffix}`;
@@ -173,12 +184,51 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
             { scheduleId: psOther, name: "Final", amount: 650 },
         ]);
         expect(res.success).toBe(true);
-        expect(res.warnings.length).toBeGreaterThan(0); // no QuickBooks connection to re-stage against
+        expect(res.warnings.length).toBeGreaterThan(0); // no QuickBooks connection to replace the staged invoice
 
+        // Amounts update locally, but the QB link is deliberately KEPT: unlinking
+        // only happens after the old QBO invoice is confirmed deleted, and this
+        // env can never reach QBO — so the payment poller keeps watching the old
+        // invoice instead of stranding any payment behind a cleared link.
         const qbRow = await prisma.paymentSchedule.findUnique({ where: { id: psQB } });
-        expect(num(qbRow!.amount)).toBe(350); // amount still updated
-        expect(qbRow!.qbInvoiceId).toBeNull(); // unlinked locally, safely
-        expect(qbRow!.qbInvoiceLink).toBeNull();
+        expect(num(qbRow!.amount)).toBe(350);
+        expect(qbRow!.qbInvoiceId).toBe("fake-qbo-1");
+        expect(qbRow!.qbInvoiceLink).toBe("https://qbo.example/fake-1");
+    });
+
+    test("rejects moving money between estimate-mirrored rows and extras", async () => {
+        await ensureClientAndProject();
+        const suffix = "crosspool";
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const eps = `${PFX}-eps-${suffix}`;
+        const psMirrored = `${PFX}-ps-m-${suffix}`;
+        const psExtra = `${PFX}-ps-x-${suffix}`;
+
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "MR Estimate", code: `EST-MR-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 400, balanceDue: 400 },
+        });
+        await prisma.estimatePaymentSchedule.create({ data: { id: eps, estimateId, name: "Deposit", amount: 400, status: "Pending", order: 1 } });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 1000, balanceDue: 1000 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psMirrored, invoiceId, name: "Deposit", amount: 400, status: "Pending", sourceScheduleId: eps } });
+        await prisma.paymentSchedule.create({ data: { id: psExtra, invoiceId, name: "Extra", amount: 600, status: "Pending" } });
+
+        // Invoice-wide total is preserved (1000) but $50 slides from the mirrored
+        // row to the extra — that would desync the estimate schedule from the
+        // estimate total, so it must be rejected.
+        await expect(
+            updatePendingMilestoneAmountsCore(invoiceId, [
+                { scheduleId: psMirrored, name: "Deposit", amount: 350 },
+                { scheduleId: psExtra, name: "Extra", amount: 650 },
+            ]),
+        ).rejects.toThrow(/estimate-linked/i);
+
+        const m = await prisma.paymentSchedule.findUnique({ where: { id: psMirrored } });
+        const x = await prisma.paymentSchedule.findUnique({ where: { id: psExtra } });
+        expect(num(m!.amount)).toBe(400); // unchanged
+        expect(num(x!.amount)).toBe(600); // unchanged
     });
 });
 
@@ -251,6 +301,28 @@ test.describe.serial("deleteInvoiceMilestoneCore", () => {
         expect(num(invoice!.totalAmount)).toBe(400);
         expect(num(invoice!.balanceDue)).toBe(0);
         expect(invoice!.status).toBe("Paid");
+    });
+
+    test("keeps a Draft invoice Draft when deleting its only pending extra", async () => {
+        await ensureClientAndProject();
+        const suffix = "delete-draft";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psExtra = `${PFX}-ps-extra-${suffix}`;
+
+        // No payments at all — a zero balance reached purely by deletion must not
+        // read as "Paid".
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Draft", totalAmount: 600, balanceDue: 600 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psExtra, invoiceId, name: "Extra Charge", amount: 600, status: "Pending" } });
+
+        const res = await deleteInvoiceMilestoneCore(psExtra);
+        expect(res.success).toBe(true);
+
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(0);
+        expect(num(invoice!.balanceDue)).toBe(0);
+        expect(invoice!.status).toBe("Draft");
     });
 });
 
