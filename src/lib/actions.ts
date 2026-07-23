@@ -2275,8 +2275,15 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         try {
             const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
             for (const milestone of pendingMilestones) {
-                const pushed = await pushMilestoneToQuickBooks(milestone.id);
-                if (milestone.id === deposit?.id) payLink = pushed.payLink;
+                // Per-milestone catch: one milestone failing (e.g. it changed mid-push
+                // and the conditional link claim refused) must not stop the remaining
+                // milestones from getting their QuickBooks links.
+                try {
+                    const pushed = await pushMilestoneToQuickBooks(milestone.id);
+                    if (milestone.id === deposit?.id) payLink = pushed.payLink;
+                } catch (e) {
+                    console.warn(`[approveEstimate] QuickBooks push skipped for milestone "${milestone.name}":`, e instanceof Error ? e.message : e);
+                }
             }
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and

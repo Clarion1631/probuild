@@ -197,14 +197,27 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
 
     const payLink = await getQBInvoicePaymentLink(tokens, qbId);
 
-    // Conditional link write: the milestone was read as unlinked and not Paid at
+    // Conditional link write: the milestone was read as unlinked and unpaid at
     // the top, but this function does several remote calls in between — a manual
-    // "Record Payment", a QB settle, or a concurrent push can land in that window.
-    // The guards go in the WHERE so a changed row loses nothing: if the claim
-    // misses, the just-created QBO invoice is deleted (compensation) instead of
-    // being attached to a row the payment poller would never watch again.
+    // "Record Payment", a QB settle, a cancellation, a concurrent push, or a
+    // rebalance changing the row's content can all land in that window. The
+    // guards go in the WHERE — status pinned to Pending (a Canceled row must
+    // never get a fresh collectible invoice: the payment poller only watches
+    // Pending) and the content snapshot (amount/name/dueDate) pinned to what the
+    // QBO invoice was actually created from, so a mid-push edit can't leave QBO
+    // silently out of sync. If the claim misses, the just-created QBO invoice is
+    // deleted (compensation) instead of being attached to a row it no longer
+    // describes.
     const linked = await prisma.paymentSchedule.updateMany({
-        where: { id: schedule.id, status: { not: "Paid" }, qbPaymentId: null, qbInvoiceId: null },
+        where: {
+            id: schedule.id,
+            status: "Pending",
+            qbPaymentId: null,
+            qbInvoiceId: null,
+            amount: schedule.amount,
+            name: schedule.name,
+            dueDate: schedule.dueDate,
+        },
         // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
         data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
     });
@@ -212,6 +225,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
         if (!compensated) {
             console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
+            throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
         }
         throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");
     }

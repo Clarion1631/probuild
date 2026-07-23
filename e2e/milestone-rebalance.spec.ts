@@ -128,11 +128,14 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         expect(a!.dueDate?.toISOString().slice(0, 10)).toBe("2026-02-01");
         expect(num(b!.amount)).toBe(650);
 
-        // Estimate-side mirror follows, percentage cleared (no longer a fixed share).
+        // Estimate-side mirrors follow, percentage cleared (no longer a fixed share).
         const eps = await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsA } });
         expect(eps!.name).toBe("Deposit (revised)");
         expect(num(eps!.amount)).toBe(350);
         expect(eps!.percentage).toBeNull();
+        const epsB2 = await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsB } });
+        expect(num(epsB2!.amount)).toBe(650);
+        expect(epsB2!.percentage).toBeNull();
 
         // Invoice total/balance are untouched by a rebalance.
         const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
