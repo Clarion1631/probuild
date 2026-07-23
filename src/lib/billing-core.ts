@@ -1540,3 +1540,364 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
         note: "Draft only — review and send it to the customer from ProBuild.",
     };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invoice milestone rebalance / delete / split — session-free cores for the
+// permission-gated actions in actions.ts (addInvoiceMilestone's siblings).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type RebalanceMilestoneRow = { scheduleId: string; name: string; amount: number; dueDate?: string | null };
+
+/**
+ * Re-price the Pending milestones on an invoice without changing the invoice
+ * total — the "Edit amounts" flow. Every currently-Pending row must be present
+ * in `rows` (the new amounts must sum to the same pending balance they replace);
+ * `invoice.totalAmount`/`balanceDue` are never touched here.
+ *
+ * Rows that change while carrying a QuickBooks invoice have that QBO invoice
+ * replaced post-commit, sequentially, on one shared token fetch: probe (refuse
+ * if a not-yet-pulled payment exists), delete in QBO, then atomically unlink
+ * (via `claimQBInvoiceUnlink`, shared with `breakQBInvoiceLink` — a concurrent
+ * settle wins the claim) and re-stage at the new amount. The link is only ever
+ * cleared AFTER the old QBO invoice is confirmed gone, so a QBO-side payment
+ * can never be stranded behind a cleared link. Every failure mode degrades to
+ * a per-row warning; the DB changes are never rolled back.
+ */
+export async function updatePendingMilestoneAmountsCore(
+    invoiceId: string,
+    rows: RebalanceMilestoneRow[],
+): Promise<{ success: true; warnings: string[] }> {
+    if (!rows.length) throw new Error("At least one milestone row is required");
+
+    const parsed = rows.map((r) => ({
+        scheduleId: r.scheduleId,
+        name: (r.name || "").trim(),
+        amount: Math.round(Number(r.amount) * 100) / 100,
+        dueDate: r.dueDate || null,
+    }));
+    for (const r of parsed) {
+        if (!r.scheduleId) throw new Error("Missing milestone id");
+        if (!r.name) throw new Error("Milestone name is required");
+        if (!Number.isFinite(r.amount) || r.amount <= 0) {
+            throw new Error(`"${r.name || r.scheduleId}": amount must be greater than zero`);
+        }
+    }
+    const seenIds = new Set(parsed.map((r) => r.scheduleId));
+    if (seenIds.size !== parsed.length) throw new Error("Duplicate milestone in the same request");
+
+    type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string };
+
+    const qbAffected = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Canonical lock order: Estimate → Invoice → schedules. The mirror sync
+        // below writes estimate-side rows, so read the estimate link (non-locking)
+        // and lock the Estimate before the Invoice — same pattern as unrecordPayment.
+        const invLink = await tx.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+        await lockMoneyParents(tx, { estimateId: invLink?.estimateId, invoiceId });
+
+        const existing = await tx.paymentSchedule.findMany({ where: { invoiceId } });
+        const existingMap = new Map(existing.map((s) => [s.id, s]));
+
+        for (const r of parsed) {
+            const row = existingMap.get(r.scheduleId);
+            if (!row) throw new Error(`Milestone not found: ${r.scheduleId}`);
+            if (row.status !== "Pending") throw new Error(`"${row.name}" is not Pending — only pending milestones can be rebalanced`);
+            if (row.stripeSessionId || row.stripePaymentIntentId) {
+                throw new Error(`A payment is in progress on "${row.name}". Wait for it to finish or void it before rebalancing.`);
+            }
+        }
+
+        // Every currently-Pending row must be accounted for — a partial submission
+        // can't total-preserve since the rows left out would be silently excluded
+        // from both sides of the comparison below.
+        const pendingRows = existing.filter((s) => s.status === "Pending");
+        if (pendingRows.length !== parsed.length || !pendingRows.every((s) => seenIds.has(s.id))) {
+            throw new Error("All pending milestones must be included in the rebalance");
+        }
+
+        const currentPendingTotal = Math.round(pendingRows.reduce((sum, s) => sum + toNum(s.amount), 0) * 100) / 100;
+        const newTotal = Math.round(parsed.reduce((sum, r) => sum + r.amount, 0) * 100) / 100;
+        if (Math.abs(newTotal - currentPendingTotal) > 0.005) {
+            throw new Error(
+                `New amounts total ${formatCurrency(newTotal)}, but the pending balance is ${formatCurrency(currentPendingTotal)}. ` +
+                `Rebalancing can't change the invoice total — use "Add extra charge" or a change order for that.`
+            );
+        }
+
+        // Total-preserving PER POOL, not just invoice-wide: estimate-mirrored rows
+        // and invoice-only extras must each keep their own sum. A single invoice
+        // total check would let money slide between the pools — the per-row mirror
+        // below would then desync the estimate-side schedule from the estimate
+        // total (e.g. the invoice reads paid while the estimate still shows a
+        // balance due).
+        const sumCents = (vals: number[]) => Math.round(vals.reduce((s, v) => s + v, 0) * 100) / 100;
+        const currentMirrored = sumCents(pendingRows.filter((s) => s.sourceScheduleId).map((s) => toNum(s.amount)));
+        const newMirrored = sumCents(parsed.filter((r) => existingMap.get(r.scheduleId)!.sourceScheduleId).map((r) => r.amount));
+        if (Math.abs(newMirrored - currentMirrored) > 0.005) {
+            throw new Error(
+                `New amounts move money between estimate-linked milestones and extra charges. ` +
+                `Estimate-linked milestones must still total ${formatCurrency(currentMirrored)} ` +
+                `(entered: ${formatCurrency(newMirrored)}) so the estimate's payment schedule stays in sync.`
+            );
+        }
+
+        const affected: QBAffected[] = [];
+        for (const r of parsed) {
+            const row = existingMap.get(r.scheduleId)!;
+            const amountChanged = Math.abs(toNum(row.amount) - r.amount) > 0.005;
+            const nameChanged = row.name !== r.name;
+            const dueDateChanged =
+                (row.dueDate ? row.dueDate.toISOString().slice(0, 10) : null) !==
+                (r.dueDate ? r.dueDate.slice(0, 10) : null);
+
+            // A QB-linked row whose content changes needs its staged QBO invoice
+            // replaced (QBO invoices are create-only here — no update path). The
+            // link is deliberately KEPT through this transaction: unlinking happens
+            // post-commit only AFTER the old QBO invoice is confirmed payment-free
+            // and actually deleted, so a payment that landed in QBO but hasn't been
+            // pulled yet can never be orphaned behind a cleared link.
+            if (row.qbInvoiceId && (amountChanged || nameChanged || dueDateChanged)) {
+                affected.push({ scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId });
+            }
+
+            await tx.paymentSchedule.update({
+                where: { id: r.scheduleId },
+                data: {
+                    name: r.name,
+                    amount: r.amount,
+                    dueDate: r.dueDate ? new Date(r.dueDate) : null,
+                },
+            });
+
+            // Mirror onto the linked estimate-side row (unpaid only). The new amount
+            // is no longer necessarily the same share of the estimate total, so clear
+            // `percentage` rather than guess one — consistent with saveEstimate's
+            // differential upsert, which nulls `percentage` whenever the incoming
+            // payload doesn't carry one for the row's new amount.
+            if (row.sourceScheduleId) {
+                await tx.estimatePaymentSchedule.updateMany({
+                    where: { id: row.sourceScheduleId, status: { not: "Paid" } },
+                    data: {
+                        name: r.name,
+                        amount: r.amount,
+                        dueDate: r.dueDate ? new Date(r.dueDate) : null,
+                        percentage: null,
+                    },
+                });
+            }
+        }
+        return affected;
+    }));
+
+    // Post-commit QBO resync: one shared token fetch, sequential per affected row.
+    // Order per row is deliberate — probe, refuse if paid, delete in QBO, and only
+    // THEN unlink locally (atomic claim) and re-stage. Unlinking last means a QBO
+    // payment the poller hasn't pulled yet can never be stranded behind a cleared
+    // link: until the old invoice is confirmed gone, the row keeps pointing at it
+    // and the payment poller keeps watching it.
+    const warnings: string[] = [];
+    if (qbAffected.length > 0) {
+        try {
+            const { getFreshQBTokens, pushMilestoneToQuickBooks, claimQBInvoiceUnlink } = await import("./quickbooks-payments");
+            const { deleteQBInvoice, probeQBInvoice } = await import("./quickbooks");
+            const tokens = await getFreshQBTokens();
+            for (const row of qbAffected) {
+                try {
+                    const probe = await probeQBInvoice(tokens, row.oldQbInvoiceId);
+                    if (probe.state === "error") {
+                        warnings.push(`"${row.name}": couldn't reach QuickBooks to replace the staged invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
+                        continue;
+                    }
+                    if (probe.state === "ok" && (probe.paymentTxnIds.length > 0 || Math.abs(probe.balance - probe.total) > 0.005)) {
+                        // A payment already exists on the old QBO invoice that ProBuild
+                        // hasn't pulled yet. Do NOT delete or unlink — leave the link so
+                        // the poller settles it — and tell the user to reconcile first.
+                        warnings.push(`"${row.name}": a payment exists on its QuickBooks invoice that ProBuild hasn't pulled yet — run "Refresh QB payments" and review before changing this milestone.`);
+                        continue;
+                    }
+                    const alreadyGone = probe.state === "voided" || probe.state === "notFound";
+                    if (!alreadyGone && !(await deleteQBInvoice(tokens, row.oldQbInvoiceId))) {
+                        warnings.push(`"${row.name}": couldn't delete the old QuickBooks invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
+                        continue;
+                    }
+                    // Old QBO invoice is confirmed gone — now clear the link, atomically
+                    // (a concurrent settle still wins the claim and we stop here).
+                    if (!(await claimQBInvoiceUnlink(prisma, row.scheduleId, row.oldQbInvoiceId))) {
+                        warnings.push(`"${row.name}": milestone changed while replacing its QuickBooks invoice — refresh and review before re-staging.`);
+                        continue;
+                    }
+                    await pushMilestoneToQuickBooks(row.scheduleId, tokens);
+                } catch (e) {
+                    warnings.push(`"${row.name}": QuickBooks re-stage failed (${e instanceof Error ? e.message : "unknown error"}) — re-stage it via "QuickBooks Link".`);
+                }
+            }
+        } catch (e) {
+            // Token fetch itself failed (QB not connected/unreachable). Nothing was
+            // unlinked — every affected row still points at its old QBO invoice,
+            // which now shows outdated details. Warn once per row.
+            const reason = e instanceof Error ? e.message : "QuickBooks unavailable";
+            for (const row of qbAffected) {
+                warnings.push(`"${row.name}": QuickBooks unavailable (${reason}) — its staged QuickBooks invoice still shows the old details. Use "Break QB Link" and re-stage once QuickBooks is back.`);
+            }
+        }
+    }
+
+    return { success: true, warnings };
+}
+
+/**
+ * Delete a Pending, non-mirrored, non-QB-linked "extra charge" milestone —
+ * the exact inverse of `addInvoiceMilestone`. QB-linked rows must go through
+ * Break QB Link first (this is DB-only, no QBO call).
+ */
+export async function deleteInvoiceMilestoneCore(
+    scheduleId: string,
+): Promise<{ success: true; projectId: string; invoiceId: string }> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        const row = await tx.paymentSchedule.findUnique({ where: { id: scheduleId } });
+        if (!row) throw new Error("Milestone not found");
+
+        await lockMoneyParents(tx, { invoiceId: row.invoiceId });
+
+        // Re-read under the invoice lock — a concurrent write between the first
+        // read and the lock could have changed status/links.
+        const locked = await tx.paymentSchedule.findUnique({ where: { id: scheduleId } });
+        if (!locked) throw new Error("Milestone not found");
+        if (locked.status !== "Pending") throw new Error("Only pending milestones can be deleted");
+        if (locked.sourceScheduleId) {
+            throw new Error("This milestone is linked to the estimate — remove it from the estimate's payment schedule instead");
+        }
+        if (locked.qbInvoiceId) {
+            throw new Error(`This milestone has a QuickBooks invoice staged — break the QuickBooks link first, then delete.`);
+        }
+        if (locked.stripeSessionId || locked.stripePaymentIntentId) {
+            throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
+        }
+
+        await tx.paymentSchedule.delete({ where: { id: scheduleId } });
+
+        const invoice = await tx.invoice.findUnique({ where: { id: locked.invoiceId } });
+        if (!invoice) throw new Error("Invoice not found");
+
+        const amount = toNum(locked.amount);
+        const newTotal = Math.round((toNum(invoice.totalAmount) - amount) * 100) / 100;
+        const newBalance = Math.max(0, Math.round((toNum(invoice.balanceDue) - amount) * 100) / 100);
+        // Inverse of addInvoiceMilestone's ladder: a pure decrement can only ever
+        // free up balance. "Paid" requires actual money received — a zero balance
+        // reached by deleting the only pending row on an invoice with no payments
+        // (e.g. a Draft whose sole extra is removed) keeps its current status
+        // rather than reading as settled.
+        const paidAmount = Math.round((toNum(invoice.totalAmount) - toNum(invoice.balanceDue)) * 100) / 100;
+        const nextStatus =
+            newBalance <= 0 ? (paidAmount > 0.005 ? "Paid" : invoice.status)
+            : invoice.status === "Paid" ? "Partially Paid"
+            : invoice.status;
+
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+                totalAmount: newTotal,
+                balanceDue: newBalance,
+                ...(nextStatus !== invoice.status ? { status: nextStatus } : {}),
+            },
+        });
+
+        return { success: true as const, projectId: invoice.projectId, invoiceId: invoice.id };
+    }));
+}
+
+/**
+ * Replace every non-Paid milestone on an invoice with a fresh set — the
+ * "Split payments" flow. Moved from actions.ts verbatim except the arithmetic
+ * fix below; behavior for the caller is unchanged.
+ *
+ * KNOWN LIMITATION: this deletes and recreates every non-Paid row, so any
+ * `sourceScheduleId` link to an estimate-side mirror is dropped — the new rows
+ * are unlinked extras. `updatePendingMilestoneAmountsCore` (re-price in place)
+ * is the correct tool when the mirror link must survive.
+ */
+export async function splitInvoiceMilestonesCore(
+    invoiceId: string,
+    milestones: { name: string; amount: number; dueDate?: string | null }[],
+): Promise<string> {
+    if (!milestones.length) throw new Error("At least one milestone is required");
+
+    const validated = milestones.map((m, i) => {
+        const name = (m.name || "").trim();
+        const amount = Math.round(Number(m.amount) * 100) / 100;
+        if (!name) throw new Error(`Milestone ${i + 1}: name is required`);
+        if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Milestone ${i + 1}: amount must be greater than zero`);
+        return { name, amount, dueDate: m.dueDate || null };
+    });
+
+    const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
+
+    // Interactive tx, invoice locked FIRST (canonical Estimate → Invoice order; this flow touches
+    // only the invoice). The paid portion is re-read from the LOCKED invoice, so a concurrent
+    // settle on a surviving Paid milestone can't leave paidAmount stale and get its balance
+    // overwritten. Arithmetic is otherwise unchanged from the original array-form transaction.
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+        if (!invoice) throw new Error("Invoice not found");
+
+        // Refuse to re-split while a payment is in flight on a non-Paid milestone. The delete
+        // below drops every non-Paid schedule; if one has an open Stripe checkout or a sent
+        // QuickBooks invoice, a settlement landing afterward would find no row to claim and the
+        // customer would be charged with nothing to reconcile against. Checked under the invoice
+        // lock so a checkout/QB-send starting concurrently can't slip in after this guard.
+        const inFlight = await tx.paymentSchedule.findFirst({
+            where: {
+                invoiceId,
+                status: { not: "Paid" },
+                OR: [
+                    { stripeSessionId: { not: null } },
+                    { stripePaymentIntentId: { not: null } },
+                    { qbInvoiceId: { not: null } },
+                ],
+            },
+            select: { name: true },
+        });
+        if (inFlight) {
+            throw new Error(
+                `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
+            );
+        }
+
+        // Recalculate: the paid portion survives untouched, and only the pending
+        // portion is replaced. totalAmount must keep counting the surviving paid
+        // rows (paidAmount + newTotal) — a prior version dropped paidAmount from
+        // totalAmount here, undercounting the invoice whenever the split ran on a
+        // partially-paid invoice. balanceDue is exactly the fresh pending total.
+        const paidAmount = Math.round(
+            (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
+        ) / 100;
+        const newInvoiceTotal = Math.round((paidAmount + newTotal) * 100) / 100;
+        const newBalance = newTotal; // validated milestones are all > 0, so this is always positive
+        const newStatus =
+            invoice.status === "Draft" ? "Draft"
+            : invoice.status === "Overdue" ? "Overdue"
+            : paidAmount > 0 ? "Partially Paid"
+            : "Issued";
+
+        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
+        // NOTE: this drops sourceScheduleId links on any replaced row — see the
+        // KNOWN LIMITATION above. Rebalancing amounts in place (without touching
+        // links) should go through updatePendingMilestoneAmountsCore instead.
+        await tx.paymentSchedule.createMany({
+            data: validated.map((m) => ({
+                invoiceId,
+                name: m.name,
+                amount: m.amount,
+                status: "Pending",
+                dueDate: m.dueDate ? new Date(m.dueDate) : null,
+            })),
+        });
+        await tx.invoice.update({
+            where: { id: invoiceId },
+            data: { totalAmount: newInvoiceTotal, balanceDue: newBalance, status: newStatus },
+        });
+        return invoice.projectId;
+    }));
+
+    return projectId;
+}
