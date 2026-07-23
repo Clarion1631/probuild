@@ -37,6 +37,38 @@ interface CrewOption {
 // popover of its own) and `variant="popover"` (the Schedule & crew table's
 // own trigger + FloatingPopover). No selected-initials chip here — the
 // table/bar trigger button keeps summarizing initials on its own.
+// Serializes full-list crew writes: instant optimistic UI, but requests go
+// out strictly in order (a later toggle's list can never be overtaken by an
+// earlier one racing through the locked server transaction). While one write
+// is in flight, newer lists coalesce into a single queued follow-up.
+function useSerializedCrewSubmit(send: (ids: string[]) => Promise<void>, onError: (message: string) => void) {
+    const [, startTransition] = useTransition();
+    const inFlightRef = useRef(false);
+    const queuedRef = useRef<string[] | null>(null);
+    return (ids: string[]) => {
+        if (inFlightRef.current) {
+            queuedRef.current = ids;
+            return;
+        }
+        inFlightRef.current = true;
+        startTransition(async () => {
+            try {
+                let current: string[] | null = ids;
+                while (current) {
+                    await send(current);
+                    current = queuedRef.current;
+                    queuedRef.current = null;
+                }
+            } catch (err: any) {
+                queuedRef.current = null;
+                onError(err?.message ?? "Failed to update crew");
+            } finally {
+                inFlightRef.current = false;
+            }
+        });
+    };
+}
+
 function CrewChecklist({
     legend,
     options,
@@ -99,18 +131,20 @@ export function CrewPicker({
     const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
     const selected = override && override.key === crewKey ? override.ids : crew.map(c => c.id);
 
+    const submitCrew = useSerializedCrewSubmit(
+        async ids => {
+            await updateProjectCrewAction(projectId, ids);
+            router.refresh();
+        },
+        message => {
+            toast.error(message || "Failed to update crew");
+            setOverride(null);
+        },
+    );
     function toggle(userId: string) {
         const next = selected.includes(userId) ? selected.filter(id => id !== userId) : [...selected, userId];
         setOverride({ key: crewKey, ids: next });
-        startTransition(async () => {
-            try {
-                await updateProjectCrewAction(projectId, next);
-                router.refresh();
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to update crew");
-                setOverride(null);
-            }
-        });
+        submitCrew(next);
     }
 
     // Option list: the picker team list PLUS any currently-assigned member who
@@ -175,18 +209,20 @@ export function TaskCrewPicker({
     ];
     const legend = `Task crew — ${selected.length} assigned`;
 
+    const submitCrew = useSerializedCrewSubmit(
+        async ids => {
+            await updateTaskCrewAction(task.id, ids);
+            router.refresh();
+        },
+        message => {
+            toast.error(message || "Failed to update task crew");
+            setOverride(null);
+        },
+    );
     function toggle(userId: string) {
         const next = selected.includes(userId) ? selected.filter(id => id !== userId) : [...selected, userId];
         setOverride({ key: assignmentKey, ids: next });
-        startTransition(async () => {
-            try {
-                await updateTaskCrewAction(task.id, next);
-                router.refresh();
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to update task crew");
-                setOverride(null);
-            }
-        });
+        submitCrew(next);
     }
 
     if (variant === "inline") {

@@ -484,8 +484,17 @@ export function ScheduleBoard({
             setProjectPreviewOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
             setProjectIncomeOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
             setProjectRefreshExpectations(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
+            // A reconciled refresh (e.g. an end-resize save) must not eat the
+            // visual preview of a still-UNSAVED start draft on the same
+            // project — rebuild that preview from fresh canonical data.
+            for (const projectId of reconciled) {
+                const draft = projectDrafts[projectId];
+                const canonical = canonicalProjectById.get(projectId);
+                if (draft && canonical) setProjectPreview(canonical, draft.targetStart);
+            }
         }, 0);
         return () => window.clearTimeout(timeoutId);
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- projectDrafts read at fire time by design
     }, [canonicalProjectById, projectRefreshExpectations]);
 
     useEffect(() => {
@@ -716,7 +725,9 @@ export function ScheduleBoard({
                 .map(([taskId]) => canonicalTaskProjectById.get(taskId))
                 .filter((id): id is string => Boolean(id)),
         ]);
-        onEffectivePendingProjectIdsChange(lockedProjectIds);
+        // The batch's page-wide lock must UNION any in-flight end-resize saves
+        // — replacing the set would unlock a project mid-resize-save.
+        onEffectivePendingProjectIdsChange(mergeProjectPendingIds(lockedProjectIds, endResizeSavingProjectIds));
 
         const failedProjectNames: string[] = [];
         const succeededProjectIds: string[] = [];
@@ -844,7 +855,10 @@ export function ScheduleBoard({
         }
 
         setIsSaving(false);
-        onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS);
+        // Reset to the still-in-flight end-resize saves, not blindly to empty
+        // (the isSaving-gated effect re-publishes on the next change anyway,
+        // but the window between here and that effect must not unlock them).
+        onEffectivePendingProjectIdsChange(endResizeSavingProjectIds.size > 0 ? endResizeSavingProjectIds : EMPTY_PROJECT_IDS);
         router.refresh();
 
         if (saveNotes.length > 0) toast.info(saveNotes.join(" "));

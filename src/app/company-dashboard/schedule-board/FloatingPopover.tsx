@@ -37,6 +37,7 @@ export interface FloatingPopoverProps {
  */
 export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224, pointerEventsNone = false }: FloatingPopoverProps) {
     const panelRef = useRef<HTMLDivElement | null>(null);
+    const contentRef = useRef<HTMLDivElement | null>(null);
     const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
     useLayoutEffect(() => {
@@ -54,7 +55,11 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             const viewportWidth = window.innerWidth;
             const viewportHeight = window.innerHeight;
             const panelWidth = panelRef.current?.offsetWidth ?? width;
-            const panelHeight = panelRef.current?.offsetHeight ?? 0;
+            // scrollHeight, not offsetHeight: once a maxHeight is applied the
+            // box stops growing, so a menu switching to taller content (the
+            // inline crew checklist) would keep measuring the SHORT view and
+            // never re-place. scrollHeight always reflects the content.
+            const panelHeight = Math.max(panelRef.current?.scrollHeight ?? 0, panelRef.current?.offsetHeight ?? 0);
 
             // Clamp order matters: the left-edge floor is applied LAST so a
             // viewport narrower than the panel pins to the margin instead of
@@ -96,10 +101,14 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
         // Re-measure when the PANEL's content changes size (e.g. a menu view
         // switching to the taller inline crew checklist) — placement computed
         // for the short view would otherwise keep constraining the tall one.
-        const panelObserver = typeof ResizeObserver !== "undefined" && panelRef.current
+        // Observe the CONTENT wrapper, not the panel: a maxHeight-capped panel
+        // box never changes size when its content grows, so panel observation
+        // misses the menu→taller-checklist switch entirely.
+        const observed = contentRef.current ?? panelRef.current;
+        const panelObserver = typeof ResizeObserver !== "undefined" && observed
             ? new ResizeObserver(() => place())
             : null;
-        if (panelObserver && panelRef.current) panelObserver.observe(panelRef.current);
+        if (panelObserver && observed) panelObserver.observe(observed);
         return () => {
             window.removeEventListener("resize", place);
             window.removeEventListener("scroll", place, true);
@@ -157,7 +166,10 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             className={`z-[200] space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl ${pointerEventsNone ? "pointer-events-none" : ""}`}
             onPointerDown={pointerEventsNone ? undefined : event => event.stopPropagation()}
         >
-            {children}
+            {/* Content wrapper: observed for size changes — the panel box
+                itself stops growing once maxHeight caps it, so observing the
+                panel alone misses menu→taller-view switches. */}
+            <div ref={contentRef}>{children}</div>
         </div>,
         document.body,
     );
