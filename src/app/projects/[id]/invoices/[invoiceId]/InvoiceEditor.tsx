@@ -869,9 +869,11 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                     {payment.status !== 'Paid' && payment.qbSyncError && (
                                                         <span
                                                             className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
-                                                            title="The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                            title={payment.qbSyncError === 'realmMismatch'
+                                                                ? 'The linked QuickBooks invoice belongs to a different QuickBooks company (the connection changed after it was staged). Use Break QB Link to clear it, then re-stage.'
+                                                                : 'The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice.'}
                                                         >
-                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : 'voided'}
+                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : payment.qbSyncError === 'realmMismatch' ? 'company changed' : 'voided'}
                                                         </span>
                                                     )}
                                                 </div>

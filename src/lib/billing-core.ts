@@ -1873,9 +1873,20 @@ export async function updatePendingMilestoneAmountsCore(
                     // path's own drift/identity guards refuse the row until it's
                     // broken and re-staged.
                     if (!qboRealmMatches(row.oldQbRealmId, tokens.realmId)) {
+                        // qbSyncError holds short state codes (see the probe sweep in
+                        // quickbooks-payments), not prose — "realmMismatch" gets its own
+                        // badge/tooltip in the invoice editor. Pinned on the old link AND
+                        // Pending/unpaid so neither a concurrent re-push nor an old-realm
+                        // settlement that just paid the row gets a stale flag stamped on it.
                         await prisma.paymentSchedule.updateMany({
-                            where: { id: row.scheduleId, qbInvoiceId: row.oldQbInvoiceId, qbRealmId: row.oldQbRealmId },
-                            data: { qbSyncError: "Rebalanced locally, but the staged QuickBooks invoice belongs to a different QuickBooks company — use \"Break QB Link\" and re-stage." },
+                            where: {
+                                id: row.scheduleId,
+                                status: "Pending",
+                                qbPaymentId: null,
+                                qbInvoiceId: row.oldQbInvoiceId,
+                                qbRealmId: row.oldQbRealmId,
+                            },
+                            data: { qbSyncError: "realmMismatch" },
                         });
                         warnings.push(`"${row.name}": its old QuickBooks invoice is bound to a different QuickBooks company — left untouched and flagged. Use "Break QB Link" and re-stage.`);
                         continue;
