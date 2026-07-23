@@ -51,6 +51,9 @@ export type PersistedTaskDate = PersistedScheduleTaskDate;
 
 export interface ProjectRefreshExpectation {
     projectStartDate?: string | null;
+    // Edge-resize end saves reconcile through the same expectation system —
+    // without this the resize preview override masks refreshed data forever.
+    projectEndDate?: string | null;
     taskDates: PersistedTaskDate[];
 }
 
@@ -209,6 +212,8 @@ export function projectRefreshMatches(
     if (!canonical) return false;
     if (expected.projectStartDate !== undefined
         && canonical.startDate?.slice(0, 10) !== expected.projectStartDate?.slice(0, 10)) return false;
+    if (expected.projectEndDate !== undefined
+        && (canonical.endDate?.slice(0, 10) ?? null) !== (expected.projectEndDate?.slice(0, 10) ?? null)) return false;
     const canonicalTasks = new Map(canonical.tasks.map(task => [task.id, task]));
     return expected.taskDates.every(task => {
         const canonicalTask = canonicalTasks.get(task.id);

@@ -41,17 +41,15 @@ function CrewChecklist({
     legend,
     options,
     selected,
-    disabled,
     onToggle,
 }: {
     legend: string;
     options: CrewOption[];
     selected: string[];
-    disabled: boolean;
     onToggle: (userId: string) => void;
 }) {
     return (
-        <fieldset className="m-0 min-w-0 border-0 p-0" disabled={disabled}>
+        <fieldset className="m-0 min-w-0 border-0 p-0">
             <legend className="mb-1 px-0 text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">{legend}</legend>
             {options.length === 0 ? (
                 <p className="px-2 py-1 text-xs text-hui-textMuted">No active team members.</p>
@@ -129,7 +127,7 @@ export function CrewPicker({
     const legend = `Project crew — ${selected.length} assigned`;
 
     if (variant === "inline") {
-        return <CrewChecklist legend={legend} options={options} selected={selected} disabled={isPending} onToggle={toggle} />;
+        return <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />;
     }
 
     const selectedNames = options.filter(o => selected.includes(o.id));
@@ -147,7 +145,7 @@ export function CrewPicker({
                 {selectedNames.length === 0 ? "Assign crew" : selectedNames.map(o => initials(o.label)).join(" ")}
             </button>
             <FloatingPopover open={open} anchorRef={triggerRef} onClose={() => setOpen(false)} width={320}>
-                <CrewChecklist legend={legend} options={options} selected={selected} disabled={isPending} onToggle={toggle} />
+                <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />
             </FloatingPopover>
         </>
     );
@@ -192,7 +190,7 @@ export function TaskCrewPicker({
     }
 
     if (variant === "inline") {
-        return <CrewChecklist legend={legend} options={options} selected={selected} disabled={isPending} onToggle={toggle} />;
+        return <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />;
     }
 
     return (
@@ -201,7 +199,7 @@ export function TaskCrewPicker({
                 {selected.length === 0 ? "Assign task crew" : task.assignments.filter(a => selected.includes(a.userId)).map(a => initials(a.name)).join(" ") || `${selected.length} assigned`}
             </button>
             <FloatingPopover open={open} anchorRef={triggerRef} onClose={() => setOpen(false)} width={320}>
-                <CrewChecklist legend={legend} options={options} selected={selected} disabled={isPending} onToggle={toggle} />
+                <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />
             </FloatingPopover>
         </>
     );

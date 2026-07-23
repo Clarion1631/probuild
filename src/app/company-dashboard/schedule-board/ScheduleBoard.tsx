@@ -335,6 +335,14 @@ export function ScheduleBoard({
     const isAnyDragActive = pointerDragActive || projectKeyboardEdit !== null || taskKeyboardEdit !== null;
 
     useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
+    // Edge-resize saves must lock the project PAGE-WIDE: without publishing,
+    // the legacy StartDateRow can mutate the same project mid-save and reject
+    // or clobber the new end date. (saveAllDrafts publishes its own set
+    // in-line; this effect only speaks while no batch save is running.)
+    useEffect(() => {
+        if (isSaving) return;
+        onEffectivePendingProjectIdsChange(endResizeSavingProjectIds);
+    }, [endResizeSavingProjectIds, isSaving, onEffectivePendingProjectIdsChange]);
 
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
@@ -1046,6 +1054,14 @@ export function ScheduleBoard({
         void (async () => {
             try {
                 await updateProjectEndDateAction(project.id, candidateEnd);
+                // Reconcile the resize preview through the expectation system —
+                // it clears the override once canonical endDate matches;
+                // leaving the override unmanaged would mask ALL later
+                // refreshed data for this project.
+                setProjectRefreshExpectations(current => ({
+                    ...current,
+                    [project.id]: { projectEndDate: candidateEnd, taskDates: [] },
+                }));
                 router.refresh();
                 if (taskDerivedRange && parseUTCDate(candidateEnd) < taskDerivedRange.end) {
                     toast.info(`End date saved — the bar still shows through ${formatDate(addDays(taskDerivedRange.end, -1))} because tasks run that long.`);
@@ -1097,9 +1113,15 @@ export function ScheduleBoard({
             const dayWidth = drag.start.timelineDayWidth ?? drag.monthDayWidth;
             if (!dayWidth) return null;
             const deltaDays = getTimelinePointerDelta(drag.latestClientX, drag.originX, dayWidth);
+            // Clamp against the PERSISTED start marker when one exists — the
+            // effective range can start at an earlier task (marker-only moves),
+            // and the server rejects end <= persisted startDate.
+            const clampStart = drag.project.startDate
+                ? parseUTCDate(drag.project.startDate.slice(0, 10))
+                : parseUTCDate(drag.originalStart);
             const candidateEnd = computeProjectEndResizeCandidate(
                 parseUTCDate(drag.originalEnd),
-                parseUTCDate(drag.originalStart),
+                clampStart,
                 deltaDays,
             );
             return formatDate(candidateEnd);

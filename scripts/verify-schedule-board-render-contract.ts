@@ -361,7 +361,11 @@ assert.match(layoutSource, /candidate < minEnd \? minEnd : candidate/, "the clam
 assert.match(boardSource, /function measureMonthDayWidth\(clientX: number, clientY: number\): number \| null \{/, "Month's day width must be measured from the underlying week-grid day cell, not hardcoded");
 assert.match(boardSource, /function handleProjectEndResizeStart\(project: DashboardProjectRow, start: ProjectEndResizePointerStart\) \{/);
 assert.match(boardSource, /const dayWidth = drag\.start\.timelineDayWidth \?\? drag\.monthDayWidth;/, "px->day math must read the CURRENT day width — Timeline's zoom-driven prop or Month's measured value — never a hardcoded constant");
-assert.match(boardSource, /computeProjectEndResizeCandidate\(\s*\n\s*parseUTCDate\(drag\.originalEnd\),\s*\n\s*parseUTCDate\(drag\.originalStart\),/, "the live preview must run through the shared pure clamp helper");
+// The clamp floor is the PERSISTED start marker when one exists (the effective
+// range can begin at an earlier task after marker-only moves, and the server
+// rejects end <= persisted startDate) — falling back to the range start.
+assert.match(boardSource, /const clampStart = drag\.project\.startDate\s*\n\s*\? parseUTCDate\(drag\.project\.startDate\.slice\(0, 10\)\)\s*\n\s*: parseUTCDate\(drag\.originalStart\);/, "the resize clamp must floor at the persisted start marker");
+assert.match(boardSource, /computeProjectEndResizeCandidate\(\s*\n\s*parseUTCDate\(drag\.originalEnd\),\s*\n\s*clampStart,/, "the live preview must run through the shared pure clamp helper");
 assert.match(boardSource, /function commitProjectEndResize\(project: DashboardProjectRow, candidateEnd: string\) \{/);
 assert.doesNotMatch(
     boardSource.slice(boardSource.indexOf("function commitProjectEndResize("), boardSource.indexOf("function handleProjectEndResizeStart(")),

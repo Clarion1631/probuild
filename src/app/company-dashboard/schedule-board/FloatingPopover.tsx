@@ -93,9 +93,17 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
         place();
         window.addEventListener("resize", place);
         window.addEventListener("scroll", place, true);
+        // Re-measure when the PANEL's content changes size (e.g. a menu view
+        // switching to the taller inline crew checklist) — placement computed
+        // for the short view would otherwise keep constraining the tall one.
+        const panelObserver = typeof ResizeObserver !== "undefined" && panelRef.current
+            ? new ResizeObserver(() => place())
+            : null;
+        if (panelObserver && panelRef.current) panelObserver.observe(panelRef.current);
         return () => {
             window.removeEventListener("resize", place);
             window.removeEventListener("scroll", place, true);
+            panelObserver?.disconnect();
         };
     }, [open, anchorRef, anchorPoint, width]);
 
@@ -105,7 +113,9 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             if (event.key !== "Escape") return;
             event.preventDefault();
             onClose();
-            anchorRef?.current?.focus();
+            // Hover cards open on focus — restoring focus to the anchor would
+            // immediately reopen the card Escape just dismissed.
+            if (!pointerEventsNone) anchorRef?.current?.focus();
         }
         function onPointerDownOutside(event: PointerEvent) {
             const target = event.target as Node;
@@ -119,7 +129,7 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             window.removeEventListener("keydown", onKeyDown);
             window.removeEventListener("pointerdown", onPointerDownOutside, true);
         };
-    }, [open, onClose, anchorRef]);
+    }, [open, onClose, anchorRef, pointerEventsNone]);
 
     if (!open || typeof document === "undefined") return null;
 
