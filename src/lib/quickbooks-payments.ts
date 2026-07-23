@@ -10,6 +10,7 @@
  * milestone Paid exactly like the Stripe webhook does. That keeps ProBuild,
  * QuickBooks, and the bank in sync, and keeps the sales-tax report truthful.
  */
+import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
@@ -49,6 +50,41 @@ export async function getFreshQBTokens(): Promise<QBTokens> {
         // Refresh can fail transiently; the old access token may still be valid.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }
+}
+
+/**
+ * Atomically clear a milestone's QuickBooks link fields. The guard fields
+ * (`status`, `qbPaymentId`, and the exact `qbInvoiceId` the caller read) all go
+ * in the WHERE, so if a QB settlement lands on this milestone between the
+ * caller's read and this write, the claim matches 0 rows and the settle wins —
+ * we never strip QB fields off a now-paid row, and a concurrent re-push (new
+ * id) can't be clobbered either.
+ *
+ * Accepts either a bare `prisma` client or an in-flight `tx` — shared by
+ * `breakQBInvoiceLink` (standalone) and `updatePendingMilestoneAmountsCore`
+ * (inside its rebalance transaction) so both go through the same claim.
+ */
+export async function claimQBInvoiceUnlink(
+    client: Prisma.TransactionClient,
+    scheduleId: string,
+    expectedQbInvoiceId: string,
+): Promise<boolean> {
+    const cleared = await client.paymentSchedule.updateMany({
+        where: {
+            id: scheduleId,
+            status: { not: "Paid" },
+            qbPaymentId: null,
+            qbInvoiceId: expectedQbInvoiceId,
+        },
+        data: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            qbInvoiceSentAt: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+        },
+    });
+    return cleared.count === 1;
 }
 
 async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
