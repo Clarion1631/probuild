@@ -18,7 +18,11 @@ export function deriveInvoiceStatus(input: {
     if (input.currentStatus === "Canceled") return "Canceled";
     const active = (input.paymentStatuses || []).filter((status) => status !== "Canceled");
     const anyPaid = active.some((status) => status === "Paid");
-    if (input.balanceDue <= 0 || (active.length > 0 && active.every((status) => status === "Paid"))) return "Paid";
+    // "Paid" strictly requires a settled balance. Milestones being all-Paid is
+    // NOT sufficient: invoices exist whose schedules don't cover totalAmount
+    // (legacy conversions, mirror drift, removed extras), and marking those Paid
+    // while money is still owed silently closes real AR.
+    if (input.balanceDue <= 0) return "Paid";
     if (anyPaid || (input.totalAmount != null && input.balanceDue < input.totalAmount)) return "Partially Paid";
     if (input.issueDate || input.sentAt) return "Issued";
     return "Draft";

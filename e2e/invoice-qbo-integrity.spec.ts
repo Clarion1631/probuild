@@ -35,6 +35,11 @@ test.describe("QBO mapping integrity gate", () => {
 
         const actions = readFileSync(resolve(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
         expect(actions).toContain("qboRealmMatches(schedule.qbRealmId, tokens.realmId)");
-        expect(actions).toContain("qbRealmId: schedule.qbRealmId");
+        // The unlink claim moved into the shared realm-aware helper — the caller
+        // must pass the realm it read, and the helper must pin + clear it.
+        expect(actions).toContain("claimQBInvoiceUnlink(tx, schedule.id, schedule.qbInvoiceId!, schedule.qbRealmId)");
+        const qbPayments = readFileSync(resolve(__dirname, "..", "src", "lib", "quickbooks-payments.ts"), "utf8");
+        expect(qbPayments).toContain("qbRealmId: expectedQbRealmId");
+        expect(qbPayments).toContain("expectedQbRealmId: string | null");
     });
 });

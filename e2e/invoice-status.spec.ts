@@ -11,6 +11,10 @@ test.describe("canonical invoice status", () => {
         expect(deriveInvoiceStatus({ balanceDue: 50, issueDate: new Date(), paymentStatuses: ["Paid", "Pending"] })).toBe("Partially Paid");
         expect(deriveInvoiceStatus({ balanceDue: 50, totalAmount: 100, issueDate: new Date(), paymentStatuses: ["Pending"] })).toBe("Partially Paid");
         expect(deriveInvoiceStatus({ balanceDue: 0, issueDate: new Date(), paymentStatuses: ["Paid"] })).toBe("Paid");
+        // All milestones Paid but a balance remains (schedules don't cover the
+        // invoice total — legacy/mirror-drift invoices): still money owed, so
+        // never "Paid".
+        expect(deriveInvoiceStatus({ balanceDue: 550, totalAmount: 1000, issueDate: new Date(), paymentStatuses: ["Paid"] })).toBe("Partially Paid");
         expect(deriveInvoiceStatus({ currentStatus: "Canceled", balanceDue: 100, issueDate: new Date(), paymentStatuses: ["Pending"] })).toBe("Canceled");
     });
 
@@ -44,7 +48,7 @@ test.describe("canonical invoice status", () => {
     test("the additive migration is atomic and backfills partial payment from balances", () => {
         const migration = readFileSync(resolve(__dirname, "..", "scripts", "apply-invoice-lifecycle.mjs"), "utf8");
         expect(migration).toContain("prisma.$transaction");
-        expect(migration).toContain('"balanceDue" > 0 AND "balanceDue" < "totalAmount"');
+        expect(migration).toContain('i."balanceDue" > 0 AND i."balanceDue" < i."totalAmount"');
         expect(migration).toContain("ADD COLUMN IF NOT EXISTS");
         expect(migration).toContain("QBO_LEGACY_REALM_ID");
         expect(migration).toContain('SET "qbRealmId" = ${legacyQboRealmId}');
