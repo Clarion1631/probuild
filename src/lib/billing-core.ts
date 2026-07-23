@@ -1585,6 +1585,56 @@ export async function updatePendingMilestoneAmountsCore(
     const seenIds = new Set(parsed.map((r) => r.scheduleId));
     if (seenIds.size !== parsed.length) throw new Error("Duplicate milestone in the same request");
 
+    // Content-change test shared by the QBO preflight below and the in-tx
+    // collection: any of amount/name/dueDate differing means the staged QBO
+    // invoice (if one exists) no longer matches and must be replaced.
+    const contentChanged = (
+        row: { amount: unknown; name: string; dueDate: Date | null },
+        r: { name: string; amount: number; dueDate: string | null },
+    ) =>
+        Math.abs(toNum(row.amount) - r.amount) > 0.005 ||
+        row.name !== r.name ||
+        (row.dueDate ? row.dueDate.toISOString().slice(0, 10) : null) !== (r.dueDate ? r.dueDate.slice(0, 10) : null);
+
+    // PREFLIGHT (before any DB write): a QB-linked row may only be repriced if
+    // its staged QBO invoice is reachable and payment-free RIGHT NOW. Committing
+    // new amounts first and checking later leaves a window where a payment that
+    // already landed in QBO (possibly hours before the poller's next pull)
+    // settles the milestone at the NEW local amount while the client actually
+    // paid the OLD one — a silent cash/records mismatch. Aborting here costs
+    // nothing: no row has been touched yet. The post-commit loop re-probes
+    // before the delete, so the residual race is only the seconds between this
+    // check and the delete — and QBO refuses to delete a paid invoice even then.
+    const preflightRows = await prisma.paymentSchedule.findMany({
+        where: { invoiceId, id: { in: parsed.map((r) => r.scheduleId) }, qbInvoiceId: { not: null } },
+    });
+    const preflightChanged = preflightRows.filter((row) => contentChanged(row, parsed.find((p) => p.scheduleId === row.id)!));
+    if (preflightChanged.length > 0) {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        const { probeQBInvoice } = await import("./quickbooks");
+        let tokens;
+        try {
+            tokens = await getFreshQBTokens();
+        } catch (e) {
+            throw new Error(
+                `QuickBooks is unreachable (${e instanceof Error ? e.message : "unknown error"}) and this rebalance changes milestones with staged QuickBooks invoices. ` +
+                `Nothing was changed — retry when QuickBooks is back, or use "Break QB Link" first.`
+            );
+        }
+        for (const row of preflightChanged) {
+            const probe = await probeQBInvoice(tokens, row.qbInvoiceId!);
+            if (probe.state === "error") {
+                throw new Error(`Couldn't verify "${row.name}"'s staged QuickBooks invoice — nothing was changed. Retry in a moment.`);
+            }
+            if (probe.state === "ok" && (probe.paymentTxnIds.length > 0 || Math.abs(probe.balance - probe.total) > 0.005)) {
+                throw new Error(
+                    `A payment already exists on "${row.name}"'s QuickBooks invoice that ProBuild hasn't pulled yet. ` +
+                    `Nothing was changed — run "Refresh QB payments" first, then rebalance.`
+                );
+            }
+        }
+    }
+
     type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string };
 
     const qbAffected = await withTxRetry(() => prisma.$transaction(async (tx) => {
@@ -1643,19 +1693,15 @@ export async function updatePendingMilestoneAmountsCore(
         const affected: QBAffected[] = [];
         for (const r of parsed) {
             const row = existingMap.get(r.scheduleId)!;
-            const amountChanged = Math.abs(toNum(row.amount) - r.amount) > 0.005;
-            const nameChanged = row.name !== r.name;
-            const dueDateChanged =
-                (row.dueDate ? row.dueDate.toISOString().slice(0, 10) : null) !==
-                (r.dueDate ? r.dueDate.slice(0, 10) : null);
 
             // A QB-linked row whose content changes needs its staged QBO invoice
             // replaced (QBO invoices are create-only here — no update path). The
-            // link is deliberately KEPT through this transaction: unlinking happens
-            // post-commit only AFTER the old QBO invoice is confirmed payment-free
-            // and actually deleted, so a payment that landed in QBO but hasn't been
-            // pulled yet can never be orphaned behind a cleared link.
-            if (row.qbInvoiceId && (amountChanged || nameChanged || dueDateChanged)) {
+            // preflight above already verified these invoices are reachable and
+            // payment-free. The link is deliberately KEPT through this transaction:
+            // unlinking happens post-commit only AFTER the old QBO invoice is
+            // confirmed still payment-free and actually deleted, so a payment that
+            // landed in QBO can never be orphaned behind a cleared link.
+            if (row.qbInvoiceId && contentChanged(row, r)) {
                 affected.push({ scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId });
             }
 
@@ -1708,10 +1754,11 @@ export async function updatePendingMilestoneAmountsCore(
                         continue;
                     }
                     if (probe.state === "ok" && (probe.paymentTxnIds.length > 0 || Math.abs(probe.balance - probe.total) > 0.005)) {
-                        // A payment already exists on the old QBO invoice that ProBuild
-                        // hasn't pulled yet. Do NOT delete or unlink — leave the link so
-                        // the poller settles it — and tell the user to reconcile first.
-                        warnings.push(`"${row.name}": a payment exists on its QuickBooks invoice that ProBuild hasn't pulled yet — run "Refresh QB payments" and review before changing this milestone.`);
+                        // A payment landed on the old QBO invoice in the seconds since
+                        // the preflight passed. Do NOT delete or unlink — leave the link
+                        // so the poller settles it — but the local amount has already
+                        // changed, so tell the user to reconcile this milestone now.
+                        warnings.push(`"${row.name}": a payment just landed on its old QuickBooks invoice, but the milestone amount here already changed — run "Refresh QB payments" and reconcile this milestone before sending anything.`);
                         continue;
                     }
                     const alreadyGone = probe.state === "voided" || probe.state === "notFound";
