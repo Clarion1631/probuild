@@ -134,7 +134,6 @@ export function TaskBlockSegment({
     const rootRef = useRef<HTMLDivElement | null>(null);
     const fragmentId = useId().replace(/:/g, "");
     const [allocatedWidth, setAllocatedWidth] = useState(0);
-    const actionTriggerRef = useRef<HTMLButtonElement>(null);
     const [menuOpen, setMenuOpen] = useState(false);
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number } | null>(null);
     const [menuView, setMenuView] = useState<TaskMenuView>("main");
@@ -185,7 +184,7 @@ export function TaskBlockSegment({
         if (!menuOpen) setNoteDraft("");
     }, [menuOpen]);
     // Only one schedule-board menu open at a time (item 1) — including across
-    // a right-click/context menu vs the click-triggered "⋯" menu.
+    // right-click/context-menu and block-activation paths.
     useEffect(() => {
         if (!menuOpen) {
             setMenuView("main");
@@ -268,6 +267,25 @@ export function TaskBlockSegment({
         setMenuOpen(true);
     }
 
+    // Activation seam: a future drawer can replace this one function while
+    // pointer, keyboard, and edit-gating behavior stays at the block boundary.
+    function handleBlockActivate(event: ReactMouseEvent<HTMLDivElement> | KeyboardEvent<HTMLElement>) {
+        if (!canEdit || isPending) return;
+        if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
+        // A block sits inside its project bar, whose own click opens the
+        // PROJECT menu — without this, the bar menu instantly replaces the
+        // task menu via the exclusive-menu coordinator.
+        event.stopPropagation();
+        const anchorPoint = event.type === "click"
+            ? { x: (event as ReactMouseEvent<HTMLDivElement>).clientX, y: (event as ReactMouseEvent<HTMLDivElement>).clientY }
+            : null;
+        if (menuOpen) {
+            setMenuOpen(false);
+        } else {
+            openMenu(anchorPoint);
+        }
+    }
+
     function handleKeyboard(event: KeyboardEvent<HTMLElement>, mode: TaskEditMode) {
         if (event.target !== event.currentTarget) return;
         if (!canEdit || isPending) return;
@@ -278,6 +296,12 @@ export function TaskBlockSegment({
             event.preventDefault();
             event.stopPropagation();
             openMenu(null);
+            return;
+        }
+        if (mode === "move" && activeMode === null && (event.key === " " || event.key === "Enter")) {
+            event.preventDefault();
+            event.stopPropagation();
+            handleBlockActivate(event);
             return;
         }
         if (!editing && (event.key === " " || event.key === "Enter")) {
@@ -382,13 +406,14 @@ export function TaskBlockSegment({
             title={title}
             role="group"
             tabIndex={0}
-            aria-label={`${title}. ${canEdit ? "Press Space or Enter to move with the keyboard." : "Read only."}${isDraft ? " Unsaved change." : ""}`}
+            aria-label={`${title}. ${canEdit ? "Press Enter or Space to open task actions." : "Read only."}${isDraft ? " Unsaved change." : ""}`}
             aria-disabled={!canEdit || isPending}
             aria-busy={isPending}
             data-task-edit-block="true"
             data-project-start={formatDate(projectRange.start)}
             data-can-edit={canEdit ? "true" : "false"}
             onPointerDown={event => beginPointerEdit(event, "move")}
+            onClick={handleBlockActivate}
             onKeyDown={event => handleKeyboard(event, "move")}
             onContextMenu={handleContextMenu}
             onMouseEnter={handleHoverCardMouseEnter}
@@ -432,19 +457,7 @@ export function TaskBlockSegment({
             )}
 
             {!mutationDisabled && (
-            <>
-                <button
-                    ref={actionTriggerRef}
-                    type="button"
-                    onClick={event => { event.stopPropagation(); if (menuOpen) setMenuOpen(false); else openMenu(null); }}
-                    onPointerDown={event => event.stopPropagation()}
-                    aria-expanded={menuOpen}
-                    className="absolute right-0 top-0 z-30 cursor-pointer rounded bg-white/85 px-1 text-[8px] font-bold text-slate-800 opacity-0 shadow transition group-hover/task:opacity-100 group-focus-within/task:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-                    aria-label={`Task actions for ${task.name}`}
-                >
-                    ⋯
-                </button>
-                <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
+                <FloatingPopover open={menuOpen} anchorRef={rootRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
                     {menuView === "main" && (
                         <div className="space-y-1" onPointerDown={event => event.stopPropagation()}>
                             <button type="button" onClick={() => setMenuView("dates")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
@@ -534,7 +547,6 @@ export function TaskBlockSegment({
                         </div>
                     )}
                 </FloatingPopover>
-            </>
             )}
             <FloatingPopover open={hoverCardOpen} anchorRef={rootRef} onClose={closeHoverCard} width={220} pointerEventsNone>
                 <div className="space-y-1">

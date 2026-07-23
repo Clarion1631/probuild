@@ -171,7 +171,7 @@ export function ProjectBar({
     const gridStart = useContext(ProjectBarGridStartContext);
     const projectRange = getEffectiveProjectRange(project);
     const projectStart = projectRange ? formatDate(projectRange.start) : "";
-    const actionTriggerRef = useRef<HTMLButtonElement>(null);
+    const rootRef = useRef<HTMLDivElement>(null);
     const [menuOpen, setMenuOpen] = useState(false);
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number } | null>(null);
     const [menuView, setMenuView] = useState<BarMenuView>("main");
@@ -196,7 +196,7 @@ export function ProjectBar({
         setMenuOpen(false);
     }, [actionResetKey]);
     // Only one schedule-board menu open at a time (item 1) — including across
-    // a right-click/context menu vs the click-triggered Actions menu.
+    // right-click/context-menu and bar-activation paths.
     useEffect(() => {
         if (!menuOpen) {
             setMenuView("main");
@@ -408,7 +408,7 @@ export function ProjectBar({
         if (menuOpen) {
             setMenuOpen(false);
         } else {
-            openMenu(null);
+            openMenu({ x: event.clientX, y: event.clientY });
         }
     }
 
@@ -416,6 +416,7 @@ export function ProjectBar({
 
     return (
         <div
+            ref={rootRef}
             className={`group/project relative touch-pan-y select-none overflow-visible rounded-md border text-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 ${canMoveProject && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
             style={{ backgroundColor: projectColor, height: barHeight }}
             data-can-edit={canEdit ? "true" : "false"}
@@ -445,18 +446,7 @@ export function ProjectBar({
                     </span>
                 )}
                 {canEdit && (
-                    <>
-                        <button
-                            ref={actionTriggerRef}
-                            type="button"
-                            onClick={event => { event.stopPropagation(); if (menuOpen) setMenuOpen(false); else openMenu(null); }}
-                            aria-expanded={menuOpen}
-                            className="shrink-0 cursor-pointer rounded bg-white/20 px-1 py-0.5 text-[9px] font-bold text-white opacity-0 transition hover:bg-white/30 group-hover/project:opacity-100 group-focus-within/project:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                            aria-label={`Project actions for ${project.name}`}
-                        >
-                            Actions
-                        </button>
-                        <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
+                        <FloatingPopover open={menuOpen} anchorRef={rootRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
                             {menuView === "main" && (
                                 <div className="space-y-1">
                                     <Link
@@ -557,7 +547,6 @@ export function ProjectBar({
                                 </div>
                             )}
                         </FloatingPopover>
-                    </>
                 )}
                 {segment.continuesAfter && <span aria-hidden="true">›</span>}
             </div>
