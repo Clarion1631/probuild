@@ -1866,8 +1866,18 @@ export async function updatePendingMilestoneAmountsCore(
                     // Defensive re-check of the preflight's realm gate: the QBO
                     // connection could have been re-pointed at a different company
                     // between the tx and this loop. Never probe/delete across realms.
+                    // The local amounts are already committed at this point, so a
+                    // toast alone isn't enough — stamp qbSyncError (pinned to the
+                    // old link so a concurrent re-push isn't clobbered) to make the
+                    // stale-realm link a durable, visible recovery state; the send
+                    // path's own drift/identity guards refuse the row until it's
+                    // broken and re-staged.
                     if (!qboRealmMatches(row.oldQbRealmId, tokens.realmId)) {
-                        warnings.push(`"${row.name}": its old QuickBooks invoice is bound to a different QuickBooks company — left untouched. Use "Break QB Link" and re-stage.`);
+                        await prisma.paymentSchedule.updateMany({
+                            where: { id: row.scheduleId, qbInvoiceId: row.oldQbInvoiceId, qbRealmId: row.oldQbRealmId },
+                            data: { qbSyncError: "Rebalanced locally, but the staged QuickBooks invoice belongs to a different QuickBooks company — use \"Break QB Link\" and re-stage." },
+                        });
+                        warnings.push(`"${row.name}": its old QuickBooks invoice is bound to a different QuickBooks company — left untouched and flagged. Use "Break QB Link" and re-stage.`);
                         continue;
                     }
                     const probe = await probeQBInvoice(tokens, row.oldQbInvoiceId);
