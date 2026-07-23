@@ -7,7 +7,7 @@ import { prisma } from "../src/lib/prisma";
 import { getCompanyDashboardData, setProjectCrew, setProjectStartDate, setTaskCrew, shiftNotStartedTasks } from "../src/lib/schedule-core";
 import { canAccessProject, hasPermission } from "../src/lib/permissions";
 import { withTxRetry } from "../src/lib/tx-retry";
-import { saveCompanyScheduleTaskDatesAction } from "../src/lib/actions";
+import { saveCompanyScheduleTaskDatesAction, updateProjectEndDateAction } from "../src/lib/actions";
 
 type Check = [label: string, passed: boolean];
 
@@ -68,6 +68,9 @@ async function main() {
                 status: "In Progress",
                 startDate: at(0),
                 color: "#123456",
+                // Shop coordinates exactly — distanceMilesFromShop must be 0.
+                locationLat: 45.6617,
+                locationLng: -122.5484,
             },
         });
         projectIds.push(project.id);
@@ -190,6 +193,11 @@ async function main() {
                 status: "Waiting to Start",
                 startDate: at(30),
                 color: "#654321",
+                // Exactly 1 degree of latitude north of the shop, same
+                // longitude — a pure-meridian great-circle distance, exactly
+                // EARTH_RADIUS_MILES * (pi/180) =~ 69.09 mi, rounds to 69.
+                locationLat: 46.6617,
+                locationLng: -122.5484,
             },
         });
         projectIds.push(waitingProject.id);
@@ -237,6 +245,10 @@ async function main() {
             check(`${role} dashboard includes project/task color, parentId, and progress`, additiveFieldsPresent);
             const substantialRow = dashboard.pipeline.substantialCompletion.find(candidate => candidate.id === substantialProject.id);
             check(`${role} dashboard enriches Substantial Completion rows and tasks`, substantialRow?.tasks.some(task => task.id === substantialTask.id) === true);
+            // distanceMilesFromShop is NOT money — serialized identically for
+            // every role, including FIELD_CREW and FINANCE.
+            check(`${role} dashboard computes distanceMilesFromShop = 0 for a shop-coordinate project`, row?.distanceMilesFromShop === 0);
+            check(`${role} dashboard leaves distanceMilesFromShop null for an ungeocoded project`, substantialRow?.distanceMilesFromShop === null);
             if (role === "ADMIN") {
                 check("ADMIN dashboard includes overlays, cashflow, and strip", dashboard.overlays !== null && dashboard.cashflow !== null && dashboard.strip !== null);
             } else {
@@ -269,6 +281,20 @@ async function main() {
         check("explicit canSeeFinancials=false overrides the MANAGER role default", overriddenManager.canSeeFinancials === false
             && overriddenManager.pipeline.inProgress.every(candidate => candidate.contractValue === null)
             && overriddenManager.pipeline.estimating.every(candidate => candidate.targetRevenue === null && candidate.latestEstimateTotal === null));
+        // teamMembers.role is always serialized (crew-availability panel role
+        // filter); burdenedHourlyRate is MONEY — present only when the caller
+        // can see financials, absent (not null) otherwise.
+        check("overridden MANAGER teamMembers carry role but omit burdenedHourlyRate (money gated off)",
+            (overriddenManager.teamMembers ?? []).length > 0
+            && (overriddenManager.teamMembers ?? []).every(m => typeof m.role === "string" && !Object.prototype.hasOwnProperty.call(m, "burdenedHourlyRate")));
+        const adminDashboardForTeam = await getCompanyDashboardData({ role: "ADMIN" }, month);
+        check("ADMIN teamMembers carry role and burdenedHourlyRate (money visible)",
+            (adminDashboardForTeam.teamMembers ?? []).length > 0
+            && (adminDashboardForTeam.teamMembers ?? []).every(m => typeof m.role === "string" && typeof m.burdenedHourlyRate === "number"));
+        const waitingRowForDistance = [...adminDashboardForTeam.pipeline.waitingToStart, ...adminDashboardForTeam.pipeline.scheduled]
+            .find(candidate => candidate.id === waitingProject.id);
+        check("dashboard computes distanceMilesFromShop for a known 1-degree-latitude offset (~69 mi)",
+            waitingRowForDistance?.distanceMilesFromShop === 69);
 
         const allTasksBeforeZero = snapshot(await prisma.scheduleTask.findMany({
             where: { projectId: project.id },
@@ -467,11 +493,81 @@ async function main() {
             && !["ADMIN", "MANAGER"].includes(authorizedFieldCrew.role));
         check("TEAM actor expression stays pinned to the authenticated caller", actionBody.includes('actor: { type: "TEAM", name: caller.name || caller.email }'));
 
+        // ── PB-schedule-002 item 2: updateProjectColor previously had NO auth
+        // check at all — tightened to assertScheduleProjectAccess (schedules
+        // permission + project access), the same gate the other per-project
+        // schedule mutations in this file use. ──
+        const colorActionStart = actionsSource.indexOf("export async function updateProjectColor");
+        const colorActionEnd = actionsSource.indexOf("export async function updateProjectTags", colorActionStart);
+        const colorActionBody = actionsSource.slice(colorActionStart, colorActionEnd);
+        check("updateProjectColor is gated behind assertScheduleProjectAccess (schedules permission + project access)",
+            colorActionStart >= 0 && colorActionBody.includes("await assertScheduleProjectAccess(projectId)"));
+
+        // ── PB-schedule-002 item 3: updateProjectEndDateAction — ADMIN/MANAGER
+        // gate, end<=start rejection, single ActivityLog row, revalidation.
+        // The write/validation path is asserted at the source level (like the
+        // other gated actions above) since this script runs outside a request
+        // scope and can't authenticate as ADMIN/MANAGER; the reachability call
+        // below only proves the action hits the same expected auth wall
+        // saveCompanyScheduleTaskDatesAction does further down. ──
+        const endDateActionStart = actionsSource.indexOf("export async function updateProjectEndDateAction");
+        const endDateActionEnd = actionsSource.indexOf("// Shift unfinished work on an active project", endDateActionStart);
+        const endDateActionBody = actionsSource.slice(endDateActionStart, endDateActionEnd);
+        check("updateProjectEndDateAction exists and is ADMIN/MANAGER gated",
+            endDateActionStart >= 0 && endDateActionBody.includes('["ADMIN", "MANAGER"].includes(caller.role)'));
+        check("updateProjectEndDateAction validates with parseStartDateInput, rejects end <= start under the Project row lock, writes one set_project_end_date ActivityLog row, and revalidates both boards",
+            endDateActionBody.includes("parseStartDateInput(endDateISO)")
+            && endDateActionBody.includes('FOR UPDATE')
+            && endDateActionBody.includes("withTxRetry")
+            && endDateActionBody.includes("endDate.getTime() <= locked.startDate.getTime()")
+            && endDateActionBody.includes('throw new Error("End date must be after the project\'s start date")')
+            && endDateActionBody.includes('action: "set_project_end_date"')
+            && endDateActionBody.includes("previousEndDate:")
+            && endDateActionBody.includes('revalidatePath("/company-dashboard")')
+            && endDateActionBody.includes('revalidatePath("/projects")'));
+
+        const endDateProject = await prisma.project.create({
+            data: {
+                name: `BOARD ENDDATE VERIFY ${tag} DELETE ME`,
+                clientId: client.id,
+                status: "Waiting to Start",
+                startDate: at(40),
+                endDate: at(50),
+            },
+        });
+        projectIds.push(endDateProject.id);
+
+        // getEffectiveProjectRange/serialization (item 3): Project.endDate must
+        // reach the dashboard row as-is (ISO string), and getEffectiveProjectRange
+        // (useBarLayout.ts) must treat it as a direct end candidate — asserted at
+        // the pure-function level in verify-schedule-board-layout.ts; here only
+        // the DB -> serialized-row leg is exercised.
+        const endDateDashboard = await getCompanyDashboardData({ role: "ADMIN" }, month);
+        const endDateRow = [...endDateDashboard.pipeline.waitingToStart, ...endDateDashboard.pipeline.scheduled]
+            .find(candidate => candidate.id === endDateProject.id);
+        check("dashboard serializes Project.endDate onto the pipeline row",
+            endDateRow?.endDate === at(50).toISOString());
+        const noEndDateRow = endDateDashboard.pipeline.inProgress.find(candidate => candidate.id === project.id);
+        check("dashboard leaves endDate null for a project with none set", noEndDateRow?.endDate === null);
+
+        let endDateActionRan = false;
+        let endDateActionErr = "";
+        try {
+            await updateProjectEndDateAction(endDateProject.id, "2040-08-01");
+            endDateActionRan = true;
+        } catch (error) {
+            endDateActionErr = String((error as Error)?.message ?? error);
+        }
+        check("updateProjectEndDateAction is reachable (runs, or hits the expected script auth wall outside a request scope)",
+            endDateActionRan || /Forbidden|Unauthorized|outside a request scope|headers/i.test(endDateActionErr));
+
         // ── Owner-feedback round: crew ACTIVATED-added-only validation (fix 1),
         // FINANCE exclusion + name disambiguation (fix 7), batch task-date save
         // (fix 2) ──
         const crewUsers = [
-            await prisma.user.create({ data: { email: `board-active-${tag}@example.invalid`, name: `Board Active ${tag}`, role: "FIELD_CREW", status: "ACTIVATED" } }),
+            // hourlyRate/burdenRate: exact known values to assert
+            // burdenedHourlyRate = round2(hourlyRate + burdenRate) = 30.85.
+            await prisma.user.create({ data: { email: `board-active-${tag}@example.invalid`, name: `Board Active ${tag}`, role: "FIELD_CREW", status: "ACTIVATED", hourlyRate: 24.75, burdenRate: 6.10 } }),
             await prisma.user.create({ data: { email: `board-pending-${tag}@example.invalid`, name: `Board Pending ${tag}`, role: "FIELD_CREW", status: "PENDING" } }),
             await prisma.user.create({ data: { email: `board-legacy-${tag}@example.invalid`, name: `Board Legacy ${tag}`, role: "FIELD_CREW", status: "DISABLED" } }),
             await prisma.user.create({ data: { email: `board-finance-${tag}@example.invalid`, name: `Board Finance ${tag}`, role: "FINANCE", status: "ACTIVATED" } }),
@@ -554,6 +650,8 @@ async function main() {
         const soloNamedEntry = (dashboardForCrew.teamMembers ?? []).find(u => u.id === activeUser.id);
         check("teamMembers leaves unique display names unmodified",
             soloNamedEntry?.name === (activeUser.name ?? activeUser.email) && !soloNamedEntry.name.includes("@"));
+        check("teamMembers.burdenedHourlyRate is exactly hourlyRate + burdenRate, rounded to 2dp",
+            soloNamedEntry?.role === "FIELD_CREW" && soloNamedEntry?.burdenedHourlyRate === 30.85);
 
         const scheduleCoreCrewStart = scheduleCoreSource.indexOf("export async function setProjectCrew");
         const scheduleCoreCrewEnd = scheduleCoreSource.indexOf("export interface CrewConflictPair", scheduleCoreCrewStart);
@@ -602,7 +700,8 @@ async function main() {
         const timelineSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TimelineView.tsx", import.meta.url), "utf8");
         const projectBarSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/ProjectBar.tsx", import.meta.url), "utf8");
         const taskBlockSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TaskBlockSegment.tsx", import.meta.url), "utf8");
-        const scheduleBoardSources = [boardSource, monthSource, timelineSource, projectBarSource, taskBlockSource];
+        const availabilityPanelSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/AvailabilityPanel.tsx", import.meta.url), "utf8");
+        const scheduleBoardSources = [boardSource, monthSource, timelineSource, projectBarSource, taskBlockSource, availabilityPanelSource];
         check("source forwards canEdit through both views to ProjectBar", monthSource.includes("canEdit={data.canEdit}")
             && timelineSource.includes("canEdit={data.canEdit}"));
         check("source forwards canEdit from ProjectBar to TaskBlockSegment", projectBarSource.includes("<TaskBlockSegment")
@@ -617,6 +716,15 @@ async function main() {
         check("schedule-board components do not import or call money-fetch functions", scheduleBoardSources.every(source =>
             !/\b(?:getCashflowOutlook|getChangeOrderOverlayRows|getCalendarOverlays|getCompanyDashboardData)\b/.test(source)
             && !/\bfetch\s*\(/.test(source)));
+
+        // ── Crew-availability panel (item PB-crew-availability) ──
+        check("availability panel is rendered only for canEdit roles", boardSource.includes("{data.canEdit && <AvailabilityPanel"));
+        check("availability panel's planned-$/day row is gated on canSeeFinancials", availabilityPanelSource.includes("{canSeeFinancials && (")
+            && availabilityPanelSource.indexOf("Planned $/day") > availabilityPanelSource.indexOf("{canSeeFinancials && ("));
+        check("availability panel derives from the DashboardProjectRow/DashboardTaskRow shape already on data (no direct prisma access)",
+            !/\bprisma\b/.test(availabilityPanelSource));
+        check("ProjectBar popover surfaces the shop distance line", projectBarSource.includes("project.distanceMilesFromShop != null")
+            && projectBarSource.includes("mi from shop"));
     } finally {
         let cleanupPassed = false;
         try {

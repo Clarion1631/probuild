@@ -8,7 +8,8 @@ import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateP
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, OverlayIncomeItem } from "@/lib/schedule-core";
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
-import { TimelineView } from "./TimelineView";
+import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
+import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
 import {
@@ -164,6 +165,12 @@ export function ScheduleBoard({
     const [showExpenses, setShowExpenses] = useState(false);
     const [showHours, setShowHours] = useState(false);
     const [boardView, setBoardView] = useState<BoardView>("month");
+    // Lifted from TimelineView (see CREW_MODE_STORAGE_KEY) so the
+    // availability panel's drill-down can force crew mode on even when
+    // Timeline is already mounted — writing localStorage alone wouldn't
+    // reach an already-mounted view's own state.
+    const [groupByCrew, setGroupByCrew] = useState(false);
+    const boardContainerRef = useRef<HTMLDivElement>(null);
     const [projectPreviewOverrides, setProjectPreviewOverrides] = useState<Record<string, DashboardProjectRow>>({});
     const [projectIncomeOverrides, setProjectIncomeOverrides] = useState<Record<string, OverlayIncomeItem[]>>({});
     const [projectRefreshExpectations, setProjectRefreshExpectations] = useState<Record<string, ProjectRefreshExpectation>>({});
@@ -186,6 +193,10 @@ export function ScheduleBoard({
     const activeProjectPointerRef = useRef<ActiveProjectPointerEdit | null>(null);
     const previousExternallyPendingProjectIdsRef = useRef<ReadonlySet<string>>(new Set(externallyPendingProjectIds));
     const [confirmIntent, setConfirmIntent] = useState<ProjectDropIntent | null>(null);
+    // Bumped on every "Today" click so TimelineView re-scrolls to today even
+    // when the anchor month itself doesn't change (item 4) — e.g. the user
+    // scrolled elsewhere in the wide canvas and wants back to today.
+    const [scrollToTodayNonce, setScrollToTodayNonce] = useState(0);
     // Bridges the ShiftConfirmDialog (shown at SAVE time, one project at a
     // time) back into the sequential save loop below.
     const confirmResolverRef = useRef<((choice: ProjectMoveChoice | "cancel") => void) | null>(null);
@@ -197,6 +208,29 @@ export function ScheduleBoard({
             // Storage can be unavailable in privacy-restricted browser contexts.
         }
     }, []);
+    useEffect(() => {
+        try {
+            const stored = localStorage.getItem(CREW_MODE_STORAGE_KEY);
+            if (stored === "true") setGroupByCrew(true);
+        } catch {
+            // Storage can be unavailable in privacy-restricted browser contexts.
+        }
+    }, []);
+    function setGroupByCrewMode(next: boolean) {
+        setGroupByCrew(next);
+        try {
+            localStorage.setItem(CREW_MODE_STORAGE_KEY, String(next));
+        } catch {
+            // The selected mode still applies for this session when persistence fails.
+        }
+    }
+    // Availability panel drill-down: force Timeline + By-crew mode and bring
+    // the board into view, regardless of which view/mode was active before.
+    function drillDownToCrewTimeline() {
+        selectBoardView("timeline");
+        setGroupByCrewMode(true);
+        boardContainerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
     const anchor = parseUTCDate(`${month}-01`);
     const monthLabel = `${MONTH_LABELS[anchor.getUTCMonth()]} ${anchor.getUTCFullYear()}`;
     const canonicalProjects = useMemo(() => [
@@ -616,6 +650,9 @@ export function ScheduleBoard({
         // caught in a shift must have their pinned overrides rewritten to the
         // shifted dates or their awaiting ids can never reconcile.
         const shiftedPersistedDates: { id: string; startDate: string; endDate: string }[] = [];
+        // Core-side side notes (skipped QB milestones, cleared end dates, …)
+        // surfaced to the user after the batch settles.
+        const saveNotes: string[] = [];
 
         for (const [projectId, draft] of projectEntries) {
             const canonicalProject = canonicalProjectById.get(projectId);
@@ -637,6 +674,7 @@ export function ScheduleBoard({
                     if (choice === "marker-only") {
                         const result = await updateProjectStartDateAction(projectId, draft.targetStart, false);
                         projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: [] };
+                        if (result.notes?.length) saveNotes.push(...result.notes.map(note => `${canonicalProject.name}: ${note}`));
                     } else {
                         // Owner-decided semantics: the bar drag moves the start
                         // marker AND the not-started work — the whole future of
@@ -648,11 +686,14 @@ export function ScheduleBoard({
                             projectStartDate: markerResult.startDate,
                             taskDates: shiftResult.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)),
                         };
+                        const notes = [...(markerResult.notes ?? []), ...(shiftResult.notes ?? [])];
+                        if (notes.length) saveNotes.push(...notes.map(note => `${canonicalProject.name}: ${note}`));
                     }
                 } else {
                     const result = await updateProjectStartDateAction(projectId, draft.targetStart, true);
                     shiftedPersistedDates.push(...result.shiftedTaskDates);
                     projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
+                    if (result.notes?.length) saveNotes.push(...result.notes.map(note => `${canonicalProject.name}: ${note}`));
                 }
                 succeededProjectIds.push(projectId);
             } catch (error) {
@@ -730,6 +771,7 @@ export function ScheduleBoard({
         onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS);
         router.refresh();
 
+        if (saveNotes.length > 0) toast.info(saveNotes.join(" "));
         const totalSucceeded = succeededProjectIds.length + succeededTaskCount;
         const totalFailed = failedProjectNames.length + failedTaskNames.length;
         if (totalFailed === 0 && totalSucceeded > 0) {
@@ -1285,7 +1327,7 @@ export function ScheduleBoard({
     ].filter((kind): kind is string => Boolean(kind));
 
     return (
-        <div className="hui-card mb-6 overflow-hidden">
+        <div ref={boardContainerRef} className="hui-card mb-6 overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-hui-border">
                 <div className="flex items-baseline gap-3">
                     <h2 className="text-base font-semibold text-hui-textMain">Project Schedule — {monthLabel}</h2>
@@ -1321,7 +1363,7 @@ export function ScheduleBoard({
                         </div>
                     )}
                     <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, -1))} className="hui-btn hui-btn-secondary text-sm">← Prev</button>
-                    <button type="button" onClick={() => router.push("/company-dashboard")} className="hui-btn hui-btn-secondary text-sm">Today</button>
+                    <button type="button" onClick={() => { router.push("/company-dashboard"); setScrollToTodayNonce(n => n + 1); }} className="hui-btn hui-btn-secondary text-sm">Today</button>
                     <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, 1))} className="hui-btn hui-btn-secondary text-sm">Next →</button>
                 </div>
             </div>
@@ -1370,6 +1412,7 @@ export function ScheduleBoard({
                     isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
+                    teamMembers={data.teamMembers ?? []}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
@@ -1399,6 +1442,10 @@ export function ScheduleBoard({
                     isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
+                    groupByCrew={groupByCrew}
+                    onToggleGroupByCrew={() => setGroupByCrewMode(!groupByCrew)}
+                    scrollToTodayNonce={scrollToTodayNonce}
+                    teamMembers={data.teamMembers ?? []}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
@@ -1415,6 +1462,7 @@ export function ScheduleBoard({
                     onTaskMoveBy={handleTaskMoveBy}
                 />
             )}
+            {data.canEdit && <AvailabilityPanel data={data} onDrillDown={drillDownToCrewTimeline} />}
             <ShiftConfirmDialog
                 intent={confirmIntent}
                 isPending={false}

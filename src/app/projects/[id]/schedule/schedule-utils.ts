@@ -27,6 +27,21 @@ export function getDefaultColorForTaskName(name: string): string | undefined {
     return undefined;
 }
 
+// Deterministic fallback for a project with no explicit Project.color, drawn
+// from the same PRESET_COLORS palette the Color… picker offers (company
+// schedule board, item 2) so unset projects still read as part of the
+// original scheme — and stable by project id, so the Month and Timeline
+// views (and any other consumer) always agree on the same project's color.
+// White is excluded from the AUTO rotation only: project bars always render
+// white text over the bar color, so an auto-picked white would be
+// unreadable — white stays fully pickable via the explicit Color… picker.
+const FALLBACK_PROJECT_COLORS = PRESET_COLORS.filter(c => c.toLowerCase() !== "#ffffff");
+export function getFallbackProjectColor(projectId: string): string {
+    let hash = 0;
+    for (let index = 0; index < projectId.length; index++) hash = (hash * 31 + projectId.charCodeAt(index)) >>> 0;
+    return FALLBACK_PROJECT_COLORS[hash % FALLBACK_PROJECT_COLORS.length];
+}
+
 export function getDaysBetween(a: Date, b: Date) { return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)); }
 export function addDays(date: Date, days: number) { const d = new Date(date.getTime()); d.setUTCDate(d.getUTCDate() + days); return d; }
 export function formatDate(d: Date) { return d.toISOString().split("T")[0]; }

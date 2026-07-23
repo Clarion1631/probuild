@@ -10,6 +10,7 @@
  * milestone Paid exactly like the Stripe webhook does. That keeps ProBuild,
  * QuickBooks, and the bank in sync, and keeps the sales-tax report truthful.
  */
+import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
@@ -26,6 +27,7 @@ import {
     getQBInvoiceStatus,
     probeQBInvoice,
     getQBPayment,
+    deleteQBInvoice,
 } from "./quickbooks";
 import type { QBSyncIssue } from "./payment-notifications";
 import { qboAmountsMatch, validateQboMappingIdentity } from "./qbo-mapping-integrity";
@@ -51,6 +53,44 @@ export async function getFreshQBTokens(): Promise<QBTokens> {
         // Refresh can fail transiently; the old access token may still be valid.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }
+}
+
+/**
+ * Atomically clear a milestone's QuickBooks link fields. The guard fields
+ * (`status`, `qbPaymentId`, and the exact `qbInvoiceId` the caller read) all go
+ * in the WHERE, so if a QB settlement lands on this milestone between the
+ * caller's read and this write, the claim matches 0 rows and the settle wins —
+ * we never strip QB fields off a now-paid row, and a concurrent re-push (new
+ * id) can't be clobbered either.
+ *
+ * Accepts either a bare `prisma` client or an in-flight `tx` — shared by
+ * `breakQBInvoiceLink` (standalone) and `updatePendingMilestoneAmountsCore`
+ * (inside its rebalance transaction) so both go through the same claim.
+ */
+export async function claimQBInvoiceUnlink(
+    client: Prisma.TransactionClient,
+    scheduleId: string,
+    expectedQbInvoiceId: string,
+    expectedQbRealmId: string | null,
+): Promise<boolean> {
+    const cleared = await client.paymentSchedule.updateMany({
+        where: {
+            id: scheduleId,
+            status: { not: "Paid" },
+            qbPaymentId: null,
+            qbInvoiceId: expectedQbInvoiceId,
+            qbRealmId: expectedQbRealmId,
+        },
+        data: {
+            qbInvoiceId: null,
+            qbRealmId: null,
+            qbInvoiceLink: null,
+            qbInvoiceSentAt: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+        },
+    });
+    return cleared.count === 1;
 }
 
 async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
@@ -177,11 +217,38 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
 
     const payLink = await getQBInvoicePaymentLink(tokens, qbId);
 
-    await prisma.paymentSchedule.update({
-        where: { id: schedule.id },
+    // Conditional link write: the milestone was read as unlinked and unpaid at
+    // the top, but this function does several remote calls in between — a manual
+    // "Record Payment", a QB settle, a cancellation, a concurrent push, or a
+    // rebalance changing the row's content can all land in that window. The
+    // guards go in the WHERE — status pinned to Pending (a Canceled row must
+    // never get a fresh collectible invoice: the payment poller only watches
+    // Pending) and the content snapshot (amount/name/dueDate) pinned to what the
+    // QBO invoice was actually created from, so a mid-push edit can't leave QBO
+    // silently out of sync. If the claim misses, the just-created QBO invoice is
+    // deleted (compensation) instead of being attached to a row it no longer
+    // describes.
+    const linked = await prisma.paymentSchedule.updateMany({
+        where: {
+            id: schedule.id,
+            status: "Pending",
+            qbPaymentId: null,
+            qbInvoiceId: null,
+            amount: schedule.amount,
+            name: schedule.name,
+            dueDate: schedule.dueDate,
+        },
         // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
         data: { qbInvoiceId: qbId, qbRealmId: tokens.realmId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
     });
+    if (linked.count !== 1) {
+        const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
+        if (!compensated) {
+            console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
+            throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
+        }
+        throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");
+    }
 
     return { qbInvoiceId: qbId, payLink, qbTotal: total };
 }

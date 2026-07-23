@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe, updatePendingMilestoneAmounts, deleteInvoiceMilestone } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -49,6 +49,21 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     const [qbBusy, setQbBusy] = useState<string | null>(null);
     const [isEmailingCopy, setIsEmailingCopy] = useState(false);
 
+    // Break QB Link confirm dialog (replaces window.confirm so the "also delete
+    // in QuickBooks" checkbox has somewhere to live).
+    const [breakQBTarget, setBreakQBTarget] = useState<{ id: string; name: string } | null>(null);
+    const [breakQBDeleteInQBO, setBreakQBDeleteInQBO] = useState(false);
+
+    // Edit amounts (rebalance Pending milestones without changing the invoice total)
+    type EditRow = { name: string; amount: string; dueDate: string };
+    const [editMode, setEditMode] = useState(false);
+    const [editRows, setEditRows] = useState<Record<string, EditRow>>({});
+    const [isSavingEdit, setIsSavingEdit] = useState(false);
+
+    // Delete a non-mirrored, non-QB-linked Pending milestone
+    const [deleteMilestoneTarget, setDeleteMilestoneTarget] = useState<{ id: string; name: string } | null>(null);
+    const [isDeletingMilestone, setIsDeletingMilestone] = useState(false);
+
     // On view: if any pending milestone is on the QuickBooks rail, pull settled
     // payments right now (the hourly cron is the backstop, this is the fast path).
     const qbCheckedRef = useRef(false);
@@ -94,25 +109,27 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
     }
 
     // Recover a milestone whose QuickBooks invoice was voided/deleted: clear the
-    // stale link so it can be re-created fresh. Money state is untouched.
-    async function handleBreakQBLink(payment: { id: string; name: string }) {
-        const ok = window.confirm(
-            `Break the QuickBooks link for "${payment.name}"?\n\n` +
-            `Use this when the QuickBooks invoice was voided or deleted and this milestone ` +
-            `is stuck on "Pending". It clears the QuickBooks link in ProBuild so you can ` +
-            `re-create it fresh with "QuickBooks Link".\n\n` +
-            `It does NOT change the paid/unpaid status, and does NOT delete the invoice in QuickBooks.`
-        );
-        if (!ok) return;
-        setQbBusy(payment.id);
+    // stale link so it can be re-created fresh. Money state is untouched. Opens
+    // the confirm dialog below (with the optional "also delete in QuickBooks"
+    // checkbox) instead of firing immediately.
+    function handleBreakQBLink(payment: { id: string; name: string }) {
+        setBreakQBDeleteInQBO(false);
+        setBreakQBTarget(payment);
+    }
+
+    async function confirmBreakQBLink() {
+        if (!breakQBTarget) return;
+        const target = breakQBTarget;
+        setQbBusy(target.id);
         try {
-            const res = await breakQBInvoiceLink(payment.id);
+            const res = await breakQBInvoiceLink(target.id, { deleteInQBO: breakQBDeleteInQBO });
             if (!res.success) {
                 toast.error(res.error);
                 return;
             }
             if (res.warning) toast.warning(res.warning);
             else toast.success("QuickBooks link cleared — you can now re-create it.");
+            setBreakQBTarget(null);
             router.refresh();
         } finally {
             setQbBusy(null);
@@ -205,6 +222,68 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
             toast.error(e?.message || "Failed to update payment schedule");
         } finally {
             setIsSplitting(false);
+        }
+    }
+
+    const pendingPayments = (initialInvoice.payments || []).filter((p: any) => p.status === "Pending");
+    const requiredRemaining = pendingPayments.reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
+
+    function handleEnterEditMode() {
+        const rows: Record<string, EditRow> = {};
+        for (const p of pendingPayments) {
+            rows[p.id] = {
+                name: p.name,
+                amount: String(Number(p.amount)),
+                dueDate: p.dueDate ? new Date(p.dueDate).toISOString().slice(0, 10) : "",
+            };
+        }
+        setEditRows(rows);
+        setEditMode(true);
+        setShowSplit(false);
+        setShowAddMilestone(false);
+    }
+
+    function handleCancelEditMode() {
+        setEditMode(false);
+        setEditRows({});
+    }
+
+    const enteredSum = Object.values(editRows).reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+    const editTotalsMatch = Math.abs(enteredSum - requiredRemaining) < 0.005;
+
+    async function handleSaveEdit() {
+        setIsSavingEdit(true);
+        try {
+            const rows = Object.entries(editRows).map(([scheduleId, r]) => ({
+                scheduleId,
+                name: r.name.trim(),
+                amount: parseFloat(r.amount) || 0,
+                dueDate: r.dueDate || null,
+            }));
+            const res = await updatePendingMilestoneAmounts(initialInvoice.id, rows);
+            for (const warning of res.warnings || []) toast.warning(warning);
+            if (!res.warnings || res.warnings.length === 0) toast.success("Payment schedule updated");
+            handleCancelEditMode();
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to update milestone amounts");
+        } finally {
+            setIsSavingEdit(false);
+        }
+    }
+
+    async function handleDeleteMilestone() {
+        if (!deleteMilestoneTarget) return;
+        setIsDeletingMilestone(true);
+        try {
+            await deleteInvoiceMilestone(deleteMilestoneTarget.id);
+            toast.success("Milestone deleted");
+            setDeleteMilestoneTarget(null);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to delete milestone");
+        } finally {
+            setIsDeletingMilestone(false);
         }
     }
 
@@ -495,19 +574,33 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                     {paidCount} of {totalCount} paid
                                 </span>
                                 <button
-                                    onClick={() => { setShowSplit(v => !v); setShowAddMilestone(false); }}
+                                    onClick={() => { setShowSplit(v => !v); setShowAddMilestone(false); if (editMode) handleCancelEditMode(); }}
                                     className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
                                 >
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
                                     {showSplit ? "Cancel" : "Split payments"}
                                 </button>
                                 <button
-                                    onClick={() => { setShowAddMilestone(v => !v); setShowSplit(false); }}
+                                    onClick={() => { setShowAddMilestone(v => !v); setShowSplit(false); if (editMode) handleCancelEditMode(); }}
                                     className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
                                 >
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
                                     {showAddMilestone ? "Cancel" : "Add extra charge"}
                                 </button>
+                                {pendingPayments.length > 0 && (
+                                    <button
+                                        onClick={() => {
+                                            if (editMode) { handleCancelEditMode(); return; }
+                                            setShowSplit(false);
+                                            setShowAddMilestone(false);
+                                            handleEnterEditMode();
+                                        }}
+                                        className="hui-btn hui-btn-secondary text-xs py-1 px-3 flex items-center gap-1"
+                                    >
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                                        {editMode ? "Cancel" : "Edit amounts"}
+                                    </button>
+                                )}
                             </div>
                         </div>
                         {showSplit && (
@@ -619,6 +712,33 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 </p>
                             </div>
                         )}
+                        {editMode && (
+                            <div className="px-6 py-3 border-b border-hui-border bg-indigo-50/40 flex items-center justify-between gap-4">
+                                <p className="text-xs text-hui-textMuted">
+                                    Edit the name, amount, or due date of the pending milestones below. The total must stay
+                                    the same — use "Add extra charge" or a change order to change the invoice total.
+                                </p>
+                                <div className="flex items-center gap-3 shrink-0">
+                                    <span className={`text-xs font-medium whitespace-nowrap ${editTotalsMatch ? "text-emerald-600" : "text-red-600"}`}>
+                                        Entered {formatCurrency(enteredSum)} / Required {formatCurrency(requiredRemaining)}
+                                    </span>
+                                    <button
+                                        onClick={handleCancelEditMode}
+                                        disabled={isSavingEdit}
+                                        className="hui-btn hui-btn-secondary text-sm disabled:opacity-50"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={handleSaveEdit}
+                                        disabled={isSavingEdit || !editTotalsMatch}
+                                        className="hui-btn hui-btn-primary text-sm disabled:opacity-50"
+                                    >
+                                        {isSavingEdit ? "Saving..." : "Save"}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                         <div className="overflow-x-auto">
                         <table className="w-full min-w-[34rem] text-sm text-left">
                             <thead className="bg-white text-hui-textMuted border-b border-hui-border">
@@ -692,26 +812,51 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 ) : null}
                                             </td>
                                             <td className="px-6 py-4 font-medium text-hui-textMain">
-                                                <div>{payment.name}</div>
-                                                {payment.status === 'Paid' && methodLabel && (
-                                                    <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{methodLabel}</div>
+                                                {editMode && payment.status === 'Pending' ? (
+                                                    <>
+                                                        <input
+                                                            type="text"
+                                                            value={editRows[payment.id]?.name ?? ""}
+                                                            onChange={(e) => setEditRows(prev => ({ ...prev, [payment.id]: { ...prev[payment.id], name: e.target.value } }))}
+                                                            className="hui-input text-sm w-full"
+                                                        />
+                                                        {payment.qbInvoiceId && (
+                                                            <p className="text-[11px] text-amber-700 mt-1">
+                                                                QuickBooks invoice will be re-staged at the new amount.
+                                                            </p>
+                                                        )}
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <div>{payment.name}</div>
+                                                        {payment.status === 'Paid' && methodLabel && (
+                                                            <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{methodLabel}</div>
+                                                        )}
+                                                        {payment.status !== 'Paid' && sentLabel && (
+                                                            <div className="text-[11px] text-emerald-600 font-semibold mt-0.5 flex items-center gap-1">
+                                                                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                                                                {sentLabel}
+                                                            </div>
+                                                        )}
+                                                        {delivery && (
+                                                            <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">
+                                                                Delivery: {delivery.lastError === 'interrupted' ? 'interrupted' : delivery.status}
+                                                                {delivery.deliveredAt ? ` · ${new Date(delivery.deliveredAt).toLocaleString()}` : ''}
+                                                            </div>
+                                                        )}
+                                                        {viewLabel && <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{viewLabel}</div>}
+                                                    </>
                                                 )}
-                                                {payment.status !== 'Paid' && sentLabel && (
-                                                    <div className="text-[11px] text-emerald-600 font-semibold mt-0.5 flex items-center gap-1">
-                                                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
-                                                        {sentLabel}
-                                                    </div>
-                                                )}
-                                                {delivery && (
-                                                    <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">
-                                                        Delivery: {delivery.lastError === 'interrupted' ? 'interrupted' : delivery.status}
-                                                        {delivery.deliveredAt ? ` · ${new Date(delivery.deliveredAt).toLocaleString()}` : ''}
-                                                    </div>
-                                                )}
-                                                {viewLabel && <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{viewLabel}</div>}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted">
-                                                {payment.dueDate ? (
+                                                {editMode && payment.status === 'Pending' ? (
+                                                    <input
+                                                        type="date"
+                                                        value={editRows[payment.id]?.dueDate ?? ""}
+                                                        onChange={(e) => setEditRows(prev => ({ ...prev, [payment.id]: { ...prev[payment.id], dueDate: e.target.value } }))}
+                                                        className="hui-input text-sm w-full"
+                                                    />
+                                                ) : payment.dueDate ? (
                                                     <span className={isPastDue ? 'text-red-600 font-medium' : ''}>
                                                         {new Date(payment.dueDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
                                                         {isPastDue && <span className="ml-1 text-[10px] uppercase font-bold">overdue</span>}
@@ -732,7 +877,21 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                 </div>
                                             </td>
                                             <td className="px-6 py-4 text-right font-medium text-hui-textMain">
-                                                {formatCurrency(payment.amount)}
+                                                {editMode && payment.status === 'Pending' ? (
+                                                    <div className="relative">
+                                                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-hui-textMuted text-sm">$</span>
+                                                        <input
+                                                            type="number"
+                                                            min="0"
+                                                            step="0.01"
+                                                            value={editRows[payment.id]?.amount ?? ""}
+                                                            onChange={(e) => setEditRows(prev => ({ ...prev, [payment.id]: { ...prev[payment.id], amount: e.target.value } }))}
+                                                            className="hui-input text-sm pl-6 w-32 text-right"
+                                                        />
+                                                    </div>
+                                                ) : (
+                                                    formatCurrency(payment.amount)
+                                                )}
                                             </td>
                                             <td className="px-6 py-4 text-right text-hui-textMuted">
                                                 {payment.paymentDate
@@ -741,7 +900,10 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <div className="flex items-center justify-end gap-2 flex-wrap">
-                                                    {payment.status !== 'Paid' && (
+                                                    {editMode && payment.status === 'Pending' && (
+                                                        <span className="text-xs text-hui-textMuted italic">Editing…</span>
+                                                    )}
+                                                    {!editMode && payment.status !== 'Paid' && (
                                                         <>
                                                         <button
                                                             onClick={() => handleQBLink(payment)}
@@ -779,6 +941,15 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                                 {qbBusy === payment.id ? "Working…" : "Break QB Link"}
                                                             </button>
                                                         )}
+                                                        {payment.status === 'Pending' && !payment.sourceScheduleId && !payment.qbInvoiceId && (
+                                                            <button
+                                                                onClick={() => setDeleteMilestoneTarget({ id: payment.id, name: payment.name })}
+                                                                title="Delete this milestone"
+                                                                className="p-1.5 rounded text-hui-textMuted hover:text-red-600 hover:bg-red-50 transition"
+                                                            >
+                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                                            </button>
+                                                        )}
                                                         </>
                                                     )}
                                                     {payment.status === 'Paid' && (
@@ -814,6 +985,90 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
 
                 </div>
             </div>
+
+            {/* Break QB Link confirm dialog */}
+            {breakQBTarget && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setBreakQBTarget(null)}>
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+                        <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-amber-50/50 rounded-t-xl">
+                            <h3 className="text-lg font-semibold text-slate-900">Break QuickBooks Link</h3>
+                            <button type="button" onClick={() => setBreakQBTarget(null)} className="text-slate-400 hover:text-slate-600 transition rounded-lg p-1 hover:bg-slate-100">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="px-6 py-4 space-y-3">
+                            <p className="text-sm text-slate-700">
+                                Break the QuickBooks link for <strong>"{breakQBTarget.name}"</strong>?
+                            </p>
+                            <p className="text-xs text-slate-500">
+                                Use this when the QuickBooks invoice was voided or deleted and this milestone is stuck
+                                on "Pending". It clears the QuickBooks link in ProBuild so you can re-create it fresh
+                                with "QuickBooks Link". It does NOT change the paid/unpaid status.
+                            </p>
+                            <label className="flex items-start gap-2 text-sm text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={breakQBDeleteInQBO}
+                                    onChange={(e) => setBreakQBDeleteInQBO(e.target.checked)}
+                                    className="mt-0.5 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                                />
+                                <span>
+                                    Also delete the staged invoice in QuickBooks.
+                                    {breakQBDeleteInQBO
+                                        ? " This WILL delete it in QuickBooks (if it has no linked payment)."
+                                        : " Leave unchecked to keep the QuickBooks invoice as-is (e.g. a voided invoice kept for audit)."}
+                                </span>
+                            </label>
+                        </div>
+                        <div className="px-6 py-4 border-t border-slate-200 flex items-center justify-end gap-2 bg-slate-50/50 rounded-b-xl">
+                            <button type="button" onClick={() => setBreakQBTarget(null)} disabled={qbBusy === breakQBTarget.id} className="hui-btn hui-btn-secondary">
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={confirmBreakQBLink}
+                                disabled={qbBusy === breakQBTarget.id}
+                                className="hui-btn bg-red-600 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                            >
+                                {qbBusy === breakQBTarget.id ? "Working…" : "Break Link"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Delete Milestone confirm dialog */}
+            {deleteMilestoneTarget && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setDeleteMilestoneTarget(null)}>
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+                        <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-red-50/50 rounded-t-xl">
+                            <h3 className="text-lg font-semibold text-slate-900">Delete Milestone</h3>
+                            <button type="button" onClick={() => setDeleteMilestoneTarget(null)} className="text-slate-400 hover:text-slate-600 transition rounded-lg p-1 hover:bg-slate-100">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+                        <div className="px-6 py-4">
+                            <p className="text-sm text-slate-700">
+                                Delete <strong>"{deleteMilestoneTarget.name}"</strong>? This removes the milestone and
+                                lowers the invoice total by its amount. This cannot be undone.
+                            </p>
+                        </div>
+                        <div className="px-6 py-4 border-t border-slate-200 flex items-center justify-end gap-2 bg-slate-50/50 rounded-b-xl">
+                            <button type="button" onClick={() => setDeleteMilestoneTarget(null)} disabled={isDeletingMilestone} className="hui-btn hui-btn-secondary">
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleDeleteMilestone}
+                                disabled={isDeletingMilestone}
+                                className="hui-btn bg-red-600 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                            >
+                                {isDeletingMilestone ? "Deleting…" : "Delete Milestone"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Send Invoice Modal */}
             {showSendModal && (

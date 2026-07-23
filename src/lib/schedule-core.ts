@@ -25,6 +25,22 @@ export const CONTRACT_ESTIMATE_STATUSES = ["Approved", "Invoiced", "Partially Pa
 
 export type ScheduleActor = { type: "TEAM" | "SYSTEM"; name: string };
 
+// The company shop — 5305 NE 121st Ave, Vancouver WA — anchor point for the
+// crew-availability panel's "how far is this job" distance (not money; safe
+// to serialize for every role).
+const SHOP_LAT = 45.6617;
+const SHOP_LNG = -122.5484;
+
+function haversineMiles(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const EARTH_RADIUS_MILES = 3958.8;
+    const toRad = (deg: number) => (deg * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return EARTH_RADIUS_MILES * c;
+}
+
 /**
  * Strict day-only start-date parser, shared by the MCP tool and the UI server
  * action so no timezone-bearing or overflowing value can reach the core.
@@ -59,12 +75,21 @@ export interface PipelineProject {
     client: string | null;
     status: string;
     startDate: string | null;
+    // Target end date (PB-schedule-002 item 3). Feeds getEffectiveProjectRange
+    // (bar rendering) AND effectiveWorkEnd (CO placement + the project-window
+    // conflict rule) via the same raw Date value — see effectiveWorkEnd's
+    // doc comment for the shared semantics.
+    endDate: string | null;
     color: string | null;
     // totalAmount of the project's most recent Approved/Invoiced/Partially
     // Paid/Paid estimate; null when none exists.
     contractValue: number | null;
     // Project.crew (the same relation the dashboard picker writes).
     crew: PipelineCrewMember[];
+    // Great-circle miles from the shop, rounded to a whole number; null when
+    // the project has no geocoded location yet. Not money — serialized for
+    // every role.
+    distanceMilesFromShop: number | null;
 }
 
 export interface PipelineLead {
@@ -110,7 +135,8 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             where: { status: { in: OPEN_PROJECT_STATUSES } },
             orderBy: { createdAt: "desc" },
             select: {
-                id: true, name: true, status: true, startDate: true, color: true,
+                id: true, name: true, status: true, startDate: true, endDate: true, color: true,
+                locationLat: true, locationLng: true,
                 client: { select: { name: true } },
                 crew: { select: { id: true, name: true, email: true, status: true, role: true } },
                 estimates: {
@@ -129,9 +155,13 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         client: p.client?.name ?? null,
         status: p.status,
         startDate: p.startDate ? p.startDate.toISOString() : null,
+        endDate: p.endDate ? p.endDate.toISOString() : null,
         color: p.color,
         contractValue: p.estimates[0] ? Number(p.estimates[0].totalAmount) : null,
         crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status, role: u.role })),
+        distanceMilesFromShop: p.locationLat != null && p.locationLng != null
+            ? Math.round(haversineMiles(SHOP_LAT, SHOP_LNG, p.locationLat, p.locationLng))
+            : null,
     });
 
     const waitingToStart: PipelineProject[] = [];
@@ -331,7 +361,7 @@ export async function setProjectStartDate(input: {
 
         const project = await tx.project.findUnique({
             where: { id: projectId },
-            select: { id: true, name: true, status: true, startDate: true },
+            select: { id: true, name: true, status: true, startDate: true, endDate: true },
         });
         if (!project) throw new Error("Project not found");
         if (CLOSED_PROJECT_STATUSES.includes(project.status)) {
@@ -342,6 +372,14 @@ export async function setProjectStartDate(input: {
         await tx.project.update({ where: { id: projectId }, data: { startDate } });
 
         const notes: string[] = [];
+        // Preserve the endDate > startDate invariant under the same lock: a
+        // start moved past a saved end would flip the window negative and
+        // collapse estimate-generation windowDays to the 1-day clamp. Clearing
+        // (not silently shifting) keeps the human in charge of the new end.
+        if (startDate && project.endDate && project.endDate.getTime() <= startDate.getTime()) {
+            await tx.project.update({ where: { id: projectId }, data: { endDate: null } });
+            notes.push(`Saved end date ${project.endDate.toISOString().slice(0, 10)} was on or before the new start — cleared; set a new end date if needed.`);
+        }
         const skippedQbMilestones: SkippedQbMilestone[] = [];
         let shiftedTasks = 0;
         let shiftedTaskDates: PersistedScheduleTaskDate[] = [];
@@ -553,6 +591,7 @@ export async function setProjectStartDate(input: {
                     shiftedTasks,
                     shiftedMilestones,
                     skippedQbMilestones: skippedQbMilestones.length,
+                    notes,
                 }),
             },
         });
@@ -1907,7 +1946,10 @@ export interface CompanyDashboardData {
     };
     calendar: StartCalendar;
     cashflow: CashflowOutlook | null;
-    teamMembers: { id: string; name: string; email: string }[] | null;
+    // burdenedHourlyRate is MONEY (hourlyRate + burdenRate) — present only
+    // when canSeeFinancials is true; absent (never null) otherwise, same
+    // redaction convention as contractValue/targetRevenue below.
+    teamMembers: { id: string; name: string; email: string; role: string; burdenedHourlyRate?: number }[] | null;
     crewConflicts: CrewConflict[] | null;
     overlays: CalendarOverlays | null;
     strip: ProjectMonthStripRow[] | null;
@@ -2064,7 +2106,42 @@ export async function getCompanyDashboardData(
         // the calendar fetch stays financial-free here.
         getStartCalendar(from, to, { includeFinancials: false }),
         isAdmin ? getCashflowOutlook() : Promise.resolve(null),
-        canEdit ? getCrewConflicts(from, to) : Promise.resolve(null),
+        // Conflicts feed BOTH the month-scoped conflicts card AND the
+        // availability grid (always today..today+14, regardless of the viewed
+        // month). Two separate window fetches — NOT a min/max hull, which
+        // would (a) pull every intervening conflict when viewing a distant
+        // month and (b) let getCrewConflicts' one-interval-per-pair rule
+        // displace the availability-date interval with a month-gap one.
+        // Results merge with per-interval dedupe; views filter to their own
+        // window (badges by grid range, availability by day-in-pair-range).
+        canEdit ? (async () => {
+            const now = new Date();
+            const localToday = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+            const availabilityFrom = addDays(localToday, -1);
+            const availabilityTo = addDays(localToday, 15);
+            const [monthConflicts, availabilityConflicts] = await Promise.all([
+                getCrewConflicts(from, to),
+                availabilityFrom >= from && availabilityTo <= to
+                    ? Promise.resolve([] as CrewConflict[]) // fully inside the grid — one fetch suffices
+                    : getCrewConflicts(availabilityFrom, availabilityTo),
+            ]);
+            const byUser = new Map<string, CrewConflict>();
+            for (const conflict of [...monthConflicts, ...availabilityConflicts]) {
+                const existing = byUser.get(conflict.userId);
+                if (!existing) {
+                    byUser.set(conflict.userId, { ...conflict, pairs: [...conflict.pairs] });
+                    continue;
+                }
+                const seen = new Set(existing.pairs.map(pair =>
+                    [pair.projectA.id, pair.projectB.id, pair.overlapStart, pair.overlapEnd, pair.taskA?.id ?? "", pair.taskB?.id ?? ""].join("|"),
+                ));
+                for (const pair of conflict.pairs) {
+                    const key = [pair.projectA.id, pair.projectB.id, pair.overlapStart, pair.overlapEnd, pair.taskA?.id ?? "", pair.taskB?.id ?? ""].join("|");
+                    if (!seen.has(key)) existing.pairs.push(pair);
+                }
+            }
+            return [...byUser.values()];
+        })() : Promise.resolve(null),
         isAdmin ? coRowsPromise.then(rows => getCalendarOverlays(from, to, rows)) : Promise.resolve(null),
         isAdmin ? coRowsPromise.then(rows => getProjectMonthStrip(from, to, rows)) : Promise.resolve(null),
     ]);
@@ -2134,12 +2211,21 @@ export async function getCompanyDashboardData(
         ? await prisma.user.findMany({
             where: { status: "ACTIVATED", role: { not: "FINANCE" } },
             orderBy: { name: "asc" },
-            select: { id: true, name: true, email: true },
+            select: { id: true, name: true, email: true, role: true, hourlyRate: true, burdenRate: true },
         })
         : [];
     const teamMembers = canEdit
         ? (() => {
-            const rows = teamMembersRaw.map(u => ({ id: u.id, name: u.name || u.email, email: u.email }));
+            const rows = teamMembersRaw.map(u => ({
+                id: u.id,
+                name: u.name || u.email,
+                email: u.email,
+                role: u.role,
+                // MONEY — only serialized for financialReports holders (the
+                // availability panel's planned-$ row needs it; the picker UI
+                // ignores the extra field).
+                ...(canSeeFinancials ? { burdenedHourlyRate: round2(Number(u.hourlyRate) + Number(u.burdenRate)) } : {}),
+            }));
             const nameCounts = new Map<string, number>();
             for (const r of rows) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1);
             return rows.map(r => (nameCounts.get(r.name)! > 1 ? { ...r, name: `${r.name} (${r.email})` } : r));
