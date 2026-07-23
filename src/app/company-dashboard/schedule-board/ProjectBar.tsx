@@ -573,11 +573,14 @@ export function ProjectBar({
                     role="presentation"
                     aria-hidden="true"
                     title={`Drag to change ${project.name}'s end date`}
-                    className="absolute right-0 top-0 z-20 h-[18px] w-1.5 touch-pan-y cursor-ew-resize opacity-0 transition group-hover/project:opacity-100 group-focus-within/project:opacity-100 [@media(hover:none)]:opacity-100"
+                    // 16px grab zone with a 4px overhang past the bar edge — a
+                    // 6px sliver was practically unhittable next to the bar's
+                    // own move/click cursor (owner couldn't find it).
+                    className="absolute -right-1 top-0 z-20 h-[18px] w-4 touch-pan-y cursor-ew-resize opacity-0 transition group-hover/project:opacity-100 group-focus-within/project:opacity-100 [@media(hover:none)]:opacity-100"
                     onPointerDown={handleEndResizePointerDown}
                 >
-                    <span className="absolute inset-y-1 left-0 w-px bg-white/90" />
-                    <span className="absolute inset-y-1 right-0 w-px bg-white/90" />
+                    <span className="absolute inset-y-1 left-[5px] w-px bg-white/90" />
+                    <span className="absolute inset-y-1 left-[9px] w-px bg-white/90" />
                 </div>
             )}
             {hiddenTasks.length > 0 && (

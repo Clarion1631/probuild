@@ -352,7 +352,9 @@ assert.match(projectBarSource, /opacity-0 transition group-hover\/project:opacit
 // Confined to the title strip's own 18px band — this is what keeps it from
 // EVER vertically overlapping a task block's own resize-right handle, which
 // lives only inside the task strip below.
-assert.match(projectBarSource, /className="absolute right-0 top-0 z-20 h-\[18px\] w-1\.5/, "the edge-resize handle must be confined to the title strip's 18px band, never the task strip");
+// 16px grab zone with a 4px overhang past the bar edge (a 6px sliver was
+// unhittable in practice) — still confined to the title strip's 18px band.
+assert.match(projectBarSource, /className="absolute -right-1 top-0 z-20 h-\[18px\] w-4/, "the edge-resize handle must be a findable-width target confined to the title strip's 18px band, never the task strip");
 // ScheduleBoard: a SEPARATE drag machine from the whole-bar move, live local
 // preview via the SAME projectPreviewOverrides mechanism the move-drag/item-3
 // preview already uses, immediate commit (never draftProjectMove).
