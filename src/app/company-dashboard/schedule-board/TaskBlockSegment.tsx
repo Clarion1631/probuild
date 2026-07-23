@@ -4,8 +4,8 @@ import { useCallback, useEffect, useId, useRef, useState, useTransition, type Fo
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { DashboardTaskRow } from "@/lib/schedule-core";
-import { deleteScheduleTask } from "@/lib/actions";
-import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addTaskComment, deleteScheduleTask } from "@/lib/actions";
+import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } from "./useBarLayout";
 import { FloatingPopover } from "./FloatingPopover";
 import { TaskCrewPicker } from "./CrewPickers";
@@ -58,6 +58,10 @@ export interface TaskBlockSegmentProps extends TaskEditCallbacks {
     // Context-menu "Task crew…" (item 1) reuses the exact TaskCrewPicker the
     // Schedule & crew table uses.
     teamMembers: { id: string; name: string; email: string }[];
+    // Suppresses the hover card while ANY schedule-board drag (project move,
+    // project end-resize, task move/resize, or either's keyboard mode) is in
+    // progress — a hover card popping up mid-drag would be pure noise.
+    isAnyDragActive: boolean;
 }
 
 function readableText(color: string): string {
@@ -73,6 +77,23 @@ function initials(name: string): string {
     return name.trim().split(/\s+/).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
+// Hover-card notes (owner-feedback round, item 3).
+const HOVER_CARD_OPEN_DELAY_MS = 300;
+const NOTE_TRUNCATE_LENGTH = 140;
+
+function relativeDayLabel(iso: string): string {
+    const createdDay = parseUTCDate(iso.slice(0, 10));
+    const diffDays = getDaysBetween(createdDay, todayUTC());
+    if (diffDays <= 0) return "Today";
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays < 7) return `${diffDays} days ago`;
+    return formatDate(createdDay);
+}
+
+function truncateNote(text: string): string {
+    return text.length > NOTE_TRUNCATE_LENGTH ? `${text.slice(0, NOTE_TRUNCATE_LENGTH)}…` : text;
+}
+
 // Readability pass (2026-07-22): a task chip only shows its text label once
 // it's wide enough for roughly 3 characters at the bumped 11px label font —
 // narrower than that, the label is dropped in favor of the milestone's own
@@ -82,7 +103,7 @@ const MIN_LABEL_WIDTH_PX = 28;
 // Same single-popover, view-switching pattern as ProjectBar (item 1): one
 // FloatingPopover instance whose content swaps between the top-level menu
 // list and each item's own sub-view.
-type TaskMenuView = "main" | "dates" | "crew";
+type TaskMenuView = "main" | "dates" | "crew" | "notes";
 
 export function TaskBlockSegment({
     task,
@@ -99,6 +120,7 @@ export function TaskBlockSegment({
     laneTop,
     laneHeight,
     teamMembers,
+    isAnyDragActive,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
     onTaskKeyboardAdjust,
@@ -109,6 +131,7 @@ export function TaskBlockSegment({
 }: TaskBlockSegmentProps) {
     const router = useRouter();
     const observerRef = useRef<ResizeObserver | null>(null);
+    const rootRef = useRef<HTMLDivElement | null>(null);
     const fragmentId = useId().replace(/:/g, "");
     const [allocatedWidth, setAllocatedWidth] = useState(0);
     const actionTriggerRef = useRef<HTMLButtonElement>(null);
@@ -116,6 +139,13 @@ export function TaskBlockSegment({
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number } | null>(null);
     const [menuView, setMenuView] = useState<TaskMenuView>("main");
     const [isDeletePending, startDeleteTransition] = useTransition();
+    const [isNotePending, startNoteTransition] = useTransition();
+    const [noteDraft, setNoteDraft] = useState("");
+    // Hover card (item 3): mouseenter opens after a short delay; focus opens
+    // immediately. Suppressed while the click/context menu is open or ANY
+    // board drag is active.
+    const [hoverCardOpen, setHoverCardOpen] = useState(false);
+    const hoverOpenTimeoutRef = useRef<number | null>(null);
     const actionResetKey = `${isPending ? "pending" : "ready"}:${task.startDate}:${task.endDate}`;
     const [menuDraft, setMenuDraft] = useState<{ resetKey: string; dates: TaskDateOverride | null }>(() => ({
         resetKey: actionResetKey,
@@ -136,6 +166,7 @@ export function TaskBlockSegment({
     const activeMode = activeTaskKeyboardEdit?.taskId === task.id ? activeTaskKeyboardEdit.mode : null;
 
     const setMeasuredElement = useCallback((element: HTMLDivElement | null) => {
+        rootRef.current = element;
         observerRef.current?.disconnect();
         observerRef.current = null;
         if (!element) return;
@@ -150,6 +181,9 @@ export function TaskBlockSegment({
     useEffect(() => {
         setMenuOpen(false);
     }, [actionResetKey]);
+    useEffect(() => {
+        if (!menuOpen) setNoteDraft("");
+    }, [menuOpen]);
     // Only one schedule-board menu open at a time (item 1) — including across
     // a right-click/context menu vs the click-triggered "⋯" menu.
     useEffect(() => {
@@ -162,6 +196,43 @@ export function TaskBlockSegment({
         activateExclusiveMenu(close);
         return () => deactivateExclusiveMenu(close);
     }, [menuOpen]);
+    // Hover card: a drag starting anywhere on the board (or the click/context
+    // menu opening) force-closes an already-open card — never left floating
+    // over an active edit.
+    useEffect(() => {
+        if (!isAnyDragActive && !menuOpen) return;
+        if (hoverOpenTimeoutRef.current != null) {
+            window.clearTimeout(hoverOpenTimeoutRef.current);
+            hoverOpenTimeoutRef.current = null;
+        }
+        setHoverCardOpen(false);
+    }, [isAnyDragActive, menuOpen]);
+    useEffect(() => () => {
+        if (hoverOpenTimeoutRef.current != null) window.clearTimeout(hoverOpenTimeoutRef.current);
+    }, []);
+
+    function handleHoverCardMouseEnter() {
+        if (isAnyDragActive || menuOpen || hoverOpenTimeoutRef.current != null) return;
+        hoverOpenTimeoutRef.current = window.setTimeout(() => {
+            hoverOpenTimeoutRef.current = null;
+            setHoverCardOpen(true);
+        }, HOVER_CARD_OPEN_DELAY_MS);
+    }
+    function handleHoverCardFocus() {
+        if (isAnyDragActive || menuOpen) return;
+        if (hoverOpenTimeoutRef.current != null) {
+            window.clearTimeout(hoverOpenTimeoutRef.current);
+            hoverOpenTimeoutRef.current = null;
+        }
+        setHoverCardOpen(true);
+    }
+    function closeHoverCard() {
+        if (hoverOpenTimeoutRef.current != null) {
+            window.clearTimeout(hoverOpenTimeoutRef.current);
+            hoverOpenTimeoutRef.current = null;
+        }
+        setHoverCardOpen(false);
+    }
 
     if (!clipped || (!isMilestone && taskEnd <= taskStart)) return null;
 
@@ -279,6 +350,26 @@ export function TaskBlockSegment({
         setMenuOpen(false);
     }
 
+    // Add note (item 3): an IMMEDIATE action through the existing task-comment
+    // creation action (addTaskComment, now hardened with assertScheduleTaskAccess)
+    // — not part of the board's draft-mode/Save system. The new note shows up
+    // in the hover card after the refresh below re-serializes latestComments.
+    function submitNote() {
+        const text = noteDraft.trim();
+        if (mutationDisabled || isNotePending || !text) return;
+        startNoteTransition(async () => {
+            try {
+                await addTaskComment(task.id, text);
+                router.refresh();
+                toast.success("Note added");
+            } catch (err: any) {
+                toast.error(err?.message || "Failed to add note");
+            }
+        });
+        setNoteDraft("");
+        setMenuOpen(false);
+    }
+
     const laneStyle = laneTop != null && laneHeight != null
         ? { top: laneTop, height: laneHeight }
         : undefined;
@@ -300,6 +391,10 @@ export function TaskBlockSegment({
             onPointerDown={event => beginPointerEdit(event, "move")}
             onKeyDown={event => handleKeyboard(event, "move")}
             onContextMenu={handleContextMenu}
+            onMouseEnter={handleHoverCardMouseEnter}
+            onMouseLeave={closeHoverCard}
+            onFocus={handleHoverCardFocus}
+            onBlur={closeHoverCard}
         >
             <div className="absolute inset-0 overflow-hidden rounded-sm">
                 <span className="absolute inset-y-0 left-0 bg-white/25" style={{ width: `${progress}%` }} aria-hidden="true" />
@@ -358,6 +453,9 @@ export function TaskBlockSegment({
                             <button type="button" onClick={() => setMenuView("crew")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
                                 Task crew…
                             </button>
+                            <button type="button" onClick={() => setMenuView("notes")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
+                                Add note…
+                            </button>
                             <button
                                 type="button"
                                 disabled={isDeletePending}
@@ -414,12 +512,49 @@ export function TaskBlockSegment({
                         <div className="space-y-2" onPointerDown={event => event.stopPropagation()}>
                             <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
                             <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Task crew</p>
-                            <TaskCrewPicker task={task} teamMembers={teamMembers} />
+                            <TaskCrewPicker task={task} teamMembers={teamMembers} variant="inline" />
+                        </div>
+                    )}
+                    {menuView === "notes" && (
+                        <div className="space-y-2" onPointerDown={event => event.stopPropagation()}>
+                            <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
+                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`task-note-${task.id}-${fragmentId}`}>Note</label>
+                            <textarea
+                                id={`task-note-${task.id}-${fragmentId}`}
+                                value={noteDraft}
+                                onChange={event => setNoteDraft(event.target.value)}
+                                disabled={mutationDisabled || isNotePending}
+                                rows={3}
+                                className="hui-input w-full px-2 py-1 text-xs"
+                            />
+                            <button type="button" disabled={mutationDisabled || isNotePending || !noteDraft.trim()} onClick={submitNote} className="hui-btn hui-btn-primary w-full text-xs disabled:opacity-60">
+                                {isNotePending ? "Saving..." : "Add note"}
+                            </button>
+                            <p className="px-2 text-[9px] text-hui-textMuted">Saves immediately — not part of unsaved changes.</p>
                         </div>
                     )}
                 </FloatingPopover>
             </>
             )}
+            <FloatingPopover open={hoverCardOpen} anchorRef={rootRef} onClose={closeHoverCard} width={220} pointerEventsNone>
+                <div className="space-y-1">
+                    <p className="text-xs font-semibold text-hui-textMain">{isMilestone ? `◆ ${task.name}` : task.name}</p>
+                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {formatDate(isMilestone ? taskStart : taskEnd)}</p>
+                    <p className="text-[10px] text-hui-textMuted">Crew: {crew}</p>
+                    {task.latestComments.length > 0 && (
+                        <div className="space-y-1 border-t border-hui-border pt-1">
+                            {task.latestComments.map((comment, index) => (
+                                <p key={index} className="text-[10px] text-hui-textMain">
+                                    <span className="font-semibold">{comment.authorName}</span>{" "}
+                                    <span className="text-hui-textMuted">{relativeDayLabel(comment.createdAt)}</span>
+                                    {" — "}
+                                    {truncateNote(comment.text)}
+                                </p>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </FloatingPopover>
         </div>
     );
 }

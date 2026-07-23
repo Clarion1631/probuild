@@ -16,8 +16,8 @@ const project = {
     startDate: null, endDate: null, color: "#123456", contractValue: null, crew: [],
     taskCount: 2, hasQualifyingEstimate: false, unappliedChangeOrders: { count: 0, items: [] },
     tasks: [
-        { id: "t1", name: "Frame", startDate: "2037-01-03T00:00:00.000Z", endDate: "2037-01-06T00:00:00.000Z", color: "#111111", parentId: null, progress: 0, status: "Not Started", type: "task", assignments: [] },
-        { id: "t2", name: "Billing", startDate: "2037-01-20T00:00:00.000Z", endDate: "2037-01-20T00:00:00.000Z", color: "#222222", parentId: null, progress: 0, status: "Not Started", type: "milestone", assignments: [] },
+        { id: "t1", name: "Frame", startDate: "2037-01-03T00:00:00.000Z", endDate: "2037-01-06T00:00:00.000Z", color: "#111111", parentId: null, progress: 0, status: "Not Started", type: "task", assignments: [], latestComments: [] },
+        { id: "t2", name: "Billing", startDate: "2037-01-20T00:00:00.000Z", endDate: "2037-01-20T00:00:00.000Z", color: "#222222", parentId: null, progress: 0, status: "Not Started", type: "milestone", assignments: [], latestComments: [] },
     ],
 };
 
@@ -421,5 +421,19 @@ const fourOverlapping = assignTaskLanes([
 assert.equal(fourOverlapping.laneCount, 3, "lane assignment caps at MAX_TASK_LANES");
 assert.equal(fourOverlapping.hiddenTaskIds.length, 1, "the 4th concurrent task is reported hidden for the +N chip");
 assert.deepEqual([...fourOverlapping.laneByTaskId.values()].sort(), [0, 1, 2]);
+
+// Owner-feedback round (2026-07-22), item 2: project-bar right-edge resize
+// preview clamp — a candidate end may never land on or before the project's
+// start; it clamps to start+1 instead of going negative/zero-width.
+assert.equal(typeof (barLayout as Record<string, unknown>).computeProjectEndResizeCandidate, "function", "computeProjectEndResizeCandidate must be exported");
+const computeProjectEndResizeCandidate = (barLayout as unknown as {
+    computeProjectEndResizeCandidate: (originalEnd: Date, startDate: Date, deltaDays: number) => Date;
+}).computeProjectEndResizeCandidate;
+const resizeStart = parseUTCDate("2037-01-03");
+const resizeOriginalEnd = parseUTCDate("2037-01-06");
+assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, 2), parseUTCDate("2037-01-08"), "a positive drag extends the end by exactly the dragged days");
+assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -2), parseUTCDate("2037-01-04"), "a negative drag shortens the end while it stays past the start");
+assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -10), addDays(resizeStart, 1), "dragging past the start clamps to start+1, never to or before the start");
+assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -3), addDays(resizeStart, 1), "the clamp boundary itself (candidate === start) also clamps to start+1");
 
 console.log("schedule-board layout verification: PASS");

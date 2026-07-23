@@ -6,32 +6,125 @@
 // import (CompanyDashboardClient -> ScheduleBoard -> …View -> ProjectBar
 // would import back into CompanyDashboardClient otherwise). Behavior is
 // byte-identical to the original inline components.
+//
+// Rebuild (owner-feedback round, item 5): the picker used to bring its own
+// fixed-width, fixed-height, self-scrolling inner panel, nested inside the
+// schedule board's ALREADY-scrollable FloatingPopover menus (ProjectBar/
+// TaskBlockSegment's "crew" view) — a double scrollbar + horizontal overflow.
+// CrewChecklist is now a plain two-column grid with NO scroll/width of its
+// own — FloatingPopover is the one and only scroll owner everywhere a picker
+// renders.
 
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { DashboardTaskRow, PipelineCrewMember } from "@/lib/schedule-core";
 import { updateProjectCrewAction, updateTaskCrewAction } from "@/lib/actions";
+import { FloatingPopover } from "./FloatingPopover";
 
 function initials(name: string): string {
     const parts = name.trim().split(/\s+/);
     return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
-// Compact crew picker (checkbox popover) — the list is pre-filtered to
-// ACTIVATED users server-side; every toggle replaces the crew idempotently.
+interface CrewOption {
+    id: string;
+    label: string;
+}
+
+// Shared checklist presentation — used both `variant="inline"` (rendered
+// directly inside an ALREADY-open schedule-board FloatingPopover, no nested
+// popover of its own) and `variant="popover"` (the Schedule & crew table's
+// own trigger + FloatingPopover). No selected-initials chip here — the
+// table/bar trigger button keeps summarizing initials on its own.
+// Serializes full-list crew writes: instant optimistic UI, but requests go
+// out strictly in order (a later toggle's list can never be overtaken by an
+// earlier one racing through the locked server transaction). While one write
+// is in flight, newer lists coalesce into a single queued follow-up.
+function useSerializedCrewSubmit(send: (ids: string[]) => Promise<void>, onError: (message: string) => void) {
+    const [isPending, startTransition] = useTransition();
+    const inFlightRef = useRef(false);
+    const queuedRef = useRef<string[] | null>(null);
+    const submit = (ids: string[]) => {
+        if (inFlightRef.current) {
+            queuedRef.current = ids;
+            return;
+        }
+        inFlightRef.current = true;
+        startTransition(async () => {
+            try {
+                let current: string[] | null = ids;
+                while (current) {
+                    await send(current);
+                    current = queuedRef.current;
+                    queuedRef.current = null;
+                }
+            } catch (err: any) {
+                queuedRef.current = null;
+                onError(err?.message ?? "Failed to update crew");
+            } finally {
+                inFlightRef.current = false;
+            }
+        });
+    };
+    return { submit, isPending };
+}
+
+function CrewChecklist({
+    legend,
+    options,
+    selected,
+    onToggle,
+}: {
+    legend: string;
+    options: CrewOption[];
+    selected: string[];
+    onToggle: (userId: string) => void;
+}) {
+    return (
+        <fieldset className="m-0 min-w-0 border-0 p-0">
+            <legend className="mb-1 px-0 text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">{legend}</legend>
+            {options.length === 0 ? (
+                <p className="px-2 py-1 text-xs text-hui-textMuted">No active team members.</p>
+            ) : (
+                <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+                    {options.map(option => (
+                        <label key={option.id} className="flex min-h-11 min-w-0 items-center gap-2 rounded-md px-2 py-2 hover:bg-slate-50 focus-within:ring-2 focus-within:ring-hui-primary">
+                            <input
+                                type="checkbox"
+                                checked={selected.includes(option.id)}
+                                onChange={() => onToggle(option.id)}
+                                className="h-4 w-4 shrink-0 accent-hui-primary"
+                            />
+                            <span className="min-w-0 break-words text-sm text-hui-textMain">{option.label}</span>
+                        </label>
+                    ))}
+                </div>
+            )}
+        </fieldset>
+    );
+}
+
+// Compact crew picker — the list is pre-filtered to ACTIVATED users
+// server-side; every toggle replaces the crew idempotently.
 export function CrewPicker({
     projectId,
     crew,
     teamMembers,
+    variant = "popover",
 }: {
     projectId: string;
     crew: PipelineCrewMember[];
     teamMembers: { id: string; name: string; email: string }[];
+    // "inline" (ProjectBar's "Project crew…" menu view — already inside a
+    // FloatingPopover) vs "popover" (Schedule & crew table — owns its own
+    // trigger + FloatingPopover).
+    variant?: "inline" | "popover";
 }) {
     const router = useRouter();
     const [open, setOpen] = useState(false);
-    const [isPending, startTransition] = useTransition();
+    const triggerRef = useRef<HTMLButtonElement>(null);
+
 
     // Selection mirrors the server crew unless the user just toggled (the
     // override keys on the crew contents, so refreshed props take back over).
@@ -39,18 +132,20 @@ export function CrewPicker({
     const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
     const selected = override && override.key === crewKey ? override.ids : crew.map(c => c.id);
 
+    const { submit: submitCrew, isPending } = useSerializedCrewSubmit(
+        async ids => {
+            await updateProjectCrewAction(projectId, ids);
+            router.refresh();
+        },
+        message => {
+            toast.error(message || "Failed to update crew");
+            setOverride(null);
+        },
+    );
     function toggle(userId: string) {
         const next = selected.includes(userId) ? selected.filter(id => id !== userId) : [...selected, userId];
         setOverride({ key: crewKey, ids: next });
-        startTransition(async () => {
-            try {
-                await updateProjectCrewAction(projectId, next);
-                router.refresh();
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to update crew");
-                setOverride(null);
-            }
-        });
+        submitCrew(next);
     }
 
     // Option list: the picker team list PLUS any currently-assigned member who
@@ -64,45 +159,45 @@ export function CrewPicker({
         ...teamMembers.map(m => ({ id: m.id, label: m.name || m.email })),
         ...unlistedAssigned.map(c => ({ id: c.id, label: `${c.name} (${c.role === "FINANCE" ? "finance" : "inactive"})` })),
     ];
+    const legend = `Project crew — ${selected.length} assigned`;
+
+    if (variant === "inline") {
+        return <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />;
+    }
+
     const selectedNames = options.filter(o => selected.includes(o.id));
     return (
-        <div className="relative">
+        <>
             <button
+                ref={triggerRef}
                 type="button"
                 onClick={() => setOpen(o => !o)}
                 disabled={isPending}
+                aria-expanded={open}
                 className="hui-btn hui-btn-secondary text-xs px-2 py-1"
                 title="Assign crew"
             >
                 {selectedNames.length === 0 ? "Assign crew" : selectedNames.map(o => initials(o.label)).join(" ")}
             </button>
-            {open && (
-                <>
-                    <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
-                    <div className="absolute z-30 mt-1 w-56 bg-white border border-hui-border rounded-lg shadow-lg p-2 max-h-64 overflow-y-auto">
-                        {options.length === 0 && <p className="text-xs text-hui-textMuted px-2 py-1">No active team members.</p>}
-                        {options.map(o => (
-                            <label key={o.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    checked={selected.includes(o.id)}
-                                    onChange={() => toggle(o.id)}
-                                    className="accent-hui-primary"
-                                />
-                                <span className="text-sm text-hui-textMain">{o.label}</span>
-                            </label>
-                        ))}
-                    </div>
-                </>
-            )}
-        </div>
+            <FloatingPopover open={open} anchorRef={triggerRef} onClose={() => setOpen(false)} width={320}>
+                <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />
+            </FloatingPopover>
+        </>
     );
 }
 
-export function TaskCrewPicker({ task, teamMembers }: { task: DashboardTaskRow; teamMembers: { id: string; name: string; email: string }[] }) {
+export function TaskCrewPicker({
+    task,
+    teamMembers,
+    variant = "popover",
+}: {
+    task: DashboardTaskRow;
+    teamMembers: { id: string; name: string; email: string }[];
+    variant?: "inline" | "popover";
+}) {
     const router = useRouter();
     const [open, setOpen] = useState(false);
-    const [isPending, startTransition] = useTransition();
+    const triggerRef = useRef<HTMLButtonElement>(null);
     const assignedIds = task.assignments.map(a => a.userId);
     const assignmentKey = [...assignedIds].sort().join(",");
     const [override, setOverride] = useState<{ key: string; ids: string[] } | null>(null);
@@ -112,40 +207,36 @@ export function TaskCrewPicker({ task, teamMembers }: { task: DashboardTaskRow; 
         ...teamMembers.map(member => ({ id: member.id, label: member.name || member.email })),
         ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.role === "FINANCE" ? "finance" : "inactive"})` })),
     ];
+    const legend = `Task crew — ${selected.length} assigned`;
 
+    const { submit: submitCrew, isPending } = useSerializedCrewSubmit(
+        async ids => {
+            await updateTaskCrewAction(task.id, ids);
+            router.refresh();
+        },
+        message => {
+            toast.error(message || "Failed to update task crew");
+            setOverride(null);
+        },
+    );
     function toggle(userId: string) {
         const next = selected.includes(userId) ? selected.filter(id => id !== userId) : [...selected, userId];
         setOverride({ key: assignmentKey, ids: next });
-        startTransition(async () => {
-            try {
-                await updateTaskCrewAction(task.id, next);
-                router.refresh();
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to update task crew");
-                setOverride(null);
-            }
-        });
+        submitCrew(next);
+    }
+
+    if (variant === "inline") {
+        return <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />;
     }
 
     return (
-        <div className="relative inline-block">
-            <button type="button" onClick={() => setOpen(value => !value)} disabled={isPending} className="hui-btn hui-btn-secondary text-xs px-2 py-1" aria-expanded={open}>
+        <>
+            <button ref={triggerRef} type="button" onClick={() => setOpen(value => !value)} disabled={isPending} className="hui-btn hui-btn-secondary text-xs px-2 py-1" aria-expanded={open}>
                 {selected.length === 0 ? "Assign task crew" : task.assignments.filter(a => selected.includes(a.userId)).map(a => initials(a.name)).join(" ") || `${selected.length} assigned`}
             </button>
-            {open && (
-                <>
-                    <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
-                    <div className="absolute right-0 z-30 mt-1 w-56 bg-white border border-hui-border rounded-lg shadow-lg p-2 max-h-64 overflow-y-auto">
-                        {options.length === 0 && <p className="text-xs text-hui-textMuted px-2 py-1">No active team members.</p>}
-                        {options.map(option => (
-                            <label key={option.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
-                                <input type="checkbox" checked={selected.includes(option.id)} onChange={() => toggle(option.id)} className="accent-hui-primary" />
-                                <span className="text-sm text-hui-textMain">{option.label}</span>
-                            </label>
-                        ))}
-                    </div>
-                </>
-            )}
-        </div>
+            <FloatingPopover open={open} anchorRef={triggerRef} onClose={() => setOpen(false)} width={320}>
+                <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />
+            </FloatingPopover>
+        </>
     );
 }

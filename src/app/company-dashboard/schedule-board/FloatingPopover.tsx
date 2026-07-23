@@ -21,6 +21,8 @@ export interface FloatingPopoverProps {
     children: ReactNode;
     /** Panel width in px — the panel right-aligns to the trigger by default (matching the prior `absolute right-0` menus), then clamps into the viewport. */
     width?: number;
+    /** Non-interactive hover card mode (schedule-board task hover notes): the panel never captures pointer events, so it can never trap the mouse mid-hover. Default false (normal click/context menu). */
+    pointerEventsNone?: boolean;
 }
 
 /**
@@ -33,8 +35,9 @@ export interface FloatingPopoverProps {
  * horizontally with an 8px viewport margin. Escape closes and returns focus
  * to the trigger; a pointerdown outside the panel and trigger also closes it.
  */
-export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224 }: FloatingPopoverProps) {
+export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224, pointerEventsNone = false }: FloatingPopoverProps) {
     const panelRef = useRef<HTMLDivElement | null>(null);
+    const contentRef = useRef<HTMLDivElement | null>(null);
     const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
     useLayoutEffect(() => {
@@ -52,7 +55,11 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             const viewportWidth = window.innerWidth;
             const viewportHeight = window.innerHeight;
             const panelWidth = panelRef.current?.offsetWidth ?? width;
-            const panelHeight = panelRef.current?.offsetHeight ?? 0;
+            // scrollHeight, not offsetHeight: once a maxHeight is applied the
+            // box stops growing, so a menu switching to taller content (the
+            // inline crew checklist) would keep measuring the SHORT view and
+            // never re-place. scrollHeight always reflects the content.
+            const panelHeight = Math.max(panelRef.current?.scrollHeight ?? 0, panelRef.current?.offsetHeight ?? 0);
 
             // Clamp order matters: the left-edge floor is applied LAST so a
             // viewport narrower than the panel pins to the margin instead of
@@ -91,9 +98,21 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
         place();
         window.addEventListener("resize", place);
         window.addEventListener("scroll", place, true);
+        // Re-measure when the PANEL's content changes size (e.g. a menu view
+        // switching to the taller inline crew checklist) — placement computed
+        // for the short view would otherwise keep constraining the tall one.
+        // Observe the CONTENT wrapper, not the panel: a maxHeight-capped panel
+        // box never changes size when its content grows, so panel observation
+        // misses the menu→taller-checklist switch entirely.
+        const observed = contentRef.current ?? panelRef.current;
+        const panelObserver = typeof ResizeObserver !== "undefined" && observed
+            ? new ResizeObserver(() => place())
+            : null;
+        if (panelObserver && observed) panelObserver.observe(observed);
         return () => {
             window.removeEventListener("resize", place);
             window.removeEventListener("scroll", place, true);
+            panelObserver?.disconnect();
         };
     }, [open, anchorRef, anchorPoint, width]);
 
@@ -103,7 +122,9 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             if (event.key !== "Escape") return;
             event.preventDefault();
             onClose();
-            anchorRef?.current?.focus();
+            // Hover cards open on focus — restoring focus to the anchor would
+            // immediately reopen the card Escape just dismissed.
+            if (!pointerEventsNone) anchorRef?.current?.focus();
         }
         function onPointerDownOutside(event: PointerEvent) {
             const target = event.target as Node;
@@ -117,7 +138,7 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             window.removeEventListener("keydown", onKeyDown);
             window.removeEventListener("pointerdown", onPointerDownOutside, true);
         };
-    }, [open, onClose, anchorRef]);
+    }, [open, onClose, anchorRef, pointerEventsNone]);
 
     if (!open || typeof document === "undefined") return null;
 
@@ -131,12 +152,24 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
                 maxHeight: position?.maxHeight,
                 overflowY: "auto",
                 width,
+                // Crew-picker rebuild (item 5): FloatingPopover is now the ONLY
+                // scroll owner any schedule-board menu ever nests — content
+                // (e.g. CrewChecklist) must never bring its own w-*/max-h-*
+                // scroller, and a viewport narrower than `width` must clip
+                // horizontally rather than overflow the screen.
+                maxWidth: `calc(100vw - ${2 * VIEWPORT_MARGIN_PX}px)`,
+                boxSizing: "border-box",
+                overflowX: "hidden",
+                overscrollBehaviorY: "contain",
                 visibility: position ? "visible" : "hidden",
             }}
-            className="z-[200] space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl"
-            onPointerDown={event => event.stopPropagation()}
+            className={`z-[200] space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl ${pointerEventsNone ? "pointer-events-none" : ""}`}
+            onPointerDown={pointerEventsNone ? undefined : event => event.stopPropagation()}
         >
-            {children}
+            {/* Content wrapper: observed for size changes — the panel box
+                itself stops growing once maxHeight caps it, so observing the
+                panel alone misses menu→taller-view switches. */}
+            <div ref={contentRef}>{children}</div>
         </div>,
         document.body,
     );

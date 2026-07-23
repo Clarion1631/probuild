@@ -51,6 +51,9 @@ export type PersistedTaskDate = PersistedScheduleTaskDate;
 
 export interface ProjectRefreshExpectation {
     projectStartDate?: string | null;
+    // Edge-resize end saves reconcile through the same expectation system —
+    // without this the resize preview override masks refreshed data forever.
+    projectEndDate?: string | null;
     taskDates: PersistedTaskDate[];
 }
 
@@ -209,6 +212,8 @@ export function projectRefreshMatches(
     if (!canonical) return false;
     if (expected.projectStartDate !== undefined
         && canonical.startDate?.slice(0, 10) !== expected.projectStartDate?.slice(0, 10)) return false;
+    if (expected.projectEndDate !== undefined
+        && (canonical.endDate?.slice(0, 10) ?? null) !== (expected.projectEndDate?.slice(0, 10) ?? null)) return false;
     const canonicalTasks = new Map(canonical.tasks.map(task => [task.id, task]));
     return expected.taskDates.every(task => {
         const canonicalTask = canonicalTasks.get(task.id);
@@ -486,6 +491,19 @@ export function assignTaskLanes(tasks: TaskLaneRange[]): TaskLaneLayout {
 
     const laneCount = laneByTaskId.size === 0 ? 0 : Math.max(...laneByTaskId.values()) + 1;
     return { laneByTaskId, hiddenTaskIds, laneCount };
+}
+
+// Project-bar right-edge resize (owner-feedback round, item 2): the dragged
+// END date, clamped so the live preview (and the value actually saved on
+// release) never lands on or before the project's start — a project must
+// span at least one day. This is a PREVIEW-time clamp only; the persisted
+// value can still end up earlier than the last task's end (getEffectiveProjectRange
+// treats endDate as an extend-only candidate — see the ScheduleBoard commit
+// handler's "still shows through" info toast).
+export function computeProjectEndResizeCandidate(originalEnd: Date, startDate: Date, deltaDays: number): Date {
+    const candidate = addDays(originalEnd, deltaDays);
+    const minEnd = addDays(startDate, 1);
+    return candidate < minEnd ? minEnd : candidate;
 }
 
 export function toTimelineRect(range: DateRange, origin: Date, dayWidth: number): TimelineRect {

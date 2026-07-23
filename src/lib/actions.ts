@@ -6809,6 +6809,12 @@ export async function importEstimateToSchedule(projectId: string, estimateId: st
 // ========== TASK COMMENTS ==========
 
 export async function addTaskComment(taskId: string, text: string, photoUrls?: string[]) {
+    // Hardened (owner-feedback round, item 3): this action had no auth check
+    // at all — any caller could comment on any task. Same gate every other
+    // per-task schedule mutation in this file uses (schedules permission +
+    // project access), now also the entry point for the schedule board's
+    // hover-card "Add note…".
+    await assertScheduleTaskAccess(taskId);
     // Derive identity from the session — never trust a client-supplied userId.
     const session = await getSessionOrDev();
     const sessionUserId = (session?.user as any)?.id as string | null | undefined;

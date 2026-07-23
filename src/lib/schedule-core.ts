@@ -1889,6 +1889,12 @@ export interface DashboardTaskAssignment {
     role: string;
 }
 
+export interface DashboardTaskComment {
+    text: string;
+    authorName: string;
+    createdAt: string;
+}
+
 export interface DashboardTaskRow {
     id: string;
     name: string;
@@ -1900,6 +1906,10 @@ export interface DashboardTaskRow {
     status: string;
     type: string;
     assignments: DashboardTaskAssignment[];
+    // Hover-card notes (owner-feedback round, item 3): most recent 2 task
+    // comments, newest first — same TaskComment source the project schedule
+    // page already shows, no new writes/schema.
+    latestComments: DashboardTaskComment[];
 }
 
 export interface DashboardProjectRow extends PipelineProject {
@@ -2164,6 +2174,14 @@ export async function getCompanyDashboardData(
                     orderBy: { createdAt: "asc" },
                     select: { id: true, userId: true, user: { select: { name: true, email: true, status: true, role: true } } },
                 },
+                // Hover-card notes (item 3): capped at 2, newest first — same
+                // audience as the project schedule page's own comment thread
+                // (not money, no extra gate).
+                comments: {
+                    orderBy: { createdAt: "desc" },
+                    take: 2,
+                    select: { text: true, createdAt: true, subcontractorName: true, user: { select: { name: true, email: true } } },
+                },
             },
         }),
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
@@ -2189,6 +2207,11 @@ export async function getCompanyDashboardData(
                 name: a.user.name || a.user.email,
                 status: a.user.status,
                 role: a.user.role,
+            })),
+            latestComments: task.comments.map(c => ({
+                text: c.text,
+                authorName: c.user?.name ?? c.user?.email ?? c.subcontractorName ?? "Unknown",
+                createdAt: c.createdAt.toISOString(),
             })),
         });
         tasksByProject.set(task.projectId, rows);

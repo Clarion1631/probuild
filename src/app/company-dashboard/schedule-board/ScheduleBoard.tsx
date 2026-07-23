@@ -4,7 +4,7 @@ import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } fro
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectStartDateAction } from "@/lib/actions";
+import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectEndDateAction, updateProjectStartDateAction } from "@/lib/actions";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, OverlayIncomeItem } from "@/lib/schedule-core";
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
@@ -13,11 +13,13 @@ import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
 import {
+    computeProjectEndResizeCandidate,
     createProjectDropIntent,
     getEffectiveProjectRange,
     getNewlyPendingProjectIds,
     getTimelineAutoscrollStep,
     getTimelinePointerDelta,
+    mergeProjectPendingIds,
     previewProjectMove,
     previewProjectIncomeOverlays,
     previewTaskDates,
@@ -30,7 +32,7 @@ import {
     type TaskEditMode,
 } from "./useBarLayout";
 import type { TaskPointerEditStart } from "./TaskBlockSegment";
-import type { ProjectPointerEditStart } from "./ProjectBar";
+import type { ProjectEndResizePointerStart, ProjectPointerEditStart } from "./ProjectBar";
 
 export type { ProjectMoveChoice } from "./ShiftConfirmDialog";
 export type { ProjectDropIntent } from "./useBarLayout";
@@ -111,6 +113,36 @@ interface ActiveProjectPointerEdit {
     cleanup: () => void;
 }
 
+// Right-edge resize drag (item 2) — a SEPARATE pointer-drag from
+// ActiveProjectPointerEdit above: it previews via the SAME projectPreviewOverrides
+// slot (only one project edit can be active at a time — see cancelActiveProjectEdit)
+// but commits immediately (updateProjectEndDateAction), never joining the
+// draft/Save system.
+interface ActiveProjectEndResizeEdit {
+    projectId: string;
+    project: DashboardProjectRow;
+    pointerId: number;
+    pointerType: string;
+    startX: number;
+    startY: number;
+    originX: number;
+    latestClientX: number;
+    latestClientY: number;
+    originalStart: string;
+    originalEnd: string;
+    // Month has no fixed per-day pixel width (Timeline's zoom-driven
+    // timelineDayWidth) — measured once at drag start from the underlying
+    // week-grid day cell (see measureMonthDayWidth).
+    monthDayWidth: number | null;
+    active: boolean;
+    currentCandidate: string | null;
+    animationFrameId: number | null;
+    sourceElement: HTMLElement;
+    previousTouchAction: string;
+    start: ProjectEndResizePointerStart;
+    cleanup: () => void;
+}
+
 // Draft-mode: a drafted project-start move accumulated locally until Save.
 interface ProjectDraftMove {
     originalStart: string;
@@ -137,6 +169,19 @@ function hitTestTimelineScheduleGrid(clientX: number, clientY: number): boolean 
             && clientY >= bounds.top && clientY <= bounds.bottom;
     }
     return false;
+}
+
+// Project-bar right-edge resize (item 2), Month view only: there is no fixed
+// per-day pixel width the way Timeline has (its zoom-driven timelineDayWidth)
+// — the week grid's day-cell width is measured directly from whichever
+// [data-schedule-date] cell sits under the pointer at drag start (every cell
+// in a week row is exactly one day wide by construction).
+function measureMonthDayWidth(clientX: number, clientY: number): number | null {
+    for (const element of document.elementsFromPoint(clientX, clientY)) {
+        const cell = element instanceof HTMLElement ? element.closest<HTMLElement>("[data-schedule-date]") : null;
+        if (cell) return cell.getBoundingClientRect().width;
+    }
+    return null;
 }
 
 function isInteractiveTaskFallbackTarget(target: EventTarget | null): boolean {
@@ -178,6 +223,12 @@ export function ScheduleBoard({
     // the pending-to-save payload; nothing writes to the server until Save.
     const [taskDateOverrides, setTaskDateOverrides] = useState<Record<string, TaskDateOverride>>({});
     const [projectDrafts, setProjectDrafts] = useState<Record<string, ProjectDraftMove>>({});
+    // Read at reconciliation-timeout FIRE time (an effect-render snapshot can
+    // miss a just-added draft or resurrect a just-discarded one).
+    const projectDraftsRef = useRef(projectDrafts);
+    useEffect(() => { projectDraftsRef.current = projectDrafts; }, [projectDrafts]);
+    // Batch-save lock set feeding the single derived page-wide publisher.
+    const [saveLockedProjectIds, setSaveLockedProjectIds] = useState<ReadonlySet<string>>(EMPTY_PROJECT_IDS);
     const [isSaving, setIsSaving] = useState(false);
     const [awaitingTaskRefreshIds, setAwaitingTaskRefreshIds] = useState<Set<string>>(() => new Set());
     const [taskKeyboardEdit, setTaskKeyboardEdit] = useState<TaskKeyboardEditState | null>(null);
@@ -191,6 +242,17 @@ export function ScheduleBoard({
     const projectKeyboardCleanupRef = useRef<(() => void) | null>(null);
     const projectKeyboardSentinelRef = useRef<HTMLSpanElement>(null);
     const activeProjectPointerRef = useRef<ActiveProjectPointerEdit | null>(null);
+    // Right-edge resize (item 2): a SEPARATE active-drag ref from the
+    // whole-bar move above, plus the set of projects with an in-flight
+    // updateProjectEndDateAction save (merged into pendingProjectIds below so
+    // it participates in the SAME isPending gating as every other lock).
+    const activeProjectEndResizeRef = useRef<ActiveProjectEndResizeEdit | null>(null);
+    const [endResizeSavingProjectIds, setEndResizeSavingProjectIds] = useState<ReadonlySet<string>>(EMPTY_PROJECT_IDS);
+    // True for the duration of ANY pointer drag whose threshold has been
+    // crossed (project move, project end-resize, task move/resize) —
+    // combined with the keyboard-edit states below to gate task hover cards
+    // off while an edit is in progress (item 3).
+    const [pointerDragActive, setPointerDragActive] = useState(false);
     const previousExternallyPendingProjectIdsRef = useRef<ReadonlySet<string>>(new Set(externallyPendingProjectIds));
     const [confirmIntent, setConfirmIntent] = useState<ProjectDropIntent | null>(null);
     // Bumped on every "Today" click so TimelineView re-scrolls to today even
@@ -267,7 +329,25 @@ export function ScheduleBoard({
         return Boolean(projectId && isProjectExternallyPending(projectId));
     }, [isSaving, isProjectExternallyPending, canonicalTaskProjectById]);
 
+    // End-resize saves are a SECOND source of "externally" pending, alongside
+    // the legacy StartDateRow (item 2) — merged so both views' isPending gate
+    // (isSaving || pendingProjectIds.has(id)) sees either lock the same way.
+    const combinedPendingProjectIds = useMemo(
+        () => mergeProjectPendingIds(externallyPendingProjectIds, endResizeSavingProjectIds),
+        [externallyPendingProjectIds, endResizeSavingProjectIds],
+    );
+    // Hover cards go quiet the moment ANY drag — pointer or keyboard, project
+    // or task — is in progress (item 3).
+    const isAnyDragActive = pointerDragActive || projectKeyboardEdit !== null || taskKeyboardEdit !== null;
+
     useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
+    // ONE derived publisher for the page-wide lock: the live union of the
+    // running batch save's locked projects and every in-flight end-resize
+    // save. Snapshot-based inline publications left windows where a resize
+    // starting mid-batch went unpublished.
+    useEffect(() => {
+        onEffectivePendingProjectIdsChange(mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds));
+    }, [saveLockedProjectIds, endResizeSavingProjectIds, onEffectivePendingProjectIdsChange]);
 
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
@@ -409,6 +489,14 @@ export function ScheduleBoard({
             setProjectPreviewOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
             setProjectIncomeOverrides(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
             setProjectRefreshExpectations(current => Object.fromEntries(Object.entries(current).filter(([id]) => !reconciled.has(id))));
+            // A reconciled refresh (e.g. an end-resize save) must not eat the
+            // visual preview of a still-UNSAVED start draft on the same
+            // project — rebuild that preview from fresh canonical data.
+            for (const projectId of reconciled) {
+                const draft = projectDraftsRef.current[projectId];
+                const canonical = canonicalProjectById.get(projectId);
+                if (draft && canonical) setProjectPreview(canonical, draft.targetStart);
+            }
         }, 0);
         return () => window.clearTimeout(timeoutId);
     }, [canonicalProjectById, projectRefreshExpectations]);
@@ -421,6 +509,7 @@ export function ScheduleBoard({
 
     useEffect(() => () => {
         activeProjectPointerRef.current?.cleanup();
+        activeProjectEndResizeRef.current?.cleanup();
         projectKeyboardCleanupRef.current?.();
         activeTaskPointerRef.current?.cleanup();
         taskKeyboardCleanupRef.current?.();
@@ -640,7 +729,7 @@ export function ScheduleBoard({
                 .map(([taskId]) => canonicalTaskProjectById.get(taskId))
                 .filter((id): id is string => Boolean(id)),
         ]);
-        onEffectivePendingProjectIdsChange(lockedProjectIds);
+        setSaveLockedProjectIds(lockedProjectIds); // the derived publisher unions live resize saves
 
         const failedProjectNames: string[] = [];
         const succeededProjectIds: string[] = [];
@@ -768,7 +857,7 @@ export function ScheduleBoard({
         }
 
         setIsSaving(false);
-        onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS);
+        setSaveLockedProjectIds(EMPTY_PROJECT_IDS); // derived publisher keeps live resize saves locked
         router.refresh();
 
         if (saveNotes.length > 0) toast.info(saveNotes.join(" "));
@@ -790,6 +879,10 @@ export function ScheduleBoard({
         if (pointerEdit && projectIds.has(pointerEdit.projectId)) {
             pointerEdit.cleanup();
         }
+        const endResizeEdit = activeProjectEndResizeRef.current;
+        if (endResizeEdit && projectIds.has(endResizeEdit.projectId)) {
+            endResizeEdit.cleanup();
+        }
         const keyboardEdit = projectKeyboardEditRef.current;
         if (keyboardEdit && projectIds.has(keyboardEdit.projectId)) {
             projectKeyboardCleanupRef.current?.();
@@ -799,6 +892,7 @@ export function ScheduleBoard({
 
     function cancelActiveProjectEdit() {
         activeProjectPointerRef.current?.cleanup();
+        activeProjectEndResizeRef.current?.cleanup();
         projectKeyboardCleanupRef.current?.();
         setProjectKeyboardState(null);
     }
@@ -906,6 +1000,7 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
+                setPointerDragActive(true);
             }
             event.preventDefault();
             requestProjectPointerFrame();
@@ -935,6 +1030,7 @@ export function ScheduleBoard({
         const onWindowBlur = () => finish(true);
         drag.cleanup = () => {
             if (activeProjectPointerRef.current === drag) activeProjectPointerRef.current = null;
+            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
@@ -949,6 +1045,196 @@ export function ScheduleBoard({
             }
         };
         activeProjectPointerRef.current = drag;
+        try {
+            start.sourceElement.setPointerCapture(start.pointerId);
+        } catch {
+            // Window listeners keep ownership stable when capture is unavailable.
+        }
+        window.addEventListener("pointermove", onPointerMove, { passive: false });
+        window.addEventListener("pointerup", onPointerUp);
+        window.addEventListener("pointercancel", onPointerCancel);
+        window.addEventListener("blur", onWindowBlur);
+    }
+
+    // Immediate server write for a released end-resize drag (item 2) — NOT
+    // part of the draft system. getEffectiveProjectRange treats endDate as an
+    // EXTEND-ONLY candidate, so a released end shorter than the last task's
+    // end still saves (owner-approved semantics) but the bar keeps showing
+    // through the task-derived date — surfaced here as an info toast.
+    function commitProjectEndResize(project: DashboardProjectRow, candidateEnd: string) {
+        const taskDerivedRange = getEffectiveProjectRange({ ...project, endDate: null });
+        setEndResizeSavingProjectIds(current => new Set([...current, project.id]));
+        void (async () => {
+            try {
+                await updateProjectEndDateAction(project.id, candidateEnd);
+                // Reconcile the resize preview through the expectation system —
+                // it clears the override once canonical endDate matches;
+                // leaving the override unmanaged would mask ALL later
+                // refreshed data for this project.
+                setProjectRefreshExpectations(current => ({
+                    ...current,
+                    [project.id]: { projectEndDate: candidateEnd, taskDates: [] },
+                }));
+                router.refresh();
+                if (taskDerivedRange && parseUTCDate(candidateEnd) < taskDerivedRange.end) {
+                    toast.info(`End date saved — the bar still shows through ${formatDate(addDays(taskDerivedRange.end, -1))} because tasks run that long.`);
+                } else {
+                    toast.success("End date saved");
+                }
+            } catch (error: any) {
+                clearProjectPreview(project.id);
+                toast.error(error?.message || "Failed to update end date");
+            } finally {
+                setEndResizeSavingProjectIds(current => {
+                    if (!current.has(project.id)) return current;
+                    const next = new Set(current);
+                    next.delete(project.id);
+                    return next;
+                });
+            }
+        })();
+    }
+
+    function handleProjectEndResizeStart(project: DashboardProjectRow, start: ProjectEndResizePointerStart) {
+        const canonicalProject = canonicalProjectById.get(project.id);
+        if (!data.canEdit || !canonicalProject || isProjectLocked(project.id)) return;
+        cancelActiveProjectEdit();
+        cancelActiveTaskEdit();
+        const drag: ActiveProjectEndResizeEdit = {
+            projectId: project.id,
+            project: canonicalProject,
+            pointerId: start.pointerId,
+            pointerType: start.pointerType,
+            startX: start.clientX,
+            startY: start.clientY,
+            originX: start.clientX,
+            latestClientX: start.clientX,
+            latestClientY: start.clientY,
+            originalStart: start.originalStart,
+            originalEnd: start.originalEnd,
+            monthDayWidth: start.timelineDayWidth ? null : measureMonthDayWidth(start.clientX, start.clientY),
+            active: false,
+            currentCandidate: null,
+            animationFrameId: null,
+            sourceElement: start.sourceElement,
+            previousTouchAction: start.sourceElement.style.touchAction,
+            start,
+            cleanup: () => undefined,
+        };
+
+        const calculateEndResizeCandidate = (): string | null => {
+            const dayWidth = drag.start.timelineDayWidth ?? drag.monthDayWidth;
+            if (!dayWidth) return null;
+            const deltaDays = getTimelinePointerDelta(drag.latestClientX, drag.originX, dayWidth);
+            // Clamp against the PERSISTED start marker when one exists — the
+            // effective range can start at an earlier task (marker-only moves),
+            // and the server rejects end <= persisted startDate.
+            const clampStart = drag.project.startDate
+                ? parseUTCDate(drag.project.startDate.slice(0, 10))
+                : parseUTCDate(drag.originalStart);
+            const candidateEnd = computeProjectEndResizeCandidate(
+                parseUTCDate(drag.originalEnd),
+                clampStart,
+                deltaDays,
+            );
+            return formatDate(candidateEnd);
+        };
+        const getEndResizeAutoscrollStep = () => {
+            const container = drag.start.timelineScrollContainerRef?.current;
+            if (!container || !drag.start.timelineDayWidth) return 0;
+            const bounds = container.getBoundingClientRect();
+            return getTimelineAutoscrollStep({
+                clientX: drag.latestClientX,
+                containerLeft: bounds.left,
+                containerRight: bounds.right,
+                timelineLeftInset: drag.start.timelineLeftInset ?? 0,
+                scrollLeft: container.scrollLeft,
+                scrollWidth: container.scrollWidth,
+                clientWidth: container.clientWidth,
+                threshold: EDGE_AUTOSCROLL_THRESHOLD_PX,
+                maxStep: MAX_AUTOSCROLL_PX_PER_FRAME,
+            });
+        };
+        const applyEndResizeCandidate = () => {
+            const candidate = calculateEndResizeCandidate();
+            drag.currentCandidate = candidate;
+            if (!candidate || candidate === drag.originalEnd) {
+                clearProjectPreview(drag.projectId);
+                return;
+            }
+            setProjectPreviewOverrides(current => ({
+                ...current,
+                [drag.projectId]: { ...drag.project, endDate: `${candidate}T00:00:00.000Z` },
+            }));
+        };
+        const runEndResizeFrame = () => {
+            drag.animationFrameId = null;
+            if (!drag.active) return;
+            const container = drag.start.timelineScrollContainerRef?.current;
+            const scrollDelta = getEndResizeAutoscrollStep();
+            if (container && scrollDelta !== 0) {
+                const before = container.scrollLeft;
+                container.scrollLeft += scrollDelta;
+                drag.originX -= container.scrollLeft - before;
+            }
+            applyEndResizeCandidate();
+            if (getEndResizeAutoscrollStep() !== 0 && drag.animationFrameId == null) {
+                drag.animationFrameId = requestAnimationFrame(runEndResizeFrame);
+            }
+        };
+        const onPointerMove = (event: PointerEvent) => {
+            if (event.pointerId !== drag.pointerId) return;
+            drag.latestClientX = event.clientX;
+            drag.latestClientY = event.clientY;
+            if (!drag.active) {
+                const threshold = drag.pointerType === "touch" ? PROJECT_TOUCH_DRAG_THRESHOLD_PX : PROJECT_MOUSE_DRAG_THRESHOLD_PX;
+                if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
+                drag.active = true;
+                drag.sourceElement.style.touchAction = "none";
+                setPointerDragActive(true);
+            }
+            event.preventDefault();
+            if (drag.animationFrameId == null) drag.animationFrameId = requestAnimationFrame(runEndResizeFrame);
+        };
+        const finish = (cancelled: boolean, releaseEvent?: PointerEvent) => {
+            if (releaseEvent) {
+                drag.latestClientX = releaseEvent.clientX;
+                drag.latestClientY = releaseEvent.clientY;
+            }
+            if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
+            drag.animationFrameId = null;
+            const candidate = drag.active && !cancelled ? calculateEndResizeCandidate() : null;
+            drag.cleanup();
+            if (!drag.active || cancelled || !candidate || candidate === drag.originalEnd) {
+                clearProjectPreview(drag.projectId);
+                return;
+            }
+            commitProjectEndResize(drag.project, candidate);
+        };
+        const onPointerUp = (event: PointerEvent) => {
+            if (event.pointerId === drag.pointerId) finish(false, event);
+        };
+        const onPointerCancel = (event: PointerEvent) => {
+            if (event.pointerId === drag.pointerId) finish(true);
+        };
+        const onWindowBlur = () => finish(true);
+        drag.cleanup = () => {
+            if (activeProjectEndResizeRef.current === drag) activeProjectEndResizeRef.current = null;
+            setPointerDragActive(false);
+            window.removeEventListener("pointermove", onPointerMove);
+            window.removeEventListener("pointerup", onPointerUp);
+            window.removeEventListener("pointercancel", onPointerCancel);
+            window.removeEventListener("blur", onWindowBlur);
+            if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
+            drag.animationFrameId = null;
+            drag.sourceElement.style.touchAction = drag.previousTouchAction;
+            try {
+                if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
+            } catch {
+                // The optimistic preview may re-key the originating segment.
+            }
+        };
+        activeProjectEndResizeRef.current = drag;
         try {
             start.sourceElement.setPointerCapture(start.pointerId);
         } catch {
@@ -1130,6 +1416,7 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
+                setPointerDragActive(true);
             }
             event.preventDefault();
             if (drag.animationFrameId == null) drag.animationFrameId = requestAnimationFrame(runTaskPointerFrame);
@@ -1162,6 +1449,7 @@ export function ScheduleBoard({
 
         drag.cleanup = () => {
             if (activeTaskPointerRef.current === drag) activeTaskPointerRef.current = null;
+            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
@@ -1405,7 +1693,7 @@ export function ScheduleBoard({
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
                     showHours={showHours}
-                    pendingProjectIds={externallyPendingProjectIds}
+                    pendingProjectIds={combinedPendingProjectIds}
                     pendingTaskIds={EMPTY_PROJECT_IDS}
                     draftProjectIds={draftProjectIds}
                     draftTaskIds={draftTaskIds}
@@ -1413,6 +1701,7 @@ export function ScheduleBoard({
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
                     teamMembers={data.teamMembers ?? []}
+                    isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
@@ -1420,6 +1709,7 @@ export function ScheduleBoard({
                     onProjectKeyboardCommit={handleProjectKeyboardCommit}
                     onProjectKeyboardCancel={handleProjectKeyboardCancel}
                     onProjectMoveCommit={handleProjectMoveCommit}
+                    onProjectEndResizeStart={handleProjectEndResizeStart}
                     onTaskPointerEditStart={handleTaskPointerEditStart}
                     onTaskKeyboardStart={handleTaskKeyboardStart}
                     onTaskKeyboardAdjust={handleTaskKeyboardAdjust}
@@ -1435,7 +1725,7 @@ export function ScheduleBoard({
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
                     showHours={showHours}
-                    pendingProjectIds={externallyPendingProjectIds}
+                    pendingProjectIds={combinedPendingProjectIds}
                     pendingTaskIds={EMPTY_PROJECT_IDS}
                     draftProjectIds={draftProjectIds}
                     draftTaskIds={draftTaskIds}
@@ -1446,6 +1736,7 @@ export function ScheduleBoard({
                     onToggleGroupByCrew={() => setGroupByCrewMode(!groupByCrew)}
                     scrollToTodayNonce={scrollToTodayNonce}
                     teamMembers={data.teamMembers ?? []}
+                    isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
@@ -1453,6 +1744,7 @@ export function ScheduleBoard({
                     onProjectKeyboardCommit={handleProjectKeyboardCommit}
                     onProjectKeyboardCancel={handleProjectKeyboardCancel}
                     onProjectMoveCommit={handleProjectMoveCommit}
+                    onProjectEndResizeStart={handleProjectEndResizeStart}
                     onTaskPointerEditStart={handleTaskPointerEditStart}
                     onTaskKeyboardStart={handleTaskKeyboardStart}
                     onTaskKeyboardAdjust={handleTaskKeyboardAdjust}

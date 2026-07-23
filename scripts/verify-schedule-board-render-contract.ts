@@ -56,8 +56,11 @@ assert.match(boardSource, /draftProjectMove\(project, current\.targetStart\)/, "
 assert.doesNotMatch(boardSource, /updateCompanyScheduleTaskDatesAction/, "the board no longer calls the single-task write action directly");
 
 // The batch save is the ONLY place these three server actions are called,
-// and it fires exactly once per Save click.
-assert.match(boardSource, /import \{ saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectStartDateAction \} from "@\/lib\/actions"/);
+// and it fires exactly once per Save click. (updateProjectEndDateAction
+// joined this import in the owner-feedback round — item 2's edge-resize
+// commit — but it is NOT part of the batch/draft system below; see its own
+// assertions further down.)
+assert.match(boardSource, /import \{ saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectEndDateAction, updateProjectStartDateAction \} from "@\/lib\/actions"/);
 const saveAllDraftsStart = boardSource.indexOf("async function saveAllDrafts()");
 const saveAllDraftsEnd = boardSource.indexOf("function cancelProjectEditsForProjects", saveAllDraftsStart);
 const saveAllDraftsBody = boardSource.slice(saveAllDraftsStart, saveAllDraftsEnd);
@@ -216,7 +219,7 @@ assert.match(monthSource, /No unscheduled projects/, "Month's Schedule-here must
 assert.match(timelineSource, /No unscheduled projects/, "Timeline's Schedule-here must show a disabled line when there is nothing to schedule");
 // Task block: Delete task is an immediate action (not draft-mode) through
 // the existing deleteScheduleTask, with explicit non-draft copy in the confirm.
-assert.match(taskBlockSource, /import \{ deleteScheduleTask \} from "@\/lib\/actions"/);
+assert.match(taskBlockSource, /import \{ addTaskComment, deleteScheduleTask \} from "@\/lib\/actions"/);
 assert.match(taskBlockSource, /await deleteScheduleTask\(task\.id\)/);
 assert.match(taskBlockSource, /Deletes now — not part of unsaved changes/, "Delete task's confirm copy must explicitly say it is immediate, not draft-mode");
 // Project bar: Remove from schedule only for Waiting to Start, through the
@@ -229,10 +232,13 @@ assert.match(projectBarSource, /import \{ addDays, formatDate, parseUTCDate, PRE
 assert.match(projectBarSource, /PRESET_COLORS\.map\(swatch =>/, "the Color… grid must be built from PRESET_COLORS");
 // Project crew…/Task crew… reuse the SAME pickers as the Schedule & crew
 // table (via the extracted CrewPickers module), never a rebuilt picker.
+// Crew-picker rebuild (item 5): the schedule-board menu instances render the
+// shared CrewChecklist INLINE (variant="inline") — no nested popover inside
+// the bar/block's own FloatingPopover menu, which was the double-scrollbar bug.
 assert.match(projectBarSource, /import \{ CrewPicker \} from "\.\/CrewPickers"/);
-assert.match(projectBarSource, /<CrewPicker projectId=\{project\.id\} crew=\{project\.crew\} teamMembers=\{teamMembers\} \/>/);
+assert.match(projectBarSource, /<CrewPicker projectId=\{project\.id\} crew=\{project\.crew\} teamMembers=\{teamMembers\} variant="inline" \/>/);
 assert.match(taskBlockSource, /import \{ TaskCrewPicker \} from "\.\/CrewPickers"/);
-assert.match(taskBlockSource, /<TaskCrewPicker task=\{task\} teamMembers=\{teamMembers\} \/>/);
+assert.match(taskBlockSource, /<TaskCrewPicker task=\{task\} teamMembers=\{teamMembers\} variant="inline" \/>/);
 
 // ── Item 6: a bar click toggles its menu, never navigates ──
 assert.match(projectBarSource, /function handleBarClick\(/);
@@ -302,5 +308,125 @@ assert.match(timelineSource, /export const CREW_MODE_STORAGE_KEY/);
 assert.match(boardSource, /import \{ TimelineView, CREW_MODE_STORAGE_KEY \} from "\.\/TimelineView"/);
 assert.match(boardSource, /function drillDownToCrewTimeline\(/);
 assert.match(boardSource, /onDrillDown=\{drillDownToCrewTimeline\}/);
+
+// ── Owner-feedback round (2026-07-22), item 1: end date merged into
+// "Edit dates…" — the standalone "Set end date…" item and its own menu view
+// are GONE; the "dates" view now carries both fields. ──
+assert.doesNotMatch(projectBarSource, /Set end date…/, "the standalone \"Set end date…\" menu item must be removed");
+assert.doesNotMatch(projectBarSource, /"main" \| "dates" \| "crew" \| "color" \| "end-date"/, "BarMenuView must no longer carry a separate end-date view");
+assert.match(projectBarSource, /type BarMenuView = "main" \| "dates" \| "crew" \| "color";/);
+// "Edit dates…" is no longer canMoveProject-gated at the menu-item level (a
+// Substantial Completion project can't move its start, but must still be
+// able to set an end date) — the Start FIELD inside the view stays gated.
+assert.doesNotMatch(projectBarSource, /\{canMoveProject && \(\s*<button type="button" onClick=\{\(\) => setMenuView\("dates"\)\}/, "the Edit dates… menu item itself must not be canMoveProject-gated");
+assert.match(projectBarSource, /\{menuView === "dates" && \(/, "the merged dates view must not require canMoveProject to render at all");
+assert.match(projectBarSource, /\{canMoveProject && \(\s*<div>\s*<label[\s\S]{0,300}Start date/, "the Start date FIELD inside the merged view stays canMoveProject-gated");
+assert.match(projectBarSource, /htmlFor=\{`bar-project-enddate-\$\{project\.id\}`\}>End date/, "the merged view must contain an End date field");
+assert.match(projectBarSource, /Joins unsaved changes — Save to commit\./, "the Start field needs a caption distinguishing it from the immediate End write");
+assert.match(projectBarSource, /Saves immediately\./, "the End field needs a caption distinguishing it from the draft Start write");
+assert.match(projectBarSource, /Clear end date/, "the merged view keeps a Clear end date affordance");
+// Submit behavior: Start routes through the EXISTING draft path
+// (onMoveCommit -> draftProjectMove); End calls updateProjectEndDateAction
+// (via submitEndDate) immediately and ONLY when it actually changed.
+const handleDateSubmitStart = projectBarSource.indexOf("function handleDateSubmit(");
+const handleDateSubmitEnd = projectBarSource.indexOf("function submitColor(", handleDateSubmitStart);
+const handleDateSubmitBody = projectBarSource.slice(handleDateSubmitStart, handleDateSubmitEnd);
+assert.ok(handleDateSubmitStart >= 0, "handleDateSubmit must exist");
+assert.match(handleDateSubmitBody, /onMoveCommit\(project, targetStart\)/, "a start change must route through the existing draft path");
+assert.match(handleDateSubmitBody, /if \(endDateValue !== projectEndDate\) \{\s*\n\s*submitEndDate\(endDateValue \|\| null\);/, "an end change must fire submitEndDate ONLY when the value actually changed");
+assert.match(projectBarSource, /await updateProjectEndDateAction\(project\.id, value\);/, "the merged End field still routes through the existing updateProjectEndDateAction — no new action");
+assert.match(projectBarSource, /toast\.error\(err\?\.message \|\| "Failed to update end date"\)/, "end-date validation errors stay toasts");
+
+// ── Item 2: project-bar right-edge resize -> end date ──
+assert.match(projectBarSource, /onProjectEndResizeStart: ProjectEditCallbacks\["onProjectEndResizeStart"\]/, "ProjectBarProps must carry the end-resize callback");
+assert.match(projectBarSource, /export interface ProjectEndResizePointerStart \{/, "a dedicated pointer-start payload type must exist for the edge-resize drag");
+assert.match(projectBarSource, /function handleEndResizePointerDown\(event: ReactPointerEvent<HTMLDivElement>\) \{/);
+assert.match(projectBarSource, /event\.stopPropagation\(\);\s*\n\s*onProjectEndResizeStart\(project, \{/, "the edge-resize pointerdown must stop propagation so it wins over the whole-bar move drag");
+// The handle only renders on the segment that actually ENDS the project
+// (never a continuation), is canEdit-gated independent of canMoveProject
+// (matches item 1's End-date access boundary), and follows the standard
+// hover-reveal + [@media(hover:none)] always-visible pattern.
+assert.match(projectBarSource, /\{canEdit && !isPending && !segment\.continuesAfter && \(/, "the edge-resize handle must only render on the segment ending the project, canEdit-gated, independent of canMoveProject");
+assert.match(projectBarSource, /onPointerDown=\{handleEndResizePointerDown\}/);
+assert.match(projectBarSource, /opacity-0 transition group-hover\/project:opacity-100 group-focus-within\/project:opacity-100 \[@media\(hover:none\)\]:opacity-100/, "the edge-resize handle must use the standard hover/focus/touch-always-visible pattern");
+// Confined to the title strip's own 18px band — this is what keeps it from
+// EVER vertically overlapping a task block's own resize-right handle, which
+// lives only inside the task strip below.
+assert.match(projectBarSource, /className="absolute right-0 top-0 z-20 h-\[18px\] w-1\.5/, "the edge-resize handle must be confined to the title strip's 18px band, never the task strip");
+// ScheduleBoard: a SEPARATE drag machine from the whole-bar move, live local
+// preview via the SAME projectPreviewOverrides mechanism the move-drag/item-3
+// preview already uses, immediate commit (never draftProjectMove).
+assert.match(layoutSource, /export function computeProjectEndResizeCandidate\(originalEnd: Date, startDate: Date, deltaDays: number\): Date \{/, "the resize-preview clamp must be an exported PURE helper (testable, reused by both views)");
+assert.match(layoutSource, /candidate < minEnd \? minEnd : candidate/, "the clamp must floor the candidate at start+1, never at or before the start");
+assert.match(boardSource, /function measureMonthDayWidth\(clientX: number, clientY: number\): number \| null \{/, "Month's day width must be measured from the underlying week-grid day cell, not hardcoded");
+assert.match(boardSource, /function handleProjectEndResizeStart\(project: DashboardProjectRow, start: ProjectEndResizePointerStart\) \{/);
+assert.match(boardSource, /const dayWidth = drag\.start\.timelineDayWidth \?\? drag\.monthDayWidth;/, "px->day math must read the CURRENT day width — Timeline's zoom-driven prop or Month's measured value — never a hardcoded constant");
+// The clamp floor is the PERSISTED start marker when one exists (the effective
+// range can begin at an earlier task after marker-only moves, and the server
+// rejects end <= persisted startDate) — falling back to the range start.
+assert.match(boardSource, /const clampStart = drag\.project\.startDate\s*\n\s*\? parseUTCDate\(drag\.project\.startDate\.slice\(0, 10\)\)\s*\n\s*: parseUTCDate\(drag\.originalStart\);/, "the resize clamp must floor at the persisted start marker");
+assert.match(boardSource, /computeProjectEndResizeCandidate\(\s*\n\s*parseUTCDate\(drag\.originalEnd\),\s*\n\s*clampStart,/, "the live preview must run through the shared pure clamp helper");
+assert.match(boardSource, /function commitProjectEndResize\(project: DashboardProjectRow, candidateEnd: string\) \{/);
+assert.doesNotMatch(
+    boardSource.slice(boardSource.indexOf("function commitProjectEndResize("), boardSource.indexOf("function handleProjectEndResizeStart(")),
+    /draftProjectMove|setProjectDrafts/,
+    "the edge-resize commit must NEVER join the draft/Save system — it writes immediately",
+);
+assert.match(boardSource, /await updateProjectEndDateAction\(project\.id, candidateEnd\);/, "the edge-resize commit must call the existing updateProjectEndDateAction — no new action");
+assert.match(boardSource, /const taskDerivedRange = getEffectiveProjectRange\(\{ \.\.\.project, endDate: null \}\);/, "the 'still shows through' toast must compare against the pure task/marker-derived range (endDate ignored)");
+assert.match(boardSource, /End date saved — the bar still shows through \$\{formatDate\(addDays\(taskDerivedRange\.end, -1\)\)\} because tasks run that long\./, "a released end shorter than the last task's end must still save, with an info toast explaining the bar's visible length");
+assert.match(boardSource, /activeProjectEndResizeRef\.current\?\.cleanup\(\);/, "starting another project/task edit must cancel an active end-resize drag");
+assert.match(boardSource, /const combinedPendingProjectIds = useMemo\(\s*\n\s*\(\) => mergeProjectPendingIds\(externallyPendingProjectIds, endResizeSavingProjectIds\),/, "an in-flight end-resize save must lock the project the SAME way the legacy externally-pending mechanism does");
+assert.equal((boardSource.match(/pendingProjectIds=\{combinedPendingProjectIds\}/g) ?? []).length, 2, "both views must receive the combined (legacy + end-resize) pending-project set");
+assert.match(monthSource, /onProjectEndResizeStart=\{onProjectEndResizeStart\}/);
+assert.match(timelineSource, /onProjectEndResizeStart=\{onProjectEndResizeStart\}/);
+assert.match(boardSource, /onProjectEndResizeStart=\{handleProjectEndResizeStart\}/, "the board must wire the end-resize handler into at least one view");
+
+// ── Item 3: hover notes on task blocks ──
+assert.match(coreSource, /latestComments: DashboardTaskComment\[\];/, "DashboardTaskRow must carry the hover-card's latestComments");
+assert.match(coreSource, /comments: \{\s*\n\s*orderBy: \{ createdAt: "desc" \},\s*\n\s*take: 2,/, "the task select must cap comments at 2, newest first");
+assert.match(coreSource, /authorName: c\.user\?\.name \?\? c\.user\?\.email \?\? c\.subcontractorName \?\? "Unknown",/, "author fallback chain must be user.name -> user.email -> subcontractorName -> Unknown");
+const addTaskCommentStart = actionsSource.indexOf("export async function addTaskComment(");
+const addTaskCommentEnd = actionsSource.indexOf("export async function getTaskComments(", addTaskCommentStart);
+const addTaskCommentBody = actionsSource.slice(addTaskCommentStart, addTaskCommentEnd);
+assert.ok(addTaskCommentStart >= 0, "addTaskComment must exist");
+assert.match(addTaskCommentBody, /await assertScheduleTaskAccess\(taskId\);/, "addTaskComment previously had NO auth check — hardened to the same schedule-task gate every other per-task mutation uses");
+assert.match(taskBlockSource, /import \{ addTaskComment, deleteScheduleTask \} from "@\/lib\/actions"/);
+assert.match(taskBlockSource, /Add note…/, "the task context menu must offer Add note…");
+assert.match(taskBlockSource, /await addTaskComment\(task\.id, text\);/, "Add note must go through the existing (now hardened) addTaskComment action");
+assert.match(taskBlockSource, /task\.latestComments\.map\(\(comment, index\) => \(/, "the hover card must render latestComments");
+assert.match(taskBlockSource, /truncateNote\(comment\.text\)/, "note text in the hover card must be truncated");
+assert.match(taskBlockSource, /const NOTE_TRUNCATE_LENGTH = 140;/);
+assert.match(taskBlockSource, /isAnyDragActive: boolean;/, "TaskBlockSegmentProps must accept the cross-board drag-active flag");
+assert.match(taskBlockSource, /if \(!isAnyDragActive && !menuOpen\) return;[\s\S]{0,300}setHoverCardOpen\(false\);/, "an active drag (or the click/context menu) must force-close an already-open hover card");
+assert.match(taskBlockSource, /if \(isAnyDragActive \|\| menuOpen(?: \|\| hoverOpenTimeoutRef\.current != null)?\) return;/, "opening the hover card must be gated on isAnyDragActive");
+assert.match(popoverSource, /pointerEventsNone\?: boolean;/, "FloatingPopover must support a non-interactive hover-card mode");
+assert.match(popoverSource, /pointerEventsNone \? "pointer-events-none" : ""/);
+assert.match(taskBlockSource, /pointerEventsNone/, "the hover card FloatingPopover instance must opt into pointer-events-none");
+for (const source of [monthSource, timelineSource, projectBarSource]) {
+    assert.match(source, /isAnyDragActive=\{isAnyDragActive\}/, "every TaskBlockSegment/ProjectBar render site must thread isAnyDragActive through");
+}
+
+// ── Item 5: crew-picker rebuild (owner-flagged double scrollbar) ──
+// CrewChecklist owns NO scroll/width of its own — FloatingPopover (width=320
+// for the standalone popover variant) is the ONLY scroll owner anywhere a
+// picker renders, including the "inline" variant nested inside an ALREADY-
+// open schedule-board menu.
+assert.doesNotMatch(crewPickersSource, /max-h-64/, "CrewPickers must not bring its own max-height scroller — FloatingPopover owns scrolling");
+assert.doesNotMatch(crewPickersSource, /overflow-y-auto/, "CrewPickers must not bring its own scroll region — double scrollbar was the bug");
+assert.match(crewPickersSource, /function CrewChecklist\(/, "a single shared checklist presentation must exist");
+assert.match(crewPickersSource, /grid grid-cols-1 gap-1 sm:grid-cols-2/, "the checklist must be a two-column grid, not a single vertical list");
+assert.match(crewPickersSource, /variant\?: "inline" \| "popover";/, "CrewPicker/TaskCrewPicker must accept the inline/popover variant");
+assert.match(crewPickersSource, /if \(variant === "inline"\) \{\s*\n\s*return <CrewChecklist/, "the inline variant must render the checklist directly with no nested trigger/popover of its own");
+assert.match(crewPickersSource, /<FloatingPopover open=\{open\} anchorRef=\{triggerRef\} onClose=\{\(\) => setOpen\(false\)\} width=\{320\}>/, "the popover variant (Schedule & crew table) must use FloatingPopover at width 320");
+assert.doesNotMatch(crewPickersSource, /w-56/, "the old fixed w-56 picker panel must be gone");
+assert.match(popoverSource, /overflowX: "hidden",/, "FloatingPopover must clip horizontally so nested content can never reintroduce a second scroll axis");
+assert.match(popoverSource, /maxWidth: `calc\(100vw - \$\{2 \* VIEWPORT_MARGIN_PX\}px\)`,/, "FloatingPopover must clamp its own width into the viewport");
+// FINANCE/inactive labeling and FloatingPopover's existing maxHeight/overflowY
+// contract stay exactly as before the rebuild.
+assert.match(crewPickersSource, /c\.role === "FINANCE" \? "finance" : "inactive"/, "CrewPicker must still label removable FINANCE crew entries");
+assert.match(crewPickersSource, /a\.role === "FINANCE" \? "finance" : "inactive"/, "TaskCrewPicker must still label removable FINANCE task-crew entries");
+assert.match(popoverSource, /maxHeight: position\?\.maxHeight,/);
+assert.match(popoverSource, /overflowY: "auto",/);
 
 console.log("schedule-board render contract verification: PASS");
