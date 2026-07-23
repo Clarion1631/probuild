@@ -502,8 +502,14 @@ export function TimelineView({
                                     lane: 0,
                                 }
                             : null;
+                        // Badge only for conflicts intersecting the visible canvas —
+                        // the merged list also carries availability-window pairs.
                         const conflictNames = [...new Set((data.crewConflicts ?? []).flatMap(conflict =>
-                            conflict.pairs.some(pair => pair.projectA.id === project.id || pair.projectB.id === project.id)
+                            conflict.pairs.some(pair =>
+                                (pair.projectA.id === project.id || pair.projectB.id === project.id)
+                                && new Date(pair.overlapStart) < gridEnd
+                                && new Date(pair.overlapEnd) > gridStart,
+                            )
                                 ? [conflict.name]
                                 : [],
                         ))];

@@ -591,6 +591,7 @@ export async function setProjectStartDate(input: {
                     shiftedTasks,
                     shiftedMilestones,
                     skippedQbMilestones: skippedQbMilestones.length,
+                    notes,
                 }),
             },
         });
@@ -2107,17 +2108,39 @@ export async function getCompanyDashboardData(
         isAdmin ? getCashflowOutlook() : Promise.resolve(null),
         // Conflicts feed BOTH the month-scoped conflicts card AND the
         // availability grid (always today..today+14, regardless of the viewed
-        // month) — fetch the UNION window, with a ±1-day margin for client/
-        // server calendar-day drift, so off-month viewing can't produce
-        // false-negative conflict rings.
-        canEdit ? (() => {
+        // month). Two separate window fetches — NOT a min/max hull, which
+        // would (a) pull every intervening conflict when viewing a distant
+        // month and (b) let getCrewConflicts' one-interval-per-pair rule
+        // displace the availability-date interval with a month-gap one.
+        // Results merge with per-interval dedupe; views filter to their own
+        // window (badges by grid range, availability by day-in-pair-range).
+        canEdit ? (async () => {
             const now = new Date();
             const localToday = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
             const availabilityFrom = addDays(localToday, -1);
             const availabilityTo = addDays(localToday, 15);
-            const conflictsFrom = availabilityFrom < from ? availabilityFrom : from;
-            const conflictsTo = availabilityTo > to ? availabilityTo : to;
-            return getCrewConflicts(conflictsFrom, conflictsTo);
+            const [monthConflicts, availabilityConflicts] = await Promise.all([
+                getCrewConflicts(from, to),
+                availabilityFrom >= from && availabilityTo <= to
+                    ? Promise.resolve([] as CrewConflict[]) // fully inside the grid — one fetch suffices
+                    : getCrewConflicts(availabilityFrom, availabilityTo),
+            ]);
+            const byUser = new Map<string, CrewConflict>();
+            for (const conflict of [...monthConflicts, ...availabilityConflicts]) {
+                const existing = byUser.get(conflict.userId);
+                if (!existing) {
+                    byUser.set(conflict.userId, { ...conflict, pairs: [...conflict.pairs] });
+                    continue;
+                }
+                const seen = new Set(existing.pairs.map(pair =>
+                    [pair.projectA.id, pair.projectB.id, pair.overlapStart, pair.overlapEnd, pair.taskA?.id ?? "", pair.taskB?.id ?? ""].join("|"),
+                ));
+                for (const pair of conflict.pairs) {
+                    const key = [pair.projectA.id, pair.projectB.id, pair.overlapStart, pair.overlapEnd, pair.taskA?.id ?? "", pair.taskB?.id ?? ""].join("|");
+                    if (!seen.has(key)) existing.pairs.push(pair);
+                }
+            }
+            return [...byUser.values()];
         })() : Promise.resolve(null),
         isAdmin ? coRowsPromise.then(rows => getCalendarOverlays(from, to, rows)) : Promise.resolve(null),
         isAdmin ? coRowsPromise.then(rows => getProjectMonthStrip(from, to, rows)) : Promise.resolve(null),

@@ -650,6 +650,9 @@ export function ScheduleBoard({
         // caught in a shift must have their pinned overrides rewritten to the
         // shifted dates or their awaiting ids can never reconcile.
         const shiftedPersistedDates: { id: string; startDate: string; endDate: string }[] = [];
+        // Core-side side notes (skipped QB milestones, cleared end dates, …)
+        // surfaced to the user after the batch settles.
+        const saveNotes: string[] = [];
 
         for (const [projectId, draft] of projectEntries) {
             const canonicalProject = canonicalProjectById.get(projectId);
@@ -671,6 +674,7 @@ export function ScheduleBoard({
                     if (choice === "marker-only") {
                         const result = await updateProjectStartDateAction(projectId, draft.targetStart, false);
                         projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: [] };
+                        if (result.notes?.length) saveNotes.push(...result.notes.map(note => `${canonicalProject.name}: ${note}`));
                     } else {
                         // Owner-decided semantics: the bar drag moves the start
                         // marker AND the not-started work — the whole future of
@@ -682,11 +686,14 @@ export function ScheduleBoard({
                             projectStartDate: markerResult.startDate,
                             taskDates: shiftResult.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)),
                         };
+                        const notes = [...(markerResult.notes ?? []), ...(shiftResult.notes ?? [])];
+                        if (notes.length) saveNotes.push(...notes.map(note => `${canonicalProject.name}: ${note}`));
                     }
                 } else {
                     const result = await updateProjectStartDateAction(projectId, draft.targetStart, true);
                     shiftedPersistedDates.push(...result.shiftedTaskDates);
                     projectExpectations[projectId] = { projectStartDate: result.startDate, taskDates: result.shiftedTaskDates.filter(row => !batchedTaskIds.has(row.id)) };
+                    if (result.notes?.length) saveNotes.push(...result.notes.map(note => `${canonicalProject.name}: ${note}`));
                 }
                 succeededProjectIds.push(projectId);
             } catch (error) {
@@ -764,6 +771,7 @@ export function ScheduleBoard({
         onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS);
         router.refresh();
 
+        if (saveNotes.length > 0) toast.info(saveNotes.join(" "));
         const totalSucceeded = succeededProjectIds.length + succeededTaskCount;
         const totalFailed = failedProjectNames.length + failedTaskNames.length;
         if (totalFailed === 0 && totalSucceeded > 0) {

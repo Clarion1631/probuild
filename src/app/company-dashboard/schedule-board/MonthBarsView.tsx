@@ -53,10 +53,17 @@ interface MonthBarsViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     teamMembers: { id: string; name: string; email: string }[];
 }
 
-function projectConflictNames(projectId: string, conflicts: CompanyDashboardData["crewConflicts"]): string[] {
+// window: badges only reflect conflicts intersecting the visible grid — the
+// merged conflict list also carries availability-window pairs that may be
+// months away from the viewed grid.
+function projectConflictNames(projectId: string, conflicts: CompanyDashboardData["crewConflicts"], window: { start: Date; end: Date }): string[] {
     if (!conflicts) return [];
     return [...new Set(conflicts.flatMap(conflict =>
-        conflict.pairs.some(pair => pair.projectA.id === projectId || pair.projectB.id === projectId)
+        conflict.pairs.some(pair =>
+            (pair.projectA.id === projectId || pair.projectB.id === projectId)
+            && new Date(pair.overlapStart) < window.end
+            && new Date(pair.overlapEnd) > window.start,
+        )
             ? [conflict.name]
             : [],
     ))];
@@ -303,7 +310,7 @@ export function MonthBarsView({
                                                     project={project}
                                                     segment={segment}
                                                     projectColor={project.color || getFallbackProjectColor(project.id)}
-                                                    conflictNames={projectConflictNames(project.id, data.crewConflicts)}
+                                                    conflictNames={projectConflictNames(project.id, data.crewConflicts, { start: gridStart, end: addDays(gridStart, 42) })}
                                                     incomeMilestones={milestoneMaps?.income.get(project.id) ?? EMPTY_INCOME}
                                                     changeOrderMilestones={milestoneMaps?.changeOrders.get(project.id) ?? EMPTY_CHANGE_ORDERS}
                                                     canEdit={data.canEdit}

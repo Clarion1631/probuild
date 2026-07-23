@@ -126,6 +126,8 @@ function StartDateRow({
                         ? `Start set — ${result.shiftedTasks} job task${result.shiftedTasks === 1 ? "" : "s"} shifted`
                         : "Start date set"
                 );
+                // Surface core-side side notes (e.g. "saved end date cleared").
+                if (result.notes?.length) toast.info(result.notes.join(" "));
                 router.refresh();
             } catch (error) {
                 clearProjectMutation(project.id);
